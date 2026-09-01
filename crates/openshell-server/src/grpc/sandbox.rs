@@ -60,6 +60,7 @@ use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, clamp_limit};
 use crate::persistence::current_time_ms;
 
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
+const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
 
 #[derive(Debug)]
 pub struct WatchSandboxStream {
@@ -216,6 +217,7 @@ async fn handle_create_sandbox_inner(
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
+    let await_main_process_attachment = request.await_main_process_attachment;
     let mut spec = request
         .spec
         .ok_or_else(|| Status::invalid_argument("spec is required"))?;
@@ -365,7 +367,10 @@ async fn handle_create_sandbox_inner(
         None => None,
     };
 
-    let sandbox = state.compute.create_sandbox(sandbox, sandbox_token).await?;
+    let sandbox = state
+        .compute
+        .create_sandbox(sandbox, sandbox_token, await_main_process_attachment)
+        .await?;
 
     info!(
         sandbox_id = %id,
@@ -1032,7 +1037,7 @@ pub(super) async fn handle_watch_sandbox(
                     if stop_on_terminal {
                         let phase = SandboxPhase::try_from(sandbox.phase())
                             .unwrap_or(SandboxPhase::Unknown);
-                        if phase == SandboxPhase::Ready {
+                        if is_watch_terminal(phase) {
                             return;
                         }
                     }
@@ -1106,7 +1111,7 @@ pub(super) async fn handle_watch_sandbox(
                                         }
                                         if stop_on_terminal {
                                             let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
-                                            if phase == SandboxPhase::Ready {
+                                            if is_watch_terminal(phase) {
                                                 return;
                                             }
                                         }
@@ -1179,6 +1184,13 @@ pub(super) async fn handle_watch_sandbox(
     Ok(Response::new(WatchSandboxStream::new(rx, producer)))
 }
 
+fn is_watch_terminal(phase: SandboxPhase) -> bool {
+    matches!(
+        phase,
+        SandboxPhase::Ready | SandboxPhase::Completed | SandboxPhase::Stopped | SandboxPhase::Error
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Exec handler
 // ---------------------------------------------------------------------------
@@ -1227,6 +1239,8 @@ pub(super) async fn handle_exec_sandbox(
 
     let sandbox_id = sandbox.object_id().to_string();
 
+    let no_login_shell = req.no_login_shell;
+
     let (tx, rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(256);
     tokio::spawn(async move {
         // Wait for the supervisor's reverse CONNECT to deliver the relay stream.
@@ -1245,6 +1259,7 @@ pub(super) async fn handle_exec_sandbox(
             stdin_payload,
             timeout_seconds,
             request_tty,
+            no_login_shell,
         )
         .await
         {
@@ -1316,7 +1331,10 @@ pub(super) async fn handle_forward_tcp(
 
     let sandbox = fetch_and_authorize_sandbox(state, &principal, &init.sandbox_id).await?;
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
+    // The main process may finish between minting the SSH token and opening
+    // its transport. Keep the relay reachable until terminal delivery is
+    // finalized so fast commands can attach without a readiness race.
+    if !sandbox_relay_reachable(state, &sandbox) {
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
@@ -1393,7 +1411,7 @@ async fn acquire_forward_connection_guard(
     Ok(ForwardConnectionGuard {
         state: state.clone(),
         token: Some(token.to_string()),
-        sandbox_id,
+        sandbox_id: sandbox_id.clone(),
     })
 }
 
@@ -1651,6 +1669,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
     let request_tty = req.tty;
+    let no_login_shell = req.no_login_shell;
     let timeout_seconds = req.timeout_seconds;
     let cols = if req.cols == 0 { 80 } else { req.cols };
     let rows = if req.rows == 0 { 24 } else { req.rows };
@@ -1679,6 +1698,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
             &command_str,
             input_stream,
             request_tty,
+            no_login_shell,
             timeout_seconds,
             cols,
             rows,
@@ -1697,6 +1717,16 @@ pub(super) async fn handle_exec_sandbox_interactive(
 // SSH session handlers
 // ---------------------------------------------------------------------------
 
+fn sandbox_relay_reachable(state: &ServerState, sandbox: &Sandbox) -> bool {
+    let phase = SandboxPhase::try_from(sandbox.phase()).ok();
+    matches!(phase, Some(SandboxPhase::Ready))
+        || (matches!(phase, Some(SandboxPhase::Completed | SandboxPhase::Error))
+            && state.supervisor_sessions.has_session(sandbox.object_id())
+            && !state
+                .supervisor_sessions
+                .terminal_delivery_finalized(sandbox.object_id()))
+}
+
 pub(super) async fn handle_create_ssh_session(
     state: &Arc<ServerState>,
     request: Request<CreateSshSessionRequest>,
@@ -1709,7 +1739,7 @@ pub(super) async fn handle_create_ssh_session(
 
     let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
+    if !sandbox_relay_reachable(state, &sandbox) {
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
@@ -1896,6 +1926,16 @@ const EXEC_KEEPALIVE_MAX: usize = 4;
 /// Max wait for a trailing `Close` after `ExitStatus`.
 const EXEC_POST_EXIT_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Supervisor SSH banner software token that signals no-login-shell support.
+const OPENSHELL_SSHID_PREFIX: &[u8] = b"SSH-2.0-OpenShell_";
+
+/// A supervisor honors `OPENSHELL_NO_LOGIN_SHELL` only if it identifies as
+/// `OpenShell`. Older sandboxes present russh's default banner and silently
+/// ignore the env request, so gate the opt-out on the `OpenShell` identity.
+fn supervisor_supports_no_login_shell(remote_sshid: &[u8]) -> bool {
+    remote_sshid.starts_with(OPENSHELL_SSHID_PREFIX)
+}
+
 /// russh client config for exec relays.
 fn exec_ssh_client_config() -> russh::client::Config {
     russh::client::Config {
@@ -1956,6 +1996,7 @@ async fn stream_exec_over_relay(
     stdin_payload: Vec<u8>,
     timeout_seconds: u32,
     request_tty: bool,
+    no_login_shell: bool,
 ) -> Result<(), Status> {
     let command_preview: String = command
         .chars()
@@ -1980,6 +2021,7 @@ async fn stream_exec_over_relay(
         command,
         stdin_payload,
         request_tty,
+        no_login_shell,
         tx.clone(),
     );
 
@@ -2034,6 +2076,7 @@ async fn stream_interactive_exec_over_relay(
     command: &str,
     input_stream: tonic::Streaming<ExecSandboxInput>,
     request_tty: bool,
+    no_login_shell: bool,
     timeout_seconds: u32,
     cols: u32,
     rows: u32,
@@ -2060,6 +2103,7 @@ async fn stream_interactive_exec_over_relay(
         command,
         input_stream,
         request_tty,
+        no_login_shell,
         cols,
         rows,
         tx.clone(),
@@ -2107,11 +2151,13 @@ async fn stream_interactive_exec_over_relay(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_interactive_exec_with_russh(
     local_proxy_port: u16,
     command: &str,
     mut input_stream: tonic::Streaming<ExecSandboxInput>,
     request_tty: bool,
+    no_login_shell: bool,
     cols: u32,
     rows: u32,
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
@@ -2138,7 +2184,11 @@ async fn run_interactive_exec_with_russh(
     set_tcp_nodelay_best_effort(&stream);
 
     let config = Arc::new(exec_ssh_client_config());
-    let mut client = russh::client::connect_stream(config, stream, SandboxSshClientHandler)
+    let remote_sshid = Arc::new(std::sync::Mutex::new(None));
+    let handler = SandboxSshClientHandler {
+        remote_sshid: remote_sshid.clone(),
+    };
+    let mut client = russh::client::connect_stream(config, stream, handler)
         .await
         .map_err(|e| Status::internal(format!("failed to establish ssh transport: {e}")))?;
 
@@ -2165,6 +2215,19 @@ async fn run_interactive_exec_with_russh(
             .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
             .await
             .map_err(|e| Status::internal(format!("failed to allocate PTY: {e}")))?;
+    }
+
+    if no_login_shell {
+        let banner = remote_sshid.lock().unwrap().clone().unwrap_or_default();
+        if !supervisor_supports_no_login_shell(&banner) {
+            return Err(Status::failed_precondition(
+                "sandbox supervisor is too old to honor --no-login-shell; recreate the sandbox on a current gateway",
+            ));
+        }
+        channel
+            .set_env(false, NO_LOGIN_SHELL_ENV.0, NO_LOGIN_SHELL_ENV.1)
+            .await
+            .map_err(|e| Status::internal(format!("failed to set login-shell env: {e}")))?;
     }
 
     channel
@@ -2278,8 +2341,10 @@ async fn start_single_use_ssh_proxy_over_relay(
     Ok((port, task))
 }
 
-#[derive(Debug, Clone, Copy)]
-struct SandboxSshClientHandler;
+#[derive(Debug, Clone)]
+struct SandboxSshClientHandler {
+    remote_sshid: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+}
 
 impl russh::client::Handler for SandboxSshClientHandler {
     type Error = russh::Error;
@@ -2290,6 +2355,16 @@ impl russh::client::Handler for SandboxSshClientHandler {
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }
+
+    async fn kex_done(
+        &mut self,
+        _shared_secret: Option<&[u8]>,
+        _names: &russh::Names,
+        session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        *self.remote_sshid.lock().unwrap() = Some(session.remote_sshid().to_vec());
+        Ok(())
+    }
 }
 
 async fn run_exec_with_russh(
@@ -2297,6 +2372,7 @@ async fn run_exec_with_russh(
     command: &str,
     stdin_payload: Vec<u8>,
     request_tty: bool,
+    no_shell_login: bool,
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
 ) -> Result<i32, Status> {
     // Defense-in-depth: validate command at the transport boundary.
@@ -2319,7 +2395,11 @@ async fn run_exec_with_russh(
     set_tcp_nodelay_best_effort(&stream);
 
     let config = Arc::new(exec_ssh_client_config());
-    let mut client = russh::client::connect_stream(config, stream, SandboxSshClientHandler)
+    let remote_sshid = Arc::new(std::sync::Mutex::new(None));
+    let handler = SandboxSshClientHandler {
+        remote_sshid: remote_sshid.clone(),
+    };
+    let mut client = russh::client::connect_stream(config, stream, handler)
         .await
         .map_err(|e| Status::internal(format!("failed to establish ssh transport: {e}")))?;
 
@@ -2346,6 +2426,19 @@ async fn run_exec_with_russh(
             .request_pty(false, "xterm-256color", 0, 0, 0, 0, &[])
             .await
             .map_err(|e| Status::internal(format!("failed to allocate PTY: {e}")))?;
+    }
+
+    if no_shell_login {
+        let banner = remote_sshid.lock().unwrap().clone().unwrap_or_default();
+        if !supervisor_supports_no_login_shell(&banner) {
+            return Err(Status::failed_precondition(
+                "sandbox supervisor is too old to honor --no-login-shell; recreate the sandbox on a current gateway",
+            ));
+        }
+        channel
+            .set_env(false, NO_LOGIN_SHELL_ENV.0, NO_LOGIN_SHELL_ENV.1)
+            .await
+            .map_err(|e| Status::internal(format!("failed to set login-shell env: {e}")))?;
     }
 
     channel
@@ -2457,6 +2550,30 @@ mod tests {
     }
 
     // ---- shell_escape ----
+
+    #[test]
+    fn watch_terminal_phases_include_command_results_and_errors() {
+        for phase in [
+            SandboxPhase::Ready,
+            SandboxPhase::Completed,
+            SandboxPhase::Stopped,
+            SandboxPhase::Error,
+        ] {
+            assert!(is_watch_terminal(phase), "{phase:?} should stop the watch");
+        }
+        for phase in [
+            SandboxPhase::Provisioning,
+            SandboxPhase::Starting,
+            SandboxPhase::Stopping,
+            SandboxPhase::Deleting,
+            SandboxPhase::Unknown,
+        ] {
+            assert!(
+                !is_watch_terminal(phase),
+                "{phase:?} should keep the watch open"
+            );
+        }
+    }
 
     #[test]
     fn telemetry_compute_driver_uses_resolved_driver_kind() {
@@ -3361,6 +3478,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                await_main_process_attachment: false,
             }),
         )
         .await
@@ -3384,6 +3502,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                await_main_process_attachment: false,
             }),
         )
         .await
@@ -3419,6 +3538,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                await_main_process_attachment: false,
             }),
         )
         .await
@@ -3443,6 +3563,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::from([(annotation_key.clone(), annotation_value.clone())]),
                 workspace: String::new(),
+                await_main_process_attachment: false,
             }),
         )
         .await
@@ -3503,6 +3624,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                await_main_process_attachment: false,
             }),
         )
         .await
@@ -3568,6 +3690,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                await_main_process_attachment: false,
             }),
         )
         .await
@@ -3598,6 +3721,7 @@ mod tests {
                 labels: HashMap::from([("team".to_string(), "x".repeat(512))]),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                await_main_process_attachment: false,
             }),
         )
         .await
@@ -3630,6 +3754,7 @@ mod tests {
                     labels: HashMap::new(),
                     annotations: HashMap::new(),
                     workspace: String::new(),
+                    await_main_process_attachment: false,
                 }),
             )
             .await
@@ -3924,6 +4049,40 @@ mod tests {
             .unwrap();
         assert!(session1.is_some());
         assert!(session2.is_some());
+    }
+
+    #[tokio::test]
+    async fn create_ssh_session_allows_terminal_sandbox_while_supervisor_is_reachable() {
+        let state = test_server_state().await;
+        let mut sandbox = test_sandbox("work", Vec::new());
+        sandbox.set_phase(SandboxPhase::Completed as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let (tx, _rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        let _ = state.supervisor_sessions.register(
+            "sandbox-work".to_string(),
+            "session-1".to_string(),
+            tx,
+            shutdown_tx,
+        );
+
+        let response = handle_create_ssh_session(
+            &state,
+            authed_request(CreateSshSessionRequest {
+                sandbox_id: "sandbox-work".to_string(),
+            }),
+        )
+        .await;
+
+        assert!(response.is_ok());
+
+        assert!(
+            state
+                .supervisor_sessions
+                .finalize_main_process_exit("sandbox-work")
+        );
+        assert!(!sandbox_relay_reachable(&state, &sandbox));
     }
 
     #[tokio::test]
@@ -4756,5 +4915,43 @@ mod tests {
             .expect("session should still exist after revocation");
         assert!(session.revoked);
         assert_eq!(session.object_workspace(), "default");
+    }
+
+    // ---- supervisor_supports_no_login_shell ----
+
+    /// A current supervisor identifies itself with the `OpenShell` banner, so the
+    /// gateway may forward the login-shell opt-out.
+    #[test]
+    fn no_login_shell_gate_accepts_openshell_banner() {
+        assert!(supervisor_supports_no_login_shell(
+            b"SSH-2.0-OpenShell_0.0.4-dev.3+g2bf9969"
+        ));
+        assert!(supervisor_supports_no_login_shell(
+            b"SSH-2.0-OpenShell_0.1.0"
+        ));
+    }
+
+    /// A supervisor predating this feature presents russh's default banner and
+    /// silently ignores the env request, so the gate must reject the opt-out.
+    #[test]
+    fn no_login_shell_gate_rejects_pre_feature_banner() {
+        assert!(!supervisor_supports_no_login_shell(b"SSH-2.0-Russh_0.62.5"));
+        assert!(!supervisor_supports_no_login_shell(b"SSH-2.0-OpenSSH_9.6"));
+    }
+
+    /// A missing banner (kex callback never populated the slot) must fail
+    /// closed rather than forwarding the opt-out to an unknown supervisor.
+    #[test]
+    fn no_login_shell_gate_rejects_empty_banner() {
+        assert!(!supervisor_supports_no_login_shell(b""));
+    }
+
+    /// The banner prefix must match at the start; an `OpenShell` token appearing
+    /// only in the comment tail does not signal support.
+    #[test]
+    fn no_login_shell_gate_requires_prefix_position() {
+        assert!(!supervisor_supports_no_login_shell(
+            b"SSH-2.0-Russh_0.62.5 OpenShell_0.1.0"
+        ));
     }
 }

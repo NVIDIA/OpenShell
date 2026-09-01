@@ -40,6 +40,8 @@ pub struct MainProcessConfig {
     pub version: u32,
     pub command: Vec<String>,
     pub tty: bool,
+    #[serde(default)]
+    pub await_main_process_attachment: bool,
 }
 
 impl MainProcessConfig {
@@ -51,6 +53,7 @@ impl MainProcessConfig {
             version: Self::VERSION,
             command: vec!["/bin/bash".to_string(), "-l".to_string()],
             tty: true,
+            await_main_process_attachment: false,
         }
     }
 
@@ -61,6 +64,7 @@ impl MainProcessConfig {
                 version: Self::VERSION,
                 command: spec.command.clone(),
                 tty: spec.tty,
+                await_main_process_attachment: spec.await_main_process_attachment,
             },
             None | Some(_) => Self::scratch(),
         }
@@ -233,12 +237,14 @@ mod tests {
         let spec = crate::proto::compute::v1::DriverSandboxSpec {
             command: vec!["/bin/sh".into(), "-c".into(), "printf '%s' 'a b'".into()],
             tty: false,
+            await_main_process_attachment: true,
             ..Default::default()
         };
         let encoded = MainProcessConfig::encode_driver_spec(Some(&spec)).unwrap();
         let decoded = MainProcessConfig::decode(&encoded).unwrap();
         assert_eq!(decoded.command, spec.command);
         assert!(!decoded.tty);
+        assert!(decoded.await_main_process_attachment);
     }
 
     #[test]

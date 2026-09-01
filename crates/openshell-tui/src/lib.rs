@@ -1407,6 +1407,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             workspace: workspace.clone(),
+            await_main_process_attachment: false,
         };
 
         let sandbox_name =
@@ -2705,6 +2706,7 @@ fn phase_label(phase: i32) -> String {
         x if x == SandboxPhase::Stopping as i32 => "Stopping",
         x if x == SandboxPhase::Stopped as i32 => "Stopped",
         x if x == SandboxPhase::Starting as i32 => "Starting",
+        x if x == SandboxPhase::Completed as i32 => "Completed",
         _ => "Unknown",
     }
     .to_string()
@@ -2766,6 +2768,7 @@ mod phase_label_tests {
         assert_eq!(phase_label(SandboxPhase::Stopping as i32), "Stopping");
         assert_eq!(phase_label(SandboxPhase::Stopped as i32), "Stopped");
         assert_eq!(phase_label(SandboxPhase::Starting as i32), "Starting");
+        assert_eq!(phase_label(SandboxPhase::Completed as i32), "Completed");
     }
 }
 

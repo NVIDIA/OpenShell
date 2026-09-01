@@ -2146,6 +2146,41 @@ def test_stop_and_start_forward_workspace_and_return_phase() -> None:
     assert starting.phase == openshell_pb2.SANDBOX_PHASE_STARTING
 
 
+@pytest.mark.parametrize(
+    ("phase", "should_succeed"),
+    [
+        (openshell_pb2.SANDBOX_PHASE_COMPLETED, True),
+        (openshell_pb2.SANDBOX_PHASE_ERROR, False),
+    ],
+)
+def test_wait_ready_handles_terminal_main_process_results(
+    phase: openshell_pb2.SandboxPhase, should_succeed: bool
+) -> None:
+    class TerminalStub(_FakeSandboxStub):
+        def GetSandbox(
+            self,
+            request: openshell_pb2.GetSandboxRequest,
+            timeout: float | None = None,
+        ) -> Any:
+            _ = timeout
+            return SimpleNamespace(
+                sandbox=_make_sandbox_proto(
+                    "sandbox-1",
+                    request.name,
+                    phase=phase,
+                    workspace=request.workspace,
+                )
+            )
+
+    client = _client_with_fake_stub(TerminalStub())
+    if should_succeed:
+        result = client.wait_ready("job-1", workspace="default", timeout_seconds=0.1)
+        assert result.phase == openshell_pb2.SANDBOX_PHASE_COMPLETED
+    else:
+        with pytest.raises(SandboxError, match="entered error phase"):
+            client.wait_ready("job-1", workspace="default", timeout_seconds=0.1)
+
+
 def test_create_without_args_sends_empty_metadata() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)

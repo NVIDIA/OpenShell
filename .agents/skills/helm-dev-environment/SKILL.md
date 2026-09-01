@@ -259,7 +259,9 @@ annotations to `spiffe://openshell.local/openshell/sandbox/<sandbox-id>`.
 OpenShell mounts the SPIFFE CSI Workload API socket at
 `/spiffe-workload-api/spire-agent.sock` into sandbox pods for provider token
 grants. Supervisor-to-gateway authentication remains on the Kubernetes
-ServiceAccount bootstrap and gateway-minted sandbox JWT path.
+ServiceAccount bootstrap and gateway-minted sandbox JWT path; the selected
+Kubernetes compute driver validates the projected token before the gateway
+mints its JWT.
 
 ---
 

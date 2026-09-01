@@ -392,7 +392,7 @@ kubectl -n openshell get pod -l app.kubernetes.io/name=helm-chart -o jsonpath="{
 ```
 
 Sandbox pods using provider token grants should have an
-`openshell.io/sandbox-id` annotation, an `openshell.ai/managed-by=openshell`
+`openshell.ai/sandbox-id` annotation, an `openshell.ai/managed-by=openshell`
 label, supervisor env vars `OPENSHELL_K8S_SA_TOKEN_FILE` and
 `OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET`, plus both the projected
 `openshell-sa-token` volume and the `spiffe-workload-api` CSI volume.
@@ -467,7 +467,10 @@ Then inspect sandbox resources in that namespace.
 Check the configured sandbox service account when TokenReview bootstrap or
 sandbox registration fails. Helm creates a dedicated sandbox service account by
 default and writes it to `[openshell.drivers.kubernetes].service_account_name`;
-the gateway rejects projected tokens from other service accounts.
+the selected Kubernetes compute driver rejects projected tokens from other
+service accounts. For an external driver, inspect its logs and confirm it
+advertises `supports_sandbox_authentication`; the gateway delegates the opaque
+credential over the driver socket and never interprets Kubernetes settings.
 
 ```bash
 helm -n openshell get values openshell | grep -A3 sandboxServiceAccount

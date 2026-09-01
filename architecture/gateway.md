@@ -16,8 +16,10 @@ workloads.
 - Coordinate supervisor relay sessions for connect, exec, file sync, and
   service forwarding.
 - Persist the canonical main-process instance ID and normalized exit code on
-  sandbox status. Any main process exit transitions the sandbox to `Error`,
-  including exit code zero.
+  sandbox status. Exit code zero transitions the sandbox to `Completed`;
+  nonzero results transition it to `Error/MainProcessFailed`. Infrastructure
+  failures also use `Error`, with a distinct reason and no fabricated command
+  result.
 
 The gateway does not enforce agent network policy at request time. That happens
 inside each sandbox, where the supervisor and proxy can observe local process
@@ -26,7 +28,15 @@ identity.
 The live supervisor session is the readiness authority for its main-process
 instance. The supervisor reports its normalized result through the
 sandbox-authenticated `ReportMainProcessExit` RPC, and the gateway rejects
-results from stale instance IDs.
+results from stale instance IDs. Foreground creation carries a one-shot
+attachment intent to the process supervisor. The supervisor durably reports the
+result immediately, accepts that declared SSH attachment even when the process
+has already exited, sends the retained output and exit status, and waits for the
+peer's channel close before finalizing the result for ephemeral cleanup.
+Detached commands carry no attachment intent, so they finalize and exit
+immediately without a grace period. Finalization is persisted separately from
+the exit result; the gateway deletes an ephemeral sandbox only after the
+finalized supervisor session disconnects.
 
 ## Protocol and Auth
 
@@ -225,11 +235,12 @@ identity inspection without client-side token decoding.
 Sandbox secrets are gateway-signed JWTs bound to a single sandbox ID. Docker,
 Podman, and VM drivers deliver the initial token through supervisor-only
 runtime material; Kubernetes supervisors exchange a projected ServiceAccount
-token through `IssueSandboxToken`. The gateway validates that projected token
-with Kubernetes `TokenReview`, requires the configured sandbox service account,
-checks the returned pod binding against the live pod UID, and verifies the pod's
-controlling `Sandbox` ownerReference against the live Sandbox CR UID and
-sandbox-id label before minting the gateway JWT. The bootstrap path accepts
+token through `IssueSandboxToken`. The gateway delegates that opaque credential
+to the selected compute driver's `AuthenticateSandbox` RPC. A capable driver is
+trusted to return the authenticated sandbox ID, while the gateway still requires
+a matching durable sandbox record before minting a JWT. The Kubernetes driver
+uses its own named configuration to run TokenReview and verify the live pod and
+controlling Sandbox CR. The bootstrap path accepts
 both `agents.x-k8s.io/v1beta1` ownerReferences from newer Agent Sandbox
 controllers and `agents.x-k8s.io/v1alpha1` ownerReferences from existing
 deployments. Supervisors renew gateway JWTs in memory before expiry only while

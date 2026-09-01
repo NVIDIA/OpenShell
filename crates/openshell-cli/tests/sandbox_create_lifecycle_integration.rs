@@ -51,8 +51,12 @@ struct SandboxState {
     deletion_get_requests: Arc<AtomicUsize>,
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
     vm_error_after_started: Arc<AtomicBool>,
+    vm_error_with_observed_exit: Arc<AtomicBool>,
     vm_slow_progress_before_ready: Arc<AtomicBool>,
     vm_log_churn_before_ready: Arc<AtomicBool>,
+    terminal_before_relay: Arc<AtomicBool>,
+    ssh_session_failures_remaining: Arc<AtomicUsize>,
+    ssh_session_requests: Arc<AtomicUsize>,
     global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
     gateway_config_requests: Arc<AtomicUsize>,
 }
@@ -68,6 +72,13 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
     ) -> Result<Response<openshell_core::proto::ReportMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn finalize_main_process_exit(
+        &self,
+        _request: tonic::Request<openshell_core::proto::FinalizeMainProcessExitRequest>,
+    ) -> Result<Response<openshell_core::proto::FinalizeMainProcessExitResponse>, Status> {
         Err(Status::unimplemented("not used by this test server"))
     }
 
@@ -269,6 +280,19 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<CreateSshSessionRequest>,
     ) -> Result<Response<CreateSshSessionResponse>, Status> {
+        self.state
+            .ssh_session_requests
+            .fetch_add(1, Ordering::SeqCst);
+        if self
+            .state
+            .ssh_session_failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(Status::failed_precondition("sandbox is not ready"));
+        }
         let sandbox_id = request.into_inner().sandbox_id;
         Ok(Response::new(CreateSshSessionResponse {
             sandbox_id,
@@ -442,11 +466,16 @@ impl OpenShell for TestOpenShell {
         let sandbox_id = request.into_inner().id;
         let (tx, rx) = mpsc::channel(4);
         let vm_error_after_started = self.state.vm_error_after_started.load(Ordering::SeqCst);
+        let vm_error_with_observed_exit = self
+            .state
+            .vm_error_with_observed_exit
+            .load(Ordering::SeqCst);
         let vm_slow_progress_before_ready = self
             .state
             .vm_slow_progress_before_ready
             .load(Ordering::SeqCst);
         let vm_log_churn_before_ready = self.state.vm_log_churn_before_ready.load(Ordering::SeqCst);
+        let terminal_before_relay = self.state.terminal_before_relay.load(Ordering::SeqCst);
 
         tokio::spawn(async move {
             let mut provisioning = Sandbox {
@@ -478,8 +507,17 @@ impl OpenShell for TestOpenShell {
                 ..provisioning.clone()
             };
             error.set_phase(SandboxPhase::Error as i32);
+            if vm_error_with_observed_exit {
+                error.status.as_mut().unwrap().exit_code = Some(137);
+            }
             let mut ready = provisioning.clone();
             ready.set_phase(SandboxPhase::Ready as i32);
+            let mut completed = provisioning.clone();
+            completed.status = Some(SandboxStatus {
+                exit_code: Some(0),
+                ..SandboxStatus::default()
+            });
+            completed.set_phase(SandboxPhase::Completed as i32);
 
             let _ = tx
                 .send(Ok(SandboxStreamEvent {
@@ -525,6 +563,14 @@ impl OpenShell for TestOpenShell {
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                    }))
+                    .await;
+                return;
+            }
+            if terminal_before_relay {
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Sandbox(completed)),
                     }))
                     .await;
                 return;
@@ -1506,6 +1552,35 @@ async fn sandbox_create_persists_exact_trailing_argv_as_main_process() {
         .expect("sandbox spec should be persisted at create time");
     assert_eq!(spec.command, command);
     assert!(!spec.tty);
+    assert!(requests[0].await_main_process_attachment);
+}
+
+#[tokio::test]
+async fn detached_command_does_not_declare_main_process_attachment() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("detached-main"),
+            command: &["echo".into(), "OK".into()],
+            detach: true,
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("detached sandbox create should succeed");
+
+    let requests = create_requests(&server).await;
+    assert!(!requests[0].await_main_process_attachment);
 }
 
 #[tokio::test]
@@ -1724,6 +1799,44 @@ async fn sandbox_create_returns_vm_error_without_waiting_for_timeout() {
 }
 
 #[tokio::test]
+async fn sandbox_create_preserves_vm_error_when_exit_code_is_observed() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .vm_error_after_started
+        .store(true, Ordering::SeqCst);
+    server
+        .openshell
+        .state
+        .vm_error_with_observed_exit
+        .store(true, Ordering::SeqCst);
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    let err = run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("vm-error-with-exit"),
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect_err("an observed process exit must not hide the infrastructure error");
+
+    let rendered = err.to_string();
+    assert!(rendered.contains("sandbox entered error phase while provisioning"));
+    assert!(rendered.contains("ProcessExited: VM process exited with status 0"));
+}
+
+#[tokio::test]
 async fn sandbox_create_keeps_waiting_while_vm_progress_arrives() {
     let server = run_server().await;
     server
@@ -1797,6 +1910,50 @@ async fn sandbox_create_times_out_when_only_logs_arrive() {
 }
 
 #[tokio::test]
+async fn sandbox_create_retries_terminal_attachment_until_relay_registers() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .terminal_before_relay
+        .store(true, Ordering::SeqCst);
+    server
+        .openshell
+        .state
+        .ssh_session_failures_remaining
+        .store(1, Ordering::SeqCst);
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    let exit_code = run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("fast-command"),
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("sandbox create should wait for the declared terminal attachment relay");
+
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .ssh_session_requests
+            .load(Ordering::SeqCst),
+        2
+    );
+}
+
+#[tokio::test]
 async fn sandbox_create_deletes_command_sessions_with_no_keep() {
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();
@@ -1824,10 +1981,49 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         deleted_names(&server).await,
         vec![vec!["ephemeral-command".to_string()]]
     );
+    let requests = create_requests(&server).await;
+    assert_eq!(
+        requests[0]
+            .annotations
+            .get("openshell.nvidia.com/retention")
+            .map(String::as_str),
+        Some("ephemeral")
+    );
     assert_eq!(
         load_last_sandbox("openshell", "default"),
         None,
         "no-keep sandboxes should not be persisted as last-used"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_returns_exact_main_status_after_no_keep_cleanup() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_executable_script(&fake_ssh_dir, "ssh", "#!/bin/sh\nexit 7\n");
+
+    let exit_code = run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("ephemeral-failure"),
+            keep: false,
+            command: &["sh".into(), "-c".into(), "exit 7".into()],
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("a main-process failure is a command result, not a cleanup error");
+
+    assert_eq!(exit_code, 7);
+    assert_eq!(
+        deleted_names(&server).await,
+        vec![vec!["ephemeral-failure".to_string()]]
     );
 }
 

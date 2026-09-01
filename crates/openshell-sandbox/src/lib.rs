@@ -103,6 +103,7 @@ pub async fn run_sandbox(
     workdir: Option<String>,
     timeout_secs: u64,
     interactive: bool,
+    await_main_process_attachment: bool,
     sandbox_id: Option<String>,
     sandbox: Option<String>,
     openshell_endpoint: Option<String>,
@@ -889,35 +890,54 @@ pub async fn run_sandbox(
             } else {
                 None
             };
-        let sidecar_exit_tx =
-            if process_uses_sidecar_control && let Some(writer) = process_control_writer.clone() {
-                let exit_ack = Arc::clone(&process_exit_ack);
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<
-                    openshell_supervisor_process::run::SidecarExitReport,
-                >(1);
-                tokio::spawn(async move {
-                    while let Some((instance_id, exit_code, ack)) = rx.recv().await {
-                        let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
-                        *exit_ack.lock().await = Some((instance_id.clone(), durable_tx));
-                        let result = match sidecar_control::send_main_process_exited(
-                            &writer,
+        let sidecar_exit_tx = if process_uses_sidecar_control
+            && let Some(writer) = process_control_writer.clone()
+        {
+            let exit_ack = Arc::clone(&process_exit_ack);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<
+                openshell_supervisor_process::run::SidecarExitReport,
+            >(1);
+            tokio::spawn(async move {
+                while let Some(report) = rx.recv().await {
+                    match report {
+                        openshell_supervisor_process::run::SidecarExitReport::Exited {
                             instance_id,
                             exit_code,
-                        )
-                        .await
-                        {
-                            Ok(()) => durable_rx.await.map_err(|_| {
-                                "sidecar durable exit acknowledgement closed".to_string()
-                            }),
-                            Err(error) => Err(error.to_string()),
-                        };
-                        let _ = ack.send(result);
+                            ack,
+                        } => {
+                            let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
+                            *exit_ack.lock().await = Some((instance_id.clone(), durable_tx));
+                            let result = match sidecar_control::send_main_process_exited(
+                                &writer,
+                                instance_id,
+                                exit_code,
+                            )
+                            .await
+                            {
+                                Ok(()) => durable_rx.await.map_err(|_| {
+                                    "sidecar durable exit acknowledgement closed".to_string()
+                                }),
+                                Err(error) => Err(error.to_string()),
+                            };
+                            let _ = ack.send(result);
+                        }
+                        openshell_supervisor_process::run::SidecarExitReport::Finalized {
+                            instance_id,
+                            ack,
+                        } => {
+                            let result =
+                                sidecar_control::send_main_process_finalized(&writer, instance_id)
+                                    .await
+                                    .map_err(|error| error.to_string());
+                            let _ = ack.send(result);
+                        }
                     }
-                });
-                Some(tx)
-            } else {
-                None
-            };
+                }
+            });
+            Some(tx)
+        } else {
+            None
+        };
 
         let process = openshell_supervisor_process::run::run_process(
             program,
@@ -925,6 +945,7 @@ pub async fn run_sandbox(
             workspace,
             timeout_secs,
             interactive,
+            await_main_process_attachment,
             sandbox_id.as_deref(),
             openshell_endpoint.as_deref(),
             ssh_socket_path,
@@ -1313,11 +1334,39 @@ fn spawn_sidecar_entrypoint_handler(
             control_publisher,
         } = handler;
         let mut session_started = false;
+        let mut session_task: Option<tokio::task::JoinHandle<()>> = None;
         let mut trusted_supervisor_pid = None;
         let terminating = Arc::new(AtomicBool::new(false));
         while let Some(started) = entrypoint_rx.recv().await {
-            if let Some(exit_code) = started.exit_code {
+            if started.finalized {
+                if let (Some(endpoint), Some(id)) =
+                    (openshell_endpoint.as_ref(), sandbox_id.as_ref())
+                {
+                    let mut delay = Duration::from_millis(250);
+                    loop {
+                        match openshell_supervisor_process::supervisor_session::finalize_main_process_exit(
+                            endpoint,
+                            id,
+                            &started.instance_id,
+                        )
+                        .await
+                        {
+                            Ok(()) => break,
+                            Err(error) => {
+                                warn!(%error, "sidecar main-process finalization failed; retrying");
+                                tokio::time::sleep(delay).await;
+                                delay = (delay * 2).min(Duration::from_secs(2));
+                            }
+                        }
+                    }
+                }
                 terminating.store(true, Ordering::Release);
+                if let Some(task) = session_task.take() {
+                    task.abort();
+                }
+                break;
+            }
+            if let Some(exit_code) = started.exit_code {
                 if let (Some(endpoint), Some(id)) =
                     (openshell_endpoint.as_ref(), sandbox_id.as_ref())
                 {
@@ -1343,7 +1392,7 @@ fn spawn_sidecar_entrypoint_handler(
                         publisher.publish_main_process_exit_ack(started.instance_id.clone());
                     }
                 }
-                break;
+                continue;
             }
             entrypoint_pid.store(started.pid, Ordering::Release);
             if started.start_session {
@@ -1386,7 +1435,7 @@ fn spawn_sidecar_entrypoint_handler(
                     );
                     continue;
                 };
-                openshell_supervisor_process::supervisor_session::spawn(
+                session_task = Some(openshell_supervisor_process::supervisor_session::spawn(
                     endpoint.clone(),
                     id.clone(),
                     trusted_ssh_socket_path.clone(),
@@ -1394,7 +1443,7 @@ fn spawn_sidecar_entrypoint_handler(
                     Some(supervisor_pid),
                     Arc::clone(&terminating),
                     started.instance_id.clone(),
-                );
+                ));
                 session_started = true;
                 info!("sidecar supervisor session task spawned");
             }

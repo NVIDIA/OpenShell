@@ -25,8 +25,9 @@ use openshell_core::proto::{
     DetachSandboxProviderRequest, DetachSandboxProviderResponse, EditDraftChunkRequest,
     EditDraftChunkResponse, ExchangeProviderSubjectTokenRequest,
     ExchangeProviderSubjectTokenResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
-    ExposeServiceRequest, GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse,
-    GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
+    ExposeServiceRequest, FinalizeMainProcessExitRequest, FinalizeMainProcessExitResponse,
+    GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse, GetDraftHistoryRequest,
+    GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetGatewayInfoRequest,
     GetGatewayInfoResponse, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
     GetProviderRefreshStatusResponse, GetProviderRequest, GetSandboxConfigRequest,
@@ -693,6 +694,13 @@ impl OpenShell for OpenShellService {
         request: Request<ReportMainProcessExitRequest>,
     ) -> Result<Response<ReportMainProcessExitResponse>, Status> {
         crate::supervisor_session::handle_report_main_process_exit(&self.state, request).await
+    }
+
+    async fn finalize_main_process_exit(
+        &self,
+        request: Request<FinalizeMainProcessExitRequest>,
+    ) -> Result<Response<FinalizeMainProcessExitResponse>, Status> {
+        crate::supervisor_session::handle_finalize_main_process_exit(&self.state, request).await
     }
 
     type RelayStreamStream =

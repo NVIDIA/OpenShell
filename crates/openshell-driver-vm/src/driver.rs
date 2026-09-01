@@ -524,6 +524,7 @@ impl VmDriver {
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,
+            supports_sandbox_authentication: false,
         }
     }
 
@@ -3325,6 +3326,16 @@ impl VmDriver {
 
 #[tonic::async_trait]
 impl ComputeDriver for VmDriver {
+    async fn authenticate_sandbox(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>, Status>
+    {
+        Err(Status::unimplemented(
+            "VM driver does not authenticate sandbox credentials",
+        ))
+    }
+
     async fn get_capabilities(
         &self,
         _request: Request<GetCapabilitiesRequest>,

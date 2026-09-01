@@ -107,6 +107,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not used by this test server"))
     }
 
+    async fn finalize_main_process_exit(
+        &self,
+        _request: tonic::Request<proto::FinalizeMainProcessExitRequest>,
+    ) -> Result<Response<proto::FinalizeMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn get_current_user(
         &self,
         _request: tonic::Request<proto::GetCurrentUserRequest>,
@@ -906,6 +913,41 @@ async fn wait_ready_transitions_through_phases() {
         .unwrap();
     assert_eq!(sandbox.phase, SandboxPhase::Ready);
     assert!(state.get_calls.load(Ordering::SeqCst) >= 3);
+}
+
+#[tokio::test]
+async fn wait_ready_accepts_successful_completion() {
+    let state = Arc::new(MockState {
+        phase_sequence: vec![
+            proto::SandboxPhase::Provisioning,
+            proto::SandboxPhase::Completed,
+        ],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state).await;
+    let client = connect(&endpoint).await;
+
+    let sandbox = client
+        .wait_ready("short-job", std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(sandbox.phase, SandboxPhase::Completed);
+}
+
+#[tokio::test]
+async fn wait_ready_surfaces_stopped_phase_without_timing_out() {
+    let state = Arc::new(MockState {
+        phase_sequence: vec![proto::SandboxPhase::Stopped],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state).await;
+    let client = connect(&endpoint).await;
+
+    let err = client
+        .wait_ready("failed-job", std::time::Duration::from_secs(5))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "connect");
 }
 
 #[tokio::test]

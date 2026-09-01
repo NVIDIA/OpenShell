@@ -4,13 +4,8 @@
 name: CodeQL
 
 on:
-  pull_request:
-  merge_group:
-    types: [checks_requested]
-  push:
-    branches: [main]
   schedule:
-    - cron: "29 5 * * 6"
+    - cron: "29 5 * * *"
   workflow_dispatch:
 
 permissions:
@@ -26,6 +21,9 @@ jobs:
     name: CodeQL (${{ matrix.language }})
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      # Keep Rust test fixtures out of production-focused security results.
+      CODEQL_EXTRACTOR_RUST_OPTION_CARGO_CFG_OVERRIDES: "-test"
     strategy:
       fail-fast: false
       matrix:

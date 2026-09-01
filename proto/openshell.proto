@@ -472,6 +472,14 @@ service OpenShell {
     };
   }
 
+  // Confirm that foreground terminal delivery completed naturally.
+  rpc FinalizeMainProcessExit(FinalizeMainProcessExitRequest)
+      returns (FinalizeMainProcessExitResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
   // Raw byte relay between supervisor and gateway.
   //
   // The supervisor initiates this call after receiving a RelayOpen message
@@ -908,7 +916,8 @@ message SandboxStatus {
   // The gateway uses this to reject stale exit reports after a restart.
   string main_process_instance_id = 8;
   // Normalized main process result. Signal exits use 128 + signal number.
-  // Presence indicates that the main process exited and the sandbox is in Error.
+  // Presence indicates that the canonical main process exited. Exit code 0
+  // produces Completed; nonzero and signal-normalized exits produce Error.
   optional int32 exit_code = 9;
 }
 
@@ -940,6 +949,8 @@ enum SandboxPhase {
   SANDBOX_PHASE_STOPPING = 6;
   SANDBOX_PHASE_STOPPED = 7;
   SANDBOX_PHASE_STARTING = 8;
+  // The canonical main process exited successfully and its result is final.
+  SANDBOX_PHASE_COMPLETED = 9;
 }
 
 // Public platform event exposed on the sandbox watch stream.
@@ -969,6 +980,10 @@ message CreateSandboxRequest {
   map<string, string> annotations = 4;
   // Workspace for the sandbox. Empty defaults to "default".
   string workspace = 5;
+  // One-shot launch hint indicating that the creating client will attach to
+  // the canonical main process. The supervisor keeps the terminal transport
+  // alive until that attachment connects and closes naturally.
+  bool await_main_process_attachment = 6;
 }
 
 // Get sandbox request.
@@ -1251,6 +1266,13 @@ message ExecSandboxRequest {
 
   // Initial terminal rows (used when tty=true, 0 = use default).
   uint32 rows = 9;
+
+  // Skip sourcing shell login/profile startup files before running the command.
+  // When false (the default), the command runs through a login shell
+  // (`bash -lc`) so user startup files (.bash_profile/.profile, and .bashrc if
+  // sourced by them) are applied. When true, the command runs without those
+  // files (`bash -c`), for automation that needs predictable startup behavior.
+  bool no_login_shell = 10;
 }
 
 // One stdout chunk from a sandbox exec.
@@ -1359,7 +1381,8 @@ message WatchSandboxRequest {
   // Replay the last N platform events (best-effort) before following.
   uint32 event_tail = 6;
 
-  // Stop streaming once the sandbox reaches a terminal phase (READY or ERROR).
+  // Stop streaming once the sandbox reaches READY or a terminal result phase
+  // (COMPLETED, STOPPED, or ERROR).
   bool stop_on_terminal = 7;
 
   // Only include log lines with timestamp >= this value (milliseconds since epoch).
@@ -2243,6 +2266,15 @@ message ReportMainProcessExitRequest {
 }
 
 message ReportMainProcessExitResponse {}
+
+// Terminal-delivery completion reported after all expected foreground SSH
+// attachments close. A successful response permits ephemeral cleanup.
+message FinalizeMainProcessExitRequest {
+  string sandbox_id = 1;
+  string instance_id = 2;
+}
+
+message FinalizeMainProcessExitResponse {}
 
 // Gateway requests the supervisor to open a relay channel.
 //

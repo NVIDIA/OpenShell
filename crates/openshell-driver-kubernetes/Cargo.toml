@@ -45,6 +45,7 @@ bytes = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 temp-env = "0.3"
+tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }
 tower = { workspace = true }
 

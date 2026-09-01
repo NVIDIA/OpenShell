@@ -14,8 +14,8 @@
 //!
 //! Live authenticators slotting into the chain:
 //! - [`super::sandbox_jwt::SandboxJwtAuthenticator`] — gateway-minted JWTs
-//! - [`super::k8s_sa::K8sServiceAccountAuthenticator`] — K8s projected SA
-//!   tokens (path-scoped to `IssueSandboxToken`)
+//! - [`super::compute_driver::ComputeDriverAuthenticator`] — driver-native
+//!   sandbox bootstrap credentials (path-scoped to `IssueSandboxToken`)
 //! - [`super::oidc::OidcAuthenticator`] — user OIDC Bearer tokens
 use super::principal::Principal;
 use async_trait::async_trait;

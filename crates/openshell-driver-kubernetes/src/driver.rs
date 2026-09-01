@@ -8,9 +8,12 @@ use crate::config::{
     DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID,
     DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, OperatorNamespaceAllowlist,
     SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode, is_dns_1123_label,
-    managed_namespace, validate_managed_namespace_name,
+    managed_namespace, managed_namespace_prefix, validate_managed_namespace_name,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
+use k8s_openapi::api::authentication::v1::{
+    TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo,
+};
 use k8s_openapi::api::core::v1::{
     Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod, Secret,
     ServiceAccount, Volume, VolumeMount,
@@ -19,13 +22,14 @@ use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
     NetworkPolicySpec,
 };
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{
     Api, ApiResource, DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions,
 };
 use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
+use kube::runtime::WatchStreamExt;
 use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
 use openshell_core::driver_mounts;
@@ -118,6 +122,9 @@ pub const SANDBOX_KIND: &str = "Sandbox";
 const SANDBOX_POD_NAME_ANNOTATION: &str = "agents.x-k8s.io/pod-name";
 const SANDBOX_SUSPENDED_CONDITION: &str = "Suspended";
 const SANDBOX_SUSPENDED_POD_NOT_OWNED_REASON: &str = "PodNotOwned";
+const SANDBOX_TOKEN_AUDIENCE: &str = "openshell-gateway";
+const POD_NAME_EXTRA: &str = "authentication.kubernetes.io/pod-name";
+const POD_UID_EXTRA: &str = "authentication.kubernetes.io/pod-uid";
 
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const SPIFFE_WORKLOAD_API_VOLUME_NAME: &str = "spiffe-workload-api";
@@ -567,7 +574,69 @@ impl KubernetesComputeDriver {
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: false,
+            supports_sandbox_authentication: true,
         })
+    }
+
+    /// Authenticate the projected `ServiceAccount` token used by a sandbox pod.
+    pub async fn authenticate_sandbox(&self, credential: &str) -> Result<String, tonic::Status> {
+        let reviews: Api<TokenReview> = Api::all(self.client.clone());
+        let review = TokenReview {
+            metadata: ObjectMeta::default(),
+            spec: TokenReviewSpec {
+                audiences: Some(vec![SANDBOX_TOKEN_AUDIENCE.to_string()]),
+                token: Some(credential.to_string()),
+            },
+            status: None,
+        };
+        let review = reviews
+            .create(&PostParams::default(), &review)
+            .await
+            .map_err(|error| {
+                warn!(%error, "Kubernetes TokenReview failed");
+                tonic::Status::internal("Kubernetes TokenReview failed")
+            })?;
+        let status = review
+            .status
+            .ok_or_else(|| tonic::Status::internal("TokenReview response missing status"))?;
+        let identity = token_review_identity(&status, &self.config.service_account_name)?
+            .ok_or_else(|| tonic::Status::unauthenticated("sandbox credential was not accepted"))?;
+        if !self.accepts_auth_namespace(&identity.namespace) {
+            return Err(tonic::Status::permission_denied(
+                "sandbox credential namespace is not accepted by the driver",
+            ));
+        }
+
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &identity.namespace);
+        let pod = pods
+            .get_opt(&identity.pod_name)
+            .await
+            .map_err(|error| {
+                warn!(pod = %identity.pod_name, %error, "failed to read authenticated sandbox pod");
+                tonic::Status::internal("failed to read authenticated sandbox pod")
+            })?
+            .ok_or_else(|| {
+                tonic::Status::permission_denied("authenticated sandbox pod not found")
+            })?;
+        validate_pod_uid(&pod, &identity.pod_uid)?;
+        let sandbox_id = pod_sandbox_id(&pod)?;
+        let owner = sandbox_owner_reference(&pod)?;
+        let sandboxes = self
+            .supported_agent_sandbox_api(self.client.clone(), &identity.namespace)
+            .await
+            .map_err(|error| {
+                tonic::Status::internal(format!("failed to select Sandbox API: {error}"))
+            })?;
+        let sandbox = sandboxes.api.get_opt(&owner.name).await.map_err(|error| {
+            warn!(sandbox = %owner.name, %error, "failed to read authenticated Sandbox resource");
+            tonic::Status::internal("failed to read authenticated Sandbox resource")
+        })?.ok_or_else(|| tonic::Status::permission_denied("sandbox owner not found"))?;
+        validate_sandbox_owner_identity(owner, &sandbox_id, &sandbox)?;
+        Ok(sandbox_id)
+    }
+
+    fn accepts_auth_namespace(&self, namespace: &str) -> bool {
+        accepts_auth_namespace(&self.config, self.operator_allowlist.as_ref(), namespace)
     }
 
     pub fn operator_allowlist(&self) -> Option<&OperatorNamespaceAllowlist> {
@@ -1554,8 +1623,7 @@ impl KubernetesComputeDriver {
         let (agent_sandbox_api, kube_name, pod_name, namespace, stop_timeout) = self
             .patch_sandbox_operating_state(sandbox_id, false)
             .await?;
-        let legacy_pod_api = (agent_sandbox_api.resource.version == SANDBOX_VERSION_V1ALPHA1)
-            .then(|| Api::<Pod>::namespaced(self.client.clone(), &namespace));
+        let pod_api = Api::<Pod>::namespaced(self.client.clone(), &namespace);
 
         let deadline = tokio::time::Instant::now() + stop_timeout;
         let mut poll_interval = STOP_INITIAL_POLL_INTERVAL;
@@ -1580,17 +1648,18 @@ impl KubernetesComputeDriver {
                 ))
             })?
             .map_err(KubernetesDriverError::from_kube)?;
-            if kubernetes_sandbox_has_stopped_condition(&object) {
-                return Ok(());
-            }
             if let Some(error) = kubernetes_sandbox_stop_failure(&object) {
                 return Err(KubernetesDriverError::Message(error));
             }
-            if let Some(pod_api) = legacy_pod_api.as_ref()
-                && kubernetes_sandbox_pod_is_gone(pod_api, &pod_name, deadline)
-                    .await
-                    .map_err(KubernetesDriverError::Message)?
-            {
+            let pod_is_gone = kubernetes_sandbox_pod_is_gone(&pod_api, &pod_name, deadline)
+                .await
+                .map_err(KubernetesDriverError::Message)?;
+            let stop_is_complete = kubernetes_sandbox_stop_is_complete(
+                &agent_sandbox_api.resource.version,
+                &object,
+                pod_is_gone,
+            );
+            if stop_is_complete {
                 return Ok(());
             }
             let now = tokio::time::Instant::now();
@@ -1861,8 +1930,16 @@ impl KubernetesComputeDriver {
             .await?;
         let event_api: Api<KubeEventObj> = Api::namespaced(self.watch_client.clone(), &namespace);
         let watcher_config = watcher::Config::default().labels(&openshell_sandbox_label_selector());
-        let mut sandbox_stream = watcher::watcher(agent_sandbox_api.api, watcher_config).boxed();
-        let mut event_stream = watcher::watcher(event_api, watcher::Config::default()).boxed();
+        let mut sandbox_stream = recovering_watcher_stream(
+            watcher::watcher(agent_sandbox_api.api, watcher_config),
+            "sandbox-resource",
+        )
+        .boxed();
+        let mut event_stream = recovering_watcher_stream(
+            watcher::watcher(event_api, watcher::Config::default()),
+            "kubernetes-event",
+        )
+        .boxed();
         let (tx, rx) = mpsc::channel(256);
 
         tokio::spawn(async move {
@@ -1871,8 +1948,8 @@ impl KubernetesComputeDriver {
 
             loop {
                 tokio::select! {
-                    result = sandbox_stream.try_next() => match result {
-                        Ok(Some(Event::Applied(obj))) => {
+                    event = sandbox_stream.next() => match event {
+                        Some(Event::Applied(obj)) => {
                             if let Ok((kube_name, sandbox)) = sandbox_from_object(&namespace, obj) {
                                 update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
                                 let event = WatchSandboxesEvent {
@@ -1885,7 +1962,7 @@ impl KubernetesComputeDriver {
                                 }
                             }
                         }
-                        Ok(Some(Event::Deleted(obj))) => {
+                        Some(Event::Deleted(obj)) => {
                             if is_openshell_managed(&obj)
                                 && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
                             {
@@ -1900,7 +1977,7 @@ impl KubernetesComputeDriver {
                                 }
                             }
                         }
-                        Ok(Some(Event::Restarted(objs))) => {
+                        Some(Event::Restarted(objs)) => {
                             for obj in objs {
                                 if let Ok((kube_name, sandbox)) = sandbox_from_object(&namespace, obj) {
                                     update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
@@ -1915,19 +1992,15 @@ impl KubernetesComputeDriver {
                                 }
                             }
                         }
-                        Ok(None) => {
+                        None => {
                             let _ = tx.send(Err(KubernetesDriverError::Message(
                                 "sandbox watcher stream ended unexpectedly".to_string()
                             ))).await;
                             break;
                         }
-                        Err(err) => {
-                            let _ = tx.send(Err(KubernetesDriverError::Message(err.to_string()))).await;
-                            break;
-                        }
                     },
-                    result = event_stream.try_next() => match result {
-                        Ok(Some(Event::Applied(obj))) => {
+                    event = event_stream.next() => match event {
+                        Some(Event::Applied(obj)) => {
                             if let Some((sandbox_id, event)) = map_kube_event_to_platform(
                                 &sandbox_name_to_id,
                                 &agent_pod_to_id,
@@ -1943,18 +2016,14 @@ impl KubernetesComputeDriver {
                                 }
                             }
                         }
-                        Ok(Some(Event::Deleted(_))) => {}
-                        Ok(Some(Event::Restarted(_))) => {
+                        Some(Event::Deleted(_)) => {}
+                        Some(Event::Restarted(_)) => {
                             debug!(namespace = %namespace, "Kubernetes event watcher restarted");
                         }
-                        Ok(None) => {
+                        None => {
                             let _ = tx.send(Err(KubernetesDriverError::Message(
                                 "kubernetes event watcher stream ended".to_string()
                             ))).await;
-                            break;
-                        }
-                        Err(err) => {
-                            let _ = tx.send(Err(KubernetesDriverError::Message(err.to_string()))).await;
                             break;
                         }
                     },
@@ -1974,15 +2043,59 @@ impl KubernetesComputeDriver {
             Self::cluster_wide_sandbox_api(self.watch_client.clone(), sandbox_api_version);
         let selector = self.openshell_sandbox_selector();
         let watcher_config = watcher::Config::default().labels(&selector);
-        let mut sandbox_stream = watcher::watcher(cluster_api.api, watcher_config).boxed();
-        let (tx, rx) = mpsc::channel(256);
-        let default_namespace = self.config.namespace.clone();
+        let sandbox_stream = recovering_watcher_stream(
+            watcher::watcher(cluster_api.api, watcher_config),
+            "sandbox-resource",
+        )
+        .boxed();
 
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    result = sandbox_stream.try_next() => match result {
-                        Ok(Some(Event::Applied(obj))) => {
+        Ok(cluster_wide_watch_stream(
+            sandbox_stream,
+            self.config.namespace.clone(),
+        ))
+    }
+}
+
+fn cluster_wide_watch_stream<S>(mut sandbox_stream: S, default_namespace: String) -> WatchStream
+where
+    S: Stream<Item = Event<DynamicObject>> + Send + Unpin + 'static,
+{
+    let (tx, rx) = mpsc::channel(256);
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                event = sandbox_stream.next() => match event {
+                    Some(Event::Applied(obj)) => {
+                        let ns = obj.metadata.namespace.clone()
+                            .unwrap_or_else(|| default_namespace.clone());
+                        if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj) {
+                            let event = WatchSandboxesEvent {
+                                payload: Some(watch_sandboxes_event::Payload::Sandbox(
+                                    WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
+                                )),
+                            };
+                            if tx.send(Ok(event)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Some(Event::Deleted(obj)) => {
+                        if is_openshell_managed(&obj)
+                            && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
+                        {
+                            let event = WatchSandboxesEvent {
+                                payload: Some(watch_sandboxes_event::Payload::Deleted(
+                                    WatchSandboxesDeletedEvent { sandbox_id }
+                                )),
+                            };
+                            if tx.send(Ok(event)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Some(Event::Restarted(objs)) => {
+                        for obj in objs {
                             let ns = obj.metadata.namespace.clone()
                                 .unwrap_or_else(|| default_namespace.clone());
                             if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj) {
@@ -1992,58 +2105,61 @@ impl KubernetesComputeDriver {
                                     )),
                                 };
                                 if tx.send(Ok(event)).await.is_err() {
-                                    break;
+                                    return;
                                 }
                             }
                         }
-                        Ok(Some(Event::Deleted(obj))) => {
-                            if is_openshell_managed(&obj)
-                                && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
-                            {
-                                let event = WatchSandboxesEvent {
-                                    payload: Some(watch_sandboxes_event::Payload::Deleted(
-                                        WatchSandboxesDeletedEvent { sandbox_id }
-                                    )),
-                                };
-                                if tx.send(Ok(event)).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                        Ok(Some(Event::Restarted(objs))) => {
-                            for obj in objs {
-                                let ns = obj.metadata.namespace.clone()
-                                    .unwrap_or_else(|| default_namespace.clone());
-                                if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj) {
-                                    let event = WatchSandboxesEvent {
-                                        payload: Some(watch_sandboxes_event::Payload::Sandbox(
-                                            WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
-                                        )),
-                                    };
-                                    if tx.send(Ok(event)).await.is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            let _ = tx.send(Err(KubernetesDriverError::Message(
-                                "sandbox watcher stream ended unexpectedly".to_string()
-                            ))).await;
-                            break;
-                        }
-                        Err(err) => {
-                            let _ = tx.send(Err(KubernetesDriverError::Message(err.to_string()))).await;
-                            break;
-                        }
-                    },
-                    () = tx.closed() => break,
-                }
+                    }
+                    None => {
+                        let _ = tx.send(Err(KubernetesDriverError::Message(
+                            "sandbox watcher stream ended unexpectedly".to_string()
+                        ))).await;
+                        break;
+                    }
+                },
+                () = tx.closed() => break,
             }
-        });
+        }
+    });
 
-        Ok(Box::pin(ReceiverStream::new(rx)))
-    }
+    Box::pin(ReceiverStream::new(rx))
+}
+
+fn recovering_watcher_stream<S, T, E>(
+    stream: S,
+    watcher: &'static str,
+) -> impl Stream<Item = Event<T>>
+where
+    S: Stream<Item = Result<Event<T>, E>>,
+    E: std::fmt::Display,
+{
+    continue_on_watcher_errors(stream.default_backoff(), watcher)
+}
+
+/// Drop kube-runtime watcher errors after logging them so continued polling can
+/// drive its built-in relist and recovery state machine. The production adapter
+/// above applies backoff first to avoid hot-looping on persistent API failures.
+fn continue_on_watcher_errors<S, T, E>(
+    stream: S,
+    watcher: &'static str,
+) -> impl Stream<Item = Event<T>>
+where
+    S: Stream<Item = Result<Event<T>, E>>,
+    E: std::fmt::Display,
+{
+    stream.filter_map(move |result| {
+        futures::future::ready(match result {
+            Ok(event) => Some(event),
+            Err(err) => {
+                warn!(
+                    watcher,
+                    error = %err,
+                    "Kubernetes watcher stream error; waiting for kube-runtime recovery"
+                );
+                None
+            }
+        })
+    })
 }
 
 fn add_trace_context_annotation(annotations: &mut BTreeMap<String, String>) {
@@ -2230,6 +2346,161 @@ fn sandbox_id_from_object(obj: &DynamicObject) -> Result<String, String> {
         return Ok(id.clone());
     }
     Err("sandbox id not found on object".to_string())
+}
+
+#[derive(Debug)]
+struct TokenReviewIdentity {
+    namespace: String,
+    pod_name: String,
+    pod_uid: String,
+}
+
+#[allow(clippy::result_large_err)]
+fn token_review_identity(
+    status: &TokenReviewStatus,
+    expected_service_account: &str,
+) -> Result<Option<TokenReviewIdentity>, tonic::Status> {
+    if status.authenticated != Some(true) {
+        return Ok(None);
+    }
+    if !status
+        .audiences
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|audience| audience == SANDBOX_TOKEN_AUDIENCE)
+    {
+        return Err(tonic::Status::unauthenticated(
+            "sandbox credential audience not accepted",
+        ));
+    }
+    let user = status
+        .user
+        .as_ref()
+        .ok_or_else(|| tonic::Status::permission_denied("TokenReview response missing user"))?;
+    let rest = user
+        .username
+        .as_deref()
+        .unwrap_or_default()
+        .strip_prefix("system:serviceaccount:")
+        .ok_or_else(|| tonic::Status::permission_denied("credential is not a service account"))?;
+    let (namespace, service_account) = rest
+        .split_once(':')
+        .filter(|(namespace, service_account)| !namespace.is_empty() && !service_account.is_empty())
+        .ok_or_else(|| tonic::Status::permission_denied("invalid service account identity"))?;
+    if service_account != expected_service_account {
+        return Err(tonic::Status::permission_denied(
+            "credential is not from the configured sandbox service account",
+        ));
+    }
+    Ok(Some(TokenReviewIdentity {
+        namespace: namespace.to_string(),
+        pod_name: user_extra_one(user, POD_NAME_EXTRA)?,
+        pod_uid: user_extra_one(user, POD_UID_EXTRA)?,
+    }))
+}
+
+#[allow(clippy::result_large_err)]
+fn user_extra_one(user: &UserInfo, key: &str) -> Result<String, tonic::Status> {
+    let values = user
+        .extra
+        .as_ref()
+        .and_then(|extra| extra.get(key))
+        .ok_or_else(|| tonic::Status::permission_denied("sandbox credential is not pod-bound"))?;
+    if values.len() != 1 || values[0].is_empty() {
+        return Err(tonic::Status::permission_denied(
+            "sandbox credential has invalid pod binding",
+        ));
+    }
+    Ok(values[0].clone())
+}
+
+#[allow(clippy::result_large_err)]
+fn pod_sandbox_id(pod: &Pod) -> Result<String, tonic::Status> {
+    pod.metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(LABEL_SANDBOX_ID))
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| tonic::Status::permission_denied("pod is not bound to a sandbox identity"))
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_pod_uid(pod: &Pod, expected_uid: &str) -> Result<(), tonic::Status> {
+    if pod.metadata.uid.as_deref() == Some(expected_uid) {
+        return Ok(());
+    }
+    Err(tonic::Status::permission_denied(
+        "sandbox credential pod UID mismatch",
+    ))
+}
+
+#[allow(clippy::result_large_err)]
+fn sandbox_owner_reference(pod: &Pod) -> Result<&OwnerReference, tonic::Status> {
+    let mut owners = pod
+        .metadata
+        .owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|owner| {
+            owner.kind == SANDBOX_KIND
+                && matches!(
+                    owner.api_version.as_str(),
+                    "agents.x-k8s.io/v1beta1" | "agents.x-k8s.io/v1alpha1"
+                )
+        });
+    let owner = owners
+        .next()
+        .ok_or_else(|| tonic::Status::permission_denied("pod is not controlled by a Sandbox"))?;
+    if owners.next().is_some()
+        || owner.controller != Some(true)
+        || owner.name.is_empty()
+        || owner.uid.is_empty()
+    {
+        return Err(tonic::Status::permission_denied(
+            "pod has an invalid Sandbox owner",
+        ));
+    }
+    Ok(owner)
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_sandbox_owner_identity(
+    owner: &OwnerReference,
+    sandbox_id: &str,
+    sandbox: &DynamicObject,
+) -> Result<(), tonic::Status> {
+    let uid_matches = sandbox.metadata.uid.as_deref() == Some(owner.uid.as_str());
+    let sandbox_id_matches = sandbox
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
+        .is_some_and(|actual| actual == sandbox_id);
+    if uid_matches && sandbox_id_matches {
+        return Ok(());
+    }
+    Err(tonic::Status::permission_denied(
+        "pod identity does not match its Sandbox owner",
+    ))
+}
+
+fn accepts_auth_namespace(
+    config: &KubernetesComputeConfig,
+    operator_allowlist: Option<&OperatorNamespaceAllowlist>,
+    namespace: &str,
+) -> bool {
+    match config.workspace_mode {
+        WorkspaceMode::Shared => namespace == config.namespace,
+        WorkspaceMode::Managed => {
+            namespace.starts_with(&managed_namespace_prefix(&config.gateway_id))
+        }
+        WorkspaceMode::Operator => {
+            operator_allowlist.is_some_and(|allowlist| allowlist.contains(namespace))
+        }
+    }
 }
 
 fn annotation_or_label(obj: &DynamicObject, key: &str) -> Option<String> {
@@ -3558,7 +3829,7 @@ fn sandbox_template_to_k8s_with_validated_config(
         .unwrap_or_default();
     if !params.sandbox_id.is_empty() {
         pod_annotations.insert(
-            "openshell.io/sandbox-id".to_string(),
+            LABEL_SANDBOX_ID.to_string(),
             serde_json::Value::String(params.sandbox_id.to_string()),
         );
     }
@@ -4289,6 +4560,19 @@ fn kubernetes_sandbox_has_stopped_condition(obj: &DynamicObject) -> bool {
         })
 }
 
+fn kubernetes_sandbox_stop_is_complete(
+    api_version: &str,
+    obj: &DynamicObject,
+    pod_is_gone: bool,
+) -> bool {
+    if api_version == SANDBOX_VERSION_V1ALPHA1 {
+        // v1alpha1 omits a usable stopped condition.
+        pod_is_gone
+    } else {
+        kubernetes_sandbox_has_stopped_condition(obj) && pod_is_gone
+    }
+}
+
 fn kubernetes_sandbox_stop_failure(obj: &DynamicObject) -> Option<String> {
     obj.data
         .get("status")?
@@ -4644,6 +4928,7 @@ mod tests {
     };
     use openshell_core::proto::compute::v1::{GpuResourceRequirements, ResourceRequirements};
     use prost_types::{Struct, Value, value::Kind};
+    use std::collections::BTreeSet;
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
@@ -4744,6 +5029,293 @@ mod tests {
         })
     }
 
+    fn expired_watch_error() -> watcher::Error {
+        watcher::Error::WatchError(kube::core::ErrorResponse {
+            status: "Failure".to_string(),
+            message: "too old resource version".to_string(),
+            reason: "Expired".to_string(),
+            code: 410,
+        })
+    }
+
+    #[tokio::test]
+    async fn sandbox_watcher_error_does_not_hide_restarted_recovery_event() {
+        let recovered = DynamicObject {
+            types: None,
+            metadata: ObjectMeta {
+                name: Some("recovered-sandbox".to_string()),
+                ..Default::default()
+            },
+            data: serde_json::json!({}),
+        };
+        let source = futures::stream::iter([
+            Err(expired_watch_error()),
+            Ok(Event::Restarted(vec![recovered])),
+        ]);
+        let mut stream = continue_on_watcher_errors(source, "sandbox-resource");
+
+        let event = stream
+            .next()
+            .await
+            .expect("410 Expired must not terminate the watcher stream");
+        let Event::Restarted(objects) = event else {
+            panic!("expected kube-runtime recovery to emit Restarted");
+        };
+        assert_eq!(objects.len(), 1);
+        assert_eq!(
+            objects[0].metadata.name.as_deref(),
+            Some("recovered-sandbox")
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "source closure must be preserved"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outward_watch_stream_survives_expired_error_and_backoff_recovery() {
+        let recovered = DynamicObject {
+            types: None,
+            metadata: ObjectMeta {
+                name: Some("recovered-sandbox".to_string()),
+                namespace: Some("recovered-namespace".to_string()),
+                labels: Some(BTreeMap::from([
+                    (LABEL_SANDBOX_ID.to_string(), "sandbox-id".to_string()),
+                    (LABEL_SANDBOX_NAME.to_string(), "sandbox-name".to_string()),
+                    (LABEL_SANDBOX_WORKSPACE.to_string(), "workspace".to_string()),
+                    (
+                        LABEL_MANAGED_BY.to_string(),
+                        LABEL_MANAGED_BY_VALUE.to_string(),
+                    ),
+                ])),
+                ..Default::default()
+            },
+            data: serde_json::json!({}),
+        };
+        let source = futures::stream::iter([
+            Err(expired_watch_error()),
+            Ok(Event::Restarted(vec![recovered])),
+        ])
+        .chain(futures::stream::pending());
+        let sandbox_stream = recovering_watcher_stream(source, "sandbox-resource").boxed();
+        let mut outward = cluster_wide_watch_stream(sandbox_stream, "default".to_string());
+
+        let event = outward
+            .next()
+            .await
+            .expect("outward stream must stay open through recovery")
+            .expect("recoverable watcher error must not reach the outward stream");
+        let Some(watch_sandboxes_event::Payload::Sandbox(event)) = event.payload else {
+            panic!("expected recovered sandbox event");
+        };
+        let sandbox = event.sandbox.expect("sandbox payload must be populated");
+        assert_eq!(sandbox.id, "sandbox-id");
+        assert_eq!(sandbox.namespace, "recovered-namespace");
+
+        let next = outward.next();
+        futures::pin_mut!(next);
+        assert!(
+            futures::poll!(next).is_pending(),
+            "outward stream must remain open after the recovered event"
+        );
+    }
+
+    #[tokio::test]
+    async fn kubernetes_event_watcher_error_does_not_hide_restarted_recovery_event() {
+        let source = futures::stream::iter([
+            Err(expired_watch_error()),
+            Ok(Event::Restarted(vec![KubeEventObj::default()])),
+        ]);
+        let mut stream = continue_on_watcher_errors(source, "kubernetes-event");
+
+        let event = stream
+            .next()
+            .await
+            .expect("410 Expired must not terminate the watcher stream");
+        let Event::Restarted(events) = event else {
+            panic!("expected kube-runtime recovery to emit Restarted");
+        };
+        assert_eq!(events.len(), 1);
+        assert!(
+            stream.next().await.is_none(),
+            "source closure must be preserved"
+        );
+    }
+
+    fn authenticated_token_review(username: &str) -> TokenReviewStatus {
+        TokenReviewStatus {
+            authenticated: Some(true),
+            audiences: Some(vec![SANDBOX_TOKEN_AUDIENCE.to_string()]),
+            user: Some(UserInfo {
+                username: Some(username.to_string()),
+                extra: Some(BTreeMap::from([
+                    (POD_NAME_EXTRA.to_string(), vec!["sandbox-pod".to_string()]),
+                    (POD_UID_EXTRA.to_string(), vec!["pod-uid".to_string()]),
+                ])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn token_review_uses_configured_service_account_and_pod_binding() {
+        let status = authenticated_token_review("system:serviceaccount:workspaces:sandbox-sa");
+        let identity = token_review_identity(&status, "sandbox-sa")
+            .unwrap()
+            .expect("authenticated identity");
+        assert_eq!(identity.namespace, "workspaces");
+        assert_eq!(identity.pod_name, "sandbox-pod");
+        assert_eq!(identity.pod_uid, "pod-uid");
+    }
+
+    #[test]
+    fn token_review_rejects_a_different_service_account() {
+        let status = authenticated_token_review("system:serviceaccount:workspaces:other");
+        let error = token_review_identity(&status, "sandbox-sa").unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn token_review_rejects_wrong_audience_and_missing_pod_binding() {
+        let mut wrong_audience =
+            authenticated_token_review("system:serviceaccount:workspaces:sandbox-sa");
+        wrong_audience.audiences = Some(vec!["kubernetes.default.svc".to_string()]);
+        let error = token_review_identity(&wrong_audience, "sandbox-sa").unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+
+        let mut missing_binding =
+            authenticated_token_review("system:serviceaccount:workspaces:sandbox-sa");
+        missing_binding.user.as_mut().unwrap().extra = None;
+        let error = token_review_identity(&missing_binding, "sandbox-sa").unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn token_review_returns_none_when_not_authenticated() {
+        let status = TokenReviewStatus {
+            authenticated: Some(false),
+            error: Some("token rejected".to_string()),
+            ..Default::default()
+        };
+
+        assert!(
+            token_review_identity(&status, "sandbox-sa")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn authentication_namespace_validation_covers_each_workspace_mode() {
+        let mut config = KubernetesComputeConfig {
+            namespace: "openshell".to_string(),
+            ..Default::default()
+        };
+        assert!(accepts_auth_namespace(&config, None, "openshell"));
+        assert!(!accepts_auth_namespace(&config, None, "other"));
+
+        config.workspace_mode = WorkspaceMode::Managed;
+        config.gateway_id = "gateway-a".to_string();
+        assert!(accepts_auth_namespace(
+            &config,
+            None,
+            "openshell-gateway-a-workspace-a"
+        ));
+        assert!(!accepts_auth_namespace(
+            &config,
+            None,
+            "openshell-gateway-b-workspace-a"
+        ));
+
+        config.workspace_mode = WorkspaceMode::Operator;
+        let allowlist = OperatorNamespaceAllowlist::from_set(BTreeSet::from([
+            "team-a".to_string(),
+            "team-b".to_string(),
+        ]));
+        assert!(accepts_auth_namespace(&config, Some(&allowlist), "team-a"));
+        assert!(!accepts_auth_namespace(&config, Some(&allowlist), "team-c"));
+        assert!(!accepts_auth_namespace(&config, None, "team-a"));
+    }
+
+    fn sandbox_owner_for_test(name: &str, uid: &str) -> OwnerReference {
+        OwnerReference {
+            api_version: "agents.x-k8s.io/v1beta1".to_string(),
+            block_owner_deletion: None,
+            controller: Some(true),
+            kind: SANDBOX_KIND.to_string(),
+            name: name.to_string(),
+            uid: uid.to_string(),
+        }
+    }
+
+    fn sandbox_object_for_test(uid: &str, sandbox_id: &str) -> DynamicObject {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox-a", &resource);
+        sandbox.metadata.uid = Some(uid.to_string());
+        sandbox.metadata.labels = Some(BTreeMap::from([(
+            LABEL_SANDBOX_ID.to_string(),
+            sandbox_id.to_string(),
+        )]));
+        sandbox
+    }
+
+    #[test]
+    fn pod_identity_requires_matching_uid_annotation_and_controlling_owner() {
+        let owner = sandbox_owner_for_test("sandbox-a", "sandbox-uid-a");
+        let pod = Pod {
+            metadata: ObjectMeta {
+                uid: Some("pod-uid-a".to_string()),
+                annotations: Some(BTreeMap::from([(
+                    LABEL_SANDBOX_ID.to_string(),
+                    "sandbox-id-a".to_string(),
+                )])),
+                owner_references: Some(vec![owner.clone()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        validate_pod_uid(&pod, "pod-uid-a").expect("matching pod UID");
+        assert_eq!(pod_sandbox_id(&pod).unwrap(), "sandbox-id-a");
+        assert_eq!(sandbox_owner_reference(&pod).unwrap(), &owner);
+
+        let error = validate_pod_uid(&pod, "other-pod-uid").unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+        let mut missing_annotation = pod.clone();
+        missing_annotation.metadata.annotations = None;
+        let error = pod_sandbox_id(&missing_annotation).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+        let mut non_controlling = pod;
+        non_controlling.metadata.owner_references.as_mut().unwrap()[0].controller = Some(false);
+        let error = sandbox_owner_reference(&non_controlling).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn sandbox_owner_identity_requires_matching_uid_and_sandbox_id() {
+        let owner = sandbox_owner_for_test("sandbox-a", "sandbox-uid-a");
+        let sandbox = sandbox_object_for_test("sandbox-uid-a", "sandbox-id-a");
+        validate_sandbox_owner_identity(&owner, "sandbox-id-a", &sandbox)
+            .expect("matching owner identity");
+
+        let mismatched_owner = sandbox_object_for_test("sandbox-uid-b", "sandbox-id-a");
+        let error =
+            validate_sandbox_owner_identity(&owner, "sandbox-id-a", &mismatched_owner).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+        let mismatched_annotation = sandbox_object_for_test("sandbox-uid-a", "sandbox-id-b");
+        let error = validate_sandbox_owner_identity(&owner, "sandbox-id-a", &mismatched_annotation)
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
     #[test]
     fn sandbox_api_version_probe_retries_on_structured_and_raw_404() {
         let structured = kube_api_error(404, "could not find the requested resource");
@@ -4831,6 +5403,43 @@ mod tests {
             }
         });
         assert!(kubernetes_sandbox_has_stopped_condition(&sandbox));
+    }
+
+    #[test]
+    fn beta_stop_requires_suspended_condition_and_deleted_pod() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox", &resource);
+
+        assert!(!kubernetes_sandbox_stop_is_complete(
+            SANDBOX_VERSION_V1BETA1,
+            &sandbox,
+            true,
+        ));
+
+        sandbox.data = serde_json::json!({
+            "status": {
+                "conditions": [{"type": "Suspended", "status": "True"}]
+            }
+        });
+        assert!(!kubernetes_sandbox_stop_is_complete(
+            SANDBOX_VERSION_V1BETA1,
+            &sandbox,
+            false,
+        ));
+        assert!(kubernetes_sandbox_stop_is_complete(
+            SANDBOX_VERSION_V1BETA1,
+            &sandbox,
+            true,
+        ));
+        assert!(kubernetes_sandbox_stop_is_complete(
+            SANDBOX_VERSION_V1ALPHA1,
+            &DynamicObject::new("sandbox", &resource),
+            true,
+        ));
     }
 
     #[test]
@@ -7118,6 +7727,24 @@ mod tests {
             serde_json::json!(false),
             "explicit service account selection must not re-enable default token automounting"
         );
+    }
+
+    #[test]
+    fn sandbox_template_annotation_is_accepted_by_bootstrap_authentication() {
+        let params = SandboxPodParams {
+            sandbox_id: "sandbox-a",
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+        let pod: Pod = serde_json::from_value(pod_template).expect("valid pod template");
+
+        assert_eq!(pod_sandbox_id(&pod).unwrap(), "sandbox-a");
     }
 
     #[test]

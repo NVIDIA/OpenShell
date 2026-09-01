@@ -29,7 +29,9 @@ The gateway forwards one exact, persisted main-process specification to every
 driver. Drivers serialize that specification in
 `OPENSHELL_MAIN_PROCESS_SPEC`; they do not install an idle `sleep` workload or
 reconstruct argv with shell parsing. Runtime restart policies are disabled so
-an exited canonical process remains a terminal sandbox error.
+an exited canonical process remains a terminal sandbox result. Exit code zero
+produces `Completed`; a nonzero or signal-normalized exit produces `Error`
+with the exact exit code. Driver and supervisor failures remain `Error`.
 
 ## Configure a Compute Driver
 
@@ -373,7 +375,7 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 |---|---|---|
 | `compute_drivers = ["kubernetes"]` | Not applicable | Select the Kubernetes compute driver. |
 | `[openshell.drivers.kubernetes].namespace` | `server.sandboxNamespace` | Set the namespace for sandbox resources. The Helm chart defaults to the release namespace when left empty. |
-| `service_account_name` | `sandboxServiceAccount.name` | Set the Kubernetes service account assigned to sandbox pods and accepted by the gateway TokenReview bootstrap path. The Helm chart creates a dedicated sandbox service account by default. |
+| `service_account_name` | `sandboxServiceAccount.name` | Set the Kubernetes service account assigned to sandbox pods and accepted by the Kubernetes driver's TokenReview bootstrap path. The Helm chart creates a dedicated sandbox service account by default. |
 | `default_image` | `server.sandboxImage` | Set the default sandbox image. |
 | `image_pull_policy` | `server.sandboxImagePullPolicy` | Set the Kubernetes image pull policy for sandbox pods. |
 | `image_pull_secrets` | `server.sandboxImagePullSecrets` | Attach Kubernetes image-pull Secrets to sandbox pods. Managed mode copies these explicitly named Secrets from the configured source namespace into each workspace namespace. In shared and operator modes, the Secrets must already exist in the sandbox namespace. |
@@ -434,7 +436,9 @@ The Kubernetes driver creates namespaced `agents.x-k8s.io` `Sandbox` resources f
 Stop patches the existing resource rather than deleting it. For `v1beta1`,
 the driver sets `spec.operatingMode` to `Suspended` or `Running`. For
 `v1alpha1`, it sets `spec.replicas` to `0` or `1`. The Sandbox resource and its
-workspace PVC keep their identity across both operations.
+workspace PVC keep their identity across both operations. Stop returns only
+after the controller reports suspension and deletes the old pod, so an
+immediate start cannot race the prior pod's termination.
 
 If Agent Sandbox is upgraded in place, restart the OpenShell gateway after the controller and CRD rollout completes so the gateway can detect the served API versions again.
 

@@ -115,7 +115,7 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
         kind: SettingValueKind::Bool,
         allowed_string_values: None,
     },
-    // When true the sandbox writes OCSF v1.7.0 JSONL records to
+    // When true the sandbox writes OCSF v1.8.0 JSONL records to
     // `/var/log/openshell-ocsf*.log` (daily rotation, 3 files) in addition
     // to the human-readable shorthand log. Defaults to false (no JSONL written).
     RegisteredSetting {

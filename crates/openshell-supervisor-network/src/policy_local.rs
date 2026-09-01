@@ -1440,6 +1440,7 @@ mod tests {
         assert_eq!(rule.endpoints[0].port, 443);
         assert_eq!(rule.endpoints[0].ports, vec![443]);
         assert_eq!(rule.endpoints[0].protocol, "rest");
+        assert!(rule.endpoints[0].advisor_proposed);
         #[allow(deprecated)]
         {
             assert!(rule.binaries[0].harness);

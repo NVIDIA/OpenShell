@@ -131,6 +131,25 @@ OpenShell has two proposal paths:
 | Mechanistic mapper | Aggregated denial summaries from the sandbox. | Groups by host, port, and binary. If L7 request samples are available, it can draft REST method and path rules. Otherwise it drafts an L4 endpoint. |
 | Agent-authored proposal | The in-sandbox agent, using `policy.local`. | Usually a REST `addRule` with exact host, port, binary, method, and path from the structured denial. It can also propose L4 rules for opaque protocols. |
 
+### How proposal provenance works
+
+OpenShell tracks whether an endpoint and binary came from policy advisor. This is internal provenance; it is not a policy YAML field that authors set. Think of each marker as answering “who introduced this identity?” rather than “what traffic does this allow?”
+
+| Marker | `false` | `true` | When both declarations meet |
+|---|---|---|---|
+| Endpoint provenance | A user or provider explicitly declared the endpoint. | Policy advisor proposed the endpoint. | The values do not conflict by themselves. The explicit declaration wins if the endpoints merge. |
+| Binary provenance | A user or provider explicitly declared the binary path. | Policy advisor proposed the binary path. | The explicit declaration wins if the same path merges. |
+
+For example, a GitHub provider can explicitly declare `api.github.com:443` for read operations. An agent can then propose `PUT /repos/NVIDIA/OpenShell/contents/docs/**` for the same endpoint. The provider endpoint has provenance `false`; the proposal endpoint has provenance `true`. OpenShell allows that overlap, keeps the provider rule immutable, and stores an approved write rule in the sandbox policy layer.
+
+Provenance does not hide a real endpoint conflict. The same two declarations still fail validation if they disagree on connection or request-processing behavior that must have one value, such as TLS mode, `allowed_ips`, an equally specific L7 protocol or parser contract, credential binding, or enforcement mode. Authorization fields such as compatible allow and deny rules can combine.
+
+Exact-host SSRF trust requires an exact endpoint and the matching binary identity to be explicit in the same rule. An advisor-only endpoint or binary does not create that stronger trust. For example:
+
+- A provider rule that explicitly declares both `/usr/bin/gh` and `api.github.com:443` already establishes exact-host trust for that pair. A later advisor proposal does not create or broaden that trust.
+- If the provider declares `api.github.com:443` for `/usr/bin/gh`, but the advisor proposes the endpoint for `/usr/bin/curl`, `curl` does not inherit the provider's binary identity. Its proposed rule remains subject to the normal SSRF checks.
+- If an advisor proposes `internal-api.example:443` and it resolves to a private address, approval alone is not enough. A developer must explicitly authorize the intended address range with `allowed_ips`.
+
 For REST APIs, prefer L7 rules over broad L4 access. A good proposal allows one method and the smallest safe path:
 
 ```json
@@ -172,7 +191,7 @@ For REST APIs, prefer L7 rules over broad L4 access. A good proposal allows one 
 
 The current `policy.local` JSON shape covers L4 endpoints and REST method or path rules. Use [Customize Sandbox Policies](/sandboxes/policies) or [Policy Schema Reference](/reference/policy-schema) for policy fields that are not part of the agent-authored proposal surface, such as WebSocket credential rewrite, GraphQL operation matching, endpoint path scoping, and provider-owned policy bundles.
 
-Policy advisor proposals do not add `allowed_ips` automatically. If an advisor-proposed hostname resolves to an internal or private address, OpenShell's SSRF protections still block the connection until a developer explicitly adds the required `allowed_ips` entry. Exact hostname trust for user-declared policy endpoints does not apply to advisor-generated proposal binaries.
+Policy advisor proposals do not add `allowed_ips` automatically. If an advisor-proposed hostname resolves to an internal or private address, OpenShell's SSRF protections still block the connection until a developer explicitly adds the required `allowed_ips` entry.
 
 Private RFC 1918, CGNAT, IPv6 ULA, and other special-use destinations classified as internal produce advisory security notes when they appear as literal endpoint IPs or in `allowed_ips`. CIDR intersections are included, and hostless `allowed_ips` rules receive an additional warning because they can match any hostname resolving into the configured range.
 

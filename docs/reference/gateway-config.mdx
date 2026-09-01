@@ -258,6 +258,8 @@ gateway under the worktree-specific k3d cluster name; select it with
 `openshell gateway select <name>`. The local Podman, Docker, and VM gateway
 tasks export to the forwarded receiver automatically.
 
+In-process compute drivers read their backend-specific settings from `[openshell.drivers.<name>]`. An external driver's gateway table supplies only its `socket_path`; configure the external driver process itself through that binary's flags or environment variables. A driver that advertises `supports_sandbox_authentication` may authenticate an opaque bootstrap credential through the compute-driver protocol. The gateway trusts the returned sandbox ID only for `IssueSandboxToken`, verifies that the sandbox still exists, and then mints its own JWT. The in-process Kubernetes driver reads `service_account_name`, `workspace_mode`, and namespace discovery from `[openshell.drivers.kubernetes]`; an external Kubernetes driver receives the equivalent values through its own CLI or environment contract.
+
 ### Tuning
 
 This table decides whether and where to export. How the SDK exports is controlled by the standard OpenTelemetry environment variables, which the gateway reads through the SDK rather than mirroring as TOML keys:

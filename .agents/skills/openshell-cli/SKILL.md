@@ -74,6 +74,12 @@ This creates a sandbox whose canonical main process is `/bin/bash -l` and
 attaches your terminal to that retained process. Add `--detach` to return after
 the sandbox becomes ready without attaching.
 
+An explicit trailing command is foreground even when stdin or stdout is not a
+terminal. The CLI streams its stdout and stderr and returns its exact exit
+status. Exit code 0 leaves a retained sandbox in `Completed`; nonzero leaves it
+in `Error` with `MainProcessFailed`. Use `--no-keep` to delete either result
+after output drains, or `--detach` for a long-running service.
+
 When supplying `--name`, use a portable DNS-1123 label: at most 63 lowercase alphanumeric or `-` characters, beginning and ending with an alphanumeric character. The Kubernetes driver rejects uppercase letters, underscores, dots, and other names that cannot become Kubernetes resource labels.
 
 **Shortcut for known tools**: When the trailing command is a recognized tool, the CLI auto-creates the required provider from local credentials:
@@ -248,10 +254,15 @@ Key flags:
 - `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default
 - `--upload <PATH>[:<DEST>]`: Upload local files into the container working directory or an explicit destination
 - `--no-git-ignore`: Disable `.gitignore` filtering for uploads
-- `--no-keep`: Delete the sandbox after the initial command or shell exits
+- `--no-keep`: Delete the sandbox after main output and the exit result drain
 - `--detach`: Start the canonical main process without attaching
 - `--forward [BIND_ADDRESS:]PORT`: Forward a local port and keep the sandbox alive
 - `--editor vscode|cursor`: Open a remote editor after creation and keep the sandbox alive
+
+`--detach` adds no attachment grace period. When the canonical process exits,
+its terminal phase is reported immediately. A foreground create declares one
+expected main-process SSH attachment; cleanup finalizes after that connection
+closes naturally.
 
 Do not combine `--upload` with a trailing main command. Uploads currently finish
 after the canonical process starts; create a scratch sandbox and use
@@ -371,7 +382,10 @@ openshell sandbox start [name]
 Both commands default to the last-used sandbox. Stop stops background
 forwards and waits for `Stopped`; start waits for `Ready`. Connect, exec,
 file transfer, forwarding, and exposed services are unavailable while
-stopped. Delete remains the operation that removes retained state.
+stopped or completed. Starting a retained `Completed` or
+`Error/MainProcessFailed` sandbox launches a fresh canonical-main instance and
+invalidates SSH sessions from the previous runtime generation. Delete remains
+the operation that removes retained state.
 
 ---
 

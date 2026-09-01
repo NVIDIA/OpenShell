@@ -58,6 +58,9 @@ struct LiveSession {
     /// the old session's `tx` just before supersede could still enqueue a
     /// `RelayOpen` onto the stale stream and sit until the relay timeout.
     shutdown: oneshot::Sender<()>,
+    /// Set after the supervisor confirms that every expected foreground
+    /// attachment has closed and terminal output delivery is complete.
+    terminal_delivery_finalized: bool,
     #[allow(dead_code)]
     connected_at: Instant,
 }
@@ -125,6 +128,7 @@ impl SupervisorSessionRegistry {
                 session_id,
                 tx,
                 shutdown,
+                terminal_delivery_finalized: false,
                 connected_at: Instant::now(),
             },
         );
@@ -163,15 +167,17 @@ impl SupervisorSessionRegistry {
     /// This guards against the supersede race: an old session's task may
     /// finish long after a new session has taken its place. The old task's
     /// cleanup must not evict the new registration.
-    fn remove_if_current(&self, sandbox_id: &str, session_id: &str) -> bool {
+    fn remove_if_current(&self, sandbox_id: &str, session_id: &str) -> Option<bool> {
         let mut sessions = self.sessions.lock().unwrap();
         let is_current = sessions
             .get(sandbox_id)
             .is_some_and(|s| s.session_id == session_id);
         if is_current {
-            sessions.remove(sandbox_id);
+            return sessions
+                .remove(sandbox_id)
+                .map(|session| session.terminal_delivery_finalized);
         }
-        is_current
+        None
     }
 
     /// Look up the sender for a supervisor session, waiting up to `timeout`
@@ -208,6 +214,23 @@ impl SupervisorSessionRegistry {
 
     pub fn has_session(&self, sandbox_id: &str) -> bool {
         self.sessions.lock().unwrap().contains_key(sandbox_id)
+    }
+
+    pub fn terminal_delivery_finalized(&self, sandbox_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .is_some_and(|session| session.terminal_delivery_finalized)
+    }
+
+    pub fn finalize_main_process_exit(&self, sandbox_id: &str) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(session) = sessions.get_mut(sandbox_id) else {
+            return false;
+        };
+        session.terminal_delivery_finalized = true;
+        true
     }
 
     pub fn is_current_session(&self, sandbox_id: &str, session_id: &str) -> bool {
@@ -797,17 +820,17 @@ pub async fn handle_connect_supervisor(
             shutdown_rx,
         )
         .await;
-        let still_ours = state_clone
+        let terminal_finalized = state_clone
             .supervisor_sessions
             .remove_if_current(&sandbox_id_clone, &session_id);
-        if still_ours {
+        if let Some(terminal_finalized) = terminal_finalized {
             info!(sandbox_id = %sandbox_id_clone, session_id = %session_id, "supervisor session: ended");
             state_clone
                 .telemetry
                 .sandbox_session_disconnected(&sandbox_id_clone);
             if let Err(err) = state_clone
                 .compute
-                .supervisor_session_disconnected(&sandbox_id_clone)
+                .supervisor_session_disconnected(&sandbox_id_clone, terminal_finalized)
                 .await
             {
                 warn!(
@@ -848,10 +871,43 @@ pub async fn handle_report_main_process_exit(
     }
     state
         .compute
-        .main_process_exited(&report.sandbox_id, &report.instance_id, report.exit_code)
+        .report_main_process_exit(&report.sandbox_id, &report.instance_id, report.exit_code)
         .await
         .map_err(Status::failed_precondition)?;
     Ok(Response::new(ReportMainProcessExitResponse {}))
+}
+
+pub async fn handle_finalize_main_process_exit(
+    state: &Arc<ServerState>,
+    request: Request<openshell_core::proto::FinalizeMainProcessExitRequest>,
+) -> Result<Response<openshell_core::proto::FinalizeMainProcessExitResponse>, Status> {
+    let principal = request.extensions().get::<Principal>().cloned();
+    let report = request.into_inner();
+    if report.sandbox_id.is_empty() {
+        return Err(Status::invalid_argument("sandbox_id is required"));
+    }
+    if report.instance_id.is_empty() {
+        return Err(Status::invalid_argument("instance_id is required"));
+    }
+    if let Some(principal) = principal.as_ref() {
+        crate::auth::guard::ensure_sandbox_principal_scope(principal, &report.sandbox_id)?;
+    }
+    state
+        .compute
+        .finalize_main_process_exit(&report.sandbox_id, &report.instance_id)
+        .await
+        .map_err(Status::failed_precondition)?;
+    if !state
+        .supervisor_sessions
+        .finalize_main_process_exit(&report.sandbox_id)
+    {
+        return Err(Status::failed_precondition(
+            "supervisor session is not connected",
+        ));
+    }
+    Ok(Response::new(
+        openshell_core::proto::FinalizeMainProcessExitResponse {},
+    ))
 }
 
 async fn run_session_loop(
@@ -1108,7 +1164,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         registry.register("sbx".to_string(), "s1".to_string(), tx, make_shutdown());
 
-        assert!(registry.remove_if_current("sbx", "s1"));
+        assert_eq!(registry.remove_if_current("sbx", "s1"), Some(false));
         assert!(!registry.sessions.lock().unwrap().contains_key("sbx"));
     }
 
@@ -1134,7 +1190,7 @@ mod tests {
 
         // Cleanup from the old session task runs late. It must NOT evict the
         // newly registered session.
-        assert!(!registry.remove_if_current("sbx", "s-old"));
+        assert_eq!(registry.remove_if_current("sbx", "s-old"), None);
         let sessions = registry.sessions.lock().unwrap();
         assert!(
             sessions.contains_key("sbx"),
@@ -1146,7 +1202,18 @@ mod tests {
     #[test]
     fn remove_if_current_unknown_sandbox_is_noop() {
         let registry = SupervisorSessionRegistry::new();
-        assert!(!registry.remove_if_current("sbx-does-not-exist", "s1"));
+        assert_eq!(registry.remove_if_current("sbx-does-not-exist", "s1"), None);
+    }
+
+    #[test]
+    fn remove_if_current_returns_terminal_finalization_state() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, _rx) = mpsc::channel(1);
+        registry.register("sbx".to_string(), "s1".to_string(), tx, make_shutdown());
+
+        assert!(registry.finalize_main_process_exit("sbx"));
+        assert!(registry.terminal_delivery_finalized("sbx"));
+        assert_eq!(registry.remove_if_current("sbx", "s1"), Some(true));
     }
 
     // ---- open_relay: happy path and wait semantics ----

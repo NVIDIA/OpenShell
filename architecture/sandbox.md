@@ -405,7 +405,14 @@ sandbox workload directly. The relay supports:
 - Attachment to the canonical main process through the `openshell-main` SSH
   subsystem. The supervisor owns its retained PTY or pipes, a 1 MiB replay
   buffer, and a single stdin lease across client disconnects.
-- Independent shell and command execution sessions.
+- Independent interactive shell sessions.
+- Command execution. Commands run through a login shell (`bash -lc`) by default,
+  so the first of the user's `.bash_profile`, `.bash_login`, or `.profile` is
+  sourced (and `.bashrc` only if that file sources it). Callers set
+  `ExecSandboxRequest.no_login_shell` to skip those files; the gateway signals
+  this to the supervisor over the SSH `OPENSHELL_NO_LOGIN_SHELL` env request,
+  which selects `bash -c` instead of `bash -lc`. Note `bash -c` still reads
+  `BASH_ENV` when the child environment sets it.
 - Tar-based file sync.
 - Port forwarding where supported by the CLI/TUI surface.
 
@@ -481,7 +488,15 @@ engine with a gateway policy revision.
   re-evaluate.
 - If the supervisor relay drops, the sandbox can keep running, but connect and
   exec operations fail until the supervisor registers again.
-- If the canonical main process exits, including with code 0, the supervisor
-  reports its normalized exit code before shutdown. The gateway persists the
-  code on sandbox status, records `MainProcessExited`, and makes the sandbox
-  terminal `Error`; runtime restart policies must not replace the process.
+- If the canonical main process exits, the supervisor durably reports the
+  normalized result immediately. A foreground create declares a one-shot main
+  attachment, so the supervisor accepts it even after a fast process exits,
+  sends the retained output and SSH exit status, waits for the peer's channel
+  close, and then finalizes ephemeral cleanup. With no declared or active
+  attachment, it finalizes and exits without a grace period. The gateway waits
+  for that finalized supervisor session to disconnect before deleting an
+  ephemeral sandbox. Exit code 0 records
+  `Completed/MainProcessCompleted`; nonzero and signal-normalized exits record
+  `Error/MainProcessFailed`. Infrastructure failures also use `Error`, with a
+  distinct condition reason and no fabricated canonical-process result. Runtime
+  restart policies must not replace the canonical process.

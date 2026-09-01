@@ -452,6 +452,7 @@ class SandboxSession:
         env: Mapping[str, str] | None = None,
         stdin: bytes | None = None,
         timeout_seconds: int | None = None,
+        no_login_shell: bool = False,
     ) -> ExecResult:
         return self._client.exec(
             self.sandbox.id,
@@ -461,6 +462,7 @@ class SandboxSession:
             env=env,
             stdin=stdin,
             timeout_seconds=timeout_seconds,
+            no_login_shell=no_login_shell,
         )
 
     def exec_python(
@@ -887,6 +889,18 @@ class SandboxClient:
             sandbox = self.get(sandbox_name, workspace=workspace)
             if sandbox.status.phase == target_phase:
                 return sandbox
+            if (
+                target_phase == openshell_pb2.SANDBOX_PHASE_READY
+                and sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_COMPLETED
+            ):
+                return sandbox
+            if (
+                target_phase == openshell_pb2.SANDBOX_PHASE_READY
+                and sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_STOPPED
+            ):
+                raise SandboxError(
+                    f"sandbox {sandbox_name} stopped before becoming ready"
+                )
             if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_ERROR:
                 raise SandboxError(f"sandbox {sandbox_name} entered error phase")
             time.sleep(1)
@@ -903,6 +917,7 @@ class SandboxClient:
         env: Mapping[str, str] | None = None,
         stdin: bytes | None = None,
         timeout_seconds: int | None = None,
+        no_login_shell: bool = False,
     ) -> Iterator[ExecChunk | ExecResult]:
         if not command:
             raise SandboxError("command must not be empty")
@@ -914,6 +929,7 @@ class SandboxClient:
             environment=dict(env or {}),
             timeout_seconds=timeout_seconds or 0,
             stdin=stdin or b"",
+            no_login_shell=no_login_shell,
         )
         # Use whichever is larger: the default client timeout or the command
         # timeout plus headroom for SSH setup / teardown overhead.
@@ -958,6 +974,7 @@ class SandboxClient:
         env: Mapping[str, str] | None = None,
         stdin: bytes | None = None,
         timeout_seconds: int | None = None,
+        no_login_shell: bool = False,
     ) -> ExecResult:
         result: ExecResult | None = None
         for item in self.exec_stream(
@@ -967,6 +984,7 @@ class SandboxClient:
             env=env,
             stdin=stdin,
             timeout_seconds=timeout_seconds,
+            no_login_shell=no_login_shell,
         ):
             if stream_output and isinstance(item, ExecChunk):
                 if item.stream == "stdout":
@@ -1290,6 +1308,7 @@ class Sandbox:
         env: Mapping[str, str] | None = None,
         stdin: bytes | None = None,
         timeout_seconds: int | None = None,
+        no_login_shell: bool = False,
     ) -> ExecResult:
         if self._session is None:
             raise SandboxError("sandbox context has not been entered")
@@ -1300,6 +1319,7 @@ class Sandbox:
             env=env,
             stdin=stdin,
             timeout_seconds=timeout_seconds,
+            no_login_shell=no_login_shell,
         )
 
     def exec_python(
