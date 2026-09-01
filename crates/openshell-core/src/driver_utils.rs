@@ -10,9 +10,7 @@ use crate::proto::compute::v1::DriverSandbox;
 /// Built-in sandbox network topologies used to derive a callback endpoint
 /// when an operator does not configure a per-driver `grpc_endpoint` override.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GatewayCallbackTopology<'a> {
-    /// A sandbox pod reaches the gateway through its Kubernetes service.
-    Kubernetes { namespace: &'a str },
+pub enum GatewayCallbackTopology {
     /// A Docker container reaches the host through Docker's gateway alias.
     Docker,
     /// A Podman container reaches the host through Podman's gateway alias.
@@ -28,15 +26,12 @@ pub enum GatewayCallbackTopology<'a> {
 /// operator override for remote or non-standard deployments.
 #[must_use]
 pub fn gateway_callback_endpoint(
-    topology: GatewayCallbackTopology<'_>,
+    topology: GatewayCallbackTopology,
     gateway_port: u16,
     gateway_tls_enabled: bool,
 ) -> String {
     let scheme = if gateway_tls_enabled { "https" } else { "http" };
     let host = match topology {
-        GatewayCallbackTopology::Kubernetes { namespace } => {
-            return format!("{scheme}://openshell-gateway.{namespace}.svc:{gateway_port}");
-        }
         GatewayCallbackTopology::Docker | GatewayCallbackTopology::Vm => "host.openshell.internal",
         GatewayCallbackTopology::Podman => "host.containers.internal",
     };
@@ -60,16 +55,6 @@ mod callback_endpoint_tests {
         assert_eq!(
             gateway_callback_endpoint(GatewayCallbackTopology::Vm, 17670, true),
             "https://host.openshell.internal:17670"
-        );
-        assert_eq!(
-            gateway_callback_endpoint(
-                GatewayCallbackTopology::Kubernetes {
-                    namespace: "agents"
-                },
-                8080,
-                true,
-            ),
-            "https://openshell-gateway.agents.svc:8080"
         );
     }
 }

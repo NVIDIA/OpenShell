@@ -96,8 +96,11 @@ mount attaches an existing PVC under `/sandbox`, which skips the default PVC.
 ## Credentials, TLS, and Relay
 
 The driver injects gateway callback configuration, sandbox identity, TLS client
-material, and the supervisor SSH socket path into the workload. Driver-owned
-values must override image-provided environment variables.
+material, and the supervisor SSH socket path into the workload. The callback
+endpoint is required because the sandbox namespace does not identify the
+Gateway Service; Helm renders it from the release topology, while standalone
+and raw TOML configurations must set it explicitly. Driver-owned values must
+override image-provided environment variables.
 
 Sandbox pods run as `service_account_name` and keep
 `automountServiceAccountToken: false`. The only Kubernetes token exposed to the

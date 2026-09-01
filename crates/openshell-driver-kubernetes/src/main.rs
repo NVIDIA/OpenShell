@@ -8,7 +8,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::info;
 
-use openshell_core::driver_utils::{GatewayCallbackTopology, gateway_callback_endpoint};
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_core::{ImagePullPolicy, VERSION};
 use openshell_driver_kubernetes::{
@@ -95,8 +94,10 @@ struct Args {
     )]
     managed_ssh_gateway_pod_selector: Vec<String>,
 
+    /// Gateway callback endpoint reachable from sandbox pods. Kubernetes
+    /// service topology cannot be inferred from the sandbox namespace.
     #[arg(long, env = "OPENSHELL_GRPC_ENDPOINT")]
-    grpc_endpoint: Option<String>,
+    grpc_endpoint: String,
 
     #[arg(
         long,
@@ -240,15 +241,6 @@ async fn main() -> Result<()> {
         .collect::<Result<BTreeMap<_, _>>>()?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let grpc_endpoint = args.grpc_endpoint.unwrap_or_else(|| {
-        gateway_callback_endpoint(
-            GatewayCallbackTopology::Kubernetes {
-                namespace: &args.sandbox_namespace,
-            },
-            openshell_core::config::DEFAULT_SERVER_PORT,
-            false,
-        )
-    });
     let driver = KubernetesComputeDriver::new(
         KubernetesComputeConfig {
             workspace_mode: args.workspace_mode,
@@ -282,7 +274,7 @@ async fn main() -> Result<()> {
             proxy_auth_secret_key: args.proxy_auth_secret_key,
             proxy_auth_allow_insecure: args.proxy_auth_allow_insecure.then_some(true),
             proxy_connect_by_hostname: args.proxy_connect_by_hostname.then_some(true),
-            grpc_endpoint,
+            grpc_endpoint: args.grpc_endpoint,
             ssh_socket_path: args.sandbox_ssh_socket_path,
             client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
             host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
@@ -346,6 +338,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn requires_explicit_gateway_callback_endpoint() {
+        let error = Args::try_parse_from(["openshell-driver-kubernetes"])
+            .expect_err("Kubernetes service topology must be explicit");
+        assert!(error.to_string().contains("--grpc-endpoint"));
+    }
+
+    #[test]
     fn accepts_gateway_otlp_configuration() {
         let args = Args::try_parse_from([
             "openshell-driver-kubernetes",
@@ -353,6 +352,8 @@ mod tests {
             "http://collector.example:4317",
             "--gateway-name",
             "kubernetes-dev",
+            "--grpc-endpoint",
+            "http://openshell.example:8080",
         ])
         .expect("OTLP endpoint should parse");
 

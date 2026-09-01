@@ -82,12 +82,15 @@ future version. To migrate an existing file:
    Podman-only `newer`. Kubernetes-style capitalization and Podman's `missing`
    spelling are rejected.
 6. Remove zero sentinels. Omit `gateway_jwt.ttl_secs` for a non-expiring token,
-   omit Docker or Podman `sandbox_pids_limit` for the runtime default, and omit
-   Podman `health_check_interval_secs` to disable health checks. Explicit zero
-   values are invalid.
-7. Remove `grpc_endpoint` when the topology-derived callback is correct, or
-   retain it as an explicit override. New VM root filesystems use UID/GID 1000;
-   existing persisted VM state using 10001 remains compatible.
+   omit Docker or Podman `sandbox_pids_limit` to use OpenShell's default limit
+   of 2048, and omit Podman `health_check_interval_secs` to disable health
+   checks. Explicit zero values are invalid.
+7. Remove local Docker, Podman, or VM `grpc_endpoint` when the topology-derived
+   callback is correct, or retain it as an explicit override. Kubernetes raw
+   TOML requires an explicit endpoint; Helm derives one from the release's
+   gateway Service. New VM root filesystems use an image-provided `sandbox`
+   account when present and otherwise use UID/GID 1000. Existing persisted VM
+   state using 10001 remains compatible.
 
 Unknown fields and non-table `[openshell.drivers.<name>]` values fail startup.
 This strict validation prevents misspelled or misplaced security-sensitive
@@ -559,9 +562,10 @@ topology                       = "combined"
 # Last resort for hostname-filtering proxy ACLs. The proxy resolves the target,
 # so its ACL becomes part of the egress boundary for proxied connections.
 # proxy_connect_by_hostname    = true
-# Optional override. When omitted, the gateway derives
-# https://openshell-gateway.<namespace>.svc:<gateway-port>.
-grpc_endpoint                  = "https://openshell-gateway.agents.svc:8080"
+# Required in raw gateway TOML because `namespace` identifies sandbox
+# placement, not the gateway Service. Helm renders this from the release's
+# gateway Service name and namespace.
+grpc_endpoint                  = "https://openshell-gateway.openshell.svc:8080"
 ssh_socket_path                = "/run/openshell/ssh.sock"
 client_tls_secret_name         = "openshell-client-tls"
 host_gateway_ip                = "10.0.0.1"

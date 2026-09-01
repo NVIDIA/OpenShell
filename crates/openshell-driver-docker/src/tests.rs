@@ -151,6 +151,16 @@ fn docker_config_rejects_legacy_sandbox_namespace() {
 }
 
 #[test]
+fn docker_config_defaults_to_driver_owned_pids_limit() {
+    let config: DockerComputeConfig = serde_json::from_value(serde_json::json!({}))
+        .expect("default Docker config should deserialize");
+    assert_eq!(
+        config.sandbox_pids_limit.map(std::num::NonZeroI64::get),
+        Some(openshell_core::config::DEFAULT_SANDBOX_PIDS_LIMIT)
+    );
+}
+
+#[test]
 fn docker_config_rejects_invalid_pids_limits() {
     let zero = serde_json::from_value::<DockerComputeConfig>(serde_json::json!({
         "sandbox_pids_limit": 0

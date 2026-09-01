@@ -162,9 +162,12 @@ pub struct DockerComputeConfig {
 
     /// Container cgroup PID limit for Docker-managed sandboxes.
     ///
-    /// Omit the field to leave Docker's runtime/default PID limit unchanged.
-    /// Explicit zero is invalid.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Omit the field to use `OpenShell`'s 2048-process sandbox limit. Explicit
+    /// zero is invalid.
+    #[serde(
+        default = "openshell_core::config::default_sandbox_pids_limit",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub sandbox_pids_limit: Option<std::num::NonZeroI64>,
 
     /// Allow sandbox requests to attach host bind mounts through
@@ -203,7 +206,7 @@ impl Default for DockerComputeConfig {
             network_name: DEFAULT_DOCKER_NETWORK_NAME.to_string(),
             host_gateway_ip: String::new(),
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
-            sandbox_pids_limit: None,
+            sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
             enable_bind_mounts: false,
             upstream_proxy: UpstreamProxyConfig::default(),
             provider_spiffe_workload_api_socket: None,

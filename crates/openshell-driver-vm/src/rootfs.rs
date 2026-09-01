@@ -16,8 +16,7 @@ const ROOTFS_VARIANT_MARKER: &str = ".openshell-rootfs-variant";
 const SANDBOX_GUEST_INIT_PATH: &str = "/srv/openshell-vm-sandbox-init.sh";
 const SANDBOX_SUPERVISOR_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
 const SANDBOX_UMOCI_PATH: &str = openshell_core::container_paths::VM_UMOCI_PATH;
-const SANDBOX_OWNER_NORMALIZED_MARKER: &str =
-    openshell_core::container_paths::VM_SANDBOX_OWNER_NORMALIZED_MARKER;
+const DEFAULT_SANDBOX_UID: u32 = 1000;
 const ROOTFS_IMAGE_MIN_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 const ROOTFS_IMAGE_MIN_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
 const EXT4_IMAGE_MIN_HEADROOM_BYTES: u64 = 16 * 1024 * 1024;
@@ -31,8 +30,8 @@ pub const fn sandbox_guest_init_path() -> &'static str {
 pub fn prepare_sandbox_rootfs_from_image_root(
     rootfs: &Path,
     image_identity: &str,
-    sandbox_uid: u32,
-    sandbox_gid: u32,
+    sandbox_uid: Option<u32>,
+    sandbox_gid: Option<u32>,
 ) -> Result<(), String> {
     prepare_sandbox_rootfs(rootfs, sandbox_uid, sandbox_gid)?;
     validate_sandbox_rootfs(rootfs)?;
@@ -353,7 +352,11 @@ fn append_symlink_to_archive(
 }
 
 #[allow(clippy::similar_names)]
-fn prepare_sandbox_rootfs(rootfs: &Path, sandbox_uid: u32, sandbox_gid: u32) -> Result<(), String> {
+fn prepare_sandbox_rootfs(
+    rootfs: &Path,
+    sandbox_uid: Option<u32>,
+    sandbox_gid: Option<u32>,
+) -> Result<(), String> {
     for relative in ["opt/openshell/.initialized", "opt/openshell/.rootfs-type"] {
         remove_rootfs_path(rootfs, relative)?;
     }
@@ -567,8 +570,7 @@ fn normalize_sandbox_owner_in_rootfs_image(source: &Path, image_path: &Path) -> 
         return Ok(());
     }
 
-    run_debugfs_batch(image_path, &commands)?;
-    write_rootfs_image_file(image_path, SANDBOX_OWNER_NORMALIZED_MARKER, b"1\n")
+    run_debugfs_batch(image_path, &commands)
 }
 
 fn collect_sandbox_owner_commands(
@@ -789,9 +791,18 @@ fn temporary_injection_path(image_path: &Path) -> PathBuf {
 #[allow(clippy::similar_names)]
 fn ensure_sandbox_guest_user(
     rootfs: &Path,
-    sandbox_uid: u32,
-    sandbox_gid: u32,
+    sandbox_uid: Option<u32>,
+    sandbox_gid: Option<u32>,
 ) -> Result<(), String> {
+    // An image's sandbox account is part of its filesystem contract. Leave it
+    // intact unless an operator explicitly configured either side of the
+    // identity. A missing account still gets the OpenShell default.
+    if sandbox_uid.is_none() && sandbox_gid.is_none() && sandbox_guest_user_ids(rootfs)?.is_some() {
+        return Ok(());
+    }
+
+    let sandbox_uid = sandbox_uid.unwrap_or(DEFAULT_SANDBOX_UID);
+    let sandbox_gid = sandbox_gid.unwrap_or(sandbox_uid);
     let etc_dir = rootfs.join("etc");
     fs::create_dir_all(&etc_dir).map_err(|e| format!("create {}: {e}", etc_dir.display()))?;
 
@@ -983,7 +994,7 @@ mod tests {
 
         // Use a non-standard UID so the test doesn't collide with the default.
         let uid = 20001;
-        prepare_sandbox_rootfs(&rootfs, uid, uid).expect("prepare sandbox rootfs");
+        prepare_sandbox_rootfs(&rootfs, Some(uid), Some(uid)).expect("prepare sandbox rootfs");
         validate_sandbox_rootfs(&rootfs).expect("validate sandbox rootfs");
 
         assert!(rootfs.join("srv/openshell-vm-sandbox-init.sh").is_file());
@@ -1035,7 +1046,7 @@ mod tests {
         fs::create_dir_all(rootfs.join("sandbox")).expect("create sandbox workdir");
         fs::write(rootfs.join("sandbox/app.py"), "print('hello')\n").expect("write app");
 
-        prepare_sandbox_rootfs(&rootfs, 10001, 10001).expect("prepare sandbox rootfs");
+        prepare_sandbox_rootfs(&rootfs, Some(10001), Some(10001)).expect("prepare sandbox rootfs");
 
         assert!(rootfs.join("sandbox").is_dir());
         assert_eq!(
@@ -1113,6 +1124,61 @@ mod tests {
         assert_eq!(&tail, b"tail");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sandbox_user_preserves_image_account_when_identity_is_omitted() {
+        let dir = unique_temp_dir();
+        let rootfs = dir.join("rootfs");
+        fs::create_dir_all(rootfs.join("etc")).unwrap();
+        fs::write(
+            rootfs.join("etc/passwd"),
+            "sandbox:x:4242:4343:Image:/image-home:/bin/false\n",
+        )
+        .unwrap();
+        fs::write(rootfs.join("etc/group"), "sandbox:x:4343:\n").unwrap();
+
+        ensure_sandbox_guest_user(&rootfs, None, None).unwrap();
+
+        assert_eq!(sandbox_guest_user_ids(&rootfs).unwrap(), Some((4242, 4343)));
+        assert!(
+            fs::read_to_string(rootfs.join("etc/passwd"))
+                .unwrap()
+                .contains("Image:/image-home:/bin/false")
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sandbox_user_defaults_to_1000_when_image_has_no_account() {
+        let dir = unique_temp_dir();
+        let rootfs = dir.join("rootfs");
+        ensure_sandbox_guest_user(&rootfs, None, None).unwrap();
+        assert_eq!(sandbox_guest_user_ids(&rootfs).unwrap(), Some((1000, 1000)));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sandbox_user_explicit_identity_overrides_image_account() {
+        let dir = unique_temp_dir();
+        let rootfs = dir.join("rootfs");
+        fs::create_dir_all(rootfs.join("etc")).unwrap();
+        fs::write(
+            rootfs.join("etc/passwd"),
+            "sandbox:x:4242:4343:Image:/image-home:/bin/false\n",
+        )
+        .unwrap();
+        fs::write(rootfs.join("etc/group"), "sandbox:x:4343:\n").unwrap();
+
+        ensure_sandbox_guest_user(&rootfs, Some(2000), Some(3000)).unwrap();
+
+        assert_eq!(sandbox_guest_user_ids(&rootfs).unwrap(), Some((2000, 3000)));
+        assert!(
+            fs::read_to_string(rootfs.join("etc/group"))
+                .unwrap()
+                .contains("sandbox:x:3000:")
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

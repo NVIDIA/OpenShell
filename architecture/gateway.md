@@ -794,7 +794,10 @@ system entry instead of pretending to delete package-manager owned state.
 - Gateway TLS and client certificate distribution are deployment concerns owned
   by the operator or packaging layer.
 - Compute runtimes own the mechanics of starting workloads and injecting
-  callback configuration.
+  callback configuration. Local Docker, Podman, and VM callback endpoints can
+  be derived from their fixed host aliases. Kubernetes requires an explicit
+  endpoint from deployment topology; Helm renders it from the gateway Service
+  name and namespace rather than inferring it from sandbox placement.
 - Docker-backed local gateways use Docker's `host-gateway` callback alias on
   macOS and Docker Desktop-style runtimes. They request IPv4 loopback callback
   reachability and add a listener only when the primary does not cover it.

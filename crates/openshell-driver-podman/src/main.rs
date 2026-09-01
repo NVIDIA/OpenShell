@@ -87,9 +87,9 @@ struct Args {
     #[arg(long, env = "OPENSHELL_STOP_TIMEOUT", default_value_t = DEFAULT_PODMAN_STOP_TIMEOUT_SECS)]
     stop_timeout: u32,
 
-    /// Container cgroup PID limit for sandbox containers. Omit to inherit
-    /// Podman's runtime/default PID limit.
-    #[arg(long, env = "OPENSHELL_SANDBOX_PIDS_LIMIT")]
+    /// Container cgroup PID limit for sandbox containers. Omit to use
+    /// `OpenShell`'s 2048-process default.
+    #[arg(long, env = "OPENSHELL_SANDBOX_PIDS_LIMIT", default_value = "2048")]
     sandbox_pids_limit: Option<NonZeroI64>,
 
     /// Health check interval in seconds. Omit it in gateway TOML to disable
@@ -330,6 +330,10 @@ mod tests {
         assert_eq!(
             defaults.health_check_interval_secs.map(NonZeroU64::get),
             Some(10)
+        );
+        assert_eq!(
+            defaults.sandbox_pids_limit.map(NonZeroI64::get),
+            Some(openshell_core::config::DEFAULT_SANDBOX_PIDS_LIMIT)
         );
 
         for flag in ["--sandbox-pids-limit", "--health-check-interval-secs"] {
