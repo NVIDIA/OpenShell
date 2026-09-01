@@ -44,8 +44,6 @@ pub const SUPERVISOR_CONTAINER_DIR: &str = "/opt/openshell/bin";
 pub const SUPERVISOR_CONTAINER_BINARY: &str = "/opt/openshell/bin/openshell-sandbox";
 pub const TLS_CLIENT_DIR: &str = "/etc/openshell/tls/client";
 pub const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
-pub const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
-pub const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
 pub const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
 pub const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str = "/etc/openshell/auth/upstream-proxy";
 pub const CONTAINER_POLICY_PATH: &str = "/etc/openshell/policy.yaml";
@@ -60,8 +58,6 @@ pub const SUPERVISOR_CA_CERT_PATH: &str = "/etc/openshell-tls/openshell-ca.pem";
 pub const SUPERVISOR_CA_BUNDLE_PATH: &str = "/etc/openshell-tls/ca-bundle.pem";
 
 pub const VM_GUEST_TLS_CA_PATH: &str = "/opt/openshell/tls/ca.crt";
-pub const VM_GUEST_TLS_CERT_PATH: &str = "/opt/openshell/tls/tls.crt";
-pub const VM_GUEST_TLS_KEY_PATH: &str = "/opt/openshell/tls/tls.key";
 pub const VM_GUEST_SANDBOX_TOKEN_PATH: &str = "/opt/openshell/auth/sandbox.jwt";
 pub const VM_GUEST_INIT_DROPIN_DIR: &str = "/opt/openshell/init.d";
 pub const VM_GUEST_INIT_DROPIN_MANIFEST: &str = "/opt/openshell/init.d.manifest";
@@ -84,8 +80,6 @@ mod tests {
             SUPERVISOR_CONTAINER_BINARY,
             TLS_CLIENT_DIR,
             TLS_CA_MOUNT_PATH,
-            TLS_CERT_MOUNT_PATH,
-            TLS_KEY_MOUNT_PATH,
             SANDBOX_TOKEN_MOUNT_PATH,
             UPSTREAM_PROXY_AUTH_MOUNT_PATH,
             CONTAINER_POLICY_PATH,
@@ -98,8 +92,6 @@ mod tests {
             SUPERVISOR_CA_CERT_PATH,
             SUPERVISOR_CA_BUNDLE_PATH,
             VM_GUEST_TLS_CA_PATH,
-            VM_GUEST_TLS_CERT_PATH,
-            VM_GUEST_TLS_KEY_PATH,
             VM_GUEST_SANDBOX_TOKEN_PATH,
             VM_GUEST_INIT_DROPIN_DIR,
             VM_GUEST_INIT_DROPIN_MANIFEST,

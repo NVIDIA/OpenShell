@@ -67,9 +67,9 @@ On first start, the gateway automatically generates:
 
 > **Note:** The primary gateway listener uses the loopback default,
 > `127.0.0.1:17670`. The Podman driver requests a separate callback listener
-> scoped to the interface its sandboxes can reach. Mutual TLS (mTLS) is
-> enabled automatically on first start, requiring a valid client certificate
-> for every connection. See CONFIGURATION.md for details.
+> scoped to the interface its sandboxes can reach. mTLS user authentication is
+> enabled automatically on first start, while sandbox callbacks use the gateway
+> CA plus sandbox-scoped bearer tokens. See CONFIGURATION.md for details.
 
 Verify the service is running:
 

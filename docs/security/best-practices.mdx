@@ -256,14 +256,14 @@ The gateway secures communication between the CLI, sandbox workloads, and extern
 
 ### mTLS
 
-Gateway transport uses TLS, with client certificate checks available where the deployment provides a client CA. Local single-user Docker, Podman, and VM gateways can use the verified client certificate as user authentication. Kubernetes deployments use the certificate bundle for transport and sandbox supervisor connectivity only; configure OIDC or a trusted access proxy for user authentication.
+Gateway transport uses TLS, with client certificate checks available where the deployment provides a client CA. mTLS user authentication is gateway policy and does not depend on the compute driver. Sandbox supervisors receive only the gateway CA and authenticate API calls with gateway-minted sandbox JWTs.
 
 | Aspect | Detail |
 |---|---|
-| Default | Local TLS bundles enable mTLS user authentication for single-user local gateways. Helm deployments generate mTLS certificates for transport, while sandbox supervisors authenticate API calls with gateway-minted sandbox JWTs. TLS-enabled loopback gateways also accept plaintext HTTP for sandbox service hostnames by default. |
-| What you can change | Configure OIDC or a trusted access proxy for multi-user gateways, set `OPENSHELL_ENABLE_MTLS_AUTH=true` for local single-user gateways, enable `server.auth.allowUnauthenticatedUsers=true` only for trusted local Kubernetes development or a fully trusted proxy, disable TLS only for trusted reverse-proxy setups, or disable loopback service HTTP with `--enable-loopback-service-http=false`. |
-| Risk if relaxed | Disabling TLS removes transport-level protection entirely. Allowing unauthenticated users removes the gateway user-auth boundary and must not be exposed to shared or public networks. Treating transport certificates as shared user identity in Kubernetes would collapse user and sandbox trust boundaries. Loopback service HTTP is local-only and rejects cross-origin browser requests, but any local process can still reach exposed service URLs directly. |
-| Recommendation | Use local mTLS user authentication only for single-user Docker, Podman, and VM gateways. Use OIDC or a trusted access proxy for Kubernetes and shared deployments. |
+| Default | A configured client CA without OIDC enables mTLS user authentication. Sandbox supervisors use CA-only TLS plus gateway-minted sandbox JWTs. TLS-enabled loopback gateways also accept plaintext HTTP for sandbox service hostnames by default. |
+| What you can change | Configure mTLS user authentication, OIDC, or a trusted access proxy at the gateway; enable `server.auth.allowUnauthenticatedUsers=true` only for trusted local Kubernetes development or a fully trusted proxy; disable TLS only for trusted reverse-proxy setups; or disable loopback service HTTP with `--enable-loopback-service-http=false`. |
+| Risk if relaxed | Disabling TLS removes transport-level protection entirely. Allowing unauthenticated users removes the gateway user-auth boundary and must not be exposed to shared or public networks. Mounting a user client certificate into a sandbox would collapse user and sandbox trust boundaries. Loopback service HTTP is local-only and rejects cross-origin browser requests, but any local process can still reach exposed service URLs directly. |
+| Recommendation | Keep sandbox identity separate from user identity: expose only the gateway CA to sandboxes and require sandbox JWTs. Use managed OIDC or a trusted access proxy when certificate distribution is unsuitable for shared users. |
 
 ### SSH Tunnel Authentication
 

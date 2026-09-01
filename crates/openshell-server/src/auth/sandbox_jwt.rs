@@ -458,7 +458,9 @@ mod tests {
                     SandboxIdentitySource::BootstrapJwt { issuer: iss } => {
                         assert_eq!(iss, "openshell-gateway:test-gateway");
                     }
-                    other => panic!("unexpected source: {other:?}"),
+                    other @ SandboxIdentitySource::ComputeDriver { .. } => {
+                        panic!("unexpected source: {other:?}")
+                    }
                 }
             }
             _ => panic!("expected Sandbox principal"),

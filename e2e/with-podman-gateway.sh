@@ -481,8 +481,6 @@ cp "${ROOT}/deploy/rpm/gateway.toml.default" "${GATEWAY_CONFIG}"
   printf 'stop_timeout_secs = %s\n' "${PODMAN_STOP_TIMEOUT_SECS}"
   printf 'supervisor_image = %s\n' "$(toml_string "${SUPERVISOR_IMAGE}")"
   printf 'guest_tls_ca = %s\n'     "$(toml_string "${PKI_DIR}/ca.crt")"
-  printf 'guest_tls_cert = %s\n'   "$(toml_string "${PKI_DIR}/client/tls.crt")"
-  printf 'guest_tls_key = %s\n'    "$(toml_string "${PKI_DIR}/client/tls.key")"
   printf 'enable_bind_mounts = true\n'
   if [ -n "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET:-}" ]; then
     printf 'provider_spiffe_workload_api_socket = %s\n' "$(toml_string "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET}")"

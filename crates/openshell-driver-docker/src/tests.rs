@@ -115,8 +115,6 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         supervisor_bin: PathBuf::from("/tmp/openshell-sandbox"),
         guest_tls: Some(DockerGuestTlsPaths {
             ca: PathBuf::from("/tmp/ca.crt"),
-            cert: PathBuf::from("/tmp/tls.crt"),
-            key: PathBuf::from("/tmp/tls.key"),
         }),
         daemon_version: "28.0.0".to_string(),
         supports_gpu: false,
@@ -1070,11 +1068,17 @@ fn container_create_body_sets_driver_owned_pids_limit() {
 }
 
 #[test]
-fn build_environment_sets_docker_tls_paths() {
+fn build_environment_sets_only_docker_tls_ca() {
     let env = build_environment(&test_sandbox(), &runtime_config());
     assert!(env.contains(&format!("OPENSHELL_TLS_CA={TLS_CA_MOUNT_PATH}")));
-    assert!(env.contains(&format!("OPENSHELL_TLS_CERT={TLS_CERT_MOUNT_PATH}")));
-    assert!(env.contains(&format!("OPENSHELL_TLS_KEY={TLS_KEY_MOUNT_PATH}")));
+    assert!(
+        !env.iter()
+            .any(|entry| entry.starts_with("OPENSHELL_TLS_CERT="))
+    );
+    assert!(
+        !env.iter()
+            .any(|entry| entry.starts_with("OPENSHELL_TLS_KEY="))
+    );
     assert!(env.contains(&"TEMPLATE_ENV=template".to_string()));
     assert!(env.contains(&"SPEC_ENV=spec".to_string()));
     assert!(env.contains(&format!(
@@ -1411,7 +1415,7 @@ fn build_environment_keeps_telemetry_toggle_driver_controlled() {
 }
 
 #[test]
-fn build_binds_uses_docker_tls_directory() {
+fn build_binds_mounts_only_docker_tls_ca() {
     let binds = build_binds(&test_sandbox(), &runtime_config()).unwrap();
     let targets = binds
         .iter()
@@ -1419,8 +1423,13 @@ fn build_binds_uses_docker_tls_directory() {
         .collect::<Vec<_>>();
     assert!(targets.contains(&SUPERVISOR_MOUNT_PATH.to_string()));
     assert!(targets.contains(&TLS_CA_MOUNT_PATH.to_string()));
-    assert!(targets.contains(&TLS_CERT_MOUNT_PATH.to_string()));
-    assert!(targets.contains(&TLS_KEY_MOUNT_PATH.to_string()));
+    assert_eq!(
+        targets
+            .iter()
+            .filter(|target| target.starts_with(TLS_MOUNT_DIR))
+            .count(),
+        1
+    );
     assert!(
         targets
             .iter()
@@ -2739,18 +2748,19 @@ fn validate_linux_elf_binary_rejects_non_elf_files() {
 }
 
 #[test]
-fn docker_guest_tls_paths_require_all_files_for_https() {
+fn docker_guest_tls_paths_accept_ca_only_for_https() {
     let tempdir = TempDir::new().unwrap();
     let ca = tempdir.path().join("ca.crt");
     fs::write(&ca, b"ca").unwrap();
 
-    let err = docker_guest_tls_paths(&DockerComputeConfig {
+    let paths = docker_guest_tls_paths(&DockerComputeConfig {
         grpc_endpoint: "https://localhost:8443".to_string(),
-        guest_tls_ca: Some(ca),
+        guest_tls_ca: Some(ca.clone()),
         ..Default::default()
     })
-    .unwrap_err();
-    assert!(err.to_string().contains("guest_tls_cert"));
+    .unwrap()
+    .expect("CA-only TLS paths");
+    assert_eq!(paths.ca, ca.canonicalize().unwrap());
 }
 
 #[test]

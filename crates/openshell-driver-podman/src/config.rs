@@ -107,16 +107,14 @@ pub struct PodmanComputeConfig {
     /// Mounted read-only into sandbox containers at /opt/openshell/bin
     /// using Podman's `type=image` mount.
     pub supervisor_image: String,
-    /// Host path to the CA certificate for sandbox mTLS.
+    /// Host path to the CA certificate for sandbox-to-gateway TLS.
     ///
-    /// When all three TLS paths (`guest_tls_ca`, `guest_tls_cert`,
-    /// `guest_tls_key`) are set, the driver bind-mounts them into sandbox
-    /// containers and switches the auto-detected endpoint from `http://`
-    /// to `https://`.
+    /// When set, the driver bind-mounts the CA into sandbox containers and
+    /// switches the auto-detected endpoint from `http://` to `https://`.
     pub guest_tls_ca: Option<PathBuf>,
-    /// Host path to the client certificate for sandbox mTLS.
+    /// Deprecated. Sandboxes authenticate with bearer tokens.
     pub guest_tls_cert: Option<PathBuf>,
-    /// Host path to the client private key for sandbox mTLS.
+    /// Deprecated. Sandboxes authenticate with bearer tokens.
     pub guest_tls_key: Option<PathBuf>,
     /// Container cgroup PID limit for Podman-managed sandboxes.
     ///
@@ -256,43 +254,33 @@ pub fn parse_id_map_entry(
 }
 
 impl PodmanComputeConfig {
-    /// Returns `true` when all three TLS paths are configured.
+    /// Returns `true` when the gateway CA is configured.
     #[must_use]
     pub fn tls_enabled(&self) -> bool {
-        self.guest_tls_ca.is_some() && self.guest_tls_cert.is_some() && self.guest_tls_key.is_some()
+        self.guest_tls_ca.is_some()
     }
 
     /// Validate TLS configuration consistency.
     ///
-    /// Returns `Ok(())` when either all three TLS paths are set (full mTLS)
-    /// or none are set (plaintext).  Returns an error naming the missing
-    /// fields when only a subset is provided — this prevents silent
-    /// fallback to plaintext when an operator partially configures mTLS.
+    /// Client certificates are rejected because sandbox identity is carried
+    /// by bearer tokens rather than the gateway user's mTLS identity.
     pub fn validate_tls_config(&self) -> Result<(), crate::client::PodmanApiError> {
-        let has_ca = self.guest_tls_ca.is_some();
         let has_cert = self.guest_tls_cert.is_some();
         let has_key = self.guest_tls_key.is_some();
 
-        // All set or none set — both are valid.
-        if (has_ca && has_cert && has_key) || (!has_ca && !has_cert && !has_key) {
+        if !has_cert && !has_key {
             return Ok(());
         }
-
-        let mut missing = Vec::new();
-        if !has_ca {
-            missing.push("--podman-tls-ca / OPENSHELL_PODMAN_TLS_CA");
-        }
-        if !has_cert {
-            missing.push("--podman-tls-cert / OPENSHELL_PODMAN_TLS_CERT");
-        }
-        if !has_key {
-            missing.push("--podman-tls-key / OPENSHELL_PODMAN_TLS_KEY");
-        }
-
         Err(crate::client::PodmanApiError::InvalidInput(format!(
-            "Partial TLS configuration: all three TLS paths must be provided together. \
-             Missing: {}",
-            missing.join(", ")
+            "Sandbox client certificates are no longer supported; remove {}",
+            [
+                has_cert.then_some("--podman-tls-cert / OPENSHELL_PODMAN_TLS_CERT"),
+                has_key.then_some("--podman-tls-key / OPENSHELL_PODMAN_TLS_KEY"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" and ")
         )))
     }
 
@@ -934,107 +922,39 @@ mod tests {
     }
 
     #[test]
-    fn validate_tls_config_all_set_is_ok() {
+    fn validate_tls_config_ca_only_is_ok() {
         let cfg = PodmanComputeConfig {
             guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
-            guest_tls_cert: Some(PathBuf::from("/tls/tls.crt")),
-            guest_tls_key: Some(PathBuf::from("/tls/tls.key")),
             ..PodmanComputeConfig::default()
         };
         assert!(cfg.validate_tls_config().is_ok());
+        assert!(cfg.tls_enabled());
     }
 
     #[test]
-    fn validate_tls_config_only_ca_is_error() {
-        let cfg = PodmanComputeConfig {
-            guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
-            ..PodmanComputeConfig::default()
-        };
-        let err = cfg
-            .validate_tls_config()
-            .expect_err("only CA should be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
-    }
-
-    #[test]
-    fn validate_tls_config_only_cert_is_error() {
+    fn validate_tls_config_rejects_client_certificate() {
         let cfg = PodmanComputeConfig {
             guest_tls_cert: Some(PathBuf::from("/tls/tls.crt")),
             ..PodmanComputeConfig::default()
         };
         let err = cfg
             .validate_tls_config()
-            .expect_err("only cert should be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
-    }
-
-    #[test]
-    fn validate_tls_config_only_key_is_error() {
-        let cfg = PodmanComputeConfig {
-            guest_tls_key: Some(PathBuf::from("/tls/tls.key")),
-            ..PodmanComputeConfig::default()
-        };
-        let err = cfg
-            .validate_tls_config()
-            .expect_err("only key should be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
-    }
-
-    #[test]
-    fn validate_tls_config_ca_and_cert_missing_key_is_error() {
-        let cfg = PodmanComputeConfig {
-            guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
-            guest_tls_cert: Some(PathBuf::from("/tls/tls.crt")),
-            ..PodmanComputeConfig::default()
-        };
-        let err = cfg
-            .validate_tls_config()
-            .expect_err("missing key should be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
-    }
-
-    #[test]
-    fn validate_tls_config_ca_and_key_missing_cert_is_error() {
-        let cfg = PodmanComputeConfig {
-            guest_tls_ca: Some(PathBuf::from("/tls/ca.crt")),
-            guest_tls_key: Some(PathBuf::from("/tls/tls.key")),
-            ..PodmanComputeConfig::default()
-        };
-        let err = cfg
-            .validate_tls_config()
-            .expect_err("missing cert should be rejected");
+            .expect_err("sandbox client certificate should be rejected");
         let msg = err.to_string();
         assert!(msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
     }
 
     #[test]
-    fn validate_tls_config_cert_and_key_missing_ca_is_error() {
+    fn validate_tls_config_rejects_client_private_key() {
         let cfg = PodmanComputeConfig {
-            guest_tls_cert: Some(PathBuf::from("/tls/tls.crt")),
             guest_tls_key: Some(PathBuf::from("/tls/tls.key")),
             ..PodmanComputeConfig::default()
         };
         let err = cfg
             .validate_tls_config()
-            .expect_err("missing CA should be rejected");
+            .expect_err("sandbox client private key should be rejected");
         let msg = err.to_string();
-        assert!(msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
-        assert!(!msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
+        assert!(msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
     }
 
     #[test]

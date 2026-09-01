@@ -6,7 +6,6 @@
 use clap::parser::ValueSource;
 use clap::{ArgAction, ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
-use openshell_core::ComputeDriverKind;
 use openshell_core::config::{DEFAULT_GATEWAY_NAME, DEFAULT_SERVER_PORT};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -145,11 +144,10 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_OIDC_ISSUER")]
     oidc_issuer: Option<String>,
 
-    /// Enable mTLS client certificate authentication for local single-user gateways.
+    /// Enable mTLS client certificate authentication for gateway users.
     ///
-    /// When unset, this defaults on for Docker, Podman, and VM gateways that
-    /// have client certificate verification configured and no OIDC issuer.
-    /// Kubernetes deployments must use OIDC or fronting-proxy auth instead.
+    /// When unset, this defaults on when client certificate verification is
+    /// configured and no OIDC issuer is present.
     #[arg(
         long = "enable-mtls-auth",
         env = "OPENSHELL_ENABLE_MTLS_AUTH",
@@ -270,8 +268,6 @@ fn prepare_server_config(
     let compute_driver = compute_drivers
         .select(&args.drivers)
         .map_err(|error| miette::miette!("{error}"))?;
-    let compute_driver_kind = compute_driver.name().parse::<ComputeDriverKind>().ok();
-
     let local_tls = apply_runtime_defaults(args)?;
     let guest_tls = local_tls.as_ref().map(GuestTlsPaths::from);
     let local_jwt = defaults::complete_local_jwt_config()?;
@@ -279,9 +275,7 @@ fn prepare_server_config(
     let bind = SocketAddr::new(args.bind_address, args.port);
 
     let has_client_ca = args.tls_client_ca.is_some();
-    let has_oidc = args.oidc_issuer.is_some();
-    let mtls_auth_enabled =
-        resolve_mtls_auth_enabled(args, matches, file.as_ref(), compute_driver_kind);
+    let mtls_auth_enabled = resolve_mtls_auth_enabled(args, matches, file.as_ref());
 
     if args.disable_tls && has_client_ca {
         return Err(miette::miette!(
@@ -298,12 +292,6 @@ fn prepare_server_config(
             "mTLS user authentication requires --tls-client-ca so client certificates can be verified."
         ));
     }
-    if mtls_auth_enabled && matches!(compute_driver_kind, Some(ComputeDriverKind::Kubernetes)) {
-        return Err(miette::miette!(
-            "mTLS user authentication is not supported with the Kubernetes compute driver. Configure OIDC or a trusted fronting proxy for user authentication."
-        ));
-    }
-
     let tls = if args.disable_tls {
         None
     } else {
@@ -331,7 +319,11 @@ fn prepare_server_config(
         Some(openshell_core::TlsConfig {
             cert_path,
             key_path,
-            require_client_auth: has_client_ca && !has_oidc,
+            // Sandboxes authenticate at the application layer with bearer
+            // identity, so TLS must permit clients without certificates.
+            // When present, CLI certificates are still verified and may be
+            // promoted to users by the independently configured mTLS policy.
+            require_client_auth: false,
             client_ca_path: args.tls_client_ca.clone(),
             external_cert_path: ext_cert,
             external_key_path: ext_key,
@@ -817,23 +809,10 @@ fn normalize_compute_driver_socket_args(args: &mut RunArgs, matches: &ArgMatches
     }
 }
 
-fn is_singleplayer_driver(driver: Option<ComputeDriverKind>) -> bool {
-    matches!(
-        driver,
-        Some(
-            ComputeDriverKind::Docker
-                | ComputeDriverKind::Podman
-                | ComputeDriverKind::Vm
-                | ComputeDriverKind::Mxc
-        )
-    )
-}
-
 fn resolve_mtls_auth_enabled(
     args: &RunArgs,
     matches: &ArgMatches,
     file: Option<&ConfigFile>,
-    compute_driver: Option<ComputeDriverKind>,
 ) -> bool {
     let file_configured = file
         .and_then(|f| f.openshell.gateway.mtls_auth.as_ref())
@@ -846,7 +825,7 @@ fn resolve_mtls_auth_enabled(
         return false;
     }
 
-    is_singleplayer_driver(compute_driver)
+    true
 }
 
 #[cfg(test)]
@@ -1339,7 +1318,7 @@ mod tests {
     }
 
     #[test]
-    fn mtls_auth_auto_defaults_for_local_tls_driver() {
+    fn mtls_auth_auto_defaults_when_client_ca_is_configured() {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1359,12 +1338,7 @@ mod tests {
             "/tmp/ca.crt",
         ]);
 
-        assert!(super::resolve_mtls_auth_enabled(
-            &args,
-            &matches,
-            None,
-            Some(openshell_core::ComputeDriverKind::Docker)
-        ));
+        assert!(super::resolve_mtls_auth_enabled(&args, &matches, None));
     }
 
     #[test]
@@ -1399,11 +1373,20 @@ mod tests {
         assert_eq!(prepared.compute_driver.name(), "docker");
         assert!(prepared.config.compute_drivers.is_empty());
         assert!(prepared.config.mtls_auth.enabled);
+        assert!(
+            !prepared
+                .config
+                .tls
+                .as_ref()
+                .expect("TLS config")
+                .require_client_auth,
+            "sandbox bearer clients must be allowed through the TLS handshake"
+        );
         assert_eq!(REGISTRY_DETECTION_CALLS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn mtls_auth_does_not_auto_default_for_kubernetes_driver() {
+    fn mtls_auth_default_is_driver_independent() {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1423,12 +1406,7 @@ mod tests {
             "/tmp/ca.crt",
         ]);
 
-        assert!(!super::resolve_mtls_auth_enabled(
-            &args,
-            &matches,
-            None,
-            Some(openshell_core::ComputeDriverKind::Kubernetes)
-        ));
+        assert!(super::resolve_mtls_auth_enabled(&args, &matches, None));
     }
 
     #[test]
@@ -1463,8 +1441,7 @@ enabled = false
         assert!(!super::resolve_mtls_auth_enabled(
             &args,
             &matches,
-            Some(&file),
-            Some(openshell_core::ComputeDriverKind::Docker)
+            Some(&file)
         ));
     }
 
@@ -1699,26 +1676,6 @@ ssh_session_ttl_secs = 1234
 ",
         );
         assert_eq!(file.openshell.gateway.ssh_session_ttl_secs, Some(1234));
-    }
-
-    #[test]
-    fn singleplayer_driver_matches_only_one_local_driver() {
-        for driver in [
-            openshell_core::ComputeDriverKind::Docker,
-            openshell_core::ComputeDriverKind::Podman,
-            openshell_core::ComputeDriverKind::Vm,
-            openshell_core::ComputeDriverKind::Mxc,
-        ] {
-            assert!(
-                super::is_singleplayer_driver(Some(driver)),
-                "{driver} should be singleplayer"
-            );
-        }
-
-        assert!(!super::is_singleplayer_driver(Some(
-            openshell_core::ComputeDriverKind::Kubernetes
-        )));
-        assert!(!super::is_singleplayer_driver(None));
     }
 
     #[test]
@@ -1960,7 +1917,7 @@ namespace = "agents"
 "#,
         );
         let merged = crate::config_file::driver_table(
-            super::ComputeDriverKind::Kubernetes.as_str(),
+            openshell_core::ComputeDriverKind::Kubernetes.as_str(),
             &file.openshell.gateway,
             file.openshell.drivers.get("kubernetes"),
         );
@@ -1984,7 +1941,7 @@ default_image = "k8s-specific:1.0"
 "#,
         );
         let merged = crate::config_file::driver_table(
-            super::ComputeDriverKind::Kubernetes.as_str(),
+            openshell_core::ComputeDriverKind::Kubernetes.as_str(),
             &file.openshell.gateway,
             file.openshell.drivers.get("kubernetes"),
         );

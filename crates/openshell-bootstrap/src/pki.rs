@@ -89,7 +89,7 @@ pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
         .into_diagnostic()
         .wrap_err("failed to sign server certificate")?;
 
-    // --- Client cert (shared by CLI and sandbox pods) ---
+    // --- User client cert (CLI only; sandboxes use bearer identity) ---
     let client_key = KeyPair::generate()
         .into_diagnostic()
         .wrap_err("failed to generate client key")?;

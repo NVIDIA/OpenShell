@@ -182,8 +182,6 @@ certificates that are mounted into sandbox containers:
 ```toml
 [openshell.gateway]
 guest_tls_ca = "/home/user/.local/state/openshell/tls/ca.crt"
-guest_tls_cert = "/home/user/.local/state/openshell/tls/client/tls.crt"
-guest_tls_key = "/home/user/.local/state/openshell/tls/client/tls.key"
 ```
 
 Inside the container, the supervisor reads them from:
@@ -218,7 +216,7 @@ overrides that persist across package upgrades.
 | `compute_drivers` | `["podman"]` (RPM default) | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The RPM default pins to Podman. |
 | `default_image` | `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` | Default sandbox image. |
 | `supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Supervisor image mounted into Podman sandboxes. |
-| `guest_tls_ca`, `guest_tls_cert`, `guest_tls_key` | auto-generated paths | Client TLS material bind-mounted into sandbox containers. |
+| `guest_tls_ca` | auto-generated path | Gateway CA bind-mounted into sandbox containers for server-authenticated TLS. Sandbox identity uses a bearer token. |
 | `[openshell.gateway.tls]` paths | auto-generated paths | Server TLS certificate, key, and client CA. |
 | `disable_tls` | unset | Set to `true` to disable TLS. |
 

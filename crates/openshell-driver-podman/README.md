@@ -180,26 +180,22 @@ supervisor path as an argument to an image-provided shell.
 
 ## TLS
 
-When all three Podman TLS paths are set, the driver treats sandbox callbacks as
-mTLS callbacks:
+When the Podman TLS CA path is set, the driver treats sandbox callbacks as
+server-authenticated TLS callbacks:
 
 - `OPENSHELL_PODMAN_TLS_CA`
-- `OPENSHELL_PODMAN_TLS_CERT`
-- `OPENSHELL_PODMAN_TLS_KEY`
 
-The driver validates that the TLS paths are provided as a complete set. Partial
-configuration fails early instead of silently falling back to plaintext.
+The legacy client certificate and key options are rejected. Sandbox identity is
+carried by a gateway-minted bearer token.
 
 When enabled, the driver:
 
 1. Switches the auto-detected endpoint scheme from `http://` to `https://`.
-2. Bind-mounts the client cert files read-only into the container at
+2. Bind-mounts the CA read-only into the container at
    `/etc/openshell/tls/client/`.
-3. Sets `OPENSHELL_TLS_CA`, `OPENSHELL_TLS_CERT`, and `OPENSHELL_TLS_KEY` to
-   the container-side paths.
+3. Sets `OPENSHELL_TLS_CA` to the container-side path.
 
-The supervisor reads these env vars and uses them to establish an mTLS
-connection back to the gateway. On SELinux systems, the bind mounts include
+The supervisor reads this env var and uses it to authenticate the gateway. On SELinux systems, the bind mount includes
 Podman's shared relabel option so the container process can read the files.
 
 The RPM packaging auto-generates a self-signed PKI on first start via
@@ -290,14 +286,14 @@ The standalone `openshell-driver-podman` binary sets the same struct field from
 
 ## Credential Injection
 
-Sandboxes authenticate to the gateway via mTLS using client materials bind-
-mounted into the container from a Podman secret. No shared per-request secret
-is injected as an environment variable.
+Sandboxes authenticate to the gateway with a sandbox-scoped bearer token
+mounted from a Podman secret. TLS uses a read-only gateway CA and does not expose
+a client certificate or private key.
 
 | Credential | Mechanism | Visible in `inspect`? | Visible in `/proc/<pid>/environ`? |
 |---|---|---|---|
-| mTLS client cert/key | Bind-mounted file paths (`OPENSHELL_TLS_*` env vars point at them) | Yes (paths only) | Yes (paths only) |
-| Sandbox identity | Plaintext env var | Yes | Yes |
+| Gateway CA | Read-only bind mount or Podman secret (`OPENSHELL_TLS_CA` points at it) | Yes (path only) | Yes (path only) |
+| Sandbox identity | Root-only Podman secret | No | No |
 | gRPC endpoint | Plaintext env var, override-protected | Yes | Yes |
 | Supervisor relay socket path | Plaintext env var, override-protected | Yes | Yes |
 
@@ -389,9 +385,7 @@ Podman resources after out-of-band container removal or label drift.
 | `OPENSHELL_STOP_TIMEOUT` | `--stop-timeout` | `45` | Container stop timeout in seconds. |
 | `OPENSHELL_SANDBOX_PIDS_LIMIT` | `--sandbox-pids-limit` | `2048` | Podman cgroup PID limit for sandbox containers. Set `0` to inherit Podman's runtime/default PID limit. |
 | `OPENSHELL_SUPERVISOR_IMAGE` | `--supervisor-image` | `ghcr.io/nvidia/openshell/supervisor:latest` through the gateway, required standalone | OCI image containing the supervisor binary. |
-| `OPENSHELL_PODMAN_TLS_CA` | `--podman-tls-ca` | unset | Host path to the CA certificate mounted for sandbox mTLS. |
-| `OPENSHELL_PODMAN_TLS_CERT` | `--podman-tls-cert` | unset | Host path to the client certificate mounted for sandbox mTLS. |
-| `OPENSHELL_PODMAN_TLS_KEY` | `--podman-tls-key` | unset | Host path to the client private key mounted for sandbox mTLS. |
+| `OPENSHELL_PODMAN_TLS_CA` | `--podman-tls-ca` | unset | Host path to the CA certificate mounted so sandboxes can authenticate the gateway. |
 | `OPENSHELL_SANDBOX_HTTPS_PROXY` | `--sandbox-https-proxy` | unset | Corporate forward proxy URL for the supervisor's upstream TLS dials, chained with HTTP CONNECT. Credential-free `http://host:port` and `https://host:port` URLs are supported (scheme and port required). For an `https://` proxy the supervisor TLS-wraps the proxy connection, verifying the proxy certificate against the built-in and system roots plus `--sandbox-proxy-ca-bundle`. Plain-HTTP requests always dial directly. |
 | `OPENSHELL_SANDBOX_NO_PROXY` | `--sandbox-no-proxy` | unset | Comma-separated `NO_PROXY` list (hostnames, domain suffixes, IPs, CIDRs, each with an optional `:port` qualifier) dialed directly instead of through the corporate proxy. IP/CIDR entries also match hostnames through their validated DNS resolution. |
 | `OPENSHELL_SANDBOX_PROXY_AUTH_FILE` | `--sandbox-proxy-auth-file` | unset | Path to a file containing the proxy credentials as `user:pass`. Staged as a root-only Podman secret so credentials never appear in config or container metadata. Requires the insecure-auth acknowledgement below. |

@@ -8,7 +8,7 @@ keywords: "Generative AI, Cybersecurity, Kubernetes, cert-manager, PKI, TLS, mTL
 position: 3
 ---
 
-The OpenShell gateway uses mTLS certificates for transport between the gateway and sandbox supervisors. These certificates are not Kubernetes user authentication; configure OIDC or a trusted access proxy for user access. The Helm chart supports two ways to provision and manage the certificate bundle:
+The OpenShell gateway uses TLS for transport to sandbox supervisors. Sandbox Pods receive the gateway CA, not a client certificate or private key, and authenticate RPCs with sandbox JWTs. The generated client certificate can authenticate user clients when gateway mTLS user authentication is enabled; shared deployments can instead configure OIDC or a trusted access proxy. The Helm chart supports two ways to provision and manage the certificate bundle:
 
 | Mode | When to use |
 |---|---|

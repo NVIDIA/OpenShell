@@ -36,7 +36,7 @@ use openshell_extension_core::{BearerTokenSlot, ExtensionCredentialStore};
 use tonic::Status;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use tracing::{debug, info, warn};
 
 /// Channel type after the [`AuthInterceptor`] is applied. Aliased so the
@@ -125,10 +125,9 @@ impl tonic::service::Interceptor for AuthInterceptor {
 
 /// Build the plain (un-intercepted) gRPC channel.
 ///
-/// When the endpoint uses `https://`, mTLS is configured using these env vars:
+/// When the endpoint uses `https://`, server-authenticated TLS is configured
+/// using this env var:
 /// - `OPENSHELL_TLS_CA` -- path to the CA certificate
-/// - `OPENSHELL_TLS_CERT` -- path to the client certificate
-/// - `OPENSHELL_TLS_KEY` -- path to the client private key
 ///
 /// When the endpoint uses `http://`, a plaintext connection is used (for
 /// deployments where TLS is disabled, e.g. behind a Cloudflare Tunnel).
@@ -147,7 +146,7 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
 
     let tls_enabled = endpoint.starts_with("https://");
 
-    // TODO: TLS certs are loaded once here and never re-read. The gateway
+    // TODO: The TLS CA is loaded once here and never re-read. The gateway
     // server side supports hot-reload (ArcSwap + notify in tls.rs). The
     // supervisor should do the same so that cert-manager rotations take
     // effect without restarting the sandbox.
@@ -155,26 +154,12 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
         let ca_path = std::env::var(sandbox_env::TLS_CA)
             .into_diagnostic()
             .wrap_err("OPENSHELL_TLS_CA is required")?;
-        let cert_path = std::env::var(sandbox_env::TLS_CERT)
-            .into_diagnostic()
-            .wrap_err("OPENSHELL_TLS_CERT is required")?;
-        let key_path = std::env::var(sandbox_env::TLS_KEY)
-            .into_diagnostic()
-            .wrap_err("OPENSHELL_TLS_KEY is required")?;
-
         let ca_pem = std::fs::read(&ca_path)
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to read CA cert from {ca_path}"))?;
-        let cert_pem = std::fs::read(&cert_path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read client cert from {cert_path}"))?;
-        let key_pem = std::fs::read(&key_path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read client key from {key_path}"))?;
 
         // Trust only the configured CA — this is the chart's internal CA
-        // that signs both the gateway's internal server certificate and
-        // this client's identity certificate.  The gateway uses SNI-based
+        // that signs the gateway's internal server certificate. The gateway uses SNI-based
         // certificate selection to present this internal cert to supervisor
         // connections, so no public root trust is needed here.
         //
@@ -183,9 +168,7 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
         // (Docker/Podman drivers), and broadening the trust store would let
         // an attacker who controls the image + DNS present a publicly valid
         // certificate and intercept the supervisor→gateway TLS connection.
-        let mut tls_config = ClientTlsConfig::new()
-            .ca_certificate(Certificate::from_pem(ca_pem))
-            .identity(Identity::from_pem(cert_pem, key_pem));
+        let mut tls_config = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem));
         if let Ok(server_name) = std::env::var(sandbox_env::GATEWAY_TLS_SERVER_NAME)
             && !server_name.is_empty()
         {

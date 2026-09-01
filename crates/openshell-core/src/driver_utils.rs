@@ -90,21 +90,14 @@ pub const SUPERVISOR_CONTAINER_BINARY: &str = "/opt/openshell/bin/openshell-sand
 // ---------------------------------------------------------------------------
 // In-container mount paths for guest TLS materials and the sandbox token.
 //
-// All container-based drivers (Docker, Podman, Kubernetes) mount the gateway's
-// mTLS client credentials at these fixed paths inside every sandbox container.
-// The supervisor reads these paths on startup to establish its gRPC-over-mTLS
-// connection back to the gateway. The paths must remain stable across driver
-// versions since the supervisor binary is built and packaged separately.
+// Container-based drivers mount the gateway CA at this fixed path inside every
+// sandbox container. The supervisor reads it on startup to authenticate the
+// gateway TLS endpoint. Sandbox identity is provided separately by a bearer
+// token.
 // ---------------------------------------------------------------------------
 
-/// Container-side mount path for the guest mTLS CA certificate.
+/// Container-side mount path for the gateway CA certificate.
 pub const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
-
-/// Container-side mount path for the guest mTLS client certificate.
-pub const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
-
-/// Container-side mount path for the guest mTLS client private key.
-pub const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
 
 /// Container-side mount path for the per-sandbox JWT token.
 pub const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";

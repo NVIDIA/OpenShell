@@ -151,9 +151,7 @@ Select the VM driver with `--drivers vm`, `OPENSHELL_DRIVERS=vm`, or `compute_dr
 | `mem_mib` | `2048` | Memory per sandbox, in MiB. |
 | `overlay_disk_mib` | `4096` | Sparse writable overlay disk size per sandbox, in MiB. |
 | `krun_log_level` | `1` | libkrun verbosity (0-5). |
-| `guest_tls_ca` | unset | CA cert for the guest's mTLS client bundle. Required when `grpc_endpoint` uses `https://`. |
-| `guest_tls_cert` | unset | Guest client certificate. |
-| `guest_tls_key` | unset | Guest client private key. |
+| `guest_tls_ca` | unset | CA cert used by the guest to authenticate the gateway. Required when `grpc_endpoint` uses `https://`. Sandbox identity uses a bearer token. |
 
 See [`openshell-gateway --help`](../openshell-server/src/cli.rs) for the gateway process flag surface.
 

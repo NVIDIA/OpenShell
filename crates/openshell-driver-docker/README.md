@@ -178,12 +178,13 @@ assigned address that containers should use for callbacks; package-managed
 macOS gateways should leave it unset.
 
 For HTTPS endpoints, the server certificate must include the endpoint host as a
-subject alternative name. Docker sandboxes also need the client TLS bundle
-mounted into the container and exposed with:
+subject alternative name. Docker sandboxes receive only the gateway CA through:
 
 - `OPENSHELL_TLS_CA`
-- `OPENSHELL_TLS_CERT`
-- `OPENSHELL_TLS_KEY`
+
+The supervisor authenticates the gateway with this CA and authenticates its
+RPCs with a sandbox-scoped bearer token. Client certificates and private keys
+are not mounted into sandbox containers.
 
 HTTP endpoints reject TLS material because the supervisor would not use it.
 

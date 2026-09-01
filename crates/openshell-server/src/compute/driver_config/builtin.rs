@@ -62,21 +62,11 @@ fn apply_podman_runtime_defaults(
 ) {
     podman.gateway_port = context.gateway_port;
     apply_podman_env_overrides(podman);
-    apply_guest_tls_defaults_to_split_fields(
-        &mut podman.guest_tls_ca,
-        &mut podman.guest_tls_cert,
-        &mut podman.guest_tls_key,
-        context.guest_tls,
-    );
+    apply_guest_tls_ca_default(&mut podman.guest_tls_ca, context.guest_tls);
 }
 
 fn apply_docker_runtime_defaults(cfg: &mut DockerComputeConfig, context: DriverStartupContext<'_>) {
-    apply_guest_tls_defaults_to_split_fields(
-        &mut cfg.guest_tls_ca,
-        &mut cfg.guest_tls_cert,
-        &mut cfg.guest_tls_key,
-        context.guest_tls,
-    );
+    apply_guest_tls_ca_default(&mut cfg.guest_tls_ca, context.guest_tls);
 }
 
 fn apply_vm_runtime_defaults(cfg: &mut VmComputeConfig, context: DriverStartupContext<'_>) {
@@ -94,28 +84,14 @@ fn apply_vm_runtime_defaults(cfg: &mut VmComputeConfig, context: DriverStartupCo
         cfg.grpc_endpoint = format!("{scheme}://127.0.0.1:{}", context.gateway_port);
     }
 
-    apply_guest_tls_defaults_to_split_fields(
-        &mut cfg.guest_tls_ca,
-        &mut cfg.guest_tls_cert,
-        &mut cfg.guest_tls_key,
-        context.guest_tls,
-    );
+    apply_guest_tls_ca_default(&mut cfg.guest_tls_ca, context.guest_tls);
 }
 
-fn apply_guest_tls_defaults_to_split_fields(
-    ca: &mut Option<PathBuf>,
-    cert: &mut Option<PathBuf>,
-    key: &mut Option<PathBuf>,
-    defaults: Option<&GuestTlsPaths>,
-) {
+fn apply_guest_tls_ca_default(ca: &mut Option<PathBuf>, defaults: Option<&GuestTlsPaths>) {
     if ca.is_none()
-        && cert.is_none()
-        && key.is_none()
         && let Some(paths) = defaults
     {
         *ca = Some(paths.ca.clone());
-        *cert = Some(paths.cert.clone());
-        *key = Some(paths.key.clone());
     }
 }
 

@@ -41,12 +41,12 @@ finalized supervisor session disconnects.
 ## Protocol and Auth
 
 The gateway listens on one service port and multiplexes gRPC and HTTP traffic.
-The default local single-user deployment mode is mTLS user authentication:
-clients present a certificate signed by the local deployment CA, and the
-gateway maps the verified certificate subject to a user principal. Kubernetes
-deployments use mTLS for transport only and require OIDC or a trusted access
-proxy for user authentication unless the explicit unsafe local-development
-`allow_unauthenticated_users` switch is enabled.
+When a client CA is configured without OIDC, mTLS user authentication defaults
+on independently of the compute driver: clients present a certificate signed
+by the deployment CA, and the gateway maps the verified certificate subject to
+a user principal. Sandboxes do not receive that client certificate. They
+authenticate the gateway with the CA and authenticate their own RPCs with
+gateway-minted bearer tokens.
 When that service port is bound to loopback, the listener can also accept
 plaintext HTTP on the same port for sandbox service subdomains only. That local
 browser path is enabled by default and disabled with
@@ -188,7 +188,7 @@ Supported auth modes:
 
 | Mode | Use |
 |---|---|
-| mTLS user auth | Local single-user Docker, Podman, and VM gateway access. |
+| mTLS user auth | Gateway user access with verified client certificates. |
 | Plaintext | Local development or a trusted reverse proxy boundary. |
 | Unauthenticated local users | Trusted Kubernetes dev or fully trusted proxy deployments only. |
 | Cloudflare JWT | Edge-authenticated deployments where Cloudflare Access supplies identity. |
@@ -217,8 +217,8 @@ the capability query's admin authorization check. The CLI combines the health
 and capability results so a reachable gateway with an expired or rejected
 token is reported as connected but unauthenticated.
 
-Sandbox supervisor RPCs authenticate with explicit sandbox credentials; mTLS
-does not grant sandbox identity. Kubernetes deployments use the
+Sandbox supervisor RPCs authenticate with explicit sandbox credentials; TLS
+authenticates the gateway and does not grant sandbox identity. Kubernetes deployments use the
 gateway-minted JWT bootstrap path: the supervisor starts with a projected
 ServiceAccount token, exchanges it for a gateway-minted sandbox JWT, and uses
 that JWT on subsequent gateway RPCs.
@@ -700,7 +700,7 @@ aliases, network names, and the sandbox JWT issuer.
 
 `[openshell.gateway]` carries a small set of values (`sandbox_namespace`,
 `default_image`,
-`supervisor_image`, `guest_tls_ca/cert/key`, `client_tls_secret_name`,
+`supervisor_image`, `guest_tls_ca`, `client_tls_secret_name`,
 `host_gateway_ip`, `enable_user_namespaces`) that are inherited into each
 driver's `[openshell.drivers.<name>]` table when the driver-specific table
 does not override them. The allowlist is per-driver so a gateway-wide

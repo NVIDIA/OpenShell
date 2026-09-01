@@ -32,9 +32,9 @@ The CLI uses one of these authentication modes depending on the gateway's config
 
 ### mTLS
 
-The default mode for local Docker, Podman, and VM gateways without OIDC. The CLI presents a client certificate during the TLS handshake, and the gateway can map the verified certificate subject to a local user principal when mTLS user authentication is enabled.
+The default mode for gateways with a client CA and no OIDC issuer. The CLI presents a client certificate during the TLS handshake, and the gateway can map the verified certificate subject to a local user principal when mTLS user authentication is enabled.
 
-mTLS user authentication is for local single-user gateways. Kubernetes deployments must use OIDC or a trusted access proxy for user authentication; the Helm chart does not render `mtls_auth`.
+mTLS user authentication is configured by the gateway and is independent of the compute driver. Shared deployments can still prefer OIDC or a trusted access proxy for user identity and lifecycle management.
 
 Set these environment variables before starting the gateway:
 
@@ -43,13 +43,13 @@ Set these environment variables before starting the gateway:
 | `OPENSHELL_TLS_CERT` | Path to the gateway server certificate. |
 | `OPENSHELL_TLS_KEY` | Path to the gateway server private key. |
 | `OPENSHELL_TLS_CLIENT_CA` | Path to the CA certificate that verifies CLI client certificates. |
-| `OPENSHELL_ENABLE_MTLS_AUTH` | Set to `true` to authenticate CLI callers from verified client certificates. Defaults on for local Docker, Podman, and VM gateways with no OIDC issuer. |
+| `OPENSHELL_ENABLE_MTLS_AUTH` | Set to `true` to authenticate CLI callers from verified client certificates. Defaults on when a client CA is configured and no OIDC issuer is present. |
 
 For local access, the server certificate must be valid for the endpoint the CLI uses. Include `localhost`, `127.0.0.1`, and `::1` in the certificate SANs when users connect to a local gateway through loopback.
 
 Package-managed local gateways generate this bundle automatically for the `openshell` gateway name. Homebrew registers `https://localhost:17670`; Debian and RPM use `https://127.0.0.1:17670`.
 When you register a package-managed local gateway with `openshell gateway add <endpoint> --local --name openshell`, the CLI refreshes its mTLS bundle from the package-managed TLS directory.
-On Homebrew, the gateway service also mirrors the Docker sandbox client bundle into `$HOME/.local/state/openshell/homebrew/tls` before startup so Docker Desktop can bind-mount the files into sandbox containers.
+On Homebrew, the gateway service also mirrors the CA into `$HOME/.local/state/openshell/homebrew/tls` before startup so Docker Desktop can bind-mount gateway trust into sandbox containers. The driver does not mount the user client certificate or private key.
 
 The CLI loads its mTLS bundle from `~/.config/openshell/gateways/<name>/mtls/`:
 
@@ -191,7 +191,7 @@ to [Manage Workspaces and Access](/sandboxes/manage-workspaces).
 
 If `OPENSHELL_OIDC_SCOPES_CLAIM` is set, the gateway also enforces scopes. It accepts space-delimited scope strings such as `scope: "openid sandbox:read"` and JSON arrays such as `scp: ["sandbox:read"]`. Standard OIDC scopes such as `openid`, `profile`, `email`, and `offline_access` are ignored for authorization. `openshell:all` grants access to all scoped methods.
 
-Supervisor-to-gateway RPCs do not use user OIDC tokens or mTLS user identity. Each sandbox supervisor presents a gateway-minted `Authorization: Bearer` token scoped to its sandbox ID. On Kubernetes, the Kubernetes compute driver validates the projected ServiceAccount token with TokenReview, verifies the live pod UID and controlling `Sandbox` ownerReference, and returns the authenticated sandbox ID to the gateway. The gateway verifies that sandbox still exists before minting its JWT. Log upload, policy status, credential environment lookup, inference bundle lookup, and sandbox config sync run with sandbox-restricted scope, while CLI users authenticate with OIDC, edge auth, local mTLS user authentication, or an explicitly enabled unauthenticated local developer mode. `GetInferenceBundle` returns route material that includes provider credentials, so it requires a sandbox principal; user callers manage inference configuration through the user-facing inference APIs instead.
+Supervisor-to-gateway RPCs do not use user OIDC tokens or mTLS user identity. TLS authenticates the gateway to the supervisor using the configured CA; no client certificate or private key is mounted into the sandbox. Each sandbox supervisor presents a gateway-minted `Authorization: Bearer` token scoped to its sandbox ID. On Kubernetes, the Kubernetes compute driver validates the projected ServiceAccount token with TokenReview, verifies the live pod UID and controlling `Sandbox` ownerReference, and returns the authenticated sandbox ID to the gateway. The gateway verifies that sandbox still exists before minting its JWT. Log upload, policy status, credential environment lookup, inference bundle lookup, and sandbox config sync run with sandbox-restricted scope, while CLI users authenticate with OIDC, edge auth, local mTLS user authentication, or an explicitly enabled unauthenticated local developer mode. `GetInferenceBundle` returns route material that includes provider credentials, so it requires a sandbox principal; user callers manage inference configuration through the user-facing inference APIs instead.
 
 Re-authenticate an OIDC gateway with:
 

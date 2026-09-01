@@ -136,8 +136,6 @@ network_name      = "openshell"
 supervisor_bin    = "/usr/local/libexec/openshell/openshell-sandbox"  # optional override
 supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"      # used to extract bin
 guest_tls_ca      = "/etc/openshell/certs/ca.pem"
-guest_tls_cert    = "/etc/openshell/certs/client.pem"
-guest_tls_key     = "/etc/openshell/certs/client-key.pem"
 
 [openshell.drivers.podman]
 socket_path       = "/run/podman/podman.sock"
@@ -147,8 +145,6 @@ supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"
 network_name      = "openshell"
 stop_timeout_secs = 10
 guest_tls_ca      = "/etc/openshell/certs/ca.pem"
-guest_tls_cert    = "/etc/openshell/certs/client.pem"
-guest_tls_key     = "/etc/openshell/certs/client-key.pem"
 
 [openshell.drivers.vm]
 state_dir       = "/var/lib/openshell/vm"
@@ -158,8 +154,6 @@ vcpus           = 2
 mem_mib         = 2048
 krun_log_level  = 1
 guest_tls_ca    = "/var/lib/openshell/guest-tls/ca.pem"
-guest_tls_cert  = "/var/lib/openshell/guest-tls/client.pem"
-guest_tls_key   = "/var/lib/openshell/guest-tls/client-key.pem"
 ```
 
 ### Driver configuration
@@ -167,7 +161,7 @@ guest_tls_key   = "/var/lib/openshell/guest-tls/client-key.pem"
 Each `[openshell.drivers.<name>]` table is extracted from the parsed file and handed to the driver's initialization function as a raw TOML value. The driver is then responsible for:
 
 1. **Parsing** — deserializing the table into its own typed config struct (e.g. `KubernetesComputeConfig`, `DockerComputeConfig`, `PodmanComputeConfig`, `VmComputeConfig`).
-2. **Validation** — applying cross-field checks specific to that driver (e.g. requiring TLS triplets when sandbox-side mTLS is enabled).
+2. **Validation** — applying cross-field checks specific to that driver (e.g. requiring a CA certificate for server-authenticated sandbox TLS).
 3. **Consumption** — using the resulting struct to initialize internal state.
 
 Driver authors define and own their config schema. Adding a new driver does not require changes to the gateway's core `Config` struct or to this RFC.
