@@ -10,7 +10,7 @@
 
 use openshell_core::proto::{
     CredentialHandle, ExecSandboxRequest, Provider, SandboxPolicy as ProtoSandboxPolicy,
-    SandboxTemplate,
+    SandboxSpec, SandboxTemplate,
 };
 use prost::Message;
 use tonic::Status;
@@ -150,26 +150,12 @@ pub(super) fn validate_dns1123_label(name: &str, field: &str) -> Result<(), Stat
 /// Validate field sizes on a `CreateSandboxRequest` before persisting.
 ///
 /// Returns `INVALID_ARGUMENT` on the first field that exceeds its limit.
-pub(super) fn validate_sandbox_spec(
-    name: &str,
-    spec: &openshell_core::proto::SandboxSpec,
-) -> Result<(), Status> {
+pub(super) fn validate_sandbox_spec(name: &str, spec: &SandboxSpec) -> Result<(), Status> {
     // --- request.name ---
-    if !name.is_empty() && name.len() > MAX_ROUTABLE_NAME_LEN {
-        return Err(Status::invalid_argument(format!(
-            "name exceeds maximum length ({} > {MAX_ROUTABLE_NAME_LEN})",
-            name.len()
-        )));
-    }
-    validate_dns1123_label(name, "name")?;
+    validate_sandbox_name(name)?;
 
     // --- spec.providers ---
-    if spec.providers.len() > MAX_PROVIDERS {
-        return Err(Status::invalid_argument(format!(
-            "providers list exceeds maximum ({} > {MAX_PROVIDERS})",
-            spec.providers.len()
-        )));
-    }
+    validate_sandbox_provider_count(spec)?;
 
     // --- spec.log_level ---
     if spec.log_level.len() > MAX_LOG_LEVEL_LEN {
@@ -203,6 +189,45 @@ pub(super) fn validate_sandbox_spec(
     }
 
     // --- spec.policy serialized size ---
+    validate_sandbox_policy_size(spec)?;
+
+    Ok(())
+}
+
+pub(super) fn validate_sandbox_governance_spec(
+    name: &str,
+    spec: &SandboxSpec,
+) -> Result<(), Status> {
+    validate_sandbox_name(name)?;
+    validate_sandbox_provider_count(spec)?;
+    if !spec.command.is_empty() {
+        validate_main_process_command(&spec.command)?;
+    }
+    validate_sandbox_policy_size(spec)?;
+    Ok(())
+}
+
+fn validate_sandbox_name(name: &str) -> Result<(), Status> {
+    if !name.is_empty() && name.len() > MAX_ROUTABLE_NAME_LEN {
+        return Err(Status::invalid_argument(format!(
+            "name exceeds maximum length ({} > {MAX_ROUTABLE_NAME_LEN})",
+            name.len()
+        )));
+    }
+    validate_dns1123_label(name, "name")
+}
+
+fn validate_sandbox_provider_count(spec: &SandboxSpec) -> Result<(), Status> {
+    if spec.providers.len() > MAX_PROVIDERS {
+        return Err(Status::invalid_argument(format!(
+            "providers list exceeds maximum ({} > {MAX_PROVIDERS})",
+            spec.providers.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_sandbox_policy_size(spec: &SandboxSpec) -> Result<(), Status> {
     if let Some(ref policy) = spec.policy {
         let size = policy.encoded_len();
         if size > MAX_POLICY_SIZE {
@@ -244,7 +269,7 @@ fn validate_main_process_command(command: &[String]) -> Result<(), Status> {
     Ok(())
 }
 
-fn validate_gpu_request_fields(spec: &openshell_core::proto::SandboxSpec) -> Result<(), Status> {
+fn validate_gpu_request_fields(spec: &SandboxSpec) -> Result<(), Status> {
     if openshell_core::gpu::sandbox_gpu_count(spec.resource_requirements.as_ref()) == Some(0) {
         return Err(Status::invalid_argument("gpu count must be greater than 0"));
     }

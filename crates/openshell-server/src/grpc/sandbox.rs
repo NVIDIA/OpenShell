@@ -59,7 +59,8 @@ use super::provider::{
 };
 use super::validation::{
     level_matches, source_matches, validate_dns1123_label, validate_exec_request_fields,
-    validate_no_reserved_provider_policy_keys, validate_policy_safety, validate_sandbox_spec,
+    validate_no_reserved_provider_policy_keys, validate_policy_safety,
+    validate_sandbox_governance_spec, validate_sandbox_spec,
 };
 use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, clamp_limit};
 use crate::persistence::current_time_ms;
@@ -257,12 +258,7 @@ async fn handle_create_sandbox_inner(
     let await_main_process_attachment = request.await_main_process_attachment;
     let workload_template_name = request.workload_template_name.trim().to_string();
 
-    // Validate labels (keys and values must meet Kubernetes requirements).
-    for (key, value) in &request.labels {
-        crate::grpc::validation::validate_label_key(key)?;
-        crate::grpc::validation::validate_label_value(value)?;
-    }
-    crate::grpc::validation::validate_annotations(&request.annotations, "annotations")?;
+    validate_create_sandbox_request_pre_io(&request, &workload_template_name)?;
 
     let authz = authorize_workspace(
         &state.store,
@@ -282,9 +278,7 @@ async fn handle_create_sandbox_inner(
             .ok_or_else(|| Status::invalid_argument("spec is required"))?;
         (spec, None)
     } else {
-        validate_dns1123_label(&workload_template_name, "workload_template_name")?;
         let governance_spec = request.spec.unwrap_or_default();
-        validate_template_create_governance_spec(&governance_spec)?;
         let template = state
             .store
             .get_message_by_name::<SandboxWorkloadTemplate>(&workspace, &workload_template_name)
@@ -440,6 +434,35 @@ async fn handle_create_sandbox_inner(
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
     }))
+}
+
+fn validate_create_sandbox_request_pre_io(
+    request: &CreateSandboxRequest,
+    workload_template_name: &str,
+) -> Result<(), Status> {
+    // Validate labels (keys and values must meet Kubernetes requirements).
+    for (key, value) in &request.labels {
+        crate::grpc::validation::validate_label_key(key)?;
+        crate::grpc::validation::validate_label_value(value)?;
+    }
+    crate::grpc::validation::validate_annotations(&request.annotations, "annotations")?;
+
+    if workload_template_name.is_empty() {
+        let spec = request
+            .spec
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("spec is required"))?;
+        return validate_sandbox_spec(&request.name, spec);
+    }
+
+    validate_dns1123_label(workload_template_name, "workload_template_name")?;
+    if let Some(spec) = request.spec.as_ref() {
+        validate_template_create_governance_spec(spec)?;
+        validate_sandbox_governance_spec(&request.name, spec)?;
+    } else {
+        validate_sandbox_governance_spec(&request.name, &SandboxSpec::default())?;
+    }
+    Ok(())
 }
 
 fn validate_template_create_governance_spec(spec: &SandboxSpec) -> Result<(), Status> {
@@ -5013,7 +5036,7 @@ mod tests {
         let err = handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
-                name: "from-corrupt-template".to_string(),
+                name: "from-corrupt".to_string(),
                 spec: Some(SandboxSpec::default()),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
@@ -5025,7 +5048,7 @@ mod tests {
         .await
         .expect_err("corrupted stored template should fail as server data corruption");
 
-        assert_eq!(err.code(), tonic::Code::Internal);
+        assert_eq!(err.code(), tonic::Code::Internal, "{}", err.message());
         assert!(err.message().contains("sandbox template spec"));
     }
 
@@ -5085,6 +5108,58 @@ mod tests {
 
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("workload_template_name"));
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_from_workload_template_rejects_oversized_governance_before_lookup() {
+        let state = test_server_state().await;
+
+        let err = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                name: "bad-template-create".to_string(),
+                spec: Some(SandboxSpec {
+                    providers: (0..=MAX_PROVIDERS).map(|i| format!("p-{i}")).collect(),
+                    ..Default::default()
+                }),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                workload_template_name: "missing-template".to_string(),
+                await_main_process_attachment: false,
+            }),
+        )
+        .await
+        .expect_err("oversized governance spec should be rejected before template lookup");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("providers"));
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_rejects_oversized_direct_spec_before_workspace_lookup() {
+        let state = test_server_state().await;
+
+        let err = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                name: "bad-direct-create".to_string(),
+                spec: Some(SandboxSpec {
+                    providers: (0..=MAX_PROVIDERS).map(|i| format!("p-{i}")).collect(),
+                    ..Default::default()
+                }),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                workspace: "missing-workspace".to_string(),
+                workload_template_name: String::new(),
+                await_main_process_attachment: false,
+            }),
+        )
+        .await
+        .expect_err("oversized direct spec should be rejected before workspace lookup");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("providers"));
     }
 
     #[tokio::test]
