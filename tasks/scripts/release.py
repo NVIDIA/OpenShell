@@ -169,7 +169,7 @@ def _versions_from_prerelease(
 ) -> Versions:
     version = f"{_format_semver(base_version)}-pre.{sequence}"
     return Versions(
-        python=version,
+        python=f"{_format_semver(base_version)}rc{sequence}",
         cargo=version,
         npm=version,
         docker=version,
@@ -213,6 +213,21 @@ def _compute_versions() -> Versions:
     return _versions_from_parts(parsed_tag, git_distance, git_sha, git_tag)
 
 
+def _compute_dev_versions() -> Versions:
+    git_sha = _git(["rev-parse", "--short=9", "HEAD"])
+    git_tag = _latest_stable_tag()
+    if git_tag is None:
+        git_distance = int(_git(["rev-list", "--count", "HEAD"]))
+        return _versions_from_parts((0, 0, 0), git_distance, git_sha, "")
+
+    parsed_tag = _parse_semver_tag(git_tag)
+    if parsed_tag is None:
+        raise RuntimeError(f"invalid semantic release tag: {git_tag}")
+
+    git_distance = int(_git(["rev-list", f"{git_tag}..HEAD", "--count"]))
+    return _versions_from_parts(parsed_tag, git_distance, git_sha, git_tag)
+
+
 def _print_env(versions: Versions) -> None:
     print(f"VERSION_PY={versions.python}")
     print(f"VERSION_CARGO={versions.cargo}")
@@ -227,8 +242,8 @@ def _print_env(versions: Versions) -> None:
     print(f"GIT_DISTANCE={versions.git_distance}")
 
 
-def get_version(format: str) -> None:
-    versions = _compute_versions()
+def get_version(format: str, *, dev: bool = False) -> None:
+    versions = _compute_dev_versions() if dev else _compute_versions()
     if format == "python":
         print(versions.python)
     elif format == "cargo":
@@ -492,6 +507,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     get_version_parser = sub.add_parser("get-version", help="Print computed version.")
     get_version_parser.add_argument(
+        "--dev", action="store_true", help="Ignore exact tags and print a dev version."
+    )
+    get_version_parser.add_argument(
         "--python", action="store_true", help="Print Python version only."
     )
     get_version_parser.add_argument(
@@ -550,25 +568,25 @@ def main() -> None:
 
     if args.command == "get-version":
         if args.python:
-            get_version("python")
+            get_version("python", dev=args.dev)
         elif args.cargo:
-            get_version("cargo")
+            get_version("cargo", dev=args.dev)
         elif args.npm:
-            get_version("npm")
+            get_version("npm", dev=args.dev)
         elif args.docker:
-            get_version("docker")
+            get_version("docker", dev=args.dev)
         elif args.deb:
-            get_version("deb")
+            get_version("deb", dev=args.dev)
         elif args.snap:
-            get_version("snap")
+            get_version("snap", dev=args.dev)
         elif args.rpm_version:
-            get_version("rpm-version")
+            get_version("rpm-version", dev=args.dev)
         elif args.rpm_release:
-            get_version("rpm-release")
+            get_version("rpm-release", dev=args.dev)
         elif args.json:
-            get_version("json")
+            get_version("json", dev=args.dev)
         else:
-            get_version("all")
+            get_version("all", dev=args.dev)
     elif args.command == "generate-homebrew-formula":
         generate_homebrew_formula(
             release_tag=args.release_tag,

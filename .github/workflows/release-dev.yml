@@ -47,11 +47,11 @@ jobs:
         id: v
         run: |
           set -euo pipefail
-          echo "python=$(uv run python tasks/scripts/release.py get-version --python)" >> "$GITHUB_OUTPUT"
-          echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
-          echo "deb=$(uv run python tasks/scripts/release.py get-version --deb)" >> "$GITHUB_OUTPUT"
-          echo "rpm_version=$(uv run python tasks/scripts/release.py get-version --rpm-version)" >> "$GITHUB_OUTPUT"
-          echo "rpm_release=$(uv run python tasks/scripts/release.py get-version --rpm-release)" >> "$GITHUB_OUTPUT"
+          echo "python=$(uv run python tasks/scripts/release.py get-version --dev --python)" >> "$GITHUB_OUTPUT"
+          echo "cargo=$(uv run python tasks/scripts/release.py get-version --dev --cargo)" >> "$GITHUB_OUTPUT"
+          echo "deb=$(uv run python tasks/scripts/release.py get-version --dev --deb)" >> "$GITHUB_OUTPUT"
+          echo "rpm_version=$(uv run python tasks/scripts/release.py get-version --dev --rpm-version)" >> "$GITHUB_OUTPUT"
+          echo "rpm_release=$(uv run python tasks/scripts/release.py get-version --dev --rpm-release)" >> "$GITHUB_OUTPUT"
 
   build-cli:
     needs: compute-versions
