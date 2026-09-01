@@ -111,18 +111,19 @@ tests:
       server.oidc.issuer: https://issuer.example.com
       server.oidc.caConfigMapName: openshell-oidc-ca
     asserts:
-      - equal:
-          path: spec.template.spec.containers[0].volumeMounts[3].name
-          value: oidc-ca
-      - equal:
-          path: spec.template.spec.containers[0].volumeMounts[3].mountPath
-          value: /etc/openshell-tls/oidc-ca
-      - equal:
-          path: spec.template.spec.volumes[2].name
-          value: oidc-ca
-      - equal:
-          path: spec.template.spec.volumes[2].configMap.name
-          value: openshell-oidc-ca
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: oidc-ca
+            mountPath: /etc/openshell-tls/oidc-ca
+          any: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: oidc-ca
+            configMap:
+              name: openshell-oidc-ca
+          any: true
 
   # Regression for the P1 bug Drew flagged: grpc_endpoint MUST live in the
   # Kubernetes driver table, not in [openshell.gateway]. The gateway-side
