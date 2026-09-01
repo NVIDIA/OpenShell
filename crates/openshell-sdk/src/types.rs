@@ -128,6 +128,10 @@ pub struct SandboxTemplateCreateSpec {
     pub labels: HashMap<String, String>,
     /// Provider names to attach.
     pub providers: Vec<String>,
+    /// Exact canonical command. Empty selects the gateway's scratch login shell.
+    pub command: Vec<String>,
+    /// Allocate a retained pseudo-terminal for the canonical command.
+    pub tty: bool,
     /// Create-time sandbox policy. The named workload template supplies runtime
     /// workload fields; policy remains part of the sandbox's governance spec.
     pub policy: Option<proto::SandboxPolicy>,

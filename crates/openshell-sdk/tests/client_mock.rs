@@ -923,6 +923,8 @@ async fn create_sandbox_from_template_passes_template_name() {
             name: Some("from-template".to_string()),
             template_name: "python".to_string(),
             providers: vec!["openai".to_string()],
+            command: vec!["python".to_string(), "-m".to_string(), "agent".to_string()],
+            tty: false,
             policy: Some(proto::SandboxPolicy {
                 version: 1,
                 ..Default::default()
@@ -938,6 +940,8 @@ async fn create_sandbox_from_template_passes_template_name() {
     assert_eq!(observed.workload_template_name, "python");
     let observed_spec = observed.spec.unwrap();
     assert_eq!(observed_spec.providers, vec!["openai".to_string()]);
+    assert_eq!(observed_spec.command, vec!["python", "-m", "agent"]);
+    assert!(!observed_spec.tty);
     assert_eq!(observed_spec.policy.unwrap().version, 1);
 }
 

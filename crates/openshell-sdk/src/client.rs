@@ -1019,11 +1019,15 @@ fn create_sandbox_from_template_request(
         template_name,
         labels,
         providers,
+        command,
+        tty,
         policy,
     } = spec;
     proto::CreateSandboxRequest {
         spec: Some(proto::SandboxSpec {
             providers,
+            command,
+            tty,
             policy,
             ..proto::SandboxSpec::default()
         }),

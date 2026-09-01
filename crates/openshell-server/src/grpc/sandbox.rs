@@ -298,6 +298,8 @@ async fn handle_create_sandbox_inner(
         let mut resolved = sandbox_spec_from_stored_workload_template(&template)?;
         resolved.policy = governance_spec.policy;
         resolved.providers = governance_spec.providers;
+        resolved.command = governance_spec.command;
+        resolved.tty = governance_spec.tty;
         (resolved, Some(provenance))
     };
 
@@ -4791,6 +4793,8 @@ mod tests {
                 spec: Some(SandboxSpec {
                     providers: vec!["work-github".to_string()],
                     policy: Some(policy),
+                    command: vec!["echo".to_string(), "template-create".to_string()],
+                    tty: false,
                     ..Default::default()
                 }),
                 labels: HashMap::new(),
@@ -4815,6 +4819,11 @@ mod tests {
         let spec = created.spec.expect("resolved sandbox spec");
         assert_eq!(spec.providers, vec!["work-github".to_string()]);
         assert!(spec.policy.is_some());
+        assert_eq!(
+            spec.command,
+            vec!["echo".to_string(), "template-create".to_string()]
+        );
+        assert!(!spec.tty);
         assert_eq!(
             spec.environment.get("FEATURE_FLAG"),
             Some(&"on".to_string())
