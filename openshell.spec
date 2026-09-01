@@ -12,12 +12,6 @@
 # in the format redhat-rpm-config expects (especially on EPEL).
 %global debug_package %{nil}
 
-# Default container image tag for supervisor and sandbox images.
-# Overridden to 'latest' by Packit's fix-spec-file action for tagged stable
-# releases (via git describe --exact-match). PR and commit-to-main builds
-# keep the default 'dev' so they track the development image stream.
-%global image_tag dev
-
 Name:           openshell
 Version:        %{openshell_version}
 Release:        1.20260518180028805757.podman.toml.gateway.listener.11.g8c0cb7c8%{?dist}
@@ -30,21 +24,9 @@ Source1: openshell-%{openshell_version}-vendor.tar.xz
 
 ExclusiveArch:  x86_64 aarch64
 
-# Rust build dependencies
-# NOTE: MSRV is 1.88 (Rust edition 2024). As of mid-2025, this requires
-# Fedora Rawhide or newer. Stable Fedora and EPEL-10 may ship older Rust;
-# adjust targets in .packit.yaml accordingly or provide a supplementary
-# Rust toolchain via additional_repos in the COPR build config.
-BuildRequires:  rust >= 1.88
+# Cargo metadata generation
 BuildRequires:  cargo
 BuildRequires:  cargo-rpm-macros >= 25
-BuildRequires:  gcc
-BuildRequires:  gcc-c++
-BuildRequires:  make
-BuildRequires:  cmake
-BuildRequires:  pkg-config
-BuildRequires:  clang-devel
-BuildRequires:  z3-devel
 BuildRequires:  systemd-rpm-macros
 
 # Man page generation
@@ -103,18 +85,8 @@ sed -i 's/^version = "0.0.0"/version = "%{openshell_cargo_version}"/' Cargo.toml
 grep -q 'version = "%{openshell_cargo_version}"' Cargo.toml || (echo "ERROR: Cargo.toml version patch failed" && exit 1)
 
 %build
-# Build the CLI and gateway binaries unless the release workflow supplied the
-# same prebuilt artifacts used for tarballs and Debian packages.
-export CARGO_BUILD_JOBS=%{_smp_build_ncpus}
-# Set the default container image tag so compiled-in image refs point at
-# real tags in the ghcr.io/nvidia/openshell registry.
-export OPENSHELL_IMAGE_TAG=%{image_tag}
-if [ -n "${OPENSHELL_PREBUILT_BINARIES_DIR:-}" ]; then
-  test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell"
-  test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell-gateway"
-else
-  cargo build --release --bin openshell --bin openshell-gateway
-fi
+test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell"
+test -x "${OPENSHELL_PREBUILT_BINARIES_DIR}/openshell-gateway"
 
 # Generate vendored crate manifest and license metadata.
 # cargo-vendor.txt is consumed by an RPM generator (from cargo-rpm-macros)
@@ -129,18 +101,10 @@ pandoc -s -t man deploy/man/openshell-gateway.8.md -o openshell-gateway.8
 
 %install
 # --- CLI binary ---
-if [ -n "${OPENSHELL_PREBUILT_BINARIES_DIR:-}" ]; then
-  install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}" %{buildroot}%{_bindir}/%{name}
-else
-  install -Dpm 0755 target/release/%{name} %{buildroot}%{_bindir}/%{name}
-fi
+install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}" %{buildroot}%{_bindir}/%{name}
 
 # --- Gateway binary ---
-if [ -n "${OPENSHELL_PREBUILT_BINARIES_DIR:-}" ]; then
-  install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}-gateway" %{buildroot}%{_bindir}/%{name}-gateway
-else
-  install -Dpm 0755 target/release/%{name}-gateway %{buildroot}%{_bindir}/%{name}-gateway
-fi
+install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}-gateway" %{buildroot}%{_bindir}/%{name}-gateway
 
 # --- Default gateway TOML config template ---
 # Shipped as a read-only reference in %{_datadir}. The systemd unit seeds a
