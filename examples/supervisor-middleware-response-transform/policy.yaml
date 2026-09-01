@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 1
+
+network_middlewares:
+  response-transform:
+    name: Response transform example
+    middleware: response-transform-example
+    order: 10
+    on_error: fail_closed
+    endpoints:
+      include:
+        - host.openshell.internal
+
+network_policies:
+  response-framing-demo:
+    name: Response framing demo
+    endpoints:
+      - host: host.openshell.internal
+        port: 18081
+        protocol: rest
+        rules:
+          - allow:
+              method: GET
+              path: /headers-only
+          - allow:
+              method: GET
+              path: /whole-body
+          - allow:
+              method: GET
+              path: /stream
+    binaries:
+      - path: /usr/bin/curl
