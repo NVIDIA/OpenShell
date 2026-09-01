@@ -657,6 +657,55 @@ where
     Ok(out)
 }
 
+async fn providers_using_profile(
+    store: &Store,
+    workspace: &str,
+    profile_id: &str,
+) -> Result<Vec<String>, Status> {
+    let is_platform_scope = workspace.is_empty();
+    let mut offset = 0u32;
+    let mut blocking = Vec::new();
+    loop {
+        let records = if is_platform_scope {
+            store
+                .list_by_type(Provider::object_type(), 1000, offset)
+                .await
+        } else {
+            store
+                .list(Provider::object_type(), workspace, 1000, offset)
+                .await
+        }
+        .map_err(|e| Status::internal(format!("list providers failed: {e}")))?;
+        if records.is_empty() {
+            break;
+        }
+        offset = offset
+            .checked_add(
+                u32::try_from(records.len())
+                    .map_err(|_| Status::internal("provider page size exceeded u32"))?,
+            )
+            .ok_or_else(|| Status::internal("provider pagination offset overflow"))?;
+        for record in records {
+            let provider = Provider::decode(record.payload.as_slice())
+                .map_err(|e| Status::internal(format!("decode provider failed: {e}")))?;
+            if provider.profile_workspace != workspace
+                || normalize_profile_id(&provider.r#type).as_deref() != Some(profile_id)
+            {
+                continue;
+            }
+            let label = if is_platform_scope {
+                format!("{}/{}", provider.object_workspace(), provider.object_name())
+            } else {
+                provider.object_name().to_string()
+            };
+            blocking.push(label);
+        }
+    }
+    blocking.sort();
+    blocking.dedup();
+    Ok(blocking)
+}
+
 async fn sandboxes_using_provider(
     store: &Store,
     workspace: &str,
@@ -2447,6 +2496,7 @@ pub(super) async fn handle_create_provider(
         ));
     }
     let provider_type = provider.r#type.clone();
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
@@ -2899,11 +2949,11 @@ pub(super) async fn handle_delete_provider_profile(
         return Err(Status::not_found("provider profile not found"));
     }
 
-    let blocking_sandboxes = sandboxes_using_profile(state.store.as_ref(), &workspace, &id).await?;
-    if !blocking_sandboxes.is_empty() {
+    let blocking_providers = providers_using_profile(state.store.as_ref(), &workspace, &id).await?;
+    if !blocking_providers.is_empty() {
         return Err(Status::failed_precondition(format!(
-            "provider profile '{id}' is in use by sandboxes: {}",
-            blocking_sandboxes.join(", ")
+            "provider profile '{id}' is in use by providers: {}",
+            blocking_providers.join(", ")
         )));
     }
 
@@ -3636,72 +3686,6 @@ fn has_errors(diagnostics: &[ProfileValidationDiagnostic]) -> bool {
     diagnostics
         .iter()
         .any(|diagnostic| diagnostic.severity == "error")
-}
-
-async fn sandboxes_using_profile(
-    store: &Store,
-    workspace: &str,
-    profile_id: &str,
-) -> Result<Vec<String>, Status> {
-    let is_platform_scope = workspace.is_empty();
-
-    let candidates = if is_platform_scope {
-        scan_sandboxes_all(store, |sandbox| {
-            let has_providers = sandbox
-                .spec
-                .as_ref()
-                .is_some_and(|s| !s.providers.is_empty());
-            has_providers.then_some(sandbox)
-        })
-        .await?
-    } else {
-        scan_sandboxes(store, workspace, |sandbox| {
-            let has_providers = sandbox
-                .spec
-                .as_ref()
-                .is_some_and(|s| !s.providers.is_empty());
-            has_providers.then_some(sandbox)
-        })
-        .await?
-    };
-
-    let mut blocking = Vec::new();
-    for sandbox in candidates {
-        let sandbox_workspace = sandbox.object_workspace().to_string();
-        let spec = sandbox.spec.as_ref().expect("filtered by scan_sandboxes");
-        for provider_name in &spec.providers {
-            let provider_ws = if is_platform_scope {
-                &sandbox_workspace
-            } else {
-                workspace
-            };
-            let Some(provider) = store
-                .get_message_by_name::<Provider>(provider_ws, provider_name)
-                .await
-                .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
-            else {
-                continue;
-            };
-            if is_platform_scope && !provider.profile_workspace.is_empty() {
-                continue;
-            }
-            if !is_platform_scope && provider.profile_workspace.is_empty() {
-                continue;
-            }
-            if normalize_profile_id(&provider.r#type).as_deref() == Some(profile_id) {
-                let label = if is_platform_scope {
-                    format!("{}/{}", sandbox_workspace, sandbox.object_name())
-                } else {
-                    sandbox.object_name().to_string()
-                };
-                blocking.push(label);
-                break;
-            }
-        }
-    }
-    blocking.sort();
-    blocking.dedup();
-    Ok(blocking)
 }
 
 pub(super) async fn handle_update_provider(
@@ -4940,17 +4924,18 @@ mod tests {
     use crate::grpc::{MAX_MAP_KEY_LEN, MAX_PROVIDER_TYPE_LEN};
     use crate::persistence::test_store;
     use openshell_core::proto::{
-        ConfigureProviderRefreshRequest, CreateProviderRequest, CreateWorkspaceRequest,
-        DeleteProviderProfileRequest, DeleteProviderRefreshRequest, DeleteProviderRequest,
-        GetProviderProfileRequest, GetProviderRefreshStatusRequest, GetProviderRequest,
-        ImportProviderProfilesRequest, L7Allow, L7Rule, LintProviderProfilesRequest,
-        ListProviderProfilesRequest, ListProvidersRequest, NetworkBinary, NetworkEndpoint,
-        NetworkPolicyRule, ProviderCredentialRefresh, ProviderCredentialRefreshMaterial,
-        ProviderCredentialTokenGrant, ProviderCredentialTokenGrantAudienceOverride,
-        ProviderCredentialTokenGrantSubjectToken, ProviderCredentialTokenGrantType,
-        ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
-        ProviderProfileImportItem, RotateProviderCredentialRequest, Sandbox, SandboxPolicy,
-        SandboxSpec, StoredProviderProfile, UpdateProviderProfilesRequest, UpdateProviderRequest,
+        AttachSandboxProviderRequest, ConfigureProviderRefreshRequest, CreateProviderRequest,
+        CreateWorkspaceRequest, DeleteProviderProfileRequest, DeleteProviderRefreshRequest,
+        DeleteProviderRequest, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
+        GetProviderRequest, ImportProviderProfilesRequest, L7Allow, L7Rule,
+        LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
+        NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProviderCredentialRefresh,
+        ProviderCredentialRefreshMaterial, ProviderCredentialTokenGrant,
+        ProviderCredentialTokenGrantAudienceOverride, ProviderCredentialTokenGrantSubjectToken,
+        ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileCategory,
+        ProviderProfileCredential, ProviderProfileImportItem, RotateProviderCredentialRequest,
+        Sandbox, SandboxPolicy, SandboxSpec, StoredProviderProfile, UpdateProviderProfilesRequest,
+        UpdateProviderRequest,
     };
     use openshell_core::{ObjectId, ObjectName};
     use tonic::{Code, Request};
@@ -6508,7 +6493,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_provider_profile_rejects_builtin_and_in_use_custom_profiles() {
+    async fn delete_provider_profile_rejects_builtin_and_provider_referenced_profiles() {
         let state = test_server_state().await;
         handle_import_provider_profiles(
             &state,
@@ -6546,7 +6531,7 @@ mod tests {
             .put_message(&Sandbox {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "sandbox-id".to_string(),
-                    name: "sandbox-using-custom".to_string(),
+                    name: "sandbox-custom".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
@@ -6555,7 +6540,7 @@ mod tests {
                     deletion_timestamp_ms: 0,
                 }),
                 spec: Some(SandboxSpec {
-                    providers: vec!["custom-provider".to_string()],
+                    providers: Vec::new(),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -6573,7 +6558,57 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(in_use_err.code(), Code::FailedPrecondition);
-        assert!(in_use_err.message().contains("sandbox-using-custom"));
+        assert!(in_use_err.message().contains("custom-provider"));
+
+        let attached = super::super::sandbox::handle_attach_sandbox_provider(
+            &state,
+            authed_request(AttachSandboxProviderRequest {
+                sandbox_name: "sandbox-custom".to_string(),
+                provider_name: "custom-provider".to_string(),
+                expected_resource_version: 0,
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(attached.attached);
+    }
+
+    #[tokio::test]
+    async fn delete_global_provider_profile_checks_providers_in_every_workspace() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&stored_provider_profile_for_workspace(
+                custom_profile("global-custom"),
+                "",
+            ))
+            .await
+            .unwrap();
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), "default")
+            .await
+            .unwrap();
+        let mut provider = provider_with_values("global-provider", "global-custom");
+        provider.profile_workspace = String::new();
+        create_provider_record_with_catalog(state.store.as_ref(), &catalog, "default", provider)
+            .await
+            .unwrap();
+
+        let err = handle_delete_provider_profile(
+            &state,
+            authed_request(DeleteProviderProfileRequest {
+                id: "global-custom".to_string(),
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("default/global-provider"));
     }
 
     #[tokio::test]
@@ -7906,6 +7941,57 @@ mod tests {
             .expect("delete should succeed")
             .into_inner();
         assert!(response.deleted);
+    }
+
+    #[tokio::test]
+    async fn create_provider_waits_for_provider_profile_delete_guard() {
+        let state = test_server_state().await;
+        handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("guarded-create")),
+                    source: "guarded-create.yaml".to_string(),
+                }],
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let guard = state.compute.sandbox_sync_guard().await;
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            let mut provider = provider_with_values("guarded-provider", "guarded-create");
+            provider.credentials.clear();
+            provider.config.clear();
+            handle_create_provider(
+                &task_state,
+                authed_request(CreateProviderRequest {
+                    provider: Some(provider),
+                    workspace: "default".to_string(),
+                }),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !task.is_finished(),
+            "provider create should wait for provider profile mutation guard"
+        );
+        drop(guard);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("create should finish after guard release")
+            .expect("join create task")
+            .expect("create should succeed")
+            .into_inner();
+        assert_eq!(
+            response.provider.expect("provider").object_name(),
+            "guarded-provider"
+        );
     }
 
     #[tokio::test]

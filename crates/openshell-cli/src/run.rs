@@ -4961,12 +4961,10 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
             .into_inner()
             .provider
             .ok_or_else(|| miette::miette!("provider '{name}' not found"))?;
-        let profile_workspace = if existing.profile_workspace.is_empty() {
-            workspace
-        } else {
-            &existing.profile_workspace
-        };
-        Some(fetch_provider_profile(&mut client, &existing.r#type, profile_workspace).await?)
+        Some(
+            fetch_provider_profile(&mut client, &existing.r#type, &existing.profile_workspace)
+                .await?,
+        )
     } else {
         None
     };
@@ -4994,8 +4992,12 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
             .ok_or_else(|| miette::miette!("provider '{name}' not found"))?;
 
         let provider_type = existing.r#type;
-        let discovered =
-            discover_existing_provider_data(&mut client, &provider_type, workspace).await?;
+        let discovered = discover_existing_provider_data(
+            &mut client,
+            &provider_type,
+            &existing.profile_workspace,
+        )
+        .await?;
         let Some(discovered) = discovered else {
             return Err(miette::miette!(
                 "no existing local credentials/config found for provider type '{provider_type}'"
