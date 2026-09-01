@@ -150,6 +150,42 @@ await client.sandbox.setPolicy(name, config.policy!, { wait: true })
 await client.sandbox.setSetting(name, 'feature.enabled', { value: { case: 'boolValue', value: true } })
 ```
 
+Provider lifecycle and credential updates use the curated `client.providers`
+API. Credential values are sent only to the gateway and are deliberately absent
+from `ProviderRecord` responses. Give each sandbox (or security principal) its
+own provider when credentials must remain isolated:
+
+```ts
+const provider = await client.providers.ensure('tenant-a', {
+  name: `backend-token-${sandboxName}`,
+  type: 'backend-api',
+  credentials: { USER_JWT: initialJwt },
+  credentialExpiresAtMs: { USER_JWT: expiresAtMs.toString() },
+})
+
+const sandbox = await client.sandbox.create({
+  name: sandboxName,
+  image,
+  providers: [provider.name],
+})
+
+// Rotate through OpenShell's provider handling. Sandbox code keeps using its
+// provider environment; it never receives the credential as an app secret.
+const current = await client.providers.get('tenant-a', provider.name)
+await client.providers.update('tenant-a', {
+  name: current.name,
+  type: current.type,
+  resourceVersion: current.resourceVersion,
+  credentials: { USER_JWT: refreshedJwt },
+  credentialExpiresAtMs: { USER_JWT: refreshedExpiresAtMs.toString() },
+})
+```
+
+`update` merges credential, expiry, and configuration keys. A credential owned
+by an automatic refresh configuration must instead be rotated through the
+provider-refresh API; curated profile and refresh sub-clients are follow-up
+work and remain available through `client.raw` in the meantime.
+
 Sandbox-scoped `setPolicy` may only change `networkPolicies`; static fields (`filesystem`, `landlock`, `process`) must match the create-time policy. Sandbox-scoped setting deletes are rejected by the gateway, so only upsert (`setSetting`) is exposed here.
 
 ## Surface and roadmap
@@ -158,7 +194,8 @@ The SDK's goal is agent parity: anything the OpenShell gateway can do should be 
 
 - `client.sandbox` (`SandboxClient`) is available today: sandbox lifecycle, exec, forward, SSH, sandbox-scoped providers, config, and policy.
 - `client.gateway` (`GatewayClient`) is planned: gateway-scoped config and settings, health, and cluster status.
-- `client.providers` (`ProviderClient`) is planned: gateway-scoped provider CRUD and profiles.
+- `client.providers` (`ProviderClient`) is available: workspace-scoped provider CRUD, idempotent ensure, and manual credential updates.
+- `client.providers.profiles` and `client.providers.refresh` are planned: curated provider profile and automatic credential-refresh operations.
 
 `health()` lives at the root today and will move under `client.gateway` (with a root alias) when that lands.
 
@@ -166,7 +203,7 @@ Curated methods are added deliberately, so some gateway RPCs are not yet wrapped
 
 ### Advanced: raw escape hatch
 
-`client.raw` is a generated client for every gateway RPC, including surface the curated sub-clients do not wrap yet (gateway config, provider CRUD, policy status, watch, logs, and the full observed `Sandbox`). `client.transport` is the shared connection, so extra clients reuse one socket. Generated request and response types live at `@nvidia/openshell-sdk/raw`.
+`client.raw` is a generated client for every gateway RPC, including surface the curated sub-clients do not wrap yet (gateway config, provider profiles and refresh, policy status, watch, logs, and the full observed `Sandbox`). `client.transport` is the shared connection, so extra clients reuse one socket. Generated request and response types live at `@nvidia/openshell-sdk/raw`.
 
 ```ts
 import { OpenShellClient } from '@nvidia/openshell-sdk'
