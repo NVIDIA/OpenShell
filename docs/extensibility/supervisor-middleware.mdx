@@ -3,15 +3,19 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Supervisor Middleware"
 sidebar-title: "Supervisor Middleware"
-description: "Configure and operate built-in and operator-run middleware for sandbox HTTP requests and WebSocket messages."
-keywords: "Generative AI, Cybersecurity, AI Agents, Supervisor Middleware, Extensibility, Request Filtering"
+description: "Configure and operate built-in and operator-run middleware for sandbox HTTP requests, HTTP responses, and WebSocket messages."
+keywords: "Generative AI, Cybersecurity, AI Agents, Supervisor Middleware, Extensibility, Request Filtering, Response Filtering"
 ---
 
-Supervisor middleware adds ordered processing stages to allowed HTTP and WebSocket egress. Middleware runs after network and L7 policy admit traffic and before OpenShell injects provider credentials. A stage can allow or deny an HTTP request or client WebSocket text message, replace its payload, add approved HTTP headers, and report audit-safe findings.
+Supervisor middleware adds ordered processing stages to allowed HTTP and WebSocket egress. Request middleware runs after network and L7 policy admit traffic and before OpenShell injects provider credentials. Response middleware runs after the upstream returns a final response and before OpenShell delivers it to the sandbox. A stage can transform request or response content, mutate permitted HTTP headers, and report audit-safe findings. Request and WebSocket hooks can also deny traffic; V1 response middleware has no explicit body-denial decision.
 
 Middleware selection is independent of the network policy rule that admitted the request. OpenShell matches middleware by destination host, so the same middleware applies consistently across broad, specific, user-authored, and provider-derived network policies.
 
-## Request Flow
+## How Middleware Runs
+
+The request, response, and WebSocket hooks share policy selection and ordering, but each hook has a separate lifecycle and failure boundary.
+
+### HTTP Request Flow
 
 For each inspected HTTP request, the supervisor:
 
@@ -21,6 +25,21 @@ For each inspected HTTP request, the supervisor:
 4. Runs matching middleware by ascending `order`. Policy validation rejects duplicate order values.
 5. Re-checks body-aware protocol policy (GraphQL, JSON-RPC, MCP) after each stage that replaces the body. Every middleware receives a payload the policy admits, and a transformation cannot smuggle a denied or unparseable operation to a later stage or the upstream.
 6. Applies allowed transformations, injects provider credentials, and forwards the request.
+
+### HTTP Response Flow
+
+For each selected HTTP response chain, the supervisor:
+
+1. Relays interim `1xx` responses unchanged and retains the final non-`1xx` response head. A `101` protocol upgrade bypasses generic response processing.
+2. Runs `HttpResponsePreReturn.Evaluate` preflight once per matching `HTTP_RESPONSE/PRE_RETURN` stage in policy order. Each stage sees earlier response-header mutations and returns `SKIP` or `INSPECT`.
+3. Applies response-specific restrictions. A stage may choose `HEADERS_ONLY`, `WHOLE_BODY_BYTES`, or `STREAM_BYTES`. Bodyless responses, partial responses, non-identity content encodings, and responses with `Cache-Control: no-transform` permit headers-only inspection but reject body inspection through the stage's `on_error` policy.
+4. Normalizes representation bytes independently of HTTP transfer chunks and socket reads. Whole-body stages receive one bounded body unit at the end. Streaming stages receive ordered units of at most 64 KiB and acknowledge each unit with `PASS_THROUGH` or `TRANSFORM` before OpenShell reads and releases more data.
+5. Sends `body_end`, then normalized trailers, to body-inspecting stages. A stage may add only trailer names it declared during preflight.
+6. Removes stale range and integrity metadata after body transformation, repairs downstream framing, and delivers the result. Buffered output uses a recalculated `Content-Length` unless trailers require chunked framing; streaming output uses middleware-owned chunked framing.
+
+OpenShell keeps a stable request ID across the request and response hooks for one exchange. Response streams have no whole-response deadline. Preflight and each unit acknowledgement use the effective binding timeout, and each unit's complete middleware chain is capped at 30 seconds.
+
+### WebSocket Flow
 
 For an RFC 6455 upgrade over `ws://` or `wss://`, the supervisor first finds every host-matched attachment, then selects only implementations that advertise `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`. It opens one ordered, phase-specific `EvaluateWebSocketSession` stream per selected stage. OpenShell sends `WebSocketSessionEvent` values, while the service returns `WebSocketSessionEventResult` values only for preflight and message events; session start and end are notifications. Future upstream-to-client inspection uses the same RPC with `PRE_RETURN`; an implementation that advertises both phases receives two independent streams for the WebSocket session. An attachment without the selected binding can still inspect the HTTP upgrade request when it advertises the HTTP binding, but it is not a failed WebSocket stage. OpenShell allows post-upgrade traffic and emits an informational `binding_not_selected` coverage event for that attachment.
 
@@ -33,7 +52,7 @@ The protobuf represents each logical message with a `text` or `binary` payload v
 
 The network supervisor reserves process-wide assembly capacity before buffering every parsed WebSocket text message, even when no middleware is selected. At most 32 assemblies run while 64 additional callers wait without buffering payload bytes. When both bounds are full, OpenShell closes the WebSocket with code `1013` before reading the new message payload. A text message may contain at most 4,096 fragments, must make input progress within 30 seconds, and must finish assembly within 2 minutes. Forwarding the completed text frame must finish within another 2 minutes. The assembly budget lasts for the supervisor process lifetime, so policy reloads do not reset its capacity.
 
-Active middleware sessions additionally reserve shared middleware capacity before buffering WebSocket text, and HTTP middleware reserves the same capacity before buffering request bodies; at most 32 evaluations run and 64 additional unbuffered callers wait for capacity. When both middleware bounds are full, OpenShell sheds an HTTP request with `503 Service Unavailable` before reading its body. Persistent middleware streams use a separate process-wide budget of 32 sessions. WebSocket session admission does not wait: if the budget is full, OpenShell applies each selected config's `on_error` behavior before opening a stream.
+Active middleware sessions additionally reserve shared middleware capacity before buffering WebSocket text or HTTP request and response bodies; at most 32 evaluations run and 64 additional unbuffered callers wait for capacity. When both middleware bounds are full, OpenShell sheds an HTTP request with `503 Service Unavailable` before reading its body. Persistent middleware streams use a separate process-wide budget of 32 sessions. WebSocket and HTTP response stream admission does not wait: if the budget is full, OpenShell applies each selected config's `on_error` behavior before opening a stream.
 
 Because each transformed body is re-checked before the next stage runs, a middleware hook always receives a request that satisfies the sandbox policy. A stage whose output the policy rejects stops the chain; under `enforcement: audit` the rejection is logged and the request proceeds.
 
@@ -41,9 +60,15 @@ If post-transformation policy evaluation itself fails, OpenShell denies the requ
 
 Middleware receives the request before credential injection. Operator-run services cannot inspect OpenShell-managed credentials. Middleware-visible request headers are delivered in wire order and repeated header names are preserved as separate entries. OpenShell filters credential, routing, framing, and hop-by-hop headers before invoking middleware. It rejects malformed request headers and unsupported transfer-coding sequences before middleware or policy dispatch. Headers named by a request's `Connection` field are omitted from middleware input and removed before forwarding, except for the validated WebSocket upgrade pair.
 
+Response middleware receives the final status and safe end-to-end response headers. OpenShell omits framing, hop-by-hop, and `Connection`-nominated fields. It does not expose upstream transfer coding, transfer chunks, or socket-read boundaries through the response contract.
+
 The request context identifies the originating sandbox to operator-run services. It carries the sandbox ID (`sandbox_id`), the sandbox name (`sandbox_name`), and the workspace (`workspace`), letting audit and approval interfaces show a human-readable name and its workspace instead of an opaque ID. `sandbox_name` and `workspace` are for display and logging only: names are workspace-scoped and may be reused for different sandbox instances, so services must use `sandbox_id` for authorization, persistence, durable correlation, and identity. `sandbox_id` is always present on middleware requests. `sandbox_name` and `workspace` are best-effort: a supervisor that cannot resolve a value, or an older supervisor that predates a field, sends an empty string. Services should fall back to the sandbox ID when the name or workspace is empty.
 
-## Choose a Middleware Type
+## Configure Middleware
+
+Choose an implementation, register it when it runs out of process, then attach it to destination hosts through sandbox policy.
+
+### Choose a Middleware Type
 
 | Type | Registration | Payload limit | Deployment |
 | --- | --- | --- | --- |
@@ -52,9 +77,11 @@ The request context identifies the originating sandbox to operator-run services.
 
 `openshell/regex` is an example built-in middleware. It replaces only simple, self-contained token patterns in UTF-8 HTTP bodies and client WebSocket text messages; the initial pattern recognizes `sk-` tokens. It does not infer values from keyword assignments such as JSON `password` fields. This best-effort text transformation is not parser-aware and does not guarantee that it will detect or fully remove sensitive values. Its `config` accepts one field, `mode: redact`, which is also the default when the field is omitted. Unknown config fields and non-string values are rejected at policy validation. Custom expressions are not configurable yet.
 
-Operator-run services expose bindings for supported operation and phase pairs. A binding is identified by its operation and phase. V1 supports `HttpRequest/pre_credentials` and `WebSocketMessage/pre_credentials`; a service may expose either or both. Policies attach the complete middleware by its operator-owned gateway registration name.
+Operator-run services expose bindings for supported operation and phase pairs. A binding is identified by its operation and phase. V1 supports `HTTP_REQUEST/PRE_CREDENTIALS`, `HTTP_RESPONSE/PRE_RETURN`, and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`; a service may expose any combination. Policies attach the complete middleware by its operator-owned gateway registration name.
 
-## Register a Middleware Service
+The [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard) implements request, response, and WebSocket bindings in one service. Its response paths demonstrate all three body modes, framing repair, and body-derived trailers.
+
+### Register a Middleware Service
 
 Start an operator-run service before starting the gateway, then add a registration to the local gateway TOML:
 
@@ -78,13 +105,13 @@ timeout = "500ms"
 | `max_payload_bytes` | Shared operator limit applied to inspectable logical payloads across every binding exposed by the service, up to the 4 MiB platform maximum. It caps HTTP bodies and complete WebSocket text messages. |
 | `timeout` | Optional service-wide RPC timeout using an integer with an `ms` or `s` suffix. Defaults to `500ms`; valid values range from `10ms` through `30s`. |
 
-Each binding returned by `Describe` may advertise a shorter `timeout` using the same syntax and bounds. The operator-configured service timeout is a ceiling: OpenShell uses the smaller of the binding and service values. An omitted binding timeout inherits the service setting, and an omitted service setting uses the 500 ms platform default. OpenShell rejects an invalid timeout before accepting the manifest. The operator-configured service timeout applies to `Describe` and `ValidateConfig`. The effective binding timeout applies only to `EvaluateHttpRequest`, WebSocket preflight, and each WebSocket message. WebSocket streams have no connection-wide deadline.
+Each binding returned by `Describe` may advertise a shorter `timeout` using the same syntax and bounds. The operator-configured service timeout is a ceiling: OpenShell uses the smaller of the binding and service values. An omitted binding timeout inherits the service setting, and an omitted service setting uses the 500 ms platform default. OpenShell rejects an invalid timeout before accepting the manifest. The operator-configured service timeout applies to `Describe` and `ValidateConfig`. The effective binding timeout applies to `EvaluateHttpRequest`, response preflight and each response event that expects a result, WebSocket preflight, and each WebSocket message. Persistent response and WebSocket streams have no connection-wide deadline.
 
 The gateway connects to every registered service and verifies its capabilities before accepting traffic. Gateway startup fails when a service is unavailable, reports an invalid capability, or exposes more than one binding for the same operation and phase. The manifest `name` is diagnostic metadata and does not need to match the operator registration name. Operator-run registration names cannot claim the reserved `openshell/` namespace.
 
 Registration is static. Restart the gateway after adding, removing, or changing a service. See [Gateway Configuration](/reference/gateway-config#supervisor-middleware-services) for the complete gateway TOML context.
 
-### Authenticate OpenShell Callers
+#### Authenticate OpenShell Callers
 
 When gateway JWT signing is configured, OpenShell attaches a short-lived EdDSA bearer token to every remote middleware RPC. Gateway calls use `caller_kind: gateway`; sandbox supervisor calls use `caller_kind: supervisor` and include the sandbox ID. Supervisors request credentials by registration name through `RefreshSandboxToken`. The gateway derives the audience from operator-owned configuration and authorizes each name against the sandbox's effective policy.
 
@@ -103,13 +130,13 @@ A sandbox-to-gateway JWT is not an extension credential even though both token t
 
 Each token carries a unique `jti` that identifies that token instance for correlation and future explicit revocation. OpenShell reuses a token across calls until rotation and does not track `jti`, so rejecting a repeated `jti` would reject legitimate requests. Per-request replay resistance requires a request nonce or signature, channel binding, or another proof-of-possession mechanism.
 
-### Run Without Extension Authentication
+#### Run Without Extension Authentication
 
 Set `allow_insecure_transport = true` on a registration to keep a plaintext `http://` endpoint working. OpenShell then attaches no credential to that service, supervisors do not request one, and the gateway refuses to mint one if asked. The gateway logs a warning naming the registration at every startup.
 
 The service cannot distinguish OpenShell from any other client that can reach it. Use this only where the network already provides that guarantee, and prefer `https://` everywhere else.
 
-## Apply Middleware with Policy
+### Apply Middleware with Policy
 
 Add middleware configs to the top-level `network_middlewares` map. Each key is the policy-local config name:
 
@@ -135,14 +162,14 @@ Matching configs run once each by ascending `order`; lower values run first. Ord
 
 See [Policy Schema](/reference/policy-schema#network-middleware) for the complete field reference.
 
-## Configure Failure Behavior
+### Configure Failure Behavior
 
 `on_error` controls what happens after an operation binding is selected and middleware is unavailable, rejects its configuration, returns an invalid result, or exceeds the selected binding's payload limit. It does not turn an unadvertised operation or an unsupported WebSocket message class into a middleware failure.
 
 | Value | Behavior |
 | --- | --- |
-| `fail_closed` | Denies the HTTP request or closes the WebSocket when the stage fails. This is the default. |
-| `fail_open` | Skips the failed HTTP stage. For a broken WebSocket stage stream, disables that stage for the rest of the connection and continues the remaining chain. |
+| `fail_closed` | Denies an HTTP request, closes a WebSocket, returns a canonical `502 response_delivery_failed` before response commitment, or aborts response delivery after commitment. This is the default. |
+| `fail_open` | Skips a failed HTTP request stage. A failed response stage is disabled and the retained input continues through later stages. A broken WebSocket stage is disabled for the rest of the connection. |
 
 Use `fail_open` only when bypassing the middleware preserves the intended security policy. OpenShell emits a detection finding when a failed stage is bypassed and a separate state-change finding when a WebSocket stage is disabled for the session.
 
@@ -162,26 +189,30 @@ An explicit deny decision always stops the chain and denies the request or WebSo
 
 A failed `fail_closed` stage uses `error: middleware_failed` and a platform-owned `detail`. It also omits `rule_missing`, `next_steps`, and `agent_guidance`: the failure did not result from a missing network or L7 policy rule, and changing policy cannot repair it. Runtime diagnostic text is available only through sanitized operator telemetry.
 
+A response failure has different delivery semantics because the upstream request may already have completed. Before OpenShell commits the response, a failed `fail_closed` stage returns the canonical `502 Bad Gateway` body with `error: response_delivery_failed`; a `HEAD` response carries the same headers and no body. After commitment, OpenShell aborts delivery and never appends a replacement error body. Retrying may repeat upstream side effects.
+
 Middleware decisions are enforced regardless of the endpoint's `enforcement` mode. `enforcement: audit` applies to an endpoint's network and L7 policy rules and does not bypass middleware: a middleware deny, or a failed `fail_closed` stage, blocks the request even on an audit endpoint. A middleware service that needs to observe traffic without blocking should return an allow decision with findings, which OpenShell emits as detection findings.
 
-## Set Payload Limits
+### Set Payload Limits
 
-Every middleware binding declares the largest logical payload or replacement it supports through `max_payload_bytes`. For `HTTP_REQUEST`, that payload is one request body. For `WEBSOCKET_MESSAGE`, it is one complete message rather than the whole session.
+Every middleware binding declares the largest logical payload or replacement it supports through `max_payload_bytes`. For `HTTP_REQUEST`, that payload is one request body. For `HTTP_RESPONSE`, it limits a complete body selected with `WHOLE_BODY_BYTES`, each replacement, and the maximum unit a streaming stage accepts. The platform further limits response stream units to 64 KiB. For `WEBSOCKET_MESSAGE`, it is one complete message rather than the whole session.
 
 - Built-in middleware uses its OpenShell-defined limit.
 - Each operator-run registration sets one `max_payload_bytes` ceiling no higher than any binding's advertised `max_payload_bytes` capability.
 - A selected chain buffers using its largest stage limit, so every stage that can process the body receives it.
-- The same per-stage limit applies to request bodies and replacement bodies.
+- The same per-stage limit applies to request bodies, response whole bodies, stream inputs, and replacements.
 
 The gateway rejects a registration whose operator limit exceeds the service capability or the 4 MiB platform maximum instead of silently clamping it. OpenShell also bounds the non-payload protobuf components: 64 KiB for service config, 4 KiB for request context, 32 KiB for the target, and 128 request header lines totaling at most 64 KiB encoded. Results allow a 4 KiB discarded free-form reason, a 64-byte validated reason code, 64 header mutations totaling at most 64 KiB encoded, 32 findings of at most 4 KiB encoded each, and 64 metadata entries totaling at most 32 KiB. Middleware gRPC servers should configure request and response message limits to at least 4 MiB plus 293 KiB so every platform-valid envelope fits.
 
 At request time, exceeding a selected stage's limit is a middleware failure for that stage alone and follows that config's `on_error` behavior; other stages in the chain still run against their own limits. OpenShell can apply `fail_open` to an oversized `Content-Length` before consuming body bytes. A chunked body can cross the limit only after bytes have been consumed, so OpenShell denies that request because it cannot safely resume the original stream.
 
+At response time, OpenShell retains V1 input until the corresponding stage result is valid, so an oversized or failed `fail_open` stage can be bypassed without losing bytes. Whole-body inspection delays response commitment. Headers-only and streaming inspection commit streaming-compatible framing after preflight.
+
 For a WebSocket binding, `max_payload_bytes` covers complete client text messages and replacements. Exceeding a selected stage's effective text-message limit follows that stage's `on_error`. The 4 MiB parsed-text platform cap and other protocol-safety limits are independent of middleware failure policy. Binary messages are not delivered to middleware, so the operator ceiling does not become a binary relay limit; individual raw binary frames retain the 16 MiB relay-safety bound. Oversized parsed text closes the connection with code `1009`; invalid UTF-8 uses `1007`; protocol errors use `1002`; middleware or policy denials use `1008`; and policy reload uses `1012`.
 
-## Mutate Request Headers
+### Mutate HTTP Headers
 
-A middleware result can return ordered header mutations before OpenShell injects credentials. A `write` mutation adds a value when the case-insensitive header name is absent and selects one behavior when it is already present:
+A request result or response preflight can return ordered header mutations. A `write` mutation adds a value when the case-insensitive header name is absent and selects one behavior when it is already present:
 
 - `append` adds another field value.
 - `overwrite` removes every existing value before adding the new value.
@@ -189,7 +220,9 @@ A middleware result can return ordered header mutations before OpenShell injects
 
 A `remove` mutation removes every value for a case-insensitive header name. OpenShell applies each successful stage's mutations before invoking the next middleware, so later stages observe the accumulated header state.
 
-Header writes must use the `x-openshell-middleware-` prefix. Removes may target other middleware-visible request headers. Protected credential, routing, framing, and hop-by-hop headers are always rejected. Header values must not contain control characters.
+Writes and removals may target middleware-visible end-to-end fields without a required prefix. One shared validator and atomic applicator enforce syntax, value, count, and size rules, then select request-, response-, or trailer-specific protected fields. Request credentials and routing fields remain protected. Response status, framing, connection control, authentication challenges, content coding, range metadata, and security policy fields remain protected. Hop-by-hop and `Connection`-nominated fields are protected in every profile. Header values must not contain control characters.
+
+Response trailer mutations use the same validator. Middleware may mutate an existing safe trailer, but it may add a new trailer only when that name was declared during response preflight.
 
 OpenShell validates and applies each stage's mutations atomically. An invalid operation discards every mutation from that stage and follows its `on_error` behavior. Built-in failures can name the offending header. Operator-run failures use a platform-owned error code so request-derived header text cannot reach logs or denied responses.
 
@@ -217,15 +250,18 @@ Middleware activity is emitted through OpenShell's OCSF logging:
 - A binary message encountered by an active WebSocket stage emits an informational `unsupported_message_type` coverage event with message type, sequence, and byte count. It is not reported as an invocation or failure.
 - Built-in findings include their type, label, and aggregate count. Operator-run findings use the operator-owned registration name and a platform label plus the aggregate count; OpenShell does not log service-provided finding text or diagnostic metadata. A stage can return at most 32 findings. Exceeding the per-stage cap is an invalid response handled through `on_error`. A maximum 10-stage chain retains and emits up to 320 findings without silently dropping findings from later stages.
 - Registry reload success and failure are emitted as configuration state changes.
+- Response coverage records status and bounded byte counts but omits response content, protected headers, and free-form middleware reasons.
 
 See [Logging](/observability/logging) for log access and [OCSF JSON Export](/observability/ocsf-json-export) for structured export.
 
 ## Current Limitations
 
 - Middleware applies only through operation bindings advertised by each implementation. For protocols that have no supported middleware operation at all, such as HTTP/2 prior knowledge or non-HTTP TCP, the existing uninspectable-traffic gate denies a host match containing `fail_closed` and relays an all-`fail_open` match with a detection finding.
-- The typed operation and phase pairs are `HTTP_REQUEST/PRE_CREDENTIALS` and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`.
+- The typed operation and phase pairs are `HTTP_REQUEST/PRE_CREDENTIALS`, `HTTP_RESPONSE/PRE_RETURN`, and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`.
 - A host match does not imply every advertised operation: an HTTP-only attachment can inspect the upgrade GET, then post-upgrade traffic passes with `binding_not_selected` coverage.
 - The V1 WebSocket binding inspects complete client text messages only. Binary messages pass with `unsupported_message_type` coverage for active stages; control frames and upstream-to-client messages remain outside the middleware operation.
+- The V1 response binding handles HTTP/1.x representation bytes only. It bypasses `101` upgrades and does not decode content encodings or semantically parse SSE.
+- V1 exposes generated protobuf and gRPC types for middleware authors. A higher-level middleware-author SDK or callback adapter is follow-up work.
 - Selection uses destination host include and exclude patterns.
 - A fail-closed middleware cannot cover `tls: skip` endpoints because OpenShell cannot inspect that traffic. An all-`fail_open` match may cover the endpoint; OpenShell bypasses the middleware and emits a detection finding.
 - Operator-run services use TLS `https://` when gateway JWT signing is enabled, unless the registration sets `allow_insecure_transport`. Certificates must chain to the configured custom CA or platform roots, and the endpoint hostname must match.

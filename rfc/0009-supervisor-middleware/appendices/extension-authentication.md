@@ -2,7 +2,7 @@
 
 > This is an appendix to the [RFC](../README.md). Please familiarize yourself with the RFC before reading this.
 
-The RFC body left the authenticated-transport mechanism as follow-up protocol work: it required confidentiality plus authentication of the intended middleware service, described a phase 1 `allow_insecure` escape hatch, and deferred the phase 2 choice between mTLS, TLS plus explicit caller authentication, or an equivalent. This appendix records the mechanism that was actually built for alpha. It supersedes the body's transport-authentication and `allow_insecure` paragraphs; the rest of the body is unchanged.
+Earlier RFC revisions left the authenticated-transport mechanism as follow-up protocol work: they required confidentiality plus authentication of the intended middleware service, described a phase 1 `allow_insecure` escape hatch, and deferred the phase 2 choice between mTLS, TLS plus explicit caller authentication, or an equivalent. This appendix records the mechanism built for alpha and explains the current contract reflected in the RFC body.
 
 Related: [protocol-extensions.md](protocol-extensions.md#middleware-authentication).
 
