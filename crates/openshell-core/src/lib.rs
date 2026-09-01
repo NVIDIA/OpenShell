@@ -11,6 +11,7 @@
 
 pub mod activity;
 pub mod auth;
+pub mod cdi;
 pub mod config;
 pub mod container_paths;
 pub mod denial;
