@@ -8,9 +8,11 @@ package openshell.middleware.v1;
 import "google/protobuf/empty.proto";
 import "google/protobuf/struct.proto";
 
-// SupervisorMiddleware lets an operator-run service inspect and transform
-// sandbox HTTP requests and client WebSocket text messages before OpenShell
-// injects credentials.
+// SupervisorMiddleware is the operator-run discovery and configuration service
+// for one middleware implementation. It also evaluates sandbox HTTP requests
+// and client WebSocket text messages before OpenShell injects credentials.
+// Phase-specific evaluation services such as HttpResponsePreReturn are served
+// alongside it by the same registration.
 service SupervisorMiddleware {
   // Describe returns the service manifest and declared bindings.
   rpc Describe(google.protobuf.Empty) returns (MiddlewareManifest);
@@ -41,9 +43,9 @@ service SupervisorMiddleware {
 // configuration validation.
 service HttpResponsePreReturn {
   // Evaluate opens one stage-local stream for one HTTP response. The first
-  // event is preflight. Body and trailer events follow only when selected by
-  // the preflight result. OpenShell attempts at most one session_end before
-  // closing the stream when its transport is still writable.
+  // event is preflight. Body units follow only when selected by the preflight
+  // result. OpenShell attempts at most one session_end before closing the
+  // stream when its transport is still writable.
   rpc Evaluate(stream HttpResponseEvent)
       returns (stream HttpResponseEventResult);
 }
@@ -72,7 +74,8 @@ message MiddlewareManifest {
 message MiddlewareBinding {
   // Supported operation.
   SupervisorMiddlewareOperation operation = 1;
-  // Supported evaluation phase.
+  // Supported evaluation phase. WEBSOCKET_MESSAGE/PRE_RETURN is not yet
+  // supported and is rejected by manifest validation.
   SupervisorMiddlewarePhase phase = 2;
   // Maximum logical payload or replacement this binding can process. For
   // HTTP_REQUEST this is the request body; for HTTP_RESPONSE this is a whole
@@ -137,36 +140,38 @@ message HttpHeader {
 
 // HttpResponseEvent is one ordered event in a stage-local response stream. A
 // stream starts with exactly one preflight. An inspecting body stage then
-// receives zero or more body units, one body_end, and one trailers event. Skip
-// and headers-only stages receive none of those events. OpenShell may finish
-// any opened stream with one best-effort session_end.
+// receives one or more body units, the last of which sets end_of_stream. Skip,
+// headers-only, and block-delivery stages receive no body units. OpenShell may
+// finish any opened stream with one best-effort session_end.
 message HttpResponseEvent {
+  // 3 was a separate body-end event, replaced by
+  // HttpResponseBodyUnit.end_of_stream. 4 is held for response trailers,
+  // which are deferred from V1.
+  reserved 3, 4;
+  reserved "body_end", "trailers";
   oneof event {
     // Initial response head and request context for this stage.
     HttpResponsePreflight preflight = 1;
     // One normalized body unit selected by OpenShell.
     HttpResponseBodyUnit body = 2;
-    // Notification that OpenShell sent every body unit to this stage.
-    HttpResponseBodyEnd body_end = 3;
-    // Final normalized response trailers, including an empty trailer set.
-    HttpResponseTrailers trailers = 4;
     // Best-effort terminal notification for this stage stream.
     MiddlewareSessionEnd session_end = 5;
   }
 }
 
-// HttpResponseEventResult acknowledges response preflight, body, or trailers.
-// Results must follow event order. Every preflight, body, and trailers event
-// requires exactly one matching result. Body end and session end do not
-// produce results in V1.
+// HttpResponseEventResult answers one preflight or body event. Results must
+// follow event order. Every preflight and body event, including the final
+// end_of_stream unit, requires exactly one matching result. Session end does
+// not produce a result.
 message HttpResponseEventResult {
+  // 3 is held for response trailer results, which are deferred from V1.
+  reserved 3;
+  reserved "trailers_result";
   oneof result {
     // Result for the stream's initial preflight.
     HttpResponsePreflightDecision preflight_decision = 1;
     // Result for the next outstanding body unit.
     HttpResponseBodyResult body_result = 2;
-    // Result for the stream's trailers event.
-    HttpResponseTrailersResult trailers_result = 3;
   }
 }
 
@@ -183,9 +188,13 @@ message HttpResponsePreflight {
   // successful protocol upgrades are not evaluated through this service.
   uint32 status_code = 3;
   // Current end-to-end response headers after accepted mutations from earlier
-  // stages, in wire order. Repeated names remain separate entries. Protected
-  // routing, credential, framing, and hop-by-hop fields are omitted. At most
-  // 128 lines and 64 KiB of encoded headers are included.
+  // stages, in wire order. Repeated names remain separate entries. Credential,
+  // routing, and hop-by-hop fields are omitted. Content-Length,
+  // Content-Encoding, and Content-Range are included read-only as the upstream
+  // sent them: they are protected from mutation, so every stage sees the
+  // original values, and OpenShell may recompute or remove Content-Length
+  // downstream after transformation. At most 128 lines and 64 KiB of encoded
+  // headers are included.
   repeated HttpHeader headers = 4;
   // Built-in middleware name or operator-owned registration name.
   string middleware_name = 5;
@@ -194,18 +203,41 @@ message HttpResponsePreflight {
   google.protobuf.Struct config = 6;
   // Effective minimum of the platform, registration, and binding limits. This
   // limits the complete input and replacement in WHOLE_BODY_BYTES, and each
-  // input unit and replacement in STREAM_BYTES.
+  // replacement in STREAM_BYTES. STREAM_BYTES input units are at most half of
+  // this value, so a replacement can carry a deferred tail of up to half of
+  // this value in addition to the unit's own replacement.
   uint64 max_payload_bytes = 7;
+  // Body modes this stage may select for this response. OpenShell computes the
+  // list once from the original upstream head before any stage mutation, so
+  // every stage in the chain receives the same list. It always contains
+  // HEADERS_ONLY. Bodyless responses (HEAD, 204, 304), partial responses (206,
+  // Content-Range, multipart/byteranges), an original Cache-Control
+  // no-transform directive, and non-identity Content-Encoding permit
+  // HEADERS_ONLY only. A declared Content-Length above max_payload_bytes and
+  // media types defined as open-ended streams (text/event-stream,
+  // multipart/x-mixed-replace) omit WHOLE_BODY_BYTES. Selecting a mode that is
+  // not listed is a middleware failure handled according to on_error, never a
+  // silent downgrade.
+  repeated HttpResponseBodyMode permitted_body_modes = 8;
+  // True when this stage's binding is fail_closed. Only then may a STREAM_BYTES
+  // stage defer bytes from one unit's replacement to a later replacement, for
+  // example to hold a partial record while parsing a framed format. Deferred
+  // bytes exist only in the middleware, so a stage that failed open after
+  // deferring would silently corrupt the stream. Fail-open stages must account
+  // for each input unit fully in its own replacement.
+  bool deferral_permitted = 9;
 }
 
-// HttpResponsePreflightDecision either declines the response or selects an
-// inspection mode and mutations. Diagnostics apply to either action.
+// HttpResponsePreflightDecision declines, inspects, or blocks delivery of the
+// response. Diagnostics apply to any action.
 message HttpResponsePreflightDecision {
   oneof action {
     // Successfully decline this response without invoking on_error.
     HttpResponsePreflightSkip skip = 1;
     // Inspect the response using the selected body mode and mutations.
     HttpResponsePreflightInspect inspect = 2;
+    // Authoritatively prevent delivery of this response to the sandbox.
+    HttpResponsePreflightBlockDelivery block_delivery = 7;
   }
   // Free-form service diagnostic. OpenShell never exposes this to the sandbox
   // or security logs. Limited to 4 KiB before discarding.
@@ -213,7 +245,8 @@ message HttpResponsePreflightDecision {
   // Optional stable machine-readable code for audit and diagnostic output.
   // Codes must start with a lowercase ASCII letter and contain only lowercase
   // ASCII letters, digits, and underscores, with a maximum length of 64 bytes.
-  // OpenShell never returns this code to the sandbox.
+  // OpenShell may return this code to the sandbox for block_delivery, as it
+  // does for request denials, and never returns it for skip or inspect.
   string reason_code = 4;
   // Audit-safe findings produced during preflight. At most 32 findings of at
   // most 4 KiB encoded each are accepted.
@@ -224,16 +257,27 @@ message HttpResponsePreflightDecision {
 }
 
 // HttpResponsePreflightSkip ends this stage successfully for the current
-// response. OpenShell sends no body, body-end, or trailer events to the stage.
+// response. OpenShell sends no body units to the stage.
 message HttpResponsePreflightSkip {}
+
+// HttpResponsePreflightBlockDelivery withholds the response from the sandbox.
+// It is a successful decision enforced regardless of on_error and is distinct
+// from a middleware failure. OpenShell replaces the upstream response with a
+// platform-owned error that states the upstream request may have completed;
+// this decision does not undo that request. A block from any stage wins over
+// skip, inspect, and failures from other stages. Later stages are not opened,
+// and every opened stage receives session_end with MIDDLEWARE_DENIAL.
+message HttpResponsePreflightBlockDelivery {}
 
 // HttpResponsePreflightInspect selects this stage's response inspection mode
 // and proposes mutations to the current response head.
 message HttpResponsePreflightInspect {
-  // Required response body mode. UNSPECIFIED and modes incompatible with the
-  // response semantics are middleware failures handled according to on_error.
-  // Only HEADERS_ONLY may inspect HEAD, 204, 304, partial, original
-  // no-transform, or non-identity content-encoded responses in V1.
+  // 3 is held for declared trailer names, deferred from V1 with trailers.
+  reserved 3;
+  reserved "declared_trailer_names";
+  // Required response body mode. It must be one of
+  // HttpResponsePreflight.permitted_body_modes. UNSPECIFIED and unlisted modes
+  // are middleware failures handled according to on_error.
   HttpResponseBodyMode body_mode = 1;
   // Ordered response-header mutations applied atomically before the next stage.
   // Writes and removals may target permitted visible end-to-end headers.
@@ -242,24 +286,25 @@ message HttpResponsePreflightInspect {
   // operations, 32 KiB of validated name/value data, and 64 KiB encoded are
   // accepted.
   repeated HeaderMutation header_mutations = 2;
-  // Lowercased trailer names this stage may add after observing the final body
-  // bytes. OpenShell validates the names before committing the response head.
-  // Names count against the header-mutation count and encoded-size limits.
-  repeated string declared_trailer_names = 3;
 }
 
-// HttpResponseBodyMode controls which response-body events one stage receives.
+// HttpResponseBodyMode controls which response-body units one stage receives.
 enum HttpResponseBodyMode {
   // Invalid response value handled according to the policy failure mode.
   HTTP_RESPONSE_BODY_MODE_UNSPECIFIED = 0;
-  // Inspect and mutate only the response head. The stage receives no body,
-  // body-end, or trailer events.
+  // Inspect and mutate only the response head. The stage receives no body
+  // units.
   HTTP_RESPONSE_BODY_MODE_HEADERS_ONLY = 1;
-  // Receive the complete normalized response body as exactly one body unit.
-  // The whole input and its replacement must fit max_payload_bytes.
+  // Receive the complete normalized response body as exactly one body unit
+  // with end_of_stream set. The whole input and its replacement must fit
+  // max_payload_bytes. OpenShell buffers the body before committing the
+  // response head. It fails the stage with whole_body_over_capacity when the
+  // body exceeds the limit and with whole_body_accumulation_timeout when the
+  // complete body does not arrive within the platform accumulation deadline.
   HTTP_RESPONSE_BODY_MODE_WHOLE_BODY_BYTES = 2;
-  // Receive zero or more normalized byte units. Each input and replacement must
-  // fit max_payload_bytes; the complete response may be larger.
+  // Receive one or more normalized byte units, the last of which sets
+  // end_of_stream. Each replacement must fit max_payload_bytes; the complete
+  // response may be larger and has no total deadline.
   HTTP_RESPONSE_BODY_MODE_STREAM_BYTES = 3;
 }
 
@@ -272,9 +317,20 @@ message HttpResponseBodyUnit {
     // Normalized response bytes with no HTTP transfer-framing significance.
     // WHOLE_BODY_BYTES uses present empty data for an empty body so middleware
     // can replace it with nonempty data. STREAM_BYTES units are at most the
-    // smaller of 64 KiB and max_payload_bytes.
+    // smaller of 64 KiB and half of max_payload_bytes, and OpenShell may send
+    // shorter units to preserve upstream flush behavior.
     bytes data = 2;
   }
+  // True on the final unit for this stage. Every body-inspecting stage receives
+  // exactly one flagged unit; a zero-byte body is a single empty flagged unit
+  // at sequence 1. When the end of a chunked or close-delimited body is
+  // discovered after the last data, OpenShell sends an empty flagged unit
+  // rather than delaying the preceding unit. OpenShell never reads ahead to set
+  // this flag. The flagged unit requires a result like any other unit, and a
+  // stage that deferred bytes emits them in that result. A stage must not rely
+  // on receiving this unit: disconnects, upstream failures, policy reloads, and
+  // other stage failures end the stream with session_end instead.
+  bool end_of_stream = 3;
 }
 
 // HttpResponseBodyResult acknowledges and finalizes exactly one body unit. V1
@@ -316,50 +372,16 @@ message HttpResponseBodyPassThrough {}
 // HttpResponseBodyTransform replaces the complete corresponding input unit.
 message HttpResponseBodyTransform {
   // Exactly one replacement payload is required. Present empty data deletes the
-  // input unit. The replacement is limited to max_payload_bytes.
+  // input unit. The replacement is limited to max_payload_bytes and may carry
+  // fewer or more bytes than the input. When
+  // HttpResponsePreflight.deferral_permitted is true, a stage may withhold
+  // trailing bytes from this replacement and emit them in a later replacement,
+  // holding at most half of max_payload_bytes. Otherwise every replacement
+  // must fully account for its own input unit.
   oneof replacement {
     // Normalized replacement response bytes.
     bytes data = 1;
   }
-}
-
-// HttpResponseBodyEnd reports that OpenShell sent every body unit to this stage.
-// It requires no result because every preceding unit is already finalized.
-message HttpResponseBodyEnd {
-  // Zero when STREAM_BYTES produced no units; otherwise the final input
-  // sequence. WHOLE_BODY_BYTES always ends at sequence 1, including for an
-  // empty representation.
-  uint64 final_sequence = 1;
-}
-
-// HttpResponseTrailers contains the current normalized trailer set after body
-// processing and accepted mutations from earlier stages. OpenShell sends this
-// event even when the current trailer set is empty.
-message HttpResponseTrailers {
-  // Current end-to-end trailer fields in wire order. Repeated names remain
-  // separate entries. The response-header count and encoded-size limits apply.
-  repeated HttpHeader headers = 1;
-}
-
-// HttpResponseTrailersResult proposes mutations to the final response trailers.
-message HttpResponseTrailersResult {
-  // Ordered trailer mutations applied atomically before the next stage. A stage
-  // may add only names declared by its preflight result. Protected response
-  // fields remain immutable. An empty list preserves the current trailer set.
-  repeated HeaderMutation trailer_mutations = 1;
-  // Free-form service diagnostic. OpenShell never exposes this to the sandbox
-  // or security logs. Limited to 4 KiB before discarding.
-  string reason = 2;
-  // Optional stable machine-readable code for audit and diagnostic output.
-  // Codes follow HttpResponsePreflightDecision.reason_code and are never
-  // returned to the sandbox.
-  string reason_code = 3;
-  // Audit-safe findings produced for the final trailers. At most 32 findings of
-  // at most 4 KiB encoded each are accepted.
-  repeated Finding findings = 4;
-  // Non-secret service-defined metadata included in diagnostics. At most 64
-  // entries and 32 KiB of combined key/value data are accepted.
-  map<string, string> metadata = 5;
 }
 
 // Why OpenShell is ending an opened middleware stage stream. This enum is a
@@ -370,11 +392,12 @@ enum MiddlewareSessionEndReason {
   MIDDLEWARE_SESSION_END_REASON_UNSPECIFIED = 0;
   // The evaluated interaction completed normally.
   MIDDLEWARE_SESSION_END_REASON_NORMAL = 1;
-  // A downstream or upstream peer disconnected before processing completed.
-  MIDDLEWARE_SESSION_END_REASON_PEER_DISCONNECT = 2;
+  // The sandbox-side peer disconnected before processing completed.
+  MIDDLEWARE_SESSION_END_REASON_DOWNSTREAM_DISCONNECT = 2;
   // A policy reload replaced the active middleware chain.
   MIDDLEWARE_SESSION_END_REASON_POLICY_RELOAD = 3;
-  // A middleware stage authoritatively denied the operation.
+  // A middleware stage authoritatively denied the operation or blocked
+  // response delivery.
   MIDDLEWARE_SESSION_END_REASON_MIDDLEWARE_DENIAL = 4;
   // This or another selected middleware stage failed.
   MIDDLEWARE_SESSION_END_REASON_MIDDLEWARE_FAILURE = 5;
@@ -383,13 +406,17 @@ enum MiddlewareSessionEndReason {
   MIDDLEWARE_SESSION_END_REASON_PROTOCOL_ERROR = 6;
   // OpenShell cancelled middleware evaluation for another lifecycle reason.
   MIDDLEWARE_SESSION_END_REASON_CANCELLATION = 7;
-  // The upstream operation failed or was rejected before completion.
+  // The upstream rejected the operation or failed before producing a valid
+  // response head or accepted upgrade.
   MIDDLEWARE_SESSION_END_REASON_UPSTREAM_FAILURE = 8;
   // Network policy denied the operation.
   MIDDLEWARE_SESSION_END_REASON_POLICY_DENIAL = 9;
   // The middleware stage voluntarily declined inspection during preflight.
   // This is a successful stage-local outcome, not a cancellation or denial.
   MIDDLEWARE_SESSION_END_REASON_STAGE_SKIPPED = 10;
+  // The upstream peer disconnected after producing a valid response head or
+  // accepted upgrade, before processing completed.
+  MIDDLEWARE_SESSION_END_REASON_UPSTREAM_DISCONNECT = 11;
 }
 
 // MiddlewareSessionEnd is OpenShell's best-effort terminal notification for

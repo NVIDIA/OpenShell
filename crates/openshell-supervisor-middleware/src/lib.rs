@@ -856,7 +856,7 @@ fn supported_binding(source: &str, binding: &MiddlewareBinding) -> Result<Suppor
             Some(SupervisorMiddlewareOperation::WebsocketMessage),
             Some(SupervisorMiddlewarePhase::PreReturn),
         ) => Err(miette!(
-            "{source} advertises WEBSOCKET_MESSAGE/PRE_RETURN, which is reserved for PR 2"
+            "{source} advertises WEBSOCKET_MESSAGE/PRE_RETURN, which is not yet supported"
         )),
         _ => Err(miette!(
             "{source} advertises an unsupported middleware operation/phase pair"
@@ -3722,8 +3722,8 @@ mod tests {
 
         manifest.bindings = vec![binding(SupervisorMiddlewarePhase::PreReturn)];
         let error = validate_manifest_bindings("test WebSocket service", &manifest, None)
-            .expect_err("return-path binding stays reserved for PR 2");
-        assert!(error.to_string().contains("reserved for PR 2"));
+            .expect_err("return-path WebSocket binding is not yet supported");
+        assert!(error.to_string().contains("not yet supported"));
     }
 
     #[test]
