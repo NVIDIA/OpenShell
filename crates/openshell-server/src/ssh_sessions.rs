@@ -7,6 +7,7 @@ use openshell_core::ObjectId;
 use openshell_core::proto::SshSession;
 use openshell_core::time::now_ms;
 use prost::Message;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -36,9 +37,21 @@ pub fn spawn_session_reaper(store: Arc<Store>, interval: Duration) {
 }
 
 async fn reap_expired_sessions(store: &Store) -> Result<(), String> {
+    reap_expired_sessions_after_page(store, |_| std::future::ready(())).await
+}
+
+async fn reap_expired_sessions_after_page<F, Fut>(
+    store: &Store,
+    mut after_page: F,
+) -> Result<(), String>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = ()>,
+{
     let now_ms = now_ms();
     let started = std::time::Instant::now();
     let mut offset = 0_u32;
+    let mut page_number = 0_usize;
     let mut scanned = 0_usize;
     let mut decode_failures = 0_usize;
     let mut session_ids = Vec::new();
@@ -64,6 +77,8 @@ async fn reap_expired_sessions(store: &Store) -> Result<(), String> {
         if page_len < SESSION_REAPER_PAGE_SIZE as usize {
             break;
         }
+        page_number += 1;
+        after_page(page_number).await;
         let page_len = u32::try_from(page_len)
             .map_err(|_| "SSH session reaper page length overflow".to_string())?;
         offset = offset
@@ -227,6 +242,39 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn reaper_removes_every_expired_session_when_an_earlier_page_row_is_deleted() {
+        let store = test_store().await;
+        for idx in 0..=SESSION_REAPER_PAGE_SIZE {
+            let session = make_session(&format!("reap-{idx:04}"), "sbx1", now_ms() - 1, false);
+            store.put_message(&session).await.unwrap();
+        }
+
+        let delete_store = store.clone();
+        reap_expired_sessions_after_page(&store, move |page_number| {
+            let delete_store = delete_store.clone();
+            async move {
+                if page_number == 1 {
+                    delete_store
+                        .delete(SshSession::object_type(), "reap-0000")
+                        .await
+                        .unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store
+                .count_in_workspace(SshSession::object_type(), "default")
+                .await
+                .unwrap(),
+            0,
+            "the reaper must not leave an expired session behind"
         );
     }
 }
