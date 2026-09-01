@@ -1127,19 +1127,10 @@ class SandboxTemplateClient:
                 driver_config=driver_config,
             )
         elif (
-            any(
-                value is not None
-                for value in (
-                    name,
-                    image,
-                    labels,
-                    annotations,
-                    environment,
-                    cpu,
-                    memory,
-                    gpu_count,
-                    driver_config,
-                )
+            any(value is not None for value in (name, image, cpu, memory, gpu_count))
+            or any(
+                bool(value)
+                for value in (labels, annotations, environment, driver_config)
             )
             or gpu
         ):

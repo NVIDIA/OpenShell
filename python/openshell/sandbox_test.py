@@ -2346,6 +2346,63 @@ def test_sandbox_template_create_rejects_template_and_builder_fields() -> None:
     assert stub.create_template_request is None
 
 
+@pytest.mark.parametrize(
+    "builder_kwargs",
+    (
+        {"labels": {}},
+        {"annotations": {}},
+        {"environment": {}},
+        {"driver_config": {}},
+    ),
+)
+def test_sandbox_template_create_allows_template_and_empty_builder_mappings(
+    builder_kwargs: dict[str, Any],
+) -> None:
+    stub = _FakeSandboxStub()
+    client = _template_client_with_fake_stub(stub)
+    template = _make_workload_template_proto("gpu-kata")
+
+    created = client.create(
+        workspace="default",
+        template=template,
+        **builder_kwargs,
+    )
+
+    assert created.metadata.name == "gpu-kata"
+    assert stub.create_template_request is not None
+    assert stub.create_template_request.template.metadata.name == template.metadata.name
+    assert (
+        stub.create_template_request.template.spec.workload.image
+        == template.spec.workload.image
+    )
+
+
+@pytest.mark.parametrize(
+    "builder_kwargs",
+    (
+        {"labels": {"team": "runtime"}},
+        {"annotations": {"owner": "platform"}},
+        {"environment": {"FEATURE_FLAG": "on"}},
+        {"driver_config": {"kubernetes": {"runtime_class_name": "kata"}}},
+    ),
+)
+def test_sandbox_template_create_rejects_template_and_non_empty_builder_mappings(
+    builder_kwargs: dict[str, Any],
+) -> None:
+    stub = _FakeSandboxStub()
+    client = _template_client_with_fake_stub(stub)
+    template = _make_workload_template_proto("gpu-kata")
+
+    with pytest.raises(SandboxError):
+        client.create(
+            workspace="default",
+            template=template,
+            **builder_kwargs,
+        )
+
+    assert stub.create_template_request is None
+
+
 def test_sandbox_template_create_rejects_non_positive_gpu_count() -> None:
     stub = _FakeSandboxStub()
     client = _template_client_with_fake_stub(stub)
