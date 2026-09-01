@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // --- Mock server for SSH sessions ---
@@ -63,7 +64,7 @@ func (s *mockSSHServer) CreateSshSession(_ context.Context, req *pb.CreateSshSes
 		GatewayPort:        2222,
 		GatewayScheme:      "https",
 		HostKeyFingerprint: "SHA256:abc123",
-		ExpiresAtMs:        1700000000000,
+		ExpirationTime:     timestamppb.New(time.UnixMilli(1700000000000)),
 	}
 	s.sessions[req.GetSandboxId()] = resp
 	s.tokens[token] = true

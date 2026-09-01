@@ -1129,7 +1129,7 @@ describe('ssh sessions', () => {
         gatewayPort: 8443,
         gatewayScheme: 'https',
         hostKeyFingerprint: 'SHA256:abc',
-        expiresAtMs: 1730000000000n,
+        expirationTime: { seconds: 1730000000n, nanos: 0 },
       }),
     });
     const session = await withExpiry.createSshSession('sb');
@@ -1152,7 +1152,7 @@ describe('ssh sessions', () => {
         gatewayPort: 80,
         gatewayScheme: 'http',
         hostKeyFingerprint: '',
-        expiresAtMs: 0n,
+        expirationTime: undefined,
       }),
     });
     const bare = await noExpiry.createSshSession('sb');
@@ -1173,7 +1173,7 @@ describe('ssh sessions', () => {
       gatewayPort: 8443,
       gatewayScheme: 'https',
       hostKeyFingerprint: 'SHA256:abc',
-      expiresAtMs: 0n,
+      expirationTime: undefined,
     };
     const cases: Array<Record<string, unknown>> = [
       { ...base, sandboxId: 'different-sandbox' },
@@ -1207,7 +1207,7 @@ describe('ssh sessions', () => {
           gatewayPort: 443,
           gatewayScheme: 'https',
           hostKeyFingerprint: '',
-          expiresAtMs: 0n,
+          expirationTime: undefined,
         }),
       });
       await expect(sandbox.createSshSession('sb')).resolves.toMatchObject({ gatewayHost });
@@ -1231,7 +1231,7 @@ describe('forward', () => {
           gatewayPort: 443,
           gatewayScheme: 'https',
           hostKeyFingerprint: '',
-          expiresAtMs: 0n,
+          expirationTime: undefined,
         };
       },
       revokeSshSession: (req) => {
@@ -1314,7 +1314,7 @@ describe('forward', () => {
         gatewayPort: 443,
         gatewayScheme: 'https',
         hostKeyFingerprint: '',
-        expiresAtMs: 0n,
+        expirationTime: undefined,
       }),
       revokeSshSession: () => ({ revoked: true }),
       // Ignore inbound frames; just blast a large, verifiable byte stream back.
@@ -1375,7 +1375,7 @@ describe('forward', () => {
           gatewayPort: 443,
           gatewayScheme: 'https',
           hostKeyFingerprint: '',
-          expiresAtMs: 0n,
+          expirationTime: undefined,
         };
       },
       // biome-ignore lint/correctness/useYield: the socket is reset before any frame is relayed
@@ -1445,7 +1445,7 @@ describe('forward', () => {
         gatewayPort: 443,
         gatewayScheme: 'https',
         hostKeyFingerprint: '',
-        expiresAtMs: 0n,
+        expirationTime: undefined,
       }),
       forwardTcp: async function* (_requests, ctx) {
         streamStarted();

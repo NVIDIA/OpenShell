@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // --- Mock server for credential refresh ---
@@ -75,12 +76,12 @@ func (s *mockRefreshServer) ConfigureProviderRefresh(_ context.Context, req *pb.
 	}
 
 	st := &pb.ProviderCredentialRefreshStatus{
-		ProviderName:  req.GetProvider(),
-		ProviderId:    "prov-id-" + req.GetProvider(),
-		CredentialKey: req.GetCredentialKey(),
-		Strategy:      req.GetStrategy(),
-		Status:        "active",
-		ExpiresAtMs:   req.GetExpiresAtMs(),
+		ProviderName:   req.GetProvider(),
+		ProviderId:     "prov-id-" + req.GetProvider(),
+		CredentialKey:  req.GetCredentialKey(),
+		Strategy:       req.GetStrategy(),
+		Status:         "active",
+		ExpirationTime: req.GetExpirationTime(),
 	}
 	s.statuses[refreshKey(req.GetProvider(), req.GetCredentialKey())] = st
 	return &pb.ConfigureProviderRefreshResponse{Status: st}, nil
@@ -99,7 +100,7 @@ func (s *mockRefreshServer) RotateProviderCredential(_ context.Context, req *pb.
 		return nil, status.Errorf(codes.NotFound, "refresh config %q not found", key)
 	}
 	st.Status = "rotated"
-	st.LastRefreshAtMs = time.Now().UnixMilli()
+	st.LastRefreshTime = timestamppb.Now()
 	return &pb.RotateProviderCredentialResponse{Status: st}, nil
 }
 

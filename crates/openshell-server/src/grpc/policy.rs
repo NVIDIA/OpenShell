@@ -2801,11 +2801,13 @@ async fn compute_provider_env_revision_with_catalog_and_policy_bindings(
                 for key in credential_keys {
                     hasher.update(key.as_bytes());
                 }
-                let mut expiry_keys: Vec<_> = provider.credential_expires_at_ms.keys().collect();
+                let mut expiry_keys: Vec<_> = provider.credential_expiration_times.keys().collect();
                 expiry_keys.sort();
                 for key in expiry_keys {
                     hasher.update(key.as_bytes());
-                    hasher.update(provider.credential_expires_at_ms[key].to_le_bytes());
+                    let value = &provider.credential_expiration_times[key];
+                    hasher.update(value.seconds.to_le_bytes());
+                    hasher.update(value.nanos.to_le_bytes());
                 }
             }
             None => {
@@ -2862,11 +2864,13 @@ fn compute_provider_env_revision_from_records_and_policy_bindings(
         for key in credential_keys {
             hasher.update(key.as_bytes());
         }
-        let mut expiry_keys: Vec<_> = provider.credential_expires_at_ms.keys().collect();
+        let mut expiry_keys: Vec<_> = provider.credential_expiration_times.keys().collect();
         expiry_keys.sort();
         for key in expiry_keys {
             hasher.update(key.as_bytes());
-            hasher.update(provider.credential_expires_at_ms[key].to_le_bytes());
+            let value = &provider.credential_expiration_times[key];
+            hasher.update(value.seconds.to_le_bytes());
+            hasher.update(value.nanos.to_le_bytes());
         }
     }
 
@@ -3309,13 +3313,15 @@ pub(super) async fn handle_get_sandbox_provider_environment(
                 "withholding unbound static provider credential from binding-capable supervisor"
             );
             provider_environment.environment.remove(&key);
-            provider_environment.credential_expires_at_ms.remove(&key);
+            provider_environment
+                .credential_expiration_times
+                .remove(&key);
             provider_environment.static_credential_keys.remove(&key);
         }
     } else {
         for key in &provider_environment.static_credential_keys {
             provider_environment.environment.remove(key);
-            provider_environment.credential_expires_at_ms.remove(key);
+            provider_environment.credential_expiration_times.remove(key);
         }
         provider_environment.static_credential_bindings.clear();
     }
@@ -3335,10 +3341,20 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         .cloned()
         .collect();
 
+    let credential_expiration_times = provider_environment
+        .credential_expiration_times
+        .into_iter()
+        .filter_map(|(key, value)| {
+            openshell_core::time::optional_timestamp_from_legacy_millis(value)
+                .ok()
+                .flatten()
+                .map(|timestamp| (key, timestamp))
+        })
+        .collect();
     Ok(Response::new(GetSandboxProviderEnvironmentResponse {
         environment: provider_environment.environment,
         provider_env_revision,
-        credential_expires_at_ms: provider_environment.credential_expires_at_ms,
+        credential_expiration_times,
         dynamic_credentials: provider_environment.dynamic_credentials,
         static_credential_bindings: provider_environment.static_credential_bindings,
         non_secret_environment_keys,
@@ -4373,7 +4389,17 @@ pub(super) async fn handle_get_sandbox_logs(
             if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) =
                 evt.payload
             {
-                if req.since_ms > 0 && log.timestamp_ms < req.since_ms {
+                let since_ms = req
+                    .since_time
+                    .as_ref()
+                    .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+                    .unwrap_or_default();
+                let event_ms = log
+                    .event_time
+                    .as_ref()
+                    .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+                    .unwrap_or_default();
+                if since_ms > 0 && event_ms < since_ms {
                     return None;
                 }
                 if !req.sources.is_empty() && !source_matches(&log.source, &req.sources) {
@@ -4752,16 +4778,16 @@ pub(super) async fn handle_submit_policy_analysis(
             port: ep_port,
             binary: ep_binary,
             hit_count: chunk.hit_count.clamp(1, 100),
-            first_seen_ms: if chunk.first_seen_ms > 0 {
-                chunk.first_seen_ms
-            } else {
-                now_ms
-            },
-            last_seen_ms: if chunk.last_seen_ms > 0 {
-                chunk.last_seen_ms
-            } else {
-                now_ms
-            },
+            first_seen_ms: chunk
+                .first_seen_time
+                .as_ref()
+                .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+                .unwrap_or(now_ms),
+            last_seen_ms: chunk
+                .last_seen_time
+                .as_ref()
+                .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+                .unwrap_or(now_ms),
             validation_result: evaluation.validation_result.clone(),
             rejection_reason: String::new(),
             application_error: evaluation.application_error.clone(),
@@ -4939,7 +4965,10 @@ pub(super) async fn handle_get_draft_policy(
         .map(|r| draft_chunk_record_to_proto(&r))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let last_analyzed_at_ms = chunks.iter().map(|c| c.created_at_ms).max().unwrap_or(0);
+    let last_analyzed_time = chunks
+        .iter()
+        .filter_map(|chunk| chunk.created_time)
+        .max_by_key(|value| (value.seconds, value.nanos));
 
     debug!(
         sandbox_id = %sandbox_id,
@@ -4952,7 +4981,7 @@ pub(super) async fn handle_get_draft_policy(
         chunks,
         rolling_summary: String::new(),
         draft_version: u64::try_from(draft_version).unwrap_or(0),
-        last_analyzed_at_ms,
+        last_analyzed_time,
     }))
 }
 
@@ -5805,7 +5834,11 @@ pub(super) async fn handle_get_draft_history(
 
     for chunk in &all_chunks {
         entries.push(DraftHistoryEntry {
-            timestamp_ms: chunk.created_at_ms,
+            event_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+                chunk.created_at_ms,
+            )
+            .ok()
+            .flatten(),
             event_type: "proposed".to_string(),
             description: format!(
                 "Rule '{}' proposed (confidence: {:.0}%)",
@@ -5817,7 +5850,9 @@ pub(super) async fn handle_get_draft_history(
 
         if let Some(decided_at) = chunk.decided_at_ms {
             entries.push(DraftHistoryEntry {
-                timestamp_ms: decided_at,
+                event_time: openshell_core::time::optional_timestamp_from_legacy_millis(decided_at)
+                    .ok()
+                    .flatten(),
                 event_type: chunk.status.clone(),
                 description: format!("Rule '{}' {}", chunk.rule_name, chunk.status),
                 chunk_id: chunk.id.clone(),
@@ -5825,7 +5860,12 @@ pub(super) async fn handle_get_draft_history(
         }
     }
 
-    entries.sort_by_key(|e| e.timestamp_ms);
+    entries.sort_by_key(|entry| {
+        entry
+            .event_time
+            .as_ref()
+            .map_or((0, 0), |value| (value.seconds, value.nanos))
+    });
 
     debug!(
         sandbox_id = %sandbox_id,
@@ -5981,11 +6021,25 @@ fn draft_chunk_record_to_proto(record: &DraftChunkRecord) -> Result<PolicyChunk,
         rationale: record.rationale.clone(),
         security_notes,
         confidence: record.confidence as f32,
-        created_at_ms: record.created_at_ms,
-        decided_at_ms: record.decided_at_ms.unwrap_or(0),
+        created_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+            record.created_at_ms,
+        )
+        .ok()
+        .flatten(),
+        decided_time: record
+            .decided_at_ms
+            .and_then(|value| openshell_core::time::timestamp_from_millis(value).ok()),
         hit_count: record.hit_count,
-        first_seen_ms: record.first_seen_ms,
-        last_seen_ms: record.last_seen_ms,
+        first_seen_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+            record.first_seen_ms,
+        )
+        .ok()
+        .flatten(),
+        last_seen_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+            record.last_seen_ms,
+        )
+        .ok()
+        .flatten(),
         binary: record.binary.clone(),
         validation_result: record.validation_result.clone(),
         rejection_reason: record.rejection_reason.clone(),
@@ -6017,8 +6071,10 @@ fn policy_record_to_revision(
             policy_hash,
             status: stored_status.into(),
             load_error: record.load_error.clone().unwrap_or_default(),
-            created_at_ms: record.created_at_ms,
-            loaded_at_ms: record.loaded_at_ms.unwrap_or(0),
+            created_time: openshell_core::time::timestamp_from_millis(record.created_at_ms).ok(),
+            loaded_time: record
+                .loaded_at_ms
+                .and_then(|value| openshell_core::time::timestamp_from_millis(value).ok()),
             policy: include_policy.then_some(policy),
             provenance: record.provenance.clone(),
         }),
@@ -6047,8 +6103,10 @@ fn policy_record_to_revision(
                 policy_hash: String::new(),
                 status: PolicyStatus::Failed.into(),
                 load_error,
-                created_at_ms: record.created_at_ms,
-                loaded_at_ms: record.loaded_at_ms.unwrap_or(0),
+                created_time: openshell_core::time::timestamp_from_millis(record.created_at_ms).ok(),
+                loaded_time: record
+                    .loaded_at_ms
+                    .and_then(|value| openshell_core::time::timestamp_from_millis(value).ok()),
                 policy: None,
                 provenance: record.provenance.clone(),
             })
@@ -8796,12 +8854,12 @@ mod tests {
             metadata: Some(ObjectMeta {
                 id: "sandbox-b-id".to_string(),
                 name: "sandbox-b".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "workspace-b".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             ..Sandbox::default()
         };
@@ -8811,12 +8869,12 @@ mod tests {
             metadata: Some(ObjectMeta {
                 id: "member-a-id".to_string(),
                 name: "test-user".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             principal_subject: "test-user".to_string(),
             role: WorkspaceRole::User.into(),
@@ -8854,12 +8912,12 @@ mod tests {
             metadata: Some(ObjectMeta {
                 id: "default-admin-member-id".to_string(),
                 name: "test-user".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             principal_subject: "test-user".to_string(),
             role: WorkspaceRole::Admin.into(),
@@ -9118,12 +9176,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: id.to_string(),
                     name: name.to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     policy: None,
@@ -9154,12 +9212,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-self".to_string(),
                 name: "self".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -9189,12 +9247,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: id.to_string(),
                     name: name.to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     policy: None,
@@ -9227,12 +9285,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: id.to_string(),
                     name: name.to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     policy: None,
@@ -9324,12 +9382,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-x".to_string(),
                 name: "x".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -9407,12 +9465,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-no-policy".to_string(),
                 name: "no-policy-sandbox".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -9436,18 +9494,18 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("provider-{name}"),
                 name: name.to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: provider_type.to_string(),
             credentials: std::iter::once(("GITHUB_TOKEN".to_string(), "ghp-test".to_string()))
                 .collect(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         }
@@ -9538,12 +9596,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: id.to_string(),
                 name: name.to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(policy),
@@ -9795,12 +9853,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "profile-generic".to_string(),
                     name: "generic".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "generic".to_string(),
@@ -9888,12 +9946,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "profile-custom-api".to_string(),
                     name: "custom-api".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "custom-api".to_string(),
@@ -9959,12 +10017,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "profile-custom-api".to_string(),
                     name: "custom-api".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "custom-api".to_string(),
@@ -10125,18 +10183,18 @@ mod tests {
         let store = test_store().await;
 
         let make_stored_profile = |id: &str, workspace: &str, host: &str| StoredProviderProfile {
-            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                id: format!("profile-{id}-{workspace}"),
-                name: id.to_string(),
-                created_at_ms: 1_000_000,
-                labels: HashMap::new(),
-                resource_version: 0,
-                annotations: HashMap::new(),
-                workspace: workspace.to_string(),
-                deletion_timestamp_ms: 0,
-            }),
-            profile: Some(openshell_core::proto::ProviderProfile {
-                id: id.to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: format!("profile-{id}-{workspace}"),
+                    name: id.to_string(),
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: workspace.to_string(),
+                    deletion_time: None,
+                }),
+                profile: Some(openshell_core::proto::ProviderProfile {
+                    id: id.to_string(),
                 display_name: format!("{host} profile"),
                 endpoints: vec![NetworkEndpoint {
                     host: host.to_string(),
@@ -10245,12 +10303,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "profile-mcp-default".to_string(),
                     name: "mcp-default".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
                     id: "mcp-default".to_string(),
@@ -10872,12 +10930,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "profile-ambiguous".to_string(),
                     name: "ambiguous".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
                     id: "ambiguous".to_string(),
@@ -10945,12 +11003,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "profile-tls-skip".to_string(),
                 name: "tls-skip".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 resource_version: 0,
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             profile: Some(ProviderProfile {
                 id: "tls-skip".to_string(),
@@ -11105,12 +11163,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "profile-custom-policy".to_string(),
                     name: "custom-policy".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
                     id: "custom-policy".to_string(),
@@ -11665,12 +11723,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "profile-custom-dynamic".to_string(),
                 name: "custom-dynamic".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             profile: Some(ProviderProfile {
                 id: "custom-dynamic".to_string(),
@@ -11753,12 +11811,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "profile-token-exchange-subject".to_string(),
                 name: "token-exchange-subject".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             profile: Some(ProviderProfile {
                 id: "token-exchange-subject".to_string(),
@@ -11805,8 +11863,10 @@ mod tests {
             "subject_token".to_string(),
             "raw-gateway-oidc-token".to_string(),
         )]);
-        provider.credential_expires_at_ms =
-            HashMap::from([("subject_token".to_string(), current_time_ms() + 60_000)]);
+        provider.credential_expiration_times = HashMap::from([(
+            "subject_token".to_string(),
+            openshell_core::time::timestamp_from_millis(current_time_ms() + 60_000).unwrap(),
+        )]);
         state.store.put_message(&provider).await.unwrap();
         state
             .store
@@ -11842,7 +11902,7 @@ mod tests {
         );
         assert!(
             !response
-                .credential_expires_at_ms
+                .credential_expiration_times
                 .contains_key("subject_token"),
             "withheld subject credentials must not emit sandbox expiry metadata"
         );
@@ -11962,12 +12022,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: format!("profile-{id}"),
                     name: id.to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
                     id: id.to_string(),
@@ -12147,12 +12207,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "profile-custom-token".to_string(),
                     name: "custom-token".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
                     id: "custom-token".to_string(),
@@ -12268,12 +12328,12 @@ mod tests {
                         }
                     ),
                     name: "scoped-revision".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: workspace.to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
                     id: "scoped-revision".to_string(),
@@ -12667,12 +12727,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-global-profile".to_string(),
                 name: "global-profile-sandbox".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(sandbox_policy),
@@ -12752,12 +12812,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-backfill".to_string(),
                 name: "backfill-sandbox".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -13723,12 +13783,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-draft-flow".to_string(),
                 name: "draft-flow".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -13764,8 +13824,8 @@ mod tests {
                     rationale: "observed denied request".to_string(),
                     confidence: 0.85,
                     hit_count: 3,
-                    first_seen_ms: 100,
-                    last_seen_ms: 200,
+                    first_seen_time: openshell_core::time::timestamp_from_millis(100).ok(),
+                    last_seen_time: openshell_core::time::timestamp_from_millis(200).ok(),
                     binary: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
@@ -13978,12 +14038,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-feedback".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -14082,12 +14142,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-agent-l7-verdict".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -14202,12 +14262,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-supersede-flow".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -14413,12 +14473,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-mechanistic-clean".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -14524,12 +14584,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-mechanistic-existing-rest".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(base_policy),
@@ -14641,7 +14701,7 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-invalid-graphql-preflight".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 workspace: "default".to_string(),
                 ..Default::default()
             }),
@@ -14724,7 +14784,7 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: sandbox_id.to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 workspace: "default".to_string(),
                 ..Default::default()
             }),
@@ -14949,12 +15009,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-l7-full-with-cred".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -15059,12 +15119,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-default-manual-mode".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -15157,12 +15217,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-unknown-mode".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -15247,12 +15307,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-explicit-manual-mode".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -15339,12 +15399,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-gateway-auto-mode".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -15431,12 +15491,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-gateway-pinned-manual".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -15528,12 +15588,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-reject-provider-prefix".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -15795,12 +15855,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-agent-l4-with-cred".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -15897,12 +15957,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-agent-l4-no-cred".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -15987,12 +16047,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-agent-link-local".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -16084,12 +16144,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "profile-custom-api".to_string(),
                     name: "custom-api".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
                     id: "custom-api".to_string(),
@@ -16129,12 +16189,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: sandbox_id.to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -16313,12 +16373,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-full-loop-v2".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -16503,12 +16563,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-redraft".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -16625,12 +16685,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-mech-dedup".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -16734,12 +16794,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: sandbox_id.to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: std::collections::HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -17011,12 +17071,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-undo-clears".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -17147,12 +17207,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-draft-owner".to_string(),
                 name: "draft-owner".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -17166,12 +17226,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-draft-other".to_string(),
                 name: "draft-other".to_string(),
-                created_at_ms: 1_000_001,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_001).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -17206,8 +17266,8 @@ mod tests {
                     rationale: "observed denied request".to_string(),
                     confidence: 0.85,
                     hit_count: 3,
-                    first_seen_ms: 100,
-                    last_seen_ms: 200,
+                    first_seen_time: openshell_core::time::timestamp_from_millis(100).ok(),
+                    last_seen_time: openshell_core::time::timestamp_from_millis(200).ok(),
                     binary: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
@@ -18284,12 +18344,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: format!("profile-{suffix}"),
                     name: profile_name.clone(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
                     id: profile_name.clone(),
@@ -19208,12 +19268,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: sb_id.to_string(),
                     name: sb_name.to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     annotations: HashMap::new(),
                     resource_version: 0,
                     workspace: ws.to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     policy: None,
@@ -19350,12 +19410,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-1".to_string(),
                 name: "test-sandbox".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None, // No policy yet - will be backfilled
@@ -19445,7 +19505,7 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-annotated-backfill".to_string(),
                 name: "annotated-backfill".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::from([(
@@ -19453,7 +19513,7 @@ mod tests {
                     "keep".to_string(),
                 )]),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -19886,7 +19946,7 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-preserve-backfill".to_string(),
                 name: "preserve-backfill".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::from([(
@@ -19894,7 +19954,7 @@ mod tests {
                     "keep".to_string(),
                 )]),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -20040,12 +20100,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: sandbox_id.to_string(),
                 name: sandbox_name.to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -20127,12 +20187,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: sandbox_id.clone(),
                     name: sandbox_name.clone(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     policy: None,
@@ -20209,12 +20269,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: sandbox_id.to_string(),
                 name: sandbox_name.to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -20379,12 +20439,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-sync-strip".to_string(),
                 name: "sync-strip".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -20486,12 +20546,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-1".to_string(),
                 name: "test-sandbox".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -20583,12 +20643,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-1".to_string(),
                 name: "test-sandbox".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,

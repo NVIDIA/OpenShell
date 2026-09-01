@@ -180,7 +180,10 @@ fn token_grant_request<'a>(
         client_assertion_type: &token_grant.client_assertion_type,
         audience: &token_grant.audience,
         scopes: &token_grant.scopes,
-        cache_ttl_seconds: token_grant.cache_ttl_seconds,
+        cache_ttl_seconds: token_grant
+            .cache_ttl
+            .as_ref()
+            .map_or(0, |value| value.seconds),
         grant_type: token_grant.grant_type,
         requested_token_type: &token_grant.requested_token_type,
     }
@@ -518,7 +521,10 @@ pub mod test_support {
             client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
                 .to_string(),
             scopes: vec!["read".to_string()],
-            cache_ttl_seconds: 300,
+            cache_ttl: Some(prost_types::Duration {
+                seconds: 300,
+                nanos: 0,
+            }),
             audience_overrides: Vec::new(),
             grant_type: ProviderCredentialTokenGrantType::ClientCredentials as i32,
             subject_token: None,

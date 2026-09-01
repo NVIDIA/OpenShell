@@ -18,6 +18,7 @@ use openshell_sdk::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -93,11 +94,11 @@ fn sandbox_with_phase_ws(
         metadata: Some(proto::datamodel::v1::ObjectMeta {
             id: format!("id-{name}"),
             name: name.to_string(),
-            created_at_ms: 0,
+            created_time: None,
             labels: HashMap::new(),
             annotations: HashMap::new(),
             resource_version: 1,
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
             workspace: workspace.to_string(),
         }),
         spec: None,
@@ -114,11 +115,11 @@ fn workspace_proto(name: &str, phase: proto::datamodel::v1::WorkspacePhase) -> p
         metadata: Some(proto::datamodel::v1::ObjectMeta {
             id: format!("ws-{name}"),
             name: name.to_string(),
-            created_at_ms: 1_000_000,
+            created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
             labels: HashMap::new(),
             annotations: HashMap::new(),
             resource_version: 1,
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
             workspace: String::new(),
         }),
         status: Some(proto::datamodel::v1::WorkspaceStatus {
@@ -132,11 +133,11 @@ fn workload_template_proto(name: &str, workspace: &str) -> proto::SandboxWorkloa
         metadata: Some(proto::datamodel::v1::ObjectMeta {
             id: format!("template-{workspace}-{name}"),
             name: name.to_string(),
-            created_at_ms: 1_000_000,
+            created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
             labels: HashMap::new(),
             annotations: HashMap::new(),
             resource_version: 1,
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
             workspace: workspace.to_string(),
         }),
         spec: Some(proto::SandboxWorkloadTemplateSpec {
@@ -1222,7 +1223,7 @@ async fn wait_ready_transitions_through_phases() {
     let client = connect(&endpoint).await;
 
     let sandbox = client
-        .wait_ready("my-box", std::time::Duration::from_secs(5))
+        .wait_ready("my-box", Duration::from_secs(5))
         .await
         .unwrap();
     assert_eq!(sandbox.phase, SandboxPhase::Ready);
@@ -1242,7 +1243,7 @@ async fn wait_ready_accepts_successful_completion() {
     let client = connect(&endpoint).await;
 
     let sandbox = client
-        .wait_ready("short-job", std::time::Duration::from_secs(5))
+        .wait_ready("short-job", Duration::from_secs(5))
         .await
         .unwrap();
     assert_eq!(sandbox.phase, SandboxPhase::Completed);
@@ -1258,7 +1259,7 @@ async fn wait_ready_surfaces_stopped_phase_without_timing_out() {
     let client = connect(&endpoint).await;
 
     let err = client
-        .wait_ready("failed-job", std::time::Duration::from_secs(5))
+        .wait_ready("failed-job", Duration::from_secs(5))
         .await
         .unwrap_err();
     assert_eq!(err.code(), "connect");
@@ -1274,7 +1275,7 @@ async fn wait_ready_surfaces_error_phase() {
     let client = connect(&endpoint).await;
 
     let err = client
-        .wait_ready("my-box", std::time::Duration::from_secs(5))
+        .wait_ready("my-box", Duration::from_secs(5))
         .await
         .unwrap_err();
     assert_eq!(err.code(), "connect");
@@ -1291,7 +1292,7 @@ async fn wait_deleted_returns_when_get_reports_not_found() {
     let client = connect(&endpoint).await;
 
     client
-        .wait_deleted("my-box", std::time::Duration::from_secs(5))
+        .wait_deleted("my-box", Duration::from_secs(5))
         .await
         .unwrap();
     assert!(state.get_calls.load(Ordering::SeqCst) >= 3);
@@ -1325,7 +1326,7 @@ async fn exec_buffers_stdout_stderr_and_exit() {
             &["echo".to_string(), "hello".to_string()],
             ExecOptions {
                 workdir: Some("/work".to_string()),
-                timeout: Some(std::time::Duration::from_secs(10)),
+                timeout: Some(Duration::from_secs(10)),
                 ..Default::default()
             },
         )
@@ -1343,7 +1344,13 @@ async fn exec_buffers_stdout_stderr_and_exit() {
         vec!["echo".to_string(), "hello".to_string()]
     );
     assert_eq!(observed.workdir, "/work");
-    assert_eq!(observed.timeout_seconds, 10);
+    assert_eq!(
+        observed
+            .execution_timeout
+            .as_ref()
+            .and_then(|value| openshell_core::time::duration_to_std(value).ok()),
+        Some(Duration::from_secs(10))
+    );
 }
 
 /// Refresher that hands out a fixed "fresh-token" and counts invocations.

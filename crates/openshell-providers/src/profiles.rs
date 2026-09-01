@@ -1261,8 +1261,14 @@ fn credential_refresh_from_proto(refresh: &ProviderCredentialRefresh) -> Credent
             .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified),
         token_url: refresh.token_url.clone(),
         scopes: refresh.scopes.clone(),
-        refresh_before_seconds: refresh.refresh_before_seconds,
-        max_lifetime_seconds: refresh.max_lifetime_seconds,
+        refresh_before_seconds: refresh
+            .refresh_before
+            .as_ref()
+            .map_or(0, |value| value.seconds),
+        max_lifetime_seconds: refresh
+            .max_lifetime
+            .as_ref()
+            .map_or(0, |value| value.seconds),
         material: refresh
             .material
             .iter()
@@ -1289,8 +1295,14 @@ fn credential_refresh_to_proto(refresh: &CredentialRefreshProfile) -> ProviderCr
         strategy: refresh.strategy as i32,
         token_url: refresh.token_url.clone(),
         scopes: refresh.scopes.clone(),
-        refresh_before_seconds: refresh.refresh_before_seconds,
-        max_lifetime_seconds: refresh.max_lifetime_seconds,
+        refresh_before: Some(prost_types::Duration {
+            seconds: refresh.refresh_before_seconds,
+            nanos: 0,
+        }),
+        max_lifetime: Some(prost_types::Duration {
+            seconds: refresh.max_lifetime_seconds,
+            nanos: 0,
+        }),
         material: refresh
             .material
             .iter()
@@ -1325,7 +1337,10 @@ fn token_grant_from_proto(
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
         client_assertion_type: token_grant.client_assertion_type.clone(),
         scopes: token_grant.scopes.clone(),
-        cache_ttl_seconds: token_grant.cache_ttl_seconds,
+        cache_ttl_seconds: token_grant
+            .cache_ttl
+            .as_ref()
+            .map_or(0, |value| value.seconds),
         audience_overrides: token_grant
             .audience_overrides
             .iter()
@@ -1349,7 +1364,10 @@ fn token_grant_to_proto(
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
         client_assertion_type: token_grant.client_assertion_type.clone(),
         scopes: token_grant.scopes.clone(),
-        cache_ttl_seconds: token_grant.cache_ttl_seconds,
+        cache_ttl: Some(prost_types::Duration {
+            seconds: token_grant.cache_ttl_seconds,
+            nanos: 0,
+        }),
         audience_overrides: token_grant
             .audience_overrides
             .iter()

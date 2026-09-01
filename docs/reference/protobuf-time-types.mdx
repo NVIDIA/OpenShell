@@ -1,0 +1,52 @@
+---
+title: Protobuf time types
+description: Timestamp and duration representation in the OpenShell API
+---
+
+OpenShell represents absolute times with `google.protobuf.Timestamp` and
+elapsed times with `google.protobuf.Duration` in its protobuf APIs.
+
+In protobuf JSON, timestamps are RFC 3339 strings and durations are strings
+ending in `s`:
+
+```json
+{
+  "createdTime": "2026-08-31T14:05:06.123456789Z",
+  "executionTimeout": "1.500s"
+}
+```
+
+An absent message means that no timestamp or duration was supplied. It is
+different from the Unix epoch (`1970-01-01T00:00:00Z`) and from a zero duration
+(`0s`). OpenShell validates protobuf timestamp and duration bounds at API
+boundaries.
+
+## Upgrade from scalar time fields
+
+The well-known time fields replace earlier public fields encoded as Unix
+milliseconds, integer seconds, or duration strings. Their names and protobuf
+tags changed, so clients generated from the old schema are not wire-compatible
+with a gateway generated from the new schema. Upgrade the gateway, CLI, and all
+SDK clients together.
+
+Before upgrading a gateway with persisted state:
+
+1. Stop all gateway replicas.
+2. Back up the SQLite database or PostgreSQL database.
+3. Upgrade every gateway replica and client from the same OpenShell release.
+4. Start one gateway replica and wait for startup to complete before starting
+   the remaining replicas.
+
+At startup, the gateway migrates affected protobuf payloads in one database
+transaction. Legacy zero timestamps become absent. Zero expiry-map values are
+removed, and the legacy maximum-integer refresh sentinel becomes an absent
+next-refresh timestamp. The database columns `created_at_ms` and
+`updated_at_ms` remain unchanged because they are internal ordering metadata.
+
+If a legacy payload is malformed or outside protobuf time bounds, startup
+fails with the affected object type and ID and rolls back the transaction.
+Restore the backup or repair the reported record with the previous OpenShell
+version before retrying the upgrade.
+
+User-facing timeout options and gateway TOML settings keep their existing
+units. The CLI and SDKs convert those values at the protobuf boundary.

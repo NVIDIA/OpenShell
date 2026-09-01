@@ -176,8 +176,8 @@ func profileCredentialRefreshFromProto(r *pb.ProviderCredentialRefresh) *types.P
 	}
 	result := &types.ProfileCredentialRefresh{
 		Strategy: RefreshStrategyFromProto(r.GetStrategy()), TokenURL: r.GetTokenUrl(),
-		Scopes: CopyStringSlice(r.GetScopes()), RefreshBeforeSeconds: r.GetRefreshBeforeSeconds(),
-		MaxLifetimeSeconds: r.GetMaxLifetimeSeconds(),
+		Scopes: CopyStringSlice(r.GetScopes()), RefreshBeforeSeconds: int64(DurationSecondsFromProto(r.GetRefreshBefore())),
+		MaxLifetimeSeconds: int64(DurationSecondsFromProto(r.GetMaxLifetime())),
 	}
 	for _, material := range r.GetMaterial() {
 		result.Material = append(result.Material, types.ProfileCredentialRefreshMaterial{Name: material.GetName(), Description: material.GetDescription(), Required: material.GetRequired(), Secret: material.GetSecret()})
@@ -194,8 +194,8 @@ func profileCredentialRefreshToProto(r *types.ProfileCredentialRefresh) *pb.Prov
 	}
 	result := &pb.ProviderCredentialRefresh{
 		Strategy: RefreshStrategyToProto(r.Strategy), TokenUrl: r.TokenURL,
-		Scopes: CopyStringSlice(r.Scopes), RefreshBeforeSeconds: r.RefreshBeforeSeconds,
-		MaxLifetimeSeconds: r.MaxLifetimeSeconds,
+		Scopes: CopyStringSlice(r.Scopes), RefreshBefore: DurationFromSeconds(uint64(r.RefreshBeforeSeconds)),
+		MaxLifetime: DurationFromSeconds(uint64(r.MaxLifetimeSeconds)),
 	}
 	for _, material := range r.Material {
 		result.Material = append(result.Material, &pb.ProviderCredentialRefreshMaterial{Name: material.Name, Description: material.Description, Required: material.Required, Secret: material.Secret})
@@ -215,7 +215,7 @@ func tokenGrantFromProto(tg *pb.ProviderCredentialTokenGrant) *types.CredentialT
 		Audience:            tg.GetAudience(),
 		JWTSVIDAudience:     tg.GetJwtSvidAudience(),
 		Scopes:              CopyStringSlice(tg.GetScopes()),
-		CacheTTLSeconds:     tg.GetCacheTtlSeconds(),
+		CacheTTLSeconds:     int64(DurationSecondsFromProto(tg.GetCacheTtl())),
 		ClientAssertionType: tg.GetClientAssertionType(),
 		GrantType:           CredentialTokenGrantTypeFromProto(tg.GetGrantType()),
 		SubjectToken:        subjectTokenFromProto(tg.GetSubjectToken()),
@@ -239,7 +239,7 @@ func tokenGrantToProto(tg *types.CredentialTokenGrant) *pb.ProviderCredentialTok
 		Audience:            tg.Audience,
 		JwtSvidAudience:     tg.JWTSVIDAudience,
 		Scopes:              CopyStringSlice(tg.Scopes),
-		CacheTtlSeconds:     tg.CacheTTLSeconds,
+		CacheTtl:            DurationFromSeconds(uint64(tg.CacheTTLSeconds)),
 		ClientAssertionType: tg.ClientAssertionType,
 		GrantType:           CredentialTokenGrantTypeToProto(tg.GrantType),
 		SubjectToken:        subjectTokenToProto(tg.SubjectToken),

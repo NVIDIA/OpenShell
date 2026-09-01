@@ -102,7 +102,10 @@ pub async fn handle_issue_sandbox_token(
     );
     Ok(Response::new(IssueSandboxTokenResponse {
         token: minted.token,
-        expires_at_ms: minted.expires_at_ms,
+        expiration_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+            minted.expires_at_ms,
+        )
+        .map_err(|error| Status::internal(error.to_string()))?,
     }))
 }
 
@@ -245,10 +248,13 @@ pub async fn handle_refresh_sandbox_token(
             .gateway_token
             .expose_secret()
             .to_string(),
-        expires_at_ms: authentication
-            .supervisor
-            .gateway_expires_at
-            .saturating_mul(1000),
+        expiration_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+            authentication
+                .supervisor
+                .gateway_expires_at
+                .saturating_mul(1000),
+        )
+        .map_err(|error| Status::internal(error.to_string()))?,
         extension_credentials,
         sandbox_token: authentication
             .supervisor
@@ -353,7 +359,10 @@ fn mint_extension_credentials(
             Ok(ExtensionServiceCredential {
                 service_name: name.clone(),
                 token: minted.token,
-                expires_at_ms: minted.expires_at_ms,
+                expiration_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+                    minted.expires_at_ms,
+                )
+                .map_err(|error| Status::internal(error.to_string()))?,
             })
         })
         .collect()
@@ -450,12 +459,12 @@ mod tests {
             metadata: Some(ObjectMeta {
                 id: sandbox_id.to_string(),
                 name: sandbox_id.to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::default(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -552,7 +561,7 @@ mod tests {
             .expect("refresh OK")
             .into_inner();
         assert!(!resp.token.is_empty());
-        assert!(resp.expires_at_ms > 0);
+        assert!(resp.expiration_time.is_some());
     }
 
     #[tokio::test]
@@ -583,7 +592,7 @@ mod tests {
             .into_inner();
         assert_eq!(replayed.token, second.token);
         assert_eq!(replayed.sandbox_token, second.sandbox_token);
-        assert_eq!(replayed.expires_at_ms, second.expires_at_ms);
+        assert_eq!(replayed.expiration_time, second.expiration_time);
 
         let mut changed_retry = request();
         changed_retry.get_mut().extension_service_names = vec!["content-guard".to_string()];
@@ -656,7 +665,7 @@ mod tests {
         assert_eq!(credentials.len(), 1);
         assert_eq!(credentials[0].service_name, "content-guard");
         assert!(!credentials[0].token.is_empty());
-        assert!(credentials[0].expires_at_ms > 0);
+        assert!(credentials[0].expiration_time.is_some());
 
         let error = mint_extension_credentials(
             issuer,
@@ -759,7 +768,7 @@ mod tests {
             .expect("issue OK")
             .into_inner();
         assert!(!resp.token.is_empty());
-        assert!(resp.expires_at_ms > 0);
+        assert!(resp.expiration_time.is_some());
     }
 
     #[tokio::test]

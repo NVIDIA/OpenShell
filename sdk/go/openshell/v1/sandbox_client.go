@@ -382,7 +382,7 @@ func (s *sandboxClient) GetLogs(ctx context.Context, workspace, sandboxName stri
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	}
 	if !cfg.Since().IsZero() {
-		req.SinceMs = converter.MillisFromTime(cfg.Since())
+		req.SinceTime = converter.TimestampFromTime(cfg.Since())
 	}
 
 	resp, err := s.client.GetSandboxLogs(ctx, req)

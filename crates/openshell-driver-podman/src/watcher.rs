@@ -338,7 +338,7 @@ async fn map_podman_event(
                             status: "Unknown".to_string(),
                             reason: "InspectFailed".to_string(),
                             message: format!("Container inspect failed: {e}"),
-                            last_transition_time: String::new(),
+                            transition_time: None,
                         },
                         false,
                     )))
@@ -495,7 +495,7 @@ pub fn driver_sandbox_from_list_entry(entry: &ContainerListEntry) -> Option<Driv
             status: status_str.to_string(),
             reason: reason.to_string(),
             message,
-            last_transition_time: String::new(),
+            transition_time: None,
         },
         entry.state == "removing",
     ))
@@ -561,21 +561,23 @@ fn condition_from_state(state: &ContainerState) -> DriverCondition {
         ),
     };
 
-    // Use Podman's state timestamps for last_transition_time:
+    // Use Podman's state timestamps for transition_time:
     // - Running/healthy states use started_at
     // - Stopped/exited states use finished_at
-    let last_transition_time = match state.status.as_str() {
+    let transition_time = match state.status.as_str() {
         "running" => state.started_at.clone().unwrap_or_default(),
         "exited" | "stopped" => state.finished_at.clone().unwrap_or_default(),
         _ => String::new(),
-    };
+    }
+    .parse()
+    .ok();
 
     DriverCondition {
         r#type: "Ready".to_string(),
         status: status_val.to_string(),
         reason: reason.to_string(),
         message,
-        last_transition_time,
+        transition_time,
     }
 }
 
@@ -719,7 +721,7 @@ mod tests {
         assert_eq!(cond.r#type, "Ready");
         assert_eq!(cond.status, "True");
         assert_eq!(cond.reason, "HealthCheckPassed");
-        assert_eq!(cond.last_transition_time, "2026-04-14T10:00:00Z");
+        assert_eq!(cond.transition_time, "2026-04-14T10:00:00Z".parse().ok());
     }
 
     #[test]
@@ -738,7 +740,10 @@ mod tests {
         assert_eq!(cond.status, "True");
         assert_eq!(cond.reason, CONDITION_RUNNING);
         assert_eq!(cond.message, "Container is running");
-        assert_eq!(cond.last_transition_time, "2026-04-14T10:00:00Z");
+        assert_eq!(
+            cond.transition_time,
+            "2026-04-14T10:00:00Z".parse().ok()
+        );
     }
 
     #[test]
@@ -774,7 +779,7 @@ mod tests {
         let cond = condition_from_state(&state);
         assert_eq!(cond.status, "False");
         assert_eq!(cond.reason, "OOMKilled");
-        assert_eq!(cond.last_transition_time, "2026-04-14T11:00:00Z");
+        assert_eq!(cond.transition_time, "2026-04-14T11:00:00Z".parse().ok());
     }
 
     #[test]
@@ -879,7 +884,7 @@ mod tests {
             status: "Unknown".to_string(),
             reason: "InspectFailed".to_string(),
             message: "Container inspect failed: connection refused".to_string(),
-            last_transition_time: String::new(),
+            transition_time: None,
         };
 
         let sandbox = DriverSandbox {

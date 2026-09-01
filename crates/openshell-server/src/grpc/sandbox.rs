@@ -221,7 +221,9 @@ pub(super) async fn handle_begin_rootfs_tar_staging(
         staging_token: slot.token,
         upload_path: slot.upload_path.to_string_lossy().into_owned(),
         max_bytes: slot.max_bytes,
-        expires_at_ms: slot.expires_at_ms,
+        expiration_time: openshell_core::time::timestamp_from_millis(slot.expires_at_ms)
+            .map(Some)
+            .map_err(|error| Status::internal(error.to_string()))?,
     }))
 }
 
@@ -463,12 +465,12 @@ async fn handle_create_sandbox_inner(
         metadata: Some(ObjectMeta {
             id: id.clone(),
             name: name.clone(),
-            created_at_ms: now_ms,
+            created_time: openshell_core::time::timestamp_from_millis(now_ms).ok(),
             labels: request.labels.clone(),
             resource_version: 0,
             annotations: request.annotations.clone(),
             workspace,
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         spec: Some(spec),
         status: None,
@@ -804,12 +806,12 @@ pub(super) async fn handle_create_sandbox_template(
     resolved.metadata = Some(ObjectMeta {
         id: uuid::Uuid::new_v4().to_string(),
         name: metadata.name,
-        created_at_ms: current_time_ms(),
+        created_time: openshell_core::time::timestamp_from_millis(current_time_ms()).ok(),
         labels: metadata.labels,
         resource_version: 0,
         annotations: metadata.annotations,
         workspace: workspace.clone(),
-        deletion_timestamp_ms: 0,
+        deletion_time: None,
     });
     validate_sandbox_workload_template(&resolved)?;
 
@@ -1610,7 +1612,13 @@ pub(super) async fn handle_watch_sandbox(
         req.log_tail_lines
     };
     let stop_on_terminal = req.stop_on_terminal;
-    let log_since_ms = req.log_since_ms;
+    let log_since_ms = req
+        .since_time
+        .as_ref()
+        .map(openshell_core::time::timestamp_to_millis)
+        .transpose()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?
+        .unwrap_or_default();
     let log_sources = req.log_sources;
     let log_min_level = req.log_min_level;
     let event_tail = req.event_tail;
@@ -1701,7 +1709,12 @@ pub(super) async fn handle_watch_sandbox(
                         ref log,
                     )) = evt.payload
                     {
-                        if log_since_ms > 0 && log.timestamp_ms < log_since_ms {
+                        let event_ms = log
+                            .event_time
+                            .as_ref()
+                            .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+                            .unwrap_or_default();
+                        if log_since_ms > 0 && event_ms < log_since_ms {
                             continue;
                         }
                         if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
@@ -1884,7 +1897,12 @@ pub(super) async fn handle_exec_sandbox(
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
     let stdin_payload = req.stdin;
-    let timeout_seconds = req.timeout_seconds;
+    let execution_timeout = req
+        .execution_timeout
+        .as_ref()
+        .map(openshell_core::time::duration_to_std)
+        .transpose()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let request_tty = req.tty;
     let (cols, rows) = pty_dimensions(req.cols, req.rows);
 
@@ -1908,7 +1926,7 @@ pub(super) async fn handle_exec_sandbox(
             relay_stream,
             &command_str,
             stdin_payload,
-            timeout_seconds,
+            execution_timeout,
             request_tty,
             no_login_shell,
             cols,
@@ -2084,9 +2102,11 @@ async fn validate_ssh_forward_token(
         return Err(Status::unauthenticated("SSH session token is not valid"));
     }
 
-    if session.expires_at_ms > 0 {
+    if let Some(expiration_time) = session.expiration_time.as_ref() {
         let now_ms = current_time_ms();
-        if now_ms > session.expires_at_ms {
+        let expires_at_ms = openshell_core::time::timestamp_to_millis(expiration_time)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        if now_ms > expires_at_ms {
             return Err(Status::unauthenticated("SSH session token expired"));
         }
     }
@@ -2323,7 +2343,12 @@ pub(super) async fn handle_exec_sandbox_interactive(
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
     let request_tty = req.tty;
     let no_login_shell = req.no_login_shell;
-    let timeout_seconds = req.timeout_seconds;
+    let execution_timeout = req
+        .execution_timeout
+        .as_ref()
+        .map(openshell_core::time::duration_to_std)
+        .transpose()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let (cols, rows) = pty_dimensions(req.cols, req.rows);
 
     let sandbox_id = sandbox.object_id().to_string();
@@ -2351,7 +2376,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
             input_stream,
             request_tty,
             no_login_shell,
-            timeout_seconds,
+            execution_timeout,
             cols,
             rows,
         )
@@ -2403,17 +2428,18 @@ pub(super) async fn handle_create_ssh_session(
         metadata: Some(ObjectMeta {
             id: token.clone(),
             name: generate_name(),
-            created_at_ms: now_ms,
+            created_time: openshell_core::time::timestamp_from_millis(now_ms).ok(),
             labels: HashMap::new(),
             resource_version: 0,
             annotations: HashMap::new(),
             workspace: sandbox.object_workspace().to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         sandbox_id: req.sandbox_id.clone(),
         token: token.clone(),
         revoked: false,
-        expires_at_ms,
+        expiration_time: openshell_core::time::optional_timestamp_from_legacy_millis(expires_at_ms)
+            .map_err(|error| Status::internal(error.to_string()))?,
     };
 
     // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
@@ -2457,7 +2483,8 @@ pub(super) async fn handle_create_ssh_session(
         gateway_port: gateway_port.into(),
         gateway_scheme: scheme.to_string(),
         host_key_fingerprint: String::new(),
-        expires_at_ms,
+        expiration_time: openshell_core::time::optional_timestamp_from_legacy_millis(expires_at_ms)
+            .map_err(|error| Status::internal(error.to_string()))?,
     }))
 }
 
@@ -2643,7 +2670,7 @@ async fn stream_exec_over_relay(
     relay_stream: tokio::io::DuplexStream,
     command: &str,
     stdin_payload: Vec<u8>,
-    timeout_seconds: u32,
+    execution_timeout: Option<std::time::Duration>,
     request_tty: bool,
     no_login_shell: bool,
     cols: u32,
@@ -2677,25 +2704,22 @@ async fn stream_exec_over_relay(
         tx.clone(),
     );
 
-    let exec_result = if timeout_seconds == 0 {
-        exec.await
-    } else if let Ok(r) = tokio::time::timeout(
-        std::time::Duration::from_secs(u64::from(timeout_seconds)),
-        exec,
-    )
-    .await
-    {
-        r
+    let exec_result = if let Some(execution_timeout) = execution_timeout {
+        if let Ok(result) = tokio::time::timeout(execution_timeout, exec).await {
+            result
+        } else {
+            let _ = tx
+                .send(Ok(ExecSandboxEvent {
+                    payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
+                        ExecSandboxExit { exit_code: 124 },
+                    )),
+                }))
+                .await;
+            let _ = proxy_task.await;
+            return Ok(());
+        }
     } else {
-        let _ = tx
-            .send(Ok(ExecSandboxEvent {
-                payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
-                    ExecSandboxExit { exit_code: 124 },
-                )),
-            }))
-            .await;
-        let _ = proxy_task.await;
-        return Ok(());
+        exec.await
     };
 
     let exit_code = match exec_result {
@@ -2729,7 +2753,7 @@ async fn stream_interactive_exec_over_relay(
     input_stream: tonic::Streaming<ExecSandboxInput>,
     request_tty: bool,
     no_login_shell: bool,
-    timeout_seconds: u32,
+    execution_timeout: Option<std::time::Duration>,
     cols: u32,
     rows: u32,
 ) -> Result<(), Status> {
@@ -2761,25 +2785,22 @@ async fn stream_interactive_exec_over_relay(
         tx.clone(),
     );
 
-    let exec_result = if timeout_seconds == 0 {
-        exec.await
-    } else if let Ok(r) = tokio::time::timeout(
-        std::time::Duration::from_secs(u64::from(timeout_seconds)),
-        exec,
-    )
-    .await
-    {
-        r
+    let exec_result = if let Some(execution_timeout) = execution_timeout {
+        if let Ok(result) = tokio::time::timeout(execution_timeout, exec).await {
+            result
+        } else {
+            let _ = tx
+                .send(Ok(ExecSandboxEvent {
+                    payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
+                        ExecSandboxExit { exit_code: 124 },
+                    )),
+                }))
+                .await;
+            let _ = proxy_task.await;
+            return Ok(());
+        }
     } else {
-        let _ = tx
-            .send(Ok(ExecSandboxEvent {
-                payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
-                    ExecSandboxExit { exit_code: 124 },
-                )),
-            }))
-            .await;
-        let _ = proxy_task.await;
-        return Ok(());
+        exec.await
     };
 
     let exit_code = match exec_result {
@@ -3580,18 +3601,18 @@ mod tests {
             metadata: Some(ObjectMeta {
                 id: format!("provider-{name}"),
                 name: name.to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: provider_type.to_string(),
             credentials: std::iter::once((credential_key.to_string(), "secret".to_string()))
                 .collect(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         }
@@ -3602,12 +3623,12 @@ mod tests {
             metadata: Some(ObjectMeta {
                 id: format!("sandbox-{name}"),
                 name: name.to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::iter::once(("team".to_string(), "agents".to_string())).collect(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 log_level: "debug".to_string(),
@@ -3627,12 +3648,12 @@ mod tests {
             metadata: Some(ObjectMeta {
                 id: String::new(),
                 name: name.to_string(),
-                created_at_ms: 0,
+                created_time: openshell_core::time::timestamp_from_millis(0).ok(),
                 labels: HashMap::from([("team".to_string(), "runtime".to_string())]),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: String::new(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(openshell_core::proto::SandboxWorkloadTemplateSpec {
                 workload: Some(openshell_core::proto::SandboxWorkloadConfig {

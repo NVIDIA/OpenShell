@@ -99,7 +99,7 @@ func (p *providerClient) Update(ctx context.Context, workspace string, provider 
 		WorkspaceScope: namedWorkspaceScope(workspace),
 	}
 	if proto != nil {
-		req.CredentialExpiresAtMs = proto.CredentialExpiresAtMs
+		req.CredentialExpirationTimes = proto.CredentialExpirationTimes
 	}
 
 	resp, err := p.client.UpdateProvider(ctx, req)

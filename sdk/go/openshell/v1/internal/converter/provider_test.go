@@ -11,6 +11,7 @@ import (
 	dm "github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func TestProviderFromProto_Nil(t *testing.T) {
@@ -22,7 +23,7 @@ func TestProviderFromProto_Full(t *testing.T) {
 		Metadata: &dm.ObjectMeta{
 			Id:              "prov-1",
 			Name:            "claude-provider",
-			CreatedAtMs:     1700000000000,
+			CreatedTime:     TimestampFromMillis(1700000000000),
 			Labels:          map[string]string{"env": "prod"},
 			Annotations:     map[string]string{"note": "test"},
 			ResourceVersion: 42,
@@ -32,8 +33,8 @@ func TestProviderFromProto_Full(t *testing.T) {
 		Credentials:      map[string]string{"api_key": "secret"},
 		Config:           map[string]string{"base_url": "https://api.example.com"},
 		ProfileWorkspace: "shared",
-		CredentialExpiresAtMs: map[string]int64{
-			"api_key": 1700003600000,
+		CredentialExpirationTimes: map[string]*timestamppb.Timestamp{
+			"api_key": TimestampFromMillis(1700003600000),
 		},
 		CredentialHandles: map[string]*dm.CredentialHandle{
 			"api_key": {
@@ -133,8 +134,8 @@ func TestProviderToProto_Full(t *testing.T) {
 	assert.Equal(t, map[string]string{"token": "abc"}, result.Credentials)
 	assert.Equal(t, map[string]string{"url": "https://example.com"}, result.Config)
 
-	require.Len(t, result.CredentialExpiresAtMs, 1)
-	assert.Greater(t, result.CredentialExpiresAtMs["token"], int64(0))
+	require.Len(t, result.CredentialExpirationTimes, 1)
+	assert.Greater(t, MillisFromProto(result.CredentialExpirationTimes["token"]), int64(0))
 
 	require.Len(t, result.CredentialHandles, 1)
 	h := result.CredentialHandles["token"]

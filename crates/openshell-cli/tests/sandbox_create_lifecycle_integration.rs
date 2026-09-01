@@ -150,12 +150,12 @@ impl OpenShell for TestOpenShell {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("id-{sandbox_name}"),
                 name: sandbox_name,
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: String::new(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             ..Sandbox::default()
         };
@@ -188,12 +188,12 @@ impl OpenShell for TestOpenShell {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("id-{name}"),
                 name,
-                created_at_ms: 0,
+                created_time: None,
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: String::new(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             ..Sandbox::default()
         };
@@ -223,7 +223,7 @@ impl OpenShell for TestOpenShell {
         template.metadata = Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: format!("template-{name}"),
             name,
-            created_at_ms: 0,
+            created_time: openshell_core::time::timestamp_from_millis(0).ok(),
             labels: template
                 .metadata
                 .as_ref()
@@ -234,7 +234,7 @@ impl OpenShell for TestOpenShell {
             workspace: selected_workspace(&request.workspace_scope)
                 .unwrap_or("default")
                 .to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         });
         self.state
             .template_create_requests
@@ -261,14 +261,14 @@ impl OpenShell for TestOpenShell {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: format!("template-{}", request.name),
                     name: request.name,
-                    created_at_ms: 0,
+                    created_time: openshell_core::time::timestamp_from_millis(0).ok(),
                     labels: HashMap::new(),
                     resource_version: 1,
                     annotations: HashMap::new(),
                     workspace: selected_workspace(&request.workspace_scope)
                         .unwrap_or("default")
                         .to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: None,
             }),
@@ -609,12 +609,12 @@ impl OpenShell for TestOpenShell {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: sandbox_id.clone(),
                     name: sandbox_id.trim_start_matches("id-").to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: String::new(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 ..Sandbox::default()
             };
@@ -627,7 +627,7 @@ impl OpenShell for TestOpenShell {
                         status: "False".to_string(),
                         reason: "ProcessExited".to_string(),
                         message: "VM process exited with status 0".to_string(),
-                        last_transition_time: String::new(),
+                        transition_time: None,
                     }],
                     ..Default::default()
                 }),
@@ -710,7 +710,7 @@ impl OpenShell for TestOpenShell {
                         .send(Ok(SandboxStreamEvent {
                             payload: Some(sandbox_stream_event::Payload::Log(SandboxLogLine {
                                 sandbox_id: sandbox_id.clone(),
-                                timestamp_ms: 0,
+                                event_time: None,
                                 level: "INFO".to_string(),
                                 target: "test".to_string(),
                                 message: message.to_string(),
@@ -1428,17 +1428,17 @@ async fn add_provider(server: &TestServer, name: &str, provider_type: &str) {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("provider-{name}"),
                 name: name.to_string(),
-                created_at_ms: 0,
+                created_time: openshell_core::time::timestamp_from_millis(0).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: provider_type.to_string(),
             credentials: HashMap::new(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         });
