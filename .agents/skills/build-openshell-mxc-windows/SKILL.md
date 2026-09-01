@@ -192,7 +192,7 @@ The GitHub Actions jobs layer architecture-specific `Swatinem/rust-cache`
 entries for Cargo registry and dependency target artifacts with sccache's GHA
 backend for cacheable Rust compiler outputs. Failed runs also save their usable
 dependency artifacts. Pull-request mirrors and merge queues run Clippy for the
-Windows gateway, core, and CLI crates plus Rust tests. Pushes to `main` and
+Windows-supported workspace and e2e crates plus Rust tests. Pushes to `main` and
 manual dispatches run the same lint and test commands in a cache-seed job,
 followed by a dependent release-binary build job. The seed and PR jobs use the
 same cache namespaces. The binaries are not uploaded or published.

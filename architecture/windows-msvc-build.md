@@ -54,8 +54,8 @@ creating misleading Windows driver artifacts.
 
 ## Mise Lane
 
-The GitHub Actions workflow runs Clippy for the Windows gateway, core, and CLI
-crates plus Rust tests for pull-request mirror branches and merge queues. On
+The GitHub Actions workflow runs Clippy for the Windows-supported workspace and
+e2e crates plus Rust tests for pull-request mirror branches and merge queues. On
 pushes to `main`, a cache-seed job runs the same lint and test commands before a
 dependent job builds the release binaries. Manual dispatches exercise the same
 seed-then-build path. The binaries remain CI validation artifacts and are not
@@ -145,7 +145,7 @@ The x64 GitHub Actions jobs run on `windows-2025`. Pull-request mirrors and
 merge queues execute:
 
 ```powershell
-cargo clippy -p openshell-server -p openshell-core -p openshell-cli --all-targets --no-deps --features openshell-prover/prebuilt-z3 -- -D warnings -A dead-code -A unused-imports -A clippy::unused-async
+mise run --skip-tools rust:lint
 mise run --skip-tools test:rust
 ```
 
