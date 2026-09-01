@@ -3717,12 +3717,21 @@ fn labels_display(labels: &HashMap<String, String>) -> String {
 }
 
 /// Controls whether sandbox deletion waits for durable absence.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct SandboxDeleteOptions {
-    /// Return after the gateway acknowledges an asynchronous delete.
-    pub no_wait: bool,
+    /// Wait for terminal absence after deletion is acknowledged.
+    pub wait: bool,
     /// Override the per-sandbox lifecycle timeout. The environment/default applies when unset.
     pub timeout: Option<Duration>,
+}
+
+impl Default for SandboxDeleteOptions {
+    fn default() -> Self {
+        Self {
+            wait: true,
+            timeout: None,
+        }
+    }
 }
 
 /// Delete a sandbox by name, or all sandboxes when `all` is true.
@@ -3806,7 +3815,7 @@ pub async fn sandbox_delete(
         let deletion = response.into_inner();
         match deletion.outcome() {
             DeletionOutcome::Completed => println!("{} Deleted sandbox {name}", "✓".green().bold()),
-            DeletionOutcome::Accepted if options.no_wait => println!(
+            DeletionOutcome::Accepted if !options.wait => println!(
                 "{} Sandbox {name} deletion accepted; cleanup is pending",
                 "✓".green().bold()
             ),

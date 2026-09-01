@@ -465,16 +465,18 @@ openshell logs my-sandbox --since 5m
 openshell sandbox delete my-sandbox
 openshell sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
 openshell sandbox delete --all
-openshell sandbox delete my-sandbox --no-wait            # Async acknowledgment only
+openshell sandbox delete my-sandbox --wait=false         # Async acknowledgment only
 ```
 
-Deletion waits for the targeted sandbox to disappear by default. Use `--no-wait`
-for an acknowledgment before cleanup finishes, and `--timeout <seconds>` to
-bound each wait (300 seconds by default). `OPENSHELL_LIFECYCLE_TIMEOUT` also
-sets the default. A timeout reports an error while deletion continues. An
-already-absent sandbox succeeds;
-missing workspaces and authorization failures remain errors. Do not blindly
-retry by name if another process might have recreated that name.
+Delete waits for terminal absence by default, so a following workspace delete
+can run immediately. Use `--wait=false` only when the caller does not depend on
+cleanup completion. Override the default 300-second per-sandbox lifecycle
+timeout with a positive `--timeout <seconds>` value or
+`OPENSHELL_LIFECYCLE_TIMEOUT`; a timeout reports an error while gateway
+deletion continues asynchronously. The timeout is ignored when `--wait=false`.
+An already-absent sandbox succeeds. Missing workspaces and authorization
+failures remain errors. Do not blindly retry by name if another process might
+have recreated that name.
 
 ### Stop and start sandboxes
 
