@@ -97,6 +97,7 @@ impl<K: MockKind> NetworkMediationSource for MockSource<K> {
                 ancestors: vec![],
                 cmdline_paths: vec![],
             }),
+            destination: None,
         })
     }
 }
@@ -113,6 +114,7 @@ impl NetworkMediationSource for UnattributedSource {
         Ok(MediatedConnection {
             stream: Box::new(near),
             binary_identity: Err(ResolveError::Failed("hash unavailable".to_string())),
+            destination: None,
         })
     }
 }
@@ -700,6 +702,10 @@ fn error_kinds_map_to_supervisor_status_classes() {
     );
     assert_eq!(
         BackendError::Unavailable("x".into()).kind(),
+        BackendErrorKind::Unavailable
+    );
+    assert_eq!(
+        BackendError::Unsupported("x".into()).kind(),
         BackendErrorKind::Unavailable
     );
     assert_eq!(
