@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "openshell-isolation"
-description = "OpenShell Isolation Backend runtime contract (RFC 0012)"
+name = "openshell-isolation-interface"
+description = "OpenShell Isolation Backend interface (RFC 0012)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
