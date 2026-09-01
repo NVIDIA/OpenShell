@@ -9,8 +9,9 @@ position: 3
 ---
 
 An OpenShell workspace is an access and resource isolation boundary. Sandboxes,
-providers, services, policies, settings, and inference routes belong to a
-workspace and are not visible to members of other workspaces.
+sandbox workload templates, providers, services, policies, settings, and
+inference routes belong to a workspace and are not visible to members of other
+workspaces.
 
 The CLI targets the `default` workspace unless you set `--workspace` or
 `OPENSHELL_WORKSPACE`. The logical OpenShell workspace described here is
@@ -49,6 +50,8 @@ The following table summarizes common operations.
 | Add Workspace Users or remove members | Any workspace | Assigned workspace | No |
 | Assign the Workspace Admin role | Any workspace | No | No |
 | Create, use, or delete sandboxes and services | Any workspace | Assigned workspace | Assigned workspace |
+| Create or delete sandbox workload templates | Any workspace | Assigned workspace | No |
+| Read or list sandbox workload templates | Any workspace | Assigned workspace | Assigned workspace |
 | Create, update, or delete providers | Any workspace | Assigned workspace | No |
 | Change workspace policy or settings | Any workspace | Assigned workspace | No |
 | Manage platform profiles or global configuration | Yes | No | No |
@@ -187,11 +190,11 @@ be deleted.
 openshell workspace delete team-ml
 ```
 
-A custom workspace must not contain sandboxes, providers, provider profiles,
-services, SSH sessions, settings, policies, draft policy chunks, or credential
-refresh state. Remove those resources before retrying deletion. OpenShell
-removes membership records and inference routes as part of successful
-workspace deletion.
+A custom workspace must not contain sandboxes, sandbox workload templates,
+providers, provider profiles, services, SSH sessions, settings, policies, draft
+policy chunks, or credential refresh state. Remove those resources before
+retrying deletion. OpenShell removes membership records and inference routes as
+part of successful workspace deletion.
 
 ## Next Steps
 
