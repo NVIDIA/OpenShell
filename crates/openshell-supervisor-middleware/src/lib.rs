@@ -5,7 +5,14 @@
 
 pub mod headers;
 mod remote;
+mod response;
 mod websocket;
+
+pub use response::{
+    HttpResponseFinish, HttpResponseInvocation, HttpResponseInvocationOutcome,
+    HttpResponseMiddlewareFailure, HttpResponsePreflightInput, HttpResponsePreflightOutcome,
+    HttpResponseSession, MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES,
+};
 
 pub use websocket::{
     WebSocketCoverage, WebSocketCoverageState, WebSocketInvocation, WebSocketInvocationOutcome,
@@ -33,7 +40,8 @@ use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response as TonicResponse, Status as TonicStatus};
 
 pub use openshell_core::middleware::{
-    HttpRequestView, InProcessMiddleware, SupervisorMiddlewareEndpoint, WebSocketResponseStream,
+    HttpRequestView, HttpResponseResultStream, InProcessMiddleware, SupervisorMiddlewareEndpoint,
+    WebSocketResponseStream,
 };
 pub type MiddlewareService =
     dyn SupervisorMiddleware<EvaluateWebSocketSessionStream = WebSocketResponseStream>;
@@ -179,6 +187,13 @@ impl InProcessMiddleware for EndpointInProcessAdapter {
         requests: tokio::sync::mpsc::Receiver<openshell_core::proto::WebSocketSessionEvent>,
     ) -> std::result::Result<WebSocketResponseStream, tonic::Status> {
         self.endpoint.open_websocket_session(requests).await
+    }
+
+    async fn open_http_response_pre_return(
+        &self,
+        requests: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpResponseEvent>,
+    ) -> std::result::Result<HttpResponseResultStream, tonic::Status> {
+        self.endpoint.open_http_response_pre_return(requests).await
     }
 }
 
@@ -618,6 +633,16 @@ impl MiddlewareDispatch {
             Self::Grpc(service) => service.open_websocket_session(receiver).await,
         }
     }
+
+    async fn open_http_response_pre_return(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpResponseEvent>,
+    ) -> std::result::Result<HttpResponseResultStream, tonic::Status> {
+        match self {
+            Self::InProcess(service) => service.open_http_response_pre_return(receiver).await,
+            Self::Grpc(service) => service.open_http_response_pre_return(receiver).await,
+        }
+    }
 }
 
 struct MiddlewareServiceState {
@@ -823,6 +848,7 @@ fn validate_payload_limit(source: &str, binding: &MiddlewareBinding) -> Result<u
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SupportedBinding {
     HttpPreCredentials,
+    HttpResponsePreReturn,
     WebSocketPreCredentials,
 }
 
@@ -835,6 +861,10 @@ fn supported_binding(source: &str, binding: &MiddlewareBinding) -> Result<Suppor
             Some(SupervisorMiddlewareOperation::HttpRequest),
             Some(SupervisorMiddlewarePhase::PreCredentials),
         ) => Ok(SupportedBinding::HttpPreCredentials),
+        (
+            Some(SupervisorMiddlewareOperation::HttpResponse),
+            Some(SupervisorMiddlewarePhase::PreReturn),
+        ) => Ok(SupportedBinding::HttpResponsePreReturn),
         (
             Some(SupervisorMiddlewareOperation::WebsocketMessage),
             Some(SupervisorMiddlewarePhase::PreCredentials),
@@ -1430,6 +1460,20 @@ impl ChainRunner {
                 entries,
                 SupervisorMiddlewareOperation::WebsocketMessage,
                 SupervisorMiddlewarePhase::PreCredentials,
+            )
+            .await?
+            .entries)
+    }
+
+    pub async fn describe_http_response_chain(
+        &self,
+        entries: &[ChainEntry],
+    ) -> Result<Vec<DescribedChainEntry>> {
+        Ok(self
+            .describe_chain_for(
+                entries,
+                SupervisorMiddlewareOperation::HttpResponse,
+                SupervisorMiddlewarePhase::PreReturn,
             )
             .await?
             .entries)

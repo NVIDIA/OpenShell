@@ -11,10 +11,16 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
 use crate::proto::{
-    HttpHeader, HttpRequestEvaluation, HttpRequestResult, HttpRequestTarget, MiddlewareManifest,
-    RequestContext, SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse,
-    WebSocketSessionEvent, WebSocketSessionEventResult,
+    HttpHeader, HttpRequestEvaluation, HttpRequestResult, HttpRequestTarget, HttpResponseEvent,
+    HttpResponseEventResult, MiddlewareManifest, RequestContext, SupervisorMiddlewarePhase,
+    ValidateConfigRequest, ValidateConfigResponse, WebSocketSessionEvent,
+    WebSocketSessionEventResult,
 };
+
+/// Transport-neutral result stream for one HTTP response middleware stage.
+pub type HttpResponseResultStream = Pin<
+    Box<dyn tokio_stream::Stream<Item = Result<HttpResponseEventResult, Status>> + Send + 'static>,
+>;
 
 /// Transport-neutral response stream for one WebSocket middleware stage.
 pub type WebSocketResponseStream = Pin<
@@ -47,6 +53,15 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
         &self,
         requests: mpsc::Receiver<WebSocketSessionEvent>,
     ) -> Result<WebSocketResponseStream, Status>;
+
+    async fn open_http_response_pre_return(
+        &self,
+        _requests: mpsc::Receiver<HttpResponseEvent>,
+    ) -> Result<HttpResponseResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement HTTP response pre-return evaluation",
+        ))
+    }
 }
 
 /// Borrowed request state exposed to one in-process middleware invocation.
@@ -240,6 +255,18 @@ pub trait InProcessMiddleware: Send + Sync {
     ) -> std::result::Result<WebSocketResponseStream, Status> {
         Err(Status::unimplemented(
             "middleware does not implement WebSocket sessions",
+        ))
+    }
+
+    /// Open one HTTP response pre-return stream.
+    ///
+    /// Request-only implementations may keep the default unsupported response.
+    async fn open_http_response_pre_return(
+        &self,
+        _requests: mpsc::Receiver<HttpResponseEvent>,
+    ) -> std::result::Result<HttpResponseResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement HTTP response pre-return evaluation",
         ))
     }
 }
