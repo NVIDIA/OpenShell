@@ -73,8 +73,8 @@ rules:
     verbs:
       - get
   # PDB access spans workspace namespaces in managed/operator modes. Keep
-  # cleanup available when new requests are disabled so stale managed PDBs can
-  # still expire or be removed.
+  # cleanup and metadata-only gateway ownership adoption available when new
+  # requests are disabled so stale managed PDBs can still expire or be removed.
   - apiGroups:
       - policy
     resources:
@@ -83,9 +83,9 @@ rules:
       - delete
       - get
       - list
+      - patch
       {{- if .Values.server.disruptionProtection.enabled }}
       - create
-      - patch
       {{- end }}
   {{- end }}
   {{- $copiedSecretNames := list }}

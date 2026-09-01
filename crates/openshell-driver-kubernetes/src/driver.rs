@@ -814,6 +814,10 @@ impl KubernetesComputeDriver {
 
         let gateway_id = &self.config.gateway_id;
         for obj in &list {
+            // A previous startup may already have adopted the Sandbox while
+            // leaving its PDB on the old gateway ID. Check every Sandbox so a
+            // retry repairs either side of that partial transition.
+            self.backfill_disruption_protection_gateway_id(obj).await?;
             if !gateway_id_label_needs_backfill(obj.metadata.labels.as_ref(), gateway_id) {
                 continue;
             }
@@ -847,6 +851,85 @@ impl KubernetesComputeDriver {
             }
         }
 
+        Ok(())
+    }
+
+    async fn backfill_disruption_protection_gateway_id(
+        &self,
+        sandbox: &DynamicObject,
+    ) -> Result<(), KubernetesDriverError> {
+        let name = sandbox.metadata.name.as_deref().ok_or_else(|| {
+            KubernetesDriverError::Message("Sandbox is missing metadata.name".to_string())
+        })?;
+        let namespace = sandbox.metadata.namespace.as_deref().ok_or_else(|| {
+            KubernetesDriverError::Message(format!(
+                "Sandbox '{name}' is missing metadata.namespace"
+            ))
+        })?;
+        let api = self.disruption_protection_api(namespace);
+        let existing = tokio::time::timeout(KUBE_API_TIMEOUT, api.get_opt(name))
+            .await
+            .map_err(|_| {
+                KubernetesDriverError::Message(format!(
+                    "timed out fetching PodDisruptionBudget '{name}' during gateway-id backfill"
+                ))
+            })?
+            .map_err(KubernetesDriverError::from_kube)?;
+        let Some(existing) = existing else {
+            return Ok(());
+        };
+        let gateway_id = &self.config.gateway_id;
+        if !gateway_id_label_needs_backfill(existing.metadata.labels.as_ref(), gateway_id) {
+            return Ok(());
+        }
+
+        if !disruption_protection_pdb_has_management_labels(&existing) {
+            // A user-managed PDB may legitimately have the same name as a
+            // Sandbox that did not request OpenShell disruption protection.
+            return Ok(());
+        }
+        let sandbox_id = sandbox_id_from_object(sandbox).map_err(KubernetesDriverError::Message)?;
+        if !disruption_protection_pdb_belongs_to_sandbox(&existing, sandbox, &sandbox_id) {
+            return Err(KubernetesDriverError::Precondition(format!(
+                "PodDisruptionBudget '{namespace}/{name}' cannot be adopted by gateway '{gateway_id}' because it is not owned by Sandbox UID and ID"
+            )));
+        }
+        let resource_version = existing.metadata.resource_version.ok_or_else(|| {
+            KubernetesDriverError::Message(format!(
+                "PodDisruptionBudget '{namespace}/{name}' is missing metadata.resourceVersion"
+            ))
+        })?;
+        let previous_gateway_id = existing
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(LABEL_GATEWAY_ID))
+            .cloned();
+        let patch = serde_json::json!({
+            "metadata": {
+                "resourceVersion": resource_version,
+                "labels": {
+                    LABEL_GATEWAY_ID: gateway_id
+                }
+            }
+        });
+        tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            api.patch(name, &PatchParams::default(), &Patch::Merge(&patch)),
+        )
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!(
+                "timed out backfilling gateway-id label on PodDisruptionBudget '{namespace}/{name}'"
+            ))
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+        info!(
+            sandbox = %name,
+            previous_gateway_id = previous_gateway_id.as_deref().unwrap_or("<missing>"),
+            gateway_id,
+            "backfilled gateway-id label on disruption protection PDB"
+        );
         Ok(())
     }
 
@@ -3446,6 +3529,26 @@ fn disruption_protection_pdb_is_managed_by(
     sandbox_id: &str,
     gateway_id: &str,
 ) -> bool {
+    disruption_protection_pdb_has_sandbox_id(pdb, sandbox_id)
+        && pdb
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(LABEL_GATEWAY_ID))
+            .is_some_and(|value| value == gateway_id)
+}
+
+fn disruption_protection_pdb_has_sandbox_id(pdb: &PodDisruptionBudget, sandbox_id: &str) -> bool {
+    disruption_protection_pdb_has_management_labels(pdb)
+        && pdb
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
+            .is_some_and(|value| value == sandbox_id)
+}
+
+fn disruption_protection_pdb_has_management_labels(pdb: &PodDisruptionBudget) -> bool {
     let labels = pdb.metadata.labels.as_ref();
     labels
         .and_then(|labels| labels.get(LABEL_MANAGED_BY))
@@ -3453,12 +3556,38 @@ fn disruption_protection_pdb_is_managed_by(
         && labels
             .and_then(|labels| labels.get(DISRUPTION_PROTECTION_LABEL))
             .is_some_and(|value| value == DISRUPTION_PROTECTION_LABEL_VALUE)
-        && labels
-            .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
-            .is_some_and(|value| value == sandbox_id)
-        && labels
-            .and_then(|labels| labels.get(LABEL_GATEWAY_ID))
-            .is_some_and(|value| value == gateway_id)
+}
+
+fn disruption_protection_pdb_belongs_to_sandbox(
+    pdb: &PodDisruptionBudget,
+    sandbox: &DynamicObject,
+    sandbox_id: &str,
+) -> bool {
+    let Some(sandbox_name) = sandbox.metadata.name.as_deref() else {
+        return false;
+    };
+    let Some(sandbox_namespace) = sandbox.metadata.namespace.as_deref() else {
+        return false;
+    };
+    let Some(owner_uid) = sandbox.metadata.uid.as_deref() else {
+        return false;
+    };
+
+    pdb.metadata.name.as_deref() == Some(sandbox_name)
+        && pdb.metadata.namespace.as_deref() == Some(sandbox_namespace)
+        && disruption_protection_pdb_has_sandbox_id(pdb, sandbox_id)
+        && pdb
+            .metadata
+            .owner_references
+            .as_ref()
+            .is_some_and(|owners| {
+                owners.iter().any(|owner| {
+                    owner.kind == SANDBOX_KIND
+                        && owner.name == sandbox_name
+                        && owner.uid == owner_uid
+                        && owner.controller == Some(true)
+                })
+            })
 }
 
 fn sandbox_labels(sandbox: &Sandbox, gateway_id: Option<&str>) -> BTreeMap<String, String> {
@@ -7287,6 +7416,75 @@ mod tests {
                 "{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{DISRUPTION_PROTECTION_LABEL}={DISRUPTION_PROTECTION_LABEL_VALUE},{LABEL_GATEWAY_ID}=gateway-a"
             )
         );
+    }
+
+    #[test]
+    fn gateway_id_backfill_can_adopt_owned_pdb_from_previous_gateway() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("workspace--tool", &resource);
+        sandbox.metadata.namespace = Some("openshell".to_string());
+        sandbox.metadata.uid = Some("sandbox-uid".to_string());
+        sandbox.metadata.annotations = Some(BTreeMap::from([(
+            LABEL_SANDBOX_ID.to_string(),
+            "sandbox-id".to_string(),
+        )]));
+        let owner = disruption_protection_owner_reference(&sandbox, &resource).unwrap();
+        let pdb = disruption_protection_pdb(
+            "workspace--tool",
+            "openshell",
+            "sandbox-id",
+            "gateway-old",
+            "2026-08-10T16:00:00Z",
+            Some(owner),
+        );
+
+        assert!(gateway_id_label_needs_backfill(
+            pdb.metadata.labels.as_ref(),
+            "gateway-new"
+        ));
+        assert!(disruption_protection_pdb_belongs_to_sandbox(
+            &pdb,
+            &sandbox,
+            "sandbox-id"
+        ));
+    }
+
+    #[test]
+    fn gateway_id_backfill_rejects_pdb_owned_by_different_sandbox_uid() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("workspace--tool", &resource);
+        sandbox.metadata.namespace = Some("openshell".to_string());
+        sandbox.metadata.uid = Some("sandbox-uid".to_string());
+        let owner = OwnerReference {
+            api_version: resource.api_version,
+            kind: resource.kind,
+            name: "workspace--tool".to_string(),
+            uid: "different-sandbox-uid".to_string(),
+            controller: Some(true),
+            block_owner_deletion: Some(false),
+        };
+        let pdb = disruption_protection_pdb(
+            "workspace--tool",
+            "openshell",
+            "sandbox-id",
+            "gateway-old",
+            "2026-08-10T16:00:00Z",
+            Some(owner),
+        );
+
+        assert!(!disruption_protection_pdb_belongs_to_sandbox(
+            &pdb,
+            &sandbox,
+            "sandbox-id"
+        ));
     }
 
     #[test]

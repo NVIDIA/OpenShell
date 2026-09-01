@@ -9,7 +9,7 @@ release:
   namespace: my-namespace
 
 tests:
-  - it: grants PodDisruptionBudget cleanup in multi-namespace mode while protection is disabled
+  - it: grants PodDisruptionBudget cleanup and ownership adoption while protection is disabled
     set:
       server.drivers.kubernetes.workspaceMode: managed
     asserts:
@@ -18,7 +18,7 @@ tests:
           content:
             apiGroups: ["policy"]
             resources: ["poddisruptionbudgets"]
-            verbs: ["delete", "get", "list"]
+            verbs: ["delete", "get", "list", "patch"]
 
   - it: grants PodDisruptionBudget mutation in multi-namespace mode when protection is enabled
     set:
@@ -30,7 +30,7 @@ tests:
           content:
             apiGroups: ["policy"]
             resources: ["poddisruptionbudgets"]
-            verbs: ["delete", "get", "list", "create", "patch"]
+            verbs: ["delete", "get", "list", "patch", "create"]
 
   - it: omits cluster-wide PodDisruptionBudget access in shared mode
     set:

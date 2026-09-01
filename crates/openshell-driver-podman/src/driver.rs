@@ -2894,7 +2894,7 @@ mod tests {
             name: name.to_string(),
             namespace: String::new(),
             workspace: String::new(),
-            spec: None,
+            spec: Some(DriverSandboxSpec::default()),
             status: None,
         }
     }

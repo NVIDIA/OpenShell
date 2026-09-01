@@ -1133,7 +1133,7 @@ async fn wait_ready_accepts_successful_completion() {
     let client = connect(&endpoint).await;
 
     let sandbox = client
-        .wait_ready("short-job", std::time::Duration::from_secs(5))
+        .wait_ready("short-job", Duration::from_secs(5))
         .await
         .unwrap();
     assert_eq!(sandbox.phase, SandboxPhase::Completed);
@@ -1149,7 +1149,7 @@ async fn wait_ready_surfaces_stopped_phase_without_timing_out() {
     let client = connect(&endpoint).await;
 
     let err = client
-        .wait_ready("failed-job", std::time::Duration::from_secs(5))
+        .wait_ready("failed-job", Duration::from_secs(5))
         .await
         .unwrap_err();
     assert_eq!(err.code(), "connect");
