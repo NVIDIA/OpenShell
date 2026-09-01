@@ -2226,7 +2226,11 @@ def test_create_forwards_name_and_labels() -> None:
 def test_create_from_template_forwards_workload_template_name() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
-    spec = openshell_pb2.SandboxSpec(providers=["github"])
+    spec = openshell_pb2.SandboxSpec(
+        providers=["github"],
+        command=["/opt/worker", "--serve"],
+        tty=True,
+    )
 
     ref = client.create_from_template(
         workspace="default",
@@ -2241,6 +2245,8 @@ def test_create_from_template_forwards_workload_template_name() -> None:
     assert stub.create_request.workload_template_name == "gpu-kata"
     assert dict(stub.create_request.labels) == {"team": "runtime"}
     assert list(stub.create_request.spec.providers) == ["github"]
+    assert list(stub.create_request.spec.command) == ["/opt/worker", "--serve"]
+    assert stub.create_request.spec.tty is True
     assert dict(ref.labels) == {"team": "runtime"}
 
 
@@ -2655,7 +2661,11 @@ def test_high_level_template_creation_forwards_template_name(
         classmethod(lambda _cls, **_kwargs: recording),
     )
 
-    spec = openshell_pb2.SandboxSpec(providers=["github"])
+    spec = openshell_pb2.SandboxSpec(
+        providers=["github"],
+        command=["/opt/worker", "--serve"],
+        tty=True,
+    )
     sandbox = Sandbox(
         workspace="staging",
         template_name="gpu-kata",
@@ -2673,6 +2683,10 @@ def test_high_level_template_creation_forwards_template_name(
         "name": "job-1",
         "labels": {"team": "runtime"},
     }
+    assert recording.create_template_kwargs is not None
+    forwarded_spec = recording.create_template_kwargs["spec"]
+    assert list(forwarded_spec.command) == ["/opt/worker", "--serve"]
+    assert forwarded_spec.tty is True
 
 
 def test_high_level_attach_rejects_name() -> None:
