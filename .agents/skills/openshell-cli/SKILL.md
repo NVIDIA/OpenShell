@@ -106,9 +106,12 @@ openshell sandbox delete <name>
 Providers supply credentials and provider-specific configuration to sandboxes. Provider types come from built-in and custom profiles; do not rely on a hard-coded type list. Discover the profiles available on the selected gateway:
 
 ```bash
-openshell provider list-profiles
-openshell provider list-profiles --output json
+openshell profile list
+openshell profile list --output json
+openshell profile describe <id>
 ```
+
+`openshell provider list-profiles` remains available as an alias.
 
 ### Create a provider from local credentials
 
@@ -799,7 +802,7 @@ $ openshell sandbox upload --help
 | Download files from sandbox | `openshell sandbox download <name> <path>` |
 | Create provider | `openshell provider create --name N --type T --from-existing` |
 | List providers | `openshell provider list` |
-| Discover provider profiles | `openshell provider list-profiles` |
+| Discover provider profiles | `openshell profile list` |
 | List attached providers | `openshell sandbox provider list <name>` |
 | View settings | `openshell settings get [name]` |
 | Configure managed inference | `openshell inference set --provider P --model M` |

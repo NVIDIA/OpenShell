@@ -105,8 +105,17 @@ openshell
 │   │   ├── update <id> --file <path>
 │   │   ├── lint (--file <path>|--from <dir>)
 │   │   └── delete <id>
+│   │   (aliases of the top-level `profile` command)
 │   ├── update <name> [opts]
 │   └── delete <name>...
+├── profile
+│   ├── list [--type provider] [opts]
+│   ├── describe <id> [opts]
+│   ├── export <id> [opts]
+│   ├── import (--file <path>|--from <dir>)
+│   ├── update <id> --file <path>
+│   ├── lint (--file <path>|--from <dir>)
+│   └── delete <id>
 ├── doctor
 │   └── check
 ├── term
@@ -548,14 +557,24 @@ Update an existing provider without changing its type.
 
 Delete one or more providers by name.
 
-### Provider profiles
+### Profiles
+
+- `openshell profile list [--type provider] [--output table|yaml|json]`
+- `openshell profile describe <id> [--output table|yaml|json]`
+- `openshell profile export <id> [--output table|yaml|json]`
+- `openshell profile import (--file <path>|--from <dir>)`
+- `openshell profile update <id> --file <path>`
+- `openshell profile lint (--file <path>|--from <dir>)`
+- `openshell profile delete <id>`
+
+Every profile is currently a provider profile, so `--type provider` matches the
+full inventory. The filter exists so a caller can pin the type it expects
+without the command changing meaning when other profile types are added.
+
+The original spellings remain available and run the same code:
 
 - `openshell provider list-profiles [--output table|yaml|json]`
-- `openshell provider profile export <id> [--output table|yaml|json]`
-- `openshell provider profile import (--file <path>|--from <dir>)`
-- `openshell provider profile update <id> --file <path>`
-- `openshell provider profile lint (--file <path>|--from <dir>)`
-- `openshell provider profile delete <id>`
+- `openshell provider profile export|import|update|lint|delete ...`
 
 ### Provider credential refresh
 
