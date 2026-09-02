@@ -300,6 +300,35 @@ file and builds the `Proxy-Authorization: Basic` header; a credential that is
 empty, contains control characters, or is not in `user:pass` form is fatal on
 both sides.
 
+The VM driver has no argv seam of its own: its guest init script runs as PID 1
+and execs a fixed supervisor command line, and the libkrun and QEMU launch
+backends both reach the supervisor through that script. Driver-owned
+supervisor arguments therefore travel in a per-sandbox file the driver writes
+into the overlay upperdir at a fixed guest path, one argument per line, which
+the guest reads verbatim (no word splitting or globbing) and appends to every
+supervisor exec. The file is written on **every** launch, including an empty
+file when there is nothing to pass: the upperdir copy always shadows the
+read-only image layer, so a sandbox image can neither supply its own
+supervisor arguments by baking a file at that path nor disable the operator's
+by omitting one. This mirrors the driver-authored `init.d` manifest, which
+solves the same trust problem for guest init drop-ins.
+
+A microVM has no bind mounts or container secrets, so the VM driver stages the
+credential and the CA bundle into the per-sandbox overlay disk instead — the
+credential root-only, the CA world-readable, both at fixed `/opt/openshell`
+paths and both removed with the sandbox state directory. The consequence,
+which differs from the Podman secret model, is that the credential is at rest
+inside that overlay image on the gateway host; the per-sandbox gateway JWT
+already travels the same path. Proxy reachability differs by VM backend. libkrun-backed
+sandboxes egress through gvproxy, so a proxy on the gateway host's loopback is
+reachable through the host alias `host.openshell.internal`, which gvproxy NATs
+to the host's `127.0.0.1`. QEMU/TAP sandboxes (GPU) have no equivalent: that
+alias resolves to the TAP host address, and the driver's nftables `input`
+chain accepts only the gateway port from the guest, so no gateway-host proxy
+is reachable. The driver rejects a gateway-host proxy URL on the QEMU path at
+launch rather than producing CONNECT timeouts. The guest's gateway callback is
+unaffected in both backends and never traverses the proxy.
+
 For Kubernetes sandboxes, the operator configures a Secret name and key rather
 than a gateway-host file path. Kubernetes projects that Secret only into the
 container that runs network supervision. Proxy credential Secrets require the

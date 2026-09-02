@@ -375,6 +375,123 @@ pub const MAX_UPSTREAM_PROXY_CREDENTIAL_BYTES: u64 = 4096;
 /// cannot be opened or stat'd, is not a regular file, or exceeds the size
 /// bound.
 pub fn read_upstream_proxy_credential_file(path: &str) -> Result<String, String> {
+    read_regular_file_bounded(path, MAX_UPSTREAM_PROXY_CREDENTIAL_BYTES).map_err(|err| match err {
+        BoundedReadError::Open(e) => format!("failed to open proxy auth file '{path}': {e}"),
+        BoundedReadError::Stat(e) => format!("failed to stat proxy auth file '{path}': {e}"),
+        BoundedReadError::NotRegular => format!("proxy auth file '{path}' is not a regular file"),
+        BoundedReadError::TooLarge => format!(
+            "proxy auth file '{path}' exceeds the {MAX_UPSTREAM_PROXY_CREDENTIAL_BYTES}-byte limit"
+        ),
+        BoundedReadError::Read(e) => format!("failed to read proxy auth file '{path}': {e}"),
+    })
+}
+
+/// Hard upper bound on the size of a corporate proxy CA bundle file.
+///
+/// A CA bundle holding every corporate trust anchor is a few tens of
+/// kilobytes; this cap only exists so a hostile or misconfigured path (a huge
+/// file, or a special file such as `/dev/zero`) cannot exhaust gateway,
+/// driver, or supervisor memory during a bounded read.
+pub const MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES: u64 = 1024 * 1024;
+
+/// Read and validate an operator corporate proxy CA bundle PEM file.
+///
+/// Rejects non-regular files (e.g. `/dev/zero`, directories, FIFOs) and files
+/// larger than [`MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES`], then requires the
+/// bundle to contribute at least one trust anchor rustls actually accepts —
+/// see [`validate_upstream_proxy_ca_bundle_pem`]. Returns the PEM contents.
+///
+/// Shared by the compute driver (at sandbox-create time, so the operator gets
+/// an error naming the setting) and the in-container supervisor (at startup),
+/// so a bundle accepted on the host is never rejected inside the sandbox and
+/// vice versa. This is a blocking read; async callers should wrap it (e.g.
+/// `tokio::task::spawn_blocking`).
+///
+/// `label` names the operator-facing setting (`proxy_ca_bundle`, or the
+/// supervisor's argument name) and prefixes every error.
+///
+/// # Errors
+///
+/// Returns a descriptive error (never containing file contents) when the path
+/// cannot be read, is not a regular file, exceeds the size bound, or holds no
+/// usable certificate.
+pub fn read_upstream_proxy_ca_bundle_file(path: &str, label: &str) -> Result<String, String> {
+    let pem = read_regular_file_bounded(path, MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES).map_err(
+        |err| match err {
+            BoundedReadError::Open(e) | BoundedReadError::Stat(e) | BoundedReadError::Read(e) => {
+                format!("{label} '{path}' could not be read: {e}")
+            }
+            BoundedReadError::NotRegular => {
+                format!("{label} '{path}' is not a regular file")
+            }
+            BoundedReadError::TooLarge => format!(
+                "{label} '{path}' exceeds the {MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES}-byte limit"
+            ),
+        },
+    )?;
+    validate_upstream_proxy_ca_bundle_pem(&pem, path, label)?;
+    Ok(pem)
+}
+
+/// Require a CA bundle PEM to contribute at least one usable trust anchor.
+///
+/// Fail-closed to match the rest of the operator-owned proxy configuration:
+/// the operator explicitly pointed at this file, so a bundle with no usable
+/// certificate is an error rather than a silent fall-back to the built-in
+/// roots that would quietly weaken the trust boundary.
+///
+/// Validating that rustls accepts an anchor — rather than only that PEM
+/// framing base64-decodes — is what makes the host-side check equivalent to
+/// the guest-side one: a PEM block holding invalid DER passes
+/// `rustls_pemfile::certs` but is silently dropped by
+/// `RootCertStore::add_parsable_certificates`, so counting PEM blocks alone
+/// would accept on the host a bundle that contributes zero anchors at runtime.
+///
+/// # Errors
+///
+/// Returns a descriptive error, prefixed with `label` and naming `path`, when
+/// the PEM holds no certificate block or no block contains valid X.509 DER.
+pub fn validate_upstream_proxy_ca_bundle_pem(
+    pem: &str,
+    path: &str,
+    label: &str,
+) -> Result<(), String> {
+    let certs: Vec<_> = rustls_pemfile::certs(&mut pem.as_bytes())
+        .flatten()
+        .collect();
+    if certs.is_empty() {
+        return Err(format!(
+            "{label} '{path}' contains no PEM certificate blocks"
+        ));
+    }
+    let mut store = rustls::RootCertStore::empty();
+    let (added, _ignored) = store.add_parsable_certificates(certs);
+    if added == 0 {
+        return Err(format!(
+            "{label} '{path}' contains no usable trust anchors \
+             (PEM blocks were found but none contain valid X.509 DER)"
+        ));
+    }
+    Ok(())
+}
+
+/// Failure modes of [`read_regular_file_bounded`], so each caller can phrase
+/// them in terms of the operator setting it is reading.
+enum BoundedReadError {
+    Open(std::io::Error),
+    Stat(std::io::Error),
+    NotRegular,
+    TooLarge,
+    Read(std::io::Error),
+}
+
+/// Read a regular file into a `String`, rejecting anything larger than
+/// `max_bytes` and anything that is not a regular file.
+///
+/// Backs the operator-supplied proxy file readers, which must never let a
+/// hostile or misconfigured path (`/dev/zero`, a FIFO, a directory, a huge
+/// file) exhaust memory or block the caller.
+fn read_regular_file_bounded(path: &str, max_bytes: u64) -> Result<String, BoundedReadError> {
     use std::io::Read as _;
 
     // Windows rejects opening a directory before a file handle is available,
@@ -384,10 +501,9 @@ pub fn read_upstream_proxy_credential_file(path: &str) -> Result<String, String>
     // window if the path is replaced between these operations.
     #[cfg(target_os = "windows")]
     {
-        let path_metadata = std::fs::metadata(path)
-            .map_err(|e| format!("failed to open proxy auth file '{path}': {e}"))?;
+        let path_metadata = std::fs::metadata(path).map_err(BoundedReadError::Open)?;
         if !path_metadata.is_file() {
-            return Err(format!("proxy auth file '{path}' is not a regular file"));
+            return Err(BoundedReadError::NotRegular);
         }
     }
 
@@ -405,29 +521,143 @@ pub fn read_upstream_proxy_credential_file(path: &str) -> Result<String, String>
     #[cfg(not(unix))]
     let open_result = std::fs::File::open(path);
 
-    let file = open_result.map_err(|e| format!("failed to open proxy auth file '{path}': {e}"))?;
-    let metadata = file
-        .metadata()
-        .map_err(|e| format!("failed to stat proxy auth file '{path}': {e}"))?;
+    let file = open_result.map_err(BoundedReadError::Open)?;
+    let metadata = file.metadata().map_err(BoundedReadError::Stat)?;
     if !metadata.is_file() {
-        return Err(format!("proxy auth file '{path}' is not a regular file"));
+        return Err(BoundedReadError::NotRegular);
     }
-    if metadata.len() > MAX_UPSTREAM_PROXY_CREDENTIAL_BYTES {
-        return Err(format!(
-            "proxy auth file '{path}' exceeds the {MAX_UPSTREAM_PROXY_CREDENTIAL_BYTES}-byte limit"
-        ));
+    if metadata.len() > max_bytes {
+        return Err(BoundedReadError::TooLarge);
     }
     // Bound the read even if the file grows between stat and read.
     let mut buf = String::new();
-    file.take(MAX_UPSTREAM_PROXY_CREDENTIAL_BYTES + 1)
+    file.take(max_bytes + 1)
         .read_to_string(&mut buf)
-        .map_err(|e| format!("failed to read proxy auth file '{path}': {e}"))?;
-    if buf.len() as u64 > MAX_UPSTREAM_PROXY_CREDENTIAL_BYTES {
-        return Err(format!(
-            "proxy auth file '{path}' exceeds the {MAX_UPSTREAM_PROXY_CREDENTIAL_BYTES}-byte limit"
-        ));
+        .map_err(BoundedReadError::Read)?;
+    if buf.len() as u64 > max_bytes {
+        return Err(BoundedReadError::TooLarge);
     }
     Ok(buf)
+}
+
+/// Operator-supplied corporate upstream-proxy settings, as a borrowed view.
+///
+/// Compute drivers store these keys under their own
+/// `[openshell.drivers.<name>]` table; this type exists so the pairing rules
+/// between them live in one place instead of being restated per driver.
+/// Field names map 1:1 onto the documented TOML keys `https_proxy`,
+/// `no_proxy`, `proxy_auth_file`, `proxy_auth_allow_insecure`,
+/// `proxy_connect_by_hostname`, and `proxy_ca_bundle`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UpstreamProxySettings<'a> {
+    /// `https_proxy`: the corporate forward proxy URL.
+    pub url: Option<&'a str>,
+    /// `no_proxy`: comma-separated bypass list.
+    pub no_proxy: Option<&'a str>,
+    /// `proxy_auth_file`: host path to a `user:pass` credential file.
+    pub auth_file: Option<&'a str>,
+    /// `proxy_auth_allow_insecure`: acknowledgement that Basic auth to an
+    /// `http://` proxy travels in cleartext.
+    pub auth_allow_insecure: Option<bool>,
+    /// `proxy_connect_by_hostname`: send hostnames rather than validated IPs
+    /// in CONNECT requests.
+    pub connect_by_hostname: Option<bool>,
+    /// `proxy_ca_bundle`: host path to a PEM CA bundle trusted for the proxy.
+    pub ca_bundle: Option<&'a str>,
+}
+
+/// Validate operator-supplied corporate upstream-proxy settings, fail-closed.
+///
+/// Shares URL semantics with the in-container supervisor through
+/// [`parse_upstream_proxy_url`], so a value accepted here can never be
+/// rejected by the supervisor at sandbox startup (or vice versa). Every
+/// auxiliary setting is only meaningful relative to a proxy boundary the
+/// operator believed was in effect, so a stray one is rejected rather than
+/// silently accepted while all egress dials directly.
+///
+/// A present-but-empty string is rejected everywhere: the supervisor treats
+/// an empty driver-supplied argument as a fatal misconfiguration, so a driver
+/// must never accept (and later pass) one.
+///
+/// # Errors
+///
+/// Returns a message naming the offending key.
+pub fn validate_upstream_proxy_settings(
+    settings: &UpstreamProxySettings<'_>,
+) -> Result<(), String> {
+    let proxy_secure = if let Some(url) = settings.url {
+        let addr = parse_upstream_proxy_url(url).map_err(|err| match err {
+            UpstreamProxyUrlError::Empty => "https_proxy must not be empty when set".to_string(),
+            UpstreamProxyUrlError::InlineCredentials => {
+                "https_proxy must not embed credentials in the URL; supply them via \
+                 proxy_auth_file so they are not stored in config or sandbox metadata"
+                    .to_string()
+            }
+            err => format!("https_proxy {err}"),
+        })?;
+        addr.secure
+    } else {
+        false
+    };
+
+    if let Some(list) = settings.no_proxy {
+        if list.trim().is_empty() {
+            return Err("no_proxy must not be empty when set; omit it instead".to_string());
+        }
+        if settings.url.is_none() {
+            return Err("no_proxy is set but no https_proxy is configured".to_string());
+        }
+    }
+
+    if let Some(path) = settings.auth_file {
+        if path.trim().is_empty() {
+            return Err("proxy_auth_file must not be empty when set".to_string());
+        }
+        if settings.url.is_none() {
+            return Err("proxy_auth_file is set but no https_proxy is configured".to_string());
+        }
+        // Basic auth over the plain-TCP proxy connection is readable by
+        // anyone on the network path; sending it requires an explicit
+        // operator acknowledgement rather than being an implicit side effect
+        // of configuring credentials. For an https:// proxy the credential is
+        // inside the verified TLS session, so the acknowledgement is
+        // unnecessary (but tolerated).
+        if settings.auth_allow_insecure != Some(true) && !proxy_secure {
+            return Err(
+                "proxy_auth_file sends the credential as cleartext Basic auth over the \
+                 plain-TCP connection to the http:// proxy; set proxy_auth_allow_insecure \
+                 = true to accept that exposure, or remove proxy_auth_file"
+                    .to_string(),
+            );
+        }
+    } else if settings.auth_allow_insecure.is_some() {
+        // The acknowledgement without credentials means the operator believed
+        // an auth file was configured; surface the mismatch.
+        return Err(
+            "proxy_auth_allow_insecure is set but no proxy_auth_file is configured".to_string(),
+        );
+    }
+
+    if settings.connect_by_hostname.is_some() && settings.url.is_none() {
+        return Err(
+            "proxy_connect_by_hostname is set but no https_proxy is configured".to_string(),
+        );
+    }
+
+    // A CA bundle only makes sense relative to a proxy boundary (an https://
+    // proxy handshake, or a TLS-intercepting proxy's re-sign CA). The file's
+    // readability and certificate content are checked at sandbox-create time
+    // by the driver and fail closed again in the supervisor.
+    if let Some(path) = settings.ca_bundle {
+        if path.trim().is_empty() {
+            return Err("proxy_ca_bundle must not be empty when set".to_string());
+        }
+        if settings.url.is_none() {
+            return Err("proxy_ca_bundle is set but no https_proxy is configured".to_string());
+        }
+    }
+
+    Ok(())
 }
 
 /// Container-side directory where the provider SPIFFE Workload API socket is mounted.
@@ -887,5 +1117,274 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(5),
             "reading a FIFO must not block"
         );
+    }
+
+    /// Build settings with only the fields a case cares about.
+    #[test]
+    fn ca_bundle_file_accepts_a_real_certificate() {
+        // The positive case that pins host acceptance to guest acceptance:
+        // what the driver stages is exactly what rustls will trust.
+        let cert = rcgen::generate_simple_self_signed(vec!["proxy.corp.example".to_string()])
+            .expect("test CA");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy-ca.pem");
+        std::fs::write(&path, cert.cert.pem()).unwrap();
+
+        let pem =
+            read_upstream_proxy_ca_bundle_file(path.to_str().unwrap(), "proxy_ca_bundle").unwrap();
+        assert!(pem.contains("BEGIN CERTIFICATE"));
+    }
+
+    #[test]
+    fn ca_bundle_file_rejects_non_regular_and_oversized_paths() {
+        // /dev/zero is the case that matters: an unbounded read of it would
+        // exhaust gateway or driver memory on any authorized sandbox create.
+        let dir = tempfile::tempdir().unwrap();
+        let err =
+            read_upstream_proxy_ca_bundle_file(dir.path().to_str().unwrap(), "proxy_ca_bundle")
+                .unwrap_err();
+        assert!(err.contains("regular file"), "{err}");
+        assert!(err.contains("proxy_ca_bundle"), "{err}");
+
+        if Path::new("/dev/zero").exists() {
+            let err =
+                read_upstream_proxy_ca_bundle_file("/dev/zero", "proxy_ca_bundle").unwrap_err();
+            assert!(err.contains("regular file"), "{err}");
+        }
+
+        let oversized = dir.path().join("oversized.pem");
+        std::fs::write(
+            &oversized,
+            vec![b'x'; usize::try_from(MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        let err =
+            read_upstream_proxy_ca_bundle_file(oversized.to_str().unwrap(), "proxy_ca_bundle")
+                .unwrap_err();
+        assert!(err.contains("exceeds"), "{err}");
+    }
+
+    #[test]
+    fn ca_bundle_file_missing_path_is_an_error() {
+        let err =
+            read_upstream_proxy_ca_bundle_file("/nonexistent/proxy-ca.pem", "proxy_ca_bundle")
+                .unwrap_err();
+        assert!(err.contains("could not be read"), "{err}");
+    }
+
+    #[test]
+    fn ca_bundle_rejects_a_file_without_certificate_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy-ca.pem");
+        std::fs::write(&path, "this is not a certificate\n").unwrap();
+        let err = read_upstream_proxy_ca_bundle_file(path.to_str().unwrap(), "proxy_ca_bundle")
+            .unwrap_err();
+        assert!(err.contains("no PEM certificate blocks"), "{err}");
+
+        std::fs::write(&path, "").unwrap();
+        let err = read_upstream_proxy_ca_bundle_file(path.to_str().unwrap(), "proxy_ca_bundle")
+            .unwrap_err();
+        assert!(err.contains("no PEM certificate blocks"), "{err}");
+    }
+
+    #[test]
+    fn ca_bundle_rejects_pem_blocks_holding_invalid_der() {
+        // Passes `rustls_pemfile::certs` but contributes no trust anchor, so
+        // accepting it on the host would break every guest after boot.
+        let err = validate_upstream_proxy_ca_bundle_pem(
+            "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
+            "/etc/openshell/tls/proxy-ca.pem",
+            "proxy_ca_bundle",
+        )
+        .unwrap_err();
+        assert!(err.contains("no usable trust anchors"), "{err}");
+    }
+
+    fn proxy_settings(url: Option<&str>) -> UpstreamProxySettings<'_> {
+        UpstreamProxySettings {
+            url,
+            ..UpstreamProxySettings::default()
+        }
+    }
+
+    #[test]
+    fn upstream_proxy_settings_accept_a_bare_proxy_url() {
+        validate_upstream_proxy_settings(&proxy_settings(Some("http://proxy.corp.com:3128")))
+            .expect("a lone proxy URL is a complete configuration");
+    }
+
+    #[test]
+    fn upstream_proxy_settings_accept_an_empty_configuration() {
+        validate_upstream_proxy_settings(&UpstreamProxySettings::default())
+            .expect("no proxy configured at all is valid");
+    }
+
+    #[test]
+    fn upstream_proxy_settings_reject_an_unsupported_scheme() {
+        let err = validate_upstream_proxy_settings(&proxy_settings(Some("socks5://proxy:1080")))
+            .expect_err("only http:// and https:// proxies are supported");
+        assert!(err.starts_with("https_proxy "), "{err}");
+        assert!(err.contains("unsupported proxy scheme"), "{err}");
+    }
+
+    #[test]
+    fn upstream_proxy_settings_reject_inline_credentials_by_naming_the_auth_file() {
+        let err = validate_upstream_proxy_settings(&proxy_settings(Some("http://u:p@proxy:3128")))
+            .expect_err("inline credentials would be stored in gateway config");
+        assert!(err.contains("proxy_auth_file"), "{err}");
+    }
+
+    #[test]
+    fn upstream_proxy_settings_reject_an_empty_proxy_url() {
+        let err = validate_upstream_proxy_settings(&proxy_settings(Some("   ")))
+            .expect_err("present-but-empty is a misconfiguration, not 'unset'");
+        assert_eq!(err, "https_proxy must not be empty when set");
+    }
+
+    #[test]
+    fn upstream_proxy_settings_reject_auxiliary_keys_without_a_proxy_url() {
+        // Each auxiliary key implies a proxy boundary the operator believed
+        // was in effect; accepting one while every dial goes direct would
+        // hide a fail-open state.
+        for (settings, key) in [
+            (
+                UpstreamProxySettings {
+                    no_proxy: Some("10.0.0.0/8"),
+                    ..UpstreamProxySettings::default()
+                },
+                "no_proxy",
+            ),
+            (
+                UpstreamProxySettings {
+                    auth_file: Some("/etc/openshell/secrets/proxy-auth"),
+                    ..UpstreamProxySettings::default()
+                },
+                "proxy_auth_file",
+            ),
+            (
+                UpstreamProxySettings {
+                    connect_by_hostname: Some(true),
+                    ..UpstreamProxySettings::default()
+                },
+                "proxy_connect_by_hostname",
+            ),
+            (
+                UpstreamProxySettings {
+                    ca_bundle: Some("/etc/openshell/tls/proxy-ca.pem"),
+                    ..UpstreamProxySettings::default()
+                },
+                "proxy_ca_bundle",
+            ),
+        ] {
+            let err = validate_upstream_proxy_settings(&settings)
+                .expect_err("an auxiliary key without a proxy URL must fail closed");
+            assert_eq!(
+                err,
+                format!("{key} is set but no https_proxy is configured")
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_proxy_settings_reject_empty_auxiliary_values() {
+        for (settings, expected) in [
+            (
+                UpstreamProxySettings {
+                    url: Some("http://proxy:3128"),
+                    no_proxy: Some(" "),
+                    ..UpstreamProxySettings::default()
+                },
+                "no_proxy must not be empty when set; omit it instead",
+            ),
+            (
+                UpstreamProxySettings {
+                    url: Some("http://proxy:3128"),
+                    auth_file: Some(""),
+                    ..UpstreamProxySettings::default()
+                },
+                "proxy_auth_file must not be empty when set",
+            ),
+            (
+                UpstreamProxySettings {
+                    url: Some("http://proxy:3128"),
+                    ca_bundle: Some(""),
+                    ..UpstreamProxySettings::default()
+                },
+                "proxy_ca_bundle must not be empty when set",
+            ),
+        ] {
+            let err = validate_upstream_proxy_settings(&settings)
+                .expect_err("present-but-empty must never be treated as unset");
+            assert_eq!(err, expected);
+        }
+    }
+
+    #[test]
+    fn upstream_proxy_credentials_require_the_cleartext_acknowledgement() {
+        let err = validate_upstream_proxy_settings(&UpstreamProxySettings {
+            url: Some("http://proxy:3128"),
+            auth_file: Some("/etc/openshell/secrets/proxy-auth"),
+            ..UpstreamProxySettings::default()
+        })
+        .expect_err("Basic auth to an http:// proxy is cleartext on the wire");
+        assert!(err.contains("proxy_auth_allow_insecure"), "{err}");
+
+        validate_upstream_proxy_settings(&UpstreamProxySettings {
+            url: Some("http://proxy:3128"),
+            auth_file: Some("/etc/openshell/secrets/proxy-auth"),
+            auth_allow_insecure: Some(true),
+            ..UpstreamProxySettings::default()
+        })
+        .expect("the explicit acknowledgement makes the exposure an operator decision");
+    }
+
+    #[test]
+    fn upstream_proxy_credentials_need_no_acknowledgement_for_an_https_proxy() {
+        // The credential travels inside the verified TLS session to the proxy.
+        validate_upstream_proxy_settings(&UpstreamProxySettings {
+            url: Some("https://proxy:3130"),
+            auth_file: Some("/etc/openshell/secrets/proxy-auth"),
+            ..UpstreamProxySettings::default()
+        })
+        .expect("an https:// proxy does not expose the credential on the wire");
+
+        // ... but setting it anyway is tolerated rather than an error.
+        validate_upstream_proxy_settings(&UpstreamProxySettings {
+            url: Some("https://proxy:3130"),
+            auth_file: Some("/etc/openshell/secrets/proxy-auth"),
+            auth_allow_insecure: Some(true),
+            ..UpstreamProxySettings::default()
+        })
+        .expect("a redundant acknowledgement is tolerated");
+    }
+
+    #[test]
+    fn upstream_proxy_acknowledgement_without_credentials_is_rejected() {
+        // Including `= false`: the operator believed an auth file was
+        // configured, so the mismatch is surfaced rather than ignored.
+        for ack in [Some(true), Some(false)] {
+            let err = validate_upstream_proxy_settings(&UpstreamProxySettings {
+                url: Some("http://proxy:3128"),
+                auth_allow_insecure: ack,
+                ..UpstreamProxySettings::default()
+            })
+            .expect_err("the acknowledgement is meaningless without a credential");
+            assert_eq!(
+                err,
+                "proxy_auth_allow_insecure is set but no proxy_auth_file is configured"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_proxy_ca_bundle_is_valid_with_a_plain_http_proxy() {
+        // A TLS-intercepting proxy can be reached over plain HTTP while still
+        // re-signing tunneled server certificates with its own CA.
+        validate_upstream_proxy_settings(&UpstreamProxySettings {
+            url: Some("http://proxy:3128"),
+            ca_bundle: Some("/etc/openshell/tls/proxy-ca.pem"),
+            ..UpstreamProxySettings::default()
+        })
+        .expect("an intercepting proxy's CA is meaningful without an https:// proxy URL");
     }
 }

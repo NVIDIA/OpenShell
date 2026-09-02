@@ -630,6 +630,58 @@ openshell status
 openshell logs <sandbox-name>
 ```
 
+#### Corporate upstream proxy
+
+When VM sandbox egress routes through a corporate HTTP forward proxy, the
+operator-owned settings live under `[openshell.drivers.vm]` and the gateway
+forwards them to the `openshell-driver-vm` subprocess as `--https-proxy`,
+`--no-proxy`, `--proxy-auth-file`, `--proxy-auth-allow-insecure`,
+`--proxy-connect-by-hostname`, and `--proxy-ca-bundle`. Both the gateway and
+the driver validate them at startup, so any present-but-invalid value fails
+closed with an error naming the key rather than reverting to a direct dial.
+Confirm the configuration and the resulting driver argv first:
+
+```bash
+grep -A20 '^\[openshell.drivers.vm\]' <gateway.toml> | grep -E 'https_proxy|no_proxy|proxy_auth_file|proxy_auth_allow_insecure|proxy_connect_by_hostname|proxy_ca_bundle'
+ps -o args= -p "$(pgrep -f openshell-driver-vm | head -n1)" | tr ' ' '\n' | grep -A1 -- '--proxy\|--https-proxy\|--no-proxy'
+```
+
+Reachability is the most common failure, and it depends on the VM backend.
+On libkrun (non-GPU sandboxes) guest egress leaves through gvproxy, so a proxy
+bound to the gateway host's loopback is **not** reachable at `127.0.0.1` from
+inside the guest: it must be addressed as
+`http://host.openshell.internal:<port>`, which gvproxy NATs from
+`192.168.127.254` to the host's `127.0.0.1`. A `https_proxy` pointing at a
+loopback URL produces policy-approved CONNECT attempts that time out while
+public destinations still work.
+
+GPU sandboxes run on QEMU/TAP, where no gateway-host proxy is reachable at
+all: `host.openshell.internal` resolves to the TAP host address, and the
+driver's nftables `input` chain accepts only the gateway port from the guest.
+The driver rejects such a configuration at launch — a create failing with
+`https_proxy ... addresses the gateway host, which a QEMU/TAP sandbox ...
+cannot reach` means the proxy must move to an address routable from the
+guest's masqueraded egress (or the sandbox must run without a GPU).
+
+The settings reach the supervisor through a driver-written argument file in
+the per-sandbox overlay, not through the guest environment. The credential and
+CA bundle are staged into the same overlay at fixed guest paths. Inspect the
+guest side from the VM console log, which records how many driver-supplied
+arguments the init script read:
+
+```bash
+grep -E 'supervisor arguments from driver|supervisor argument list' <state_dir>/sandboxes/<id>/rootfs-console.log
+grep -Ei 'upstream|connect|proxy' <state_dir>/sandboxes/<id>/rootfs-console.log | tail -n 40
+```
+
+`FATAL: supervisor argument list ... is not readable` or `FATAL: empty entry in
+supervisor argument list` means the overlay is broken or was tampered with, and
+the guest deliberately aborts rather than starting a supervisor with a
+truncated egress configuration. If the guest logs no driver arguments at all
+while `gateway.toml` sets `https_proxy`, the running driver predates the
+configuration — check that the gateway spawned the driver binary you expect
+(`[openshell.drivers.vm].driver_dir`).
+
 ## Common Failure Patterns
 
 | Symptom | Likely cause | Check |

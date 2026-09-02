@@ -154,6 +154,14 @@ Select the VM driver with `--drivers vm`, `OPENSHELL_DRIVERS=vm`, or `compute_dr
 | `guest_tls_ca` | unset | CA cert for the guest's mTLS client bundle. Required when `grpc_endpoint` uses `https://`. |
 | `guest_tls_cert` | unset | Guest client certificate. |
 | `guest_tls_key` | unset | Guest client private key. |
+| `https_proxy` | unset | Corporate forward proxy (`http://host:port` or `https://host:port`) the in-guest supervisor chains policy-approved TLS CONNECT egress through. On the libkrun backend a proxy on the gateway host's loopback must be addressed as `http://host.openshell.internal:<port>` — guest egress leaves through gvproxy, which NATs `192.168.127.254` to the host's `127.0.0.1`. The QEMU/TAP backend (GPU sandboxes) has no such NAT and its nftables rules expose only the gateway port to the guest, so a gateway-host proxy URL is rejected at launch there; use an address routable from the guest's masqueraded egress. |
+| `no_proxy` | unset | Comma-separated bypass list for the corporate proxy only. OpenShell policy evaluation still applies. |
+| `proxy_auth_file` | unset | Gateway-host path to a `user:pass` credential file. Staged root-only into the per-sandbox overlay and removed with the sandbox. |
+| `proxy_auth_allow_insecure` | unset | Required with `proxy_auth_file` against an `http://` proxy: acknowledges that Basic auth is cleartext on the connection to the proxy. |
+| `proxy_connect_by_hostname` | unset | Send hostnames rather than validated IPs in CONNECT. Last resort for proxies whose ACLs reject IP targets. |
+| `proxy_ca_bundle` | unset | Gateway-host path to a PEM CA bundle trusted for an `https://` proxy and for certificates a TLS-intercepting proxy re-signs. |
+
+The proxy settings are operator-owned and deployment-level: they are not accepted through `template.driver_config.vm`, and they reach the supervisor on its command line through a per-sandbox argument file the driver writes into the overlay upperdir on every launch, so a sandbox image cannot forge or shadow them. Every present-but-invalid value is fatal at gateway or sandbox startup rather than degrading to a direct dial.
 
 See [`openshell-gateway --help`](../openshell-server/src/cli.rs) for the gateway process flag surface.
 

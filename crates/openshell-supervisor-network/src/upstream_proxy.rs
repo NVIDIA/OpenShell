@@ -612,31 +612,12 @@ fn parse_proxy_url(raw: &str, var_name: &str) -> Result<(ProxyEndpoint, bool), S
 /// fall-back to the built-in roots that would quietly weaken the trust
 /// boundary. The error names `var_name` so the operator can locate the setting.
 pub(crate) fn read_proxy_ca_bundle(path: &str, var_name: &str) -> Result<String, String> {
-    let pem = std::fs::read_to_string(path)
-        .map_err(|err| format!("{var_name} '{path}' could not be read: {err}"))?;
-    // Validate that the bundle contributes at least one trust anchor that
-    // rustls actually accepts, not just that PEM framing base64-decodes.
-    // A PEM block with invalid DER passes `rustls_pemfile::certs` but is
-    // silently rejected by `RootCertStore::add_parsable_certificates`;
-    // counting only PEM blocks would let such a bundle satisfy the check
-    // while contributing zero usable anchors at runtime.
-    let certs: Vec<_> = rustls_pemfile::certs(&mut pem.as_bytes())
-        .flatten()
-        .collect();
-    if certs.is_empty() {
-        return Err(format!(
-            "{var_name} '{path}' contains no PEM certificate blocks"
-        ));
-    }
-    let mut store = rustls::RootCertStore::empty();
-    let (added, _ignored) = store.add_parsable_certificates(certs);
-    if added == 0 {
-        return Err(format!(
-            "{var_name} '{path}' contains no usable trust anchors \
-             (PEM blocks were found but none contain valid X.509 DER)"
-        ));
-    }
-    Ok(pem)
+    // Shared with the compute driver, which validates the same file on the
+    // gateway host before staging it, so host acceptance and guest acceptance
+    // cannot diverge. It also bounds the read: the file arrives from the
+    // driver, but a bundle the size of the sandbox disk should fail rather
+    // than be loaded whole.
+    openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(path, var_name)
 }
 
 /// Build the TLS client config used to connect to an `https://` corporate

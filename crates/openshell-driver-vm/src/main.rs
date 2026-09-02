@@ -146,6 +146,30 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_SANDBOX_GID")]
     sandbox_gid: Option<u32>,
 
+    // Corporate forward proxy for sandbox egress. Operator-owned: these reach
+    // the guest supervisor on its argv, which the sandbox image and the
+    // user-supplied environment cannot influence.
+    #[arg(long, env = "OPENSHELL_VM_HTTPS_PROXY")]
+    https_proxy: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_VM_NO_PROXY")]
+    no_proxy: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_VM_PROXY_AUTH_FILE")]
+    proxy_auth_file: Option<String>,
+
+    // Value-taking rather than a presence flag so an explicit `false` in
+    // `[openshell.drivers.vm]` survives the gateway -> driver hop and still
+    // trips the "acknowledgement without a credential" check.
+    #[arg(long, env = "OPENSHELL_VM_PROXY_AUTH_ALLOW_INSECURE")]
+    proxy_auth_allow_insecure: Option<bool>,
+
+    #[arg(long, env = "OPENSHELL_VM_PROXY_CONNECT_BY_HOSTNAME")]
+    proxy_connect_by_hostname: Option<bool>,
+
+    #[arg(long, env = "OPENSHELL_VM_PROXY_CA_BUNDLE")]
+    proxy_ca_bundle: Option<String>,
+
     #[arg(long, hide = true)]
     vm_backend: Option<String>,
 
@@ -243,6 +267,12 @@ async fn main() -> Result<()> {
         gpu_vcpus: args.gpu_vcpus,
         sandbox_uid: args.sandbox_uid,
         sandbox_gid: args.sandbox_gid,
+        https_proxy: args.https_proxy.clone(),
+        no_proxy: args.no_proxy.clone(),
+        proxy_auth_file: args.proxy_auth_file.clone(),
+        proxy_auth_allow_insecure: args.proxy_auth_allow_insecure,
+        proxy_connect_by_hostname: args.proxy_connect_by_hostname,
+        proxy_ca_bundle: args.proxy_ca_bundle.clone(),
     })
     .await
     .map_err(|err| miette::miette!("{err}"))?;
@@ -619,6 +649,63 @@ mod tests {
     };
     use clap::Parser;
     use std::path::PathBuf;
+
+    #[test]
+    fn corporate_proxy_flags_parse_into_driver_settings() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--openshell-endpoint",
+            "https://host.openshell.internal:17670",
+            "--https-proxy",
+            "http://proxy.corp.com:8080",
+            "--no-proxy",
+            "10.0.0.0/8,.svc.cluster.local",
+            "--proxy-auth-file",
+            "/etc/openshell/secrets/proxy-auth",
+            "--proxy-auth-allow-insecure",
+            "true",
+            "--proxy-connect-by-hostname",
+            "false",
+            "--proxy-ca-bundle",
+            "/etc/openshell/tls/proxy-ca.pem",
+        ]);
+
+        assert_eq!(
+            args.https_proxy.as_deref(),
+            Some("http://proxy.corp.com:8080")
+        );
+        assert_eq!(
+            args.no_proxy.as_deref(),
+            Some("10.0.0.0/8,.svc.cluster.local")
+        );
+        assert_eq!(
+            args.proxy_auth_file.as_deref(),
+            Some("/etc/openshell/secrets/proxy-auth")
+        );
+        assert_eq!(args.proxy_auth_allow_insecure, Some(true));
+        // Value-taking rather than a presence flag, so the gateway can
+        // forward an explicit `false` from `[openshell.drivers.vm]`.
+        assert_eq!(args.proxy_connect_by_hostname, Some(false));
+        assert_eq!(
+            args.proxy_ca_bundle.as_deref(),
+            Some("/etc/openshell/tls/proxy-ca.pem")
+        );
+    }
+
+    #[test]
+    fn corporate_proxy_settings_default_to_unset() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--openshell-endpoint",
+            "https://host.openshell.internal:17670",
+        ]);
+        assert!(args.https_proxy.is_none());
+        assert!(args.no_proxy.is_none());
+        assert!(args.proxy_auth_file.is_none());
+        assert!(args.proxy_auth_allow_insecure.is_none());
+        assert!(args.proxy_connect_by_hostname.is_none());
+        assert!(args.proxy_ca_bundle.is_none());
+    }
 
     #[test]
     fn peer_authorization_accepts_matching_uid_and_pid() {
