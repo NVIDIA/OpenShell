@@ -56,13 +56,24 @@ ARG OPENSHELL_VERSION=""
 
 # `-C target-feature=+crt-static` links glibc statically, producing a
 # fully-static (static-PIE) binary with no runtime libc dependency.
+#
+# The alias re-adds `bundled-ca-roots`, which a bare `--no-default-features`
+# would drop, moving this binary onto a trust store the distroless containers
+# it is injected into do not have.
+#
+# The telemetry half is a no-op here: openshell-core/telemetry stays on
+# transitively via openshell-supervisor-{network,process}, and no supervisor
+# crate calls the emitter, so the endpoint is absent either way. Kept in
+# lockstep with the gateway, which is where compiling telemetry out has effect.
 RUN . /tmp/build-env && \
     VER="${OPENSHELL_VERSION#v}" && \
     if [ -n "$VER" ]; then export OPENSHELL_GIT_VERSION="$VER"; fi && \
     RUSTFLAGS="-C target-feature=+crt-static" \
     cargo build --release \
         --target "${RUST_TARGET}" \
-        --package openshell-sandbox && \
+        --package openshell-sandbox \
+        --no-default-features \
+        --features defaults-without-telemetry && \
     mkdir -p /build/output && \
     cp /build/target/${RUST_TARGET}/release/openshell-sandbox /build/output/
 
