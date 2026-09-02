@@ -212,12 +212,15 @@ pub async fn run_process(
                     break;
                 };
 
-                if managed_children::is_managed(pid.as_raw()) {
-                    // Let the explicit waiter own this child status.
+                let Some(reap_result) = managed_children::reap_if_unmanaged(pid.as_raw(), || {
+                    waitpid(pid, Some(WaitPidFlag::WNOHANG))
+                }) else {
+                    // Let the explicit waiter own this child status. Stop here
+                    // because WNOWAIT will keep returning this same child.
                     break;
-                }
+                };
 
-                match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+                match reap_result {
                     Ok(WaitStatus::StillAlive)
                     | Err(nix::errno::Errno::ECHILD | nix::errno::Errno::EINTR) => {}
                     Ok(reaped) => {
