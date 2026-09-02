@@ -415,8 +415,10 @@ explicit container-reachable `tcp:IP:port` endpoint. The driver sets the
 supervisor's `OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET` accordingly.
 `app_armor_profile` shares the canonical
 `RuntimeDefault`, `Unconfined`, or `Localhost/<profile>` model with Docker and
-Kubernetes. Podman defaults to explicit `Unconfined` for the supervisor mount
-setup; confined choices fail early when Podman reports AppArmor unavailable.
+Kubernetes. When omitted, the driver sends no override and preserves Podman's
+runtime-selected profile. Set `Unconfined` explicitly only when the deployment
+requires the supervisor's mount setup to bypass that profile. Explicit confined
+choices fail early when Podman reports AppArmor unavailable.
 
 This is an operator-owned egress boundary: the driver passes the settings on
 the supervisor's command line, so sandbox and template environment — and any

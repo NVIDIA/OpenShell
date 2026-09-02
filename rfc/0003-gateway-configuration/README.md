@@ -8,16 +8,16 @@ state: implemented
 
 ## Summary
 
-Introduce a TOML-based configuration file for the OpenShell gateway that unifies all gateway settings — core server options, TLS, OIDC, observability listeners, and per-driver parameters — under a single structured file, while preserving full backwards compatibility with the existing CLI flags and `OPENSHELL_*` environment variables.
+Introduce a TOML-based configuration file for the OpenShell gateway that unifies gateway settings — core server options, TLS, OIDC, observability listeners, and per-driver parameters — under a single structured file. CLI flags and supported `OPENSHELL_*` environment variables retain higher precedence. Schema version 2 intentionally rejects legacy file fields and locations.
 
 ## Motivation
 
-The gateway today is configured exclusively through CLI flags and `OPENSHELL_*` environment variables. This works for simple single-node deployments but breaks down as deployments grow:
+Before this RFC, the gateway was configured exclusively through CLI flags and `OPENSHELL_*` environment variables. This worked for simple single-node deployments but broke down as deployments grew:
 
-- **Too many flags** — the gateway has ~40 configurable parameters today (TLS, OIDC, four compute drivers, three listeners). Long `docker run` commands and `args:` arrays in Kubernetes manifests are hard to read, diff, and audit.
-- **Driver coupling** — Docker, Podman, Kubernetes, and VM drivers all live in the same flat CLI namespace, with no structural separation. Most flags only apply to one driver, but there is no way to express that in CLI form.
-- **Helm friction** — The chart's `statefulset.yaml` already carries a long `env:` block of `OPENSHELL_*` variables that each map to a `values.yaml` key. A config file can be mounted as a single `ConfigMap` and reduces the chart's templating surface significantly.
-- **Secrets management** — Injecting secrets (TLS material paths, database URL, OIDC settings) via environment variables is functional but not idiomatic for Kubernetes. A file-based format opens the door to projected secrets and volume mounts that compose cleanly with the non-secret config.
+- **Too many flags** — the gateway exposed roughly 40 configurable parameters (TLS, OIDC, four compute drivers, three listeners). Long `docker run` commands and `args:` arrays in Kubernetes manifests were hard to read, diff, and audit.
+- **Driver coupling** — Docker, Podman, Kubernetes, and VM drivers shared one flat CLI namespace with no structural separation. Most flags applied to only one driver, but CLI syntax did not express that ownership.
+- **Helm friction** — The chart's `statefulset.yaml` carried a long `env:` block of `OPENSHELL_*` variables that each mapped to a `values.yaml` key. A mounted configuration file reduces the chart's templating surface.
+- **Secrets management** — Environment-only configuration did not compose naturally with Kubernetes `ConfigMap` and projected `Secret` volumes.
 
 ## Non-goals
 
@@ -87,10 +87,10 @@ server_sans                  = ["openshell", "*.dev.openshell.localhost"]
 enable_loopback_service_http = true
 
 # ──────────────────────────────────────────────────────────────────────────────
-# TLS / mTLS — when omitted, the gateway listens plaintext (sets --disable-tls)
+# TLS / mTLS — package-managed local TLS may supply listener defaults.
 # ──────────────────────────────────────────────────────────────────────────────
-# Mirrors --disable-tls / OPENSHELL_DISABLE_TLS. When true, the gateway
-# ignores the [openshell.gateway.tls] table below.
+# Mirrors --disable-tls / OPENSHELL_DISABLE_TLS. Set true explicitly for a
+# plaintext listener; guest TLS fields must then be omitted.
 disable_tls           = false
 
 # Gateway-owned TLS bundle injected into the selected local driver.
@@ -202,9 +202,9 @@ Deserialization uses `#[serde(deny_unknown_fields)]` at every table level. An un
 The following cross-field validations are applied after merging file + env + CLI:
 
 - `bind_address`, `health_bind_address`, and `metrics_bind_address` must all use distinct ports when set.
-- When `[openshell.gateway.tls]` is present, all three of `cert_path`, `key_path`, and `client_ca_path` must be present (either from the file or from CLI/env). Partial TLS configuration is an error.
+- Gateway listener TLS requires `cert_path` and `key_path`; `client_ca_path` is required only for listener client-certificate verification. TLS-enabled Docker, Podman, and VM drivers also require a complete gateway-owned guest CA, certificate, and key bundle. Kubernetes projects guest TLS through a Secret instead.
 - `database_url` must be non-empty after merging env + CLI — every supported driver requires it. The field is not accepted from the file (see Secrets above).
-- `compute_driver` selects exactly one driver. When omitted, the gateway falls back to auto-detection. A custom driver name with no matching `[openshell.drivers.<name>]` table runs with its built-in defaults. The legacy `compute_drivers` list is rejected.
+- `compute_driver` selects exactly one driver. When omitted, the gateway falls back to auto-detection. A custom driver requires a named table with `socket_path`, unless startup supplies an explicit socket override. The legacy `compute_drivers` list is rejected.
 
 ### Schema compatibility
 
@@ -220,7 +220,8 @@ version = 2
 bind_address  = "0.0.0.0:8080"
 compute_driver = "kubernetes"
 # database_url comes from env (e.g. valueFrom.secretKeyRef).
-# No [openshell.gateway.tls] → plaintext listener (gateway runs behind Envoy / ingress).
+# The gateway runs plaintext behind Envoy / ingress.
+disable_tls = true
 
 [openshell.drivers.kubernetes]
 namespace        = "agents"
@@ -231,12 +232,7 @@ grpc_endpoint    = "https://openshell-gateway.agents.svc:8080"
 
 ### Helm integration
 
-The Helm chart today renders a long `env:` block in `templates/statefulset.yaml`, with each `OPENSHELL_*` variable mapped to a `values.yaml` key. This RFC's adoption replaces that block with:
-
-1. A new `gateway.config` value tree (TOML-shaped YAML) in `values.yaml`.
-2. A new `ConfigMap` template that renders the values into a TOML document via Helm's `tpl`.
-3. A volume mount of the `ConfigMap` at `/etc/openshell/gateway.toml` and a `--config` flag in the gateway container's `args`.
-4. Continued use of a `Secret`-backed `env:` entry for `OPENSHELL_DB_URL` (which never lives in the `ConfigMap`), plus optional projections for TLS material paths. The CLI/env precedence above means any `Secret`-backed env var also wins over a value in the `ConfigMap`.
+The Helm chart renders schema-v2 gateway TOML into a `ConfigMap`, mounts it at `/etc/openshell/gateway.toml`, and starts the gateway with that file. Secret process inputs such as `OPENSHELL_DB_URL` remain `Secret`-backed environment entries and retain higher precedence. Kubernetes projects sandbox guest TLS through its configured Secret rather than placing host guest-certificate paths in the gateway TOML.
 
 ```yaml
 # values.yaml excerpt
@@ -255,23 +251,15 @@ gateway:
 
 The chart owners can migrate one section at a time: `OPENSHELL_*` env vars and the `ConfigMap` coexist during the transition, with env continuing to override the file.
 
-## Implementation plan
+## Implementation
 
-No part of this RFC has shipped yet. The work breaks down as:
-
-1. **Add a config-file loader to `openshell-server`** — define a `GatewayConfigFile` struct that mirrors the schema above, parse it with `serde` + `toml`, and merge it into `openshell_core::Config` plus the per-driver structs in `compute/`.
-2. **Wire the merge into `cli.rs`** — add `--config` / `OPENSHELL_GATEWAY_CONFIG`, gate each existing flag's "apply from file" path on clap `ValueSource::DefaultValue`, and run cross-field validation after the merge.
-3. **Per-driver deserialization** — give each driver crate (`openshell-driver-{kubernetes,docker,podman,vm}`) a `from_toml` (or `serde::Deserialize`) entry point so the gateway can hand each driver its own table.
-4. **Test coverage** — file parsing, env-overrides-file, CLI-overrides-env, partial TLS error, port-collision error, unknown-field rejection, missing driver table fallback.
-5. **Helm chart migration** — add `gateway.config` value tree, render the `ConfigMap`, mount it, switch the gateway container to `--config`. Keep the `OPENSHELL_*` env names available as opt-in overrides for secrets.
-6. **Example file** — ship the per-driver examples on the published docs reference at `docs/reference/gateway-config.mdx`.
-7. **Architecture doc update** — reflect the new config sources and precedence in `architecture/gateway.md`.
+The implemented gateway loader parses TOML with `serde`, merges file values below environment and CLI sources, and rejects unknown fields. Each compute driver deserializes only its named table. Helm renders schema-v2 TOML into a ConfigMap, while secret process inputs remain environment-backed. Package templates, examples, tests, and the gateway architecture documentation use the same canonical schema.
 
 ## Risks
 
-- **Serde `deny_unknown_fields` is strict** — any field name change in `openshell_core::Config` or in a driver's config struct becomes a breaking change for anyone using the file. Mitigate by treating field renames as breaking, keeping the `version` field reserved for schema migrations, and surfacing rename errors clearly.
+- **Serde `deny_unknown_fields` is strict** — any field name change in `openshell_core::Config` or in a driver's config struct becomes a breaking change for anyone using the file. Treat field renames as versioned schema changes and surface migration errors clearly.
 - **Secrets in the file** — `database_url` is excluded from the schema entirely (env / CLI only). OIDC settings remain allowed in the file because none of them are credentials in isolation. Operators should still prefer env-var injection for any field that would live in a `Secret` rather than a `ConfigMap` (TLS material paths, restricted-environment OIDC issuers, etc.). Documentation must call this out prominently.
-- **Partial TLS configuration** — the hard error on partial TLS config is the right UX, but the error message must clearly identify which source (file vs. CLI/env) is missing which field, since the file's `[openshell.gateway.tls]` table is all-or-nothing while the CLI flags are independent.
+- **Partial TLS configuration** — listener and guest TLS are separate complete-bundle contracts. Startup rejects partial bundles and identifies the missing configuration before constructing a driver.
 - **Driver schema drift** — once each driver owns its own TOML table, driver releases can change field names independently of the gateway. The gateway's `version` field does not protect against driver-side breakage; document driver-config stability separately.
 
 ## Alternatives
@@ -290,8 +278,7 @@ No part of this RFC has shipped yet. The work breaks down as:
 
 ## Open questions
 
-1. **Schema versioning** — the `version` field is reserved but not acted on. Should the parser reject files with `version > 1`, or just warn? Define this before the first stable release.
-2. **Directory-based config (`conf.d` pattern)** — a `--config-dir` flag that globs all `*.toml` files in a directory, sorts them alphabetically, and deep-merges them in order (later files win per key). CLI/env overrides still sit above everything. This maps cleanly to Kubernetes: a base `ConfigMap` as `10-base.toml`, driver config as `20-kubernetes.toml`, and credentials from a projected `Secret` as `90-credentials.toml` — all mounted into the same directory without a monolithic file. This is the approach taken by cri-o and kubelet, inspired by systemd's `conf.d` convention.
+1. **Directory-based config (`conf.d` pattern)** — a `--config-dir` flag that globs all `*.toml` files in a directory, sorts them alphabetically, and deep-merges them in order (later files win per key). CLI/env overrides still sit above everything. This maps cleanly to Kubernetes: a base `ConfigMap` as `10-base.toml`, driver config as `20-kubernetes.toml`, and credentials from a projected `Secret` as `90-credentials.toml` — all mounted into the same directory without a monolithic file. This is the approach taken by cri-o and kubelet, inspired by systemd's `conf.d` convention.
 
-   Deferred to a follow-on: the single `--config` file is sufficient for v1, and the directory loader can be added without any schema changes. Before implementing, three design decisions must be settled: (a) whether `--config` and `--config-dir` are mutually exclusive or composable (and if so which takes lower precedence); (b) whether a later file's array value (for example `credential_drivers`) replaces or appends — replace is simpler and less surprising; (c) `deny_unknown_fields` validation must apply to the final merged result rather than each individual file, since partial drop-in files won't contain all sections.
-3. **OIDC secret hygiene (revisit)** — `database_url` is excluded from the file schema (resolved). OIDC settings are allowed for v1 since the listed fields are identifiers, not credentials. If we add OIDC fields that *are* credentials in the future (e.g. a client secret for confidential-client flows), they should join the env-only list at that point. Re-evaluate once the OIDC surface stabilises.
+   Deferred to a follow-on: the single `--config` file is sufficient for the current schema, and the directory loader can be added without changing the file schema. Before implementing, three design decisions must be settled: (a) whether `--config` and `--config-dir` are mutually exclusive or composable (and if so which takes lower precedence); (b) whether a later file's array value (for example `credential_drivers`) replaces or appends — replace is simpler and less surprising; (c) `deny_unknown_fields` validation must apply to the final merged result rather than each individual file, since partial drop-in files won't contain all sections.
+2. **OIDC secret hygiene (revisit)** — `database_url` is excluded from the file schema (resolved). Schema version 2 allows the listed OIDC fields because they are identifiers, not credentials. If we add OIDC fields that *are* credentials in the future (e.g. a client secret for confidential-client flows), they should join the env-only list at that point. Re-evaluate once the OIDC surface stabilises.

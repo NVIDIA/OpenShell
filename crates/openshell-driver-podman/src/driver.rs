@@ -2272,6 +2272,8 @@ mod tests {
         }
         validate_apparmor_support(Some(&AppArmorProfile::Unconfined), false)
             .expect("Unconfined does not require AppArmor support");
+        validate_apparmor_support(None, false)
+            .expect("an omitted profile preserves Podman's runtime behavior");
     }
 
     #[test]

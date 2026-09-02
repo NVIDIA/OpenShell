@@ -152,7 +152,7 @@ Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, 
 | `mem_mib` | `2048` | Memory per sandbox, in MiB. |
 | `overlay_disk_mib` | `4096` | Sparse writable overlay disk size per sandbox, in MiB. |
 | `krun_log_level` | `1` | libkrun verbosity (0-5). |
-| `sandbox_uid` / `sandbox_gid` | image `sandbox` account, otherwise `1000` / UID | Explicit values override the image account; when both are omitted, a supplied image `sandbox` account is preserved and an image without one gets `1000:1000`. Each overlay records its effective UID/GID. During migration, an unmarked overlay recovers that identity from its persisted prepared rootfs, then falls back to explicit configuration or the legacy `10001:10001` default. |
+| `sandbox_uid` / `sandbox_gid` | image `sandbox` account, otherwise `1000` / UID | Explicit values override the image account; when both are omitted, a supplied image `sandbox` account is preserved and an image without one gets `1000:1000`. Each overlay records its effective UID/GID. During migration, an unmarked overlay recovers identity from its upper layer or prepared rootfs, an explicit override, or the current image. Legacy `10001:10001` is retained only when persisted state reports it. |
 | `https_proxy` | unset | Corporate forward proxy (`http://host:port` or `https://host:port`) the in-guest supervisor chains policy-approved TLS CONNECT egress through. On the libkrun backend a proxy on the gateway host's loopback must be addressed as `http://host.openshell.internal:<port>` — guest egress leaves through gvproxy, which NATs `192.168.127.254` to the host's `127.0.0.1`. The QEMU/TAP backend has no such NAT, so a gateway-host proxy URL is rejected before GPU sandbox launch; use an address routable from the guest's masqueraded egress. |
 | `no_proxy` | unset | Comma-separated bypass list for the corporate proxy only. OpenShell policy evaluation still applies. |
 | `proxy_auth_file` | unset | Gateway-host path to a validated `user:pass` credential file. Staged root-only into the per-sandbox overlay and removed with the sandbox; credentials never enter logs or process arguments. |
@@ -262,7 +262,7 @@ Each table is created atomically via `nft -f` on VM start and torn down atomical
 
 - macOS on Apple Silicon, or Linux on aarch64/x86_64 with KVM
 - Rust toolchain
-- e2fsprogs (`mke2fs` or `mkfs.ext4`, plus `debugfs`) for root and overlay disk image creation and QEMU environment injection
+- e2fsprogs (`mke2fs` or `mkfs.ext4`, plus `debugfs`) for root and overlay disk image creation, identity inspection, and QEMU environment injection. Explicit `sandbox_uid`/`sandbox_gid` values do not remove this runtime prerequisite.
 - Guest-supervisor cross-compile toolchain (needed on macOS, and on Linux when host arch ≠ guest arch):
   - Matching rustup target: `rustup target add aarch64-unknown-linux-gnu` (or `x86_64-unknown-linux-gnu` for an amd64 guest)
   - `cargo install --locked cargo-zigbuild` and `brew install zig` (or distro equivalent). `vm:supervisor` uses `cargo zigbuild` to cross-compile the in-VM `openshell-sandbox` supervisor binary.

@@ -26,6 +26,10 @@ does not contribute to product usage metrics.
 
 `install.sh` defaults to the *latest tagged* release — the canary is therefore checking that the most recent public release still installs, not the just-published `dev` build. The `kubernetes` job is the exception: it pins to `0.0.0-dev` chart + `:dev` images.
 
+The host-package jobs exercise fresh installs, not upgrades from a persisted
+schema-v1 gateway config. Validate Homebrew and RPM exact-default migration with
+the release-tooling and package lifecycle tests before relying on the canary.
+
 The canary does not install or import `@nvidia/openshell-sdk`. TypeScript SDK
 validation lives in the `TypeScript SDK` branch check, including a publish
 dry-run. The tagged release workflow publishes the package to GitHub Packages;

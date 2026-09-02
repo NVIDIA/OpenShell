@@ -26,6 +26,7 @@ tokio = { workspace = true }
 openshell-driver-docker = { path = "../openshell-driver-docker", optional = true }
 openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes", optional = true }
 openshell-driver-podman = { path = "../openshell-driver-podman", optional = true }
+openshell-policy = { path = "../openshell-policy", optional = true }
 hyper-util = { workspace = true, optional = true }
 nix = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
@@ -51,6 +52,7 @@ compute-driver-docker = ["dep:openshell-driver-docker", "dep:openshell-otel"]
 compute-driver-kubernetes = ["dep:openshell-driver-kubernetes", "dep:openshell-otel"]
 compute-driver-podman = ["dep:openshell-driver-podman", "dep:openshell-otel"]
 compute-driver-vm = [
+    "dep:openshell-policy",
     "dep:openshell-otel",
     "dep:hyper-util",
     "dep:nix",

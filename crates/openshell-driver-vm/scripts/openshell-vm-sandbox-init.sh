@@ -155,7 +155,10 @@ ensure_target_runtime() {
     fi
     local owner
     owner="$(sandbox_owner_for_root "$image_root")"
-    chown -R "$owner" "$image_root/sandbox" 2>/dev/null || chown -R 1000:1000 "$image_root/sandbox" || true
+    if ! chown -R "$owner" "$image_root/sandbox" 2>/dev/null; then
+        ts "FATAL: failed to apply sandbox image ownership (${owner})"
+        exit 1
+    fi
     chmod 0755 "$image_root/sandbox"
 }
 
@@ -677,7 +680,8 @@ setup_sandbox_workdir() {
     fi
     if [ "$current_owner" != "$owner" ]; then
         if ! chown -R "$owner" "$sandbox_dir" 2>/dev/null; then
-            chown -R 1000:1000 "$sandbox_dir"
+            ts "FATAL: failed to apply sandbox ownership (${owner})"
+            exit 1
         fi
     fi
     chmod 0755 "$sandbox_dir"

@@ -987,6 +987,30 @@ ssh_gateway_port = 8080
     }
 
     #[test]
+    fn rejects_missing_version_in_nonempty_file() {
+        let tmp = write_raw_tmp("[openshell]\n\n[openshell.gateway]\nname = \"test\"\n");
+        assert!(matches!(
+            load(tmp.path()),
+            Err(ConfigFileError::MissingVersion)
+        ));
+    }
+
+    #[test]
+    fn rejects_future_version() {
+        let tmp = write_raw_tmp("[openshell]\nversion = 3\n");
+        assert!(matches!(
+            load(tmp.path()),
+            Err(ConfigFileError::UnsupportedVersion { version: 3 })
+        ));
+    }
+
+    #[test]
+    fn accepts_current_version() {
+        let tmp = write_raw_tmp("[openshell]\nversion = 2\n");
+        load(tmp.path()).expect("schema version 2 must be accepted");
+    }
+
+    #[test]
     fn driver_table_uses_only_driver_owned_values() {
         let raw = toml::toml! {
             default_image = "driver-specific"
