@@ -29,6 +29,25 @@ For an RFC 6455 upgrade over `ws://` or `wss://`, the supervisor first finds eve
 3. Complete client-to-upstream text messages in sequence order. OpenShell reassembles fragmented messages and decompresses negotiated `permessage-deflate` messages before evaluation.
 4. A best-effort session-end event when the stage stream remains writable. OpenShell attempts at most one terminal event for each opened stream, including streams opened during a preflight that rejects the upgrade before session start. It then half-closes the request stream and briefly drains the response stream so the terminal event can leave the local transport before the RPC closes. Middleware services should finish their response stream after the request stream reaches EOF.
 
+```mermaid
+sequenceDiagram
+    participant S as Supervisor
+    participant H as tonic / h2
+    participant M as Middleware
+
+    Note over S,M: Previous shutdown
+    S->>H: Queue session_end
+    S-xH: Drop request and response handles
+    H--xM: RST_STREAM(CANCEL) may discard session_end
+
+    Note over S,M: Graceful shutdown
+    S->>H: Queue session_end
+    S->>H: Drop request sender to half-close
+    H->>M: Deliver session_end, then request EOF
+    M-->>H: Finish response stream
+    H-->>S: Drain completes or reaches the 10 ms bound
+```
+
 The protobuf represents each logical message with a `text` or `binary` payload variant. Text uses the protobuf `string` type, so invalid UTF-8 cannot enter the middleware contract. Results use an optional matching replacement variant: absence preserves the input, while presence represents a replacement even when its content is empty. OpenShell rejects attempts to change the message type. Allowed replacements are re-framed, re-compressed when required, and forwarded. Binary messages, control frames, and upstream-to-client traffic remain uninspected. Binary messages pass through under both `on_error` modes. For each active selected stage, OpenShell emits an informational `unsupported_message_type` coverage event and advances the session-global sequence; the next text message can therefore reach the stage with a valid sequence gap.
 
 The network supervisor reserves process-wide assembly capacity before buffering every parsed WebSocket text message, even when no middleware is selected. At most 32 assemblies run while 64 additional callers wait without buffering payload bytes. When both bounds are full, OpenShell closes the WebSocket with code `1013` before reading the new message payload. A text message may contain at most 4,096 fragments, must make input progress within 30 seconds, and must finish assembly within 2 minutes. Forwarding the completed text frame must finish within another 2 minutes. The assembly budget lasts for the supervisor process lifetime, so policy reloads do not reset its capacity.
