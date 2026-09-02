@@ -404,7 +404,7 @@ Evaluate the generated policy for overly broad access and **include warnings in 
 
 | Condition | Warning to show |
 |-----------|----------------|
-| **L4-only** (no `protocol`, or `protocol: tcp`) | "This policy allows all application methods and paths without inspection. An omitted protocol uses explicit-proxy behavior; `protocol: tcp` enables policy DNS and transparent TCP only on a runtime that advertises the complete substrate (currently Docker and Podman). Consider `protocol: rest` with a preset if you want HTTP method-level control." |
+| **L4-only** (no `protocol`, or `protocol: tcp`) | "This policy allows all application methods and paths without inspection. An omitted protocol uses explicit-proxy behavior. `protocol: tcp` enables policy DNS and transparent TCP only on a runtime that advertises the complete substrate (currently Docker and Podman); its hostname constrains connection routing, not application authority, so compatible shared infrastructure may expose other tenants or services. Consider `protocol: rest` with a preset if you want HTTP method-level or authority control." |
 | **`access: full`** | "This policy allows all HTTP methods (including DELETE) on all paths. If you don't need DELETE, `read-write` is safer. If you only need to read, `read-only` is the most restrictive option." |
 | **`access: full` + `enforcement: audit`** | "Full access in audit mode provides no actual restriction — all traffic flows through. This is effectively a monitoring-only policy." |
 | **`access: read-write`** when user hasn't confirmed write need | "This policy allows POST, PUT, and PATCH on all paths. If you only need to read data, `read-only` is more restrictive." |

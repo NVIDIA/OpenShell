@@ -37,8 +37,8 @@ pub use compose::{
     is_provider_rule_name, provider_rule_name, strip_provider_rule_names,
 };
 pub use l7_validate::{
-    L7EndpointFields, L7Protocol, validate_explicit_tcp_additional_fields,
-    validate_l7_endpoint_semantics,
+    L7EndpointFields, L7Protocol, agent_authored_transport_rejection,
+    validate_explicit_tcp_additional_fields, validate_l7_endpoint_semantics,
 };
 pub use merge::{
     PolicyMergeError, PolicyMergeOp, PolicyMergeResult, PolicyMergeWarning,
