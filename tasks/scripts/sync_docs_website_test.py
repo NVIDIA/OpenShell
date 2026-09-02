@@ -55,6 +55,38 @@ def test_resolve_display_name() -> None:
     assert sdw.resolve_display_name("dev", "dev", "main", "Custom") == "Custom"
 
 
+def test_resolve_availability() -> None:
+    assert sdw.resolve_availability("dev", "") == "beta"
+    assert sdw.resolve_availability("latest", "") is None
+    assert sdw.resolve_availability("version", "") is None
+    assert sdw.resolve_availability("version", "deprecated") == "deprecated"
+    with pytest.raises(ValueError):
+        sdw.resolve_availability("dev", "alpha")
+
+
+def test_parse_and_render_versions_preserves_availability() -> None:
+    raw_versions = [
+        {
+            "display-name": "v0.0.36",
+            "path": "./versions/v0.0.36.yml",
+            "slug": "v0.0.36",
+            "availability": "deprecated",
+        }
+    ]
+
+    entries = sdw.parse_versions(raw_versions)
+
+    assert entries == [
+        sdw.VersionEntry(
+            "v0.0.36",
+            "v0.0.36",
+            "./versions/v0.0.36.yml",
+            "deprecated",
+        )
+    ]
+    assert sdw.render_versions(entries) == raw_versions
+
+
 def test_ordered_entries_pins_latest_then_dev() -> None:
     existing = [
         sdw.VersionEntry("v0.0.36", "v0.0.36", "./versions/v0.0.36.yml"),
@@ -128,6 +160,7 @@ def test_sync_docs_creates_snapshot(tmp_path: Path) -> None:
             source_ref="main",
             version_slug="",
             display_name="",
+            availability="",
         )
     )
 
@@ -142,7 +175,60 @@ def test_sync_docs_creates_snapshot(tmp_path: Path) -> None:
     slugs = [entry["slug"] for entry in docs_yml["versions"]]
     assert slugs == ["dev"]
     assert docs_yml["versions"][0]["path"] == "./versions/dev.yml"
+    assert docs_yml["versions"][0]["availability"] == "beta"
     assert "./components" in docs_yml["experimental"]["mdx-components"]
+
+
+def test_sync_docs_preserves_other_version_availability(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    website = tmp_path / "docs-website"
+    _make_source_tree(source)
+    _make_docs_website_tree(website)
+    docs_yml_path = website / "fern" / "docs.yml"
+    docs_yml_path.write_text(
+        yaml.safe_dump(
+            {
+                "versions": [
+                    {
+                        "display-name": "v0.0.36",
+                        "path": "./versions/v0.0.36.yml",
+                        "slug": "v0.0.36",
+                        "availability": "deprecated",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sdw.sync_docs(
+        Namespace(
+            operation="sync",
+            source_root=source,
+            docs_website_root=website,
+            channel="dev",
+            source_ref="main",
+            version_slug="",
+            display_name="dev (0.0.117.dev56)",
+            availability="beta",
+        )
+    )
+
+    versions = read_yaml(docs_yml_path)["versions"]
+    assert versions == [
+        {
+            "display-name": "dev (0.0.117.dev56)",
+            "path": "./versions/dev.yml",
+            "slug": "dev",
+            "availability": "beta",
+        },
+        {
+            "display-name": "v0.0.36",
+            "path": "./versions/v0.0.36.yml",
+            "slug": "v0.0.36",
+            "availability": "deprecated",
+        },
+    ]
 
 
 def test_remove_docs_drops_snapshot(tmp_path: Path) -> None:
@@ -159,6 +245,7 @@ def test_remove_docs_drops_snapshot(tmp_path: Path) -> None:
         source_ref="v0.0.36",
         version_slug="v0.0.36",
         display_name="",
+        availability="deprecated",
     )
     sdw.sync_docs(base)
 
@@ -175,6 +262,7 @@ def test_remove_docs_drops_snapshot(tmp_path: Path) -> None:
             source_ref="",
             version_slug="v0.0.36",
             display_name="",
+            availability="",
         )
     )
 

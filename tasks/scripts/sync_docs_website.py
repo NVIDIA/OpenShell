@@ -23,6 +23,7 @@ from typing import cast
 import yaml
 
 SLUG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+VERSION_AVAILABILITIES = {"beta", "deprecated", "ga", "stable"}
 YamlMapping = dict[str, object]
 
 
@@ -31,6 +32,7 @@ class VersionEntry:
     slug: str
     display_name: str
     path: str
+    availability: str | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-ref", default="")
     parser.add_argument("--version-slug", default="")
     parser.add_argument("--display-name", default="")
+    parser.add_argument("--availability", default="")
     return parser.parse_args()
 
 
@@ -77,6 +80,18 @@ def resolve_display_name(
     if channel == "latest":
         return f"Latest ({source_ref})" if source_ref.startswith("v") else "Latest"
     return slug
+
+
+def resolve_availability(channel: str, override: str) -> str | None:
+    availability = override or ("beta" if channel == "dev" else "")
+    if not availability:
+        return None
+    if availability not in VERSION_AVAILABILITIES:
+        supported = ", ".join(sorted(VERSION_AVAILABILITIES))
+        raise ValueError(
+            f"unsupported version availability {availability!r}; expected one of: {supported}"
+        )
+    return availability
 
 
 def ensure_existing(path: Path, label: str) -> None:
@@ -179,13 +194,21 @@ def parse_versions(raw_versions: object) -> list[VersionEntry]:
         slug = entry.get("slug")
         display_name = entry.get("display-name")
         path = entry.get("path")
+        availability = entry.get("availability")
         if (
             isinstance(slug, str)
             and isinstance(display_name, str)
             and isinstance(path, str)
         ):
             entries.append(
-                VersionEntry(slug=slug, display_name=display_name, path=path)
+                VersionEntry(
+                    slug=slug,
+                    display_name=display_name,
+                    path=path,
+                    availability=availability
+                    if isinstance(availability, str)
+                    else None,
+                )
             )
     return entries
 
@@ -210,14 +233,17 @@ def ordered_entries(
 
 
 def render_versions(entries: list[VersionEntry]) -> list[dict[str, str]]:
-    return [
-        {
+    rendered: list[dict[str, str]] = []
+    for entry in entries:
+        item = {
             "display-name": entry.display_name,
             "path": entry.path,
             "slug": entry.slug,
         }
-        for entry in entries
-    ]
+        if entry.availability is not None:
+            item["availability"] = entry.availability
+        rendered.append(item)
+    return rendered
 
 
 def component_dirs(fern_dir: Path) -> list[str]:
@@ -277,8 +303,10 @@ def sync_docs(args: argparse.Namespace) -> None:
         raise ValueError("--source-ref is required when --operation=sync")
     version_slug = clean_input(args.version_slug)
     display_override = clean_input(args.display_name)
+    availability_override = clean_input(args.availability)
     slug = resolve_slug(channel, version_slug)
     display_name = resolve_display_name(channel, slug, source_ref, display_override)
+    availability = resolve_availability(channel, availability_override)
     pages_dir = f"pages-{slug}"
     refresh_shared = channel in {"dev", "latest"}
 
@@ -312,6 +340,7 @@ def sync_docs(args: argparse.Namespace) -> None:
             slug=slug,
             display_name=display_name,
             path=f"./versions/{slug}.yml",
+            availability=availability,
         ),
         target_fern,
     )

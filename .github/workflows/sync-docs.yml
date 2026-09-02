@@ -31,7 +31,11 @@ on:
         required: false
         type: string
       display_name:
-        description: "Optional version selector display name"
+        description: "Optional selector name, e.g. dev (0.0.117.dev56)"
+        required: false
+        type: string
+      availability:
+        description: "Optional Fern status: beta, deprecated, ga, or stable"
         required: false
         type: string
 
@@ -96,6 +100,7 @@ jobs:
         uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
         with:
           version: "0.10.12"
+          python-version: "3.14.5"
 
       - name: Update docs snapshot
         # Inputs flow in as quoted env vars to avoid shell injection; see the
@@ -106,6 +111,7 @@ jobs:
           SOURCE_REF: ${{ inputs.source_ref }}
           VERSION_SLUG: ${{ inputs.version_slug }}
           DISPLAY_NAME: ${{ inputs.display_name }}
+          AVAILABILITY: ${{ inputs.availability }}
         run: |
           uv run automation/tasks/scripts/sync_docs_website.py \
             --operation "$OPERATION" \
@@ -114,7 +120,8 @@ jobs:
             --channel "$CHANNEL" \
             --source-ref "$SOURCE_REF" \
             --version-slug "$VERSION_SLUG" \
-            --display-name "$DISPLAY_NAME"
+            --display-name "$DISPLAY_NAME" \
+            --availability "$AVAILABILITY"
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
