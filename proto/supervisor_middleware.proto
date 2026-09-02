@@ -149,7 +149,7 @@ message HttpResponseEvent {
     // Initial response head and request context for this stage.
     HttpResponsePreflight preflight = 1;
     // One normalized body unit selected by OpenShell.
-    HttpResponseBodyUnit body = 2;
+    HttpBodyUnit body = 2;
     // Best-effort terminal notification for this stage stream.
     MiddlewareSessionEnd session_end = 3;
   }
@@ -211,7 +211,7 @@ message HttpResponsePreflight {
   // multipart/x-mixed-replace) omit WHOLE_BODY_BYTES. Selecting a mode that is
   // not listed is a middleware failure handled according to on_error, never a
   // silent downgrade.
-  repeated HttpResponseBodyMode permitted_body_modes = 8;
+  repeated HttpBodyMode permitted_body_modes = 8;
   // True when this stage's binding is fail_closed. Only then may a STREAM_BYTES
   // stage defer bytes from one unit's replacement to a later replacement, for
   // example to hold a partial record while parsing a framed format. Deferred
@@ -272,8 +272,12 @@ message HttpResponseBlockDelivery {}
 message HttpResponsePreflightInspect {
   // Required response body mode. It must be one of
   // HttpResponsePreflight.permitted_body_modes. UNSPECIFIED and unlisted modes
-  // are middleware failures handled according to on_error.
-  HttpResponseBodyMode body_mode = 1;
+  // are middleware failures handled according to on_error. WHOLE_BODY_BYTES
+  // buffers the body before committing the response head and fails the stage
+  // with whole_body_over_capacity when the body exceeds max_payload_bytes or
+  // with whole_body_accumulation_timeout when the complete body does not
+  // arrive within the platform accumulation deadline.
+  HttpBodyMode body_mode = 1;
   // Ordered response-header mutations applied atomically before the next stage.
   // Writes and removals may target permitted visible end-to-end headers.
   // Routing, credential, framing, coding, range, and hop-by-hop fields remain
@@ -283,37 +287,37 @@ message HttpResponsePreflightInspect {
   repeated HeaderMutation header_mutations = 2;
 }
 
-// HttpResponseBodyMode controls which response-body units one stage receives.
-enum HttpResponseBodyMode {
-  // Invalid response value handled according to the policy failure mode.
-  HTTP_RESPONSE_BODY_MODE_UNSPECIFIED = 0;
-  // Inspect and mutate only the response head. The stage receives no body
+// HttpBodyMode controls which body units one stage receives. It is shared by
+// HTTP request and response middleware; each hook defines which modes a stage
+// may select for a given message.
+enum HttpBodyMode {
+  // Invalid value handled according to the policy failure mode.
+  HTTP_BODY_MODE_UNSPECIFIED = 0;
+  // Inspect and mutate only the message head. The stage receives no body
   // units.
-  HTTP_RESPONSE_BODY_MODE_HEADERS_ONLY = 1;
-  // Receive the complete normalized response body as exactly one body unit
-  // with end_of_stream set. The whole input and its replacement must fit
-  // max_payload_bytes. OpenShell buffers the body before committing the
-  // response head. It fails the stage with whole_body_over_capacity when the
-  // body exceeds the limit and with whole_body_accumulation_timeout when the
-  // complete body does not arrive within the platform accumulation deadline.
-  HTTP_RESPONSE_BODY_MODE_WHOLE_BODY_BYTES = 2;
+  HTTP_BODY_MODE_HEADERS_ONLY = 1;
+  // Receive the complete normalized body as exactly one body unit with
+  // end_of_stream set. The whole input and its replacement must fit
+  // max_payload_bytes.
+  HTTP_BODY_MODE_WHOLE_BODY_BYTES = 2;
   // Receive one or more normalized byte units, the last of which sets
   // end_of_stream. Each replacement must fit max_payload_bytes; the complete
-  // response may be larger and has no total deadline.
-  HTTP_RESPONSE_BODY_MODE_STREAM_BYTES = 3;
+  // body may be larger and has no total deadline.
+  HTTP_BODY_MODE_STREAM_BYTES = 3;
 }
 
-// HttpResponseBodyUnit contains one supervisor-defined logical body unit. Unit
-// boundaries have no HTTP transport or application semantic meaning.
-message HttpResponseBodyUnit {
+// HttpBodyUnit contains one supervisor-defined logical body unit of an HTTP
+// request or response. Unit boundaries have no HTTP transport or application
+// semantic meaning.
+message HttpBodyUnit {
   // Contiguous and stage-local, starting at 1.
   uint64 sequence = 1;
   oneof payload {
-    // Normalized response bytes with no HTTP transfer-framing significance.
+    // Normalized body bytes with no HTTP transfer-framing significance.
     // WHOLE_BODY_BYTES uses present empty data for an empty body so middleware
     // can replace it with nonempty data. STREAM_BYTES units are at most the
     // smaller of 64 KiB and half of max_payload_bytes, and OpenShell may send
-    // shorter units to preserve upstream flush behavior.
+    // shorter units to preserve flush behavior.
     bytes data = 2;
   }
   // True on the final unit for this stage. Every body-inspecting stage that
@@ -343,14 +347,14 @@ message HttpResponseBodyResult {
   // ownership transfer without changing the RPC cardinality.
   oneof action {
     // Forward the corresponding input unit without modification.
-    HttpResponseBodyPassThrough pass_through = 2;
+    HttpBodyPassThrough pass_through = 2;
     // Replace the complete corresponding input unit.
-    HttpResponseBodyTransform transform = 3;
+    HttpBodyTransform transform = 3;
     // Stop delivery of this response. See HttpResponseBlockDelivery for the
     // difference between results before and after head commitment.
     HttpResponseBlockDelivery block_delivery = 8;
     // Finalize this unit, then opt out of inspecting the rest of the response.
-    HttpResponseBodySkipRemaining skip_remaining = 9;
+    HttpBodySkipRemaining skip_remaining = 9;
   }
   // Free-form service diagnostic. OpenShell never exposes this to the sandbox
   // or security logs. Limited to 4 KiB before discarding.
@@ -367,37 +371,37 @@ message HttpResponseBodyResult {
   map<string, string> metadata = 7;
 }
 
-// HttpResponseBodyPassThrough preserves the corresponding input unit exactly.
-message HttpResponseBodyPassThrough {}
+// HttpBodyPassThrough preserves the corresponding input unit exactly.
+message HttpBodyPassThrough {}
 
-// HttpResponseBodySkipRemaining finalizes the current unit and ends this
-// stage's participation in the response. OpenShell forwards every later unit
+// HttpBodySkipRemaining finalizes the current unit and ends this stage's
+// participation in the body. OpenShell forwards every later unit
 // without sending it to this stage, other stages continue to evaluate those
 // units, and this stage receives no end_of_stream unit. A stage that deferred
 // bytes must emit them in the nested transform. Coverage records the remaining
 // body as skipped by choice, distinct from a fail-open bypass. On the
 // WHOLE_BODY_BYTES unit this is equivalent to the nested action alone.
-message HttpResponseBodySkipRemaining {
+message HttpBodySkipRemaining {
   // Exactly one action for the current unit is required.
   oneof current {
     // Forward the current unit without modification.
-    HttpResponseBodyPassThrough pass_through = 1;
+    HttpBodyPassThrough pass_through = 1;
     // Replace the current unit, including any deferred bytes.
-    HttpResponseBodyTransform transform = 2;
+    HttpBodyTransform transform = 2;
   }
 }
 
-// HttpResponseBodyTransform replaces the complete corresponding input unit.
-message HttpResponseBodyTransform {
+// HttpBodyTransform replaces the complete corresponding input unit.
+message HttpBodyTransform {
   // Exactly one replacement payload is required. Present empty data deletes the
   // input unit. The replacement is limited to max_payload_bytes and may carry
-  // fewer or more bytes than the input. When
-  // HttpResponsePreflight.deferral_permitted is true, a stage may withhold
-  // trailing bytes from this replacement and emit them in a later replacement,
-  // holding at most half of max_payload_bytes. Otherwise every replacement
-  // must fully account for its own input unit.
+  // fewer or more bytes than the input. When the hook's preflight reports
+  // deferral_permitted, a stage may withhold trailing bytes from this
+  // replacement and emit them in a later replacement, holding at most half of
+  // max_payload_bytes. Otherwise every replacement must fully account for its
+  // own input unit.
   oneof replacement {
-    // Normalized replacement response bytes.
+    // Normalized replacement body bytes.
     bytes data = 1;
   }
 }
