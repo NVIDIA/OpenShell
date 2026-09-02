@@ -139,7 +139,7 @@ jobs:
             args+=(--allow-full-bootstrap)
           fi
 
-          node tasks/scripts/codex-security-release-range.mjs "${args[@]}"
+          python3 tasks/scripts/codex_security_range.py "${args[@]}"
 
       - name: Scan changes since the previous stable
         env:

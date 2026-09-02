@@ -365,7 +365,9 @@ a pull request or merge group.
   NVIDIA key and is exposed to the scan step alone, as `OPENAI_API_KEY` so the
   CLI selects API-key auth and as `NVIDIA_INFERENCE_API_KEY`, the provider
   `env_key` read by the Codex child process.
-  `tasks/scripts/codex-security-release-range.mjs` resolves the scan range: the
+  `tasks/scripts/codex_security_range.py` resolves the scan range, reusing the
+  tag parsers in `tasks/scripts/release.py` so both stay on one definition of a
+  release tag while requiring the `v` prefix that a release workflow needs: the
   candidate must be a `vX.Y.Z-pre.N` tag that is an ancestor of `origin/main`,
   and the base is the newest stable `vX.Y.Z` tag merged into the candidate that
   is strictly older than the release train `vX.Y.Z` the candidate targets. A
