@@ -176,15 +176,10 @@ fn tracing_output_is_free_of_escape_sequences_when_piped() {
     );
 }
 
-/// Run a failing command with stdout attached to a pseudo-terminal and stderr
-/// on a pipe, returning what each stream received.
-///
-/// `Command::output` gives both streams pipes, so it cannot distinguish a
-/// per-stream decision from a single one resolved off stdout. This asymmetric
-/// setup is the only way to catch a stream being handed the other stream's
-/// answer.
+/// Run a command with stdout attached to a pseudo-terminal and stderr on a
+/// pipe, returning what each stream received.
 #[cfg(target_os = "linux")]
-fn split_streams_stdout_tty(args: &[&str]) -> (String, String) {
+fn run_with_stdout_tty(mut command: Command) -> (String, String) {
     use std::io::Read;
     use std::os::fd::{AsRawFd, OwnedFd};
 
@@ -192,30 +187,14 @@ fn split_streams_stdout_tty(args: &[&str]) -> (String, String) {
     let controller: OwnedFd = pty.master;
     let follower: OwnedFd = pty.slave;
 
-    let tmpdir = tempfile::tempdir().expect("create tmpdir");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_openshell"))
-        .args([
-            "sandbox",
-            "list",
-            "--gateway",
-            "test-gateway",
-            "--gateway-endpoint",
-            "http://127.0.0.1:1",
-        ])
-        .args(args)
-        .env("XDG_CONFIG_HOME", tmpdir.path())
-        .env("RUST_LOG", "debug")
-        // Pin TERM: `auto` now requires a capable terminal, and CI runners
-        // often leave TERM unset, which would make this test's outcome depend
-        // on the ambient environment.
-        .env("TERM", "xterm-256color")
-        .env_remove("NO_COLOR")
-        .env_remove("FORCE_COLOR")
-        .env_remove("OPENSHELL_COLOR")
+    let mut child = command
         .stdout(follower.try_clone().expect("dup pty follower"))
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn openshell");
+    // `Command` retains its configured stdio handles after spawning. Drop it so
+    // the controller sees EIO once the child exits.
+    drop(command);
 
     // Drop every follower handle in this process, or reading the controller
     // blocks forever instead of returning EIO once the child exits.
@@ -246,14 +225,48 @@ fn split_streams_stdout_tty(args: &[&str]) -> (String, String) {
     )
 }
 
-/// Run `forward list` with *both* streams on one pseudo-terminal, under the
-/// given `TERM`, and return everything the terminal received.
+/// Run a failing command with stdout attached to a pseudo-terminal and stderr
+/// on a pipe, returning what each stream received.
 ///
-/// Both streams share the terminal so the `owo-colors` table is styled too — it
-/// requires both streams to accept escapes. This is the shape of a real
-/// interactive session, which is the only place terminal capability matters.
+/// `Command::output` gives both streams pipes, so it cannot distinguish a
+/// per-stream decision from a single one resolved off stdout. This asymmetric
+/// setup is the only way to catch a stream being handed the other stream's
+/// answer.
 #[cfg(target_os = "linux")]
-fn forward_list_on_pty(term: &str, args: &[&str]) -> String {
+fn split_streams_stdout_tty(args: &[&str]) -> (String, String) {
+    let tmpdir = tempfile::tempdir().expect("create tmpdir");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_openshell"));
+    command
+        .args([
+            "sandbox",
+            "list",
+            "--gateway",
+            "test-gateway",
+            "--gateway-endpoint",
+            "http://127.0.0.1:1",
+        ])
+        .args(args)
+        .env("XDG_CONFIG_HOME", tmpdir.path())
+        .env("RUST_LOG", "debug")
+        // Pin TERM: `auto` now requires a capable terminal, and CI runners
+        // often leave TERM unset, which would make this test's outcome depend
+        // on the ambient environment.
+        .env("TERM", "xterm-256color")
+        .env_remove("NO_COLOR")
+        .env_remove("FORCE_COLOR")
+        .env_remove("OPENSHELL_COLOR");
+
+    run_with_stdout_tty(command)
+}
+
+/// Run `forward list` with stdout on a pseudo-terminal, under the given `TERM`,
+/// and return everything stdout received.
+///
+/// When `stderr_on_tty` is true, both streams share the terminal so the
+/// `owo-colors` table is styled too. Otherwise, stderr is redirected to
+/// `/dev/null`, which verifies the conservative table behavior.
+#[cfg(target_os = "linux")]
+fn forward_list_on_pty(term: &str, args: &[&str], stderr_on_tty: bool) -> String {
     use std::os::fd::{AsRawFd, OwnedFd};
 
     let pty = nix::pty::openpty(None, None).expect("openpty");
@@ -263,7 +276,8 @@ fn forward_list_on_pty(term: &str, args: &[&str]) -> String {
     let tmpdir = tempfile::tempdir().expect("create tmpdir");
     config_dir_with_forward(tmpdir.path());
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_openshell"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_openshell"));
+    command
         .args(["forward", "list"])
         .args(args)
         .env("XDG_CONFIG_HOME", tmpdir.path())
@@ -271,10 +285,16 @@ fn forward_list_on_pty(term: &str, args: &[&str]) -> String {
         .env_remove("NO_COLOR")
         .env_remove("FORCE_COLOR")
         .env_remove("OPENSHELL_COLOR")
-        .stdout(follower.try_clone().expect("dup pty follower"))
-        .stderr(follower.try_clone().expect("dup pty follower"))
-        .spawn()
-        .expect("spawn openshell");
+        .stdout(follower.try_clone().expect("dup pty follower"));
+    if stderr_on_tty {
+        command.stderr(follower.try_clone().expect("dup pty follower"));
+    } else {
+        command.stderr(std::process::Stdio::null());
+    }
+    let mut child = command.spawn().expect("spawn openshell");
+    // `Command` retains its configured stdio handles after spawning. Drop it so
+    // the controller sees EIO once the child exits.
+    drop(command);
 
     // Drop every follower handle here, or the controller read never sees EIO.
     drop(follower);
@@ -305,11 +325,11 @@ fn forward_list_on_pty(term: &str, args: &[&str]) -> String {
 #[cfg(target_os = "linux")]
 #[test]
 fn dumb_terminal_is_not_styled_under_auto() {
-    let dumb = forward_list_on_pty("dumb", &[]);
+    let dumb = forward_list_on_pty("dumb", &[], true);
     // Positive control: the same session on a capable terminal is styled, so a
     // plain result below means capability was consulted, not that the pty setup
     // silently produced nothing.
-    let capable = forward_list_on_pty("xterm-256color", &[]);
+    let capable = forward_list_on_pty("xterm-256color", &[], true);
 
     assert!(
         capable.contains(ESC),
@@ -326,7 +346,7 @@ fn dumb_terminal_is_not_styled_under_auto() {
 #[cfg(target_os = "linux")]
 #[test]
 fn color_always_overrides_a_dumb_terminal() {
-    let forced = forward_list_on_pty("dumb", &["--color", "always"]);
+    let forced = forward_list_on_pty("dumb", &["--color", "always"], true);
 
     assert!(
         forced.contains(ESC),
@@ -353,6 +373,23 @@ fn redirected_stderr_stays_plain_while_stdout_is_a_terminal() {
     assert!(
         !stderr.contains(ESC),
         "redirected stderr must not receive escapes, got: {stderr:?}"
+    );
+}
+
+/// `Painted` cannot identify its destination stream, so table styling is
+/// deliberately disabled when either stream is redirected.
+#[cfg(target_os = "linux")]
+#[test]
+fn status_table_is_plain_when_stderr_is_redirected() {
+    let stdout = forward_list_on_pty("xterm-256color", &[], false);
+
+    assert!(
+        stdout.contains(SANDBOX),
+        "expected the seeded forward in the table, got: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains(ESC),
+        "STATUS table must stay plain when stderr is redirected, got: {stdout:?}"
     );
 }
 
