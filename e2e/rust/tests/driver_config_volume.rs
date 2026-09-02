@@ -526,8 +526,9 @@ async fn connect_container_api(driver: &str) -> Result<Docker, String> {
 }
 
 fn podman_socket_path() -> Result<PathBuf, String> {
-    let path = std::env::var_os("OPENSHELL_PODMAN_SOCKET")
-        .ok_or_else(|| "OPENSHELL_PODMAN_SOCKET must be set by e2e/with-podman-gateway.sh".to_string())?;
+    let path = std::env::var_os("OPENSHELL_PODMAN_SOCKET").ok_or_else(|| {
+        "OPENSHELL_PODMAN_SOCKET must be set by e2e/with-podman-gateway.sh".to_string()
+    })?;
     Ok(PathBuf::from(path))
 }
 
