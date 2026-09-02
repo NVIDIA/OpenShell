@@ -65,6 +65,32 @@ pub const VM_GUEST_TLS_KEY_PATH: &str = "/opt/openshell/tls/tls.key";
 pub const VM_GUEST_SANDBOX_TOKEN_PATH: &str = "/opt/openshell/auth/sandbox.jwt";
 pub const VM_GUEST_INIT_DROPIN_DIR: &str = "/opt/openshell/init.d";
 pub const VM_GUEST_INIT_DROPIN_MANIFEST: &str = "/opt/openshell/init.d.manifest";
+
+/// Guest path for the corporate upstream-proxy credential in VM sandboxes.
+///
+/// The VM driver stages the `user:pass` credential here (mode `0600`,
+/// root-only) inside the per-sandbox overlay upperdir, and passes only this
+/// path on the supervisor's argv. A microVM has no bind mounts or container
+/// secrets, so this is the same delivery the per-sandbox JWT already uses.
+pub const VM_GUEST_UPSTREAM_PROXY_AUTH_PATH: &str = "/opt/openshell/auth/upstream-proxy";
+
+/// Guest path for the corporate proxy CA bundle in VM sandboxes.
+///
+/// A CA certificate is not secret, so unlike the credential this is staged
+/// world-readable. The supervisor trusts it for the handshake with an
+/// `https://` proxy and for server certificates re-signed by a
+/// TLS-intercepting proxy.
+pub const VM_GUEST_PROXY_CA_PATH: &str = "/opt/openshell/tls/proxy-ca.pem";
+
+/// Guest path for the driver-authored supervisor argument list in VM sandboxes.
+///
+/// Podman and Kubernetes build the supervisor's command line directly; the VM
+/// guest init script execs a fixed argv, so driver-owned arguments travel
+/// through this file instead. The driver writes it into the overlay upperdir
+/// on every launch — empty when it has no arguments to pass — so a sandbox
+/// image can neither forge entries nor shadow the driver's copy, and the
+/// guest appends exactly what it finds there and nothing else.
+pub const VM_GUEST_SUPERVISOR_ARGS_PATH: &str = "/opt/openshell/supervisor-args";
 pub const VM_UMOCI_PATH: &str = "/opt/openshell/bin/umoci";
 pub const VM_SANDBOX_OWNER_NORMALIZED_MARKER: &str = "/opt/openshell/.sandbox-owner-normalized";
 
@@ -103,6 +129,9 @@ mod tests {
             VM_GUEST_SANDBOX_TOKEN_PATH,
             VM_GUEST_INIT_DROPIN_DIR,
             VM_GUEST_INIT_DROPIN_MANIFEST,
+            VM_GUEST_UPSTREAM_PROXY_AUTH_PATH,
+            VM_GUEST_PROXY_CA_PATH,
+            VM_GUEST_SUPERVISOR_ARGS_PATH,
             VM_UMOCI_PATH,
             VM_SANDBOX_OWNER_NORMALIZED_MARKER,
         ];

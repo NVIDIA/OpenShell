@@ -99,6 +99,34 @@ pub struct VmComputeConfig {
 
     /// Host-side private key for the guest's mTLS client bundle.
     pub guest_tls_key: Option<PathBuf>,
+
+    /// Corporate forward proxy URL (`http://host:port` or `https://host:port`)
+    /// for policy-approved TLS egress from VM sandboxes.
+    ///
+    /// Deployment-level configuration, not a per-sandbox setting: it is passed
+    /// to the driver, which puts it on the guest supervisor's argv. A proxy on
+    /// this host's loopback is reachable from a guest only through the gvproxy
+    /// host alias `host.openshell.internal`.
+    pub https_proxy: Option<String>,
+
+    /// Comma-separated `NO_PROXY` list. Bypasses only the corporate proxy,
+    /// never `OpenShell` policy evaluation.
+    pub no_proxy: Option<String>,
+
+    /// Path on this host to a `user:pass` corporate proxy credential file.
+    pub proxy_auth_file: Option<String>,
+
+    /// Acknowledgement that Basic auth to an `http://` proxy is cleartext.
+    /// Required alongside `proxy_auth_file` unless the proxy is `https://`.
+    pub proxy_auth_allow_insecure: Option<bool>,
+
+    /// Send hostnames rather than validated IPs in CONNECT requests. Last
+    /// resort for proxies whose ACLs reject IP CONNECT targets.
+    pub proxy_connect_by_hostname: Option<bool>,
+
+    /// Path on this host to a PEM CA bundle trusted for the corporate proxy
+    /// and for server certificates a TLS-intercepting proxy re-signs.
+    pub proxy_ca_bundle: Option<String>,
 }
 
 impl VmComputeConfig {
@@ -135,6 +163,29 @@ impl VmComputeConfig {
         4096
     }
 
+    /// Validate the corporate upstream-proxy settings, fail-closed.
+    ///
+    /// Runs in the gateway as well as in the driver so an invalid
+    /// `[openshell.drivers.vm]` table reports the offending key instead of
+    /// surfacing as an opaque driver-startup timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`Error::config`] naming the offending key.
+    pub fn validate_proxy_config(&self) -> Result<()> {
+        openshell_core::driver_utils::validate_upstream_proxy_settings(
+            &openshell_core::driver_utils::UpstreamProxySettings {
+                url: self.https_proxy.as_deref(),
+                no_proxy: self.no_proxy.as_deref(),
+                auth_file: self.proxy_auth_file.as_deref(),
+                auth_allow_insecure: self.proxy_auth_allow_insecure,
+                connect_by_hostname: self.proxy_connect_by_hostname,
+                ca_bundle: self.proxy_ca_bundle.as_deref(),
+            },
+        )
+        .map_err(Error::config)
+    }
+
     #[must_use]
     fn default_driver_search_dirs(home: Option<PathBuf>) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
@@ -163,6 +214,12 @@ impl Default for VmComputeConfig {
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
+            https_proxy: None,
+            no_proxy: None,
+            proxy_auth_file: None,
+            proxy_auth_allow_insecure: None,
+            proxy_connect_by_hostname: None,
+            proxy_ca_bundle: None,
         }
     }
 }
@@ -460,6 +517,8 @@ pub async fn spawn(
         ));
     }
 
+    vm_config.validate_proxy_config()?;
+
     let driver_bin = resolve_compute_driver_bin(vm_config)?;
     let socket_path = compute_driver_socket_path(vm_config);
     let guest_tls_paths = compute_driver_guest_tls_paths(vm_config)?;
@@ -501,6 +560,7 @@ pub async fn spawn(
         command.arg("--guest-tls-cert").arg(tls.cert);
         command.arg("--guest-tls-key").arg(tls.key);
     }
+    append_upstream_proxy_args(&mut command, vm_config);
 
     let mut child = command.spawn().map_err(|e| {
         Error::execution(format!(
@@ -513,6 +573,38 @@ pub async fn spawn(
     Ok(AcquiredRemoteDriverEndpoint::managed(
         "vm", channel, process,
     ))
+}
+
+/// Forward the operator's corporate proxy settings to the driver subprocess.
+///
+/// Only keys the operator actually set are passed, so the driver keeps the
+/// same "omitted means no proxy" contract the supervisor enforces. The
+/// booleans travel as explicit values rather than presence flags so an
+/// explicit `false` still trips the driver's pairing checks.
+#[cfg(unix)]
+fn append_upstream_proxy_args(command: &mut Command, vm_config: &VmComputeConfig) {
+    if let Some(url) = &vm_config.https_proxy {
+        command.arg("--https-proxy").arg(url);
+    }
+    if let Some(list) = &vm_config.no_proxy {
+        command.arg("--no-proxy").arg(list);
+    }
+    if let Some(path) = &vm_config.proxy_auth_file {
+        command.arg("--proxy-auth-file").arg(path);
+    }
+    if let Some(allow) = vm_config.proxy_auth_allow_insecure {
+        command
+            .arg("--proxy-auth-allow-insecure")
+            .arg(allow.to_string());
+    }
+    if let Some(by_hostname) = vm_config.proxy_connect_by_hostname {
+        command
+            .arg("--proxy-connect-by-hostname")
+            .arg(by_hostname.to_string());
+    }
+    if let Some(path) = &vm_config.proxy_ca_bundle {
+        command.arg("--proxy-ca-bundle").arg(path);
+    }
 }
 
 #[cfg(unix)]
@@ -606,9 +698,10 @@ async fn connect_compute_driver(socket_path: &Path) -> Result<Channel> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        VmComputeConfig, append_otlp_args, compute_driver_guest_tls_paths,
-        compute_driver_socket_path, current_euid, prepare_compute_driver_socket_path,
-        prepare_vm_state_dir, resolve_compute_driver_bin, resolve_driver_search_dirs,
+        VmComputeConfig, append_otlp_args, append_upstream_proxy_args,
+        compute_driver_guest_tls_paths, compute_driver_socket_path, current_euid,
+        prepare_compute_driver_socket_path, prepare_vm_state_dir, resolve_compute_driver_bin,
+        resolve_driver_search_dirs,
     };
     use openshell_server::config_file::OtlpConfig;
     use std::os::unix::fs::PermissionsExt;
@@ -642,6 +735,83 @@ mod tests {
                 "production-us-west"
             ]
         );
+    }
+
+    #[test]
+    fn vm_driver_command_forwards_corporate_proxy_settings() {
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        append_upstream_proxy_args(
+            &mut command,
+            &VmComputeConfig {
+                https_proxy: Some("http://proxy.corp.com:8080".to_string()),
+                no_proxy: Some("10.0.0.0/8".to_string()),
+                proxy_auth_file: Some("/etc/openshell/secrets/proxy-auth".to_string()),
+                proxy_auth_allow_insecure: Some(true),
+                proxy_connect_by_hostname: Some(false),
+                proxy_ca_bundle: Some("/etc/openshell/tls/proxy-ca.pem".to_string()),
+                ..VmComputeConfig::default()
+            },
+        );
+
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--https-proxy",
+                "http://proxy.corp.com:8080",
+                "--no-proxy",
+                "10.0.0.0/8",
+                "--proxy-auth-file",
+                "/etc/openshell/secrets/proxy-auth",
+                "--proxy-auth-allow-insecure",
+                "true",
+                // Passed as an explicit value, not a presence flag, so the
+                // driver still sees the operator's `false`.
+                "--proxy-connect-by-hostname",
+                "false",
+                "--proxy-ca-bundle",
+                "/etc/openshell/tls/proxy-ca.pem",
+            ]
+        );
+    }
+
+    #[test]
+    fn vm_driver_command_omits_unset_corporate_proxy_settings() {
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        append_upstream_proxy_args(&mut command, &VmComputeConfig::default());
+        assert_eq!(command.as_std().get_args().count(), 0);
+    }
+
+    #[test]
+    fn invalid_corporate_proxy_config_is_rejected_before_the_driver_starts() {
+        // Without this the operator would see an opaque driver-readiness
+        // timeout instead of an error naming the offending key.
+        let err = VmComputeConfig {
+            https_proxy: Some("socks5://proxy.corp.com:1080".to_string()),
+            ..VmComputeConfig::default()
+        }
+        .validate_proxy_config()
+        .expect_err("only http:// and https:// proxies are supported");
+        assert!(err.to_string().contains("https_proxy"), "{err}");
+
+        let err = VmComputeConfig {
+            proxy_ca_bundle: Some("/etc/openshell/tls/proxy-ca.pem".to_string()),
+            ..VmComputeConfig::default()
+        }
+        .validate_proxy_config()
+        .expect_err("a CA bundle without a proxy URL would hide a fail-open state");
+        assert!(err.to_string().contains("proxy_ca_bundle"), "{err}");
+
+        VmComputeConfig {
+            https_proxy: Some("http://proxy.corp.com:8080".to_string()),
+            ..VmComputeConfig::default()
+        }
+        .validate_proxy_config()
+        .expect("a lone proxy URL is a complete configuration");
     }
 
     #[test]

@@ -796,6 +796,50 @@ guest_tls_key    = "/var/lib/openshell/guest-tls/client-key.pem"
 # Defaults to 10001 when unset; matching GID is used if sandbox_gid is empty.
 # Any non-root Linux UID/GID is valid.
 # sandbox_uid = 20001
+# Corporate forward proxy for sandbox egress. The keys, their semantics, and
+# the fail-closed contract are identical to the Podman driver above: only TLS
+# (CONNECT) egress is chained, plain-HTTP destination requests always dial
+# directly, credentials must come from proxy_auth_file rather than the URL,
+# an http:// proxy with credentials requires proxy_auth_allow_insecure, and
+# any present-but-invalid value is rejected at gateway startup rather than
+# degrading to a direct dial. proxy_auth_file and proxy_ca_bundle are paths on
+# the gateway host.
+#
+# The sandbox cannot select or override these settings. They reach the guest
+# supervisor on its command line through a per-sandbox file the driver writes
+# into the overlay upperdir on every launch, so a sandbox image cannot supply
+# its own values or disable the operator's by baking a file at that path.
+#
+# Reachability: a proxy on the corporate network needs no special address and
+# works on every VM sandbox. The guest's callback to the gateway is unaffected
+# and never traverses the proxy.
+#
+# A proxy on the gateway host itself is reachable only from libkrun-backed
+# (non-GPU) sandboxes: their egress leaves through gvproxy, which NATs
+# 192.168.127.254 to the host's 127.0.0.1, so address it as
+# http://host.openshell.internal:<port> rather than http://127.0.0.1:<port>.
+# GPU sandboxes run on the QEMU/TAP backend, which has no such NAT —
+# host.openshell.internal resolves to the TAP host address, and the driver's
+# nftables rules let the guest reach only the gateway port on the host. A
+# gateway-host proxy URL is therefore rejected when the sandbox launches on
+# QEMU, rather than timing out on every CONNECT; give GPU sandboxes a proxy
+# address routable from the guest's masqueraded egress.
+#
+# Because a microVM has no bind mounts or container secrets, the driver stages
+# the credential and the CA into the per-sandbox overlay disk: the credential
+# root-only inside the guest, and both removed with the sandbox. The
+# credential is therefore at rest in that overlay image on the gateway host —
+# the same delivery the per-sandbox gateway token already uses, and a
+# difference from the Podman secret model worth noting when choosing where to
+# keep proxy credentials.
+# https_proxy               = "http://host.openshell.internal:8080"
+# no_proxy                  = "10.0.0.0/8,.internal.example"
+# proxy_auth_file           = "/etc/openshell/secrets/proxy-auth"
+# proxy_auth_allow_insecure = true
+# Last resort for hostname-filtering proxy ACLs; see the Podman section above.
+# proxy_connect_by_hostname = true
+# Corporate CA trusted for an https:// proxy and TLS-intercepting proxies.
+# proxy_ca_bundle           = "/etc/openshell/tls/proxy-ca.pem"
 ```
 
 ### Extension Driver
