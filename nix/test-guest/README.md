@@ -48,6 +48,12 @@ nix/test-guest/
     │       ├── shared.yml
     │       └── ubuntu.yml
     └── selinux.yml
+└── provisioners/
+    └── roles/
+        ├── gateway-rootless-podman/
+        ├── openshell-development/
+        ├── openshell-rpm/
+        └── openshell-rpm-gateway-upgrade/
 ```
 
 - `default.nix` assembles the guest and cache flake apps. It selects host architecture and acceleration, supplies the runtime tools, and exposes distro profiles and configuration playbooks as Nix-store catalogs.
@@ -57,6 +63,7 @@ nix/test-guest/
 - `cache-seal.sh` removes per-instance state and zeroes free space inside a prepared guest before capture.
 - `distros/*.nix` define the immutable base-image catalog. Each record pins and exports the image URL and hash and declares the expected OS ID, version, and package family.
 - `configuration/*.yml` are host-executed Ansible playbooks that layer optional capabilities onto a base guest. Configurations remain independent and run in the order supplied with repeated `--with` arguments.
+- `provisioners/roles/*` are per-run Ansible roles that assemble a system from copied or installed artifacts. They run after artifact transfer and are never part of the prepared VM cache.
 - `README.md` documents the supported combinations and developer interface.
 
 The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-guest` and `test-guest-cache` apps. Debian artifact creation remains outside the guest harness in [`tasks/scripts/package-deb.sh`](../../tasks/scripts/package-deb.sh); the runner only installs or copies artifacts that already exist.
@@ -142,6 +149,86 @@ Configurations run in the order provided on the command line. OpenShell packages
 `--install` packages and `--copy` files are applied by a dedicated per-run
 Ansible playbook. `--copy` preserves each source file's ordinary permission
 bits. They are not stored in prepared VM cache entries.
+
+## System provisioners
+
+`--provision NAME` applies a target-specific system setup after packages and
+copied artifacts are present. Unlike `--with`, provisioners are not cached.
+They can therefore install and start an OpenShell system without coupling the
+prepared guest image to a particular build or driver configuration.
+
+Provisioners that support gateway continuity install a target-control command:
+
+```text
+/home/openshell/.local/bin/openshell-test-guest-gateway-restart
+```
+
+It restarts an already-provisioned gateway and exits only after CLI health
+succeeds. An explicit conformance plan consumes that stable test-guest contract
+without knowing how the provisioner implements it:
+
+```shell
+openshell-conformance run --plan - <<'EOF'
+version = 1
+
+[[runs]]
+scenario = "sandbox-continuity"
+workload_expectation = "reconciled"
+
+[[runs.actions]]
+name = "gateway-restart"
+command = "/home/openshell/.local/bin/openshell-test-guest-gateway-restart"
+timeout_secs = 120
+EOF
+```
+
+`openshell-development` expects these copied guest paths:
+
+- `/usr/local/bin/openshell`
+- `/usr/local/bin/openshell-gateway`
+- `/usr/local/lib/openshell-sandbox.tar`
+
+Compose it with `gateway-rootless-podman` to configure a rootless Podman
+gateway. For example, run conformance after the provisioners complete:
+
+```shell
+nix run .#test-guest -- \
+  --distro fedora --with podman-rootless --with selinux \
+  --copy ./openshell:/usr/local/bin/openshell \
+  --copy ./openshell-conformance:/usr/local/bin/openshell-conformance \
+  --copy ./openshell-gateway:/usr/local/bin/openshell-gateway \
+  --copy ./openshell-sandbox.tar:/usr/local/lib/openshell-sandbox.tar \
+  --provision openshell-development \
+  --provision gateway-rootless-podman \
+  -- /usr/local/bin/openshell-conformance run --plan - <<'EOF'
+version = 1
+
+[[runs]]
+scenario = "sandbox-continuity"
+workload_expectation = "reconciled"
+
+[[runs.actions]]
+name = "gateway-restart"
+command = "/home/openshell/.local/bin/openshell-test-guest-gateway-restart"
+timeout_secs = 120
+EOF
+```
+
+`openshell-rpm` expects OpenShell to have been installed with `--install`. It
+uses the RPM-owned `/usr/bin` binaries and `openshell-gateway` user service,
+without copied development artifacts or a supervisor archive. Compose it with
+`gateway-rootless-podman` before an RPM action such as
+`openshell-rpm-gateway-upgrade`.
+
+`openshell-rpm-latest-release` downloads and installs the latest stable
+OpenShell GitHub release for the guest architecture, then publishes the same
+RPM installation contract. Compose it with `gateway-rootless-podman` and an
+RPM gateway action when testing an upgrade from the current release.
+
+Versioned plans under `nix/test-guest/conformance-plans/` bind conformance
+scenarios to the stable action-command contracts installed by provisioners.
+Copy the applicable plan to the guest and pass it to `openshell-conformance run
+--plan`.
 
 ## Prepared VM cache
 
@@ -279,7 +366,7 @@ The destination must be an absolute guest path. Copied files are installed with 
 --forward-port HOST_PORT:GUEST_PORT
                     Forward a loopback host port to a guest port; repeatable
 --keep              Preserve the disk overlay and logs after shutdown
---list              List distros and configurations
+--list              List distros, configurations, and provisioners
 ```
 
 Each `--forward-port` binds only `127.0.0.1` on the host. Both ports must be unprivileged values from 1024 through 65535, and each host port may appear only once.
