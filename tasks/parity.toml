@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+["test:e2e-parity"]
+description = "Run deterministic schema-v1/schema-v2 parity harness tests"
+run = "bash e2e/parity/test.sh"
+hide = true
+
+["e2e:parity:podman"]
+description = "Compare frozen schema-v1 and current schema-v2 conformance against Podman (opt-in live test)"
+run = "bash e2e/parity/run.sh --driver podman"

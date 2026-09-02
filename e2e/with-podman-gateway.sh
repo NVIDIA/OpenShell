@@ -28,6 +28,8 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=e2e/support/gateway-common.sh
 source "${ROOT}/e2e/support/gateway-common.sh"
+# shellcheck source=e2e/support/podman-gateway-config.sh
+source "${ROOT}/e2e/support/podman-gateway-config.sh"
 
 require_container_engine_lane() {
   local lane=$1
@@ -370,6 +372,9 @@ if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]; then
   exit $?
 fi
 
+# Validate the generated configuration dialect before creating runtime resources.
+CONFIG_SCHEMA_VERSION="$(e2e_podman_config_schema_version)"
+
 # Preflight for managed Podman gateway mode.
 if ! command -v podman >/dev/null 2>&1; then
   echo "ERROR: podman CLI is required to run Podman-backed e2e tests" >&2
@@ -437,79 +442,25 @@ export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
 e2e_generate_gateway_jwt "${JWT_DIR}"
 
-# Driver-specific options moved from CLI flags into a TOML config table
-# (commit 560550d2). Synthesize a minimal config here and pass --config.
-# Quote a value as a TOML basic string: see with-docker-gateway.sh for
-# the same helper (kept duplicated to avoid sourcing across e2e scripts).
-toml_string() {
-  local value="$1"
-  value="${value//\\/\\\\}"
-  value="${value//\"/\\\"}"
-  printf '"%s"' "${value}"
-}
-
 GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
-
-# Start from the RPM default template so this e2e test exercises the same TOML
-# config path that RPM users get on first start. The template leaves
-# bind_address unset and sets compute_driver = "podman". On Podman Machine,
-# the driver reserves IPv4 loopback for its callback-only listener, so the
-# primary listener uses IPv6 loopback. Native Linux keeps the IPv4 default.
-#
-# We append the driver-specific table and override the port via CLI flag
-# (CLI > TOML in the merge precedence) so the test can use an ephemeral port.
-cp "${ROOT}/deploy/rpm/gateway.toml.default" "${GATEWAY_CONFIG}"
-# The TLS listener credentials are supplied by CLI below. Schema v2 keeps the
-# supervisor client bundle gateway-owned, so add it to [openshell.gateway]
-# before the RPM template opens the Podman driver table.
-GATEWAY_CONFIG_WITH_TLS="${GATEWAY_CONFIG}.tls"
-while IFS= read -r line; do
-  if [ "${line}" = "[openshell.drivers.podman]" ]; then
-    printf 'guest_tls_ca = %s\n' "$(toml_string "${PKI_DIR}/ca.crt")"
-    printf 'guest_tls_cert = %s\n' "$(toml_string "${PKI_DIR}/client/tls.crt")"
-    printf 'guest_tls_key = %s\n\n' "$(toml_string "${PKI_DIR}/client/tls.key")"
-  fi
-  printf '%s\n' "${line}"
-done <"${GATEWAY_CONFIG}" >"${GATEWAY_CONFIG_WITH_TLS}"
-mv "${GATEWAY_CONFIG_WITH_TLS}" "${GATEWAY_CONFIG}"
-{
-  # The RPM template ends in [openshell.drivers.podman]. Append driver-owned
-  # overrides before opening any nested gateway tables below.
-  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
-    printf 'socket_path = %s\n' "$(toml_string "${DRIVER_SOCKET}")"
-  else
-  # The Podman driver scopes isolation by network rather than namespace.
-  printf 'network_name = %s\n'   "$(toml_string "${PODMAN_NETWORK_NAME}")"
-  printf 'gateway_port = %s\n'   "${HOST_PORT}"
-  printf 'default_image = %s\n'  "$(toml_string "${SANDBOX_IMAGE}")"
-  printf 'image_pull_policy = "if_not_present"\n'
-  # The RPM template already opts into the 10-second Podman health check.
-  # Keep CI teardown bounded while the production Podman driver default stays
-  # conservative for real user workloads.
-  printf 'stop_timeout_secs = %s\n' "${PODMAN_STOP_TIMEOUT_SECS}"
-  printf 'supervisor_image = %s\n' "$(toml_string "${SUPERVISOR_IMAGE}")"
-  printf 'enable_bind_mounts = true\n'
-  if [ -n "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET:-}" ]; then
-    printf 'provider_spiffe_workload_api_socket = %s\n' "$(toml_string "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET}")"
-  fi
-  # The in-process Podman driver reads `socket_path` from TOML only — the
-  # OPENSHELL_PODMAN_SOCKET env var is honoured by the standalone driver
-  # binary, not the in-process driver used here. Pin the socket to the one
-  # the harness discovered (e.g. via `podman machine inspect` on macOS) so
-  # we don't fall back to the driver's stale macOS default.
-  if [ -n "${OPENSHELL_PODMAN_SOCKET:-}" ]; then
-    printf 'socket_path = %s\n' "$(toml_string "${OPENSHELL_PODMAN_SOCKET}")"
-  fi
-  fi
-
-  e2e_write_gateway_jwt_config "${JWT_DIR}" "openshell-e2e-podman-${HOST_PORT}"
-  if [ "${OIDC_MODE}" != "1" ]; then
-    e2e_write_gateway_mtls_auth_config
-    if [ -n "${OPENSHELL_OIDC_ISSUER:-}" ]; then
-      e2e_write_gateway_oidc_config "${OPENSHELL_OIDC_ISSUER}"
-    fi
-  fi
-} >> "${GATEWAY_CONFIG}"
+e2e_write_podman_gateway_config \
+  "${GATEWAY_CONFIG}" \
+  "${CONFIG_SCHEMA_VERSION}" \
+  "${ROOT}" \
+  "${PKI_DIR}" \
+  "${JWT_DIR}" \
+  "openshell-e2e-podman-${HOST_PORT}" \
+  "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" \
+  "${DRIVER_SOCKET}" \
+  "${PODMAN_NETWORK_NAME}" \
+  "${HOST_PORT}" \
+  "${SANDBOX_IMAGE}" \
+  "${PODMAN_STOP_TIMEOUT_SECS}" \
+  "${SUPERVISOR_IMAGE}" \
+  "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET:-}" \
+  "${OPENSHELL_PODMAN_SOCKET:-}" \
+  "${OIDC_MODE}" \
+  "${OPENSHELL_OIDC_ISSUER:-}"
 
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   OPENSHELL_COMPUTE_DRIVER_SOCKET="${DRIVER_SOCKET}" \
