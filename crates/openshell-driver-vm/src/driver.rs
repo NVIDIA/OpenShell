@@ -60,7 +60,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -131,8 +131,8 @@ impl VmSandboxDriverConfig {
 ///
 /// Code paths route via `GVPROXY_HOST_LOOPBACK_ALIAS` (DNS / /etc/hosts)
 /// instead so logs stay readable; this constant is kept for documentation
-/// and parity with the guest init script, and by the QEMU/TAP reachability
-/// guard in [`proxy_url_targets_gateway_host`].
+/// and parity with the guest init script.
+#[allow(dead_code)] // Documentation/parity anchor; all routing goes via the alias.
 const GVPROXY_HOST_LOOPBACK_IP: &str = "192.168.127.254";
 const OPENSHELL_HOST_GATEWAY_ALIAS: &str = "host.openshell.internal";
 /// Hostname gvproxy resolves (via its embedded DNS) to the host-loopback IP.
@@ -1838,22 +1838,6 @@ impl VmDriver {
         plan: &mut LaunchPlan,
     ) -> Result<(), Status> {
         plan.backend = VmBackend::Qemu;
-        // The corporate-proxy host-loopback recipe is a libkrun/gvproxy
-        // property and has no QEMU/TAP equivalent (see
-        // `proxy_url_targets_gateway_host`). Fail the create with the reason
-        // rather than boot a sandbox whose policy-approved CONNECTs all time
-        // out against an unreachable proxy.
-        if let Some(url) = self.config.https_proxy.as_deref()
-            && proxy_url_targets_gateway_host(url)
-        {
-            return Err(Status::failed_precondition(format!(
-                "https_proxy '{url}' addresses the gateway host, which a QEMU/TAP sandbox \
-                 (GPU sandboxes) cannot reach: host.openshell.internal resolves to the TAP \
-                 host address and the driver's nftables rules allow only the gateway port \
-                 from the guest. Configure a proxy address routable from the guest's \
-                 masqueraded egress, or run this sandbox without a GPU"
-            )));
-        }
         if is_gpu {
             plan.vcpus = self.config.gpu_vcpus;
             plan.mem_mib = self.config.gpu_mem_mib;
@@ -1861,26 +1845,44 @@ impl VmDriver {
         if plan.gpu_bdf.is_none() {
             plan.gpu_bdf = gpu_bdf;
         }
-        if has_complete_qemu_network(plan) {
-            return Ok(());
+        if !has_complete_qemu_network(plan) {
+            let subnet = self
+                .subnet_allocator
+                .lock()
+                .map_err(|e| Status::internal(format!("subnet allocator lock poisoned: {e}")))?
+                .allocate(sandbox_id)
+                .map_err(Status::failed_precondition)?;
+            let mac = mac_from_sandbox_id(sandbox_id);
+            plan.tap_device = Some(tap_device_name(sandbox_id));
+            plan.guest_ip = Some(subnet.guest_ip.to_string());
+            plan.host_ip = Some(subnet.host_ip.to_string());
+            plan.vsock_cid = Some(allocate_vsock_cid());
+            plan.guest_mac = Some(format!(
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            ));
+            plan.gateway_port = gateway_port_from_endpoint(&self.config.openshell_endpoint);
         }
 
-        let subnet = self
-            .subnet_allocator
-            .lock()
-            .map_err(|e| Status::internal(format!("subnet allocator lock poisoned: {e}")))?
-            .allocate(sandbox_id)
-            .map_err(Status::failed_precondition)?;
-        let mac = mac_from_sandbox_id(sandbox_id);
-        plan.tap_device = Some(tap_device_name(sandbox_id));
-        plan.guest_ip = Some(subnet.guest_ip.to_string());
-        plan.host_ip = Some(subnet.host_ip.to_string());
-        plan.vsock_cid = Some(allocate_vsock_cid());
-        plan.guest_mac = Some(format!(
-            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-        ));
-        plan.gateway_port = gateway_port_from_endpoint(&self.config.openshell_endpoint);
+        // The corporate-proxy host-loopback recipe is a libkrun/gvproxy
+        // property and has no QEMU/TAP equivalent (see
+        // `proxy_url_targets_gateway_host`). Run it here, after the subnet
+        // allocation above has settled `plan.host_ip`, because the address to
+        // compare against is this sandbox's own TAP host address. Fail the
+        // create with the reason rather than boot a sandbox whose
+        // policy-approved CONNECTs all time out against an unreachable proxy.
+        if let Some(url) = self.config.https_proxy.as_deref()
+            && proxy_url_targets_gateway_host(url, plan.host_ip.as_deref())
+        {
+            let tap_host = plan.host_ip.as_deref().unwrap_or("the TAP host address");
+            return Err(Status::failed_precondition(format!(
+                "https_proxy '{url}' addresses the gateway host, which a QEMU/TAP sandbox \
+                 (GPU sandboxes) cannot reach: host.openshell.internal resolves to this \
+                 sandbox's TAP host address {tap_host} and the driver's nftables rules allow \
+                 only the gateway port from the guest. Configure a proxy address routable \
+                 from the guest's masqueraded egress, or run this sandbox without a GPU"
+            )));
+        }
         Ok(())
     }
 
@@ -4604,7 +4606,8 @@ fn guest_visible_openshell_endpoint(endpoint: &str) -> String {
     endpoint.to_string()
 }
 
-/// Whether a corporate proxy URL points at the gateway host itself.
+/// Whether a corporate proxy URL points at the gateway host itself, as seen
+/// from a QEMU/TAP guest whose TAP host address is `tap_host_ip`.
 ///
 /// On the libkrun backend gvproxy NATs the host-loopback alias
 /// `host.openshell.internal` (and any loopback URL, which the driver rewrites
@@ -4615,16 +4618,31 @@ fn guest_visible_openshell_endpoint(endpoint: &str) -> String {
 /// gateway port from the guest and drops the rest, so no proxy on the gateway
 /// host is reachable regardless of the address it binds.
 ///
-/// Used to reject such a configuration up front on the QEMU path instead of
-/// letting every policy-approved CONNECT time out.
-fn proxy_url_targets_gateway_host(url: &str) -> bool {
+/// The gateway host is therefore reached from a QEMU guest under exactly three
+/// spellings: the guest's own loopback (never the host's, but a configuration
+/// that plainly means the host), the documented host aliases that
+/// `write_host_gateway_aliases` seeds to the TAP host address, and that TAP
+/// host address written literally. `tap_host_ip` is this sandbox's allocated
+/// address, so the comparison must be made after the launch plan's subnet
+/// allocation; `None` means the plan carries no TAP host and only the
+/// address-independent spellings are classified.
+///
+/// gvproxy's `GVPROXY_HOST_LOOPBACK_IP` is deliberately **not** matched here.
+/// It is special only to libkrun; on QEMU/TAP it is an ordinary address that
+/// may well be routable through the guest's masqueraded egress, and rejecting
+/// it would refuse a working configuration.
+///
+/// Used to reject an unreachable configuration up front on the QEMU path
+/// instead of letting every policy-approved CONNECT time out.
+fn proxy_url_targets_gateway_host(url: &str, tap_host_ip: Option<&str>) -> bool {
     let Ok(parsed) = Url::parse(url) else {
         // Unparseable URLs are rejected by shared validation before launch.
         return false;
     };
+    let tap_host = tap_host_ip.and_then(|ip| ip.parse::<IpAddr>().ok());
     match parsed.host() {
-        Some(Host::Ipv4(ip)) => ip.is_loopback() || ip.to_string() == GVPROXY_HOST_LOOPBACK_IP,
-        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(Host::Ipv4(ip)) => ip.is_loopback() || tap_host == Some(IpAddr::V4(ip)),
+        Some(Host::Ipv6(ip)) => ip.is_loopback() || tap_host == Some(IpAddr::V6(ip)),
         Some(Host::Domain(host)) => {
             host.eq_ignore_ascii_case("localhost")
                 || host.eq_ignore_ascii_case(OPENSHELL_HOST_GATEWAY_ALIAS)
@@ -8448,6 +8466,12 @@ mod tests {
         }
     }
 
+    fn test_driver_with_proxy(https_proxy: &str) -> VmDriver {
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.https_proxy = Some(https_proxy.to_string());
+        driver
+    }
+
     #[derive(Debug)]
     struct QemuRequiringExtension {
         name: String,
@@ -9044,7 +9068,10 @@ mod tests {
     fn qemu_backend_rejects_a_gateway_host_proxy() {
         // gvproxy's host-loopback NAT has no QEMU/TAP equivalent, so a proxy
         // on the gateway host is unreachable from a GPU sandbox and must be
-        // rejected rather than time out on every CONNECT.
+        // rejected rather than time out on every CONNECT. The address that
+        // reaches the gateway host from a QEMU guest is this sandbox's own
+        // TAP host address, so the classifier is parameterized by it.
+        let tap_host = Some("10.0.128.1");
         for url in [
             "http://host.openshell.internal:8080",
             "http://host.containers.internal:8080",
@@ -9052,17 +9079,86 @@ mod tests {
             "http://127.0.0.1:8080",
             "http://localhost:8080",
             "https://[::1]:8080",
-            "http://192.168.127.254:8080",
+            // The address the aliases above resolve to inside the guest.
+            "http://10.0.128.1:8080",
         ] {
-            assert!(proxy_url_targets_gateway_host(url), "{url}");
+            assert!(proxy_url_targets_gateway_host(url, tap_host), "{url}");
         }
         for url in [
             "http://proxy.corp.example:8080",
             "https://10.1.2.3:3128",
+            // Special only to libkrun/gvproxy. On QEMU/TAP it is an ordinary
+            // address that may be routable through the guest's masqueraded
+            // egress, so rejecting it would refuse a working configuration.
+            "http://192.168.127.254:8080",
+            // Another sandbox's TAP host, not this one's.
+            "http://10.0.128.5:8080",
             "not a url",
         ] {
-            assert!(!proxy_url_targets_gateway_host(url), "{url}");
+            assert!(!proxy_url_targets_gateway_host(url, tap_host), "{url}");
         }
+
+        // Without an allocated TAP host only the address-independent
+        // spellings classify; the loopback and alias guards still hold.
+        assert!(proxy_url_targets_gateway_host(
+            "http://127.0.0.1:8080",
+            None
+        ));
+        assert!(proxy_url_targets_gateway_host(
+            "http://host.openshell.internal:8080",
+            None
+        ));
+        assert!(!proxy_url_targets_gateway_host(
+            "http://10.0.128.1:8080",
+            None
+        ));
+    }
+
+    #[test]
+    fn qemu_launch_plan_rejects_a_proxy_at_the_allocated_tap_host() {
+        // The preflight has to run against the address this sandbox actually
+        // got, which only exists once the launch plan's subnet is allocated.
+        // A proxy there is what `host.openshell.internal` resolves to in the
+        // guest, and the driver's own nftables input chain drops the port.
+        let probe = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        let tap_host = probe
+            .build_vm_launch_plan("sandbox-proxy-tap", true, true, None)
+            .expect("gpu plan should build")
+            .host_ip
+            .expect("a QEMU plan carries a TAP host address");
+        probe.release_subnet("sandbox-proxy-tap");
+
+        let driver = test_driver_with_proxy(&format!("http://{tap_host}:8080"));
+        let mut plan = driver
+            .build_vm_launch_plan("sandbox-proxy-tap", true, true, None)
+            .expect("gpu plan should build");
+        assert_eq!(plan.host_ip.as_deref(), Some(tap_host.as_str()));
+
+        let err = driver
+            .resolve_launch_plan_backend("sandbox-proxy-tap", true, None, &mut plan)
+            .expect_err("a proxy at the TAP host address is unreachable from the guest");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains(&tap_host), "{err}");
+
+        driver.release_subnet("sandbox-proxy-tap");
+    }
+
+    #[test]
+    fn qemu_launch_plan_allows_a_proxy_at_the_gvproxy_host_loopback_address() {
+        // 192.168.127.254 carries no meaning on QEMU/TAP, so a launch must
+        // proceed rather than be refused for a libkrun-only reason.
+        let driver = test_driver_with_proxy(&format!("http://{GVPROXY_HOST_LOOPBACK_IP}:8080"));
+        let mut plan = driver
+            .build_vm_launch_plan("sandbox-proxy-gvproxy", true, true, None)
+            .expect("gpu plan should build");
+        assert_ne!(plan.host_ip.as_deref(), Some(GVPROXY_HOST_LOOPBACK_IP));
+
+        driver
+            .resolve_launch_plan_backend("sandbox-proxy-gvproxy", true, None, &mut plan)
+            .expect("a routable proxy address must not block a GPU launch");
+        assert_eq!(plan.backend, VmBackend::Qemu);
+
+        driver.release_subnet("sandbox-proxy-gvproxy");
     }
 
     #[tokio::test]
