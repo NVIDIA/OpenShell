@@ -8,8 +8,10 @@
 # without rediscovering the migration's intended behavior.
 manifest_version = 1
 baseline_ref = "origin/main"
+baseline_commit = "74960ebfaeec4673885089ed995fad902459749f"
 baseline_schema_version = 1
 candidate_ref = "HEAD"
+candidate_commit = "8c868e430e9cd3284d7e274628419ab484ebcee0"
 candidate_schema_version = 2
 
 # Allowed lane names: deterministic, e2e-docker, e2e-podman, e2e-kubernetes,
@@ -32,7 +34,7 @@ id = "schema-version-and-strict-layout"
 topics = ["configuration_producers"]
 origin_main_access_paths = ["[openshell] version = 1", "[openshell.gateway] inherited driver defaults"]
 schema_v2_access_paths = ["[openshell] version = 2", "[openshell.gateway] gateway-only fields", "[openshell.drivers.<name>] driver-owned fields"]
-behavioral_oracle = "Missing, v1, future, unknown, misplaced, and non-table driver values fail before runtime construction."
+behavioral_oracle = "Missing, v1, future, unknown gateway, misplaced selected-driver, unknown selected-driver, and non-table driver values fail before runtime construction; unselected driver tables are validated when selected."
 required_environment = "none; TOML parser only"
 test_lane = "deterministic"
 status = "not_run"
@@ -240,9 +242,9 @@ status = "not_run"
 [[capabilities]]
 id = "docker-security-and-provider-configuration"
 topics = ["docker", "credentials"]
-origin_main_access_paths = ["[openshell.drivers.docker].{sandbox_pids_limit,enable_bind_mounts,https_proxy,no_proxy,proxy_auth_file,proxy_auth_allow_insecure,proxy_connect_by_hostname,provider_spiffe_workload_api_socket,app_armor_profile}"]
-schema_v2_access_paths = ["same [openshell.drivers.docker] fields"]
-behavioral_oracle = "Docker rejects unsafe proxy or PID inputs, preserves explicit bind-mount and AppArmor posture, and mounts authorized SPIFFE/proxy material only into the supervisor."
+origin_main_access_paths = ["[openshell.drivers.docker].{sandbox_pids_limit,enable_bind_mounts}", "no origin/main Docker equivalent for proxy, SPIFFE, or AppArmor configuration"]
+schema_v2_access_paths = ["[openshell.drivers.docker].{sandbox_pids_limit,enable_bind_mounts,https_proxy,no_proxy,proxy_auth_file,proxy_auth_allow_insecure,proxy_connect_by_hostname,provider_spiffe_workload_api_socket,app_armor_profile}"]
+behavioral_oracle = "Docker preserves PID and bind-mount behavior while schema v2 adds fail-closed proxy, SPIFFE, and AppArmor configuration whose material is mounted only into the supervisor."
 required_environment = "Linux Docker daemon, proxy fixture, optional SPIFFE Unix socket and AppArmor support"
 test_lane = "e2e-docker"
 status = "not_run"
@@ -310,10 +312,10 @@ status = "not_run"
 [[capabilities]]
 id = "vm-launch-and-resource-configuration"
 topics = ["vm"]
-origin_main_access_paths = ["[openshell.gateway].{default_image,guest_tls_ca,guest_tls_cert,guest_tls_key} inherited by VM", "[openshell.drivers.vm].{openshell_endpoint,state_dir,launcher_bin,default_image,bootstrap_image,log_level,krun_log_level,vcpus,mem_mib,overlay_disk_mib,gpu_enabled,gpu_mem_mib,gpu_vcpus}"]
-schema_v2_access_paths = ["[openshell.drivers.vm].{grpc_endpoint,state_dir,launcher_bin,default_image,bootstrap_image,log_level,krun_log_level,vcpus,mem_mib,overlay_disk_mib,gpu_enabled,gpu_mem_mib,gpu_vcpus}"]
-behavioral_oracle = "The VM driver receives its renamed callback endpoint and launches a guest with selected state, images, resources, and optional GPU configuration."
-required_environment = "Linux libkrun/KVM host, VM driver binary, OCI image, optional GPU/VFIO hardware"
+origin_main_access_paths = ["[openshell.gateway].{default_image,guest_tls_ca,guest_tls_cert,guest_tls_key} inherited by VM", "[openshell.drivers.vm].{openshell_endpoint,state_dir,driver_dir,default_image,bootstrap_image,krun_log_level,vcpus,mem_mib,overlay_disk_mib,sandbox_uid,sandbox_gid}"]
+schema_v2_access_paths = ["[openshell.drivers.vm].{grpc_endpoint,state_dir,driver_dir,default_image,bootstrap_image,krun_log_level,vcpus,mem_mib,overlay_disk_mib,sandbox_uid,sandbox_gid}", "[openshell.gateway].{guest_tls_ca,guest_tls_cert,guest_tls_key}"]
+behavioral_oracle = "The gateway finds and launches the VM driver from driver_dir, forwards the renamed callback endpoint, and launches a guest with the selected state, images, resources, and identity."
+required_environment = "Linux libkrun/KVM host, VM driver binary, and OCI image"
 test_lane = "e2e-vm"
 status = "not_run"
 
