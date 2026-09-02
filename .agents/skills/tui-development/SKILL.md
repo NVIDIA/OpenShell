@@ -384,7 +384,7 @@ All actions are accessible via keyboard shortcuts displayed in the nav bar. The 
 `[Tab] Switch Panel  [Enter] Select  [j/k] Navigate  │  [:] Command  [q] Quit`
 
 **Dashboard (Providers focus):**
-`[Tab] Switch Panel  [h/l] Switch Tab  [j/k] Navigate  [Enter] Detail  [c] Create  [u] Update  [d] Delete  │  [:] Command  [q] Quit`
+`[Tab] Switch Panel  [h/l] Switch Tab  [j/k] Navigate  [Enter] Detail  [c] Create  [u] Update  [d] Delete  [w] Workspace  │  [:] Command  [q] Quit`
 
 **Dashboard (Global Settings focus):**
 `[Tab] Switch Panel  [h/l] Switch Tab  [j/k] Navigate  [Enter] Edit  [d] Delete  │  [:] Command  [q] Quit`
@@ -535,7 +535,7 @@ On launch, before the event loop starts:
 
 ### Workspace switching lifecycle
 
-1. User presses `[w]` on the sandboxes panel → `cycle_workspace()` advances through discovered workspace names, then "all"
+1. User presses `[w]` on the providers or sandboxes panel → `cycle_workspace()` advances through discovered workspace names, then "all"
 2. `pending_workspace_refresh = true` is set, cursor indices are reset
 3. Event loop calls `refresh_providers()` and `refresh_sandboxes()` with the new workspace scope
 

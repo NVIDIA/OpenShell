@@ -223,6 +223,9 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Span::styled("  ", t.text),
                 Span::styled("[c/u/d]", t.key_hint),
                 Span::styled(" Create/Update/Delete", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[w]", t.key_hint),
+                Span::styled(" Workspace", t.text),
                 Span::styled("  |  ", t.border),
                 Span::styled("[:]", t.muted),
                 Span::styled(" Command  ", t.muted),
@@ -661,4 +664,47 @@ pub fn centered_popup(percent_x: u16, height: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vert[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openshell_core::auth::EdgeAuthInterceptor;
+    use openshell_core::proto::open_shell_client::OpenShellClient;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn test_app() -> App {
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let client = OpenShellClient::with_interceptor(channel, EdgeAuthInterceptor::noop());
+        let mut app = App::new(
+            client,
+            "test".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "default".to_string(),
+            Theme::dark(),
+        );
+        app.screen = Screen::Dashboard;
+        app.focus = Focus::Providers;
+        app
+    }
+
+    #[tokio::test]
+    async fn providers_navigation_advertises_workspace_shortcut() {
+        let app = test_app();
+        let mut terminal = Terminal::new(TestBackend::new(180, 1)).unwrap();
+
+        terminal
+            .draw(|frame| draw_nav_bar(frame, &app, frame.size()))
+            .unwrap();
+
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("[w] Workspace"), "nav bar was: {text:?}");
+    }
 }
