@@ -2143,10 +2143,15 @@ pub(super) async fn validate_candidate_sandbox_credential_policy(
 /// so an operator can round-trip `policy get --base` through `policy set` — and
 /// can edit the offending endpoint — instead of being locked out by a rule the
 /// sandbox image supplied.
+///
+/// `current_base` must be the policy revision the replacement is about to be
+/// committed against, so callers evaluate it inside their persistence attempt:
+/// a baseline read before the attempt could name a violation another writer has
+/// since removed, and the replacement would restore it unclassified.
 pub(super) async fn validate_updated_sandbox_credential_policy(
     state: &ServerState,
     workspace: &str,
-    sandbox: &Sandbox,
+    current_base: &ProtoSandboxPolicy,
     provider_names: &[String],
     policy: &ProtoSandboxPolicy,
 ) -> Result<(), Status> {
@@ -2154,10 +2159,14 @@ pub(super) async fn validate_updated_sandbox_credential_policy(
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), workspace)
         .await?;
-    let current_base = current_base_policy_for_sandbox(state.store.as_ref(), sandbox).await?;
-    let current_effective =
-        effective_policy_for_source(state, &catalog, workspace, provider_names, current_base)
-            .await?;
+    let current_effective = effective_policy_for_source(
+        state,
+        &catalog,
+        workspace,
+        provider_names,
+        current_base.clone(),
+    )
+    .await?;
     let inherited = uninspected_credentialed_endpoint_keys(&current_effective);
 
     let effective =
@@ -2967,7 +2976,9 @@ impl UninspectedCredentialedEndpoint {
 
 /// Identity of an uninspected credentialed endpoint. `mode` participates: moving
 /// an inherited L4-only endpoint to `tls: skip` is a fresh authoring act, not the
-/// same finding carried forward.
+/// same finding carried forward. A multi-port endpoint contributes one key per
+/// port, so widening `[443]` to `[443, 8443]` introduces `8443` while reordering
+/// the same ports carries the whole endpoint forward.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct UninspectedCredentialedEndpointKey {
     rule_name: String,
@@ -3009,15 +3020,25 @@ fn collect_uninspected_credentialed_endpoints(
                 continue;
             }
 
-            violations.push(UninspectedCredentialedEndpoint {
-                rule_name: rule_name.clone(),
-                host: endpoint.host.clone(),
-                port: endpoint_ports(endpoint)
-                    .first()
-                    .copied()
-                    .unwrap_or(endpoint.port),
-                mode,
-            });
+            // One violation per effective port. Collapsing a multi-port
+            // endpoint onto its first port would let an edit keep an inherited
+            // port and add another one under the same identity.
+            let mut ports = endpoint_ports(endpoint);
+            if ports.is_empty() {
+                // Unconstrained endpoint: it stands for every port, and `0`
+                // is the identity the message reports.
+                ports.push(endpoint.port);
+            }
+            ports.sort_unstable();
+            ports.dedup();
+            for port in ports {
+                violations.push(UninspectedCredentialedEndpoint {
+                    rule_name: rule_name.clone(),
+                    host: endpoint.host.clone(),
+                    port,
+                    mode,
+                });
+            }
         }
     }
     violations
@@ -3778,20 +3799,6 @@ async fn handle_update_config_inner(
         &effective_policy,
     )
     .await?;
-    // Sandbox-authored syncs replay a policy the supervisor already discovered
-    // on disk. Rejecting it here would crash-loop the sandbox instead of
-    // surfacing an operator decision, so only operator-authored updates gate.
-    if !sandbox_caller {
-        validate_updated_sandbox_credential_policy(
-            state,
-            &workspace,
-            &sandbox,
-            &spec.providers,
-            &new_policy,
-        )
-        .await?;
-    }
-
     let _sandbox_sync_guard = if backfill_policy.is_some() {
         Some(state.compute.sandbox_sync_guard().await)
     } else {
@@ -3808,6 +3815,31 @@ async fn handle_update_config_inner(
                 .get_latest_policy(&sandbox_id)
                 .await
                 .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
+
+            // Sandbox-authored syncs replay a policy the supervisor already
+            // discovered on disk. Rejecting it here would crash-loop the sandbox
+            // instead of surfacing an operator decision, so only
+            // operator-authored updates gate. The baseline is this attempt's
+            // revision: the write below claims `latest.version + 1` and loses
+            // the unique-version race to any revision that landed after this
+            // read, so a retry reclassifies against the newer policy.
+            if !sandbox_caller {
+                let current_base = match latest {
+                    Some(ref record) => ProtoSandboxPolicy::decode(
+                        record.policy_payload.as_slice(),
+                    )
+                    .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?,
+                    None => spec.policy.clone().unwrap_or_default(),
+                };
+                validate_updated_sandbox_credential_policy(
+                    state,
+                    &workspace,
+                    &current_base,
+                    &spec.providers,
+                    &new_policy,
+                )
+                .await?;
+            }
 
             if let Some(ref current) = latest
                 && current.policy_hash == hash
@@ -7279,6 +7311,62 @@ mod tests {
     }
 
     #[test]
+    fn a_port_added_to_an_inherited_endpoint_is_newly_authored() {
+        let endpoint = |ports: Vec<u32>| NetworkEndpoint {
+            host: "github.com".to_string(),
+            ports,
+            provider_credentialed: true,
+            ..Default::default()
+        };
+        let policy = |endpoint: NetworkEndpoint| ProtoSandboxPolicy {
+            network_policies: std::iter::once((
+                "pypi".to_string(),
+                NetworkPolicyRule {
+                    endpoints: vec![endpoint],
+                    ..Default::default()
+                },
+            ))
+            .collect(),
+            ..Default::default()
+        };
+
+        // Keeping the inherited port and adding another one exposes the added
+        // port for the first time, so the endpoint cannot be carried forward
+        // wholesale on the strength of its first port.
+        let single_port = uninspected_credentialed_endpoint_keys(&policy(endpoint(vec![443])));
+        let error = validate_uninspected_credentialed_endpoints_excluding(
+            &policy(endpoint(vec![443, 8443])),
+            &single_port,
+        )
+        .expect_err("a port added to an inherited endpoint must be rejected");
+        assert!(
+            error.message().contains("github.com:8443"),
+            "{}",
+            error.message()
+        );
+
+        let both_ports = uninspected_credentialed_endpoint_keys(&policy(endpoint(vec![443, 8443])));
+        assert_eq!(both_ports.len(), 2);
+        // Reordering exposes nothing new.
+        assert!(
+            validate_uninspected_credentialed_endpoints_excluding(
+                &policy(endpoint(vec![8443, 443])),
+                &both_ports
+            )
+            .is_ok()
+        );
+        // Neither does dropping a port: narrowing an inherited endpoint is the
+        // repair the operator has to be able to make.
+        assert!(
+            validate_uninspected_credentialed_endpoints_excluding(
+                &policy(endpoint(vec![443])),
+                &both_ports
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn credentialed_l4_and_tls_skip_require_explicit_opt_in() {
         let endpoint = |protocol: &str, tls: &str, allow: bool| NetworkEndpoint {
             host: "api.vendor.example".to_string(),
@@ -9430,6 +9518,127 @@ mod tests {
         )
         .unwrap();
         assert!(!stored.network_policies.contains_key("pypi"));
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_a_port_added_to_an_inherited_uninspected_endpoint() {
+        let (state, image_policy) = inherited_uninspected_gating_state().await;
+
+        // The same endpoint, restated through `ports`: nothing new is exposed.
+        let mut restated = image_policy.clone();
+        restated.network_policies.get_mut("pypi").unwrap().endpoints[0].ports = vec![443];
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "inherited-gating".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(restated),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("restating the inherited port must be admitted");
+
+        // Keeping the inherited port and adding a second one to the same
+        // endpoint authors a new uninspected credentialed port.
+        let mut widened = image_policy;
+        widened.network_policies.get_mut("pypi").unwrap().endpoints[0].ports = vec![443, 8443];
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "inherited-gating".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(widened),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("a port added to an inherited endpoint must be rejected");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(
+            error.message().contains("github.com:8443"),
+            "{}",
+            error.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_a_replacement_that_restores_a_removed_uninspected_endpoint() {
+        let (state, image_policy) = inherited_uninspected_gating_state().await;
+
+        let mut fixed = image_policy.clone();
+        fixed.network_policies.remove("pypi");
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "inherited-gating".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(fixed),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("removing the offending rule must be possible");
+
+        // A replacement composed against the older revision. The endpoint is no
+        // longer inherited from the policy this write commits against, so it is
+        // newly authored and must not slip back in unclassified.
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "inherited-gating".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(image_policy),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("restoring a removed uninspected endpoint must be rejected");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("pypi"), "{}", error.message());
+    }
+
+    #[tokio::test]
+    async fn concurrent_full_replacements_do_not_restore_a_removed_uninspected_endpoint() {
+        let (state, image_policy) = inherited_uninspected_gating_state().await;
+
+        let mut fixed = image_policy.clone();
+        fixed.network_policies.remove("pypi");
+
+        // Whichever order these interleave in, the inherited endpoint must not
+        // survive a replacement classified against a revision that no longer
+        // carries it.
+        let (restore, remove) = tokio::join!(
+            handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    name: "inherited-gating".to_string(),
+                    workspace: "default".to_string(),
+                    policy: Some(image_policy),
+                    ..Default::default()
+                })),
+            ),
+            handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    name: "inherited-gating".to_string(),
+                    workspace: "default".to_string(),
+                    policy: Some(fixed),
+                    ..Default::default()
+                })),
+            )
+        );
+        remove.expect("removing the offending rule must be possible");
+
+        if restore.is_ok() {
+            let stored = get_sandbox_policy(&state, "sb-inherited-gating").await;
+            assert!(
+                !stored.network_policies.contains_key("pypi"),
+                "a replacement validated against a stale revision restored the endpoint"
+            );
+        } else {
+            assert_eq!(restore.unwrap_err().code(), Code::FailedPrecondition);
+        }
     }
 
     #[tokio::test]

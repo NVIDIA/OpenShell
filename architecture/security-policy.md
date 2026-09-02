@@ -142,8 +142,13 @@ the uninspected credentialed endpoints it introduces, while endpoints the
 sandbox's current policy already carries are logged and admitted. An endpoint's
 identity for this comparison is its rule name, host, port, and uninspected mode,
 so moving an inherited endpoint from L4-only to `tls: skip` is a fresh authoring
-act rather than the same finding carried forward. Stamping is unaffected and
-stays a full recomputation.
+act rather than the same finding carried forward. A multi-port endpoint has one
+identity per port, so keeping an inherited port and adding another one is
+likewise newly authored. The baseline is the policy revision the edit is about
+to be committed against, evaluated inside the persistence attempt: a baseline
+read earlier could name a violation a concurrent writer has since removed, and
+the edit would restore it without ever being classified. Stamping is unaffected
+and stays a full recomputation.
 
 The gate has to work this way because a supervisor syncing the policy baked into
 a sandbox image reaches the store without passing it — rejecting that delivery
