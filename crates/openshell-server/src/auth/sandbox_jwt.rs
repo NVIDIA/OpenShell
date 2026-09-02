@@ -84,7 +84,7 @@ pub struct SandboxJwtIssuer {
     kid: String,
     issuer: String,
     audience: String,
-    ttl: Duration,
+    ttl: Option<Duration>,
 }
 
 impl std::fmt::Debug for SandboxJwtIssuer {
@@ -110,9 +110,13 @@ impl SandboxJwtIssuer {
         signing_key_pem: &[u8],
         kid: String,
         gateway_id: &str,
-        ttl: Duration,
+        ttl: Option<Duration>,
     ) -> Result<Self, String> {
         crate::install_jsonwebtoken_crypto_provider();
+
+        if ttl.is_some_and(|ttl| ttl.is_zero()) {
+            return Err("sandbox token TTL must be positive when configured".to_string());
+        }
 
         let encoding_key = EncodingKey::from_ed_pem(signing_key_pem)
             .map_err(|e| format!("failed to parse Ed25519 signing key PEM: {e}"))?;
@@ -132,11 +136,9 @@ impl SandboxJwtIssuer {
         crate::install_jsonwebtoken_crypto_provider();
 
         let now = now_secs();
-        let exp = if self.ttl.is_zero() {
-            0
-        } else {
-            now.saturating_add(i64::try_from(self.ttl.as_secs()).unwrap_or(3_600))
-        };
+        let exp = self.ttl.map_or(0, |ttl| {
+            now.saturating_add(i64::try_from(ttl.as_secs()).unwrap_or(3_600))
+        });
         let claims = SandboxJwtClaims {
             sub: format!("{SPIFFE_SUBJECT_PREFIX}{sandbox_id}"),
             iss: self.issuer.clone(),
@@ -226,7 +228,7 @@ impl SandboxJwtIssuer {
         })
     }
 
-    pub fn ttl(&self) -> Duration {
+    pub fn sandbox_token_ttl(&self) -> Option<Duration> {
         self.ttl
     }
 }
@@ -417,10 +419,10 @@ mod tests {
     }
 
     fn pair() -> (SandboxJwtIssuer, SandboxJwtAuthenticator) {
-        pair_with_ttl(Duration::from_secs(3600))
+        pair_with_ttl(Some(Duration::from_secs(3600)))
     }
 
-    fn pair_with_ttl(ttl: Duration) -> (SandboxJwtIssuer, SandboxJwtAuthenticator) {
+    fn pair_with_ttl(ttl: Option<Duration>) -> (SandboxJwtIssuer, SandboxJwtAuthenticator) {
         let mat = generate_jwt_key().expect("jwt key");
         let issuer = SandboxJwtIssuer::from_pem(
             mat.signing_key_pem.as_bytes(),
@@ -446,6 +448,7 @@ mod tests {
     async fn mint_and_validate_round_trip() {
         let (issuer, auth) = pair();
         let minted = issuer.mint("sandbox-a").unwrap();
+        assert!(minted.expires_at_ms > 0);
         let principal = auth
             .authenticate(&header_map_with_bearer(&minted.token), "/anything")
             .await
@@ -472,7 +475,7 @@ mod tests {
             mat.signing_key_pem.as_bytes(),
             mat.kid.clone(),
             "test-gateway",
-            Duration::from_secs(3600),
+            Some(Duration::from_secs(3600)),
         )
         .expect("issuer");
         let auth = SandboxJwtAuthenticator::from_pem(
@@ -514,8 +517,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ttl_zero_mints_non_expiring_token() {
-        let (issuer, auth) = pair_with_ttl(Duration::ZERO);
+    async fn ttl_none_mints_non_expiring_token() {
+        let (issuer, auth) = pair_with_ttl(None);
         let minted = issuer.mint("sandbox-never").unwrap();
         assert_eq!(minted.expires_at_ms, 0);
 
@@ -535,6 +538,19 @@ mod tests {
         let decoded = decode::<SandboxJwtClaims>(&minted.token, &auth.decoding_key, &validation)
             .expect("token should decode");
         assert_eq!(decoded.claims.exp, 0);
+    }
+
+    #[test]
+    fn ttl_some_zero_is_rejected() {
+        let mat = generate_jwt_key().expect("jwt key");
+        let error = SandboxJwtIssuer::from_pem(
+            mat.signing_key_pem.as_bytes(),
+            mat.kid,
+            "test-gateway",
+            Some(Duration::ZERO),
+        )
+        .expect_err("Some(Duration::ZERO) must not reintroduce a sentinel");
+        assert!(error.contains("must be positive"));
     }
 
     #[tokio::test]
@@ -582,7 +598,7 @@ mod tests {
             mat.signing_key_pem.as_bytes(),
             mat.kid.clone(),
             "g",
-            Duration::from_secs(3600),
+            Some(Duration::from_secs(3600)),
         )
         .unwrap();
         let auth =
@@ -613,7 +629,7 @@ mod tests {
             mat.signing_key_pem.as_bytes(),
             mat.kid.clone(),
             "gateway-a",
-            Duration::ZERO,
+            None,
         )
         .expect("issuer");
         let decoding_key = DecodingKey::from_ed_pem(mat.public_key_pem.as_bytes()).unwrap();
@@ -662,7 +678,7 @@ mod tests {
             mat.signing_key_pem.as_bytes(),
             mat.kid.clone(),
             "gateway-a",
-            Duration::from_secs(3600),
+            Some(Duration::from_secs(3600)),
         )
         .expect("issuer");
 
@@ -692,13 +708,9 @@ mod tests {
     #[test]
     fn extension_token_rejects_wrong_audience() {
         let mat = generate_jwt_key().expect("jwt key");
-        let issuer = SandboxJwtIssuer::from_pem(
-            mat.signing_key_pem.as_bytes(),
-            mat.kid,
-            "gateway-a",
-            Duration::ZERO,
-        )
-        .expect("issuer");
+        let issuer =
+            SandboxJwtIssuer::from_pem(mat.signing_key_pem.as_bytes(), mat.kid, "gateway-a", None)
+                .expect("issuer");
         let minted = issuer
             .mint_extension_token(
                 &extension_audience("service-a"),
@@ -734,7 +746,7 @@ mod tests {
 
     #[test]
     fn extension_token_enforces_positive_bounded_ttl_and_caller_shape() {
-        let (issuer, _) = pair_with_ttl(Duration::ZERO);
+        let (issuer, _) = pair_with_ttl(None);
         for ttl in [
             Duration::ZERO,
             MAX_EXTENSION_TOKEN_TTL + Duration::from_secs(1),

@@ -151,6 +151,15 @@ fn docker_config_rejects_legacy_sandbox_namespace() {
 }
 
 #[test]
+fn docker_config_keeps_explicit_unconfined_apparmor_default() {
+    let config: DockerComputeConfig = serde_json::from_value(serde_json::json!({}))
+        .expect("default Docker config should deserialize");
+    assert_eq!(config.app_armor_profile, Some(AppArmorProfile::Unconfined));
+    let serialized = serde_json::to_value(config).expect("config should serialize");
+    assert_eq!(serialized["app_armor_profile"], "Unconfined");
+}
+
+#[test]
 fn docker_config_defaults_to_driver_owned_pids_limit() {
     let config: DockerComputeConfig = serde_json::from_value(serde_json::json!({}))
         .expect("default Docker config should deserialize");

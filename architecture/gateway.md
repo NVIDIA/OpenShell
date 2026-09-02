@@ -38,6 +38,20 @@ immediately without a grace period. Finalization is persisted separately from
 the exit result; the gateway deletes an ephemeral sandbox only after the
 finalized supervisor session disconnects.
 
+## Configuration Boundary
+
+The gateway accepts exactly schema version 2. Missing, legacy, and future
+versions fail before runtime construction, and driver settings belong only to
+`[openshell.drivers.<name>]`. The process does not migrate legacy files.
+Package lifecycle code may replace an exact package-generated v1 default, but
+it preserves edited configurations for explicit operator migration.
+
+Gateway listener TLS and sandbox callback TLS are separate inputs. A selected
+local Docker, Podman, or VM driver requires a complete guest bundle whenever
+the gateway listener uses TLS; package-managed local TLS can supply that bundle.
+Kubernetes instead projects guest credentials through its configured Secret.
+The gateway validates this requirement before constructing the selected driver.
+
 ## Protocol and Auth
 
 The gateway listens on one service port and multiplexes gRPC and HTTP traffic.

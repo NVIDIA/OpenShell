@@ -204,6 +204,9 @@ tests:
       - notMatchRegex:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\][^\[]*?(sandbox_namespace|default_image|supervisor_image|client_tls_secret_name|service_account_name|host_gateway_ip|enable_user_namespaces|sa_token_ttl_secs)\s*='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'guest_tls_(ca|cert|key)\s*='
 
   - it: renders user namespace enablement under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml

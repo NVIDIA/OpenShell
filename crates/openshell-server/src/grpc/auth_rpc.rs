@@ -226,11 +226,11 @@ fn mint_extension_credentials(
             .iter()
             .map(|service| (service.name.as_str(), service))
             .collect();
-    let ttl = if issuer.ttl().is_zero() {
-        DEFAULT_EXTENSION_TOKEN_TTL
-    } else {
-        issuer.ttl().min(MAX_EXTENSION_TOKEN_TTL)
-    };
+    let ttl = issuer
+        .sandbox_token_ttl()
+        .map_or(DEFAULT_EXTENSION_TOKEN_TTL, |ttl| {
+            ttl.min(MAX_EXTENSION_TOKEN_TTL)
+        });
 
     requested_names
         .iter()
@@ -323,7 +323,7 @@ mod tests {
             mat.signing_key_pem.as_bytes(),
             mat.kid,
             "test-gateway",
-            Duration::from_secs(3600),
+            Some(Duration::from_secs(3600)),
         )
         .unwrap();
         state.sandbox_jwt_issuer = Some(Arc::new(issuer));

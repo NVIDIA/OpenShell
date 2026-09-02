@@ -187,6 +187,7 @@ pub struct DockerComputeConfig {
 
     /// `AppArmor` confinement requested for sandbox containers. The explicit
     /// default preserves the prior supervisor-compatible Docker behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub app_armor_profile: Option<AppArmorProfile>,
 }
 

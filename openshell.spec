@@ -110,6 +110,8 @@ install -Dpm 0755 "${OPENSHELL_PREBUILT_BINARIES_DIR}/%{name}-gateway" %{buildro
 # Shipped as a read-only reference in %{_datadir}. The systemd unit seeds a
 # user-level copy at ~/.config/openshell/gateway.toml on first start.
 install -Dpm 0644 deploy/rpm/gateway.toml.default %{buildroot}%{_datadir}/%{name}-gateway/gateway.toml.default
+install -Dpm 0644 deploy/rpm/gateway.toml.default.v1 %{buildroot}%{_datadir}/%{name}-gateway/gateway.toml.default.v1
+install -Dpm 0755 deploy/rpm/migrate-gateway-config.sh %{buildroot}%{_libexecdir}/%{name}-gateway-migrate-config
 
 # --- Gateway systemd user unit ---
 # Installed to the systemd user unit directory so any user can run:
@@ -129,11 +131,10 @@ Type=exec
 # the CLI discovers them automatically.
 # See /usr/share/doc/openshell-gateway/ for details.
 
-# Seed a default TOML config on first start if the user has not created one.
-# The template ships at /usr/share/openshell-gateway/gateway.toml.default.
-# Edit ~/.config/openshell/gateway.toml to customize.
+# Seed a default TOML config on first start. On upgrade, replace only the exact
+# schema-v1 config previously seeded by this package; preserve edited files.
 # %%E expands to $XDG_CONFIG_HOME (~/.config) in user units.
-ExecStartPre=/bin/sh -c 'test -f %%E/openshell/gateway.toml || install -Dm644 /usr/share/openshell-gateway/gateway.toml.default %%E/openshell/gateway.toml'
+ExecStartPre=%{_libexecdir}/%{name}-gateway-migrate-config %%E/openshell/gateway.toml /usr/share/openshell-gateway/gateway.toml.default /usr/share/openshell-gateway/gateway.toml.default.v1
 
 # Auto-generate PKI on first start if not present.
 # The default local TLS dir uses %%h because %%S resolves differently across
@@ -217,10 +218,12 @@ PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "from importlib.metadata
 # A missing template means first-start seeding silently falls back to the
 # binary default of 127.0.0.1, which breaks Podman sandbox connectivity.
 test -f %{buildroot}%{_datadir}/%{name}-gateway/gateway.toml.default
+test -f %{buildroot}%{_datadir}/%{name}-gateway/gateway.toml.default.v1
+test -x %{buildroot}%{_libexecdir}/%{name}-gateway-migrate-config
 
-# Verify the systemd unit references the template in its ExecStartPre seed step.
-# If this grep fails, the first-start seeding logic was removed from the unit.
-grep -q 'gateway.toml.default' %{buildroot}%{_userunitdir}/%{name}-gateway.service
+# Verify the systemd unit invokes exact-default migration before startup.
+grep -q '%{name}-gateway-migrate-config' %{buildroot}%{_userunitdir}/%{name}-gateway.service
+grep -q 'gateway.toml.default.v1' %{buildroot}%{_userunitdir}/%{name}-gateway.service
 
 %post gateway
 %systemd_user_post %{name}-gateway.service
@@ -248,7 +251,9 @@ grep -q 'gateway.toml.default' %{buildroot}%{_userunitdir}/%{name}-gateway.servi
 %doc %{_docdir}/%{name}-gateway/TROUBLESHOOTING.md
 %{_bindir}/%{name}-gateway
 %{_userunitdir}/%{name}-gateway.service
+%{_libexecdir}/%{name}-gateway-migrate-config
 %{_datadir}/%{name}-gateway/gateway.toml.default
+%{_datadir}/%{name}-gateway/gateway.toml.default.v1
 %{_mandir}/man8/openshell-gateway.8*
 
 %files -n python3-%{name}

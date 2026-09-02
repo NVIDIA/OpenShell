@@ -91,6 +91,12 @@ pub struct VmComputeConfig {
     /// Writable overlay disk size for each VM sandbox, in MiB.
     pub overlay_disk_mib: u64,
 
+    /// Optional UID override for the VM guest sandbox account.
+    pub sandbox_uid: Option<u32>,
+
+    /// Optional GID override for the VM guest sandbox account.
+    pub sandbox_gid: Option<u32>,
+
     /// Host-side CA certificate for the guest's mTLS client bundle.
     pub guest_tls_ca: Option<PathBuf>,
 
@@ -171,6 +177,8 @@ impl Default for VmComputeConfig {
             vcpus: Self::default_vcpus(),
             mem_mib: Self::default_mem_mib(),
             overlay_disk_mib: Self::default_overlay_disk_mib(),
+            sandbox_uid: None,
+            sandbox_gid: None,
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
@@ -474,6 +482,7 @@ pub async fn spawn(
         ));
     }
 
+    validate_vm_sandbox_identity(vm_config)?;
     vm_config.upstream_proxy.validate().map_err(Error::config)?;
     if let Some(endpoint) = vm_config
         .provider_spiffe_workload_api_tcp_endpoint
@@ -523,6 +532,7 @@ pub async fn spawn(
     command
         .arg("--overlay-disk-mib")
         .arg(vm_config.overlay_disk_mib.to_string());
+    append_vm_identity_args(&mut command, vm_config);
     if let Some(tls) = guest_tls_paths {
         command.arg("--guest-tls-ca").arg(tls.ca);
         command.arg("--guest-tls-cert").arg(tls.cert);
@@ -541,6 +551,35 @@ pub async fn spawn(
     Ok(AcquiredRemoteDriverEndpoint::managed(
         "vm", channel, process,
     ))
+}
+
+fn validate_vm_sandbox_identity(config: &VmComputeConfig) -> Result<()> {
+    let range = openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID;
+    for (field, value) in [
+        ("sandbox_uid", config.sandbox_uid),
+        ("sandbox_gid", config.sandbox_gid),
+    ] {
+        if let Some(value) = value
+            && !range.contains(&value)
+        {
+            return Err(Error::config(format!(
+                "{field} {value} is outside the allowed range [{}, {}]",
+                openshell_policy::MIN_SANDBOX_UID,
+                openshell_policy::MAX_SANDBOX_UID
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn append_vm_identity_args(command: &mut Command, config: &VmComputeConfig) {
+    if let Some(uid) = config.sandbox_uid {
+        command.arg("--sandbox-uid").arg(uid.to_string());
+    }
+    if let Some(gid) = config.sandbox_gid {
+        command.arg("--sandbox-gid").arg(gid.to_string());
+    }
 }
 
 #[cfg(unix)]
@@ -659,10 +698,11 @@ async fn connect_compute_driver(socket_path: &Path) -> Result<Channel> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        VmComputeConfig, append_otlp_args, append_vm_proxy_and_spiffe_args,
-        compute_driver_guest_tls_paths, compute_driver_socket_path, current_euid,
-        prepare_compute_driver_socket_path, prepare_vm_state_dir, resolve_compute_driver_bin,
-        resolve_driver_search_dirs,
+        VmComputeConfig, append_otlp_args, append_vm_identity_args,
+        append_vm_proxy_and_spiffe_args, compute_driver_guest_tls_paths,
+        compute_driver_socket_path, current_euid, prepare_compute_driver_socket_path,
+        prepare_vm_state_dir, resolve_compute_driver_bin, resolve_driver_search_dirs,
+        validate_vm_sandbox_identity,
     };
     use openshell_server::config_file::OtlpConfig;
     use std::os::unix::fs::PermissionsExt;
@@ -749,8 +789,6 @@ mod tests {
 
     #[test]
     fn invalid_corporate_proxy_config_is_rejected_before_the_driver_starts() {
-        // Without this the operator would see an opaque driver-readiness
-        // timeout instead of an error naming the offending key.
         let err = openshell_core::UpstreamProxyConfig {
             https_proxy: Some("socks5://proxy.corp.com:1080".to_string()),
             ..Default::default()
@@ -765,6 +803,36 @@ mod tests {
         }
         .validate()
         .expect("a lone proxy URL is a complete configuration");
+    }
+
+    #[test]
+    fn vm_driver_command_includes_configured_sandbox_identity() {
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        let config = VmComputeConfig {
+            sandbox_uid: Some(2000),
+            sandbox_gid: Some(3000),
+            ..Default::default()
+        };
+
+        validate_vm_sandbox_identity(&config).expect("valid identity");
+        append_vm_identity_args(&mut command, &config);
+
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args, ["--sandbox-uid", "2000", "--sandbox-gid", "3000"]);
+    }
+
+    #[test]
+    fn vm_gateway_config_rejects_root_identity() {
+        let config = VmComputeConfig {
+            sandbox_uid: Some(0),
+            ..Default::default()
+        };
+        let error = validate_vm_sandbox_identity(&config).expect_err("root UID must fail");
+        assert!(error.to_string().contains("sandbox_uid 0"));
     }
 
     #[test]

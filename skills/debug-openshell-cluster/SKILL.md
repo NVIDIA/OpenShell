@@ -94,9 +94,15 @@ Gateway configuration requires `[openshell] version = 2`, a singular
 `compute_driver` selector, and driver-owned settings under
 `[openshell.drivers.<name>]`. The gateway rejects legacy `compute_drivers`,
 `--drivers`, and `OPENSHELL_DRIVERS` selectors rather than silently migrating
-them. Guest TLS CA, certificate, and key paths are the exception: configure the
-complete bundle under `[openshell.gateway]`, and the gateway injects it only
-into the selected local driver.
+them. Homebrew and RPM package startup migrates only exact package-generated v1
+defaults. If an upgraded package still reports an unsupported version, inspect
+the active prefix or `~/.config/openshell/gateway.toml`; an edited v1 file must
+follow the published schema-v2 migration steps and must not be overwritten.
+Guest TLS CA, certificate, and key paths are the exception to driver ownership:
+configure the complete bundle under `[openshell.gateway]`, and the gateway
+injects it only into the selected local driver. TLS-enabled Docker, Podman, and
+VM drivers fail startup when neither those paths nor the package-managed local
+bundle is available; Kubernetes projects its bundle through a Secret.
 
 Custom names use `[openshell.drivers.<name>].socket_path`. A launch-time `--compute-driver-socket` override may also use `docker`, `podman`, `kubernetes`, or `vm`; the endpoint then takes precedence over built-in construction. First-party standalone drivers require the socket parent directory to be owned by the driver's effective UID, force its mode to `0700`, create the socket with mode `0600`, and accept only peers with that same UID. Check the parent and socket separately with `stat`; a gateway running under a different UID cannot connect even when filesystem permissions or group membership would otherwise allow it. Operator-supplied drivers must provide equivalent access control appropriate to their implementation. Check gateway logs for connection errors, `GetCapabilities` failures, or an unexpected advertised driver name. The advertised name is diagnostic metadata; negotiated features control optional behavior. The gateway does not create or supervise operator-supplied driver processes or sockets.
 
@@ -618,6 +624,11 @@ Use the VM driver logs and host diagnostics available in the user's environment.
 
 - The VM driver process is running and reachable by the gateway.
 - The runtime rootfs exists and matches the expected architecture.
+- `mke2fs` or `mkfs.ext4` and `debugfs` from e2fsprogs are installed; explicit
+  `sandbox_uid`/`sandbox_gid` does not remove this prerequisite.
+- A persisted overlay identity error is resolved from its owner marker, overlay
+  upper layer, prepared rootfs, explicit config, or current image. Do not assign
+  `10001:10001` unless the persisted state reports that legacy identity.
 - Host virtualization support is enabled.
 - The sandbox supervisor can establish its callback connection to the gateway.
 

@@ -663,7 +663,33 @@ fn debugfs_quote_argument(argument: &str) -> Option<String> {
 /// created them. Reading the matching old lower disk lets the driver preserve
 /// that overlay's real ownership contract during an upgrade.
 pub fn sandbox_guest_user_ids_from_image(image_path: &Path) -> Result<Option<(u32, u32)>, String> {
-    let quoted_path = debugfs_quote_absolute_path("/etc/passwd")
+    sandbox_guest_user_ids_from_image_path(image_path, "/etc/passwd")
+}
+
+/// Read a sandbox account copied into an overlay upper layer.
+///
+/// An upper-layer passwd file is the most direct evidence of the identity an
+/// existing overlay observed, so migration consults it before any lower image.
+pub fn sandbox_guest_user_ids_from_overlay_image(
+    image_path: &Path,
+) -> Result<Option<(u32, u32)>, String> {
+    sandbox_guest_user_ids_from_image_path(image_path, "/upper/etc/passwd")
+}
+
+fn sandbox_guest_user_ids_from_image_path(
+    image_path: &Path,
+    guest_path: &str,
+) -> Result<Option<(u32, u32)>, String> {
+    let metadata = fs::metadata(image_path)
+        .map_err(|error| format!("stat rootfs image {}: {error}", image_path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "rootfs image {} is not a regular file",
+            image_path.display()
+        ));
+    }
+
+    let quoted_path = debugfs_quote_absolute_path(guest_path)
         .expect("the static passwd path is a valid debugfs path");
     let command = format!("cat {quoted_path}");
     let mut last_error = None;
@@ -679,7 +705,7 @@ pub fn sandbox_guest_user_ids_from_image(image_path: &Path) -> Result<Option<(u3
             Ok(output) if output.status.success() => {
                 let passwd = String::from_utf8(output.stdout).map_err(|error| {
                     format!(
-                        "read /etc/passwd from {} as UTF-8: {error}",
+                        "read {guest_path} from {} as UTF-8: {error}",
                         image_path.display()
                     )
                 })?;

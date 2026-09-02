@@ -290,10 +290,12 @@ is driver-owned supervisor input and is removed from workload environments.
 
 Kubernetes, Docker, and Podman share one AppArmor configuration model:
 `RuntimeDefault`, `Unconfined`, or `Localhost/<profile>`. Each driver translates
-that model to its native API and rejects a requested confined profile when its
-backend reports AppArmor unavailable. Docker and Podman use explicit
-`Unconfined` by default because their runtime-default profiles commonly block
-the supervisor's namespace mount setup; the Helm chart uses the same default.
+that model to its native API and rejects an explicitly requested confined
+profile when its backend reports AppArmor unavailable. Docker keeps its
+historical explicit `Unconfined` default. Podman sends no override when the
+field is omitted, preserving the runtime-selected profile; development paths
+that require the supervisor's namespace mount setup opt into `Unconfined`
+explicitly. The Helm chart independently uses `Unconfined` for Kubernetes.
 
 Corporate proxy settings are driver-owned supervisor inputs. Docker, Podman,
 and VM propagate `https_proxy`, `no_proxy`, an optional root-only auth file,
@@ -322,10 +324,11 @@ For all in-tree drivers, this is equivalent to selecting a single GPU.
 VM runtime state paths are derived only from driver-validated sandbox IDs
 matching `[A-Za-z0-9._-]{1,128}`. Each writable overlay records its effective
 sandbox UID/GID so later rootfs cache changes cannot rewrite persisted file
-ownership. Unmarked pre-migration overlays recover the account from their
-persisted prepared rootfs before falling back to explicit configuration or the
-legacy `10001:10001` default. The gateway-owned VM driver socket uses a private
-`run/` directory plus Unix peer UID/PID checks. Standalone unauthenticated TCP
+ownership. Unmarked pre-migration overlays recover identity from concrete
+overlay or prepared-rootfs state, an explicit operator override, or the current
+image account. The driver never assumes `10001:10001`; it preserves that legacy
+identity only when persisted state reports it. The gateway-owned VM driver
+socket uses a private `run/` directory plus Unix peer UID/PID checks. Standalone unauthenticated TCP
 mode is disabled unless explicitly enabled for local development.
 
 Runtime-specific implementation notes belong in the driver crate README:

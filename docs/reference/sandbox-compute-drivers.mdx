@@ -64,7 +64,7 @@ Common gateway options:
 |---|---|
 | `compute_driver = "<driver>"` | Select the compute driver. Built-in values are `docker`, `podman`, `kubernetes`, and `vm`; custom names require `[openshell.drivers.<name>].socket_path`. |
 
-Set driver-specific values such as sandbox images, callback endpoints, network names, and VM sizing in the gateway TOML file. For gateway-managed Docker, Podman, and VM drivers, configure `guest_tls_ca`, `guest_tls_cert`, and `guest_tls_key` together in `[openshell.gateway]`; driver tables reject those gateway-owned fields. See the [Gateway Configuration File](./gateway-config) reference for the full schema.
+Set driver-specific values such as sandbox images, callback endpoints, network names, and VM sizing in the gateway TOML file. A TLS-enabled gateway-managed Docker, Podman, or VM driver requires a complete `guest_tls_ca`, `guest_tls_cert`, and `guest_tls_key` bundle in `[openshell.gateway]`; package-managed local TLS supplies it automatically. Driver tables reject those gateway-owned fields. Kubernetes projects guest TLS through a Secret instead. See the [Gateway Configuration File](./gateway-config) reference for the full schema and migration steps.
 
 Extension drivers use the same `compute_driver.proto` gRPC surface as the
 managed VM driver. For an out-of-tree driver, choose a driver name and point
@@ -254,6 +254,12 @@ retained intent with an idempotent start request while leaving explicitly
 stopped sandboxes alone.
 
 For proxy-required networks, the Podman driver also accepts the corporate egress proxy keys `https_proxy`, `no_proxy`, `proxy_auth_file`, `proxy_auth_allow_insecure`, and `proxy_connect_by_hostname`. The supervisor chains policy-approved TLS tunnels through the proxy with HTTP CONNECT instead of dialing destinations directly. See the [Gateway Configuration File](./gateway-config) reference for the full contract, including the cleartext-credential acknowledgement and the validated-IP CONNECT behavior.
+
+Podman preserves its runtime-selected AppArmor profile when
+`app_armor_profile` is omitted. Set `Unconfined` explicitly only when the
+supervisor's mount setup requires it. Explicit `RuntimeDefault` and
+`Localhost/<profile>` selections fail startup when Podman reports that AppArmor
+is unavailable.
 
 On macOS with `podman machine`, the driver uses gvproxy's host-loopback IP, `192.168.127.254`, for sandbox host aliases by default. Set `host_gateway_ip` only when your Podman machine uses a non-standard host-loopback address. On Linux, an empty `host_gateway_ip` keeps Podman's `host-gateway` resolver behavior. Direct local callbacks from rootless Podman require Podman to report the pasta network helper. Slirp4netns, other helpers, and Podman versions that do not report their helper require an explicitly remote `grpc_endpoint`; otherwise the gateway fails startup rather than leaving sandbox callbacks unreachable. Rootful Podman continues to use the configured network's bridge gateway address.
 
@@ -597,7 +603,7 @@ The resolved UID/GID appear in:
 
 ### VM Driver
 
-The VM driver preserves an image-provided `sandbox` account when `sandbox_uid` and `sandbox_gid` are omitted. Images without that account use UID/GID `1000`. Explicit values in `[openshell.drivers.vm]` override the image account. Persisted overlays retain the UID/GID recorded when they were created so a driver upgrade does not rewrite their ownership contract.
+The VM driver preserves an image-provided `sandbox` account when `sandbox_uid` and `sandbox_gid` are omitted. Images without that account use UID/GID `1000`. Explicit values in `[openshell.drivers.vm]` override the image account. Persisted overlays retain the UID/GID recorded when they were created. An unmarked overlay recovers identity from concrete overlay or prepared-image state, an explicit override, or the current image; the driver never assigns legacy `10001:10001` without persisted evidence.
 
 ### Custom Images
 

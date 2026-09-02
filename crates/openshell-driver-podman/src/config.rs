@@ -91,9 +91,9 @@ pub struct PodmanComputeConfig {
     /// Host path to a SPIFFE Workload API Unix socket exposed to sandbox
     /// supervisors for provider token exchange client assertions.
     pub provider_spiffe_workload_api_socket: Option<PathBuf>,
-    /// `AppArmor` confinement requested for sandbox containers. The default
-    /// explicitly opts out because the supervisor needs mount operations that
-    /// the runtime default profile denies.
+    /// `AppArmor` confinement requested for sandbox containers. Omission sends
+    /// no override and preserves Podman's runtime-selected profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_armor_profile: Option<AppArmorProfile>,
     /// Health check interval in seconds for sandbox containers.
     ///
@@ -452,7 +452,7 @@ impl Default for PodmanComputeConfig {
             sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
             enable_bind_mounts: false,
             provider_spiffe_workload_api_socket: None,
-            app_armor_profile: Some(AppArmorProfile::Unconfined),
+            app_armor_profile: None,
             health_check_interval_secs: None,
             https_proxy: None,
             no_proxy: None,
@@ -539,6 +539,32 @@ mod tests {
             PodmanComputeConfig::default().health_check_interval_secs,
             None
         );
+    }
+
+    #[test]
+    fn omitted_apparmor_profile_preserves_runtime_default() {
+        let config: PodmanComputeConfig = serde_json::from_value(serde_json::json!({}))
+            .expect("omitted AppArmor profile should deserialize");
+        assert_eq!(config.app_armor_profile, None);
+
+        let serialized = serde_json::to_value(config).expect("config should serialize");
+        assert!(serialized.get("app_armor_profile").is_none());
+    }
+
+    #[test]
+    fn explicit_apparmor_profiles_round_trip() {
+        for value in [
+            "RuntimeDefault",
+            "Unconfined",
+            "Localhost/openshell-supervisor",
+        ] {
+            let config: PodmanComputeConfig = serde_json::from_value(serde_json::json!({
+                "app_armor_profile": value,
+            }))
+            .expect("explicit AppArmor profile should deserialize");
+            let serialized = serde_json::to_value(config).expect("config should serialize");
+            assert_eq!(serialized["app_armor_profile"], value);
+        }
     }
 
     #[test]

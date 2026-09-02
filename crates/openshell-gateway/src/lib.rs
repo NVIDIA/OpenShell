@@ -198,6 +198,7 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let mut config: openshell_driver_docker::DockerComputeConfig = context.driver_config()?;
+        require_guest_tls_for_local_driver(&context, "docker")?;
         apply_guest_tls(
             &mut config.guest_tls_ca,
             &mut config.guest_tls_cert,
@@ -230,6 +231,7 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let mut config: openshell_driver_podman::PodmanComputeConfig = context.driver_config()?;
+        require_guest_tls_for_local_driver(&context, "podman")?;
         config.gateway_port = context.gateway_port();
         if let Ok(path) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
             config.socket_path = Some(path.into());
@@ -268,6 +270,7 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let mut config: vm::VmComputeConfig = context.driver_config()?;
+        require_guest_tls_for_local_driver(&context, "vm")?;
         if config.state_dir.as_os_str().is_empty() {
             config.state_dir = vm::VmComputeConfig::default_state_dir();
         }
@@ -301,6 +304,32 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
 }
 
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+fn require_guest_tls_for_local_driver(
+    context: &openshell_server::ComputeDriverBuildContext<'_>,
+    driver_name: &str,
+) -> openshell_core::Result<()> {
+    validate_local_driver_guest_tls(
+        context.gateway_tls_enabled(),
+        context.guest_tls_paths().is_some(),
+        driver_name,
+    )
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+fn validate_local_driver_guest_tls(
+    gateway_tls_enabled: bool,
+    has_guest_tls: bool,
+    driver_name: &str,
+) -> openshell_core::Result<()> {
+    if gateway_tls_enabled && !has_guest_tls {
+        return Err(openshell_core::Error::config(format!(
+            "gateway TLS requires guest_tls_ca, guest_tls_cert, and guest_tls_key in [openshell.gateway] when using the {driver_name} compute driver"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 fn apply_guest_tls(
     ca: &mut Option<std::path::PathBuf>,
     cert: &mut Option<std::path::PathBuf>,
@@ -315,6 +344,47 @@ fn apply_guest_tls(
         *ca = Some(default_ca.to_owned());
         *cert = Some(default_cert.to_owned());
         *key = Some(default_key.to_owned());
+    }
+}
+
+#[cfg(all(test, not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+mod local_driver_tests {
+    use super::{apply_guest_tls, validate_local_driver_guest_tls};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn tls_enabled_local_drivers_require_a_guest_bundle() {
+        for driver_name in ["docker", "podman", "vm"] {
+            let error = validate_local_driver_guest_tls(true, false, driver_name)
+                .expect_err("TLS-enabled local driver must require guest TLS");
+            let message = error.to_string();
+            assert!(message.contains(driver_name));
+            assert!(message.contains("guest_tls_ca"));
+        }
+        validate_local_driver_guest_tls(true, true, "docker")
+            .expect("a complete guest bundle satisfies the requirement");
+        validate_local_driver_guest_tls(false, false, "docker")
+            .expect("plaintext gateways do not require guest TLS");
+    }
+
+    #[test]
+    fn package_managed_guest_bundle_is_injected_when_driver_paths_are_absent() {
+        let mut ca = None;
+        let mut cert = None;
+        let mut key = None;
+        apply_guest_tls(
+            &mut ca,
+            &mut cert,
+            &mut key,
+            Some((
+                Path::new("/managed/ca.pem"),
+                Path::new("/managed/client.pem"),
+                Path::new("/managed/client-key.pem"),
+            )),
+        );
+        assert_eq!(ca, Some(PathBuf::from("/managed/ca.pem")));
+        assert_eq!(cert, Some(PathBuf::from("/managed/client.pem")));
+        assert_eq!(key, Some(PathBuf::from("/managed/client-key.pem")));
     }
 }
 

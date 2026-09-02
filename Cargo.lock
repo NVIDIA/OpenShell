@@ -4133,6 +4133,7 @@ dependencies = [
  "openshell-driver-mxc",
  "openshell-driver-podman",
  "openshell-otel",
+ "openshell-policy",
  "openshell-server",
  "rustix 1.1.4",
  "serde",

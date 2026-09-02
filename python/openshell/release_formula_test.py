@@ -64,9 +64,28 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
         flags=re.DOTALL,
     )
     assert generated_config is not None
+    assert "version = 2" in generated_config.group("contents")
     assert "[openshell.gateway]" in generated_config.group("contents")
     assert "bind_address =" not in generated_config.group("contents")
-    assert 'bind_address = "[::1]:17670"' in formula
+
+    legacy_empty_config = re.search(
+        r"legacy_empty_gateway_config_contents = <<~TOML\n(?P<contents>.*?)\n    TOML",
+        formula,
+        flags=re.DOTALL,
+    )
+    assert legacy_empty_config is not None
+    assert "version = 1" in legacy_empty_config.group("contents")
+    assert "bind_address =" not in legacy_empty_config.group("contents")
+
+    legacy_ipv6_config = re.search(
+        r"legacy_ipv6_gateway_config_contents = <<~TOML\n(?P<contents>.*?)\n    TOML",
+        formula,
+        flags=re.DOTALL,
+    )
+    assert legacy_ipv6_config is not None
+    assert "version = 1" in legacy_ipv6_config.group("contents")
+    assert 'bind_address = "[::1]:17670"' in legacy_ipv6_config.group("contents")
+    assert "gateway_config.read == legacy_empty_gateway_config_contents ||" in formula
     assert "gateway_config.read == legacy_ipv6_gateway_config_contents" in formula
     assert "gateway_config.write gateway_config_contents" in formula
     assert '# compute_driver = "vm"' not in formula
@@ -142,12 +161,15 @@ def test_snap_docker_connect_hook_restarts_gateway() -> None:
     )
 
 
-def test_rpm_spec_uses_gateway_defaults_without_config_helper() -> None:
+def test_rpm_spec_seeds_and_migrates_gateway_defaults() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     spec = (repo_root / "openshell.spec").read_text(encoding="utf-8")
 
     assert "init-gateway-config.sh" not in spec
     assert "init-pki.sh" not in spec
+    assert "migrate-gateway-config.sh" in spec
+    assert "gateway.toml.default.v1" in spec
+    assert "%{name}-gateway-migrate-config" in spec
     assert "Environment=OPENSHELL_LOCAL_TLS_DIR=%%h/.local/state/openshell/tls" in spec
     assert (
         "openshell-gateway generate-certs --output-dir ${OPENSHELL_LOCAL_TLS_DIR}"

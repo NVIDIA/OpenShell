@@ -11,7 +11,8 @@ use crate::lifecycle::{
 use crate::rootfs::{
     clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
     extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path,
-    sandbox_guest_user_ids_from_image, set_rootfs_image_file_mode, write_rootfs_image_file,
+    sandbox_guest_user_ids_from_image, sandbox_guest_user_ids_from_overlay_image,
+    set_rootfs_image_file_mode, write_rootfs_image_file,
 };
 use crate::runtime::VmBackend;
 use bollard::Docker;
@@ -187,7 +188,6 @@ const SANDBOX_OVERLAY_IMAGE: &str = "overlay.ext4";
 const SANDBOX_OWNER_STATE_FILE: &str = "sandbox-owner-state";
 const SANDBOX_OWNER_STATE_V1: &str = "sandbox-owner-v1";
 const SANDBOX_OWNER_STATE_V2: &str = "sandbox-owner-v2";
-const LEGACY_SANDBOX_UID: u32 = 10001;
 const SANDBOX_REQUEST_FILE: &str = "sandbox.pb";
 const SANDBOX_STOPPED_FILE: &str = "stopped";
 /// Durable tombstone preventing driver restart from relaunching a sandbox
@@ -203,6 +203,7 @@ const IMAGE_IDENTITY_FILE: &str = "image-identity";
 const IMAGE_REFERENCE_FILE: &str = "image-reference";
 const IMAGE_PREP_INIT_MODE: &str = "image-prep";
 static IMAGE_CACHE_BUILD_COUNTER: AtomicU64 = AtomicU64::new(0);
+static OWNER_STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 struct VmDriverTlsPaths {
@@ -2230,6 +2231,14 @@ impl VmDriver {
             preparation,
         )
         .await?;
+        let owner_state_written_before_prepare =
+            write_owner_state && preparation == OverlayPreparation::Fresh;
+        if owner_state_written_before_prepare {
+            // Persist the selected identity before creating the overlay. A
+            // crash during preparation can then retry without misclassifying
+            // the partial overlay as legacy state.
+            write_sandbox_owner_state(state_dir, owner_state).await?;
+        }
 
         let template_path = overlay_template_image(&self.config.state_dir, overlay_size_bytes);
         if !overlay_template_image_ready(&template_path, overlay_size_bytes).await? {
@@ -2256,7 +2265,7 @@ impl VmDriver {
         .await
         .map_err(|err| format!("overlay image preparation panicked: {err}"))?;
         result?;
-        if write_owner_state {
+        if write_owner_state && !owner_state_written_before_prepare {
             write_sandbox_owner_state(state_dir, owner_state).await?;
         }
         span_status.finish(Ok(owner_state))
@@ -5050,9 +5059,9 @@ fn sandbox_runtime_disk_paths(state_dir: &Path) -> SandboxRuntimeDiskPaths {
 /// Select the exact identity the guest must use for this overlay and whether a
 /// successful preparation must create or upgrade its state marker.
 ///
-/// For an unmarked persisted overlay, inspect the prepared rootfs recorded by
-/// the previous driver before falling back to the old 10001 default. This
-/// preserves images and explicit configurations that used another UID/GID.
+/// Persisted overlays are resolved only from concrete state. In particular,
+/// absence of a marker is not evidence that an overlay used the historical
+/// 10001 identity: it can also mean fresh provisioning was interrupted.
 async fn sandbox_owner_state_for_launch(
     state_dir: &Path,
     overlay_disk: &Path,
@@ -5063,11 +5072,8 @@ async fn sandbox_owner_state_for_launch(
     let marker_path = state_dir.join(SANDBOX_OWNER_STATE_FILE);
     match tokio::fs::read_to_string(&marker_path).await {
         Ok(contents) if contents.trim() == SANDBOX_OWNER_STATE_V1 => {
-            let identity = match persisted_sandbox_owner_identity(state_dir, config).await? {
-                Some(identity) => identity,
-                None => sandbox_owner_identity_from_image(owner_source_disk).await?,
-            };
-            return Ok((identity, true));
+            // The v1 marker recorded no identity. Resolve it through the same
+            // evidence-based migration path as an unmarked overlay.
         }
         Ok(contents) => {
             let identity = parse_sandbox_owner_state(&contents).map_err(|error| {
@@ -5099,29 +5105,32 @@ async fn sandbox_owner_state_for_launch(
     };
 
     if preparation == OverlayPreparation::PreserveExisting && overlay_exists {
+        match sandbox_owner_identity_from_overlay(overlay_disk).await {
+            Ok(Some(identity)) => return Ok((identity, true)),
+            Ok(None) => {}
+            Err(error) => warn!(
+                overlay_path = %overlay_disk.display(),
+                error = %error,
+                "could not read sandbox identity from VM overlay upper layer"
+            ),
+        }
         if let Some(identity) = persisted_sandbox_owner_identity(state_dir, config).await? {
             return Ok((identity, true));
         }
         if let Some((uid, gid)) = configured_sandbox_identity(config) {
             return Ok((SandboxOwnerIdentity { uid, gid }, true));
         }
-        return Ok((
-            SandboxOwnerIdentity {
-                uid: LEGACY_SANDBOX_UID,
-                gid: LEGACY_SANDBOX_UID,
-            },
-            true,
-        ));
+        return sandbox_owner_identity_from_image(owner_source_disk)
+            .await
+            .map(|identity| (identity, true));
     }
 
-    let identity = sandbox_owner_identity_from_image(owner_source_disk)
+    if let Some((uid, gid)) = configured_sandbox_identity(config) {
+        return Ok((SandboxOwnerIdentity { uid, gid }, true));
+    }
+    sandbox_owner_identity_from_image(owner_source_disk)
         .await
-        .or_else(|error| {
-            configured_sandbox_identity(config)
-                .map(|(uid, gid)| SandboxOwnerIdentity { uid, gid })
-                .ok_or(error)
-        })?;
-    Ok((identity, true))
+        .map(|identity| (identity, true))
 }
 
 async fn persisted_sandbox_owner_identity(
@@ -5157,15 +5166,24 @@ async fn sandbox_owner_identity_from_image(
     image_path: &Path,
 ) -> Result<SandboxOwnerIdentity, String> {
     let image_path = image_path.to_path_buf();
-    let display = image_path.display().to_string();
     let identity =
         tokio::task::spawn_blocking(move || sandbox_guest_user_ids_from_image(&image_path))
             .await
             .map_err(|error| format!("read sandbox identity task failed: {error}"))??;
-    let (uid, gid) = identity.ok_or_else(|| {
-        format!("prepared VM rootfs {display} does not contain a sandbox account")
-    })?;
+    let (uid, gid) = identity.unwrap_or((DEFAULT_SANDBOX_UID, DEFAULT_SANDBOX_UID));
     Ok(SandboxOwnerIdentity { uid, gid })
+}
+
+async fn sandbox_owner_identity_from_overlay(
+    overlay_path: &Path,
+) -> Result<Option<SandboxOwnerIdentity>, String> {
+    let overlay_path = overlay_path.to_path_buf();
+    let identity = tokio::task::spawn_blocking(move || {
+        sandbox_guest_user_ids_from_overlay_image(&overlay_path)
+    })
+    .await
+    .map_err(|error| format!("read sandbox overlay identity task failed: {error}"))??;
+    Ok(identity.map(|(uid, gid)| SandboxOwnerIdentity { uid, gid }))
 }
 
 fn parse_sandbox_owner_state(contents: &str) -> Result<SandboxOwnerIdentity, String> {
@@ -5186,6 +5204,7 @@ fn parse_sandbox_owner_state(contents: &str) -> Result<SandboxOwnerIdentity, Str
     if fields.next().is_some() {
         return Err("unexpected fields".to_string());
     }
+    validate_sandbox_owner_identity(uid, gid)?;
     Ok(SandboxOwnerIdentity { uid, gid })
 }
 
@@ -5193,12 +5212,40 @@ async fn write_sandbox_owner_state(
     state_dir: &Path,
     identity: SandboxOwnerIdentity,
 ) -> Result<(), String> {
-    write_private_file(
-        &state_dir.join(SANDBOX_OWNER_STATE_FILE),
-        identity.marker_contents().into_bytes(),
-    )
-    .await
-    .map_err(|err| format!("write sandbox owner state: {err}"))
+    validate_sandbox_owner_identity(identity.uid, identity.gid)?;
+    let marker_path = state_dir.join(SANDBOX_OWNER_STATE_FILE);
+    let sequence = OWNER_STATE_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temporary_path = state_dir.join(format!(
+        ".{SANDBOX_OWNER_STATE_FILE}.{}.{sequence}.tmp",
+        std::process::id()
+    ));
+    write_private_file(&temporary_path, identity.marker_contents().into_bytes())
+        .await
+        .map_err(|err| format!("write temporary sandbox owner state: {err}"))?;
+    if let Err(error) = tokio::fs::rename(&temporary_path, &marker_path).await {
+        let _ = tokio::fs::remove_file(&temporary_path).await;
+        return Err(format!("install sandbox owner state: {error}"));
+    }
+    Ok(())
+}
+
+fn validate_sandbox_owner_identity(uid: u32, gid: u32) -> Result<(), String> {
+    let range = openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID;
+    if !range.contains(&uid) {
+        return Err(format!(
+            "uid {uid} is outside the allowed range [{}, {}]",
+            openshell_policy::MIN_SANDBOX_UID,
+            openshell_policy::MAX_SANDBOX_UID
+        ));
+    }
+    if !range.contains(&gid) {
+        return Err(format!(
+            "gid {gid} is outside the allowed range [{}, {}]",
+            openshell_policy::MIN_SANDBOX_UID,
+            openshell_policy::MAX_SANDBOX_UID
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]
@@ -7485,11 +7532,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unmarked_legacy_overlay_falls_back_to_legacy_default_identity() {
+    async fn unmarked_overlay_uses_current_image_instead_of_blind_legacy_identity() {
         let dir = unique_temp_dir();
         std::fs::create_dir_all(&dir).unwrap();
         let overlay = dir.join(SANDBOX_OVERLAY_IMAGE);
-        std::fs::write(&overlay, b"legacy overlay").unwrap();
+        std::fs::write(&overlay, b"unreadable partial overlay").unwrap();
+        let source = dir.join("current-rootfs-source");
+        std::fs::create_dir_all(source.join("etc")).unwrap();
+        std::fs::write(
+            source.join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/sh\nsandbox:x:4242:4343:Sandbox:/sandbox:/bin/sh\n",
+        )
+        .unwrap();
+        let current_rootfs = dir.join("current-rootfs.ext4");
+        create_ext4_image_from_dir_with_size(&source, &current_rootfs, 32 * 1024 * 1024).unwrap();
         let config = VmDriverConfig {
             state_dir: dir.clone(),
             ..Default::default()
@@ -7498,7 +7554,7 @@ mod tests {
         let (identity, write_marker) = sandbox_owner_state_for_launch(
             &dir,
             &overlay,
-            Path::new("/missing-current-rootfs"),
+            &current_rootfs,
             &config,
             OverlayPreparation::PreserveExisting,
         )
@@ -7508,17 +7564,101 @@ mod tests {
         assert_eq!(
             identity,
             SandboxOwnerIdentity {
-                uid: LEGACY_SANDBOX_UID,
-                gid: LEGACY_SANDBOX_UID,
+                uid: 4242,
+                gid: 4343,
             }
         );
         assert!(write_marker);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn unmarked_overlay_without_identity_evidence_fails_safely() {
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let overlay = dir.join(SANDBOX_OVERLAY_IMAGE);
+        std::fs::write(&overlay, b"unreadable partial overlay").unwrap();
+        let config = VmDriverConfig {
+            state_dir: dir.clone(),
+            ..Default::default()
+        };
+
+        let error = sandbox_owner_state_for_launch(
+            &dir,
+            &overlay,
+            Path::new("/missing-current-rootfs"),
+            &config,
+            OverlayPreparation::PreserveExisting,
+        )
+        .await
+        .expect_err("ambiguous overlay must not receive a guessed identity");
+
+        assert!(error.contains("missing-current-rootfs"));
+        assert!(!error.contains("10001"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn fresh_overlay_uses_explicit_identity_without_image_inspection() {
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = VmDriverConfig {
+            state_dir: dir.clone(),
+            sandbox_uid: Some(2000),
+            sandbox_gid: Some(3000),
+            ..Default::default()
+        };
+
+        let (identity, write_marker) = sandbox_owner_state_for_launch(
+            &dir,
+            &dir.join(SANDBOX_OVERLAY_IMAGE),
+            Path::new("/missing-current-rootfs"),
+            &config,
+            OverlayPreparation::Fresh,
+        )
+        .await
+        .unwrap();
+
         assert_eq!(
-            identity.guest_environment(),
-            [
-                "OPENSHELL_VM_SANDBOX_UID=10001".to_string(),
-                "OPENSHELL_VM_SANDBOX_GID=10001".to_string(),
-            ]
+            identity,
+            SandboxOwnerIdentity {
+                uid: 2000,
+                gid: 3000
+            }
+        );
+        assert!(write_marker);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn fresh_image_without_sandbox_account_uses_default_identity() {
+        let dir = unique_temp_dir();
+        let source = dir.join("rootfs-source");
+        std::fs::create_dir_all(source.join("etc")).unwrap();
+        std::fs::write(source.join("etc/passwd"), "root:x:0:0:root:/root:/bin/sh\n").unwrap();
+        let rootfs = dir.join("rootfs.ext4");
+        create_ext4_image_from_dir_with_size(&source, &rootfs, 32 * 1024 * 1024).unwrap();
+        let config = VmDriverConfig {
+            state_dir: dir.clone(),
+            ..Default::default()
+        };
+
+        let (identity, _) = sandbox_owner_state_for_launch(
+            &dir,
+            &dir.join(SANDBOX_OVERLAY_IMAGE),
+            &rootfs,
+            &config,
+            OverlayPreparation::Fresh,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            identity,
+            SandboxOwnerIdentity {
+                uid: DEFAULT_SANDBOX_UID,
+                gid: DEFAULT_SANDBOX_UID,
+            }
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -7563,6 +7703,8 @@ mod tests {
             "sandbox-owner-v3:1000:1000",
             "sandbox-owner-v2",
             "sandbox-owner-v2:nope:1000",
+            "sandbox-owner-v2:0:1000",
+            "sandbox-owner-v2:1000:0",
             "sandbox-owner-v2:1000:1000:extra",
         ] {
             assert!(
@@ -7604,6 +7746,44 @@ mod tests {
             std::fs::read_to_string(dir.join(SANDBOX_OWNER_STATE_FILE)).unwrap(),
             "sandbox-owner-v2:4242:4343\n"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn unmarked_overlay_recovers_identity_from_upper_passwd() {
+        let dir = unique_temp_dir();
+        let overlay_source = dir.join("overlay-source");
+        std::fs::create_dir_all(overlay_source.join("upper/etc")).unwrap();
+        std::fs::write(
+            overlay_source.join("upper/etc/passwd"),
+            "root:x:0:0:root:/root:/bin/sh\nsandbox:x:10001:10001:Sandbox:/sandbox:/bin/sh\n",
+        )
+        .unwrap();
+        let overlay = dir.join(SANDBOX_OVERLAY_IMAGE);
+        create_ext4_image_from_dir_with_size(&overlay_source, &overlay, 32 * 1024 * 1024).unwrap();
+        let config = VmDriverConfig {
+            state_dir: dir.clone(),
+            ..Default::default()
+        };
+
+        let (identity, write_marker) = sandbox_owner_state_for_launch(
+            &dir,
+            &overlay,
+            Path::new("/missing-current-rootfs"),
+            &config,
+            OverlayPreparation::PreserveExisting,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            identity,
+            SandboxOwnerIdentity {
+                uid: 10001,
+                gid: 10001,
+            }
+        );
+        assert!(write_marker);
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -204,6 +204,7 @@ fn validate_remote_driver_config(cfg: &RemoteDriverConfig, name: &str) -> Result
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::path::Path;
 
     fn test_context(file: Option<&config_file::ConfigFile>) -> DriverStartupContext<'_> {
         static EMPTY_ENDPOINT_OVERRIDES: std::sync::LazyLock<BTreeMap<String, PathBuf>> =
@@ -225,14 +226,95 @@ mod tests {
     }
 
     #[test]
-    fn gateway_guest_tls_requires_complete_bundle() {
+    fn gateway_guest_tls_resolves_explicit_complete_bundle() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ca = dir.path().join("ca.pem");
+        let cert = dir.path().join("cert.pem");
+        let key = dir.path().join("key.pem");
+        for path in [&ca, &cert, &key] {
+            std::fs::write(path, b"test").expect("write TLS fixture");
+        }
         let gateway = config_file::GatewayFileSection {
-            guest_tls_ca: Some(PathBuf::from("/tmp/ca.pem")),
+            guest_tls_ca: Some(ca.clone()),
+            guest_tls_cert: Some(cert.clone()),
+            guest_tls_key: Some(key.clone()),
+            ..Default::default()
+        };
+
+        let resolved = GuestTlsPaths::resolve(Some(&gateway), None, false)
+            .expect("complete guest TLS should resolve")
+            .expect("guest TLS bundle");
+
+        assert_eq!(
+            resolved.as_paths(),
+            (ca.as_path(), cert.as_path(), key.as_path())
+        );
+    }
+
+    #[test]
+    fn gateway_guest_tls_rejects_every_partial_bundle() {
+        let path = PathBuf::from("/tmp/guest-tls.pem");
+        for (ca, cert, key) in [
+            (Some(path.clone()), None, None),
+            (None, Some(path.clone()), None),
+            (None, None, Some(path.clone())),
+            (Some(path.clone()), Some(path.clone()), None),
+            (Some(path.clone()), None, Some(path.clone())),
+            (None, Some(path.clone()), Some(path)),
+        ] {
+            let gateway = config_file::GatewayFileSection {
+                guest_tls_ca: ca,
+                guest_tls_cert: cert,
+                guest_tls_key: key,
+                ..Default::default()
+            };
+            let error = GuestTlsPaths::resolve(Some(&gateway), None, false)
+                .expect_err("partial guest TLS must fail");
+            assert!(error.contains("one complete bundle"));
+        }
+    }
+
+    #[test]
+    fn gateway_guest_tls_rejects_missing_explicit_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let gateway = config_file::GatewayFileSection {
+            guest_tls_ca: Some(dir.path().join("missing-ca.pem")),
+            guest_tls_cert: Some(dir.path().join("missing-cert.pem")),
+            guest_tls_key: Some(dir.path().join("missing-key.pem")),
             ..Default::default()
         };
         let error = GuestTlsPaths::resolve(Some(&gateway), None, false)
-            .expect_err("partial guest TLS must fail");
-        assert!(error.contains("one complete bundle"));
+            .expect_err("missing explicit file must fail");
+        assert!(error.contains("guest_tls_ca"));
+        assert!(error.contains("does not exist"));
+    }
+
+    #[test]
+    fn gateway_guest_tls_uses_package_managed_bundle() {
+        let local = LocalTlsPaths {
+            ca: PathBuf::from("/managed/ca.pem"),
+            server_cert: PathBuf::from("/managed/server-cert.pem"),
+            server_key: PathBuf::from("/managed/server-key.pem"),
+            client_cert: PathBuf::from("/managed/client-cert.pem"),
+            client_key: PathBuf::from("/managed/client-key.pem"),
+        };
+        let resolved = GuestTlsPaths::resolve(None, Some(&local), false)
+            .expect("managed bundle should resolve")
+            .expect("guest TLS bundle");
+        assert_eq!(
+            resolved.as_paths(),
+            (
+                Path::new("/managed/ca.pem"),
+                Path::new("/managed/client-cert.pem"),
+                Path::new("/managed/client-key.pem"),
+            )
+        );
+    }
+
+    #[test]
+    fn gateway_guest_tls_can_be_absent() {
+        assert!(GuestTlsPaths::resolve(None, None, false).unwrap().is_none());
+        assert!(GuestTlsPaths::resolve(None, None, true).unwrap().is_none());
     }
 
     #[test]
@@ -268,6 +350,9 @@ socket_path = "/run/openshell/kyma.sock"
     fn remote_driver_config_reads_only_socket_path() {
         let file: config_file::ConfigFile = toml::from_str(
             r#"
+[openshell]
+version = 2
+
 [openshell.drivers.kubernetes]
 socket_path = "/run/openshell/kubernetes.sock"
 workspace_mode = "shared"

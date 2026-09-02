@@ -97,11 +97,11 @@ struct GatewayExtensionCredential {
 }
 
 fn extension_token_ttl(issuer: &auth::sandbox_jwt::SandboxJwtIssuer) -> Duration {
-    if issuer.ttl().is_zero() {
-        Duration::from_secs(15 * 60)
-    } else {
-        issuer.ttl().min(MAX_EXTENSION_TOKEN_TTL)
-    }
+    issuer
+        .sandbox_token_ttl()
+        .map_or(Duration::from_secs(15 * 60), |ttl| {
+            ttl.min(MAX_EXTENSION_TOKEN_TTL)
+        })
 }
 
 /// Mint the gateway-caller credential for one extension registration.
@@ -496,7 +496,7 @@ pub(crate) async fn run_server(
                 &signing_pem,
                 kid.clone(),
                 &jwt.gateway_id,
-                jwt.sandbox_token_ttl().unwrap_or_default(),
+                jwt.sandbox_token_ttl(),
             )
             .map_err(Error::config)?,
         );
@@ -1586,7 +1586,7 @@ mod tests {
         BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, ExtensionKind,
         GatewayListenerScope, MultiplexService, ServerState, TlsAcceptor,
         allow_plaintext_service_http, bind_gateway_listeners, classify_initial_bytes,
-        configured_compute_driver, is_benign_tls_handshake_failure,
+        configured_compute_driver, extension_token_ttl, is_benign_tls_handshake_failure,
         mint_gateway_extension_credential, serve_gateway_listener,
     };
     use openshell_core::{
@@ -1632,16 +1632,28 @@ mod tests {
     }
 
     fn extension_test_issuer() -> Arc<crate::auth::sandbox_jwt::SandboxJwtIssuer> {
+        extension_test_issuer_with_ttl(Some(Duration::from_secs(900)))
+    }
+
+    fn extension_test_issuer_with_ttl(
+        ttl: Option<Duration>,
+    ) -> Arc<crate::auth::sandbox_jwt::SandboxJwtIssuer> {
         let material = openshell_bootstrap::jwt::generate_jwt_key().expect("jwt key");
         Arc::new(
             crate::auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
                 material.signing_key_pem.as_bytes(),
                 material.kid,
                 "gateway-a",
-                Duration::from_secs(900),
+                ttl,
             )
             .expect("issuer"),
         )
+    }
+
+    #[test]
+    fn non_expiring_sandbox_tokens_use_finite_extension_ttl() {
+        let issuer = extension_test_issuer_with_ttl(None);
+        assert_eq!(extension_token_ttl(&issuer), Duration::from_secs(15 * 60));
     }
 
     #[test]

@@ -22,18 +22,20 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 
 ## Package-Managed Locations
 
-Package-managed gateways do not require a TOML file. Create one at the package's optional config location when you need to override built-in defaults. Set `OPENSHELL_GATEWAY_CONFIG` in the launch environment to use a different file.
+Package-managed gateways use either built-in defaults or a package-seeded TOML file. Set `OPENSHELL_GATEWAY_CONFIG` in the launch environment to use a different file.
 
-| Package | Optional Gateway TOML location |
+| Package | Gateway TOML location |
 |---|---|
 | Homebrew | `$XDG_CONFIG_HOME/openshell/gateway.toml` when it exists, otherwise the Homebrew prefix config such as `/opt/homebrew/var/openshell/gateway.toml`. |
 | Debian/Ubuntu | `$XDG_CONFIG_HOME/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml` for the systemd user service. |
-| Fedora/RHEL RPM | `$XDG_CONFIG_HOME/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml` for the systemd user service. |
+| Fedora/RHEL RPM | `$XDG_CONFIG_HOME/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml`; the systemd user service seeds this file from the packaged template on first start. |
 | Snap | `$SNAP_COMMON/gateway.toml`, usually `/var/snap/openshell/common/gateway.toml`. |
 
 The Fedora/RHEL RPM template leaves `[openshell.gateway].bind_address` unset. The gateway therefore uses its built-in `127.0.0.1:17670` primary listener. The Podman driver negotiates separate, restricted listeners for sandbox callbacks, so the primary listener does not need a wildcard address. Set `bind_address` explicitly only when clients must reach the primary multiplexed API through another interface.
 
-The Homebrew formula creates its prefix config without setting `bind_address`, so the gateway uses its built-in `127.0.0.1:17670` primary listener. Docker Desktop and Podman Machine reuse that listener for sandbox callbacks. A user config takes precedence. Upgrades preserve user-edited configs and migrate only an unchanged prefix config generated with the affected IPv6-loopback default.
+The Homebrew formula creates its prefix config without setting `bind_address`, so the gateway uses its built-in `127.0.0.1:17670` primary listener. Docker Desktop and Podman Machine reuse that listener for sandbox callbacks. A user config takes precedence.
+
+Homebrew and RPM upgrades migrate only exact package-generated schema-v1 defaults. Homebrew recognizes both its empty v1 prefix config and the affected IPv6-loopback variant. RPM recognizes the v1 file seeded by its systemd user service. Package upgrades never rewrite an edited file; migrate an edited v1 file manually with the steps below.
 
 ## Layout
 
@@ -74,7 +76,10 @@ future version. To migrate an existing file:
 3. Move every compute-driver option into `[openshell.drivers.<name>]`. Schema
    version 2 does not inherit driver defaults from `[openshell.gateway]`.
    Keep only `guest_tls_ca`, `guest_tls_cert`, and `guest_tls_key` at gateway
-   scope; set all three or omit all three when TLS is disabled.
+   scope. A TLS-enabled Docker, Podman, or VM gateway requires one complete
+   guest bundle. Set all three paths unless the package-managed local TLS
+   bundle supplies them. When TLS is disabled, omit all three. Kubernetes
+   projects sandbox TLS through `client_tls_secret_name` instead.
 4. Rename Docker `sandbox_namespace` to `sandbox_label`, Podman
    `sandbox_ssh_socket_path` to `ssh_socket_path`, and VM
    `openshell_endpoint` to `grpc_endpoint`.
@@ -90,7 +95,8 @@ future version. To migrate an existing file:
    TOML requires an explicit endpoint; Helm derives one from the release's
    gateway Service. New VM root filesystems use an image-provided `sandbox`
    account when present and otherwise use UID/GID 1000. Existing persisted VM
-   state using 10001 remains compatible.
+   state retains its recorded or recoverable identity, including legacy 10001;
+   the driver does not assign 10001 to an overlay without supporting state.
 
 Unknown fields and non-table `[openshell.drivers.<name>]` values fail startup.
 This strict validation prevents misspelled or misplaced security-sensitive
@@ -139,8 +145,11 @@ enable_loopback_service_http = true
 # Set true only for local plaintext gateways or trusted TLS termination.
 disable_tls = false
 
-# Guest TLS paths remain gateway settings. Set all three for TLS, or omit all
-# three only when TLS is disabled. Driver tables must not repeat these fields.
+# Guest TLS paths remain gateway settings. TLS-enabled Docker, Podman, and VM
+# gateways require a complete bundle unless package-managed local TLS supplies
+# it automatically. Omit all three when TLS is disabled. Kubernetes projects
+# sandbox TLS from client_tls_secret_name instead. Driver tables must not repeat
+# these fields.
 guest_tls_ca            = "/etc/openshell/certs/ca.pem"
 guest_tls_cert          = "/etc/openshell/certs/client.pem"
 guest_tls_key           = "/etc/openshell/certs/client-key.pem"
@@ -832,13 +841,18 @@ health_check_interval_secs = 10
 # explicit container-reachable TCP endpoint, for provider token exchange.
 # provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
 # provider_spiffe_workload_api_socket = "tcp:169.254.1.2:8081"
-# Explicit supervisor-compatible default. RuntimeDefault and Localhost/<name>
-# require Podman to report AppArmor support.
-app_armor_profile = "Unconfined"
+# Omit app_armor_profile to preserve Podman's runtime-selected profile.
+# Set Unconfined only when the supervisor's mount setup requires it.
+# Explicit RuntimeDefault and Localhost/<name> require Podman to report
+# AppArmor support.
+# app_armor_profile = "Unconfined"
 ```
 
 Use `ssh_socket_path` for Podman configurations. The legacy
-`sandbox_ssh_socket_path` key is rejected.
+`sandbox_ssh_socket_path` key is rejected. When `app_armor_profile` is omitted,
+OpenShell sends no override and Podman applies its runtime-selected profile.
+Set `Unconfined` explicitly only when the deployment requires the supervisor's
+mount setup to bypass that profile.
 
 ### MicroVM
 
@@ -873,21 +887,22 @@ vcpus            = 2
 mem_mib          = 2048
 overlay_disk_mib = 4096
 # Resolved sandbox UID/GID for new rootfs /etc/passwd entries.
-# Defaults to 1000 when unset; matching GID is used if sandbox_gid is empty.
-# Existing persisted VM rootfs/overlays with UID 10001 retain that identity.
-# Any non-root Linux UID/GID is valid.
+# Defaults to the image's sandbox account, or 1000 when the account is absent;
+# matching GID is used if sandbox_gid is empty. Persisted overlays recover their
+# recorded identity, including 10001, rather than receiving a legacy fallback.
+# Values must fall within OpenShell's allowed non-root sandbox identity range.
 # sandbox_uid = 20001
+# sandbox_gid = 20001
 # Corporate forward proxy for sandbox egress. The keys, their semantics, and
 # the fail-closed contract are identical to the Podman driver above: only TLS
 # (CONNECT) egress is chained, plain-HTTP destination requests always dial
 # directly, credentials must come from proxy_auth_file rather than the URL,
 # an http:// proxy with credentials requires proxy_auth_allow_insecure, and
 # any present-but-invalid value is rejected at gateway startup rather than
-# degrading to a direct dial. proxy_auth_file and proxy_ca_bundle are paths on
-# the gateway host.
+# degrading to a direct dial. proxy_auth_file is a path on the gateway host.
 #
 # The sandbox cannot select or override these settings. They reach the guest
-# supervisor on its command line through a per-sandbox file the driver writes
+# supervisor through a protected per-sandbox argument file the driver writes
 # into the overlay upperdir on every launch, so a sandbox image cannot supply
 # its own values or disable the operator's by baking a file at that path.
 #
@@ -907,20 +922,18 @@ overlay_disk_mib = 4096
 # address routable from the guest's masqueraded egress.
 #
 # Because a microVM has no bind mounts or container secrets, the driver stages
-# the credential and the CA into the per-sandbox overlay disk: the credential
-# root-only inside the guest, and both removed with the sandbox. The
-# credential is therefore at rest in that overlay image on the gateway host —
-# the same delivery the per-sandbox gateway token already uses, and a
-# difference from the Podman secret model worth noting when choosing where to
-# keep proxy credentials.
+# the credential into the per-sandbox overlay disk, root-only inside the guest,
+# and removes it with the sandbox. The credential is therefore at rest in that
+# overlay image on the gateway host — the same delivery the per-sandbox gateway
+# token already uses, and a difference from the Podman secret model worth noting
+# when choosing where to keep proxy credentials.
 # https_proxy               = "http://host.openshell.internal:8080"
 # no_proxy                  = "10.0.0.0/8,.internal.example"
 # proxy_auth_file           = "/etc/openshell/secrets/proxy-auth"
+# An http:// proxy with proxy_auth_file requires this explicit acknowledgement:
 # proxy_auth_allow_insecure = true
 # Last resort for hostname-filtering proxy ACLs; see the Podman section above.
 # proxy_connect_by_hostname = true
-# Corporate CA trusted for an https:// proxy and TLS-intercepting proxies.
-# proxy_ca_bundle           = "/etc/openshell/tls/proxy-ca.pem"
 # VM guests cannot mount a host Workload API Unix socket. Configure only a
 # separately operated guest-reachable TCP listener and explicitly acknowledge
 # the exposure; host-only sockets are never exposed automatically.
