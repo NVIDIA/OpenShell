@@ -60,10 +60,15 @@ openshell
 │   ├── upload <name> <path> [dest]
 │   ├── download <name> <path> [dest]
 │   ├── ssh-config [name]
-│   └── provider
-│       ├── list [name] [-o table|yaml|json]
-│       ├── attach <name> <provider>
-│       └── detach <name> <provider>
+│   ├── provider
+│   │   ├── list [name] [-o table|yaml|json]
+│   │   ├── attach <name> <provider>
+│   │   └── detach <name> <provider>
+│   └── template
+│       ├── create <name> [opts]
+│       ├── get <name>
+│       ├── list [opts]
+│       └── delete <name>...
 ├── forward
 │   ├── start <port> [name] [-d]
 │   ├── stop <port> [name]
@@ -243,6 +248,7 @@ process result immediately when it exits. Foreground creation declares one
 expected main-process SSH attachment; cleanup finalizes after that connection
 drains and closes naturally.
 | `--driver-config-json <JSON>` | Experimental driver-keyed configuration object |
+| `--template <NAME>` | Create from a named sandbox workload template |
 | `--provider <NAME>` | Provider to attach (repeatable) |
 | `--policy <PATH>` | Custom policy YAML; overrides the built-in default and `OPENSHELL_SANDBOX_POLICY` |
 | `--forward <[BIND:]PORT>` | Start a local port forward and keep the sandbox alive |
@@ -260,6 +266,57 @@ drains and closes naturally.
 currently complete after the canonical process starts. Create the default
 scratch sandbox, upload files, then use `sandbox exec`, or build the files into
 the image.
+
+`--template` uses the named template workload, so it conflicts with inline
+workload flags: `--from`, `--gpu`, `--cpu`, `--memory`, `--env`, and
+`--driver-config-json`. Direct `sandbox create --driver-config-json` remains
+valid when `--template` is not set.
+
+### `openshell sandbox template create NAME [OPTIONS]`
+
+Create a reusable sandbox workload template. Templates hold image,
+environment, resource, startup, and driver-specific configuration for later
+`sandbox create --template NAME` calls.
+
+| Flag | Description |
+|------|-------------|
+| `--image <IMAGE>` | OCI image reference; when omitted, the gateway default image is applied at sandbox create time |
+| `--env <KEY=VALUE>` | Set a non-secret template workload environment variable (repeatable) |
+| `--cpu <QUANTITY>` | CPU limit for sandboxes created from the template |
+| `--memory <QUANTITY>` | Memory limit for sandboxes created from the template |
+| `--gpu [COUNT]` | Request the driver's default GPU selection or a specific GPU count for sandboxes created from the template |
+| `--driver-config-json <JSON>` | Experimental driver-keyed configuration object owned by the template |
+| `--ready-within <DURATION>` | Target startup readiness duration, for example `30s`, `5m`, or `1h` |
+| `--max-burst <COUNT>` | Maximum startup burst associated with this template |
+| `--label <KEY=VALUE>` | Attach a template label (repeatable) |
+| `--annotation <KEY=VALUE>` | Attach a template annotation (repeatable) |
+| `--output table|yaml|json` | Output format |
+
+### `openshell sandbox template get NAME`
+
+Show a sandbox workload template.
+
+| Flag | Description |
+|------|-------------|
+| `--output table|yaml|json` | Output format |
+
+### `openshell sandbox template list`
+
+List sandbox workload templates.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--limit <N>` | 100 | Maximum templates |
+| `--offset <N>` | 0 | Pagination offset |
+| `--label-selector <KEY=VALUE,...>` | empty | Filter templates by labels |
+| `--names` | false | Print only template names |
+| `--all-workspaces` | false | List templates across all workspaces; requires platform-admin permissions |
+| `--output table|yaml|json` | `table` | Output format |
+
+### `openshell sandbox template delete NAME...`
+
+Delete one or more sandbox workload templates by name. Existing sandboxes
+created from a template are not deleted.
 
 ### `openshell sandbox get [name]`
 

@@ -401,6 +401,39 @@ impl Store {
         ))
     }
 
+    /// Atomically insert a named object only if its workspace has fewer than
+    /// `max_count` objects of the same type.
+    ///
+    /// Returns `Ok(None)` when the quota is already full. A duplicate id or
+    /// `(object_type, workspace, name)` still returns
+    /// [`PersistenceError::UniqueViolation`].
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(otel.name = "store.create_if_workspace_count_below", otel.status_code = tracing::field::Empty, object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace, max_count = max_count)
+    )]
+    pub async fn create_if_workspace_count_below(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+        max_count: u64,
+    ) -> PersistenceResult<Option<WriteResult>> {
+        store_dispatch_traced!(self.create_if_workspace_count_below(
+            object_type,
+            id,
+            name,
+            workspace,
+            payload,
+            labels,
+            max_count
+        ))
+    }
+
     /// Fetch an object by id.
     #[tracing::instrument(
         name = "store",

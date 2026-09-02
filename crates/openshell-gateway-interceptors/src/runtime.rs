@@ -1076,6 +1076,7 @@ mod tests {
             annotations: HashMap::new(),
             workspace: String::new(),
             await_main_process_attachment: false,
+            workload_template_name: String::new(),
         };
 
         let bytes = request.encode_to_vec();

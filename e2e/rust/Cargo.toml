@@ -169,6 +169,11 @@ path = "tests/workspace_lifecycle.rs"
 required-features = ["e2e"]
 
 [[test]]
+name = "sandbox_templates"
+path = "tests/sandbox_templates.rs"
+required-features = ["e2e"]
+
+[[test]]
 name = "proxy_egress_pipeline"
 path = "tests/proxy_egress_pipeline.rs"
 required-features = ["e2e-host-gateway"]

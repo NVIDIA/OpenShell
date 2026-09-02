@@ -344,23 +344,33 @@ default WAL journal mode), which mirror the same sensitive contents.
 
 Persisted state includes sandboxes, providers, provider credential refresh
 state, SSH sessions, policy revisions, settings, inference configuration, and
-deployment records. Provider refresh state is stored as a separate object
-scoped to the provider instance through `objects.scope`. Its non-secret
-configuration remains inline, while refresh tokens, client secrets, private
-keys, and other secret source material are stored through the active credential
-driver and represented by opaque handles. The provider record keeps only the
-current injectable credential handles and optional per-credential expiry
-timestamps. A refresh normally mints one credential, but a strategy may
-co-mint several (AWS STS mints the access key, secret key, and session token in
-one call); the refresh state pins the resolved set of env keys it owns so
-collision checks reserve all of them before the first mint. Provider records
-keep inline credential values only for legacy records created before credential
-driver storage. New provider and refresh-material writes keep driver-owned
-credential handles. When no external credential driver is configured, gateways
-use server-owned encrypted database credential storage for defense in depth.
-Multi-replica deployments can use that default with a shared database and
-shared key-encryption key, or opt into an external backend such as Vault or
-Kubernetes Secrets.
+deployment records, and reusable sandbox workload templates. Provider refresh
+state is stored as a separate object scoped to the provider instance through
+`objects.scope`. Its non-secret configuration remains inline, while refresh
+tokens, client secrets, private keys, and other secret source material are
+stored through the active credential driver and represented by opaque handles.
+The provider record keeps only the current injectable credential handles and
+optional per-credential expiry timestamps. A refresh normally mints one
+credential, but a strategy may co-mint several (AWS STS mints the access key,
+secret key, and session token in one call); the refresh state pins the resolved
+set of env keys it owns so collision checks reserve all of them before the
+first mint. Provider records keep inline credential values only for legacy
+records created before credential driver storage. New provider and
+refresh-material writes keep driver-owned credential handles. When no external
+credential driver is configured, gateways use server-owned encrypted database
+credential storage for defense in depth. Multi-replica deployments can use that
+default with a shared database and shared key-encryption key, or opt into an
+external backend such as Vault or Kubernetes Secrets.
+
+Sandbox workload templates are workspace-scoped gateway resources. Workspace
+admins create and delete them; workspace users can read and list them. A
+template owns reusable workload intent: image, environment, CPU and memory
+limits, GPU request, driver-specific config, and service-level hints. A sandbox
+created from a template resolves that resource once and persists an ordinary
+`SandboxSpec` snapshot. The create request still owns per-sandbox governance:
+name, labels, annotations, provider attachments, and policy. The sandbox stores
+template provenance as the template name and resource version used for the
+snapshot, so later template edits or deletes do not mutate existing sandboxes.
 
 OAuth refresh failures retain a gateway-owned recovery classification alongside
 the refresh state. The gateway reads only a bounded error response and maps

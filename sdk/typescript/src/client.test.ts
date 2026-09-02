@@ -17,6 +17,7 @@ import {
   POLICY_SOURCE_NAMES,
   Pushable,
   SandboxClient,
+  SandboxTemplateClient,
   SCOPE_NAMES,
   STATUS_NAMES,
 } from './client.js';
@@ -30,15 +31,25 @@ function client(impl: Partial<ServiceImpl<typeof OpenShell>>): SandboxClient {
   return new SandboxClient(transport);
 }
 
+function templateClient(impl: Partial<ServiceImpl<typeof OpenShell>>): SandboxTemplateClient {
+  const transport: Transport = createRouterTransport((router) => {
+    router.service(OpenShell, impl);
+  });
+  return new SandboxTemplateClient(transport);
+}
+
 function readySandbox(
   name: string,
   id: string,
   resourceVersion = 7n,
+  createdFromWorkloadTemplate?: { name: string; resourceVersion: string },
+  workspace = 'default',
 ): MessageInitShape<typeof OpenShell.method.getSandbox.output> {
   return {
     sandbox: {
-      metadata: { id, name, labels: { team: 'aire' }, resourceVersion },
+      metadata: { id, name, workspace, labels: { team: 'aire' }, resourceVersion },
       status: { phase: SandboxPhase.READY },
+      createdFromWorkloadTemplate,
     },
   };
 }
@@ -261,6 +272,207 @@ describe('create', () => {
     expect(created.spec?.providers).toEqual(['claude']);
   });
 
+  it('createFromTemplate sends the workload template name with governance fields only', async () => {
+    let created: {
+      workloadTemplateName?: string;
+      name?: string;
+      workspace?: string;
+      labels?: Record<string, string>;
+      spec?: {
+        policy?: { version?: number };
+        providers?: string[];
+        command?: string[];
+        tty?: boolean;
+        template?: { image?: string };
+      };
+    } = {};
+    const sandbox = client({
+      createSandbox: (req) => {
+        created = req;
+        return readySandbox('job-1', 'sb-id', 7n, undefined, req.workspace || 'default');
+      },
+    });
+    const ref = await sandbox.createFromTemplate({
+      name: 'job-1',
+      workspace: 'staging',
+      templateName: 'gpu-kata',
+      labels: { team: 'runtime' },
+      providers: ['github'],
+      command: ['/opt/worker', '--serve'],
+      tty: true,
+      policy: { version: 1, networkPolicies: {} },
+    });
+
+    expect(created.workloadTemplateName).toBe('gpu-kata');
+    expect(created.name).toBe('job-1');
+    expect(created.workspace).toBe('staging');
+    expect(created.labels).toEqual({ team: 'runtime' });
+    expect(created.spec?.providers).toEqual(['github']);
+    expect(created.spec?.command).toEqual(['/opt/worker', '--serve']);
+    expect(created.spec?.tty).toBe(true);
+    expect(created.spec?.policy?.version).toBe(1);
+    expect(created.spec?.template).toBeUndefined();
+    expect(ref.workspace).toBe('staging');
+  });
+
+  it('propagates workspace through sandbox lifecycle calls', async () => {
+    const observed: {
+      create?: { workspace?: string };
+      get?: { workspace?: string };
+      list?: { workspace?: string; allWorkspaces?: boolean };
+      delete?: { workspace?: string };
+      attach?: { workspace?: string };
+      detach?: { workspace?: string };
+      listProviders?: { workspace?: string };
+      updatePolicy?: { workspace?: string };
+      updateSetting?: { workspace?: string };
+      configGets: string[];
+      execGet?: string;
+      interactiveGet?: string;
+      sshGet?: string;
+      forwardGet?: string;
+    } = { configGets: [] };
+    const sandbox = client({
+      createSandbox: (req) => {
+        observed.create = req;
+        return readySandbox(req.name || 'sb', 'sb-created', 7n, undefined, req.workspace || 'default');
+      },
+      getSandbox: (req) => {
+        if (req.name === 'exec') observed.execGet = req.workspace;
+        else if (req.name === 'interactive') observed.interactiveGet = req.workspace;
+        else if (req.name === 'ssh') observed.sshGet = req.workspace;
+        else if (req.name === 'forward') observed.forwardGet = req.workspace;
+        else if (req.name === 'config') observed.configGets.push(req.workspace);
+        else observed.get = req;
+        return readySandbox(req.name, `${req.name}-id`, 7n, undefined, req.workspace || 'default');
+      },
+      listSandboxes: (req) => {
+        observed.list = req;
+        return {
+          sandboxes: [
+            {
+              metadata: {
+                id: 'listed-id',
+                name: 'listed',
+                workspace: req.workspace || 'default',
+                labels: { team: 'aire' },
+                resourceVersion: 7n,
+              },
+              status: { phase: SandboxPhase.READY },
+            },
+          ],
+        };
+      },
+      deleteSandbox: (req) => {
+        observed.delete = req;
+        return { deleted: true };
+      },
+      attachSandboxProvider: (req) => {
+        observed.attach = req;
+        return {
+          sandbox: readySandbox(req.sandboxName, 'attach-id', 7n, undefined, req.workspace || 'default').sandbox,
+          attached: true,
+        };
+      },
+      detachSandboxProvider: (req) => {
+        observed.detach = req;
+        return {
+          sandbox: readySandbox(req.sandboxName, 'detach-id', 7n, undefined, req.workspace || 'default').sandbox,
+          detached: true,
+        };
+      },
+      listSandboxProviders: (req) => {
+        observed.listProviders = req;
+        return { providers: [] };
+      },
+      updateConfig: (req) => {
+        if (req.settingKey) observed.updateSetting = req;
+        else observed.updatePolicy = req;
+        return { version: 5, policyHash: 'hash', settingsRevision: 10n, deleted: false };
+      },
+      getSandboxConfig: () => ({
+        policy: { version: 1, networkPolicies: {} },
+        version: 5,
+        policyHash: 'hash',
+        settings: {},
+        configRevision: 1n,
+        policySource: PolicySource.SANDBOX,
+        globalPolicyVersion: 0,
+        providerEnvRevision: 0n,
+      }),
+      // eslint-disable-next-line require-yield
+      execSandbox: async function* () {
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+      // eslint-disable-next-line require-yield
+      execSandboxInteractive: async function* () {
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+      createSshSession: (req) => ({
+        sandboxId: req.sandboxId,
+        token: 'tok',
+        gatewayHost: 'gw',
+        gatewayPort: 443,
+        gatewayScheme: 'https',
+        hostKeyFingerprint: '',
+        expiresAtMs: 0n,
+      }),
+      revokeSshSession: () => ({ revoked: true }),
+    });
+
+    const created = await sandbox.create({ name: 'direct', workspace: 'staging', image: 'img' });
+    const got = await sandbox.get('lookup', { workspace: 'staging' });
+    const listed = await sandbox.list({ workspace: 'staging', limit: 10 });
+    const deleted = await sandbox.delete('lookup', { workspace: 'staging' });
+    await expect(sandbox.waitReady('lookup', 1, { workspace: 'staging' })).resolves.toMatchObject({
+      workspace: 'staging',
+    });
+    await expect(sandbox.exec('exec', ['true'], { workspace: 'staging' })).resolves.toMatchObject({ exitCode: 0 });
+    const interactive = await sandbox.execInteractive('interactive', ['true'], { workspace: 'staging' });
+    for await (const _event of interactive.output) {
+      // drain
+    }
+    await sandbox.createSshSession('ssh', { workspace: 'staging' });
+    const attached = await sandbox.attachProvider('lookup', 'github', { workspace: 'staging' });
+    const detached = await sandbox.detachProvider('lookup', 'github', { workspace: 'staging' });
+    await sandbox.listProviders('lookup', { workspace: 'staging' });
+    await sandbox.getConfig('config', { workspace: 'staging' });
+    await sandbox.setPolicy('lookup', { version: 1, networkPolicies: {} }, { workspace: 'staging' });
+    await sandbox.setSetting(
+      'lookup',
+      'feature.enabled',
+      { value: { case: 'boolValue', value: true } },
+      { workspace: 'staging' },
+    );
+
+    expect(created.workspace).toBe('staging');
+    expect(got.workspace).toBe('staging');
+    expect(listed[0]?.workspace).toBe('staging');
+    expect(deleted).toBe(true);
+    expect(attached.sandbox.workspace).toBe('staging');
+    expect(detached.sandbox.workspace).toBe('staging');
+    expect(observed.create?.workspace).toBe('staging');
+    expect(observed.get?.workspace).toBe('staging');
+    expect(observed.list).toMatchObject({ workspace: 'staging', allWorkspaces: false });
+    expect(observed.delete?.workspace).toBe('staging');
+    expect(observed.execGet).toBe('staging');
+    expect(observed.interactiveGet).toBe('staging');
+    expect(observed.sshGet).toBe('staging');
+    expect(observed.attach?.workspace).toBe('staging');
+    expect(observed.detach?.workspace).toBe('staging');
+    expect(observed.listProviders?.workspace).toBe('staging');
+    expect(observed.configGets).toContain('staging');
+    expect(observed.updatePolicy?.workspace).toBe('staging');
+    expect(observed.updateSetting?.workspace).toBe('staging');
+  });
+
+  it('createFromTemplate rejects an empty template name locally', async () => {
+    const sandbox = client({});
+    await expect(sandbox.createFromTemplate({ templateName: ' ' })).rejects.toMatchObject({
+      code: 'invalid_config',
+    });
+  });
+
   it('rejects gateway sandboxes missing required metadata', async () => {
     const sandbox = client({
       getSandbox: () => ({ sandbox: { status: { phase: SandboxPhase.READY } } }),
@@ -287,6 +499,158 @@ describe('create', () => {
       mainProcessInstanceId: 'main-1',
       exitCode: 9,
     });
+  });
+
+  it('maps workload template provenance onto SandboxRef', async () => {
+    const sandbox = client({
+      getSandbox: () =>
+        readySandbox('from-template', 'sb-id', 7n, {
+          name: 'gpu-kata',
+          resourceVersion: '42',
+        }),
+    });
+
+    const ref = await sandbox.get('from-template');
+
+    expect(ref.createdFromWorkloadTemplate).toEqual({
+      name: 'gpu-kata',
+      resourceVersion: '42',
+    });
+  });
+});
+
+describe('sandbox templates', () => {
+  it('create sends the template resource and workspace', async () => {
+    let observed: {
+      workspace?: string;
+      template?: {
+        metadata?: { name?: string; labels?: Record<string, string> };
+        spec?: {
+          workload?: {
+            image?: string;
+            environment?: Record<string, string>;
+            resources?: { cpu?: string; memory?: string; gpu?: { count?: number } };
+          };
+          driverConfig?: Record<string, unknown>;
+        };
+      };
+    } = {};
+    const templates = templateClient({
+      createSandboxTemplate: (req) => {
+        observed = req;
+        return {
+          template: {
+            metadata: {
+              id: 'template-python',
+              name: req.template?.metadata?.name ?? '',
+              labels: req.template?.metadata?.labels ?? {},
+              workspace: req.workspace,
+              resourceVersion: 1n,
+            },
+            spec: req.template?.spec,
+          },
+        };
+      },
+    });
+
+    const created = await templates.create(
+      {
+        metadata: { name: 'python', labels: { team: 'runtime' } },
+        spec: {
+          workload: {
+            image: 'ghcr.io/nvidia/openshell-community/sandboxes/python:latest',
+            environment: { FEATURE_FLAG: 'on' },
+            resources: { cpu: '1', memory: '512Mi', gpu: { count: 1 } },
+          },
+          driverConfig: { kubernetes: { runtime_class_name: 'kata-containers' } },
+        },
+      },
+      { workspace: 'default' },
+    );
+
+    expect(observed.workspace).toBe('default');
+    expect(observed.template?.metadata?.name).toBe('python');
+    expect(observed.template?.metadata?.labels).toEqual({ team: 'runtime' });
+    expect(observed.template?.spec?.workload?.environment).toEqual({ FEATURE_FLAG: 'on' });
+    expect(observed.template?.spec?.workload?.resources?.gpu?.count).toBe(1);
+    expect(created.metadata?.workspace).toBe('default');
+    expect(created.metadata?.resourceVersion).toBe(1n);
+  });
+
+  it('get list and delete forward workspace and pagination', async () => {
+    const observed: {
+      get?: { name?: string; workspace?: string };
+      list?: { limit?: number; offset?: number; workspace?: string; allWorkspaces?: boolean };
+      delete?: { name?: string; workspace?: string };
+    } = {};
+    const templates = templateClient({
+      getSandboxTemplate: (req) => {
+        observed.get = req;
+        return {
+          template: {
+            metadata: { id: 'template-gpu-kata', name: req.name, workspace: req.workspace },
+            spec: { workload: { image: 'img:v1' } },
+          },
+        };
+      },
+      listSandboxTemplates: (req) => {
+        observed.list = req;
+        return {
+          templates: [
+            {
+              metadata: { id: 'template-python', name: 'python', workspace: req.workspace || 'default' },
+              spec: { workload: { image: 'img:v1' } },
+            },
+          ],
+        };
+      },
+      deleteSandboxTemplate: (req) => {
+        observed.delete = req;
+        return { deleted: true };
+      },
+    });
+
+    const got = await templates.get('gpu-kata', { workspace: 'staging' });
+    const listed = await templates.list({ workspace: 'staging', limit: 10, offset: 2, labelSelector: 'team=runtime' });
+    const deleted = await templates.delete('gpu-kata', { workspace: 'staging' });
+
+    expect(got.metadata?.name).toBe('gpu-kata');
+    expect(listed).toHaveLength(1);
+    expect(deleted).toBe(true);
+    expect(observed.get).toMatchObject({ name: 'gpu-kata', workspace: 'staging' });
+    expect(observed.list).toMatchObject({
+      limit: 10,
+      offset: 2,
+      workspace: 'staging',
+      allWorkspaces: false,
+      labelSelector: 'team=runtime',
+    });
+    expect(observed.delete).toMatchObject({ name: 'gpu-kata', workspace: 'staging' });
+  });
+
+  it('list clears workspace when allWorkspaces is set', async () => {
+    let observed: { workspace?: string; allWorkspaces?: boolean } = {};
+    const templates = templateClient({
+      listSandboxTemplates: (req) => {
+        observed = req;
+        return { templates: [] };
+      },
+    });
+
+    await templates.list({ workspace: 'staging', allWorkspaces: true });
+
+    expect(observed.workspace).toBe('');
+    expect(observed.allWorkspaces).toBe(true);
+  });
+
+  it('rejects empty names and missing template responses locally', async () => {
+    const templates = templateClient({
+      getSandboxTemplate: () => ({}),
+    });
+
+    await expect(templates.get(' ')).rejects.toMatchObject({ code: 'invalid_config' });
+    await expect(templates.delete(' ')).rejects.toMatchObject({ code: 'invalid_config' });
+    await expect(templates.get('missing-response')).rejects.toMatchObject({ code: 'invalid_config' });
   });
 });
 

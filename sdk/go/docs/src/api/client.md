@@ -2,14 +2,17 @@
 
 Constructor: `v1.NewClient(config)`
 
-The `ClientInterface` is the root entry point for all SDK operations. It provides
-typed accessors for each resource domain and manages the underlying gRPC connection.
+`Client` is the root entry point for SDK operations. It provides typed accessors
+for each resource domain and manages the underlying gRPC connection. The
+`ClientInterface` covers the stable core accessors; additive helpers such as
+`SandboxTemplates()` are available on the concrete client.
 
 ## Methods
 
 | Accessor | Returns | Description |
 |----------|---------|-------------|
 | `Sandboxes()` | `SandboxInterface` | Sandbox lifecycle management |
+| `SandboxTemplates()` | `SandboxTemplateInterface` | Reusable sandbox template management |
 | `Providers()` | `ProviderInterface` | Provider CRUD and idempotent ensure |
 | `Services()` | `ServiceInterface` | Service exposure and management |
 | `Exec()` | `ExecInterface` | Command execution (run, stream, interactive) |

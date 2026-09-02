@@ -157,6 +157,59 @@ Local directories and Dockerfiles require a local gateway because the CLI builds
 through the local Docker daemon. Use a registry image reference for remote
 gateways.
 
+## Reuse Workload Templates
+
+Sandbox workload templates let workspace admins define reusable runtime shapes for a workspace. A template stores the image, environment, resource requests, and driver-specific configuration that sandboxes should inherit. When you create a sandbox from a template, the create request can still attach providers, labels, and policy, but the workload comes from the named template.
+
+Create a template:
+
+```shell
+openshell sandbox template create gpu-kata \
+  --image registry.example.com/agent:latest \
+  --cpu 2 \
+  --memory 4Gi \
+  --gpu 1 \
+  --label team=runtime \
+  --env FEATURE_FLAG=on
+```
+
+Use `--gpu` without a count when the template should request the active
+driver's default GPU assignment. Use `--gpu COUNT` when the template needs a
+specific number of GPUs.
+
+Add driver-specific settings when the active compute driver needs them:
+
+```shell
+openshell sandbox template create gpu-kata \
+  --image registry.example.com/agent:latest \
+  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","node_selector":{"pool":"gpu"}}}}'
+```
+
+If you omit `--image`, the gateway applies its default sandbox image when a sandbox is created from the template. Use this when the template should only define resource, environment, or driver settings.
+
+Create a sandbox from a template:
+
+```shell
+openshell sandbox create --template gpu-kata --provider github -- claude
+```
+
+The `--template` flag cannot be combined with inline workload flags such as `--from`, `--cpu`, `--memory`, `--gpu`, `--env`, or `--driver-config-json`. Put those values on the template instead. Create-time policy and provider attachments remain part of the sandbox request, so each sandbox can keep its own access boundary.
+
+Inspect and manage templates:
+
+```shell
+openshell sandbox template list
+openshell sandbox template list --label-selector team=runtime
+openshell sandbox template get gpu-kata
+openshell sandbox template delete gpu-kata
+```
+
+Use `--all-workspaces` with `sandbox template list` when you need an admin view across workspaces:
+
+```shell
+openshell sandbox template list --all-workspaces
+```
+
 ## Base Sandbox Container
 
 The `base` sandbox container is the default runtime image for standard OpenShell sandboxes unless the gateway overrides its default sandbox image. It is published as `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` and maintained in the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) repository.
@@ -293,6 +346,24 @@ with SandboxClient.from_active_cluster() as client:
 
     matches = client.list(workspace="default", label_selector="env=dev,team=platform")
     assert sandbox.id in {s.id for s in matches}
+```
+
+Create reusable sandbox templates through the Python SDK when several runs
+should share the same workload shape:
+
+```python
+from openshell import SandboxClient
+
+with SandboxClient.from_active_cluster() as client:
+    templates = client.sandbox_templates()
+
+    templates.create(
+        workspace="default",
+        name="python",
+        image="ghcr.io/nvidia/openshell-community/sandboxes/python:latest",
+    )
+
+    sandbox = client.create_from_template(workspace="default", template_name="python")
 ```
 
 For non-interactive automation, pass a renewable client-credentials provider.

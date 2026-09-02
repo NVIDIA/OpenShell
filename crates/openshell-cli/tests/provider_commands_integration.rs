@@ -185,6 +185,7 @@ impl OpenShell for TestOpenShell {
                 }),
                 spec: None,
                 status: None,
+                ..Sandbox::default()
             }),
         }))
     }
@@ -195,6 +196,8 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<ListSandboxesResponse>, Status> {
         Ok(Response::new(ListSandboxesResponse::default()))
     }
+
+    unimplemented_sandbox_template_rpcs!();
 
     async fn list_sandbox_providers(
         &self,

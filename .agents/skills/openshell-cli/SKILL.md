@@ -242,6 +242,7 @@ Key flags:
 - `--gpu [COUNT]`: Request the driver's default GPU selection or a specific GPU count
 - `--cpu`, `--memory`: Set per-sandbox compute sizing. Docker/Podman apply limits; Kubernetes applies matching requests and limits.
 - `--driver-config-json`: Pass experimental driver-specific sandbox configuration
+- `--template NAME`: Create from a named sandbox workload template. Conflicts with inline workload flags such as `--from`, `--gpu`, `--cpu`, `--memory`, `--env`, and `--driver-config-json`.
 - `--label KEY=VALUE`: Add labels for later selection (repeatable)
 - `--env KEY=VALUE`: Set non-secret sandbox environment variables (repeatable); use `--provider` for credentials
 - `--tty`: Allocate a retained PTY for the canonical main process
@@ -261,6 +262,45 @@ closes naturally.
 Do not combine `--upload` with a trailing main command. Uploads currently finish
 after the canonical process starts; create a scratch sandbox and use
 `sandbox exec`, or build the files into the image.
+
+Create from a reusable workload template when several sandboxes should share
+image, environment, sizing, or driver-specific configuration:
+
+```bash
+openshell sandbox template create gpu-kata \
+  --image ghcr.io/nvidia/openshell-community/sandboxes/python:latest \
+  --cpu 2 \
+  --memory 4Gi \
+  --gpu 1 \
+  --driver-config-json '{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}'
+
+openshell sandbox create --name my-sandbox --template gpu-kata --provider my-github -- claude
+```
+
+Direct `sandbox create --driver-config-json` remains valid for one-off
+creates. Put driver config on a template only when it should be reused.
+
+### Manage sandbox workload templates
+
+```bash
+openshell sandbox template create gpu-kata \
+  --image ghcr.io/nvidia/openshell-community/sandboxes/python:latest \
+  --cpu 2 \
+  --memory 4Gi \
+  --gpu 1 \
+  --label team=runtime \
+  --env FEATURE_FLAG=on
+openshell sandbox template list
+openshell sandbox template list --label-selector team=runtime
+openshell sandbox template list --all-workspaces --output json
+openshell sandbox template get gpu-kata
+openshell sandbox template delete gpu-kata
+```
+
+Template `--image` accepts an OCI image reference. If omitted, the gateway
+applies its default sandbox image when creating a sandbox from the template.
+Create-time policy, providers, labels, uploads, forwarding, editor launch, and
+the initial command stay on `sandbox create`.
 
 ### List and inspect sandboxes
 
@@ -772,7 +812,7 @@ The CLI help is always authoritative. If the help output contradicts this skill,
 
 ```bash
 $ openshell sandbox --help
-# Shows: create, get, list, stop, start, delete, exec, connect, upload, download, ssh-config, provider
+# Shows: create, get, list, stop, start, delete, exec, connect, upload, download, ssh-config, provider, template
 
 $ openshell sandbox upload --help
 # Shows: positional arguments (name, path, dest), usage examples
@@ -793,6 +833,8 @@ $ openshell sandbox upload --help
 | Create sandbox with tool | `openshell sandbox create -- claude` |
 | Create sandbox with GPUs | `openshell sandbox create --gpu 1` |
 | Create with custom policy | `openshell sandbox create --policy ./p.yaml` |
+| Create from template | `openshell sandbox create --template gpu-kata` |
+| Create workload template | `openshell sandbox template create gpu-kata --image python:3.12` |
 | Connect to sandbox | `openshell sandbox connect <name>` |
 | Stop sandbox compute | `openshell sandbox stop [name]` |
 | Start sandbox compute | `openshell sandbox start [name]` |
