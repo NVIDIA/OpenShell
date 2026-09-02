@@ -62,6 +62,8 @@ jobs:
           toolchain: "1.95.0"
           targets: x86_64-pc-windows-msvc
           components: clippy
+      - name: Install cargo-nextest
+        run: mise install --locked github:nextest-rs/nextest
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         env:
@@ -110,6 +112,8 @@ jobs:
           toolchain: "1.95.0"
           targets: x86_64-pc-windows-msvc
           components: clippy
+      - name: Install cargo-nextest
+        run: mise install --locked github:nextest-rs/nextest
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         env:

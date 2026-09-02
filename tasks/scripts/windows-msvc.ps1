@@ -516,7 +516,7 @@ function Invoke-Test([string] $RustTarget) {
     Assert-NativeTestTarget $RustTarget
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo test --workspace $UnsupportedDriverPackageExcludes --target $RustTarget --no-fail-fast $Z3WorkspaceFeatures" `
+        -CargoArgs "cargo nextest run --profile ci --workspace $UnsupportedDriverPackageExcludes --target $RustTarget $Z3WorkspaceFeatures" `
         -LogName "test-$RustTarget.log"
 }
 
@@ -524,12 +524,8 @@ function Invoke-PreCommitTest([string] $RustTarget) {
     Assert-NativeTestTarget $RustTarget
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo test --workspace --exclude openshell-server $UnsupportedDriverPackageExcludes --target $RustTarget --no-fail-fast $Z3WorkspaceFeatures" `
-        -LogName "test-$RustTarget-precommit-workspace.log"
-    Invoke-VsCargo `
-        -RustTarget $RustTarget `
-        -CargoArgs "cargo test -p openshell-server --features test-support --target $RustTarget --no-fail-fast $Z3ServerFeatures" `
-        -LogName "test-$RustTarget-precommit-server.log"
+        -CargoArgs "cargo nextest run --profile ci --workspace $UnsupportedDriverPackageExcludes --target $RustTarget --features openshell-server/test-support $Z3ServerFeatures" `
+        -LogName "test-$RustTarget-precommit.log"
 }
 
 function Invoke-UnsupportedContractTests([string] $RustTarget) {

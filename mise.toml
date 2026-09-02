@@ -44,6 +44,7 @@ k3d = { version = "5.8.3", os = ["macos"] }
 zig = "0.14.1"
 "github:rust-secure-code/cargo-auditable" = "0.7.5"
 "github:rust-cross/cargo-zigbuild" = "0.22.3"
+"github:nextest-rs/nextest" = { version = "cargo-nextest-0.9.143", os = ["windows"] }
 "npm:markdownlint-cli2" = "0.22.0"
 
 [tools."github:mozilla/sccache"]
