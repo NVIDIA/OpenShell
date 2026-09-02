@@ -95,16 +95,7 @@ pub enum ColorChoice {
 pub fn init(choice: ColorChoice) {
     let no_color = std::env::var_os("NO_COLOR");
     let force_color = std::env::var_os("FORCE_COLOR");
-
-    // Being attached to a terminal is not the same as that terminal rendering
-    // ANSI. `TERM` is the unix signal for it; Windows consoles enable virtual
-    // terminal processing instead and do not set `TERM`, so the check does not
-    // apply there.
-    let term_capable = if cfg!(unix) {
-        term_supports_ansi(std::env::var_os("TERM").as_deref())
-    } else {
-        true
-    };
+    let term = std::env::var_os("TERM");
 
     // Under `auto` each stream answers for itself. Redirecting one must not
     // decide for the other: `openshell ... 2> build.log` from a terminal has a
@@ -113,15 +104,13 @@ pub fn init(choice: ColorChoice) {
         choice,
         no_color.as_deref(),
         force_color.as_deref(),
-        term_capable,
-        std::io::stdout().is_terminal(),
+        terminal_supports_ansi(std::io::stdout().is_terminal(), term.as_deref()),
     );
     let stderr_enabled = resolve(
         choice,
         no_color.as_deref(),
         force_color.as_deref(),
-        term_capable,
-        std::io::stderr().is_terminal(),
+        terminal_supports_ansi(std::io::stderr().is_terminal(), term.as_deref()),
     );
     STDOUT_ENABLED.store(stdout_enabled, Ordering::Relaxed);
     STDERR_ENABLED.store(stderr_enabled, Ordering::Relaxed);
@@ -179,8 +168,7 @@ fn resolve(
     choice: ColorChoice,
     no_color: Option<&OsStr>,
     force_color: Option<&OsStr>,
-    term_capable: bool,
-    stream_is_terminal: bool,
+    stream_supports_ansi: bool,
 ) -> bool {
     match choice {
         ColorChoice::Always => return true,
@@ -201,10 +189,25 @@ fn resolve(
     // Only `auto` consults the terminal. An explicit request above has already
     // returned, so `--color always` and `FORCE_COLOR` still win on a terminal
     // that reports no ANSI support.
-    stream_is_terminal && term_capable
+    stream_supports_ansi
 }
 
-/// Whether the terminal named by `TERM` renders ANSI escapes.
+/// Whether this output stream's terminal renders ANSI escapes.
+///
+/// Being attached to a terminal is not the same as that terminal rendering
+/// ANSI. `TERM` is the unix signal for it; Windows consoles enable virtual
+/// terminal processing instead and do not set `TERM`, so the check does not
+/// apply there.
+fn terminal_supports_ansi(stream_is_terminal: bool, term: Option<&OsStr>) -> bool {
+    stream_is_terminal
+        && if cfg!(unix) {
+            term_supports_ansi(term)
+        } else {
+            true
+        }
+}
+
+/// Whether the terminal named by `TERM` renders ANSI escapes on Unix.
 ///
 /// Follows the rule `console` applies on unix, which this module overrides:
 /// `dumb` means no, and an unset `TERM` means no because nothing identifies a
@@ -508,77 +511,34 @@ mod tests {
 
     #[test]
     fn explicit_choice_overrides_environment_and_terminal() {
-        assert!(resolve(
-            ColorChoice::Always,
-            Some(env("1")),
-            None,
-            true,
-            false
-        ));
-        assert!(!resolve(
-            ColorChoice::Never,
-            None,
-            Some(env("1")),
-            true,
-            true
-        ));
+        assert!(resolve(ColorChoice::Always, Some(env("1")), None, false));
+        assert!(!resolve(ColorChoice::Never, None, Some(env("1")), true));
     }
 
     #[test]
     fn no_color_disables_when_set_and_non_empty() {
-        assert!(!resolve(
-            ColorChoice::Auto,
-            Some(env("1")),
-            None,
-            true,
-            true
-        ));
+        assert!(!resolve(ColorChoice::Auto, Some(env("1")), None, true));
         // Presence is what counts; the value is not interpreted, so a value that
         // reads as falsy still disables color.
-        assert!(!resolve(
-            ColorChoice::Auto,
-            Some(env("0")),
-            None,
-            true,
-            true
-        ));
+        assert!(!resolve(ColorChoice::Auto, Some(env("0")), None, true));
         // NO_COLOR outranks FORCE_COLOR.
         assert!(!resolve(
             ColorChoice::Auto,
             Some(env("1")),
             Some(env("1")),
-            true,
             true
         ));
         // An empty value is not "set" for the purposes of the convention.
-        assert!(resolve(ColorChoice::Auto, Some(env("")), None, true, true));
+        assert!(resolve(ColorChoice::Auto, Some(env("")), None, true));
     }
 
     #[test]
     fn force_color_enables_when_set_and_non_empty() {
-        assert!(resolve(
-            ColorChoice::Auto,
-            None,
-            Some(env("1")),
-            true,
-            false
-        ));
+        assert!(resolve(ColorChoice::Auto, None, Some(env("1")), false));
         // Same presence rule as NO_COLOR: `0` is a value, not an opt-out.
         // <https://force-color.org> keys on presence and non-emptiness only.
-        assert!(resolve(
-            ColorChoice::Auto,
-            None,
-            Some(env("0")),
-            true,
-            false
-        ));
-        assert!(!resolve(
-            ColorChoice::Auto,
-            None,
-            Some(env("")),
-            true,
-            false
-        ));
+        assert!(resolve(ColorChoice::Auto, None, Some(env("0")), false));
+        assert!(!resolve(ColorChoice::Auto, None, Some(env("")), false));
     }
 
     #[test]
@@ -598,37 +558,25 @@ mod tests {
     fn auto_does_not_style_an_incapable_terminal() {
         // A `dumb` terminal is still a terminal, so `is_terminal()` alone would
         // wrongly enable color.
-        assert!(!resolve(ColorChoice::Auto, None, None, false, true));
-        assert!(resolve(ColorChoice::Auto, None, None, true, true));
+        assert!(!resolve(ColorChoice::Auto, None, None, false));
+        assert!(resolve(ColorChoice::Auto, None, None, true));
     }
 
     #[test]
     fn explicit_requests_outrank_terminal_capability() {
         // `--color always` and FORCE_COLOR are for callers who know better than
         // the detection, so an incapable terminal must not veto them.
-        assert!(resolve(ColorChoice::Always, None, None, false, true));
-        assert!(resolve(
-            ColorChoice::Auto,
-            None,
-            Some(env("1")),
-            false,
-            true
-        ));
+        assert!(resolve(ColorChoice::Always, None, None, false));
+        assert!(resolve(ColorChoice::Auto, None, Some(env("1")), false));
         // The negative direction still wins over capability too.
-        assert!(!resolve(ColorChoice::Never, None, None, true, true));
-        assert!(!resolve(
-            ColorChoice::Auto,
-            Some(env("1")),
-            None,
-            true,
-            true
-        ));
+        assert!(!resolve(ColorChoice::Never, None, None, true));
+        assert!(!resolve(ColorChoice::Auto, Some(env("1")), None, true));
     }
 
     #[test]
     fn capability_does_not_rescue_a_redirected_stream() {
         // Capability is an additional requirement, not an alternative one.
-        assert!(!resolve(ColorChoice::Auto, None, None, true, false));
+        assert!(!resolve(ColorChoice::Auto, None, None, false));
     }
 
     #[test]
@@ -636,8 +584,8 @@ mod tests {
         // `openshell ... 2> build.log` from a terminal: stdout is styled, the
         // log file is not. Resolving both from stdout's answer would put escapes
         // in the log.
-        assert!(resolve(ColorChoice::Auto, None, None, true, true));
-        assert!(!resolve(ColorChoice::Auto, None, None, true, false));
+        assert!(resolve(ColorChoice::Auto, None, None, true));
+        assert!(!resolve(ColorChoice::Auto, None, None, false));
     }
 
     #[test]
@@ -659,7 +607,7 @@ mod tests {
 
     #[test]
     fn auto_follows_the_terminal() {
-        assert!(resolve(ColorChoice::Auto, None, None, true, true));
-        assert!(!resolve(ColorChoice::Auto, None, None, true, false));
+        assert!(resolve(ColorChoice::Auto, None, None, true));
+        assert!(!resolve(ColorChoice::Auto, None, None, false));
     }
 }
