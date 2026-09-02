@@ -3544,13 +3544,13 @@ where
     if committed {
         if let Err(error) = client.write_all(&streaming_head).await {
             session
-                .end(openshell_core::proto::HttpResponseSessionEndReason::ClientDisconnect)
+                .end(openshell_core::proto::MiddlewareSessionEndReason::DownstreamDisconnect)
                 .await;
             return Err(error).into_diagnostic();
         }
         if let Err(error) = client.flush().await {
             session
-                .end(openshell_core::proto::HttpResponseSessionEndReason::ClientDisconnect)
+                .end(openshell_core::proto::MiddlewareSessionEndReason::DownstreamDisconnect)
                 .await;
             return Err(error).into_diagnostic();
         }
@@ -3578,19 +3578,19 @@ where
                 .generation_guard
                 .is_some_and(PolicyGenerationGuard::is_stale)
             {
-                openshell_core::proto::HttpResponseSessionEndReason::PolicyReload
+                openshell_core::proto::MiddlewareSessionEndReason::PolicyReload
             } else if error
                 .to_string()
                 .starts_with("HTTP response client write failed:")
             {
-                openshell_core::proto::HttpResponseSessionEndReason::ClientDisconnect
+                openshell_core::proto::MiddlewareSessionEndReason::DownstreamDisconnect
             } else if error
                 .to_string()
                 .starts_with("HTTP response middleware failure:")
             {
-                openshell_core::proto::HttpResponseSessionEndReason::MiddlewareFailure
+                openshell_core::proto::MiddlewareSessionEndReason::MiddlewareFailure
             } else {
-                openshell_core::proto::HttpResponseSessionEndReason::UpstreamError
+                openshell_core::proto::MiddlewareSessionEndReason::UpstreamDisconnect
             };
             session.end(end_reason).await;
             if committed {
@@ -3624,7 +3624,7 @@ where
         && let Err(error) = guard.ensure_current()
     {
         session
-            .end(openshell_core::proto::HttpResponseSessionEndReason::PolicyReload)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
             .await;
         return Err(error);
     }
@@ -4755,11 +4755,10 @@ mod tests {
     use openshell_core::proto::{
         Decision, HttpRequestResult, HttpResponseBodyMode, HttpResponseBodyResult,
         HttpResponseBodyTransform, HttpResponseEvent, HttpResponseEventResult,
-        HttpResponsePreflightDecision, HttpResponsePreflightInspect, HttpResponseTrailersResult,
-        MiddlewareBinding, MiddlewareManifest, SupervisorMiddlewareOperation,
-        SupervisorMiddlewarePhase, http_response_body_result, http_response_body_transform,
-        http_response_body_unit, http_response_event, http_response_event_result,
-        http_response_preflight_decision,
+        HttpResponsePreflightDecision, HttpResponsePreflightInspect, MiddlewareBinding,
+        MiddlewareManifest, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
+        http_response_body_result, http_response_body_transform, http_response_body_unit,
+        http_response_event, http_response_event_result, http_response_preflight_decision,
     };
     use openshell_core::secrets::SecretResolver;
     use std::pin::Pin;
@@ -4838,8 +4837,7 @@ mod tests {
                     };
                     let result = match event {
                         http_response_event::Event::Preflight(_) => {
-                            let (body_mode, header_mutations, declared_trailer_names) = match script
-                            {
+                            let (body_mode, header_mutations) = match script {
                                 ResponseRelayScript::HeadersOnly => (
                                     HttpResponseBodyMode::HeadersOnly,
                                     vec![write_header(
@@ -4847,38 +4845,30 @@ mod tests {
                                         "private",
                                         ExistingHeaderAction::Overwrite,
                                     )],
-                                    Vec::new(),
                                 ),
                                 ResponseRelayScript::WholeBody
-                                | ResponseRelayScript::InvalidWholeBodySequence => {
-                                    (HttpResponseBodyMode::WholeBodyBytes, Vec::new(), Vec::new())
+                                | ResponseRelayScript::InvalidWholeBodySequence
+                                | ResponseRelayScript::WholeBodyWithTrailer => {
+                                    (HttpResponseBodyMode::WholeBodyBytes, Vec::new())
                                 }
-                                ResponseRelayScript::WholeBodyWithTrailer => (
-                                    HttpResponseBodyMode::WholeBodyBytes,
-                                    Vec::new(),
-                                    vec!["digest".into()],
-                                ),
                                 ResponseRelayScript::Stream
-                                | ResponseRelayScript::InvalidBodySequence => (
-                                    HttpResponseBodyMode::StreamBytes,
-                                    Vec::new(),
-                                    vec!["digest".into()],
-                                ),
+                                | ResponseRelayScript::InvalidBodySequence => {
+                                    (HttpResponseBodyMode::StreamBytes, Vec::new())
+                                }
                             };
                             HttpResponseEventResult {
                                 result: Some(
                                     http_response_event_result::Result::PreflightDecision(
                                         HttpResponsePreflightDecision {
-                                            decision: Some(
-                                                http_response_preflight_decision::Decision::Inspect(
+                                            action: Some(
+                                                http_response_preflight_decision::Action::Inspect(
                                                     HttpResponsePreflightInspect {
                                                         body_mode: body_mode as i32,
                                                         header_mutations,
-                                                        declared_trailer_names,
-                                                        ..Default::default()
                                                     },
                                                 ),
                                             ),
+                                            ..Default::default()
                                         },
                                     ),
                                 ),
@@ -4913,43 +4903,20 @@ mod tests {
                                         } else {
                                             body.sequence
                                         },
-                                        decision: Some(
-                                            http_response_body_result::Decision::Transform(
-                                                HttpResponseBodyTransform {
-                                                    replacement: Some(
-                                                        http_response_body_transform::Replacement::Data(
-                                                            replacement,
-                                                        ),
+                                        action: Some(http_response_body_result::Action::Transform(
+                                            HttpResponseBodyTransform {
+                                                replacement: Some(
+                                                    http_response_body_transform::Replacement::Data(
+                                                        replacement,
                                                     ),
-                                                },
-                                            ),
-                                        ),
+                                                ),
+                                            },
+                                        )),
                                         ..Default::default()
                                     },
                                 )),
                             }
                         }
-                        http_response_event::Event::Trailers(_) => HttpResponseEventResult {
-                            result: Some(http_response_event_result::Result::TrailersResult(
-                                HttpResponseTrailersResult {
-                                    trailer_mutations: if matches!(
-                                        script,
-                                        ResponseRelayScript::Stream
-                                            | ResponseRelayScript::WholeBodyWithTrailer
-                                    ) {
-                                        vec![write_header(
-                                            "digest",
-                                            "sha-256=:test:",
-                                            ExistingHeaderAction::Overwrite,
-                                        )]
-                                    } else {
-                                        Vec::new()
-                                    },
-                                    ..Default::default()
-                                },
-                            )),
-                        },
-                        http_response_event::Event::BodyEnd(_) => continue,
                         http_response_event::Event::SessionEnd(_) => break,
                     };
                     if sender.send(Ok(result)).await.is_err() {
@@ -6973,7 +6940,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_middleware_streams_normalized_chunk_payloads_and_trailers() {
+    async fn response_middleware_streams_normalized_chunks_and_preserves_trailers() {
         let (outcome, delivered) = run_response_middleware_relay(
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: x-upstream\r\n\r\n2;ext=yes\r\nhe\r\n3\r\nllo\r\n0\r\nX-Upstream: kept\r\n\r\n",
             "GET",
@@ -6982,16 +6949,10 @@ mod tests {
         .await;
         assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
         let delivered = String::from_utf8(delivered).unwrap();
-        assert!(
-            delivered.contains("Trailer: x-upstream, digest\r\n"),
-            "{delivered}"
-        );
+        assert!(delivered.contains("Trailer: x-upstream\r\n"), "{delivered}");
         assert!(delivered.contains("5\r\nHELLO\r\n"), "{delivered}");
         assert!(delivered.contains("x-upstream: kept\r\n"), "{delivered}");
-        assert!(
-            delivered.contains("digest: sha-256=:test:\r\n"),
-            "{delivered}"
-        );
+        assert!(!delivered.contains("digest:"), "{delivered}");
         assert!(!delivered.contains("ext=yes"), "{delivered}");
     }
 

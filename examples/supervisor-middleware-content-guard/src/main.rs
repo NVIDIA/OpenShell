@@ -17,15 +17,14 @@ use openshell_core::proto::{
     Decision, ExistingHeaderAction, Finding, HeaderMutation, HttpRequestEvaluation,
     HttpRequestResult, HttpResponseBodyMode, HttpResponseBodyResult, HttpResponseBodyTransform,
     HttpResponseEvent, HttpResponseEventResult, HttpResponsePreflightDecision,
-    HttpResponsePreflightInspect, HttpResponsePreflightSkip, HttpResponseTrailersResult,
-    MiddlewareBinding, MiddlewareManifest, SupervisorMiddlewareOperation,
-    SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse, WebSocketMessage,
-    WebSocketMessageResult, WebSocketPreflightAction, WebSocketPreflightDecision,
-    WebSocketSessionEvent, WebSocketSessionEventResult, WriteHeader, header_mutation,
-    http_response_body_result, http_response_body_transform, http_response_body_unit,
-    http_response_event, http_response_event_result, http_response_preflight_decision,
-    web_socket_message, web_socket_message_result, web_socket_session_event,
-    web_socket_session_event_result,
+    HttpResponsePreflightInspect, HttpResponsePreflightSkip, MiddlewareBinding, MiddlewareManifest,
+    SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, ValidateConfigRequest,
+    ValidateConfigResponse, WebSocketMessage, WebSocketMessageResult, WebSocketPreflightAction,
+    WebSocketPreflightDecision, WebSocketSessionEvent, WebSocketSessionEventResult, WriteHeader,
+    header_mutation, http_response_body_result, http_response_body_transform,
+    http_response_body_unit, http_response_event, http_response_event_result,
+    http_response_preflight_decision, web_socket_message, web_socket_message_result,
+    web_socket_session_event, web_socket_session_event_result,
 };
 use prost_types::Struct;
 use prost_types::value::Kind;
@@ -310,7 +309,7 @@ enum ResponseMode {
 struct ResponseSessionState {
     selected: Option<ResponseMode>,
     next_sequence: u64,
-    input_bytes: u64,
+    body_ended: bool,
 }
 
 impl ResponseSessionState {
@@ -332,6 +331,7 @@ impl ResponseSessionState {
         };
         self.selected = Some(selected);
         self.next_sequence = 1;
+        self.body_ended = false;
         Ok(response_preflight_inspect(selected))
     }
 
@@ -347,6 +347,11 @@ impl ResponseSessionState {
                 "headers-only sessions do not receive body events",
             ));
         }
+        if self.body_ended {
+            return Err(Status::failed_precondition(
+                "body arrived after end_of_stream",
+            ));
+        }
         if body.sequence != self.next_sequence {
             return Err(Status::invalid_argument(format!(
                 "expected body sequence {}, received {}",
@@ -357,7 +362,7 @@ impl ResponseSessionState {
         let Some(http_response_body_unit::Payload::Data(data)) = body.payload else {
             return Err(Status::invalid_argument("body data is required"));
         };
-        self.input_bytes = self.input_bytes.saturating_add(data.len() as u64);
+        self.body_ended = body.end_of_stream;
         let replacement = match selected {
             ResponseMode::WholeBody => [b"[whole] ".as_slice(), &data].concat(),
             ResponseMode::Stream => data.to_ascii_uppercase(),
@@ -367,50 +372,13 @@ impl ResponseSessionState {
             result: Some(http_response_event_result::Result::BodyResult(
                 HttpResponseBodyResult {
                     sequence: body.sequence,
-                    decision: Some(http_response_body_result::Decision::Transform(
+                    action: Some(http_response_body_result::Action::Transform(
                         HttpResponseBodyTransform {
                             replacement: Some(http_response_body_transform::Replacement::Data(
                                 replacement,
                             )),
                         },
                     )),
-                    ..Default::default()
-                },
-            )),
-        })
-    }
-
-    fn body_end(&self, final_sequence: u64) -> Result<(), Status> {
-        let expected = self.next_sequence.saturating_sub(1);
-        if final_sequence != expected {
-            return Err(Status::invalid_argument(format!(
-                "expected final body sequence {expected}, received {final_sequence}"
-            )));
-        }
-        Ok(())
-    }
-
-    fn trailers(&self) -> Result<HttpResponseEventResult, Status> {
-        let selected = self
-            .selected
-            .ok_or_else(|| Status::failed_precondition("trailers arrived before preflight"))?;
-        if selected == ResponseMode::HeadersOnly {
-            return Err(Status::failed_precondition(
-                "headers-only sessions do not receive trailers",
-            ));
-        }
-        let trailer_mutations = if selected == ResponseMode::Stream {
-            vec![write_header(
-                "x-example-body-bytes",
-                &self.input_bytes.to_string(),
-            )]
-        } else {
-            Vec::new()
-        };
-        Ok(HttpResponseEventResult {
-            result: Some(http_response_event_result::Result::TrailersResult(
-                HttpResponseTrailersResult {
-                    trailer_mutations,
                     ..Default::default()
                 },
             )),
@@ -431,26 +399,22 @@ fn response_preflight_skip() -> HttpResponseEventResult {
     HttpResponseEventResult {
         result: Some(http_response_event_result::Result::PreflightDecision(
             HttpResponsePreflightDecision {
-                decision: Some(http_response_preflight_decision::Decision::Skip(
-                    HttpResponsePreflightSkip {
-                        reason: "path is outside the response example".into(),
-                        reason_code: "path_not_selected".into(),
-                        ..Default::default()
-                    },
+                action: Some(http_response_preflight_decision::Action::Skip(
+                    HttpResponsePreflightSkip {},
                 )),
+                reason: "path is outside the response example".into(),
+                reason_code: "path_not_selected".into(),
+                ..Default::default()
             },
         )),
     }
 }
 
 fn response_preflight_inspect(selected: ResponseMode) -> HttpResponseEventResult {
-    let (body_mode, declared_trailer_names) = match selected {
-        ResponseMode::HeadersOnly => (HttpResponseBodyMode::HeadersOnly, Vec::new()),
-        ResponseMode::WholeBody => (HttpResponseBodyMode::WholeBodyBytes, Vec::new()),
-        ResponseMode::Stream => (
-            HttpResponseBodyMode::StreamBytes,
-            vec!["x-example-body-bytes".into()],
-        ),
+    let body_mode = match selected {
+        ResponseMode::HeadersOnly => HttpResponseBodyMode::HeadersOnly,
+        ResponseMode::WholeBody => HttpResponseBodyMode::WholeBodyBytes,
+        ResponseMode::Stream => HttpResponseBodyMode::StreamBytes,
     };
     let mode_name = match selected {
         ResponseMode::HeadersOnly => "headers-only",
@@ -460,14 +424,13 @@ fn response_preflight_inspect(selected: ResponseMode) -> HttpResponseEventResult
     HttpResponseEventResult {
         result: Some(http_response_event_result::Result::PreflightDecision(
             HttpResponsePreflightDecision {
-                decision: Some(http_response_preflight_decision::Decision::Inspect(
+                action: Some(http_response_preflight_decision::Action::Inspect(
                     HttpResponsePreflightInspect {
                         body_mode: body_mode as i32,
                         header_mutations: vec![write_header("x-example-response-mode", mode_name)],
-                        declared_trailer_names,
-                        ..Default::default()
                     },
                 )),
+                ..Default::default()
             },
         )),
     }
@@ -508,10 +471,6 @@ impl HttpResponsePreReturn for ContentGuard {
                         state.preflight(preflight).map(Some)
                     }
                     Some(http_response_event::Event::Body(body)) => state.body(body).map(Some),
-                    Some(http_response_event::Event::BodyEnd(body_end)) => {
-                        state.body_end(body_end.final_sequence).map(|()| None)
-                    }
-                    Some(http_response_event::Event::Trailers(_)) => state.trailers().map(Some),
                     Some(http_response_event::Event::SessionEnd(_)) => break,
                     None => Err(Status::invalid_argument("response event is required")),
                 };
@@ -819,8 +778,7 @@ mod tests {
             else {
                 panic!("expected preflight decision");
             };
-            let Some(http_response_preflight_decision::Decision::Inspect(inspect)) =
-                decision.decision
+            let Some(http_response_preflight_decision::Action::Inspect(inspect)) = decision.action
             else {
                 panic!("expected inspect decision");
             };
@@ -840,13 +798,13 @@ mod tests {
                 .body(HttpResponseBodyUnit {
                     sequence: 1,
                     payload: Some(http_response_body_unit::Payload::Data(b"hello".to_vec())),
+                    end_of_stream: true,
                 })
                 .unwrap();
             let Some(http_response_event_result::Result::BodyResult(body)) = result.result else {
                 panic!("expected body result");
             };
-            let Some(http_response_body_result::Decision::Transform(transform)) = body.decision
-            else {
+            let Some(http_response_body_result::Action::Transform(transform)) = body.action else {
                 panic!("expected body transform");
             };
             let Some(http_response_body_transform::Replacement::Data(data)) = transform.replacement
@@ -858,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_declares_and_writes_byte_count_trailer() {
+    fn stream_tracks_end_of_stream_on_the_final_unit() {
         let mut state = ResponseSessionState::default();
         let preflight = state.preflight(response_preflight("/stream")).unwrap();
         let Some(http_response_event_result::Result::PreflightDecision(decision)) =
@@ -866,24 +824,19 @@ mod tests {
         else {
             panic!("expected preflight decision");
         };
-        let Some(http_response_preflight_decision::Decision::Inspect(inspect)) = decision.decision
+        let Some(http_response_preflight_decision::Action::Inspect(inspect)) = decision.action
         else {
             panic!("expected inspect decision");
         };
-        assert_eq!(inspect.declared_trailer_names, ["x-example-body-bytes"]);
+        assert_eq!(inspect.body_mode, HttpResponseBodyMode::StreamBytes as i32);
         state
             .body(HttpResponseBodyUnit {
                 sequence: 1,
                 payload: Some(http_response_body_unit::Payload::Data(b"hello".to_vec())),
+                end_of_stream: true,
             })
             .unwrap();
-        state.body_end(1).unwrap();
-        let trailers = state.trailers().unwrap();
-        let Some(http_response_event_result::Result::TrailersResult(trailers)) = trailers.result
-        else {
-            panic!("expected trailer result");
-        };
-        assert_eq!(trailers.trailer_mutations.len(), 1);
+        assert!(state.body_ended);
     }
 
     #[test]
@@ -894,10 +847,10 @@ mod tests {
         else {
             panic!("expected preflight decision");
         };
-        let Some(http_response_preflight_decision::Decision::Skip(skip)) = decision.decision else {
+        let Some(http_response_preflight_decision::Action::Skip(_)) = decision.action else {
             panic!("expected skip decision");
         };
-        assert_eq!(skip.reason_code, "path_not_selected");
+        assert_eq!(decision.reason_code, "path_not_selected");
     }
 
     #[tokio::test]
