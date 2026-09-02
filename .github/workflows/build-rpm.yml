@@ -47,7 +47,7 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 60
     container:
-      image: docker.io/library/fedora:44@sha256:be9d65e2344d805cc11114319c685ecaa96b6d9b4350a0a6460cdb931babbd19
+      image: docker.io/library/fedora:44@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
     steps:
       - name: Install packaging dependencies
         run: |
