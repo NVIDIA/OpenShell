@@ -40,6 +40,9 @@ COPY providers/ providers/
 # pass the git tag with the leading "v" stripped. Empty otherwise.
 ARG OPENSHELL_VERSION=""
 
+# The alias re-adds `in-tree-compute-drivers`, which a bare
+# `--no-default-features` would drop, leaving a gateway with no compute driver.
+
 # z3-sys bundled build needs prefetched Z3 source.
 ARG Z3_VERSION=4.16.0
 RUN mkdir -p /tmp/z3-src \
@@ -49,7 +52,8 @@ RUN mkdir -p /tmp/z3-src \
     && Z3_SYS_BUNDLED_DIR_OVERRIDE=/tmp/z3-src \
     cargo build --release \
         --package openshell-gateway \
-        --features bundled-z3
+        --no-default-features \
+        --features defaults-without-telemetry,bundled-z3
 
 # ---------------------------------------------------------------------------
 # Runtime
