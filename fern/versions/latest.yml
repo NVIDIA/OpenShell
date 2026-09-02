@@ -15,6 +15,8 @@ navigation:
   title: Manage OpenShell
 - folder: ../pages-latest/providers
   title: Providers
+- folder: ../pages-latest/extensibility
+  title: Extensibility
 - folder: ../pages-latest/observability
   title: Observability
 - folder: ../pages-latest/kubernetes

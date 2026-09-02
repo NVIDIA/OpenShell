@@ -44,7 +44,7 @@ experimental:
   - ./pages-v0.0.36/_components
   - ./components
 versions:
-- display-name: Latest (v0.0.57)
+- display-name: Latest (v0.0.116)
   path: ./versions/latest.yml
   slug: latest
 - display-name: dev

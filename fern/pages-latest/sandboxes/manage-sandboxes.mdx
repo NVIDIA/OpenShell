@@ -20,6 +20,26 @@ Create a sandbox with a single command. For example, to create a sandbox with Cl
 openshell sandbox create -- claude
 ```
 
+The trailing command is the sandbox's canonical main process. OpenShell starts
+it once and attaches your terminal to it. With no trailing command, OpenShell
+starts `/bin/bash -l` in a retained pseudo-terminal. Add `--detach` to create
+the sandbox without attaching:
+
+```shell
+openshell sandbox create --name worker --detach -- ./worker
+```
+
+`--upload` cannot yet be combined with a trailing main command because uploads
+finish after the canonical process starts. Create a scratch sandbox, upload the
+files, then launch the workload with `sandbox exec`, or build the files into the
+sandbox image.
+
+For automation, use `--output json` or `--output yaml` to get machine-readable sandbox metadata after creation:
+
+```shell
+openshell sandbox create --output json
+```
+
 Every sandbox requires a gateway. Register or select one before running sandbox commands:
 
 ```shell
@@ -43,6 +63,25 @@ value as both the request and the limit so the scheduler reserves the same
 amount the sandbox can use. The VM driver currently accepts these flags but
 does not change VM allocation.
 
+### Driver-Specific Configuration
+
+Pass experimental driver-owned settings with `--driver-config-json`. The value
+must be a JSON object keyed by driver name. The gateway forwards only the block
+for its configured compute driver:
+
+Nested keys inside each driver block use snake_case. The top-level envelope keys
+are driver names, such as `kubernetes`, and are not part of the nested schema.
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","node_selector":{"pool":"gpu"}}}}' \
+  -- claude
+```
+
+Use this only for driver-specific fields that do not have a stable CLI flag.
+Prefer stable flags such as `--cpu`, `--memory`, and `--gpu` when they cover
+the same behavior.
+
 ### GPU Resources
 
 To request GPU resources, add `--gpu`:
@@ -51,9 +90,40 @@ To request GPU resources, add `--gpu`:
 openshell sandbox create --gpu -- claude
 ```
 
+Request a specific number of GPUs by passing a count to `--gpu`:
+
+```shell
+openshell sandbox create --gpu 2 -- claude
+```
+
+When you omit the count, OpenShell treats the request as `--gpu 1`.
+Kubernetes honors counted `--gpu` requests by setting the `nvidia.com/gpu`
+limit. Docker and Podman select the requested number of default NVIDIA CDI
+devices in round-robin order. VM gateways accept only one GPU, either through
+`--gpu` or `--gpu 1`; a single `gpu_device_ids` entry works with either form.
+
 For Docker-backed sandboxes, GPU injection uses Docker CDI. If you enable Docker
 CDI after the gateway starts, restart the gateway so OpenShell can detect the
 updated Docker daemon capability.
+
+Docker and Podman refresh the CDI inventory before validating or creating a
+default GPU request, so CDI devices added or removed after the driver starts can
+be reflected in later sandbox creates. On WSL2 all-only runtimes, the default
+can fall back to `nvidia.com/gpu=all`; that fallback counts as one selectable
+device.
+
+Exact GPU device selection is driver-specific and still requires `--gpu`. For
+Docker or Podman, pass CDI IDs through `cdi_devices`. The top-level key must
+match the active driver; replace `docker` with `podman` when using Podman. CDI
+IDs are treated as opaque strings. The list must not contain duplicate IDs, and
+its length must match the effective GPU count:
+
+```shell
+openshell sandbox create \
+  --gpu \
+  --driver-config-json '{"docker":{"cdi_devices":["nvidia.com/gpu=0"]}}' \
+  -- claude
+```
 
 ### Custom Containers
 
@@ -86,11 +156,20 @@ For default policy coverage by agent, refer to [Default Policy](/reference/defau
 
 ## Connect to a Sandbox
 
-Open an SSH session into a running sandbox:
+Attach to the canonical main process in a running sandbox:
 
 ```shell
 openshell sandbox connect my-sandbox
 ```
+
+Disconnecting does not stop the process or close its stdin. A later `connect`
+attaches to the same process instance and replays up to 1 MiB of recent
+output. One attachment owns stdin at a time. Use `sandbox exec --tty --
+/bin/bash -l` when you want a new independent shell instead.
+
+Press `Ctrl-P`, then `Ctrl-Q` to disconnect without terminating the main
+process. `Ctrl-C` retains its normal terminal behavior and interrupts the
+foreground process.
 
 Launch VS Code or Cursor directly into the sandbox workspace:
 
@@ -134,6 +213,29 @@ OpenShell allocates a TTY automatically when both stdin and stdout are terminals
 | `--timeout`    | Command timeout in seconds. `0` disables the timeout.    |
 | `--tty`        | Force TTY allocation.                                    |
 | `--no-tty`     | Disable TTY allocation even when attached to a terminal. |
+| `--env`        | Set an environment variable for the command (`KEY=VALUE`, repeatable). |
+
+## Set Environment Variables
+
+Inject environment variables into the sandbox at creation time:
+
+```shell
+openshell sandbox create --env API_KEY=sk-test --env DEBUG=1 -- my-agent
+```
+
+Variables set with `--env` are available to all processes in the sandbox, including interactive shells and exec commands.
+
+When an `--env` key looks like a credential — a known provider variable, or a name whose underscore-separated segments include a credential word such as `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `API_KEY`, `ACCESS_KEY`, or `SECRET_KEY` (for example `DB_TOKEN` or `MY_ACCESS_KEY`) — `sandbox create` prints a non-blocking warning. Matching is on whole segments, so unrelated names like `TOKENIZERS_PARALLELISM` or `PASSWORDLESS_LOGIN` do not warn. The agent inside the sandbox can read plain environment values directly, so to hide a secret from the agent, attach it through a [provider](/sandboxes/providers-v2) with `--provider` instead. Suppress the warning with `--no-credential-warnings`. Detection uses the key name only; values are never inspected or printed.
+
+You can also set per-command environment variables with `sandbox exec`:
+
+```shell
+openshell sandbox exec -n my-sandbox --env MY_VAR=hello -- printenv MY_VAR
+```
+
+Per-command variables override the sandbox-level environment for that command only.
+
+Environment variable names starting with `OPENSHELL_` are reserved. Keys must match `[A-Za-z_][A-Za-z0-9_]*`.
 
 ## Label a Sandbox
 
@@ -148,6 +250,33 @@ List only the sandboxes that match a label selector:
 ```shell
 openshell sandbox list --selector env=dev
 openshell sandbox list --selector env=dev,team=platform
+```
+
+The Python SDK accepts the same gateway labels and selectors. Labels passed to
+`create` are stored on the gateway sandbox object and are returned on
+`SandboxRef.labels`, so selector-based listing finds Python-created sandboxes:
+
+```python
+from openshell import SandboxClient
+
+with SandboxClient.from_active_cluster() as client:
+    sandbox = client.create(workspace="default", name="deep-research-1", labels={"env": "dev", "team": "platform"})
+    assert sandbox.labels["team"] == "platform"
+
+    matches = client.list(workspace="default", label_selector="env=dev,team=platform")
+    assert sandbox.id in {s.id for s in matches}
+```
+
+For non-interactive automation, pass a renewable client-credentials provider.
+Omitted issuer, client ID, audience, and scopes are read from the active
+gateway's metadata. The client requires TLS for non-loopback gateways:
+
+```python
+from openshell import ClientCredentialsAuth, SandboxClient
+
+auth = ClientCredentialsAuth(client_secret=lambda: load_secret())
+with SandboxClient.from_active_cluster(client_credentials=auth) as client:
+    sandboxes = client.list(workspace="default")
 ```
 
 ## Expose Long Running Services
@@ -223,6 +352,12 @@ Get detailed information about a specific sandbox. The output lists **Policy sou
 openshell sandbox get my-sandbox
 ```
 
+For automation, use `--output json` or `--output yaml` to get machine-readable sandbox details:
+
+```shell
+openshell sandbox get my-sandbox --output json
+```
+
 Print only that policy YAML for scripting (same effective policy, no metadata):
 
 ```shell
@@ -250,6 +385,8 @@ openshell term
 
 Use the terminal to spot blocked connections marked `action=deny` and inference-related proxy activity. If a connection is blocked unexpectedly, add the host to your network policy. Refer to [Policies](/sandboxes/policies) for the workflow.
 
+The dashboard has three panels stacked vertically: Gateways, Providers (or Global Settings), and Sandboxes. Navigate within a panel with `Up`/`Down` or `j`/`k`. At a list boundary the cursor overflows into the adjacent panel, skipping empty panels. Use `Tab`/`Shift+Tab` to cycle panels directly. Press `h`/`l` or `Left`/`Right` in the middle panel to switch between the Providers and Global Settings tabs.
+
 ## Port Forwarding
 
 Forward a local port to a running sandbox to access services inside it, such as a web server or database:
@@ -258,6 +395,8 @@ Forward a local port to a running sandbox to access services inside it, such as 
 openshell forward start 8000 my-sandbox
 openshell forward start 8000 my-sandbox -d    # run in background
 ```
+
+OpenShell prints the local URL only after the forward listener is reachable. Background forwards must be tracked locally so `openshell forward list` and `openshell forward stop` can manage them.
 
 List and stop active forwards:
 
@@ -290,22 +429,31 @@ Append the output to `~/.ssh/config` or use `--editor` on `sandbox create`/`sand
 Upload files from your host into the sandbox:
 
 ```shell
-openshell sandbox upload my-sandbox ./src /sandbox/src
+openshell sandbox upload my-sandbox ./src
 ```
 
-When the local path is a named directory, OpenShell preserves that basename at the destination, matching `scp -r` and `cp -r`. The example above creates `/sandbox/src/src`.
+When you omit the destination, OpenShell discovers the sandbox's working
+directory and uploads there. For a named local directory, OpenShell preserves
+the basename, matching `scp -r` and `cp -r`. If that directory already exists,
+the upload merges into it and overwrites matching entries without deleting
+unrelated entries.
 
 OpenShell preserves symlinks during upload. A symlink arrives in the sandbox as a symlink with the same target path instead of an expanded copy of the target file or directory. Dangling symlinks are also preserved.
 
 Download files from the sandbox to your host:
 
 ```shell
-openshell sandbox download my-sandbox /sandbox/output ./local
+openshell sandbox download my-sandbox output ./local
 ```
 
 When the sandbox-side source is a single file, the destination follows `cp`-style placement: if the destination already exists as a directory or ends with `/`, the file lands inside it as `<dest>/<basename>`; otherwise the file is written at the exact destination path.
 
-The CLI only allows sandbox-side sources that resolve inside the writable workspace (`/sandbox`). Paths that escape lexically (`/etc/passwd`, `/sandbox/../etc/passwd`) and paths that escape through a symlink (`/sandbox/etc-link` pointing at `/etc`) are both refused before any data is transferred.
+The CLI discovers the sandbox's canonical working directory and only allows
+sandbox-side sources that resolve inside it. Paths that escape lexically, such
+as `/etc/passwd` or `/sandbox/../etc/passwd`, and paths that escape through a
+symlink are refused before any data is transferred. Relative sources are
+resolved from the working directory; absolute sources within the same canonical
+directory are also accepted.
 
 <Note>
 You can also upload files at creation time with the `--upload` flag on
@@ -317,6 +465,33 @@ openshell sandbox create --upload ./src:/workspace/src --upload ./config:/worksp
 ```
 
 </Note>
+
+By default, uploads inside a Git repository respect `.gitignore` rules so that
+build artifacts, dependency caches, and other ignored files are not transferred.
+If `.gitignore` filtering excludes every file in the upload path, the CLI falls
+back to an unfiltered upload and prints a warning. Pass `--no-git-ignore` to
+opt into unfiltered uploads explicitly, upload a path outside the Git work
+tree, or force-add the intended files if they should remain Git-aware.
+
+## Stop and Start Sandboxes
+
+Stop compute when you want to retain a sandbox and its persistent workspace
+without keeping its container, pod, or VM running:
+
+```shell
+openshell sandbox stop my-sandbox
+openshell sandbox start my-sandbox
+```
+
+The name is optional and defaults to the last-used sandbox. Stop stops local
+background forwards and waits for the `Stopped` phase. Start waits until the
+same sandbox returns to `Ready`. While stopped, you cannot connect, execute
+commands, transfer files, forward ports, or reach exposed services. Policies,
+provider attachments, settings, service definitions, and persistent workspace
+data remain associated with the sandbox.
+
+Stop and start are idempotent. Delete a stopped sandbox normally when you
+no longer need its retained state.
 
 ## Delete Sandboxes
 
@@ -330,12 +505,27 @@ openshell sandbox delete my-sandbox
 
 Every sandbox moves through a defined set of phases:
 
-| Phase        | Description                                                                                                                            |
-| ------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Provisioning | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy.                                    |
-| Ready        | The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs. |
-| Error        | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details.                                   |
-| Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                  |
+| Phase        | Description                                                                                                                                                    |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Provisioning | The runtime is setting up the sandbox environment, or the gateway is waiting for the sandbox supervisor to establish its authenticated control session.       |
+| Ready        | The sandbox is running and its supervisor control session is connected. You can connect, execute commands, sync files, and view logs.                          |
+| Stopping     | The gateway accepted a stop request and is stopping compute while retaining persistent state.                                                         |
+| Stopped      | Compute is stopped and access is unavailable. The sandbox record and driver-owned persistent workspace remain.                                       |
+| Starting     | Compute is starting. The sandbox becomes usable only after a fresh supervisor session connects.                                                       |
+| Error        | Provisioning failed or the canonical main process exited unexpectedly. Main-process exit is terminal even with exit code 0. Check logs with `openshell logs`.       |
+| Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                                          |
+
+The compute backend can become ready before the sandbox supervisor connects to
+the gateway. During this interval, the sandbox remains in `Provisioning` and
+reports a `Ready=False` condition with the reason `SupervisorNotConnected`.
+After a gateway restart, an existing sandbox can return to `Provisioning`
+temporarily while its supervisor reconnects. Wait for the phase to return to
+`Ready` before you connect to the sandbox or execute commands.
+
+The gateway records a canonical main-process exit as `Ready=False` with reason
+`MainProcessExited`. It also sets `status.exit_code`; signal exits use the
+standard `128 + signal` convention. Compute runtimes do not automatically
+restart that process.
 
 ## Sandbox Compute Drivers
 
@@ -346,6 +536,7 @@ For Docker, Podman, MicroVM, and Kubernetes behavior, refer to [Sandbox Compute 
 ## Next Steps
 
 - To follow a complete end-to-end example, refer to the [GitHub Sandbox](/get-started/tutorials/github-sandbox) tutorial.
+- To select a workspace or understand access roles, refer to [Manage Workspaces and Access](/sandboxes/manage-workspaces).
 - To supply API keys or tokens, refer to [Manage Providers](/sandboxes/manage-providers).
 - To control what the agent can access, refer to [Policies](/sandboxes/policies).
 - To use the default runtime image, refer to [Base Sandbox Container](#base-sandbox-container).

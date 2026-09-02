@@ -5,14 +5,19 @@ title: "OpenShift"
 sidebar-title: "OpenShift"
 description: "Install the OpenShell Helm chart on OpenShift, including the SCC binding and chart overrides required by OpenShift's Security Context Constraints."
 keywords: "Generative AI, Cybersecurity, Kubernetes, OpenShift, SCC, Security Context Constraints, Helm, Gateway, Installation"
-position: 5
+position: 6
 ---
 
 <Warning>
-The OpenShift install path is experimental. It currently requires running sandbox pods under the `privileged` SCC and installing the gateway with TLS and the PKI init job disabled. Use only for evaluation on a private network.
+The OpenShift install path is experimental. It currently requires running sandbox pods under the `privileged` SCC and installing the gateway with TLS disabled. Use only for evaluation on a private network.
 </Warning>
 
 OpenShift's [Security Context Constraints](https://docs.openshift.com/container-platform/latest/authentication/managing-security-context-constraints.html) reject the chart's default pod security settings. Installing on OpenShift requires precreating the namespace, granting the `privileged` SCC to the sandbox service account, and overriding a few chart values so the cluster admission controller can assign UIDs and FS groups itself.
+
+OpenShell installs sandbox nftables rules as individual commands. On OpenShift
+nodes where optional conntrack or packet log expressions are unavailable, those
+optional rules can fail without rolling back the required proxy bypass reject
+rules.
 
 ## Prerequisites
 
@@ -46,7 +51,6 @@ oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set pkiInitJob.enabled=false \
   --set server.disableTls=true \
   --set podSecurityContext.fsGroup=null \
   --set securityContext.runAsUser=null
@@ -54,19 +58,17 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
 
 | Override | Reason |
 |---|---|
-| `pkiInitJob.enabled=false` | Skips the built-in TLS PKI Job. TLS must also be disabled unless you provide TLS Secrets another way. |
-| `server.disableTls=true` | The gateway has no certificates without `pkiInitJob`, so it must run plaintext. |
+| `server.disableTls=true` | Runs the gateway over plaintext HTTP for simpler evaluation. |
 | `podSecurityContext.fsGroup=null` / `securityContext.runAsUser=null` | Clear the chart's hardcoded UID and fsGroup so OpenShift's SCC admission can assign them. |
-
-The gateway still needs the sandbox JWT signing Secret. When disabling
-`pkiInitJob` without enabling cert-manager, pre-create that Secret before
-installing the chart.
 
 ## Wait for the gateway to be ready
 
 ```shell
 oc -n openshell rollout status statefulset/openshell
 ```
+
+If you set `workload.kind=deployment`, use
+`oc -n openshell rollout status deployment/openshell` instead.
 
 </Steps>
 
@@ -85,8 +87,56 @@ openshell gateway add http://127.0.0.1:8080 --local --name openshift
 openshell status
 ```
 
+## Production: expose externally with a real certificate
+
+The steps above run the gateway over plaintext HTTP for quick evaluation. For
+a real deployment, cert-manager can issue the gateway's server certificate
+from a real Issuer or ClusterIssuer (for example, an ACME issuer), and an
+OpenShift Route with TLS passthrough exposes it externally while the gateway
+keeps terminating its own TLS and mTLS.
+
+Install cert-manager and configure a working `ClusterIssuer` first — see
+[Managing Certificates](/kubernetes/managing-certificates) for the
+`certManager.serverIssuerRef` details. Configure an OIDC provider as described
+in [Access Control](/kubernetes/access-control) — remote gateways authenticate
+CLI users via OIDC, not mTLS, so the gateway must know the OIDC issuer URL.
+Install the chart with:
+
+```shell
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set podSecurityContext.fsGroup=null \
+  --set securityContext.runAsUser=null \
+  --set server.disableTls=false \
+  --set certManager.enabled=true \
+  --set certManager.serverIssuerRef.name=<cluster-issuer-name> \
+  --set certManager.serverIssuerRef.kind=ClusterIssuer \
+  --set certManager.serverDnsNames[0]=<external-hostname> \
+  --set openshiftRoute.enabled=true \
+  --set openshiftRoute.host=<external-hostname> \
+  --set server.oidc.issuer=<oidc-issuer-url> \
+  --set server.oidc.audience=<oidc-audience>
+```
+
+| Override | Reason |
+|---|---|
+| `certManager.serverIssuerRef` | Creates a second server certificate from your Issuer or ClusterIssuer for external clients. The gateway uses SNI to present this cert for the external hostname while continuing to present the internal (chart CA) cert to supervisors. The internal certificate's `ca.crt` is the chart CA that also signed the client cert, so the default `clientCaFromServerTlsSecret=true` is correct. |
+| `openshiftRoute.enabled` / `openshiftRoute.host` | Creates an OpenShift Route with TLS passthrough — the router forwards the encrypted connection by SNI without decrypting, so the gateway uses the SNI hostname to select the external certificate. |
+| `server.oidc.issuer` / `server.oidc.audience` | Configures server-side OIDC validation. Without these, the gateway expects mTLS client certificates and rejects OIDC-only CLI connections. See [Access Control](/kubernetes/access-control). |
+
+Register the gateway with the CLI over OIDC. Remote gateways authenticate CLI
+users via OIDC, not mTLS — see [Access Control](/kubernetes/access-control):
+
+```shell
+openshell gateway add https://<external-hostname> \
+  --name openshift \
+  --oidc-issuer <issuer-url>
+openshell gateway login openshift
+```
+
 ## Next Steps
 
-- For TLS-enabled deployments, refer to [Managing Certificates](/kubernetes/managing-certificates) after SCC-compatible PKI is supported.
-- To expose the gateway externally, refer to [Ingress](/kubernetes/ingress).
+- For more on certificate provisioning modes, refer to [Managing Certificates](/kubernetes/managing-certificates).
+- To expose the gateway externally through the Kubernetes Gateway API instead of a Route, refer to [Ingress](/kubernetes/ingress).
 - To configure OIDC authentication, refer to [Access Control](/kubernetes/access-control).

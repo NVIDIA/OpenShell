@@ -5,31 +5,32 @@ title: "Customize Sandbox Policies"
 sidebar-title: "Policies"
 description: "Apply, iterate, and debug sandbox network policies with hot-reload on running OpenShell sandboxes."
 keywords: "Generative AI, Cybersecurity, Policy, Network Policy, Sandbox, Security, Hot Reload"
-position: 5
+position: 6
 ---
 
 Use this page to apply and iterate policy changes on running sandboxes. For a full field-by-field YAML definition, use the [Policy Schema Reference](/reference/policy-schema).
 
 ## Policy Structure
 
-A policy has static sections `filesystem_policy`, `landlock`, and `process` that are locked at sandbox creation, and a dynamic section `network_policies` that is hot-reloadable on a running sandbox.
+A policy has static sections `filesystem_policy`, `landlock`, and `process` that are locked at sandbox creation, and dynamic `network_policies` and `network_middlewares` sections that are hot-reloadable on a running sandbox.
 
 ```yaml wordWrap showLineNumbers={false}
 version: 1
 
 # Static: locked at sandbox creation. Paths the agent can read vs read/write.
 filesystem_policy:
+  include_workdir: true
   read_only: [/usr, /lib, /etc]
-  read_write: [/sandbox, /tmp]
+  read_write: [/tmp]
 
 # Static: Landlock LSM kernel enforcement. best_effort uses highest ABI the host supports.
 landlock:
   compatibility: best_effort
 
-# Static: Unprivileged user/group the agent process runs as.
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
+# Static, optional: override the identity selected by the compute driver.
+# process:
+#   run_as_user: "1500"
+#   run_as_group: "1500"
 
 # Dynamic: hot-reloadable. Named blocks of endpoints + binaries allowed to reach them.
 network_policies:
@@ -44,23 +45,62 @@ network_policies:
     binaries:
       - path: /usr/bin/curl
 
+# Dynamic: ordered middleware selected independently by admitted host.
+network_middlewares:
+  regex-redactor:
+    name: Redact API tokens
+    middleware: openshell/regex
+    order: 10
+    config:
+      mode: redact
+    on_error: fail_closed
+    endpoints:
+      include: ["api.example.com"]
+      exclude: []
+
 ```
 
 Static sections are locked at sandbox creation. Changing them requires destroying and recreating the sandbox.
 Dynamic sections can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
-When a hot reload changes rules on an active HTTP L7 endpoint, existing keep-alive tunnels are closed before forwarding another parsed request. Credential-injection-only HTTP passthrough tunnels use the same reload boundary. Most HTTP clients reconnect automatically, and the next request is evaluated against the current policy.
-Raw streams are connection-scoped and outside L7 live-reload guarantees. This includes `tls: skip`, non-HTTP TCP payloads, HTTP upgrades such as WebSocket, and long-lived response streams such as SSE. A reload applies to the next connection or next parsed HTTP request; it does not interrupt an already-forwarded raw stream. Use `protocol: websocket` when policy should stay attached to the RFC 6455 upgrade and client text messages after the allowed upgrade. Add `websocket_credential_rewrite: true` only when the relay should rewrite credential placeholders in client-to-server WebSocket text messages. Add `request_body_credential_rewrite: true` only on inspected REST endpoints that need OpenShell to rewrite placeholders in supported text request bodies.
+When a hot reload changes rules, the supervisor publishes a new policy generation and closes connections pinned to the previous generation. This includes HTTP keep-alive tunnels, `tls: skip`, non-HTTP payloads, HTTP upgrades such as WebSocket, and long-lived response streams such as SSE. Most clients reconnect automatically, and the next connection or request is evaluated against the current policy. A parsed WebSocket relay closes with code `1012` when its attached policy generation becomes stale. Use `protocol: websocket` when policy should stay attached to the RFC 6455 upgrade and client text messages after the allowed upgrade. Provider-credentialed endpoints reject L4-only and `tls: skip` modes by default. On a credentialed WebSocket upgrade, OpenShell keeps the connection on the parsed relay and rejects binary frames unless the endpoint explicitly sets `allow_uninspected_credentials: true`. Add `websocket_credential_rewrite: true` when the relay should rewrite credential placeholders in client-to-server WebSocket text messages. Add `request_body_credential_rewrite: true` only on inspected REST endpoints that need OpenShell to rewrite placeholders in supported text request bodies.
 
 | Section | Type | Description |
 |---|---|---|
 | `filesystem_policy` | Static | Controls which directories the agent can access on disk. Paths are split into `read_only` and `read_write` lists. Any path not listed in either list is inaccessible. Set `include_workdir: true` to automatically add the agent's working directory to `read_write`. [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforces these restrictions at the kernel level. |
 | `landlock` | Static | Configures Landlock LSM enforcement behavior. Set `compatibility` to `best_effort` (skip individual inaccessible paths while applying remaining rules) or `hard_requirement` (fail if any path is inaccessible or the required kernel ABI is unavailable). Refer to the [Policy Schema Reference](/reference/policy-schema#landlock) for the full behavior table. |
-| `process` | Static | Sets the OS-level identity for the agent process. `run_as_user` and `run_as_group` default to `sandbox`. Root (`root` or `0`) is rejected. The agent also runs with seccomp filters that block dangerous system calls. |
-| `network_policies` | Dynamic | Controls network access for ordinary outbound traffic from the sandbox. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br />Every outbound connection except `https://inference.local` goes through the proxy, which queries the [policy engine](/about/how-it-works#core-components) with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. <br />For endpoints with `protocol: rest`, the proxy auto-detects TLS and terminates it so each HTTP request can be checked against that endpoint's `rules` (method and path). For endpoints with `protocol: websocket`, the proxy validates the RFC 6455 upgrade and evaluates `GET` rules for the handshake plus either `WEBSOCKET_TEXT` rules for raw client text messages or GraphQL operation rules for GraphQL-over-WebSocket messages. Set `websocket_credential_rewrite: true` only when a WebSocket or REST compatibility endpoint must keep placeholder credentials in sandbox-owned text frames and resolve them at the OpenShell relay boundary. <br />Endpoints without `protocol` allow the TCP stream through without inspecting payloads. <br />If no endpoint matches, the connection is denied. Configure managed inference separately through [Inference Routing](/sandboxes/inference-routing). |
+| `process` | Static | Optionally overrides the OS-level identity for the agent process. Explicit values must be `sandbox` or numeric UID/GID values from `1` through `4294967294`; root and the invalid identity sentinel are rejected. Docker and Podman may use named identities through per-field OCI `USER` fallback; Kubernetes uses its platform-selected numeric identity. The agent also runs with seccomp filters that block dangerous system calls. |
+| `network_policies` | Dynamic | Controls network access for ordinary outbound traffic from the sandbox. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br />Every outbound connection except `https://inference.local` passes through the network supervisor, which queries the [policy engine](/about/how-it-works#core-components) with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. <br />For endpoints with `protocol: rest`, the proxy auto-detects TLS and terminates it so each HTTP request can be checked against that endpoint's `rules` (method and path). For endpoints with `protocol: websocket`, the proxy validates the RFC 6455 upgrade and evaluates `GET` rules for the handshake plus either `WEBSOCKET_TEXT` rules for raw client text messages or GraphQL operation rules for GraphQL-over-WebSocket messages. Set `websocket_credential_rewrite: true` only when a WebSocket or REST compatibility endpoint must keep placeholder credentials in sandbox-owned text frames and resolve them at the OpenShell relay boundary. <br />Endpoints with `protocol: tcp` allow ordinary DNS resolution and native TCP connections without inspecting payloads. Endpoints without `protocol` retain L4 passthrough through an explicit proxy. <br />If no endpoint matches, the connection is denied. Configure managed inference separately through [Inference Routing](/sandboxes/inference-routing). |
+| `network_middlewares` | Dynamic | Declares keyed HTTP and WebSocket middleware configs. After network and L7 policy admit a request or upgrade, OpenShell matches each config's host selectors independently and runs matching entries by their unique ascending `order` before credential injection. WebSocket-capable entries continue on complete client text messages. |
+
+## Supervisor Middleware
+
+Supervisor middleware can inspect, deny, or replace admitted HTTP request bodies and client WebSocket text messages before provider credentials are injected. Middleware selection is independent of the `network_policies` rule that admitted the traffic: each keyed `network_middlewares` entry matches the destination host through `endpoints.include` and `endpoints.exclude`.
+
+```yaml
+network_middlewares:
+  regex-redactor:
+    name: Redact API tokens
+    middleware: openshell/regex
+    order: 10
+    config:
+      mode: redact
+    on_error: fail_closed
+    endpoints:
+      include: ["*.example.com"]
+      exclude: ["trusted.example.com"]
+```
+
+Matching entries run once each by ascending `order`; lower values run first, and duplicate order values are rejected. The default order is `0`, so policies with multiple entries normally set it explicitly. Map keys are structurally unique. An optional `name` provides a human-readable label, defaults to the map key, and does not change the key used as the config identity. Different keys may use the same implementation and run as distinct stages. `exclude` takes precedence over `include`.
+
+`openshell/regex` is an example built into the supervisor. It applies fixed regular expressions to UTF-8 HTTP request bodies and complete client-to-upstream WebSocket text messages before credential injection. The initial pattern recognizes `sk-` tokens. This is a best-effort text transformation without guarantees that sensitive values will be detected or fully removed; it does not inspect binary or upstream-to-client WebSocket messages. Custom expressions are not configurable yet. Operator-run middleware must be registered by name before a policy can reference it. The gateway validates implementation-owned config before accepting the policy.
+
+`on_error` defaults to `fail_closed`. Use `fail_open` only when skipping a selected stage that fails is acceptable. For WebSocket streams, a broken fail-open stage is disabled for the rest of that connection and OpenShell emits a state-change finding. A host-matched attachment joins only operation chains advertised by its implementation. An HTTP-only attachment may inspect the WebSocket upgrade GET, but post-upgrade messages pass with informational `binding_not_selected` coverage under either error mode. Binary messages also pass without middleware inspection and produce `unsupported_message_type` coverage for active WebSocket stages. Upstream-to-client messages remain uninspected. Policy validation rejects a fail-closed selector that can cover a `tls: skip` endpoint. An all-`fail_open` match may cover the endpoint; the supervisor bypasses the middleware and emits a detection finding.
+
+See [Supervisor Middleware](/extensibility/supervisor-middleware) for registration, chain ordering, body limits, failure behavior, and operations.
 
 ## Baseline Filesystem Paths
 
-When a sandbox runs in proxy mode (the default), OpenShell automatically adds baseline filesystem paths required for the sandbox child process to function: `/usr`, `/lib`, `/etc`, `/var/log` (read-only) and `/sandbox`, `/tmp` (read-write). Paths like `/app` are included in the baseline set but are only added if they exist in the container image.
+When a sandbox runs in proxy mode (the default), OpenShell automatically adds baseline filesystem paths required for the sandbox child process to function: `/usr`, `/lib`, `/etc`, and `/var/log` (read-only), plus `/tmp` (read-write). When `filesystem.include_workdir` is `true`, OpenShell also adds the resolved working directory as read-write. Paths like `/app` are included in the baseline set but are only added if they exist in the container image.
 
 For GPU sandboxes, OpenShell also adds existing GPU device nodes as read-write paths. CUDA workloads require write access to procfs for thread metadata, so GPU baseline enrichment moves `/proc` from read-only to read-write when GPU devices are present.
 
@@ -73,6 +113,34 @@ User-specified paths in your policy YAML are not pre-filtered. If you list a pat
 
 This distinction means baseline system paths degrade gracefully while user-specified paths surface configuration errors.
 
+## Allow Native TCP Connections
+
+Use `protocol: tcp` when an application needs to resolve a policy-approved hostname and open a normal TCP connection without configuring an HTTP proxy. The endpoint remains L4-only, so OpenShell authorizes the hostname, port, and calling binary but does not inspect application payloads.
+
+```yaml showLineNumbers={false}
+network_policies:
+  postgres:
+    name: postgres
+    endpoints:
+      - host: db.internal.example
+        port: 5432
+        protocol: tcp
+    binaries:
+      - path: /usr/bin/psql
+```
+
+OpenShell answers DNS only for hostnames eligible under an active `protocol: tcp` endpoint. It validates upstream answers against destination and SSRF controls, returns a supervisor-owned synthetic address, and records the validated real addresses. When the application connects to the synthetic address, OpenShell recovers the hostname and port, evaluates the calling process against the current policy generation, and dials only an address pinned by that DNS result.
+
+Applications must honor the returned DNS TTL and resolve the hostname again before reconnecting after that TTL expires. A client that caches the synthetic address indefinitely can receive a connection failure after the mapping expires. Docker and Podman currently advertise only IPv4 egress for this feature, so OpenShell returns an empty successful answer for AAAA queries and lets dual-stack clients use the working A record.
+
+DNS resolution does not authorize a connection by itself. Unknown names, wrong ports, stale mappings, disallowed destination addresses, and binaries outside the matching policy fail closed. Applications cannot inherit access by connecting directly to a real IP returned by an upstream resolver.
+
+Do not combine `protocol: tcp` with L7-only fields such as `path`, `enforcement`, `access`, `rules`, `deny_rules`, request rewriting, or credential signing. Docker and Podman sandboxes support policy DNS and transparent TCP capture. Other compute drivers reject policies containing `protocol: tcp` until they provide the required runtime capability.
+
+Prefer exact hostnames for TCP endpoints. A wildcard authorizes DNS queries for every matching name, which means a compromised process can encode data into matching DNS labels even when the lookup does not return an address. OpenShell records failed eligible lookups for operators, but logging does not remove that exfiltration channel.
+
+The first TCP endpoint is a deliberate exception to ordinary dynamic network policy updates. A sandbox created without any `protocol: tcp` endpoint does not install the DNS and transparent-capture substrate. A hot reload that introduces the first TCP endpoint is rejected atomically and leaves the previous policy active; recreate the sandbox with a TCP endpoint to install the substrate. A sandbox that started with TCP support can remove and later re-add TCP endpoints through normal policy reloads.
+
 ## Apply a Custom Policy
 
 Pass a policy YAML file when creating the sandbox:
@@ -81,7 +149,9 @@ Pass a policy YAML file when creating the sandbox:
 openshell sandbox create --policy ./my-policy.yaml -- claude
 ```
 
-`openshell sandbox create` keeps the sandbox running after the initial command exits, which is useful when you plan to iterate on the policy. Add `--no-keep` if you want the sandbox deleted automatically instead.
+The trailing command is the sandbox's canonical main process. If it exits, the
+sandbox enters `Error`; use `sandbox exec` for one-shot commands that should not
+define sandbox health.
 
 To avoid passing `--policy` every time, set a default policy with an environment variable:
 
@@ -140,15 +210,15 @@ The following steps outline the hot-reload policy update workflow.
 
    `--add-allow` and `--add-deny` target existing `protocol: rest` or `protocol: websocket` endpoints. If you pass multiple update flags in one command, OpenShell applies them as one atomic merge batch and persists at most one new revision.
 
-4. For larger edits, pull the current effective policy and edit the YAML directly. Before reusing the file, strip the metadata header above the `---` line. If the sandbox has attached Providers v2 providers, remove generated `_provider_*` entries before reapplying the policy; those entries are derived from provider profiles.
+4. For larger edits, pull the current base policy and edit the YAML directly. The base policy is the user-authored policy without provider-composed `_provider_*` entries, so it is safe to round-trip through `openshell policy set`. Before reusing the file, strip the metadata header above the `---` line.
 
    ```shell
-   openshell policy get <name> --full > current-policy.yaml
+   openshell policy get <name> --base > current-policy.yaml
    ```
 
-   To inspect a stored sandbox-authored revision instead of the current effective policy, pass `--rev <version>`.
+   To inspect the effective policy that the sandbox enforces, including provider-composed entries, use `openshell policy get <name> --full`. To inspect a stored sandbox-authored revision instead of the current effective policy, pass `--rev <version>`.
 
-5. Edit the YAML: add or adjust `network_policies` entries, binaries, `access`, or `rules`.
+5. Edit the YAML: add or adjust `network_policies` entries, binaries, `access`, `rules`, or protocol-specific matchers such as GraphQL operation fields, MCP `method` / `tool` rules, and generic JSON-RPC `method` rules.
 
 6. Push the updated policy when you need a full replacement. Exit codes: 0 = loaded, 1 = validation failed, 124 = timeout.
 
@@ -162,6 +232,44 @@ The following steps outline the hot-reload policy update workflow.
    openshell policy list <name>
    ```
 
+### Validation failures
+
+OpenShell validates a complete candidate policy before activating any part of it. Endpoints may overlap when their connection and request-processing metadata agree. For example, two `api.example.com:443` REST entries can contribute different allow and deny rules when they use the same TLS, destination, credential, parser, and enforcement settings. A plain L4 endpoint may overlap an L7 endpoint because it authorizes the destination without contributing request-processing metadata. A more-specific path endpoint may override request-processing metadata from a broader endpoint, such as a `/graphql` GraphQL endpoint alongside a general REST endpoint for the same host. OpenShell rejects the candidate when overlapping exact or wildcard host selectors can both contribute equally specific endpoint configuration and disagree on those fields.
+
+When the gateway knows the affected sandbox scope, it validates the complete
+effective candidate before persistence. This covers direct policy replacement,
+incremental merges and proposal approvals, provider attachment, and
+provider-profile updates that fan out to attached sandboxes. An ambiguity
+failure returns `FAILED_PRECONDITION`; OpenShell stores no invalid policy
+revision and does not partially apply a profile update. Supervisor validation
+remains a defense-in-depth boundary for startup, concurrent changes, and policy
+sources outside those mutation paths.
+
+A gateway preflight rejection leaves the currently active policy unchanged
+regardless of failure mode because the candidate is never persisted or
+distributed. If a candidate reaches a supervisor and fails runtime validation,
+the gateway's `policy_validation_failure_mode` configuration determines the
+supervisor posture. Set it under `[openshell.gateway]` in `gateway.toml`. Its
+default is `fail_closed`:
+
+```toml
+[openshell.gateway]
+policy_validation_failure_mode = "fail_closed"
+```
+
+In `fail_closed` mode, the supervisor publishes a quarantine generation, denies new egress, and closes connections pinned to the previous generation. The previous policy is not active. A later valid policy exits quarantine automatically.
+
+Operators that explicitly prioritize availability can retain the previous generation:
+
+```toml
+[openshell.gateway]
+policy_validation_failure_mode = "retain_last_valid"
+```
+
+In `retain_last_valid` mode, the rejected candidate remains inactive and the previous valid generation remains active. If no previous valid generation exists, such as during initial startup, OpenShell still fails closed. Restart the gateway after changing `gateway.toml`; connected sandbox supervisors receive the configured posture from the restarted gateway. Individual sandboxes cannot override it.
+
+OCSF configuration and finding events identify the rejected candidate, validation rationale, configured and effective modes, active generation, and whether the previous policy is active. When `retain_last_valid` is configured without a previous valid generation, the effective mode remains `fail_closed`. Connection denials during quarantine include the validation failure as their policy denial rationale.
+
 ## Incremental Policy Updates
 
 Use `openshell policy update` when you want to merge network policy changes into the current live policy instead of replacing the whole YAML document. This command only updates the dynamic `network_policies` section.
@@ -173,7 +281,7 @@ Use `openshell policy update` when you want to merge network policy changes into
 - remove one endpoint or one named rule without rewriting the rest of the file.
 - preview a merged result locally with `--dry-run` before you send it to the gateway.
 
-Use `openshell policy set` instead when you want to replace the full policy, update static sections, or make broader edits that are easier to express in YAML.
+Use `openshell policy set` instead when you want to replace the full policy, update static sections, or make broader edits that are easier to express in YAML. Use full YAML for GraphQL, MCP, and JSON-RPC rule shapes.
 
 ### Update Commands
 
@@ -210,6 +318,7 @@ This is the practical difference:
 Current constraints:
 
 - `--add-allow` and `--add-deny` work on `protocol: rest` and `protocol: websocket` endpoints.
+- GraphQL, MCP, and JSON-RPC fine-grained rules require full policy YAML applied with `openshell policy set`.
 - `--add-deny` requires the endpoint to already have an allow base, either an `access` preset or explicit allow `rules`.
 - `protocol: sql` is not a practical incremental workflow today. OpenShell does not do full SQL parsing, and SQL enforcement is not meaningfully supported yet.
 
@@ -228,7 +337,7 @@ Each segment has a fixed meaning:
 | `host` | Yes | Destination hostname. |
 | `port` | Yes | Destination port, `1` through `65535`. |
 | `access` | No | Access preset for L7 endpoints: `read-only`, `read-write`, or `full`. Incremental updates expand presets into protocol-specific method/path rules for REST and WebSocket endpoints. |
-| `protocol` | No | L7 inspection mode: `rest`, `websocket`, or `sql`. `sql` is audit-only and not a recommended workflow today. |
+| `protocol` | No | Endpoint mode accepted by `openshell policy update`: `tcp`, `rest`, `websocket`, or `sql`. Use `tcp` for native DNS and TCP without L7 inspection. `sql` is audit-only and not a recommended workflow today. Full policy YAML also supports `graphql`, `mcp`, and `json-rpc`. |
 | `enforcement` | No | Enforcement mode for inspected traffic: `enforce` or `audit`. |
 | `options` | No | Comma-separated endpoint options. Use `websocket-credential-rewrite` with `protocol: websocket` or REST compatibility endpoints that perform a WebSocket upgrade. Use `request-body-credential-rewrite` only with `protocol: rest`. |
 
@@ -237,6 +346,8 @@ Examples:
 | Example | Meaning |
 |---|---|
 | `pypi.org:443` | Add a plain L4 endpoint. The proxy allows the TCP stream and does not inspect HTTP requests. |
+| `telemetry.example.com:443::::allow-uninspected-credentials` | Explicitly allow a provider-credentialed L4 endpoint after accepting that OpenShell cannot inspect or rewrite its traffic. |
+| `db.internal.example:5432::tcp` | Add an L4 endpoint for native DNS resolution and transparent TCP capture. The empty `access` segment is required before `tcp`. |
 | `api.github.com:443:read-only:rest:enforce` | Add a REST endpoint with the `read-only` preset expanded by the policy engine into GET, HEAD, and OPTIONS access. |
 | `api.example.com:443:read-write:rest:enforce:request-body-credential-rewrite` | Add a REST endpoint that rewrites credential placeholders in supported text request bodies. |
 | `realtime.example.com:443:read-write:websocket:enforce` | Add a WebSocket endpoint with the `read-write` preset expanded by the policy engine into the upgrade `GET` and client `WEBSOCKET_TEXT` access. |
@@ -246,12 +357,21 @@ If you set `protocol: rest` or `protocol: websocket`, you also need an allow sha
 
 Use the `websocket-credential-rewrite` endpoint option with `protocol: websocket` when the sandbox should send credential placeholders in client text frames and have OpenShell resolve them after the allowed upgrade. The option can also be used with `protocol: rest` compatibility endpoints that perform a WebSocket upgrade. It is rejected for plain L4 or `protocol: sql` endpoints.
 
-Use the `request-body-credential-rewrite` endpoint option with `protocol: rest` when an API expects OpenShell-managed credentials in UTF-8 JSON, form, or text request bodies. OpenShell buffers up to 256 KiB, rewrites recognized credential placeholders, updates `Content-Length`, and rejects unresolved placeholders instead of forwarding them. The option is rejected for WebSocket, GraphQL, SQL, and plain L4 endpoints.
+Use the `request-body-credential-rewrite` endpoint option with `protocol: rest` when an API expects OpenShell-managed credentials in UTF-8 JSON, form, or text request bodies. OpenShell buffers up to 256 KiB, rewrites recognized credential placeholders, updates `Content-Length`, and rejects unresolved placeholders instead of forwarding them. For chunked requests, the 256 KiB limit counts the complete wire representation, including framing, extensions, and trailers. The option is rejected for WebSocket, GraphQL, SQL, and plain L4 endpoints.
+
+Use `allow-uninspected-credentials` only when a provider-credentialed endpoint must remain L4-only, use `tls: skip`, or carry uninspectable WebSocket traffic. Without this explicit opt-in, the gateway rejects credentialed L4-only and `tls: skip` endpoints. REST bodies without placeholders continue to work when body rewrite is disabled; a body containing an OpenShell credential placeholder fails closed.
 
 Credential rewrite recognizes the canonical `openshell:resolve:env:KEY` placeholder form and whole-token provider-shaped aliases such as `provider-OPENSHELL-RESOLVE-ENV-API_TOKEN` when the referenced environment key exists in the configured provider credentials.
 
+Static provider placeholders resolve only when the request host, port, and path
+also match an endpoint in the provider profile. A sandbox policy allow does not
+expand that binding. A mismatch returns HTTP 403 with
+`credential_endpoint_mismatch`. Refer to [Static Credential Endpoint
+Binding](/sandboxes/providers-v2#understand-static-credential-endpoint-binding).
+
 For example:
 
+- `db.internal.example:5432::tcp` is valid.
 - `api.github.com:443:read-only:rest` is valid.
 - `realtime.example.com:443:read-write:websocket` is valid.
 - `api.github.com:443::rest` is invalid. It does not mean "allow all traffic." An L7 endpoint with `protocol` but no `access` or `rules` is rejected when the policy loads.
@@ -290,13 +410,14 @@ means:
 - match the endpoint `api.github.com:443`.
 - match HTTP method `POST`.
 - match paths like `/repos/acme/issues`.
-- do not match deeper paths like `/repos/acme/project/issues/123` because `*` matches one path segment.
+- also match deeper paths when the surrounding literals align, because `*` may include `/`.
 
 Path globs follow the same semantics as YAML allow and deny rules:
 
-- `*` matches one path segment.
-- `**` matches any number of segments.
-- `/repos/*/issues` matches one repository owner or name segment in the middle.
+- `*` and `**` match zero or more characters and may cross `/` boundaries.
+- `?` matches exactly one character.
+- bracket classes such as `[0-9]` and negated classes such as `[!0]` are supported.
+- `/repos/*/issues` matches any intervening text, including multiple path segments.
 - `/repos/**` matches everything under `/repos/`.
 
 The rule-level commands only modify method and path constraints. They do not change binaries, hostnames, ports, protocol settings, or WebSocket message payload matching.
@@ -421,7 +542,25 @@ The CLI validates the argument shapes before it sends the request. The gateway t
 - a port is outside `1` through `65535`.
 - `--add-allow` or `--add-deny` points at an endpoint that does not exist.
 - `--add-allow` or `--add-deny` targets an endpoint that is neither REST nor WebSocket.
+- `--add-allow` or `--add-deny` targets a host and port that resolves to more than one endpoint.
 - `--add-deny` targets an endpoint that has no base allow set.
+- an update names an existing rule and adds a binary to it without declaring every endpoint and port that rule already authorizes.
+- an update names an existing rule and adds or changes an endpoint on it without declaring every binary that rule already authorizes.
+- an update widens a rule to any binary without declaring every endpoint that rule already authorizes.
+- an update changes an endpoint without declaring every port that endpoint carries.
+- an update puts an MCP endpoint on the same host and port as a differently inspected endpoint, or gives one host and port two different MCP inspection contracts, including through separate rules or different paths.
+
+A rule authorizes every listed binary to reach every listed endpoint and port, so merging a binary and an endpoint into the same rule authorizes that pair too. The gateway rejects the whole batch rather than granting a pair the update did not ask for. The error names the binary scope and the ports involved, and lists the binaries you still need to declare. An empty binary list means any binary, so widening a rule to any binary is subject to the same requirement.
+
+You can declare the scope across several `--add-endpoint` arguments. The update is complete as long as every binary-to-port pair the merged rule ends up authorizing appears somewhere in the update.
+
+An endpoint's allow rules, deny rules, and allowed IPs apply to every port that endpoint carries, so an update that changes any of them has to name every one of those ports. Declaring `api.example.com:443` alone on an endpoint that also serves `8443` is rejected, because the change would reach `8443` as well. Declaring every existing binary does not lift this requirement; the two are separate axes of the same product.
+
+The sandbox picks the parser for a request by most-specific path, but it authorizes the request against every endpoint that matches it. A broad REST endpoint and a narrower GraphQL endpoint on one host and port share the same method-and-path rule vocabulary, so that combination stays supported. MCP does not: its rules address JSON-RPC methods and tool names, so a plain REST rule on an overlapping path could authorize a tool call the MCP endpoint denies. An MCP endpoint therefore cannot share a host and port with a differently inspected endpoint, and two MCP endpoints there must agree on strict-tool-name, method-profile, and body-limit settings, even under different paths or in separate rules. An update creating either situation is rejected. A policy that already contains one is left alone so unrelated updates still apply, but it should be repaired with full YAML replacement.
+
+To grant one binary access to only part of an existing rule's endpoints, send it under its own `--rule-name`. The gateway normally folds an update into an existing rule that shares an endpoint, but it keeps your rule name whenever folding would grant authorization you did not declare, so the narrow grant lands as its own rule authorizing exactly what you asked for. The update reports that it kept your rule name and names the rule it would otherwise have folded into. An MCP contract conflict is the exception: one host and port carry a single MCP contract regardless of which rule holds them, so a conflicting update is rejected rather than moved to a separate rule.
+
+Once a host and port appears in more than one rule, `--add-allow` and `--add-deny` can no longer target it. They select an endpoint by host and port alone, so they cannot say which rule's binary scope to widen, and the gateway rejects the update rather than guessing. The same applies when one rule carries two endpoints on that host and port under different paths. Use full YAML replacement to change L7 rules on an endpoint that appears more than once.
 
 ## Global Policy Override
 
@@ -459,8 +598,17 @@ When triaging denied requests, check:
 - Destination host and port to confirm which endpoint is missing.
 - Calling binary path to confirm which `binaries` entry needs to be added or adjusted.
 - HTTP method and path for REST endpoints, or `GET` / `WEBSOCKET_TEXT` and the upgraded request path for WebSocket endpoints, to confirm which `rules` entry needs to be added or adjusted.
+- `credential_endpoint_mismatch` in sandbox logs to confirm that policy admitted the request but the attached provider profile did not authorize its credential for that host, port, and path.
+- `request_authority_mismatch` in the response or sandbox logs to confirm that the HTTP request authority differs from the authorized tunnel endpoint. For a CONNECT tunnel to `api.example.com:8443`, send `Host: api.example.com:8443`; omitting the non-default port makes the request authority use the transport default and OpenShell rejects it. Absolute-form request targets must use the same host and port.
 
 Then push the updated policy as described above.
+
+Do not fix `credential_endpoint_mismatch` by widening sandbox policy. Export the
+provider profile with `openshell provider profile export <profile-id> -o yaml`.
+Update the custom provider profile only when the destination is an intended
+credential recipient. Refer to [Static Credential Endpoint
+Binding](/sandboxes/providers-v2#understand-static-credential-endpoint-binding)
+for the complete authorization model.
 
 For small changes, prefer `openshell policy update` over rewriting the full YAML:
 
@@ -490,7 +638,7 @@ Allow `pip install` and `uv pip install` to reach PyPI:
       - { path: /usr/local/bin/uv }
 ```
 
-Endpoints without `protocol` use TCP passthrough, where the proxy allows the stream without inspecting payloads. If the stream is HTTP and TLS is auto-terminated, the proxy can still rewrite configured credential placeholders and closes keep-alive passthrough tunnels on policy reload before forwarding another request. WebSocket text-frame policy requires an explicit `protocol: websocket` endpoint. WebSocket payload credential rewrite can also be enabled on a `protocol: rest` compatibility endpoint with `websocket_credential_rewrite: true`. REST request body credential rewrite requires an inspected `protocol: rest` endpoint with `request_body_credential_rewrite: true`.
+Endpoints without `protocol` use explicit-proxy TCP passthrough, where OpenShell allows the stream without inspecting payloads. Use `protocol: tcp` when the application needs ordinary DNS resolution and native TCP connections through transparent capture. Provider-credentialed endpoints cannot use either L4 shape unless `allow_uninspected_credentials: true` records the exception. If an explicit-proxy stream is HTTP and TLS is auto-terminated, the proxy can still rewrite configured credential placeholders and closes keep-alive passthrough tunnels on policy reload before forwarding another request. WebSocket text-frame policy requires an explicit `protocol: websocket` endpoint. WebSocket payload credential rewrite can also be enabled on a `protocol: rest` compatibility endpoint with `websocket_credential_rewrite: true`. REST request body credential rewrite requires an inspected `protocol: rest` endpoint with `request_body_credential_rewrite: true`.
 </Tab>
 
 <Tab title="Granular rules">
@@ -548,7 +696,7 @@ For an end-to-end walkthrough that combines this policy with a GitHub credential
       - { path: /usr/bin/gh }
 ```
 
-Endpoints with `protocol: rest` enable HTTP request inspection and can opt in to supported text request body credential rewrite. Endpoints with `protocol: websocket` validate WebSocket upgrades and inspect client text messages on the upgraded request path. WebSocket endpoints can also classify GraphQL-over-WebSocket operation messages with the same operation rules used by GraphQL-over-HTTP. Endpoints with `protocol: graphql` parse GraphQL-over-HTTP payloads before evaluating rules. The endpoint-level `path` field lets these protocols share `api.github.com:443` without treating GraphQL payloads as plain REST `POST /graphql` requests.
+Endpoints with `protocol: rest` enable HTTP request inspection and can opt in to supported text request body credential rewrite. Endpoints with `protocol: websocket` validate WebSocket upgrades and inspect client text messages on the upgraded request path. WebSocket endpoints can also classify GraphQL-over-WebSocket operation messages with the same operation rules used by GraphQL-over-HTTP. Endpoints with `protocol: graphql` parse GraphQL-over-HTTP payloads before evaluating rules. Endpoints with `protocol: mcp` parse MCP Streamable HTTP request bodies and evaluate `method`, optional `tool`, and supported params rules. Endpoints with `protocol: json-rpc` parse JSON-RPC-over-HTTP request bodies and evaluate `method` rules. The endpoint-level `path` field lets these protocols share `api.github.com:443` without treating GraphQL payloads as plain REST `POST /graphql` requests.
 </Tab>
 
 </Tabs>
@@ -578,6 +726,56 @@ REST rules can also constrain query parameter values:
 ```
 
 `query` matchers are case-sensitive and run on decoded values. If a request has duplicate keys (for example, `tag=a&tag=b`), every value for that key must match the configured glob(s).
+
+### MCP and JSON-RPC matching
+
+MCP endpoints use `protocol: mcp`. The proxy parses sandbox-to-server MCP Streamable HTTP request bodies, validates known MCP request and notification params, can evaluate the MCP method against rule `method`, and can match tool calls with the `tool` alias. Unknown extension methods stay addressable as literal method strings. Until OpenShell exposes MCP version profiles, `mcp.allow_all_known_mcp_methods` defaults to `false`, so endpoints require explicit MCP method rules. Set `mcp.allow_all_known_mcp_methods: true` to enable the endpoint method profile; in that mode, rules can omit `method`, and tool selectors are normalized to `tools/call` internally. By default, MCP `tools/call` tool names must match `^[A-Za-z0-9_.-]{1,128}$`; set `mcp.strict_tool_names: false` on that endpoint only when a server intentionally uses names outside the MCP-recommended pattern. Wildcard `tool` matchers require `mcp.strict_tool_names` to remain enabled. Generic JSON-RPC endpoints use `protocol: json-rpc` and evaluate `method`.
+
+MCP endpoints must declare a concrete destination with `host` and `port` or `ports`. A policy entry that only sets `protocol: mcp` is invalid and is not treated as a wildcard MCP authorization. Use `path: /mcp` when the server's MCP endpoint is path-scoped; omitting `path` matches every HTTP path on that host and port.
+
+MCP policy enforcement is directional. It applies to HTTP request bodies sent by the sandboxed process to the configured endpoint. JSON-RPC responses and server-to-client MCP messages carried on response bodies or SSE streams are relayed but are not currently parsed for policy enforcement.
+
+MCP and JSON-RPC endpoint policies currently require full policy YAML applied with `openshell policy set`; the incremental `openshell policy update --add-endpoint` parser does not accept `mcp` or `json-rpc` as protocols.
+
+An MCP client first sends `initialize`. After the server returns a successful response, the client sends `notifications/initialized`. After initialization completes and the server advertises the `tools` capability, the client can call an advertised tool. The response does not need an allow rule because these rules inspect messages sent from the client to the server. This example adds both client initialization messages to the existing tool rules. It omits `tools/list` because it assumes the client already knows the tool names; add that method when the client performs discovery.
+
+```yaml showLineNumbers={false}
+  mcp_server:
+    name: mcp_server
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        mcp:
+          max_body_bytes: 131072
+        rules:
+          - allow:
+              method: initialize
+          - allow:
+              method: notifications/initialized
+          - allow:
+              method: tools/call
+              tool: read_status
+          - allow:
+              method: tools/call
+              tool:
+                any: [submit_report, list_reports]
+        deny_rules:
+          - method: tools/call
+            tool: delete_resource
+    binaries:
+      - { path: /usr/bin/python3 }
+```
+
+`mcp.max_body_bytes` controls how many MCP-over-HTTP request body bytes OpenShell buffers for inspection. It defaults to `65536`. `mcp.strict_tool_names` defaults to `true` for each MCP endpoint. `mcp.allow_all_known_mcp_methods` defaults to `false`; when it is unset or `false`, the endpoint must define explicit MCP method rules. If an MCP endpoint sets `mcp.allow_all_known_mcp_methods: true` and omits `rules`, OpenShell allows all MCP-family methods and all tools, then applies any `deny_rules`. A broad allow or deny rule whose method matcher includes `tools/call` cannot be combined with tool-specific allow rules because it would bypass or erase the tool filter; add `tool` or `params.name` to scope `tools/call`, or remove the tool-specific rules.
+
+Use `protocol: json-rpc` and `method` when you need generic JSON-RPC 2.0 matching for a non-MCP server. Generic JSON-RPC method rules accept exact method names, or `method: "*"` as the all-method sentinel; other wildcard or glob patterns are rejected. `json_rpc.max_body_bytes` controls the generic JSON-RPC inspection buffer.
+
+Generic JSON-RPC policy `params` matchers are not supported. Generic JSON-RPC policy rules match only the JSON-RPC method. For batch requests, OpenShell evaluates each JSON-RPC call independently and denies the whole batch if any call is denied.
+
+For MCP, `tool` accepts a string glob or `{ any: [...] }` matcher for `tools/call` `params.name`. Rules that use `tool` or lower-level `params.name` must set `method: tools/call` unless `mcp.allow_all_known_mcp_methods: true` enables the endpoint method profile. MCP method globs are accepted only for the `tools/` method family, such as `tools/*`; omit `method` instead of writing `method: "*"` only when the endpoint method profile should allow all MCP methods. Omit `tool` to allow all tools for a `tools/call` method rule. OpenShell does not support MCP tool argument matching yet; allowed tools accept all argument payloads by default. Other MCP `params` keys are rejected. For batch requests, OpenShell evaluates each JSON-RPC call independently and denies the whole batch if any call is denied.
 
 ### GraphQL matching
 
