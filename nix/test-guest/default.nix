@@ -43,6 +43,7 @@ let
     "openshell-development"
     "openshell-rpm"
     "gateway-rootless-podman"
+    "openshell-rpm-gateway-reinstall"
   ];
 
   mkDistroProfile =
