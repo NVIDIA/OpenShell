@@ -1,0 +1,93 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build Debian Package
+
+on:
+  workflow_call:
+    inputs:
+      deb-version:
+        required: true
+        type: string
+      checkout-ref:
+        required: true
+        type: string
+      arch:
+        required: true
+        type: string
+      runner:
+        required: true
+        type: string
+      cli-target:
+        required: true
+        type: string
+      gnu-target:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build Debian Package (Linux ${{ inputs.arch }})
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs['checkout-ref'] }}
+
+      - name: Download CLI artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-${{ inputs['cli-target'] }}
+          path: package-binaries/
+
+      - name: Download gateway artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-gateway-${{ inputs['gnu-target'] }}
+          path: package-binaries/
+
+      - name: Download VM driver artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-driver-vm-${{ inputs['gnu-target'] }}
+          path: package-binaries/
+
+      - name: Configure package inputs
+        run: |
+          set -euo pipefail
+          chmod +x package-binaries/openshell{,-gateway,-driver-vm}
+          ls -lah package-binaries
+
+      - name: Build Debian package
+        run: |
+          set -euo pipefail
+          OPENSHELL_CLI_BINARY="${PWD}/package-binaries/openshell" \
+          OPENSHELL_GATEWAY_BINARY="${PWD}/package-binaries/openshell-gateway" \
+          OPENSHELL_DRIVER_VM_BINARY="${PWD}/package-binaries/openshell-driver-vm" \
+          OPENSHELL_DEB_VERSION="${INPUTS_DEB_VERSION}" \
+          OPENSHELL_DEB_ARCH="${{ inputs.arch }}" \
+          OPENSHELL_OUTPUT_DIR=artifacts \
+            tasks/scripts/package-deb.sh
+        env:
+          INPUTS_DEB_VERSION: ${{ inputs['deb-version'] }}
+
+      - name: Upload Debian package artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: deb-linux-${{ inputs.arch }}
+          path: artifacts/*.deb
+          retention-days: 5
