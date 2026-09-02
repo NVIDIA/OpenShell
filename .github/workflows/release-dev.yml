@@ -643,7 +643,7 @@ jobs:
       operation: sync
       channel: dev
       source_ref: ${{ github.sha }}
-      display_name: dev (${{ needs.compute-versions.outputs.docs_version }})
+      display_name: Dev (v${{ needs.compute-versions.outputs.docs_version }})
       availability: beta
       publish: true
     secrets: inherit

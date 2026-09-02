@@ -38,7 +38,10 @@ def test_release_workflows_sync_and_publish_docs_once() -> None:
     assert dev_job["uses"] == "./.github/workflows/sync-docs.yml"
     assert dev_job["with"]["channel"] == "dev"
     assert dev_job["with"]["publish"] == "true"
-    assert "docs_version" in dev_job["with"]["display_name"]
+    assert (
+        dev_job["with"]["display_name"]
+        == "Dev (v${{ needs.compute-versions.outputs.docs_version }})"
+    )
 
     assert tag_job["needs"] == ["compute-versions", "release"]
     assert tag_job["uses"] == "./.github/workflows/sync-docs.yml"
@@ -260,7 +263,7 @@ def test_sync_docs_preserves_other_version_availability(tmp_path: Path) -> None:
             channel="dev",
             source_ref="main",
             version_slug="",
-            display_name="dev (0.0.117.dev56)",
+            display_name="Dev (v0.0.117.dev56)",
             availability="beta",
         )
     )
@@ -268,7 +271,7 @@ def test_sync_docs_preserves_other_version_availability(tmp_path: Path) -> None:
     versions = read_yaml(docs_yml_path)["versions"]
     assert versions == [
         {
-            "display-name": "dev (0.0.117.dev56)",
+            "display-name": "Dev (v0.0.117.dev56)",
             "path": "./versions/dev.yml",
             "slug": "dev",
             "availability": "beta",

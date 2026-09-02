@@ -65,7 +65,7 @@ on:
         required: false
         type: string
       display_name:
-        description: "Optional selector name, e.g. dev (0.0.117.dev56)"
+        description: "Optional selector name, e.g. Dev (v0.0.117.dev56)"
         required: false
         type: string
       availability:
