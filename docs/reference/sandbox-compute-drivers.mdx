@@ -138,6 +138,20 @@ It overrides the gateway's configured default runtime class for that sandbox,
 while a typed `SandboxTemplate.runtime_class_name` value from the API still
 takes precedence.
 
+In `proxy-pod` topology the sandbox image runs directly, with no supervisor to
+launch a workload, so the container needs an entrypoint that stays running.
+Set `containers.agent.command` and `containers.agent.args` when the image's own
+entrypoint exits immediately:
+
+```shell
+openshell sandbox create --name batch \
+  --driver-config-json '{"kubernetes":{"containers":{"agent":{"command":["python","/app/agent.py"]}}}}'
+```
+
+These fields apply only to `proxy-pod`. The `combined` and `sidecar` topologies
+run the OpenShell supervisor as the container entrypoint, so setting them there
+is rejected rather than silently ignored.
+
 Docker and Podman report the address through which their sandboxes can reach
 the gateway. If the primary listener covers that address, the gateway reuses
 it and sandbox JWT authentication restricts the supervisor to its callback RPC
@@ -415,7 +429,6 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `sidecar.proxy_uid` | `supervisor.sidecar.proxyUid` | Dedicated UID of at least `1000` used by the relaxed sidecar when process/binary-aware network policy is disabled. It must not match the workload UID. The default binary-aware sidecar runs as UID 0. The network init container exempts the effective sidecar UID from proxy redirection. |
 | `proxy_pod.proxy_uid` | `supervisor.proxyPod.proxyUid` | Dedicated UID of at least `1000` used by the network supervisor in `proxy-pod` topology. It must not match the workload UID. |
 | `sidecar.process_binary_aware_network_policy` | `supervisor.sidecar.processBinaryAwareNetworkPolicy` | Keep process/binary-aware network policy enabled in `sidecar` topology. The default runs the sidecar as UID 0 with `SYS_PTRACE` and `DAC_READ_SEARCH`. Set false to run as `proxy_uid`, drop both capabilities, and enforce endpoint/L7 policy without matching `policy.binaries`. |
-| `proxy_pod.proxy_uid` | `supervisor.proxyPod.proxyUid` | Non-root UID used by the proxy-pod network supervisor. It must not match the sandbox UID. |
 | `proxy_pod.affinity` | `supervisor.proxyPod.affinity` | Configure same-node workload/supervisor placement as `disabled` (default), `preferred`, or `required`. |
 | `app_armor_profile` | `server.appArmorProfile` | Set the sandbox agent container's AppArmor profile. Helm defaults this to `Unconfined` so AppArmor-enabled nodes do not block supervisor network namespace setup. Set the Helm value to an empty string to omit the field, or use `RuntimeDefault` or `Localhost/<profile-name>` for operator-managed profiles. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |

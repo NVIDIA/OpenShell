@@ -45,22 +45,29 @@ rules:
       - pods
     verbs:
       - get
-  {{- if eq (.Values.supervisor.topology | default "combined") "proxy-pod" }}
+  {{- if or (eq (.Values.supervisor.topology | default "combined") "proxy-pod") .Values.supervisor.proxyPod.retainCompanionRbac }}
   # Proxy-pod topology creates one supervisor Deployment, one supervisor
-  # Service, and one CA Secret per sandbox. All are owner-referenced to the
-  # Sandbox CR for garbage collection. The gateway also reads the generated
-  # ReplicaSet during K8s ServiceAccount bootstrap to verify the supervisor
-  # pod's Pod -> ReplicaSet -> Deployment -> Sandbox owner chain. These
-  # permissions are only rendered when the Kubernetes driver is configured for
-  # proxy-pod topology.
+  # Service, and one CA Secret per sandbox, all owner-referenced to the Sandbox
+  # CR so Kubernetes garbage collection removes them when the CR is deleted —
+  # the gateway never deletes companions itself, so no `delete` verbs are
+  # granted. `get` supports crash-recovery reconciliation (verifying an existing
+  # companion's owner before adopting it) and, on deployments, the readiness and
+  # ServiceAccount-bootstrap owner-chain checks. `list` and `watch` on
+  # deployments back the supervisor Deployment watch that refreshes sandbox
+  # readiness when supervisor availability changes. `patch` on deployments scales
+  # the paired supervisor on stop/start. The gateway never reads Secret contents,
+  # so Secrets get `create` only. These permissions render only when the
+  # Kubernetes driver is configured for proxy-pod topology.
   - apiGroups:
       - apps
     resources:
       - deployments
     verbs:
       - create
-      - delete
       - get
+      - list
+      - patch
+      - watch
   - apiGroups:
       - apps
     resources:
@@ -71,10 +78,21 @@ rules:
       - ""
     resources:
       - services
+    verbs:
+      - create
+      - get
+  - apiGroups:
+      - ""
+    resources:
       - secrets
     verbs:
       - create
-      - delete
+  # The agent egress NetworkPolicy (the workload's egress fence) carries no
+  # owner reference so it can outlive the workload pod during deletion; the
+  # gateway therefore manages its lifecycle directly. `delete` tears it down
+  # after the pod is gone, and `list` lets reconciliation reap fences orphaned by
+  # a gateway crash. Owner-referenced NetworkPolicies (supervisor ingress) are
+  # still garbage-collected with the Sandbox CR.
   - apiGroups:
       - networking.k8s.io
     resources:
@@ -82,5 +100,7 @@ rules:
     verbs:
       - create
       - delete
+      - get
+      - list
   {{- end }}
 {{- end }}

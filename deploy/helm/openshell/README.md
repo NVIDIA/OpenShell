@@ -40,13 +40,17 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <vers
 
 ## Install on OpenShift
 
-See the full [OpenShift install guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) for details. Quick start:
+See the full [OpenShift install guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) for details. The SCC the sandbox service account needs depends on the supervisor topology.
+
+### combined (default) or sidecar
+
+These topologies enforce network policy inside the sandbox pod and require the `privileged` SCC on the sandbox service account:
 
 ```shell
 # Precreate the openshell namespace so we can create the SCC cluster role
 oc create ns openshell
 
-# Sandboxes are deployed into the openshell namespace and use the openshell-sandbox service account
+# Sandboxes use the openshell-sandbox service account
 oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell
 
 # Deploy openshell with overrides to allow SCC assignment of fsGroup and runAsUser for the gateway
@@ -54,6 +58,21 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <vers
   --set server.disableTls=true \
   --set podSecurityContext.fsGroup=null \
   --set securityContext.runAsUser=null
+```
+
+### proxy-pod
+
+Network enforcement moves to a separate supervisor pod, so sandbox pods run non-root with `drop: ALL` and need no elevated privileges. The built-in `nonroot-v2` SCC is sufficient — do not grant `privileged`. Let the chart bind `nonroot-v2` via `sandboxServiceAccount.openshift.nonrootSCC=true` (requires the default `workspaceMode=shared`); no manual `oc adm policy` step for the sandbox service account is needed:
+
+```shell
+oc create ns openshell
+
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> -n openshell \
+  --set server.disableTls=true \
+  --set podSecurityContext.fsGroup=null \
+  --set securityContext.runAsUser=null \
+  --set supervisor.topology=proxy-pod \
+  --set sandboxServiceAccount.openshift.nonrootSCC=true
 ```
 
 ## Available versions
@@ -226,6 +245,7 @@ discovery endpoint or its TLS CA.
 | sandboxServiceAccount.annotations | object | `{}` | Annotations to add to the generated sandbox service account. |
 | sandboxServiceAccount.create | bool | `true` | Create a service account for sandbox pods. |
 | sandboxServiceAccount.name | string | `""` | Existing service account name for sandbox pods when sandboxServiceAccount.create is false. |
+| sandboxServiceAccount.openshift.nonrootSCC | bool | `false` | Grant the built-in OpenShift `nonroot-v2` SCC to the sandbox ServiceAccount. Required on OpenShift for "proxy-pod" topology: the driver assigns explicit non-root UIDs, which `restricted-v2` rejects because it only admits UIDs inside the namespace's openshift.io/sa.scc.uid-range annotation. No custom SCC is created — `nonroot-v2` ships with OpenShift and already permits exactly what this topology needs, keeping drop-ALL capabilities, no privilege escalation, and no host namespaces. Creates a ClusterRole + ClusterRoleBinding. Supported only with server.drivers.kubernetes.workspaceMode=shared: the ClusterRoleBinding is scoped to the static sandbox namespace, so it does not reach the dynamically created workspace namespaces used by managed and operator modes. Enabling it with a non-shared mode fails the Helm render. |
 | securityContext.allowPrivilegeEscalation | bool | `false` | Whether the gateway container can gain additional privileges. |
 | securityContext.capabilities.drop | list | `["ALL"]` | Linux capabilities dropped from the gateway container. |
 | securityContext.runAsNonRoot | bool | `true` | Require the gateway container to run as a non-root user. |
@@ -301,7 +321,10 @@ discovery endpoint or its TLS CA.
 | supervisor.image.repository | string | `"ghcr.io/nvidia/openshell/supervisor"` | Supervisor image repository. Changing it uses the effective gateway image tag unless tag is also set. |
 | supervisor.image.tag | string | `""` | Supervisor image tag override. Empty uses the version pinned into the gateway unless repository is changed. |
 | supervisor.proxyPod.affinity | string | `"disabled"` | Same-node scheduling relationship between the workload pod and its paired proxy supervisor: disabled, preferred, or required. |
+| supervisor.proxyPod.dnsPeers | list | `[]` | Cluster DNS peers permitted by the proxy-pod agent egress NetworkPolicy. Each entry sets `namespaceLabels`, `podLabels`, or both. Empty uses the upstream kube-system/kube-dns and kube-system/coredns conventions, which do NOT match OpenShift (cluster DNS runs in `openshift-dns`) or NodeLocal DNSCache. An agent pod with no matching DNS peer cannot resolve its own paired supervisor Service.  `port` is the DNS *pod* port, not the Service port: egress rules with a podSelector match after Service address translation. Upstream CoreDNS listens on 53; OpenShift's dns-default listens on 5353 and maps 53 to it. For OpenShift:   dnsPeers:     - namespaceLabels:         kubernetes.io/metadata.name: openshift-dns       podLabels:         dns.operator.openshift.io/daemonset-dns: default       port: 5353 |
+| supervisor.proxyPod.gatewayPeers | list | `[]` | Gateway peers the proxy-pod agent egress NetworkPolicy permits, so the in-pod process supervisor can reach the gateway for its session. Same shape as dnsPeers (namespaceLabels/podLabels + port). Empty (default) auto-renders a peer matching THIS chart's own gateway pods on the service port; override only for an external or differently-labeled gateway. |
 | supervisor.proxyPod.proxyUid | int | `1337` | UID for the network supervisor in proxy-pod topology. The configured UID must not match the sandbox UID. |
+| supervisor.proxyPod.retainCompanionRbac | bool | `false` | Render the proxy-pod companion, fence, and pod-inspection RBAC even when supervisor.topology is not proxy-pod, and tell the gateway to keep running background upkeep (periodic companion reconciliation and the shared-mode supervisor Deployment readiness watch) for those sandboxes. Set this true as a migration mode when switching a gateway away from proxy-pod while proxy-pod sandboxes still exist: the driver keeps managing them by their persisted creation-time topology, and without this flag their RBAC and upkeep would stop, breaking readiness, stop/start, repair, and safe fence cleanup. Renders `proxy_pod.retain_companion_management` in gateway.toml. Leave it true until all proxy-pod sandboxes have been deleted, then remove it. |
 | supervisor.sidecar.processBinaryAwareNetworkPolicy | bool | `true` | Keep process/binary-aware network policy enabled in sidecar topology. When false, the network sidecar runs as proxyUid, drops the extra /proc inspection capabilities, and enforces endpoint/L7 policy without matching policy.binaries. |
 | supervisor.sidecar.proxyUid | int | `1337` | UID for relaxed long-running network sidecars in sidecar topology. Strict process/binary-aware sidecars run as UID 0 so Kubernetes grants the required /proc inspection capabilities into the effective set. The network init container installs nftables rules that exempt the effective sidecar UID. |
 | supervisor.sideloadMethod | string | `""` | How the supervisor binary is delivered into sandbox pods. Empty (default) = auto-detect from cluster version:   K8s >= v1.35 -> "image-volume" (ImageVolume enabled by default; GA in v1.36)   K8s < v1.35 -> "init-container" (copies via init container + emptyDir) On K8s v1.33-v1.34 with the ImageVolume feature gate manually enabled, set this to "image-volume" explicitly. |

@@ -42,17 +42,28 @@ impl Authenticator for ComputeDriverAuthenticator {
             return Ok(None);
         };
 
-        let sandbox_id = self.compute.authenticate_sandbox(credential).await?;
+        let (sandbox_id, scoped_process_caller) =
+            self.compute.authenticate_sandbox(credential).await?;
         if sandbox_id.is_empty() {
             return Err(Status::permission_denied(
                 "compute driver returned an empty sandbox identity",
             ));
         }
 
+        // A driver that authenticated a process-scoped caller (e.g. a proxy-pod
+        // agent pod) narrows the minted token to `Process`, which cannot read
+        // provider secrets or inference routing.
+        let caller_kind = if scoped_process_caller {
+            crate::auth::principal::SandboxCallerKind::Process
+        } else {
+            crate::auth::principal::SandboxCallerKind::Full
+        };
+
         Ok(Some(Principal::Sandbox(SandboxPrincipal {
             sandbox_id,
             source: SandboxIdentitySource::ComputeDriver {
                 driver_name: self.compute.configured_driver_name().to_string(),
+                caller_kind,
             },
             trust_domain: Some("openshell".to_string()),
         })))
@@ -103,7 +114,7 @@ mod tests {
         assert_eq!(principal.sandbox_id, "sandbox-a");
         assert!(matches!(
             principal.source,
-            SandboxIdentitySource::ComputeDriver { ref driver_name }
+            SandboxIdentitySource::ComputeDriver { ref driver_name, .. }
                 if driver_name == "external-kubernetes"
         ));
     }

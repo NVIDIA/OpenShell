@@ -436,6 +436,24 @@ jobs:
       e2e-task: e2e:kubernetes:workspace-operator
       conformance-artifact-prefix: openshell-conformance
 
+  kubernetes-proxy-pod-e2e:
+    needs: [pr_metadata, build-gateway, build-supervisor, build-cli]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+      # kind's default CNI does not enforce NetworkPolicies, so this exercises
+      # the proxy-pod control-plane contract (companions, readiness, sessionless
+      # relay rejection). The CNI-enforced egress isolation test is tracked
+      # separately and needs a policy-enforcing CNI.
+      job-name: Kubernetes E2E (proxy-pod topology)
+      e2e-task: e2e:kubernetes:proxy-pod
+      cli-artifact-prefix: rust-binary-cli
+
   kubernetes-ha-e2e:
     needs: [pr_metadata, build-cli, build-conformance, build-gateway-image, build-supervisor-image]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
@@ -467,7 +485,7 @@ jobs:
 
   core-e2e-result:
     name: Core E2E result
-    needs: [pr_metadata, docker-e2e, podman-e2e, vm-e2e, docker-external-driver-e2e, podman-external-driver-e2e, vm-external-driver-e2e, kubernetes-e2e, kubernetes-external-driver-e2e, kubernetes-workspace-managed-e2e, kubernetes-workspace-operator-e2e]
+    needs: [pr_metadata, docker-e2e, podman-e2e, vm-e2e, docker-external-driver-e2e, podman-external-driver-e2e, vm-external-driver-e2e, kubernetes-e2e, kubernetes-external-driver-e2e, kubernetes-workspace-managed-e2e, kubernetes-workspace-operator-e2e, kubernetes-proxy-pod-e2e]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     runs-on: ubuntu-latest
     steps:

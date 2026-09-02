@@ -75,6 +75,8 @@ tests:
     set:
       supervisor.topology: proxy-pod
     asserts:
+      # No delete: companions are garbage-collected with the Sandbox CR.
+      # list + watch back the supervisor Deployment readiness watch.
       - contains:
           path: rules
           content:
@@ -84,8 +86,10 @@ tests:
               - deployments
             verbs:
               - create
-              - delete
               - get
+              - list
+              - patch
+              - watch
 
   - it: grants ReplicaSet get for proxy-pod supervisor token bootstrap
     template: templates/role.yaml
@@ -107,6 +111,7 @@ tests:
     set:
       supervisor.topology: proxy-pod
     asserts:
+      # Services: create + get (get for 409-verify), no delete (GC-owned).
       - contains:
           path: rules
           content:
@@ -114,10 +119,21 @@ tests:
               - ""
             resources:
               - services
+            verbs:
+              - create
+              - get
+      # Secrets: create only — the gateway never reads or deletes Secret contents.
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
               - secrets
             verbs:
               - create
-              - delete
+      # NetworkPolicies: the gateway-managed egress fence needs delete + list
+      # for ordered teardown and orphan reaping.
       - contains:
           path: rules
           content:
@@ -128,6 +144,8 @@ tests:
             verbs:
               - create
               - delete
+              - get
+              - list
 
   - it: omits proxy-pod RBAC in the default combined topology
     template: templates/role.yaml

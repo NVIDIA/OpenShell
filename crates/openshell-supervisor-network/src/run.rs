@@ -161,7 +161,19 @@ pub struct Networking {
     _transparent_tcp: Option<crate::proxy::TransparentTcpHandle>,
 }
 
-fn sandbox_ca_for_proxy() -> Result<SandboxCa> {
+/// Resolve the L7 proxy CA.
+///
+/// `trust_launch_env` gates the environment-provided CA file paths. They are a
+/// proxy-pod/sidecar launch contract: those supervisors run standalone in a
+/// separate container built from the trusted supervisor image, so their process
+/// environment is set only by the driver. A combined-topology supervisor shares
+/// the workload's container and inherits the workload image's baked-in
+/// environment, which is untrusted — so it must ignore these paths and always
+/// generate an ephemeral CA rather than load attacker-supplied key material.
+fn sandbox_ca_for_proxy(trust_launch_env: bool) -> Result<SandboxCa> {
+    if !trust_launch_env {
+        return SandboxCa::generate();
+    }
     let cert_path = std::env::var(openshell_core::sandbox_env::PROXY_CA_CERT_PATH).ok();
     let key_path = std::env::var(openshell_core::sandbox_env::PROXY_CA_KEY_PATH).ok();
     match (cert_path, key_path) {
@@ -178,7 +190,19 @@ fn sandbox_ca_for_proxy() -> Result<SandboxCa> {
     }
 }
 
-fn explicit_proxy_bind_addr() -> Result<Option<SocketAddr>> {
+/// Resolve an explicit proxy bind address from the environment.
+///
+/// `trust_launch_env` gates this the same way as [`sandbox_ca_for_proxy`]: only
+/// a standalone network supervisor (proxy-pod/sidecar) may take its bind address
+/// from the environment. A combined-topology supervisor must never honor an
+/// image-baked `PROXY_BIND_ADDR`; a value like `0.0.0.0:3128` would publish the
+/// credential-bearing policy proxy on the pod network and let another workload
+/// use the sandbox as a confused deputy. It binds to the namespace-scoped veth
+/// IP instead (the caller's `proxy_bind_ip`).
+fn explicit_proxy_bind_addr(trust_launch_env: bool) -> Result<Option<SocketAddr>> {
+    if !trust_launch_env {
+        return Ok(None);
+    }
     let Some(value) = std::env::var(openshell_core::sandbox_env::PROXY_BIND_ADDR)
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -347,8 +371,13 @@ pub async fn run_networking(
 
     // Generate or load a CA and TLS state for HTTPS L7 inspection. The CA cert
     // is written to disk so sandbox processes can trust it.
+    // A standalone network supervisor (proxy-pod/sidecar; `!process_enabled`)
+    // runs in a trusted separate container, so its launch environment (CA paths,
+    // bind address) is driver-controlled. A combined supervisor shares the
+    // workload's container and must not trust image-baked launch variables.
+    let trust_launch_env = !process_enabled;
     let (tls_state, ca_file_paths) = if matches!(policy.network.mode, NetworkMode::Proxy) {
-        match sandbox_ca_for_proxy() {
+        match sandbox_ca_for_proxy(trust_launch_env) {
             Ok(ca) => {
                 let tls_dir = std::env::var(openshell_core::sandbox_env::PROXY_TLS_DIR)
                     .unwrap_or_else(|_| openshell_core::container_paths::TLS_ROOT.to_string());
@@ -452,7 +481,7 @@ pub async fn run_networking(
         // originating inside the namespace can reach the proxy. Otherwise the
         // proxy falls back to the policy-declared http_addr (loopback in
         // tests, etc.).
-        let bind_addr = explicit_proxy_bind_addr()?.or_else(|| {
+        let bind_addr = explicit_proxy_bind_addr(trust_launch_env)?.or_else(|| {
             proxy_bind_ip.map(|ip| {
                 let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
                 SocketAddr::new(ip, port)
@@ -553,5 +582,49 @@ mod transparent_runtime_tests {
         std::fs::write(&path, "corrupt\n").unwrap();
         let error = advance_allocation_epoch(&path, Some("sandbox-a")).unwrap_err();
         assert!(error.to_string().contains("allocation epoch is invalid"));
+    }
+}
+
+#[cfg(test)]
+mod launch_env_trust_tests {
+    use super::*;
+
+    // A combined-topology supervisor (`trust_launch_env = false`) shares the
+    // workload's container, so image-baked launch variables are untrusted and
+    // must be ignored; a standalone network supervisor (proxy-pod/sidecar)
+    // honors the driver-set launch environment. These vars are process-global,
+    // so both directions live in one test to avoid racing sibling tests.
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var/remove_var require unsafe in Rust 2024
+    fn launch_env_is_ignored_in_combined_topology() {
+        let bogus_cert = "/nonexistent/openshell-attacker-ca.crt";
+        let bogus_key = "/nonexistent/openshell-attacker-ca.key";
+        unsafe {
+            std::env::set_var(openshell_core::sandbox_env::PROXY_BIND_ADDR, "0.0.0.0:3128");
+            std::env::set_var(openshell_core::sandbox_env::PROXY_CA_CERT_PATH, bogus_cert);
+            std::env::set_var(openshell_core::sandbox_env::PROXY_CA_KEY_PATH, bogus_key);
+        }
+
+        // Untrusted (combined): the image-baked bind address is ignored, so the
+        // proxy falls back to the namespace-scoped veth IP instead of 0.0.0.0.
+        assert_eq!(explicit_proxy_bind_addr(false).unwrap(), None);
+        // Untrusted (combined): attacker CA paths are ignored; a fresh CA is
+        // generated rather than loaded from the (bogus) files.
+        assert!(sandbox_ca_for_proxy(false).is_ok());
+
+        // Trusted (proxy-pod/sidecar): the driver-set launch environment is honored.
+        assert_eq!(
+            explicit_proxy_bind_addr(true).unwrap(),
+            Some("0.0.0.0:3128".parse().unwrap())
+        );
+        // Trusted path actually reads the configured files, so bogus paths error
+        // rather than silently generating — proving the value is honored.
+        assert!(sandbox_ca_for_proxy(true).is_err());
+
+        unsafe {
+            std::env::remove_var(openshell_core::sandbox_env::PROXY_BIND_ADDR);
+            std::env::remove_var(openshell_core::sandbox_env::PROXY_CA_CERT_PATH);
+            std::env::remove_var(openshell_core::sandbox_env::PROXY_CA_KEY_PATH);
+        }
     }
 }

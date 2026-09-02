@@ -9,7 +9,7 @@ position: 6
 ---
 
 <Warning>
-The OpenShift install path is experimental. It currently requires running sandbox pods under the `privileged` SCC and installing the gateway with TLS disabled. Use only for evaluation on a private network.
+The OpenShift install path is experimental. The default `combined` topology runs sandbox pods under the `privileged` SCC, and this guide installs the gateway with TLS disabled. Use only for evaluation on a private network. Only the `proxy-pod` topology runs sandbox pods under the built-in `nonroot-v2` SCC (set `sandboxServiceAccount.openshift.nonrootSCC=true`); the `sidecar` and `cni-sidecar` topologies still need a custom SCC (their network init container and root sidecar require added capabilities) — see [Topology](/kubernetes/topology).
 </Warning>
 
 OpenShift's [Security Context Constraints](https://docs.openshift.com/container-platform/latest/authentication/managing-security-context-constraints.html) reject the chart's default pod security settings. Installing on OpenShift requires precreating the namespace, granting the `privileged` SCC to the sandbox service account, and overriding a few chart values so the cluster admission controller can assign UIDs and FS groups itself.
@@ -39,11 +39,13 @@ oc create ns openshell
 
 ## Grant the privileged SCC to sandbox pods
 
-Sandbox pods run under the `openshell-sandbox` service account in the `openshell` namespace and require the `privileged` SCC:
+Sandbox pods run under the `openshell-sandbox` service account in the `openshell` namespace. The default `combined` topology requires the `privileged` SCC:
 
 ```shell
 oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell
 ```
+
+For the `proxy-pod` topology, skip this grant and instead set `sandboxServiceAccount.openshift.nonrootSCC=true` when installing the chart, which binds the built-in `nonroot-v2` SCC. The `sidecar` and `cni-sidecar` topologies are *not* covered by `nonroot-v2` — their UID-0 network init container and default root sidecar need added capabilities, so they require a custom SCC. See [Topology](/kubernetes/topology) for the per-topology privilege model.
 
 ## Install the chart with OpenShift overrides
 
@@ -60,6 +62,36 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
 |---|---|
 | `server.disableTls=true` | Runs the gateway over plaintext HTTP for simpler evaluation. |
 | `podSecurityContext.fsGroup=null` / `securityContext.runAsUser=null` | Clear the chart's hardcoded UID and fsGroup so OpenShift's SCC admission can assign them. |
+
+The command above installs the default `combined` topology, which needs the
+`privileged` SCC granted above.
+
+### Proxy-pod topology on OpenShift
+
+To run the least-privilege `proxy-pod` topology instead, skip the `privileged`
+grant and install with the proxy-pod overrides. This binds the built-in
+`nonroot-v2` SCC and declares OpenShift's cluster DNS peers, which the agent pod
+needs to resolve its paired supervisor Service (OpenShift runs DNS in
+`openshift-dns` on container port `5353`, not `kube-system`/`53`, so the default
+peers do not match and are [required](/kubernetes/topology) to be set):
+
+```shell
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set server.disableTls=true \
+  --set podSecurityContext.fsGroup=null \
+  --set securityContext.runAsUser=null \
+  --set supervisor.topology=proxy-pod \
+  --set sandboxServiceAccount.openshift.nonrootSCC=true \
+  --set 'supervisor.proxyPod.dnsPeers[0].namespaceLabels.kubernetes\.io/metadata\.name=openshift-dns' \
+  --set 'supervisor.proxyPod.dnsPeers[0].podLabels.dns\.operator\.openshift\.io/daemonset-dns=default' \
+  --set supervisor.proxyPod.dnsPeers[0].port=5353
+```
+
+Proxy-pod also requires a cluster CNI that enforces Kubernetes NetworkPolicies
+(OpenShift's default OVN-Kubernetes does). See [Topology](/kubernetes/topology)
+for the full proxy-pod contract and tradeoffs.
 
 ## Wait for the gateway to be ready
 

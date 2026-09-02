@@ -28,8 +28,8 @@ use openshell_core::proto::compute::v1::{
     GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
     GetSandboxRequest, GpuResourceRequirements as DriverGpuResourceRequirements,
     ListSandboxesRequest, ResourceRequirements as DriverSandboxResourceRequirements,
-    StartSandboxRequest, StopSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent,
-    WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
+    StartSandboxRequest, StopSandboxRequest, SupervisorSessionModel, ValidateSandboxCreateRequest,
+    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
     compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
     watch_sandboxes_event,
 };
@@ -753,7 +753,13 @@ impl ComputeRuntime {
         self.driver_info.supports_sandbox_authentication
     }
 
-    pub(crate) async fn authenticate_sandbox(&self, credential: &str) -> Result<String, Status> {
+    /// Authenticate a driver-native sandbox credential. Returns the
+    /// authenticated sandbox ID and whether the driver reported a process-scoped
+    /// caller (e.g. a proxy-pod agent pod), which narrows the minted token.
+    pub(crate) async fn authenticate_sandbox(
+        &self,
+        credential: &str,
+    ) -> Result<(String, bool), Status> {
         if !self.supports_sandbox_authentication() {
             return Err(Status::unimplemented(
                 "selected compute driver does not authenticate sandbox credentials",
@@ -767,7 +773,10 @@ impl ComputeRuntime {
                 driver.authenticate_sandbox(Request::new(request)).await
             })
             .await
-            .map(|response| response.into_inner().sandbox_id)
+            .map(|response| {
+                let response = response.into_inner();
+                (response.sandbox_id, response.scoped_process_caller)
+            })
     }
 
     #[must_use]
@@ -1320,6 +1329,7 @@ impl ComputeRuntime {
         let sandbox_id = transition.object_id().to_string();
         let expected_resource_version = sandbox_resource_version(transition);
         let session_connected = self.supervisor_sessions.has_session(&sandbox_id);
+        self.record_supervisor_session_model(&sandbox_id, snapshot);
         match self
             .store
             .update_message_cas::<Sandbox, _>(&sandbox_id, expected_resource_version, |sandbox| {
@@ -2872,6 +2882,7 @@ impl ComputeRuntime {
         existing_phase: SandboxPhase,
     ) -> Result<(), String> {
         let session_connected = self.supervisor_sessions.has_session(&incoming.id);
+        self.record_supervisor_session_model(&incoming.id, &incoming);
         let sandbox = self
             .store
             .update_message_cas::<Sandbox, _>(
@@ -2906,6 +2917,17 @@ impl ComputeRuntime {
             self.cleanup_stopped_sandbox_sessions(&sandbox).await?;
         }
         Ok(())
+    }
+
+    /// Track whether this sandbox's topology can ever open a supervisor
+    /// session, so relay-backed RPCs fail fast with an explanation instead of
+    /// waiting out a timeout that cannot succeed.
+    fn record_supervisor_session_model(&self, sandbox_id: &str, snapshot: &DriverSandbox) {
+        let Some(status) = snapshot.status.as_ref() else {
+            return;
+        };
+        self.supervisor_sessions
+            .set_sessionless(sandbox_id, sandbox_has_no_supervisor_session(status));
     }
 
     pub async fn supervisor_session_connected(
@@ -3437,6 +3459,10 @@ impl ComputeRuntime {
         self.tracing_log_bus.remove(sandbox_id);
         self.tracing_log_bus.platform_event_bus.remove(sandbox_id);
         self.sandbox_watch_bus.remove(sandbox_id);
+        // Drop the sessionless marker on permanent removal only. It is a
+        // topology property that must survive stop/start, so it is not cleared
+        // in cleanup_stopped_sandbox_sessions.
+        self.supervisor_sessions.forget_sessionless(sandbox_id);
     }
 
     async fn reconcile_snapshot_sandbox(
@@ -3999,6 +4025,7 @@ fn build_platform_resources_config(
 
 fn driver_status_from_public(status: &SandboxStatus) -> DriverSandboxStatus {
     DriverSandboxStatus {
+        supervisor_session_model: 0,
         sandbox_name: status.sandbox_name.clone(),
         instance_id: status.agent_pod.clone(),
         agent_fd: status.agent_fd.clone(),
@@ -4269,16 +4296,32 @@ fn ensure_supervisor_ready_status(status: &mut Option<SandboxStatus>, sandbox_na
     );
 }
 
+/// Whether the driver reports that this sandbox has no in-sandbox process
+/// supervisor, and therefore no `ConnectSupervisor` session.
+///
+/// Unset and `Required` both preserve the default contract, so a driver that
+/// never sets the field behaves exactly as before.
+fn sandbox_has_no_supervisor_session(status: &DriverSandboxStatus) -> bool {
+    status.supervisor_session_model() == SupervisorSessionModel::None
+}
+
 /// Compose the public `SandboxPhase` from backend driver state and supervisor session presence.
 ///
 /// The readiness decision is a gateway-owned safety invariant: `SandboxPhase::Ready` means
 /// "usable through this gateway." The driver contract is the extension point for custom backend
 /// readiness semantics. RFC-0010 lifecycle hooks observe this decision via `post_commit`; they
 /// do not modify it.
+///
+/// Topologies with no in-sandbox process supervisor use that extension point.
+/// They report `SupervisorSessionModel::None`, and the gateway then trusts the
+/// backend `Ready` condition, because no session will ever arrive. Such a
+/// sandbox is usable for policy-enforced network egress but cannot serve a
+/// relay, so relay-backed RPCs are rejected rather than left to time out.
 struct ComposedPhase {
     phase: SandboxPhase,
     session_connected: bool,
     backend_ready_without_session: bool,
+    sessionless: bool,
 }
 
 impl ComposedPhase {
@@ -4288,6 +4331,7 @@ impl ComposedPhase {
         driver_reports_runtime_readiness: bool,
     ) -> Self {
         let backend_phase = derive_phase(Some(incoming_status));
+        let sessionless = sandbox_has_no_supervisor_session(incoming_status);
         // A live supervisor session is a stronger readiness signal than the backend phase.
         // set_supervisor_session_state may have already promoted the store record to Ready
         // before this driver snapshot arrived. Keep Ready rather than letting a lagging
@@ -4296,6 +4340,10 @@ impl ComposedPhase {
             SandboxPhase::Error | SandboxPhase::Deleting | SandboxPhase::Stopped => backend_phase,
             SandboxPhase::Ready if driver_reports_runtime_readiness => SandboxPhase::Ready,
             _ if session_connected => SandboxPhase::Ready,
+            // No session will ever arrive for this topology. The driver is
+            // responsible for withholding its `Ready` condition until the
+            // out-of-sandbox supervisor is actually serving.
+            SandboxPhase::Ready if sessionless => SandboxPhase::Ready,
             _ => SandboxPhase::Provisioning,
         };
         Self {
@@ -4303,7 +4351,9 @@ impl ComposedPhase {
             session_connected,
             backend_ready_without_session: !driver_reports_runtime_readiness
                 && backend_phase == SandboxPhase::Ready
-                && !session_connected,
+                && !session_connected
+                && !sessionless,
+            sessionless,
         }
     }
 
@@ -4314,6 +4364,9 @@ impl ComposedPhase {
         spec: Option<&SandboxSpec>,
     ) {
         rewrite_user_facing_conditions(status, spec);
+        if self.sessionless {
+            ensure_no_supervisor_session_status(status, sandbox_name);
+        }
         if self.backend_ready_without_session {
             ensure_supervisor_not_connected_status(status, sandbox_name);
         } else if self.session_connected && self.phase == SandboxPhase::Ready {
@@ -4345,6 +4398,74 @@ fn ensure_supervisor_not_ready_status(status: &mut Option<SandboxStatus>, sandbo
             status: "False".to_string(),
             reason: "DependenciesNotReady".to_string(),
             message: "Supervisor session disconnected".to_string(),
+            last_transition_time: String::new(),
+        },
+    );
+}
+
+/// Condition type advertising whether a sandbox can serve relay-backed
+/// operations.
+///
+/// Carried in the public status so clients can tell that SSH, `exec`, port
+/// forwarding, and file transfer are unavailable *before* attempting one,
+/// rather than discovering it from a failed connection. Using a condition
+/// avoids adding a field to the public `Sandbox` message.
+pub const SUPERVISOR_SESSION_CONDITION: &str = "SupervisorSession";
+
+/// Reason marking a `SupervisorSession=False` condition as a permanent property
+/// of the topology (no in-sandbox supervisor) rather than a transient
+/// disconnect. Only this reason is treated as durably sessionless.
+pub const SUPERVISOR_SESSION_NOT_APPLICABLE_REASON: &str = "NotApplicable";
+
+/// Whether a stored sandbox status marks the sandbox as having no supervisor
+/// session (via the durable `SupervisorSession=False` condition with reason
+/// `NotApplicable`). Lets any gateway replica reject relay-backed RPCs from
+/// durable state, not only the reconciler lease holder that populates the
+/// in-memory sessionless set. The reason is required so a future driver that
+/// reports `SupervisorSession=False` for a *transient* disconnect is not given
+/// a terminal relay rejection.
+pub fn sandbox_status_is_sessionless(status: &SandboxStatus) -> bool {
+    status.conditions.iter().any(|condition| {
+        condition.r#type == SUPERVISOR_SESSION_CONDITION
+            && condition.status.eq_ignore_ascii_case("false")
+            && condition
+                .reason
+                .eq_ignore_ascii_case(SUPERVISOR_SESSION_NOT_APPLICABLE_REASON)
+    })
+}
+
+fn upsert_condition(
+    status: &mut Option<SandboxStatus>,
+    sandbox_name: &str,
+    condition: SandboxCondition,
+) {
+    let status = status.get_or_insert_with(|| SandboxStatus {
+        sandbox_name: sandbox_name.to_string(),
+        ..Default::default()
+    });
+
+    let condition_type = condition.r#type.clone();
+    if let Some(existing) = status
+        .conditions
+        .iter_mut()
+        .find(|existing| existing.r#type == condition_type)
+    {
+        *existing = condition;
+    } else {
+        status.conditions.push(condition);
+    }
+}
+
+/// Record that this sandbox's topology never opens a supervisor session.
+fn ensure_no_supervisor_session_status(status: &mut Option<SandboxStatus>, sandbox_name: &str) {
+    upsert_condition(
+        status,
+        sandbox_name,
+        SandboxCondition {
+            r#type: SUPERVISOR_SESSION_CONDITION.to_string(),
+            status: "False".to_string(),
+            reason: SUPERVISOR_SESSION_NOT_APPLICABLE_REASON.to_string(),
+            message: openshell_core::error::no_supervisor_session_message(),
             last_transition_time: String::new(),
         },
     );
@@ -4563,6 +4684,7 @@ impl ComputeDriver for NoopTestDriver {
             Some(Ok(sandbox_id)) => Ok(tonic::Response::new(
                 openshell_core::proto::compute::v1::AuthenticateSandboxResponse {
                     sandbox_id: sandbox_id.clone(),
+                    scoped_process_caller: false,
                 },
             )),
             Some(Err((code, message))) => Err(Status::new(*code, message.clone())),
@@ -6032,6 +6154,7 @@ mod tests {
 
     fn make_driver_status(condition: DriverCondition) -> DriverSandboxStatus {
         DriverSandboxStatus {
+            supervisor_session_model: 0,
             sandbox_name: "test".to_string(),
             instance_id: "test-pod".to_string(),
             agent_fd: String::new(),
@@ -6049,6 +6172,7 @@ mod tests {
             workspace: "default".to_string(),
             spec: None,
             status: Some(DriverSandboxStatus {
+                supervisor_session_model: 0,
                 sandbox_name: name.to_string(),
                 instance_id: format!("{name}-pod"),
                 agent_fd: String::new(),
@@ -6210,6 +6334,108 @@ mod tests {
         };
 
         assert_eq!(derive_phase(Some(&status)), SandboxPhase::Deleting);
+    }
+
+    fn ready_driver_status() -> DriverSandboxStatus {
+        let mut condition = make_driver_condition("DependenciesReady", "Pod is Ready");
+        condition.status = "True".to_string();
+        make_driver_status(condition)
+    }
+
+    #[test]
+    fn composed_phase_requires_a_session_by_default() {
+        let status = ready_driver_status();
+        assert_eq!(derive_phase(Some(&status)), SandboxPhase::Ready);
+
+        // Unset session model keeps the historical contract: backend Ready is
+        // not enough, the gateway waits for a supervisor session.
+        let composed = ComposedPhase::new(&status, false, false);
+        assert_eq!(composed.phase, SandboxPhase::Provisioning);
+        assert!(composed.backend_ready_without_session);
+
+        let composed = ComposedPhase::new(&status, true, false);
+        assert_eq!(composed.phase, SandboxPhase::Ready);
+    }
+
+    #[test]
+    fn composed_phase_trusts_the_backend_when_no_session_will_ever_arrive() {
+        let mut status = ready_driver_status();
+        status.supervisor_session_model = SupervisorSessionModel::None as i32;
+
+        let composed = ComposedPhase::new(&status, false, false);
+        assert_eq!(composed.phase, SandboxPhase::Ready);
+        // Not "waiting for a supervisor session" -- none is coming, so the
+        // sandbox must not advertise that it is still settling.
+        assert!(!composed.backend_ready_without_session);
+    }
+
+    #[test]
+    fn sessionless_sandboxes_are_not_ready_until_the_backend_says_so() {
+        let mut status = make_driver_status(make_driver_condition(
+            "DependenciesNotReady",
+            "Pod exists with phase: Pending",
+        ));
+        status.supervisor_session_model = SupervisorSessionModel::None as i32;
+
+        // The driver withholds its Ready condition until the paired supervisor
+        // is serving, so the gateway must not promote this to Ready.
+        assert_eq!(
+            ComposedPhase::new(&status, false, false).phase,
+            SandboxPhase::Provisioning
+        );
+    }
+
+    #[test]
+    fn sessionless_model_does_not_override_terminal_backend_phases() {
+        for (reason, expected) in [
+            ("Failed", SandboxPhase::Error),
+            ("Suspended", SandboxPhase::Stopped),
+        ] {
+            let mut status = if reason == "Suspended" {
+                let mut status = make_driver_status(make_driver_condition("Suspended", "stopped"));
+                status.conditions[0].r#type = "Suspended".to_string();
+                status.conditions[0].status = "True".to_string();
+                status
+            } else {
+                let mut status = make_driver_status(make_driver_condition(reason, "failed"));
+                status.conditions[0].status = "False".to_string();
+                status
+            };
+            status.supervisor_session_model = SupervisorSessionModel::None as i32;
+            assert_eq!(
+                ComposedPhase::new(&status, false, false).phase,
+                expected,
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn sessionless_requires_not_applicable_reason() {
+        let sessionless = SandboxStatus {
+            conditions: vec![SandboxCondition {
+                r#type: SUPERVISOR_SESSION_CONDITION.to_string(),
+                status: "False".to_string(),
+                reason: SUPERVISOR_SESSION_NOT_APPLICABLE_REASON.to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(sandbox_status_is_sessionless(&sessionless));
+
+        // SupervisorSession=False for a *transient* disconnect (any other reason)
+        // must NOT be treated as durably sessionless, or a future driver would
+        // get a terminal relay rejection during a temporary outage.
+        let transient = SandboxStatus {
+            conditions: vec![SandboxCondition {
+                r#type: SUPERVISOR_SESSION_CONDITION.to_string(),
+                status: "False".to_string(),
+                reason: "Disconnected".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!sandbox_status_is_sessionless(&transient));
     }
 
     #[test]
@@ -7585,6 +7811,7 @@ mod tests {
                 namespace: "default".to_string(),
                 spec: None,
                 status: Some(DriverSandboxStatus {
+                    supervisor_session_model: 0,
                     sandbox_name: "sandbox-a".to_string(),
                     instance_id: "agent-pod".to_string(),
                     agent_fd: String::new(),
@@ -9191,6 +9418,7 @@ mod tests {
 
     fn make_ready_driver_status() -> DriverSandboxStatus {
         DriverSandboxStatus {
+            supervisor_session_model: 0,
             sandbox_name: "test".to_string(),
             instance_id: "test-pod".to_string(),
             agent_fd: String::new(),
@@ -9208,6 +9436,7 @@ mod tests {
 
     fn make_deleting_driver_status() -> DriverSandboxStatus {
         DriverSandboxStatus {
+            supervisor_session_model: 0,
             sandbox_name: "test".to_string(),
             instance_id: "test-pod".to_string(),
             agent_fd: String::new(),
@@ -9485,6 +9714,7 @@ mod tests {
                 namespace: "default".to_string(),
                 spec: None,
                 status: Some(DriverSandboxStatus {
+                    supervisor_session_model: 0,
                     sandbox_name: "sandbox-a".to_string(),
                     instance_id: "agent-pod".to_string(),
                     agent_fd: String::new(),
@@ -9506,6 +9736,7 @@ mod tests {
                 namespace: "default".to_string(),
                 spec: None,
                 status: Some(DriverSandboxStatus {
+                    supervisor_session_model: 0,
                     sandbox_name: "sandbox-a".to_string(),
                     instance_id: "agent-pod".to_string(),
                     agent_fd: String::new(),
@@ -9719,6 +9950,7 @@ mod tests {
                 namespace: "default".to_string(),
                 spec: None,
                 status: Some(DriverSandboxStatus {
+                    supervisor_session_model: 0,
                     sandbox_name: "sandbox-a".to_string(),
                     instance_id: "agent-pod".to_string(),
                     agent_fd: String::new(),

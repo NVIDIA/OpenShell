@@ -17,7 +17,7 @@ use openshell_driver_kubernetes::{
     AppArmorProfile, ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID,
     DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig, KubernetesComputeDriver,
     KubernetesProxyPodConfig, KubernetesSidecarConfig, ManagedSshIngressConfig, ProxyPodAffinity,
-    SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode,
+    ProxyPodDnsPeer, SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode,
 };
 
 #[derive(Parser, Debug)]
@@ -184,6 +184,36 @@ struct Args {
     )]
     proxy_pod_affinity: ProxyPodAffinity,
 
+    /// Cluster DNS peers for the proxy-pod agent egress `NetworkPolicy`, as a
+    /// JSON array of `{"namespace_labels": {..}, "pod_labels": {..}}` objects.
+    /// Defaults to the upstream kube-system conventions, which do not match
+    /// `OpenShift` or `NodeLocal` `DNSCache` deployments.
+    #[arg(
+        long = "proxy-pod-dns-peers",
+        env = "OPENSHELL_K8S_PROXY_POD_DNS_PEERS"
+    )]
+    proxy_pod_dns_peers: Option<String>,
+
+    /// Gateway peers for the proxy-pod agent egress `NetworkPolicy`, as a JSON
+    /// array of `{"namespace_labels": {..}, "pod_labels": {..}, "port": N}`
+    /// objects. Required for proxy-pod: the in-pod process supervisor needs
+    /// egress to the gateway.
+    #[arg(
+        long = "proxy-pod-gateway-peers",
+        env = "OPENSHELL_K8S_PROXY_POD_GATEWAY_PEERS"
+    )]
+    proxy_pod_gateway_peers: Option<String>,
+
+    /// Keep managing existing proxy-pod sandboxes (periodic reconcile and the
+    /// shared-mode supervisor Deployment readiness watch) after the configured
+    /// topology has been switched away from proxy-pod. Set during a
+    /// `retainCompanionRbac` migration.
+    #[arg(
+        long = "proxy-pod-retain-companion-management",
+        env = "OPENSHELL_K8S_PROXY_POD_RETAIN_COMPANION_MANAGEMENT"
+    )]
+    proxy_pod_retain_companion_management: bool,
+
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
 
@@ -265,6 +295,22 @@ async fn main() -> Result<()> {
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
 
+    let proxy_pod_dns_peers = match args.proxy_pod_dns_peers.as_deref() {
+        Some(raw) => serde_json::from_str::<Vec<ProxyPodDnsPeer>>(raw)
+            .into_diagnostic()
+            .map_err(|err| miette::miette!("--proxy-pod-dns-peers must be a JSON array: {err}"))?,
+        None => KubernetesProxyPodConfig::default().dns_peers,
+    };
+
+    let proxy_pod_gateway_peers = match args.proxy_pod_gateway_peers.as_deref() {
+        Some(raw) => serde_json::from_str::<Vec<ProxyPodDnsPeer>>(raw)
+            .into_diagnostic()
+            .map_err(|err| {
+                miette::miette!("--proxy-pod-gateway-peers must be a JSON array: {err}")
+            })?,
+        None => KubernetesProxyPodConfig::default().gateway_peers,
+    };
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let driver = KubernetesComputeDriver::new(
         KubernetesComputeConfig {
@@ -296,6 +342,9 @@ async fn main() -> Result<()> {
             proxy_pod: KubernetesProxyPodConfig {
                 proxy_uid: args.proxy_pod_proxy_uid,
                 affinity: args.proxy_pod_affinity,
+                dns_peers: proxy_pod_dns_peers,
+                gateway_peers: proxy_pod_gateway_peers,
+                retain_companion_management: args.proxy_pod_retain_companion_management,
             },
             https_proxy: args.https_proxy,
             no_proxy: args.no_proxy,

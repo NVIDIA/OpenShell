@@ -582,6 +582,30 @@ process_binary_aware_network_policy = true
 proxy_uid = 1337
 # Same-node workload/supervisor placement: disabled, preferred, or required.
 affinity = "disabled"
+# Keep running background upkeep (periodic companion reconciliation and the
+# shared-mode supervisor Deployment readiness watch) for existing proxy-pod
+# sandboxes after `topology` is switched away from proxy-pod. Set true during a
+# migration (Helm renders it from supervisor.proxyPod.retainCompanionRbac) and
+# leave it set until every proxy-pod sandbox is deleted. Default false.
+retain_companion_management = false
+# Gateway peers the agent-egress NetworkPolicy permits, so the in-pod process
+# supervisor can reach the gateway for its session. Same shape as dns_peers
+# (selectors + the gateway's TCP port). Required for proxy-pod; the Helm chart
+# renders it from the gateway's own pod labels by default.
+[[openshell.drivers.kubernetes.proxy_pod.gateway_peers]]
+port = 8080
+namespace_labels = { "kubernetes.io/metadata.name" = "openshell" }
+pod_labels = { "app.kubernetes.io/name" = "openshell" }
+# Cluster DNS peers the agent-egress NetworkPolicy allows. Empty (default) uses
+# the upstream kube-system/kube-dns and kube-system/coredns conventions, which
+# do NOT match OpenShift (cluster DNS runs in openshift-dns) or NodeLocal
+# DNSCache. Each entry sets namespace_labels, pod_labels, or both, plus the DNS
+# pod port (OpenShift's dns-default listens on 5353). An agent pod with no
+# matching DNS peer cannot resolve its own paired supervisor Service.
+[[openshell.drivers.kubernetes.proxy_pod.dns_peers]]
+port = 5353
+namespace_labels = { "kubernetes.io/metadata.name" = "openshift-dns" }
+pod_labels = { "dns.operator.openshift.io/daemonset-dns" = "default" }
 ```
 
 In managed workspace mode, the Kubernetes driver copies each explicitly named

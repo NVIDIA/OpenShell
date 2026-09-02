@@ -221,6 +221,87 @@ impl FromStr for ProxyPodAffinity {
     }
 }
 
+/// One cluster-DNS peer in the `proxy-pod` agent egress `NetworkPolicy`.
+///
+/// Each peer renders as a single `to` entry combining a `namespaceSelector`
+/// and a `podSelector`, so both selectors must match the same pod.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProxyPodDnsPeer {
+    /// Labels matched against the namespace hosting the DNS pods.
+    pub namespace_labels: BTreeMap<String, String>,
+    /// Labels matched against the DNS pods themselves.
+    pub pod_labels: BTreeMap<String, String>,
+    /// Port the DNS pods actually listen on.
+    ///
+    /// This is the **container** port, not the `Service` port. A
+    /// `NetworkPolicy` egress rule with a `podSelector` peer is evaluated
+    /// against the destination pod after `Service` address translation, so a
+    /// `Service` that maps 53 to a different container port needs that
+    /// container port here. Upstream `CoreDNS` listens on 53; `OpenShift`'s
+    /// `dns-default` listens on 5353 and maps 53 to it.
+    pub port: u16,
+}
+
+impl Default for ProxyPodDnsPeer {
+    fn default() -> Self {
+        Self {
+            namespace_labels: BTreeMap::new(),
+            pod_labels: BTreeMap::new(),
+            port: DEFAULT_DNS_PORT,
+        }
+    }
+}
+
+/// Default DNS container port, matching upstream `CoreDNS`/kube-dns.
+pub const DEFAULT_DNS_PORT: u16 = 53;
+
+impl ProxyPodDnsPeer {
+    fn new(namespace_label: (&str, &str), pod_label: (&str, &str)) -> Self {
+        Self {
+            namespace_labels: std::iter::once((
+                namespace_label.0.to_string(),
+                namespace_label.1.to_string(),
+            ))
+            .collect(),
+            pod_labels: std::iter::once((pod_label.0.to_string(), pod_label.1.to_string()))
+                .collect(),
+            port: DEFAULT_DNS_PORT,
+        }
+    }
+
+    fn validate(&self, index: usize) -> Result<(), String> {
+        if self.port == 0 {
+            return Err(format!("proxy_pod.dns_peers[{index}].port must not be 0"));
+        }
+        if self.namespace_labels.is_empty() && self.pod_labels.is_empty() {
+            return Err(format!(
+                "proxy_pod.dns_peers[{index}] must set namespace_labels, pod_labels, or both; an \
+                 empty peer would allow DNS-port egress to every pod in the cluster"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Upstream Kubernetes conventions for cluster DNS.
+///
+/// These are conventions, not guarantees. `OpenShift`, `NodeLocal` `DNSCache`, and
+/// custom DNS deployments all place cluster DNS elsewhere and require
+/// `proxy_pod.dns_peers` to be set explicitly.
+fn default_proxy_pod_dns_peers() -> Vec<ProxyPodDnsPeer> {
+    vec![
+        ProxyPodDnsPeer::new(
+            ("kubernetes.io/metadata.name", "kube-system"),
+            ("k8s-app", "kube-dns"),
+        ),
+        ProxyPodDnsPeer::new(
+            ("kubernetes.io/metadata.name", "kube-system"),
+            ("k8s-app", "coredns"),
+        ),
+    ]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesProxyPodConfig {
@@ -230,6 +311,34 @@ pub struct KubernetesProxyPodConfig {
     /// Whether same-node placement with the paired supervisor is disabled,
     /// preferred, or required.
     pub affinity: ProxyPodAffinity,
+    /// Cluster DNS peers permitted by the agent egress `NetworkPolicy`.
+    ///
+    /// Defaults to the upstream `kube-system` conventions. Clusters that host
+    /// DNS elsewhere must override this or the agent pod cannot resolve any
+    /// name, including its own paired supervisor `Service`.
+    pub dns_peers: Vec<ProxyPodDnsPeer>,
+    /// Gateway peers the agent egress `NetworkPolicy` permits, so the in-pod
+    /// process supervisor can reach the `OpenShell` gateway for its session
+    /// (relays, policy, log push, token bootstrap). Same shape as `dns_peers`
+    /// (namespace/pod selectors + the gateway's TCP port). Empty by default; the
+    /// Helm chart renders it from the gateway's own pod labels and port. A
+    /// proxy-pod sandbox whose supervisor cannot reach the gateway never becomes
+    /// ready, so validation rejects an empty list for that topology.
+    pub gateway_peers: Vec<ProxyPodDnsPeer>,
+    /// Keep managing existing proxy-pod sandboxes after the configured topology
+    /// has been switched away from `proxy-pod`.
+    ///
+    /// The driver already manages each sandbox by its persisted creation-time
+    /// topology, but background upkeep — periodic companion reconciliation and
+    /// the shared-mode supervisor `Deployment` readiness watch — is gated on
+    /// whether this gateway manages proxy-pod sandboxes at all. When the
+    /// configured topology is not `proxy-pod`, that would otherwise be inferred
+    /// from a runtime sandbox list, which a transient discovery failure could
+    /// answer "none" and freeze for a whole watch session. Set this true during
+    /// a `retainCompanionRbac` migration (the Helm chart renders it from
+    /// `supervisor.proxyPod.retainCompanionRbac`) to keep that upkeep running
+    /// deterministically until every proxy-pod sandbox is deleted.
+    pub retain_companion_management: bool,
 }
 
 impl Default for KubernetesProxyPodConfig {
@@ -237,6 +346,9 @@ impl Default for KubernetesProxyPodConfig {
         Self {
             proxy_uid: DEFAULT_PROXY_UID,
             affinity: ProxyPodAffinity::Disabled,
+            dns_peers: default_proxy_pod_dns_peers(),
+            gateway_peers: Vec::new(),
+            retain_companion_management: false,
         }
     }
 }
@@ -248,6 +360,44 @@ impl KubernetesProxyPodConfig {
                 "proxy_pod.proxy_uid must be at least {}",
                 openshell_policy::MIN_SANDBOX_UID
             ));
+        }
+        Ok(())
+    }
+
+    /// Validate the configured DNS peers.
+    ///
+    /// An empty list is rejected rather than silently denying DNS: a
+    /// `proxy-pod` sandbox with no DNS egress cannot resolve its own paired
+    /// supervisor `Service` and is inert.
+    pub fn validate_dns_peers(&self) -> Result<(), String> {
+        if self.dns_peers.is_empty() {
+            return Err(
+                "proxy_pod.dns_peers must not be empty; the agent pod needs cluster DNS to \
+                 resolve its paired supervisor Service"
+                    .to_string(),
+            );
+        }
+        for (index, peer) in self.dns_peers.iter().enumerate() {
+            peer.validate(index)?;
+        }
+        Ok(())
+    }
+
+    /// Validate the configured gateway peers.
+    ///
+    /// An empty list is rejected: the in-pod process supervisor must reach the
+    /// gateway for its session, and the agent egress `NetworkPolicy` otherwise
+    /// denies it, so the sandbox never becomes ready.
+    pub fn validate_gateway_peers(&self) -> Result<(), String> {
+        if self.gateway_peers.is_empty() {
+            return Err(
+                "proxy_pod.gateway_peers must not be empty; the in-pod process supervisor needs \
+                 egress to the gateway for its session"
+                    .to_string(),
+            );
+        }
+        for (index, peer) in self.gateway_peers.iter().enumerate() {
+            peer.validate(index)?;
         }
         Ok(())
     }
@@ -1035,6 +1185,63 @@ mod tests {
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.topology, SupervisorTopology::ProxyPod);
         assert_eq!(cfg.topology.to_string(), "proxy-pod");
+    }
+
+    #[test]
+    fn proxy_pod_dns_peers_default_to_kube_system() {
+        let cfg = KubernetesProxyPodConfig::default();
+        assert_eq!(cfg.dns_peers.len(), 2);
+        cfg.validate_dns_peers().unwrap();
+    }
+
+    #[test]
+    fn proxy_pod_retain_companion_management_defaults_off_and_parses() {
+        // Absent from config → off (a non-migrating gateway).
+        assert!(!KubernetesProxyPodConfig::default().retain_companion_management);
+        // Present and unknown-field-strict: the field parses when rendered.
+        let cfg: KubernetesProxyPodConfig =
+            serde_json::from_value(serde_json::json!({"retain_companion_management": true}))
+                .unwrap();
+        assert!(cfg.retain_companion_management);
+    }
+
+    #[test]
+    fn proxy_pod_rejects_empty_dns_peers() {
+        let cfg = KubernetesProxyPodConfig {
+            dns_peers: Vec::new(),
+            ..KubernetesProxyPodConfig::default()
+        };
+        let err = cfg.validate_dns_peers().unwrap_err();
+        assert!(err.contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn proxy_pod_rejects_a_dns_peer_with_no_selectors() {
+        let cfg = KubernetesProxyPodConfig {
+            dns_peers: vec![ProxyPodDnsPeer::default()],
+            ..KubernetesProxyPodConfig::default()
+        };
+        let err = cfg.validate_dns_peers().unwrap_err();
+        assert!(err.contains("dns_peers[0]"), "{err}");
+    }
+
+    #[test]
+    fn serde_override_proxy_pod_dns_peers_nested() {
+        let cfg: KubernetesComputeConfig = serde_json::from_value(serde_json::json!({
+            "proxy_pod": {
+                "dns_peers": [{
+                    "namespace_labels": {"kubernetes.io/metadata.name": "openshift-dns"},
+                    "pod_labels": {"dns.operator.openshift.io/daemonset-dns": "default"}
+                }]
+            }
+        }))
+        .unwrap();
+        assert_eq!(cfg.proxy_pod.dns_peers.len(), 1);
+        assert_eq!(
+            cfg.proxy_pod.dns_peers[0].pod_labels["dns.operator.openshift.io/daemonset-dns"],
+            "default"
+        );
+        cfg.proxy_pod.validate_dns_peers().unwrap();
     }
 
     #[test]

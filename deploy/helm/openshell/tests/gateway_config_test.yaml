@@ -271,6 +271,22 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\.proxy_pod\].*?affinity\s*=\s*"preferred"'
 
+  - it: renders retain_companion_management from retainCompanionRbac
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.proxyPod.retainCompanionRbac: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.proxy_pod\].*?retain_companion_management\s*=\s*true'
+
+  - it: defaults retain_companion_management to false
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.proxy_pod\].*?retain_companion_management\s*=\s*false'
+
   - it: renders process binary aware network policy under [openshell.drivers.kubernetes.sidecar]
     template: templates/gateway-config.yaml
     set:
@@ -762,3 +778,59 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: "certManager.serverIssuerRef.name is set but certManager.enabled is false \u2014 the external server certificate, its Secret mount, and the gateway TLS configuration all require cert-manager to be enabled. Set certManager.enabled=true or remove certManager.serverIssuerRef.name."
+
+  - it: omits proxy-pod dns_peers when none are configured, keeping driver defaults
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.topology: proxy-pod
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_pod\.dns_peers'
+
+  - it: renders OpenShift cluster DNS peers for proxy-pod topology
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.topology: proxy-pod
+      supervisor.proxyPod.dnsPeers:
+        - namespaceLabels:
+            kubernetes.io/metadata.name: openshift-dns
+          podLabels:
+            dns.operator.openshift.io/daemonset-dns: default
+          port: 5353
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'port = 5353'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[\[openshell\.drivers\.kubernetes\.proxy_pod\.dns_peers\]\]'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'namespace_labels = \{ "kubernetes\.io/metadata\.name" = "openshift-dns" \}'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'pod_labels = \{ "dns\.operator\.openshift\.io/daemonset-dns" = "default" \}'
+
+  - it: renders multiple proxy-pod dns peers as repeated array-of-tables entries
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.topology: proxy-pod
+      supervisor.proxyPod.dnsPeers:
+        - namespaceLabels:
+            kubernetes.io/metadata.name: openshift-dns
+        - namespaceLabels:
+            kubernetes.io/metadata.name: kube-system
+          podLabels:
+            k8s-app: node-local-dns
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'port = 53'
+
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?s)dns_peers\]\].*dns_peers\]\]'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'pod_labels = \{ "k8s-app" = "node-local-dns" \}'

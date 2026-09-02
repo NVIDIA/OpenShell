@@ -16,7 +16,7 @@
 //! prevent algorithm-confusion attacks.
 
 use super::authenticator::Authenticator;
-use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
+use super::principal::{Principal, SandboxCallerKind, SandboxIdentitySource, SandboxPrincipal};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{
@@ -76,6 +76,10 @@ pub struct SandboxJwtClaims {
     /// Canonical sandbox UUID, denormalized from `sub` for cheap parsing
     /// without a SPIFFE library.
     pub sandbox_id: String,
+    /// Authority this token carries. `#[serde(default)]` = `Full`, so tokens
+    /// minted before this claim existed keep full authority.
+    #[serde(default)]
+    pub caller_kind: SandboxCallerKind,
 }
 
 /// Mints fresh sandbox JWTs.
@@ -126,9 +130,21 @@ impl SandboxJwtIssuer {
         })
     }
 
-    /// Mint a fresh token for `sandbox_id`.
+    /// Mint a fresh full-authority token for `sandbox_id`.
     #[allow(clippy::result_large_err)] // `tonic::Status` is the natural error here
     pub fn mint(&self, sandbox_id: &str) -> Result<MintedToken, Status> {
+        self.mint_with_caller_kind(sandbox_id, SandboxCallerKind::Full)
+    }
+
+    /// Mint a fresh token for `sandbox_id` carrying `caller_kind`. The
+    /// `proxy-pod` topology mints a `Process`-kind token for the agent pod so it
+    /// cannot call the network-supervisor RPCs (provider secrets, inference).
+    #[allow(clippy::result_large_err)] // `tonic::Status` is the natural error here
+    pub fn mint_with_caller_kind(
+        &self,
+        sandbox_id: &str,
+        caller_kind: SandboxCallerKind,
+    ) -> Result<MintedToken, Status> {
         crate::install_jsonwebtoken_crypto_provider();
 
         let now = now_secs();
@@ -144,6 +160,7 @@ impl SandboxJwtIssuer {
             iat: now,
             exp,
             sandbox_id: sandbox_id.to_string(),
+            caller_kind,
         };
         let mut header = Header::new(Algorithm::EdDSA);
         header.kid = Some(self.kid.clone());
@@ -325,7 +342,10 @@ impl SandboxJwtAuthenticator {
         validate_exp(claims.exp)?;
         Ok(Some(Principal::Sandbox(SandboxPrincipal {
             sandbox_id: claims.sandbox_id,
-            source: SandboxIdentitySource::BootstrapJwt { issuer: claims.iss },
+            source: SandboxIdentitySource::BootstrapJwt {
+                issuer: claims.iss,
+                caller_kind: claims.caller_kind,
+            },
             trust_domain: Some("openshell".to_string()),
         })))
     }
@@ -455,7 +475,7 @@ mod tests {
             Principal::Sandbox(p) => {
                 assert_eq!(p.sandbox_id, "sandbox-a");
                 match p.source {
-                    SandboxIdentitySource::BootstrapJwt { issuer: iss } => {
+                    SandboxIdentitySource::BootstrapJwt { issuer: iss, .. } => {
                         assert_eq!(iss, "openshell-gateway:test-gateway");
                     }
                     other => panic!("unexpected source: {other:?}"),
@@ -463,6 +483,46 @@ mod tests {
             }
             _ => panic!("expected Sandbox principal"),
         }
+    }
+
+    #[tokio::test]
+    async fn caller_kind_round_trips_full_and_process() {
+        let (issuer, auth) = pair();
+        for (kind, sandbox) in [
+            (SandboxCallerKind::Full, "sandbox-full"),
+            (SandboxCallerKind::Process, "sandbox-proc"),
+        ] {
+            let minted = issuer.mint_with_caller_kind(sandbox, kind).unwrap();
+            let principal = auth
+                .authenticate(&header_map_with_bearer(&minted.token), "/anything")
+                .await
+                .unwrap()
+                .expect("expected principal");
+            match principal {
+                Principal::Sandbox(p) => assert_eq!(p.caller_kind(), kind, "{sandbox}"),
+                _ => panic!("expected Sandbox principal"),
+            }
+        }
+        // Plain `mint` is full authority.
+        let minted = issuer.mint("sandbox-default").unwrap();
+        let principal = auth
+            .authenticate(&header_map_with_bearer(&minted.token), "/anything")
+            .await
+            .unwrap()
+            .expect("expected principal");
+        match principal {
+            Principal::Sandbox(p) => assert_eq!(p.caller_kind(), SandboxCallerKind::Full),
+            _ => panic!("expected Sandbox principal"),
+        }
+    }
+
+    #[test]
+    fn claims_without_caller_kind_default_to_full() {
+        // A token minted before the claim existed has no `caller_kind`; it must
+        // deserialize as full authority, not a scoped credential.
+        let json = r#"{"sub":"spiffe://openshell/sandbox/s","iss":"g","aud":"g","iat":0,"exp":0,"sandbox_id":"s"}"#;
+        let claims: SandboxJwtClaims = serde_json::from_str(json).unwrap();
+        assert_eq!(claims.caller_kind, SandboxCallerKind::Full);
     }
 
     #[tokio::test]
@@ -595,6 +655,7 @@ mod tests {
             iat: now_secs() - 7200,
             exp: now_secs() - 3600,
             sandbox_id: "sandbox-c".to_string(),
+            caller_kind: SandboxCallerKind::Full,
         };
         let mut header = Header::new(Algorithm::EdDSA);
         header.kid = Some(mat.kid);

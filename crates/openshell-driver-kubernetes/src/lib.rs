@@ -9,8 +9,8 @@ pub mod otel_tracing;
 pub use config::{
     AppArmorProfile, DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
     DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, KubernetesProxyPodConfig,
-    KubernetesSidecarConfig, ManagedSshIngressConfig, ProxyPodAffinity, SupervisorSideloadMethod,
-    SupervisorTopology, WorkspaceMode, managed_namespace_prefix,
+    KubernetesSidecarConfig, ManagedSshIngressConfig, ProxyPodAffinity, ProxyPodDnsPeer,
+    SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode, managed_namespace_prefix,
 };
 pub use driver::{KubernetesComputeDriver, KubernetesDriverError};
 pub use grpc::ComputeDriverService;

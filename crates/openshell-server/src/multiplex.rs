@@ -1156,10 +1156,22 @@ where
                         return Ok(status_response(status));
                     }
                 }
-                Principal::Sandbox(_) => {
+                Principal::Sandbox(ref sandbox) => {
                     if !crate::auth::sandbox_methods::is_sandbox_callable(&path) {
                         return Ok(status_response(tonic::Status::permission_denied(
                             "sandbox principals may not call this method",
+                        )));
+                    }
+                    // A process-kind credential (proxy-pod agent pod) is denied
+                    // the network-supervisor RPCs that read provider secrets or
+                    // mint upstream credentials; those run only in the proxy pod.
+                    if sandbox.caller_kind() == crate::auth::principal::SandboxCallerKind::Process
+                        && crate::auth::sandbox_methods::is_process_caller_denied(&path)
+                    {
+                        return Ok(status_response(tonic::Status::permission_denied(
+                            "this method requires a full-authority sandbox credential; \
+                             the process-supervisor credential cannot access provider \
+                             secrets or inference routing",
                         )));
                     }
                 }
@@ -2738,6 +2750,7 @@ mod tests {
                 sandbox_id: "sandbox-a".to_string(),
                 source: SandboxIdentitySource::BootstrapJwt {
                     issuer: "openshell-gateway:test".to_string(),
+                    caller_kind: crate::auth::principal::SandboxCallerKind::Full,
                 },
                 trust_domain: Some("openshell".to_string()),
             })

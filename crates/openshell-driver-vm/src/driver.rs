@@ -46,7 +46,7 @@ use openshell_core::proto::compute::v1::{
     GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
     ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
-    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    StopSandboxRequest, StopSandboxResponse, SupervisorSessionModel, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
     compute_driver_server::ComputeDriver, watch_sandboxes_event,
@@ -5964,6 +5964,7 @@ fn sandbox_snapshot(sandbox: &Sandbox, condition: SandboxCondition, deleting: bo
         namespace: sandbox.namespace.clone(),
         workspace: sandbox.workspace.clone(),
         status: Some(SandboxStatus {
+            supervisor_session_model: SupervisorSessionModel::Unspecified as i32,
             sandbox_name: sandbox.name.clone(),
             instance_id: String::new(),
             agent_fd: String::new(),
@@ -5981,6 +5982,7 @@ fn status_with_condition(
     deleting: bool,
 ) -> SandboxStatus {
     SandboxStatus {
+        supervisor_session_model: SupervisorSessionModel::Unspecified as i32,
         sandbox_name: snapshot.name.clone(),
         instance_id: String::new(),
         agent_fd: String::new(),
