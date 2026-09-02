@@ -296,11 +296,14 @@ Project requirements:
 - Rust 1.90+
 - Python 3.11+
 - Docker (running)
+- CMake 4.4.3+ (only required when building with the `bundled-z3` feature)
 
 ### Z3 installation
 
-The `openshell-prover` crate links against Z3. On macOS and Linux, install the
-system Z3 development package; `z3-sys` discovers it through `pkg-config`.
+The `openshell-prover`, `openshell-server`, and `openshell-gateway` crates link
+against Z3; `openshell-cli` has no Z3 dependency and does not declare a
+`bundled-z3` feature. On macOS and Linux, install the system Z3 development
+package; `z3-sys` discovers it through `pkg-config`.
 
 ```bash
 # macOS
@@ -314,7 +317,7 @@ sudo dnf install z3-devel
 ```
 
 If you prefer not to install Z3 system-wide, use the bundled Z3 feature. This
-compiles Z3 from source during the Rust build:
+compiles Z3 from source during the Rust build and requires CMake 4.4.3+:
 
 ```bash
 cargo build -p openshell-prover --features bundled-z3
@@ -334,7 +337,7 @@ the default search path, set `LIBCLANG_PATH` to the directory containing
 
 ```powershell
 $env:LIBCLANG_PATH='C:\Program Files\Microsoft Visual Studio\2022\<Edition>\VC\Tools\Llvm\x64\bin'
-cargo build -p openshell-cli --target x86_64-pc-windows-msvc --features bundled-z3
+cargo build -p openshell-prover --target x86_64-pc-windows-msvc --features bundled-z3
 ```
 
 To use a local x64 Z3 release with the Windows task wrapper:
