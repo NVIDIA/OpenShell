@@ -646,13 +646,22 @@ grep -A20 '^\[openshell.drivers.vm\]' <gateway.toml> | grep -E 'https_proxy|no_p
 ps -o args= -p "$(pgrep -f openshell-driver-vm | head -n1)" | tr ' ' '\n' | grep -A1 -- '--proxy\|--https-proxy\|--no-proxy'
 ```
 
-Reachability is the most common failure. Guest egress leaves through gvproxy,
-so a proxy bound to the gateway host's loopback is **not** reachable at
-`127.0.0.1` from inside the guest: it must be addressed as
+Reachability is the most common failure, and it depends on the VM backend.
+On libkrun (non-GPU sandboxes) guest egress leaves through gvproxy, so a proxy
+bound to the gateway host's loopback is **not** reachable at `127.0.0.1` from
+inside the guest: it must be addressed as
 `http://host.openshell.internal:<port>`, which gvproxy NATs from
 `192.168.127.254` to the host's `127.0.0.1`. A `https_proxy` pointing at a
 loopback URL produces policy-approved CONNECT attempts that time out while
 public destinations still work.
+
+GPU sandboxes run on QEMU/TAP, where no gateway-host proxy is reachable at
+all: `host.openshell.internal` resolves to the TAP host address, and the
+driver's nftables `input` chain accepts only the gateway port from the guest.
+The driver rejects such a configuration at launch — a create failing with
+`https_proxy ... addresses the gateway host, which a QEMU/TAP sandbox ...
+cannot reach` means the proxy must move to an address routable from the
+guest's masqueraded egress (or the sandbox must run without a GPU).
 
 The settings reach the supervisor through a driver-written argument file in
 the per-sandbox overlay, not through the guest environment. The credential and

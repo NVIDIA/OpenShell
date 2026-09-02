@@ -27,7 +27,10 @@
 //!
 //! Fixtures run as host processes and are reached from the guest through
 //! gvproxy's `host.openshell.internal` alias, which is also what proves the
-//! documented host-loopback reachability rule.
+//! documented host-loopback reachability rule for the libkrun backend. That
+//! rule is libkrun-specific: QEMU/TAP sandboxes (GPU) cannot reach a
+//! gateway-host proxy at all, and the driver rejects such a configuration at
+//! launch — see `qemu_backend_rejects_a_gateway_host_proxy` in the driver.
 
 use std::fmt::Write as _;
 use std::io::Write as _;

@@ -154,7 +154,7 @@ Select the VM driver with `--drivers vm`, `OPENSHELL_DRIVERS=vm`, or `compute_dr
 | `guest_tls_ca` | unset | CA cert for the guest's mTLS client bundle. Required when `grpc_endpoint` uses `https://`. |
 | `guest_tls_cert` | unset | Guest client certificate. |
 | `guest_tls_key` | unset | Guest client private key. |
-| `https_proxy` | unset | Corporate forward proxy (`http://host:port` or `https://host:port`) the in-guest supervisor chains policy-approved TLS CONNECT egress through. A proxy on the gateway host's loopback must be addressed as `http://host.openshell.internal:<port>` — guest egress leaves through gvproxy, which NATs `192.168.127.254` to the host's `127.0.0.1`. |
+| `https_proxy` | unset | Corporate forward proxy (`http://host:port` or `https://host:port`) the in-guest supervisor chains policy-approved TLS CONNECT egress through. On the libkrun backend a proxy on the gateway host's loopback must be addressed as `http://host.openshell.internal:<port>` — guest egress leaves through gvproxy, which NATs `192.168.127.254` to the host's `127.0.0.1`. The QEMU/TAP backend (GPU sandboxes) has no such NAT and its nftables rules expose only the gateway port to the guest, so a gateway-host proxy URL is rejected at launch there; use an address routable from the guest's masqueraded egress. |
 | `no_proxy` | unset | Comma-separated bypass list for the corporate proxy only. OpenShell policy evaluation still applies. |
 | `proxy_auth_file` | unset | Gateway-host path to a `user:pass` credential file. Staged root-only into the per-sandbox overlay and removed with the sandbox. |
 | `proxy_auth_allow_insecure` | unset | Required with `proxy_auth_file` against an `http://` proxy: acknowledges that Basic auth is cleartext on the connection to the proxy. |

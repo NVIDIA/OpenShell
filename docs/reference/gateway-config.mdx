@@ -810,13 +810,20 @@ guest_tls_key    = "/var/lib/openshell/guest-tls/client-key.pem"
 # into the overlay upperdir on every launch, so a sandbox image cannot supply
 # its own values or disable the operator's by baking a file at that path.
 #
-# Reachability: guest egress leaves through gvproxy, so a proxy listening on
-# the gateway host's loopback is reachable only through the host alias
-# host.openshell.internal (gvproxy NATs 192.168.127.254 to the host's
-# 127.0.0.1). Address it as http://host.openshell.internal:<port>, not
-# http://127.0.0.1:<port>. A proxy on the corporate network is dialed out
-# through the host process and needs no alias. The guest's callback to the
-# gateway is unaffected and never traverses the proxy.
+# Reachability: a proxy on the corporate network needs no special address and
+# works on every VM sandbox. The guest's callback to the gateway is unaffected
+# and never traverses the proxy.
+#
+# A proxy on the gateway host itself is reachable only from libkrun-backed
+# (non-GPU) sandboxes: their egress leaves through gvproxy, which NATs
+# 192.168.127.254 to the host's 127.0.0.1, so address it as
+# http://host.openshell.internal:<port> rather than http://127.0.0.1:<port>.
+# GPU sandboxes run on the QEMU/TAP backend, which has no such NAT —
+# host.openshell.internal resolves to the TAP host address, and the driver's
+# nftables rules let the guest reach only the gateway port on the host. A
+# gateway-host proxy URL is therefore rejected when the sandbox launches on
+# QEMU, rather than timing out on every CONNECT; give GPU sandboxes a proxy
+# address routable from the guest's masqueraded egress.
 #
 # Because a microVM has no bind mounts or container secrets, the driver stages
 # the credential and the CA into the per-sandbox overlay disk: the credential

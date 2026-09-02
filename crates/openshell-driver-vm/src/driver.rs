@@ -131,8 +131,8 @@ impl VmSandboxDriverConfig {
 ///
 /// Code paths route via `GVPROXY_HOST_LOOPBACK_ALIAS` (DNS / /etc/hosts)
 /// instead so logs stay readable; this constant is kept for documentation
-/// and parity with the guest init script.
-#[allow(dead_code)]
+/// and parity with the guest init script, and by the QEMU/TAP reachability
+/// guard in [`proxy_url_targets_gateway_host`].
 const GVPROXY_HOST_LOOPBACK_IP: &str = "192.168.127.254";
 const OPENSHELL_HOST_GATEWAY_ALIAS: &str = "host.openshell.internal";
 /// Hostname gvproxy resolves (via its embedded DNS) to the host-loopback IP.
@@ -1838,6 +1838,22 @@ impl VmDriver {
         plan: &mut LaunchPlan,
     ) -> Result<(), Status> {
         plan.backend = VmBackend::Qemu;
+        // The corporate-proxy host-loopback recipe is a libkrun/gvproxy
+        // property and has no QEMU/TAP equivalent (see
+        // `proxy_url_targets_gateway_host`). Fail the create with the reason
+        // rather than boot a sandbox whose policy-approved CONNECTs all time
+        // out against an unreachable proxy.
+        if let Some(url) = self.config.https_proxy.as_deref()
+            && proxy_url_targets_gateway_host(url)
+        {
+            return Err(Status::failed_precondition(format!(
+                "https_proxy '{url}' addresses the gateway host, which a QEMU/TAP sandbox \
+                 (GPU sandboxes) cannot reach: host.openshell.internal resolves to the TAP \
+                 host address and the driver's nftables rules allow only the gateway port \
+                 from the guest. Configure a proxy address routable from the guest's \
+                 masqueraded egress, or run this sandbox without a GPU"
+            )));
+        }
         if is_gpu {
             plan.vcpus = self.config.gpu_vcpus;
             plan.mem_mib = self.config.gpu_mem_mib;
@@ -4588,6 +4604,37 @@ fn guest_visible_openshell_endpoint(endpoint: &str) -> String {
     endpoint.to_string()
 }
 
+/// Whether a corporate proxy URL points at the gateway host itself.
+///
+/// On the libkrun backend gvproxy NATs the host-loopback alias
+/// `host.openshell.internal` (and any loopback URL, which the driver rewrites
+/// to that alias) to the gateway host's `127.0.0.1`, so a proxy bound to host
+/// loopback is reachable from the guest. The QEMU/TAP backend used for GPU
+/// sandboxes has no equivalent: `host.openshell.internal` resolves to the TAP
+/// host address, and the driver's own nftables `input` chain accepts only the
+/// gateway port from the guest and drops the rest, so no proxy on the gateway
+/// host is reachable regardless of the address it binds.
+///
+/// Used to reject such a configuration up front on the QEMU path instead of
+/// letting every policy-approved CONNECT time out.
+fn proxy_url_targets_gateway_host(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        // Unparseable URLs are rejected by shared validation before launch.
+        return false;
+    };
+    match parsed.host() {
+        Some(Host::Ipv4(ip)) => ip.is_loopback() || ip.to_string() == GVPROXY_HOST_LOOPBACK_IP,
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(Host::Domain(host)) => {
+            host.eq_ignore_ascii_case("localhost")
+                || host.eq_ignore_ascii_case(OPENSHELL_HOST_GATEWAY_ALIAS)
+                || host.eq_ignore_ascii_case("host.containers.internal")
+                || host.eq_ignore_ascii_case("host.docker.internal")
+        }
+        None => false,
+    }
+}
+
 fn gateway_port_from_endpoint(endpoint: &str) -> Option<u16> {
     Url::parse(endpoint).ok().and_then(|url| url.port())
 }
@@ -5370,36 +5417,26 @@ async fn read_sandbox_proxy_credential(path: &str) -> Result<String, Status> {
 
 /// Read and validate the corporate proxy CA bundle from the gateway host.
 ///
+/// Uses the reader shared with the supervisor, so the bundle is bounded and
+/// non-regular files are rejected (an operator path such as `/dev/zero` can
+/// otherwise exhaust driver memory), and a bundle accepted here contributes at
+/// least one trust anchor rustls accepts rather than merely looking like PEM.
 /// Checked here rather than only in the guest so the operator gets an error
 /// attributable to `proxy_ca_bundle` instead of an opaque supervisor startup
-/// failure inside every sandbox.
+/// failure inside every sandbox. The error never carries the file contents.
 async fn read_sandbox_proxy_ca_bundle(path: &str) -> Result<Vec<u8>, Status> {
     let path_owned = path.to_string();
-    let bytes = tokio::task::spawn_blocking(move || fs::read(&path_owned))
-        .await
-        .map_err(|err| Status::internal(format!("proxy_ca_bundle read task failed: {err}")))?
-        .map_err(|err| {
-            Status::invalid_argument(format!("proxy_ca_bundle '{path}' could not be read: {err}"))
-        })?;
-    if bytes.is_empty() {
-        return Err(Status::invalid_argument(format!(
-            "proxy_ca_bundle '{path}' is empty"
-        )));
-    }
-    if !bytes
-        .windows(PEM_CERTIFICATE_MARKER.len())
-        .any(|window| window == PEM_CERTIFICATE_MARKER)
-    {
-        return Err(Status::invalid_argument(format!(
-            "proxy_ca_bundle '{path}' contains no PEM certificate"
-        )));
-    }
-    Ok(bytes)
+    let pem = tokio::task::spawn_blocking(move || {
+        openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(
+            &path_owned,
+            "proxy_ca_bundle",
+        )
+    })
+    .await
+    .map_err(|err| Status::internal(format!("proxy_ca_bundle read task failed: {err}")))?
+    .map_err(Status::invalid_argument)?;
+    Ok(pem.into_bytes())
 }
-
-/// Marker every PEM certificate begins with, used to reject a CA bundle that
-/// holds no certificate before it reaches the guest.
-const PEM_CERTIFICATE_MARKER: &[u8] = b"-----BEGIN CERTIFICATE-----";
 
 /// Stage the corporate upstream-proxy configuration into the guest overlay.
 ///
@@ -8957,14 +8994,75 @@ mod tests {
         let err = read_sandbox_proxy_ca_bundle(path.to_str().unwrap())
             .await
             .expect_err("an empty bundle must fail closed");
-        assert!(err.message().contains("is empty"), "{err}");
+        assert!(err.message().contains("no PEM certificate"), "{err}");
+
+        // PEM framing that base64-decodes but is not X.509 DER: accepted by
+        // `rustls_pemfile` alone, contributes zero trust anchors at runtime,
+        // and so would make every guest supervisor fail after boot.
+        std::fs::write(
+            &path,
+            b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let err = read_sandbox_proxy_ca_bundle(path.to_str().unwrap())
+            .await
+            .expect_err("a bundle with invalid DER must fail closed");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("no usable trust anchors"), "{err}");
 
         let err = read_sandbox_proxy_ca_bundle(dir.join("missing.pem").to_str().unwrap())
             .await
             .expect_err("an unreadable bundle must fail closed");
         assert!(err.message().contains("could not be read"), "{err}");
 
+        // A special file must be rejected on its type, not read: an
+        // unbounded read of /dev/zero would exhaust driver memory.
+        #[cfg(unix)]
+        {
+            let err = read_sandbox_proxy_ca_bundle("/dev/zero")
+                .await
+                .expect_err("a non-regular bundle path must fail closed");
+            assert_eq!(err.code(), Code::InvalidArgument);
+            assert!(err.message().contains("not a regular file"), "{err}");
+        }
+
+        // Oversized regular file: rejected on the stat'd length, again
+        // without reading it whole.
+        let oversized = dir.join("oversized.pem");
+        let bound = openshell_core::driver_utils::MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES;
+        std::fs::write(&oversized, vec![b'x'; usize::try_from(bound).unwrap() + 1]).unwrap();
+        let err = read_sandbox_proxy_ca_bundle(oversized.to_str().unwrap())
+            .await
+            .expect_err("an oversized bundle must fail closed");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("exceeds"), "{err}");
+
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn qemu_backend_rejects_a_gateway_host_proxy() {
+        // gvproxy's host-loopback NAT has no QEMU/TAP equivalent, so a proxy
+        // on the gateway host is unreachable from a GPU sandbox and must be
+        // rejected rather than time out on every CONNECT.
+        for url in [
+            "http://host.openshell.internal:8080",
+            "http://host.containers.internal:8080",
+            "http://host.docker.internal:8080",
+            "http://127.0.0.1:8080",
+            "http://localhost:8080",
+            "https://[::1]:8080",
+            "http://192.168.127.254:8080",
+        ] {
+            assert!(proxy_url_targets_gateway_host(url), "{url}");
+        }
+        for url in [
+            "http://proxy.corp.example:8080",
+            "https://10.1.2.3:3128",
+            "not a url",
+        ] {
+            assert!(!proxy_url_targets_gateway_host(url), "{url}");
+        }
     }
 
     #[tokio::test]
