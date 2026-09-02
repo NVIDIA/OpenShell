@@ -4,9 +4,6 @@
 name: Conformance
 
 on:
-  push:
-    branches:
-      - "pull-request/[0-9]+"
   workflow_dispatch: {}
 
 permissions: {}
