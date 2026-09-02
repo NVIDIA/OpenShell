@@ -136,9 +136,16 @@ async fn sandbox_stop_start_preserves_workspace() {
     const SENTINEL_PATH: &str = "/sandbox/.openshell-stop-start-e2e";
     let write_sentinel = format!("printf '%s\\n' '{SENTINEL}' > '{SENTINEL_PATH}'");
 
-    let mut sandbox = SandboxGuard::create(&["--", "sh", "-lc", &write_sentinel])
+    let mut sandbox = SandboxGuard::create_keep(
+        &["sh", "-c", "echo lifecycle-ready; exec sleep infinity"],
+        "lifecycle-ready",
+    )
+    .await
+    .expect("sandbox create should start a durable main process");
+    sandbox
+        .exec(&["sh", "-lc", &write_sentinel])
         .await
-        .expect("sandbox create should write the workspace sentinel");
+        .expect("sandbox exec should write the workspace sentinel");
 
     let stop_output = run_sandbox_lifecycle_command("stop", &sandbox.name).await;
     assert!(
@@ -189,9 +196,12 @@ async fn sandbox_stop_start_preserves_workspace() {
 
 #[tokio::test]
 async fn sandbox_can_be_deleted_while_stopped() {
-    let mut sandbox = SandboxGuard::create(&["--", "true"])
-        .await
-        .expect("sandbox create should succeed");
+    let mut sandbox = SandboxGuard::create_keep(
+        &["sh", "-c", "echo stop-ready; exec sleep infinity"],
+        "stop-ready",
+    )
+    .await
+    .expect("sandbox create should start a durable main process");
 
     let stop_output = run_sandbox_lifecycle_command("stop", &sandbox.name).await;
     assert!(
