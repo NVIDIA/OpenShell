@@ -9630,14 +9630,14 @@ mod tests {
         );
         remove.expect("removing the offending rule must be possible");
 
-        if restore.is_ok() {
+        if let Err(status) = restore {
+            assert_eq!(status.code(), Code::FailedPrecondition);
+        } else {
             let stored = get_sandbox_policy(&state, "sb-inherited-gating").await;
             assert!(
                 !stored.network_policies.contains_key("pypi"),
                 "a replacement validated against a stale revision restored the endpoint"
             );
-        } else {
-            assert_eq!(restore.unwrap_err().code(), Code::FailedPrecondition);
         }
     }
 
