@@ -603,6 +603,25 @@ mod tests {
     }
 
     #[test]
+    fn condition_running_with_pending_healthcheck_is_not_ready() {
+        let state = ContainerState {
+            status: "running".to_string(),
+            running: true,
+            exit_code: 0,
+            oom_killed: false,
+            health: Some(HealthState {
+                status: "starting".to_string(),
+            }),
+            started_at: Some("2026-04-14T10:00:00Z".to_string()),
+            finished_at: None,
+        };
+        let condition = condition_from_state(&state);
+        assert_eq!(condition.r#type, "Ready");
+        assert_eq!(condition.status, "False");
+        assert_eq!(condition.reason, "HealthCheckStarting");
+    }
+
+    #[test]
     fn condition_oom_killed() {
         let state = ContainerState {
             status: "exited".to_string(),

@@ -704,6 +704,7 @@ mod tests {
         prepare_vm_state_dir, resolve_compute_driver_bin, resolve_driver_search_dirs,
         validate_vm_sandbox_identity,
     };
+    use openshell_core::UpstreamProxyConfig;
     use openshell_server::config_file::OtlpConfig;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener as StdUnixListener;
@@ -823,6 +824,47 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(args, ["--sandbox-uid", "2000", "--sandbox-gid", "3000"]);
+    }
+
+    #[test]
+    fn vm_driver_command_forwards_proxy_and_spiffe_configuration_without_credentials() {
+        let config = VmComputeConfig {
+            upstream_proxy: UpstreamProxyConfig {
+                https_proxy: Some("https://proxy.internal:8443".to_string()),
+                no_proxy: Some("localhost,.svc".to_string()),
+                proxy_auth_file: Some(PathBuf::from("/gateway/secrets/proxy-auth")),
+                proxy_auth_allow_insecure: Some(true),
+                proxy_connect_by_hostname: Some(true),
+            },
+            provider_spiffe_workload_api_tcp_endpoint: Some("tcp:192.0.2.10:8081".to_string()),
+            provider_spiffe_allow_guest_tcp: true,
+            ..Default::default()
+        };
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        append_vm_proxy_and_spiffe_args(&mut command, &config);
+
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--upstream-proxy",
+                "https://proxy.internal:8443",
+                "--upstream-no-proxy",
+                "localhost,.svc",
+                "--upstream-proxy-auth-file",
+                "/gateway/secrets/proxy-auth",
+                "--upstream-proxy-auth-allow-insecure",
+                "--upstream-proxy-connect-by-hostname",
+                "--provider-spiffe-workload-api-tcp-endpoint",
+                "tcp:192.0.2.10:8081",
+                "--provider-spiffe-allow-guest-tcp",
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg.contains("user:password")));
     }
 
     #[test]

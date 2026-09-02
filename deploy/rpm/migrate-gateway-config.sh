@@ -14,7 +14,8 @@ current_default=$2
 legacy_default=$3
 
 for source in "$current_default" "$legacy_default"; do
-    if [ ! -f "$source" ]; then
+    # Package-owned defaults must be ordinary files; never follow a symlink.
+    if [ -L "$source" ] || [ ! -f "$source" ]; then
         echo "gateway config migration source is not a regular file: $source" >&2
         exit 1
     fi

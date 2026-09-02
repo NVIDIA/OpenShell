@@ -13,6 +13,7 @@ depends = [
   "test:install-sh",
   "test:build-env",
   "test:gateway-pull-policy",
+  "test:gateway-config",
   "test:packaging-assets",
   "test:codex-security-release-range",
   "test:docs-website",
@@ -278,3 +279,9 @@ run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debu
 ["e2e:openshift"]
 description = "Run OpenShift database-backend integration scenarios against a live cluster (requires oc CLI authenticated to an OpenShift cluster)"
 run = "e2e/rust/e2e-openshift.sh"
+
+["test:gateway-config"]
+description = "Test generated local gateway TOML without starting a runtime"
+run = "bash tasks/scripts/test-gateway-config.sh"
+run_windows = "echo Skipping test:gateway-config: Unix gateway scripts do not apply on Windows."
+hide = true

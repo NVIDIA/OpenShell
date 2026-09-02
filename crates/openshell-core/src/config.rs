@@ -1046,10 +1046,10 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
+        AppArmorProfile, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
         GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
         GatewayProviderProfileSourceConfig, ImagePullPolicy, PolicyValidationFailureMode,
-        normalize_compute_driver_name,
+        UpstreamProxyConfig, default_sandbox_pids_limit, normalize_compute_driver_name,
     };
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -1191,6 +1191,194 @@ mod tests {
         }
         assert!("missing".parse::<ImagePullPolicy>().is_err());
         assert!("IfNotPresent".parse::<ImagePullPolicy>().is_err());
+    }
+
+    #[test]
+    fn app_armor_profiles_round_trip_and_translate_for_each_backend() {
+        for (value, expected, kubernetes_type, localhost_profile, oci_security_opt) in [
+            (
+                "RuntimeDefault",
+                AppArmorProfile::RuntimeDefault,
+                "RuntimeDefault",
+                None,
+                None,
+            ),
+            (
+                "Unconfined",
+                AppArmorProfile::Unconfined,
+                "Unconfined",
+                None,
+                Some("apparmor=unconfined"),
+            ),
+            (
+                "Localhost/openshell-supervisor",
+                AppArmorProfile::Localhost("openshell-supervisor".to_string()),
+                "Localhost",
+                Some("openshell-supervisor"),
+                Some("apparmor=openshell-supervisor"),
+            ),
+        ] {
+            let parsed = value.parse::<AppArmorProfile>().expect("valid profile");
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.to_string(), value);
+            assert_eq!(parsed.kubernetes_type(), kubernetes_type);
+            assert_eq!(parsed.localhost_profile(), localhost_profile);
+            assert_eq!(parsed.oci_security_opt().as_deref(), oci_security_opt);
+
+            let json = serde_json::to_value(&parsed).expect("profile serializes");
+            assert_eq!(json, value);
+            assert_eq!(
+                serde_json::from_value::<AppArmorProfile>(json).expect("profile deserializes"),
+                parsed
+            );
+        }
+
+        for invalid in [
+            "Localhost/",
+            "Localhost/openshell profile",
+            "runtimeDefault",
+            "unconfined",
+            "Unknown",
+        ] {
+            assert!(
+                invalid.parse::<AppArmorProfile>().is_err(),
+                "{invalid} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_proxy_validation_enforces_cross_field_contract() {
+        let auth_file = Some("/run/secrets/proxy-auth".into());
+        let cases = [
+            ("default", UpstreamProxyConfig::default(), None),
+            (
+                "https auth",
+                UpstreamProxyConfig {
+                    https_proxy: Some("https://proxy.example:8443".to_string()),
+                    proxy_auth_file: auth_file.clone(),
+                    ..Default::default()
+                },
+                None,
+            ),
+            (
+                "acknowledged http auth",
+                UpstreamProxyConfig {
+                    https_proxy: Some("http://proxy.example:8080".to_string()),
+                    proxy_auth_file: auth_file.clone(),
+                    proxy_auth_allow_insecure: Some(true),
+                    ..Default::default()
+                },
+                None,
+            ),
+            (
+                "unacknowledged http auth",
+                UpstreamProxyConfig {
+                    https_proxy: Some("http://proxy.example:8080".to_string()),
+                    proxy_auth_file: auth_file.clone(),
+                    ..Default::default()
+                },
+                Some("proxy_auth_allow_insecure"),
+            ),
+            (
+                "no_proxy without proxy",
+                UpstreamProxyConfig {
+                    no_proxy: Some("localhost".to_string()),
+                    ..Default::default()
+                },
+                Some("no_proxy"),
+            ),
+            (
+                "blank no_proxy",
+                UpstreamProxyConfig {
+                    https_proxy: Some("https://proxy.example:8443".to_string()),
+                    no_proxy: Some("  ".to_string()),
+                    ..Default::default()
+                },
+                Some("no_proxy"),
+            ),
+            (
+                "auth file without proxy",
+                UpstreamProxyConfig {
+                    proxy_auth_file: auth_file,
+                    ..Default::default()
+                },
+                Some("proxy_auth_file"),
+            ),
+            (
+                "ack without auth file",
+                UpstreamProxyConfig {
+                    https_proxy: Some("http://proxy.example:8080".to_string()),
+                    proxy_auth_allow_insecure: Some(true),
+                    ..Default::default()
+                },
+                Some("proxy_auth_allow_insecure"),
+            ),
+            (
+                "hostname mode without proxy",
+                UpstreamProxyConfig {
+                    proxy_connect_by_hostname: Some(true),
+                    ..Default::default()
+                },
+                Some("proxy_connect_by_hostname"),
+            ),
+            (
+                "empty proxy",
+                UpstreamProxyConfig {
+                    https_proxy: Some(String::new()),
+                    ..Default::default()
+                },
+                Some("https_proxy"),
+            ),
+            (
+                "inline credentials",
+                UpstreamProxyConfig {
+                    https_proxy: Some(
+                        "https://secret-user:secret-password@proxy.example:8443".to_string(),
+                    ),
+                    ..Default::default()
+                },
+                Some("must not embed credentials"),
+            ),
+        ];
+
+        for (name, config, expected_error) in cases {
+            match expected_error {
+                None => config
+                    .validate()
+                    .unwrap_or_else(|error| panic!("{name}: {error}")),
+                Some(expected) => {
+                    let error = match config.validate() {
+                        Ok(()) => panic!("{name} should fail validation"),
+                        Err(error) => error,
+                    };
+                    assert!(error.contains(expected), "{name}: {error}");
+                    assert!(!error.contains("secret-user"), "{name}: {error}");
+                    assert!(!error.contains("secret-password"), "{name}: {error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn config_defaults_and_builder_use_singular_compute_driver() {
+        let config = Config::new(None);
+        assert_eq!(config.compute_driver, None);
+        assert_eq!(
+            Config::new(None)
+                .with_compute_driver("podman")
+                .compute_driver
+                .as_deref(),
+            Some("podman")
+        );
+    }
+
+    #[test]
+    fn typed_sandbox_pids_default_matches_positive_constant() {
+        assert_eq!(
+            default_sandbox_pids_limit().map(std::num::NonZeroI64::get),
+            Some(super::DEFAULT_SANDBOX_PIDS_LIMIT)
+        );
     }
 
     #[test]

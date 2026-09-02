@@ -5171,6 +5171,7 @@ async fn sandbox_owner_identity_from_image(
             .await
             .map_err(|error| format!("read sandbox identity task failed: {error}"))??;
     let (uid, gid) = identity.unwrap_or((DEFAULT_SANDBOX_UID, DEFAULT_SANDBOX_UID));
+    validate_sandbox_owner_identity(uid, gid)?;
     Ok(SandboxOwnerIdentity { uid, gid })
 }
 
@@ -5183,7 +5184,12 @@ async fn sandbox_owner_identity_from_overlay(
     })
     .await
     .map_err(|error| format!("read sandbox overlay identity task failed: {error}"))??;
-    Ok(identity.map(|(uid, gid)| SandboxOwnerIdentity { uid, gid }))
+    identity
+        .map(|(uid, gid)| {
+            validate_sandbox_owner_identity(uid, gid)?;
+            Ok(SandboxOwnerIdentity { uid, gid })
+        })
+        .transpose()
 }
 
 fn parse_sandbox_owner_state(contents: &str) -> Result<SandboxOwnerIdentity, String> {
@@ -7715,6 +7721,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_and_overlay_owner_evidence_rejects_root_identity() {
+        let dir = unique_temp_dir();
+        let image_source = dir.join("image-source");
+        std::fs::create_dir_all(image_source.join("etc")).unwrap();
+        std::fs::write(
+            image_source.join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/sh\nsandbox:x:0:0:Sandbox:/sandbox:/bin/sh\n",
+        )
+        .unwrap();
+        let image = dir.join("rootfs.ext4");
+        create_ext4_image_from_dir_with_size(&image_source, &image, 32 * 1024 * 1024).unwrap();
+        let image_error = sandbox_owner_identity_from_image(&image)
+            .await
+            .expect_err("root image identity must be rejected");
+        assert!(image_error.contains("uid 0 is outside the allowed range"));
+
+        let overlay_source = dir.join("overlay-source");
+        std::fs::create_dir_all(overlay_source.join("upper/etc")).unwrap();
+        std::fs::write(
+            overlay_source.join("upper/etc/passwd"),
+            "root:x:0:0:root:/root:/bin/sh\nsandbox:x:0:0:Sandbox:/sandbox:/bin/sh\n",
+        )
+        .unwrap();
+        let overlay = dir.join(SANDBOX_OVERLAY_IMAGE);
+        create_ext4_image_from_dir_with_size(&overlay_source, &overlay, 32 * 1024 * 1024).unwrap();
+        let overlay_error = sandbox_owner_identity_from_overlay(&overlay)
+            .await
+            .expect_err("root overlay identity must be rejected");
+        assert!(overlay_error.contains("uid 0 is outside the allowed range"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_owner_marker_uses_evidence_migration_and_new_markers_are_private() {
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(SANDBOX_OWNER_STATE_FILE),
+            format!("{SANDBOX_OWNER_STATE_V1}\n"),
+        )
+        .unwrap();
+        let overlay = dir.join(SANDBOX_OVERLAY_IMAGE);
+        std::fs::write(&overlay, b"legacy overlay").unwrap();
+        let config = VmDriverConfig {
+            sandbox_uid: Some(2000),
+            sandbox_gid: Some(3000),
+            ..Default::default()
+        };
+
+        let (identity, write_marker) = sandbox_owner_state_for_launch(
+            &dir,
+            &overlay,
+            Path::new("/missing-rootfs"),
+            &config,
+            OverlayPreparation::PreserveExisting,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            identity,
+            SandboxOwnerIdentity {
+                uid: 2000,
+                gid: 3000
+            }
+        );
+        assert!(write_marker);
+
+        write_sandbox_owner_state(&dir, identity).await.unwrap();
+        let marker = dir.join(SANDBOX_OWNER_STATE_FILE);
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "sandbox-owner-v2:2000:3000\n"
+        );
+        assert_eq!(
+            std::fs::metadata(marker).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn persisted_owner_marker_preserves_exact_identity() {
         let dir = unique_temp_dir();
         std::fs::create_dir_all(&dir).unwrap();
@@ -8739,6 +8826,8 @@ mod tests {
         assert!(
             env.contains(&"OPENSHELL_VM_UPSTREAM_PROXY=https://proxy.example:8443".to_string())
         );
+        assert!(env.contains(&"OPENSHELL_VM_UPSTREAM_NO_PROXY=.svc".to_string()));
+        assert!(env.contains(&"OPENSHELL_VM_UPSTREAM_PROXY_CONNECT_BY_HOSTNAME=true".to_string()));
         assert!(env.contains(&format!(
             "OPENSHELL_VM_UPSTREAM_PROXY_AUTH_FILE={GUEST_UPSTREAM_PROXY_AUTH_PATH}"
         )));
@@ -9028,14 +9117,48 @@ mod tests {
     }
 
     #[test]
-    fn prepared_image_cache_identity_includes_rootfs_layout_and_openshell_version() {
+    fn prepared_image_cache_identity_includes_layout_version_and_owner_contract() {
+        let image = "sha256:local-image";
+        let image_account = prepared_image_cache_identity(image, &VmDriverConfig::default());
         assert_eq!(
-            prepared_image_cache_identity("sha256:local-image", &VmDriverConfig::default()),
+            image_account,
             format!(
-                "sandbox-prepared-rootfs-ext4-umoci-v3:openshell-{}:image-account:sha256:local-image",
+                "sandbox-prepared-rootfs-ext4-umoci-v3:openshell-{}:image-account:{image}",
                 openshell_core::VERSION
             )
         );
+
+        let identities = [
+            VmDriverConfig {
+                sandbox_uid: Some(1000),
+                sandbox_gid: Some(1000),
+                ..Default::default()
+            },
+            VmDriverConfig {
+                sandbox_uid: Some(2000),
+                sandbox_gid: Some(3000),
+                ..Default::default()
+            },
+            VmDriverConfig {
+                sandbox_uid: Some(2000),
+                ..Default::default()
+            },
+            VmDriverConfig {
+                sandbox_gid: Some(3000),
+                ..Default::default()
+            },
+        ]
+        .map(|config| prepared_image_cache_identity(image, &config));
+
+        assert!(identities.iter().all(|identity| identity != &image_account));
+        for (index, identity) in identities.iter().enumerate() {
+            assert!(
+                identities[index + 1..]
+                    .iter()
+                    .all(|other| other != identity),
+                "owner contracts must use distinct cache keys"
+            );
+        }
     }
 
     #[test]

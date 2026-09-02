@@ -903,20 +903,33 @@ mod tests {
             cfg.supervisor_image_pull_policy,
             Some(ImagePullPolicy::Never)
         );
-        assert_eq!(
-            KubernetesComputeConfig::image_pull_policy_value(ImagePullPolicy::IfNotPresent),
-            "IfNotPresent"
-        );
+
+        for (policy, expected) in [
+            (ImagePullPolicy::Always, "Always"),
+            (ImagePullPolicy::IfNotPresent, "IfNotPresent"),
+            (ImagePullPolicy::Never, "Never"),
+        ] {
+            assert_eq!(
+                KubernetesComputeConfig::image_pull_policy_value(policy),
+                expected
+            );
+        }
     }
 
     #[test]
-    fn image_pull_policy_rejects_newer() {
-        let cfg = KubernetesComputeConfig {
-            image_pull_policy: Some(ImagePullPolicy::Newer),
-            ..KubernetesComputeConfig::default()
-        };
-        let error = cfg.validate_image_pull_policies().unwrap_err();
-        assert!(error.contains("supported only by the Podman"));
+    fn image_pull_policy_rejects_newer_for_sandbox_and_supervisor_images() {
+        for (sandbox, supervisor) in [
+            (Some(ImagePullPolicy::Newer), None),
+            (None, Some(ImagePullPolicy::Newer)),
+        ] {
+            let cfg = KubernetesComputeConfig {
+                image_pull_policy: sandbox,
+                supervisor_image_pull_policy: supervisor,
+                ..KubernetesComputeConfig::default()
+            };
+            let error = cfg.validate_image_pull_policies().unwrap_err();
+            assert!(error.contains("supported only by the Podman"));
+        }
     }
 
     #[test]

@@ -33,6 +33,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=tasks/scripts/gateway-toml.sh
+source "${ROOT}/tasks/scripts/gateway-toml.sh"
 PORT="${OPENSHELL_SERVER_PORT:-18081}"
 GATEWAY_NAME="${OPENSHELL_VM_GATEWAY_NAME:-vm-dev}"
 STATE_DIR="${OPENSHELL_VM_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-vm}"
@@ -40,6 +42,8 @@ SANDBOX_NAMESPACE="${OPENSHELL_SANDBOX_NAMESPACE:-vm-dev}"
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-${COMMUNITY_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}}"
 VM_BOOTSTRAP_IMAGE="${OPENSHELL_VM_BOOTSTRAP_IMAGE:-}"
 SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}"
+# VM currently has no image-pull-policy setting in its driver configuration; unlike
+# Docker, Podman, and Kubernetes launch paths it intentionally does not normalize this input.
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
 DRIVER_DIR_DEFAULT="${ROOT}/target/debug"
@@ -68,17 +72,6 @@ normalize_bool() {
       exit 2
       ;;
   esac
-}
-
-# Escape values that are copied from the local environment to gateway TOML.
-toml_escape() {
-  local s=$1
-  s=${s//\\/\\\\}
-  s=${s//\"/\\\"}
-  s=${s//$'\n'/\\n}
-  s=${s//$'\r'/\\r}
-  s=${s//$'\t'/\\t}
-  printf '%s' "${s}"
 }
 
 port_is_in_use() {

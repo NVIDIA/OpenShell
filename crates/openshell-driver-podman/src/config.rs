@@ -513,6 +513,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shared_image_pull_policies_map_to_podman_vocabulary() {
+        for (policy, expected) in [
+            (ImagePullPolicy::Always, "always"),
+            (ImagePullPolicy::IfNotPresent, "missing"),
+            (ImagePullPolicy::Never, "never"),
+            (ImagePullPolicy::Newer, "newer"),
+        ] {
+            assert_eq!(podman_image_pull_policy(policy), expected);
+        }
+    }
+
+    #[test]
     fn config_uses_canonical_ssh_socket_path_name() {
         let config: PodmanComputeConfig =
             serde_json::from_value(serde_json::json!({ "ssh_socket_path": "/run/test.sock" }))

@@ -1657,6 +1657,15 @@ mod tests {
     }
 
     #[test]
+    fn extension_token_ttl_is_capped_at_one_hour() {
+        let issuer = extension_test_issuer_with_ttl(Some(Duration::from_secs(24 * 60 * 60)));
+        assert_eq!(extension_token_ttl(&issuer), Duration::from_secs(60 * 60));
+
+        let short = extension_test_issuer_with_ttl(Some(Duration::from_secs(5 * 60)));
+        assert_eq!(extension_token_ttl(&short), Duration::from_secs(5 * 60));
+    }
+
+    #[test]
     fn plaintext_extension_endpoint_is_rejected_unless_explicitly_opted_out() {
         let issuer = extension_test_issuer();
 

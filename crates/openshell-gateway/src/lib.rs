@@ -349,8 +349,20 @@ fn apply_guest_tls(
 
 #[cfg(all(test, not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 mod local_driver_tests {
-    use super::{apply_guest_tls, validate_local_driver_guest_tls};
+    use super::{
+        apply_guest_tls, install_default_compute_drivers, validate_local_driver_guest_tls,
+    };
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn linux_builtin_compute_driver_registry_has_expected_names() {
+        assert_eq!(
+            install_default_compute_drivers()
+                .installed_driver_names()
+                .collect::<Vec<_>>(),
+            ["docker", "kubernetes", "podman", "vm"]
+        );
+    }
 
     #[test]
     fn tls_enabled_local_drivers_require_a_guest_bundle() {

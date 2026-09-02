@@ -1124,6 +1124,36 @@ mod tests {
     }
 
     #[test]
+    fn command_rejects_legacy_compute_driver_flags() {
+        for flag in ["--driver", "--drivers"] {
+            let err = command()
+                .try_get_matches_from([
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    flag,
+                    "docker",
+                ])
+                .expect_err("legacy compute driver selector must be rejected");
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
+    fn legacy_compute_driver_environment_is_rejected_even_when_empty() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for value in ["docker", ""] {
+            let guard = EnvVarGuard::set("OPENSHELL_DRIVERS", value);
+            let error = super::reject_legacy_driver_selector_env()
+                .expect_err("legacy environment selector must be rejected");
+            assert!(error.to_string().contains("OPENSHELL_COMPUTE_DRIVER"));
+            drop(guard);
+        }
+    }
+
+    #[test]
     fn command_rejects_removed_ssh_endpoint_flags() {
         for flag in [
             "--ssh-gateway-host",
@@ -1589,6 +1619,43 @@ log_level = "debug"
 
         assert_eq!(args.log_level, "trace", "env var must win over file");
         assert_eq!(args.name, "env-gateway");
+    }
+
+    #[test]
+    fn compute_driver_file_value_and_cli_environment_precedence_are_explicit() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _legacy = EnvVarGuard::remove("OPENSHELL_DRIVERS");
+        let file = config_file_from_toml(
+            r#"
+[openshell.gateway]
+compute_driver = "podman"
+"#,
+        );
+
+        let canonical_guard = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER");
+        let (mut file_args, file_matches) =
+            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        merge_file_into_args(&mut file_args, &file.openshell.gateway, &file_matches);
+        assert_eq!(file_args.compute_driver.as_deref(), Some("podman"));
+
+        let (mut cli_args, cli_matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver",
+            "docker",
+        ]);
+        merge_file_into_args(&mut cli_args, &file.openshell.gateway, &cli_matches);
+        assert_eq!(cli_args.compute_driver.as_deref(), Some("docker"));
+        drop(canonical_guard);
+
+        let _canonical = EnvVarGuard::set("OPENSHELL_COMPUTE_DRIVER", "vm");
+        let (mut env_args, env_matches) =
+            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        merge_file_into_args(&mut env_args, &file.openshell.gateway, &env_matches);
+        assert_eq!(env_args.compute_driver.as_deref(), Some("vm"));
     }
 
     #[test]

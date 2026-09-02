@@ -192,6 +192,57 @@ fn docker_rejects_newer_image_pull_policy() {
 }
 
 #[test]
+fn docker_apparmor_profiles_render_and_require_daemon_capability() {
+    for (profile, expected) in [
+        (AppArmorProfile::RuntimeDefault, None),
+        (
+            AppArmorProfile::Unconfined,
+            Some(vec!["apparmor=unconfined".to_string()]),
+        ),
+        (
+            AppArmorProfile::Localhost("openshell-supervisor".to_string()),
+            Some(vec!["apparmor=openshell-supervisor".to_string()]),
+        ),
+    ] {
+        let mut config = runtime_config();
+        config.app_armor_profile = Some(profile.clone());
+        let body = build_container_create_body(&test_sandbox(), &config).unwrap();
+        assert_eq!(body.host_config.unwrap().security_opt, expected);
+    }
+
+    let unavailable = SystemInfo::default();
+    assert!(
+        validate_docker_app_armor_profile(Some(&AppArmorProfile::Unconfined), &unavailable).is_ok()
+    );
+    for confined in [
+        AppArmorProfile::RuntimeDefault,
+        AppArmorProfile::Localhost("openshell-supervisor".to_string()),
+    ] {
+        let error = validate_docker_app_armor_profile(Some(&confined), &unavailable)
+            .expect_err("confined profile requires daemon AppArmor support");
+        assert!(
+            error
+                .to_string()
+                .contains("Docker reports it is unavailable")
+        );
+    }
+
+    let available = SystemInfo {
+        security_options: Some(vec!["name=apparmor".to_string()]),
+        ..Default::default()
+    };
+    assert!(
+        validate_docker_app_armor_profile(
+            Some(&AppArmorProfile::Localhost(
+                "openshell-supervisor".to_string()
+            )),
+            &available
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn docker_config_uses_shared_proxy_contract_and_explicit_apparmor_default() {
     let config: DockerComputeConfig = toml::from_str(
         r#"
@@ -1305,6 +1356,17 @@ fn container_create_body_omits_pids_limit_by_default() {
 }
 
 #[test]
+fn container_create_body_emits_configured_positive_pids_limit() {
+    let mut config = runtime_config();
+    config.sandbox_pids_limit = std::num::NonZeroI64::new(4096);
+    let body = build_container_create_body(&test_sandbox(), &config).unwrap();
+    assert_eq!(
+        body.host_config.expect("host config").pids_limit,
+        Some(4096)
+    );
+}
+
+#[test]
 fn build_environment_sets_docker_tls_paths() {
     let env = build_environment(&test_sandbox(), &runtime_config());
     assert!(env.contains(&format!("OPENSHELL_TLS_CA={TLS_CA_MOUNT_PATH}")));
@@ -2260,6 +2322,12 @@ fn docker_container_projects_proxy_and_spiffe_without_credential_metadata() {
             .windows(2)
             .any(|args| args == ["--upstream-proxy-auth-file", UPSTREAM_PROXY_AUTH_MOUNT_PATH])
     );
+    assert!(
+        command
+            .windows(2)
+            .any(|args| args == ["--upstream-no-proxy", ".svc"])
+    );
+    assert!(command.contains(&"--upstream-proxy-connect-by-hostname".to_string()));
     let binds = body.host_config.unwrap().binds.unwrap();
     assert!(
         binds
@@ -3129,6 +3197,32 @@ fn docker_guest_tls_paths_allows_plain_http_without_tls_flags() {
     })
     .unwrap();
     assert!(result.is_none());
+}
+
+#[test]
+fn docker_automatic_tls_detection_is_fail_closed_for_partial_bundles() {
+    for mask in 0_u8..8 {
+        let config = DockerComputeConfig {
+            guest_tls_ca: (mask & 1 != 0).then(|| PathBuf::from("/tmp/ca.pem")),
+            guest_tls_cert: (mask & 2 != 0).then(|| PathBuf::from("/tmp/cert.pem")),
+            guest_tls_key: (mask & 4 != 0).then(|| PathBuf::from("/tmp/key.pem")),
+            ..Default::default()
+        };
+        assert_eq!(
+            docker_guest_tls_configured(&config),
+            mask != 0,
+            "TLS presence mask {mask:03b}"
+        );
+
+        if mask != 0 && mask != 7 {
+            let mut inferred = config;
+            inferred.grpc_endpoint = "https://host.openshell.internal:8080".to_string();
+            assert!(
+                docker_guest_tls_paths(&inferred).is_err(),
+                "partial TLS presence mask {mask:03b} must fail"
+            );
+        }
+    }
 }
 
 #[test]

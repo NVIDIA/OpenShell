@@ -18,7 +18,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=tasks/scripts/gateway-pull-policy.sh
 source "${ROOT}/tasks/scripts/gateway-pull-policy.sh"
-GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
+GATEWAY_BIN="${OPENSHELL_GATEWAY_BIN:-${ROOT}/target/debug/openshell-gateway}"
 
 usage() {
   cat <<'EOF'
