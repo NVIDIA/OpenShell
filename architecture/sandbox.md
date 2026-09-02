@@ -169,6 +169,10 @@ the remote adapter materializes an owned HTTP evaluation only when a request
 crosses that transport boundary. Both paths support bounded bidirectional
 WebSocket sessions, so a manifest advertises capabilities independently of
 transport.
+When a stage ends, the remote adapter sends its terminal event, half-closes the
+request stream, and briefly drains the response stream before releasing the
+transport. This keeps a queued terminal event from being canceled with the
+bidirectional RPC.
 The runtime keeps three states distinct: host selection attaches policy configs,
 manifest operation and phase bindings select the active chain, and the parsed
 message type determines whether that chain can inspect an individual payload.

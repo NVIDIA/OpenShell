@@ -5735,7 +5735,9 @@ mod tests {
             "all-skip preflight must not retain session capacity"
         );
         assert_eq!(
-            session_ends_rx.recv().await,
+            tokio::time::timeout(Duration::from_secs(1), session_ends_rx.recv())
+                .await
+                .expect("skipped stage must receive session_end"),
             Some(openshell_core::proto::WebSocketSessionEndReason::StageSkipped)
         );
         assert!(

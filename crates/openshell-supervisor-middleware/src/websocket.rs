@@ -30,6 +30,7 @@ use super::{
 };
 
 const STREAM_CHANNEL_CAPACITY: usize = 4;
+const SESSION_END_TIMEOUT: Duration = Duration::from_millis(10);
 const MAX_REQUESTED_SUBPROTOCOLS: usize = 32;
 const MAX_SUBPROTOCOL_BYTES: usize = 4 * 1024;
 const MAX_SELECTED_SUBPROTOCOL_BYTES: usize = 256;
@@ -145,6 +146,42 @@ struct WebSocketStageTransport {
     responses: super::WebSocketResponseStream,
 }
 
+impl WebSocketStageTransport {
+    async fn end(self, reason: WebSocketSessionEndReason) {
+        let _ = tokio::time::timeout(SESSION_END_TIMEOUT, self.end_inner(reason)).await;
+    }
+
+    async fn end_inner(self, reason: WebSocketSessionEndReason) {
+        if self.sender.send(session_end_request(reason)).await.is_err() {
+            return;
+        }
+        self.drain().await;
+    }
+
+    async fn drain(self) {
+        let Self {
+            sender,
+            mut responses,
+        } = self;
+        // Keep the response handle alive while half-closing the request stream.
+        // Dropping both handles together schedules an HTTP/2 CANCEL, which may
+        // discard the buffered session_end before the middleware receives it.
+        drop(sender);
+        while responses.next().await.is_some() {}
+    }
+
+    fn end_now(self, reason: WebSocketSessionEndReason) {
+        if self.sender.try_send(session_end_request(reason)).is_err() {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            drop(runtime.spawn(async move {
+                let _ = tokio::time::timeout(SESSION_END_TIMEOUT, self.drain()).await;
+            }));
+        }
+    }
+}
+
 struct WebSocketStage {
     entry: DescribedChainEntry,
     transport: Option<WebSocketStageTransport>,
@@ -161,11 +198,7 @@ impl WebSocketStage {
 
     async fn end(&mut self, reason: WebSocketSessionEndReason) {
         if let Some(transport) = self.transport.take() {
-            let _ = tokio::time::timeout(
-                Duration::from_millis(10),
-                transport.sender.send(session_end_request(reason)),
-            )
-            .await;
+            transport.end(reason).await;
         }
     }
 }
@@ -965,25 +998,25 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
         Err(_) => return OpenStage::Failed(entry, "middleware_timeout".into()),
     };
     let Some(response) = response else {
-        let _ = sender.try_send(session_end_request(
-            WebSocketSessionEndReason::MiddlewareFailure,
-        ));
+        WebSocketStageTransport { sender, responses }
+            .end(WebSocketSessionEndReason::MiddlewareFailure)
+            .await;
         return OpenStage::Failed(entry, "missing_preflight_decision".into());
     };
     let Some(web_socket_session_event_result::Result::PreflightDecision(decision)) =
         response.result
     else {
-        let _ = sender.try_send(session_end_request(
-            WebSocketSessionEndReason::MiddlewareFailure,
-        ));
+        WebSocketStageTransport { sender, responses }
+            .end(WebSocketSessionEndReason::MiddlewareFailure)
+            .await;
         return OpenStage::Failed(entry, "invalid_preflight_decision".into());
     };
     let decision = match validate_preflight_decision(decision) {
         Ok(decision) => decision,
         Err(reason) => {
-            let _ = sender.try_send(session_end_request(
-                WebSocketSessionEndReason::MiddlewareFailure,
-            ));
+            WebSocketStageTransport { sender, responses }
+                .end(WebSocketSessionEndReason::MiddlewareFailure)
+                .await;
             return OpenStage::Failed(entry, reason.into());
         }
     };
@@ -1015,7 +1048,9 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
         WebSocketPreflightAction::Skip => {
             let outcome =
                 preflight_stage_outcome(&entry, WebSocketInvocationOutcome::Skip, decision);
-            let _ = sender.try_send(session_end_request(WebSocketSessionEndReason::StageSkipped));
+            WebSocketStageTransport { sender, responses }
+                .end(WebSocketSessionEndReason::StageSkipped)
+                .await;
             OpenStage::Skip(outcome)
         }
         WebSocketPreflightAction::Unspecified => {
@@ -1308,7 +1343,7 @@ async fn end_stages(stages: &mut [WebSocketStage], reason: WebSocketSessionEndRe
 fn end_stages_now(stages: &mut [WebSocketStage], reason: WebSocketSessionEndReason) {
     for stage in stages {
         if let Some(transport) = stage.transport.take() {
-            let _ = transport.sender.try_send(session_end_request(reason));
+            transport.end_now(reason);
         }
     }
 }
