@@ -133,13 +133,16 @@ server constructs the common runtime adapter and snapshots `GetCapabilities`
 for either result. A configured UDS endpoint still takes precedence over a
 compiled registration with the same name.
 
-The `openshell-gateway` composition crate groups first-party registrations
-behind the `in-tree-compute-drivers` feature. `openshell-server` has no compute
-driver dependencies or backend-name dispatch. Protocol-only gateway builds
-disable the composition feature and link no compute-driver crates. E2E lanes
-compose that gateway with Docker, Podman, Kubernetes, and VM driver executables
-over the public UDS gRPC contract so an in-tree driver cannot silently depend
-on a server-only API.
+The `openshell-gateway` composition crate exposes one feature per first-party
+registration: `compute-driver-kubernetes`, `compute-driver-docker`,
+`compute-driver-podman`, and `compute-driver-vm`. Builds can enable any subset.
+The default `in-tree-compute-drivers` feature remains an alias for all four
+and retains the Windows MXC registration and unsupported-driver stubs.
+`openshell-server` has no compute driver dependencies or backend-name dispatch.
+Protocol-only gateway builds disable the default features and link no
+compute-driver crates. E2E lanes compose that gateway with Docker, Podman,
+Kubernetes, and VM driver executables over the public UDS gRPC contract so an
+in-tree driver cannot silently depend on a server-only API.
 
 ## Stop and Start Lifecycle
 

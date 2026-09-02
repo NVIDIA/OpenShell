@@ -40,6 +40,25 @@ an exited canonical process remains a terminal sandbox result. Exit code zero
 produces `Completed`; a nonzero or signal-normalized exit produces `Error`
 with the exact exit code. Driver and supervisor failures remain `Error`.
 
+## Build with Selected Compute Drivers
+
+Source builds of `openshell-gateway` can include any subset of the Docker,
+Podman, Kubernetes, and VM drivers. Enable the corresponding
+`compute-driver-docker`, `compute-driver-podman`, `compute-driver-kubernetes`,
+or `compute-driver-vm` Cargo features. For example, build a Docker-only gateway
+with telemetry support:
+
+```shell
+cargo build --release -p openshell-gateway --no-default-features --features telemetry,compute-driver-docker
+```
+
+The default `in-tree-compute-drivers` feature retains the full platform driver
+set, including MXC on Windows. The four selective features apply to non-Windows
+builds. A build with no default features and no driver features connects to
+external drivers only. Auto-detection probes only compiled registrations.
+To select a driver omitted from a custom build, configure its external
+`socket_path` as described below.
+
 ## Configure a Compute Driver
 
 Configure the compute driver on the gateway. Current releases accept one driver per gateway. Set `compute_drivers` in the gateway TOML file:
