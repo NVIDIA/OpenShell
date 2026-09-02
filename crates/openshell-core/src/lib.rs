@@ -64,14 +64,18 @@ pub use metadata::{
 
 /// Build version string derived from git metadata.
 ///
-/// For local builds this is computed by `build.rs` via `git describe` using
-/// the guess-next-dev scheme (e.g. `0.0.4-dev.6+g2bf9969`). In Docker/CI
-/// builds where `.git` is absent, falls back to `CARGO_PKG_VERSION` which
-/// is already set correctly by the build pipeline's sed patch.
+/// For local builds this is computed by `build.rs` from the exact release tag
+/// or the latest merged stable tag using the guess-next-dev scheme (e.g.
+/// `0.0.4-dev.6+g2bf9969ab`). In Docker/CI builds where `.git` is absent, it
+/// falls back to `CARGO_PKG_VERSION`, which the build pipeline already stamps.
 pub const VERSION: &str = match option_env!("OPENSHELL_GIT_VERSION") {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),
 };
+
+#[cfg(test)]
+#[path = "../build_version.rs"]
+mod build_version;
 
 /// Encoded protobuf `FileDescriptorSet` for every proto in `proto/`.
 ///
