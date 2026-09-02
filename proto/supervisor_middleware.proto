@@ -140,22 +140,18 @@ message HttpHeader {
 
 // HttpResponseEvent is one ordered event in a stage-local response stream. A
 // stream starts with exactly one preflight. An inspecting body stage then
-// receives one or more body units, the last of which sets end_of_stream. Skip,
-// headers-only, and block-delivery stages receive no body units. OpenShell may
-// finish any opened stream with one best-effort session_end.
+// receives body units until it returns skip_remaining or block_delivery, or
+// until the unit that sets end_of_stream. Skip, headers-only, and
+// block-delivery stages receive no body units. OpenShell may finish any opened
+// stream with one best-effort session_end.
 message HttpResponseEvent {
-  // 3 was a separate body-end event, replaced by
-  // HttpResponseBodyUnit.end_of_stream. 4 is held for response trailers,
-  // which are deferred from V1.
-  reserved 3, 4;
-  reserved "body_end", "trailers";
   oneof event {
     // Initial response head and request context for this stage.
     HttpResponsePreflight preflight = 1;
     // One normalized body unit selected by OpenShell.
     HttpResponseBodyUnit body = 2;
     // Best-effort terminal notification for this stage stream.
-    MiddlewareSessionEnd session_end = 5;
+    MiddlewareSessionEnd session_end = 3;
   }
 }
 
@@ -164,9 +160,6 @@ message HttpResponseEvent {
 // end_of_stream unit, requires exactly one matching result. Session end does
 // not produce a result.
 message HttpResponseEventResult {
-  // 3 is held for response trailer results, which are deferred from V1.
-  reserved 3;
-  reserved "trailers_result";
   oneof result {
     // Result for the stream's initial preflight.
     HttpResponsePreflightDecision preflight_decision = 1;
@@ -238,7 +231,7 @@ message HttpResponsePreflightDecision {
     // Inspect the response using the selected body mode and mutations.
     HttpResponsePreflightInspect inspect = 2;
     // Authoritatively prevent delivery of this response to the sandbox.
-    HttpResponsePreflightBlockDelivery block_delivery = 7;
+    HttpResponseBlockDelivery block_delivery = 7;
   }
   // Free-form service diagnostic. OpenShell never exposes this to the sandbox
   // or security logs. Limited to 4 KiB before discarding.
@@ -261,21 +254,22 @@ message HttpResponsePreflightDecision {
 // response. OpenShell sends no body units to the stage.
 message HttpResponsePreflightSkip {}
 
-// HttpResponsePreflightBlockDelivery withholds the response from the sandbox.
-// It is a successful decision enforced regardless of on_error and is distinct
-// from a middleware failure. OpenShell replaces the upstream response with a
-// platform-owned error that states the upstream request may have completed;
-// this decision does not undo that request. A block from any stage wins over
-// skip, inspect, and failures from other stages. Later stages are not opened,
-// and every opened stage receives session_end with MIDDLEWARE_DENIAL.
-message HttpResponsePreflightBlockDelivery {}
+// HttpResponseBlockDelivery stops delivery of the response to the sandbox. It
+// is a successful decision enforced regardless of on_error and is distinct
+// from a middleware failure. Before the response head is committed, which is
+// always the case at preflight and for WHOLE_BODY_BYTES results, OpenShell
+// replaces the upstream response with a platform-owned error that states the
+// upstream request may have completed. After commitment, which is the case for
+// STREAM_BYTES results, OpenShell aborts delivery and the sandbox may have
+// received a prefix. Neither outcome undoes the upstream request. A block from
+// any stage wins over every other action and over failures from other stages.
+// Later stages are not opened or receive no further units, and every opened
+// stage receives session_end with MIDDLEWARE_DENIAL.
+message HttpResponseBlockDelivery {}
 
 // HttpResponsePreflightInspect selects this stage's response inspection mode
 // and proposes mutations to the current response head.
 message HttpResponsePreflightInspect {
-  // 3 is held for declared trailer names, deferred from V1 with trailers.
-  reserved 3;
-  reserved "declared_trailer_names";
   // Required response body mode. It must be one of
   // HttpResponsePreflight.permitted_body_modes. UNSPECIFIED and unlisted modes
   // are middleware failures handled according to on_error.
@@ -322,9 +316,10 @@ message HttpResponseBodyUnit {
     // shorter units to preserve upstream flush behavior.
     bytes data = 2;
   }
-  // True on the final unit for this stage. Every body-inspecting stage receives
-  // exactly one flagged unit; a zero-byte body is a single empty flagged unit
-  // at sequence 1. When the end of a chunked or close-delimited body is
+  // True on the final unit for this stage. Every body-inspecting stage that
+  // does not end its participation early with skip_remaining or block_delivery
+  // receives exactly one flagged unit; a zero-byte body is a single empty
+  // flagged unit at sequence 1. When the end of a chunked or close-delimited body is
   // discovered after the last data, OpenShell sends an empty flagged unit
   // rather than delaying the preceding unit. OpenShell never reads ahead to set
   // this flag. The flagged unit requires a result like any other unit, and a
@@ -336,21 +331,26 @@ message HttpResponseBodyUnit {
 
 // HttpResponseBodyResult acknowledges and finalizes exactly one body unit. V1
 // processes units in lockstep and does not send the next unit to a stage until
-// the current result has passed validation. V1 does not support denial or
-// ownership transfer.
+// the current result has passed validation. V1 does not support ownership
+// transfer.
 message HttpResponseBodyResult {
   // Must exactly match the sequence of the next outstanding body unit. Zero,
   // gaps, duplicates, and regressions are invalid.
   uint64 sequence = 1;
-  // Exactly one delivery action is required. An unset action is a middleware
-  // failure, not an implicit request for another input unit. Actions are
-  // explicit rather than inferred from replacement presence so a later version
-  // can add ownership transfer without changing the RPC cardinality.
+  // Exactly one action is required. An unset action is a middleware failure,
+  // not an implicit request for another input unit. Actions are explicit
+  // rather than inferred from replacement presence so a later version can add
+  // ownership transfer without changing the RPC cardinality.
   oneof action {
     // Forward the corresponding input unit without modification.
     HttpResponseBodyPassThrough pass_through = 2;
     // Replace the complete corresponding input unit.
     HttpResponseBodyTransform transform = 3;
+    // Stop delivery of this response. See HttpResponseBlockDelivery for the
+    // difference between results before and after head commitment.
+    HttpResponseBlockDelivery block_delivery = 8;
+    // Finalize this unit, then opt out of inspecting the rest of the response.
+    HttpResponseBodySkipRemaining skip_remaining = 9;
   }
   // Free-form service diagnostic. OpenShell never exposes this to the sandbox
   // or security logs. Limited to 4 KiB before discarding.
@@ -369,6 +369,23 @@ message HttpResponseBodyResult {
 
 // HttpResponseBodyPassThrough preserves the corresponding input unit exactly.
 message HttpResponseBodyPassThrough {}
+
+// HttpResponseBodySkipRemaining finalizes the current unit and ends this
+// stage's participation in the response. OpenShell forwards every later unit
+// without sending it to this stage, other stages continue to evaluate those
+// units, and this stage receives no end_of_stream unit. A stage that deferred
+// bytes must emit them in the nested transform. Coverage records the remaining
+// body as skipped by choice, distinct from a fail-open bypass. On the
+// WHOLE_BODY_BYTES unit this is equivalent to the nested action alone.
+message HttpResponseBodySkipRemaining {
+  // Exactly one action for the current unit is required.
+  oneof current {
+    // Forward the current unit without modification.
+    HttpResponseBodyPassThrough pass_through = 1;
+    // Replace the current unit, including any deferred bytes.
+    HttpResponseBodyTransform transform = 2;
+  }
+}
 
 // HttpResponseBodyTransform replaces the complete corresponding input unit.
 message HttpResponseBodyTransform {
