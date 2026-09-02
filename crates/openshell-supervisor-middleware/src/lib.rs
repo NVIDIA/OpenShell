@@ -831,7 +831,6 @@ fn validate_payload_limit(source: &str, binding: &MiddlewareBinding) -> Result<u
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SupportedBinding {
     HttpPreCredentials,
-    HttpResponsePreReturn,
     WebSocketPreCredentials,
 }
 
@@ -847,7 +846,9 @@ fn supported_binding(source: &str, binding: &MiddlewareBinding) -> Result<Suppor
         (
             Some(SupervisorMiddlewareOperation::HttpResponse),
             Some(SupervisorMiddlewarePhase::PreReturn),
-        ) => Ok(SupportedBinding::HttpResponsePreReturn),
+        ) => Err(miette!(
+            "{source} advertises HTTP_RESPONSE/PRE_RETURN, which is not yet supported"
+        )),
         (
             Some(SupervisorMiddlewareOperation::WebsocketMessage),
             Some(SupervisorMiddlewarePhase::PreCredentials),
@@ -3685,7 +3686,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_accepts_http_response_pre_return_binding() {
+    fn manifest_rejects_http_response_pre_return_binding_until_dispatch_is_available() {
         let registration = external_registration(4096);
         let manifest = MiddlewareManifest {
             name: "example/response".into(),
@@ -3699,8 +3700,13 @@ mod tests {
             expected_audience: String::new(),
         };
 
-        validate_external_manifest(&registration, &manifest, 4096, false)
-            .expect("HTTP response pre-return binding is supported");
+        let error = validate_external_manifest(&registration, &manifest, 4096, false)
+            .expect_err("HTTP response pre-return binding must remain unavailable");
+        assert!(
+            error
+                .to_string()
+                .contains("HTTP_RESPONSE/PRE_RETURN, which is not yet supported")
+        );
     }
 
     #[test]
