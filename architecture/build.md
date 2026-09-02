@@ -410,7 +410,7 @@ preview. PR previews are produced by `.github/workflows/branch-docs.yml` when
 Fern credentials are available. Production docs publish from the release tag
 workflow.
 
-Versioned site snapshots live on the generated `docs-website` branch. Maintainers use `.github/workflows/sync-docs.yml` to refresh or remove one snapshot while preserving the others. Each generated version entry keeps its stable URL slug, selector display name, and optional Fern availability status. `.github/workflows/publish-docs-website.yml` validates that branch and publishes either a preview or, when explicitly selected, the production site.
+Versioned site snapshots live on the generated `docs-website` branch. Maintainers use `.github/workflows/sync-docs.yml` to refresh or remove one snapshot while preserving the others. Each generated version entry keeps its stable URL slug, selector display name, and optional Fern availability status. Release Dev calls this workflow once to sync the commit to `dev` with its development version and Beta status, then publishes that checkout. Stable Release Tag runs call it once to sync the tag to `latest` with its release version, then publish. The workflow serializes the branch update and production publish under the `docs-website` concurrency group. `.github/workflows/publish-docs-website.yml` remains available for explicit preview or production publishing of the generated branch.
 
 ## Validation Expectations
 

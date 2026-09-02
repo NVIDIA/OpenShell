@@ -11,18 +11,69 @@ sibling script imports directly as `sync_docs_website`.
 from __future__ import annotations
 
 from argparse import Namespace
-from typing import TYPE_CHECKING, cast
+from pathlib import Path
+from typing import cast
 
 import pytest
 import sync_docs_website as sdw
 import yaml
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
 
 def read_yaml(path: Path) -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def read_workflow(name: str) -> dict:
+    path = Path(__file__).resolve().parents[2] / ".github" / "workflows" / name
+    return yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+
+
+def test_release_workflows_sync_and_publish_docs_once() -> None:
+    dev = read_workflow("release-dev.yml")
+    tag = read_workflow("release-tag.yml")
+    dev_job = dev["jobs"]["publish-fern-docs"]
+    tag_job = tag["jobs"]["publish-fern-docs"]
+
+    assert dev_job["needs"] == ["compute-versions", "release-dev"]
+    assert dev_job["uses"] == "./.github/workflows/sync-docs.yml"
+    assert dev_job["with"]["channel"] == "dev"
+    assert dev_job["with"]["publish"] == "true"
+    assert "docs_version" in dev_job["with"]["display_name"]
+
+    assert tag_job["needs"] == ["compute-versions", "release"]
+    assert tag_job["uses"] == "./.github/workflows/sync-docs.yml"
+    assert tag_job["with"]["channel"] == "latest"
+    assert tag_job["with"]["publish"] == "true"
+    assert "is_prerelease != 'true'" in tag_job["if"]
+
+    for workflow_name in ("release-dev.yml", "release-tag.yml"):
+        workflow_path = (
+            Path(__file__).resolve().parents[2]
+            / ".github"
+            / "workflows"
+            / workflow_name
+        )
+        workflow_text = workflow_path.read_text(encoding="utf-8")
+        assert workflow_text.count("uses: ./.github/workflows/sync-docs.yml") == 1
+        assert "fern generate --docs" not in workflow_text
+
+
+def test_sync_workflow_serializes_sync_and_publish() -> None:
+    workflow = read_workflow("sync-docs.yml")
+    triggers = workflow["on"]
+    publish_input = triggers["workflow_call"]["inputs"]["publish"]
+    assert publish_input["type"] == "boolean"
+    assert publish_input["default"] == "false"
+    assert workflow["concurrency"]["group"] == "docs-website"
+
+    steps = workflow["jobs"]["sync"]["steps"]
+    step_names = [step["name"] for step in steps]
+    assert step_names.index("Commit docs website changes") < step_names.index(
+        "Publish Fern docs"
+    )
+    publish_step = next(step for step in steps if step["name"] == "Publish Fern docs")
+    assert publish_step["if"] == "${{ inputs.publish }}"
+    assert publish_step["working-directory"] == "docs-website/fern"
 
 
 def test_resolve_slug_channels() -> None:

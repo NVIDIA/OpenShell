@@ -664,31 +664,19 @@ jobs:
           if-no-files-found: error
 
   publish-fern-docs:
-    name: Publish Fern Docs
+    name: Sync and Publish Fern Docs
     needs: [compute-versions, release]
     if: needs.compute-versions.outputs.is_prerelease != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.tag || github.ref }}
-
-      - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "24"
-
-      - name: Install Fern CLI
-        run: |
-          FERN_VERSION=$(node -p "require('./fern/fern.config.json').version")
-          npm install -g "fern-api@${FERN_VERSION}"
-
-      - name: Publish Fern docs
-        env:
-          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
-        working-directory: ./fern
-        run: fern generate --docs
+    permissions:
+      contents: write
+    uses: ./.github/workflows/sync-docs.yml
+    with:
+      operation: sync
+      channel: latest
+      source_ref: ${{ needs.compute-versions.outputs.source_sha }}
+      display_name: Latest (v${{ needs.compute-versions.outputs.semver }})
+      publish: true
+    secrets: inherit
 
   publish-sdk-typescript:
     name: Publish TypeScript SDK

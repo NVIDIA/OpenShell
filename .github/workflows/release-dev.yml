@@ -28,6 +28,7 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     outputs:
       python_version: ${{ steps.v.outputs.python }}
+      docs_version: ${{ steps.v.outputs.docs_version }}
       cargo_version: ${{ steps.v.outputs.cargo }}
       deb_version: ${{ steps.v.outputs.deb }}
       rpm_version: ${{ steps.v.outputs.rpm_version }}
@@ -47,11 +48,15 @@ jobs:
         id: v
         run: |
           set -euo pipefail
-          echo "python=$(uv run python tasks/scripts/release.py get-version --dev --python)" >> "$GITHUB_OUTPUT"
-          echo "cargo=$(uv run python tasks/scripts/release.py get-version --dev --cargo)" >> "$GITHUB_OUTPUT"
-          echo "deb=$(uv run python tasks/scripts/release.py get-version --dev --deb)" >> "$GITHUB_OUTPUT"
-          echo "rpm_version=$(uv run python tasks/scripts/release.py get-version --dev --rpm-version)" >> "$GITHUB_OUTPUT"
-          echo "rpm_release=$(uv run python tasks/scripts/release.py get-version --dev --rpm-release)" >> "$GITHUB_OUTPUT"
+          python_version=$(uv run python tasks/scripts/release.py get-version --dev --python)
+          {
+            echo "python=${python_version}"
+            echo "docs_version=${python_version%%+*}"
+            echo "cargo=$(uv run python tasks/scripts/release.py get-version --dev --cargo)"
+            echo "deb=$(uv run python tasks/scripts/release.py get-version --dev --deb)"
+            echo "rpm_version=$(uv run python tasks/scripts/release.py get-version --dev --rpm-version)"
+            echo "rpm_release=$(uv run python tasks/scripts/release.py get-version --dev --rpm-release)"
+          } >> "$GITHUB_OUTPUT"
 
   build-cli:
     needs: compute-versions
@@ -627,6 +632,21 @@ jobs:
           app-version: dev
           release-kind: dev
           pin-sha: ${{ github.sha }}
+
+  publish-fern-docs:
+    name: Sync and Publish Fern Docs
+    needs: [compute-versions, release-dev]
+    permissions:
+      contents: write
+    uses: ./.github/workflows/sync-docs.yml
+    with:
+      operation: sync
+      channel: dev
+      source_ref: ${{ github.sha }}
+      display_name: dev (${{ needs.compute-versions.outputs.docs_version }})
+      availability: beta
+      publish: true
+    secrets: inherit
 
   trigger-wheel-publish:
     name: Trigger Wheel Publish

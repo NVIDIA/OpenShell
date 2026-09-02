@@ -4,6 +4,40 @@
 name: Sync Docs Website
 
 on:
+  workflow_call:
+    inputs:
+      operation:
+        description: "Whether to sync or remove a docs snapshot"
+        required: true
+        type: string
+      channel:
+        description: "Docs channel to update or remove"
+        required: true
+        type: string
+      source_ref:
+        description: "Source commit SHA, branch, or tag to snapshot when operation=sync"
+        required: false
+        type: string
+      version_slug:
+        description: "Version slug when channel=version"
+        required: false
+        type: string
+      display_name:
+        description: "Optional version selector display name"
+        required: false
+        type: string
+      availability:
+        description: "Optional Fern availability status"
+        required: false
+        type: string
+      publish:
+        description: "Publish production docs after syncing"
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      FERN_TOKEN:
+        required: false
   workflow_dispatch:
     inputs:
       operation:
@@ -38,6 +72,11 @@ on:
         description: "Optional Fern status: beta, deprecated, ga, or stable"
         required: false
         type: string
+      publish:
+        description: "Publish production docs after syncing"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -167,3 +206,10 @@ jobs:
             git commit -m "docs(website): remove ${target} docs"
           fi
           git push origin HEAD:docs-website
+
+      - name: Publish Fern docs
+        if: ${{ inputs.publish }}
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+        working-directory: docs-website/fern
+        run: fern generate --docs
