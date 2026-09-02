@@ -54,6 +54,7 @@ versions:
 - display-name: v0.0.36
   path: ./versions/v0.0.36.yml
   slug: v0.0.36
+  availability: deprecated
 redirects:
 - source: /openshell/index.html
   destination: /openshell/latest
