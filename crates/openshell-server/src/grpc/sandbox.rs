@@ -4219,13 +4219,14 @@ mod tests {
             &state,
             authed_request(CreateSandboxRequest {
                 name: "mcp-canonical".to_string(),
-                spec: Some(openshell_core::proto::SandboxSpec {
+                spec: Some(SandboxSpec {
                     policy: Some(mcp_policy_with_versions(&["2025-11-25", "2025-03-26"])),
                     ..Default::default()
                 }),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                ..Default::default()
             }),
         )
         .await
@@ -4275,13 +4276,14 @@ mod tests {
                 &state,
                 authed_request(CreateSandboxRequest {
                     name: sandbox_name.to_string(),
-                    spec: Some(openshell_core::proto::SandboxSpec {
+                    spec: Some(SandboxSpec {
                         policy: Some(mcp_policy_with_options(mcp)),
                         ..Default::default()
                     }),
                     labels: HashMap::new(),
                     annotations: HashMap::new(),
                     workspace: String::new(),
+                    ..Default::default()
                 }),
             )
             .await
@@ -4373,13 +4375,14 @@ mod tests {
                     &state,
                     authed_request(CreateSandboxRequest {
                         name: sandbox_name.clone(),
-                        spec: Some(openshell_core::proto::SandboxSpec {
+                        spec: Some(SandboxSpec {
                             policy: Some(policy),
                             ..Default::default()
                         }),
                         labels: HashMap::new(),
                         annotations: HashMap::new(),
                         workspace: String::new(),
+                        ..Default::default()
                     }),
                 )
                 .await;
@@ -4440,13 +4443,14 @@ mod tests {
                 &state,
                 authed_request(CreateSandboxRequest {
                     name: sandbox_name.to_string(),
-                    spec: Some(openshell_core::proto::SandboxSpec {
+                    spec: Some(SandboxSpec {
                         policy: Some(mcp_policy_with_versions(versions)),
                         ..Default::default()
                     }),
                     labels: HashMap::new(),
                     annotations: HashMap::new(),
                     workspace: String::new(),
+                    ..Default::default()
                 }),
             )
             .await

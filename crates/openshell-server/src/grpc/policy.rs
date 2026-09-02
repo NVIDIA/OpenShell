@@ -1601,8 +1601,6 @@ async fn current_effective_policy_for_sandbox(
         .map(|spec| spec.providers.clone())
         .unwrap_or_default();
     let global_settings = load_global_settings(state.store.as_ref()).await?;
-    let providers_v2_enabled =
-        bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
     if let Some(global_policy) = decode_policy_from_global_settings(&global_settings)? {
         // A global policy is the complete effective policy. Dormant sandbox
         // history and specs may predate the current schema, but they must not
@@ -1613,7 +1611,6 @@ async fn current_effective_policy_for_sandbox(
             workspace,
             &provider_names,
             global_policy,
-            providers_v2_enabled,
             PolicySource::Global,
         )
         .await;
@@ -1641,7 +1638,6 @@ async fn current_effective_policy_for_sandbox(
         workspace,
         &provider_names,
         policy,
-        providers_v2_enabled,
         PolicySource::Sandbox,
     )
     .await
@@ -1663,15 +1659,12 @@ async fn effective_policy_for_source(
         },
     );
 
-    let providers_v2_enabled =
-        bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
     apply_effective_policy_context(
         state,
         catalog,
         workspace,
         provider_names,
         policy,
-        providers_v2_enabled,
         policy_source,
     )
     .await
@@ -1683,7 +1676,6 @@ async fn apply_effective_policy_context(
     workspace: &str,
     provider_names: &[String],
     mut policy: ProtoSandboxPolicy,
-    providers_v2_enabled: bool,
     policy_source: PolicySource,
 ) -> Result<ProtoSandboxPolicy, Status> {
     clear_provider_credentialed_markers(&mut policy);
@@ -2388,11 +2380,6 @@ pub(super) async fn handle_get_sandbox_config(
 
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let global_policy = decode_policy_from_global_settings(&global_settings)?;
-    let sandbox_settings =
-        load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name()).await?;
-    let providers_v2_enabled =
-        bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
-
     let mut global_policy_version: u32 = 0;
 
     // Try to get the latest policy from the policy history table. Under a
@@ -9873,7 +9860,6 @@ mod tests {
         };
 
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
         state
             .store
             .put_message(&StoredProviderProfile {
