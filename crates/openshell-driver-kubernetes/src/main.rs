@@ -16,8 +16,8 @@ use openshell_driver_kubernetes::otel_tracing::compute_driver_rpc_layer;
 use openshell_driver_kubernetes::{
     AppArmorProfile, ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID,
     DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig, KubernetesComputeDriver,
-    KubernetesSidecarConfig, ManagedSshIngressConfig, SupervisorSideloadMethod, SupervisorTopology,
-    WorkspaceMode,
+    KubernetesProxyPodConfig, KubernetesSidecarConfig, ManagedSshIngressConfig, ProxyPodAffinity,
+    SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode,
 };
 
 #[derive(Parser, Debug)]
@@ -169,6 +169,21 @@ struct Args {
     #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY_CONNECT_BY_HOSTNAME", action = ArgAction::SetTrue)]
     proxy_connect_by_hostname: bool,
 
+    /// UID for the proxy container in `proxy-pod` topology.
+    #[arg(
+        long = "proxy-pod-proxy-uid",
+        env = "OPENSHELL_K8S_PROXY_POD_PROXY_UID",
+        default_value_t = DEFAULT_PROXY_UID
+    )]
+    proxy_pod_proxy_uid: u32,
+
+    #[arg(
+        long = "proxy-pod-affinity",
+        env = "OPENSHELL_K8S_PROXY_POD_AFFINITY",
+        default_value = "disabled"
+    )]
+    proxy_pod_affinity: ProxyPodAffinity,
+
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
 
@@ -277,6 +292,10 @@ async fn main() -> Result<()> {
                 proxy_uid: args.sidecar_proxy_uid,
                 process_binary_aware_network_policy: args
                     .sidecar_process_binary_aware_network_policy,
+            },
+            proxy_pod: KubernetesProxyPodConfig {
+                proxy_uid: args.proxy_pod_proxy_uid,
+                affinity: args.proxy_pod_affinity,
             },
             https_proxy: args.https_proxy,
             no_proxy: args.no_proxy,

@@ -22,7 +22,7 @@ pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME: &str = "default";
 /// Default storage size for the workspace PVC.
 pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 
-/// Default non-root UID for relaxed Kubernetes network supervisor sidecars.
+/// Default UID for the long-running Kubernetes network proxy.
 pub const DEFAULT_PROXY_UID: u32 = 1337;
 
 /// How the supervisor binary is delivered into sandbox pods.
@@ -72,6 +72,9 @@ pub enum SupervisorTopology {
     /// Run network supervision in a privileged sidecar and process supervision
     /// as a low-capability wrapper in the agent container.
     Sidecar,
+    /// Run network supervision in a separate supervisor pod and process
+    /// supervision as a low-capability wrapper in the agent pod.
+    ProxyPod,
 }
 
 impl std::fmt::Display for SupervisorTopology {
@@ -79,6 +82,7 @@ impl std::fmt::Display for SupervisorTopology {
         match self {
             Self::Combined => f.write_str("combined"),
             Self::Sidecar => f.write_str("sidecar"),
+            Self::ProxyPod => f.write_str("proxy-pod"),
         }
     }
 }
@@ -90,6 +94,7 @@ impl FromStr for SupervisorTopology {
         match s {
             "combined" => Ok(Self::Combined),
             "sidecar" => Ok(Self::Sidecar),
+            "proxy-pod" => Ok(Self::ProxyPod),
             other => Err(format!("unknown topology '{other}'")),
         }
     }
@@ -171,6 +176,77 @@ impl KubernetesSidecarConfig {
                 "sidecar.proxy_uid must be in range [{}, {}]",
                 openshell_policy::MIN_SANDBOX_PROXY_UID,
                 openshell_policy::MAX_SANDBOX_UID,
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Scheduling relationship between a proxy-pod workload and its paired
+/// network-supervisor pod.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProxyPodAffinity {
+    /// Do not add an OpenShell-managed pod-affinity term.
+    #[default]
+    Disabled,
+    /// Prefer same-node placement without making it a scheduling requirement.
+    Preferred,
+    /// Require the workload and network supervisor to run on the same node.
+    Required,
+}
+
+impl std::fmt::Display for ProxyPodAffinity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => f.write_str("disabled"),
+            Self::Preferred => f.write_str("preferred"),
+            Self::Required => f.write_str("required"),
+        }
+    }
+}
+
+impl FromStr for ProxyPodAffinity {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "disabled" => Ok(Self::Disabled),
+            "preferred" => Ok(Self::Preferred),
+            "required" => Ok(Self::Required),
+            other => Err(format!(
+                "unknown proxy-pod affinity '{other}'; expected 'disabled', 'preferred', or 'required'"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesProxyPodConfig {
+    /// UID used by the network supervisor in `proxy-pod` topology. It must not
+    /// match the sandbox workload UID.
+    pub proxy_uid: u32,
+    /// Whether same-node placement with the paired supervisor is disabled,
+    /// preferred, or required.
+    pub affinity: ProxyPodAffinity,
+}
+
+impl Default for KubernetesProxyPodConfig {
+    fn default() -> Self {
+        Self {
+            proxy_uid: DEFAULT_PROXY_UID,
+            affinity: ProxyPodAffinity::Disabled,
+        }
+    }
+}
+
+impl KubernetesProxyPodConfig {
+    pub fn validate_proxy_uid(&self) -> Result<(), String> {
+        if self.proxy_uid < openshell_policy::MIN_SANDBOX_UID {
+            return Err(format!(
+                "proxy_pod.proxy_uid must be at least {}",
+                openshell_policy::MIN_SANDBOX_UID
             ));
         }
         Ok(())
@@ -326,6 +402,8 @@ pub struct KubernetesComputeConfig {
     pub topology: SupervisorTopology,
     /// Sidecar-only settings used when `topology = "sidecar"`.
     pub sidecar: KubernetesSidecarConfig,
+    /// Proxy-pod-only settings used when `topology = "proxy-pod"`.
+    pub proxy_pod: KubernetesProxyPodConfig,
     /// Corporate HTTP forward proxy used by the network supervisor for
     /// policy-approved TLS CONNECT egress.
     pub https_proxy: Option<String>,
@@ -451,6 +529,7 @@ impl Default for KubernetesComputeConfig {
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
             topology: SupervisorTopology::default(),
             sidecar: KubernetesSidecarConfig::default(),
+            proxy_pod: KubernetesProxyPodConfig::default(),
             https_proxy: None,
             no_proxy: None,
             proxy_auth_secret_name: None,
@@ -503,7 +582,8 @@ impl KubernetesComputeConfig {
     }
 
     pub fn validate_proxy_uid(&self) -> Result<(), String> {
-        self.sidecar.validate_proxy_uid()
+        self.sidecar.validate_proxy_uid()?;
+        self.proxy_pod.validate_proxy_uid()
     }
 
     /// Validate the operator-owned corporate upstream proxy configuration.
@@ -578,11 +658,11 @@ impl KubernetesComputeConfig {
                 if self.proxy_auth_allow_insecure != Some(true) {
                     return Err("proxy credentials use cleartext Basic auth over the connection to the http:// proxy; set proxy_auth_allow_insecure = true to accept that exposure, or remove the credential Secret".to_string());
                 }
-                if self.topology == SupervisorTopology::Combined {
-                    return Err(
-                        "proxy credential Secrets require topology = \"sidecar\"; combined topology shares the credential mount with the workload and fsGroup can make it readable by the sandbox user"
-                            .to_string(),
-                    );
+                if self.topology != SupervisorTopology::Sidecar {
+                    return Err(format!(
+                        "proxy credential Secrets require topology = \"sidecar\"; {} topology does not mount the credential into a supervisor container isolated from the workload",
+                        self.topology
+                    ));
                 }
             }
             _ => {
@@ -920,6 +1000,7 @@ mod tests {
     fn default_proxy_uid_is_dedicated_non_root_uid() {
         let cfg = KubernetesComputeConfig::default();
         assert_eq!(cfg.sidecar.proxy_uid, DEFAULT_PROXY_UID);
+        assert_eq!(cfg.proxy_pod.affinity, ProxyPodAffinity::Disabled);
     }
 
     #[test]
@@ -944,6 +1025,41 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.topology, SupervisorTopology::Combined);
+    }
+
+    #[test]
+    fn serde_override_topology_proxy_pod() {
+        let json = serde_json::json!({
+            "topology": "proxy-pod"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.topology, SupervisorTopology::ProxyPod);
+        assert_eq!(cfg.topology.to_string(), "proxy-pod");
+    }
+
+    #[test]
+    fn serde_override_proxy_pod_proxy_uid_nested() {
+        let json = serde_json::json!({
+            "proxy_pod": {
+                "proxy_uid": 2000,
+                "affinity": "preferred"
+            }
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.proxy_pod.proxy_uid, 2000);
+        assert_eq!(cfg.proxy_pod.affinity, ProxyPodAffinity::Preferred);
+        cfg.validate_proxy_uid().unwrap();
+    }
+
+    #[test]
+    fn serde_rejects_invalid_proxy_pod_affinity() {
+        let json = serde_json::json!({
+            "proxy_pod": {
+                "affinity": "sometimes"
+            }
+        });
+        let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown variant"));
     }
 
     #[test]

@@ -240,10 +240,15 @@ to the selected compute driver's `AuthenticateSandbox` RPC. A capable driver is
 trusted to return the authenticated sandbox ID, while the gateway still requires
 a matching durable sandbox record before minting a JWT. The Kubernetes driver
 uses its own named configuration to run TokenReview and verify the live pod and
-controlling Sandbox CR. The bootstrap path accepts
+controlling Sandbox CR: agent pods must be directly controlled by the `Sandbox`
+CR, while proxy-pod supervisor pods may be controlled through the Kubernetes
+`Pod -> ReplicaSet -> Deployment -> Sandbox` chain. The bootstrap path accepts
 both `agents.x-k8s.io/v1beta1` ownerReferences from newer Agent Sandbox
 controllers and `agents.x-k8s.io/v1alpha1` ownerReferences from existing
-deployments. Supervisors renew gateway JWTs in memory before expiry only while
+deployments. The proxy-pod gateway Role grants create/delete on its dependent
+Service, Secret, and NetworkPolicy resources, plus create/delete/get on the
+supervisor Deployment and get on its ReplicaSet for this owner-chain check.
+Supervisors renew gateway JWTs in memory before expiry only while
 the sandbox record still exists. Older tokens are not server-revoked; shared
 deployments bound replay exposure with short `gateway_jwt.ttl_secs` lifetimes.
 The config default is

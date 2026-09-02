@@ -26,6 +26,9 @@ pub const SSH_SOCKET_PATH: &str = "OPENSHELL_SSH_SOCKET_PATH";
 /// Log level for the sandbox supervisor (e.g. `"debug"`, `"info"`, `"warn"`).
 pub const LOG_LEVEL: &str = "OPENSHELL_LOG_LEVEL";
 
+/// Shell command to run inside the sandbox.
+pub const SANDBOX_COMMAND: &str = "OPENSHELL_SANDBOX_COMMAND";
+
 /// Versioned specification for the exact canonical main process.
 ///
 /// Most drivers use JSON directly. Transports that cannot preserve spaces in
@@ -147,12 +150,31 @@ pub const NETWORK_BINARY_IDENTITY: &str = "OPENSHELL_NETWORK_BINARY_IDENTITY";
 /// container.
 pub const SIDECAR_CONTROL_SOCKET: &str = "OPENSHELL_SIDECAR_CONTROL_SOCKET";
 
+/// Address where an external network supervisor forwards gateway gRPC traffic.
+pub const GATEWAY_FORWARD_ADDR: &str = "OPENSHELL_GATEWAY_FORWARD_ADDR";
+
 /// Optional TLS server name override used when connecting to the gateway.
 pub const GATEWAY_TLS_SERVER_NAME: &str = "OPENSHELL_GATEWAY_TLS_SERVER_NAME";
+
+/// Explicit URL injected into sandbox child processes for proxy-mode egress.
+///
+/// Kubernetes proxy-pod topology uses a headless Service DNS name, which
+/// cannot be represented by the policy's `SocketAddr` proxy field.
+pub const PROXY_URL: &str = "OPENSHELL_PROXY_URL";
+
+/// Explicit listener address for the network supervisor's HTTP CONNECT proxy.
+pub const PROXY_BIND_ADDR: &str = "OPENSHELL_PROXY_BIND_ADDR";
 
 /// Directory where the network supervisor writes the proxy CA files consumed
 /// by workload child processes.
 pub const PROXY_TLS_DIR: &str = "OPENSHELL_PROXY_TLS_DIR";
+
+/// Optional CA certificate PEM path used by the network supervisor instead of
+/// generating an ephemeral CA.
+pub const PROXY_CA_CERT_PATH: &str = "OPENSHELL_PROXY_CA_CERT_PATH";
+
+/// Optional CA private key PEM path paired with [`PROXY_CA_CERT_PATH`].
+pub const PROXY_CA_KEY_PATH: &str = "OPENSHELL_PROXY_CA_KEY_PATH";
 
 /// Path to the CA certificate for mTLS communication with the gateway.
 pub const TLS_CA: &str = "OPENSHELL_TLS_CA";

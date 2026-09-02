@@ -37,6 +37,7 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true }
 notify = "8"
+rcgen = { workspace = true }
 
 [dev-dependencies]
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }

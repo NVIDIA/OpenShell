@@ -20,6 +20,12 @@
 # files, relative to the repository root or absolute, to layer additional chart
 # configuration on top of ci/values-skaffold.yaml.
 #
+# Proxy-pod topology:
+#   Use OPENSHELL_E2E_KUBE_EXTRA_VALUES=deploy/helm/openshell/ci/values-proxy-pod.yaml
+#   or `mise run e2e:kubernetes:proxy-pod`. The target cluster must enforce
+#   Kubernetes NetworkPolicies; the ephemeral k3d/k3s path keeps k3s's embedded
+#   network policy controller enabled.
+#
 # Image source:
 #   - Ephemeral k3d mode builds local `openshell/{gateway,supervisor}:${IMAGE_TAG}`
 #     images by default, imports them into k3d, then installs the chart. This
@@ -94,6 +100,7 @@ VAULT_CHART_VERSION="${OPENSHELL_E2E_OPENBAO_CHART_VERSION:-0.28.3}"
 VAULT_DEV_ROOT_TOKEN="${OPENSHELL_E2E_VAULT_DEV_ROOT_TOKEN:-root}"
 CORPORATE_PROXY_FIXTURE_DEPLOYED=0
 CORPORATE_PROXY_FIXTURE_SECRET="openshell-e2e-proxy-auth"
+PROXY_POD_E2E=0
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -801,11 +808,19 @@ if [ -n "${OPENSHELL_E2E_KUBE_EXTRA_VALUES:-}" ]; then
   IFS=':' read -r -a extra_values_files <<< "${OPENSHELL_E2E_KUBE_EXTRA_VALUES}"
   for values_file in "${extra_values_files[@]}"; do
     [ -n "${values_file}" ] || continue
+    if [[ "${values_file}" == *"values-proxy-pod.yaml" ]]; then
+      PROXY_POD_E2E=1
+    fi
     if [[ "${values_file}" != /* ]]; then
       values_file="${ROOT}/${values_file}"
     fi
     helm_values_args+=(--values "${values_file}")
   done
+fi
+
+if [ "${PROXY_POD_E2E}" = "1" ]; then
+  echo "Proxy-pod e2e profile enabled; target cluster must enforce Kubernetes NetworkPolicies."
+  echo "Ephemeral k3d/k3s mode uses k3s's embedded NetworkPolicy controller unless the cluster is customized externally."
 fi
 
 if [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
