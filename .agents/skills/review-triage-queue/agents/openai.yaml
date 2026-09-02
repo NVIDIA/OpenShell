@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Triage Queue"
+  short_description: "Create a safe, local triage queue report"
+  default_prompt: "Use $review-triage-queue to review the current triage intake."
