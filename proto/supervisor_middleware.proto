@@ -64,8 +64,7 @@ message MiddlewareManifest {
 message MiddlewareBinding {
   // Supported operation.
   SupervisorMiddlewareOperation operation = 1;
-  // Supported phase. Current manifest validation accepts PRE_CREDENTIALS only;
-  // PRE_RETURN remains unavailable until the matching relay paths dispatch it.
+  // Supported phase.
   SupervisorMiddlewarePhase phase = 2;
   // Maximum request body, WebSocket message, or response body unit/replacement.
   // Required for payload-bearing operations.
