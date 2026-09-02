@@ -33,12 +33,14 @@ nix/test-guest/
 ├── cache-lib.sh
 ├── cache-seal.sh
 ├── distros/
-│   ├── ubuntu.nix
+│   ├── ubuntu-24-04.nix
+│   ├── ubuntu-26-04.nix
 │   ├── centos.nix
 │   ├── fedora.nix
 │   └── rocky.nix
 └── configuration/
     ├── docker.yml
+    ├── podman-rootless.yml
     ├── podman.yml
     └── selinux.yml
 ```
@@ -56,12 +58,13 @@ The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-gues
 
 ## Supported configurations
 
-| Distro | Docker | Podman | SELinux | Package format |
-| --- | --- | --- | --- | --- |
-| Ubuntu 24.04 | Yes | Yes | No | `.deb` |
-| CentOS Stream 10 | No | Yes | Yes | `.rpm` |
-| Fedora 44 | No | Yes | Yes | `.rpm` |
-| Rocky Linux 9 | Yes | Yes | Yes | `.rpm` |
+| Distro | Docker | Podman | Rootless Podman | SELinux | Package format |
+| --- | --- | --- | --- | --- | --- |
+| Ubuntu 24.04 | Yes | Yes | No | No | `.deb` |
+| Ubuntu 26.04 | Yes | Yes | Yes | No | `.deb` |
+| CentOS Stream 10 | No | Yes | No | Yes | `.rpm` |
+| Fedora 44 | No | Yes | No | Yes | `.rpm` |
+| Rocky Linux 9 | Yes | Yes | No | Yes | `.rpm` |
 
 The `snapd` configuration is available for Ubuntu and prepares snapd for
 local Snap lifecycle experiments. It does not install Docker, because the Snap
@@ -70,8 +73,8 @@ interface rather than the host-package Docker configuration.
 
 The Ubuntu 24.04 Podman configuration is available for runtime and packaging
 checks, but its Podman 4 release does not provide the `pasta` rootless network
-helper required by OpenShell sandbox callbacks. OpenShell Podman E2E runs use
-the Fedora guest, which provides Podman 5 and `pasta`.
+helper required by OpenShell sandbox callbacks. Rootless Podman E2E uses the
+Ubuntu 26.04 guest with `--with podman-rootless`.
 
 List the available distros and configurations:
 
@@ -84,13 +87,13 @@ nix run .#test-guest -- --list
 Boot a base Ubuntu VM:
 
 ```shell
-nix run .#test-guest -- --distro ubuntu
+nix run .#test-guest -- --distro ubuntu-24-04
 ```
 
 Apply the Docker configuration before opening the SSH session:
 
 ```shell
-nix run .#test-guest -- --distro ubuntu --with docker
+nix run .#test-guest -- --distro ubuntu-24-04 --with docker
 ```
 
 Other combinations use the same interface:
@@ -99,13 +102,14 @@ Other combinations use the same interface:
 nix run .#test-guest -- --distro rocky --with docker
 nix run .#test-guest -- --distro centos --with podman
 nix run .#test-guest -- --distro fedora --with podman
+nix run .#test-guest -- --distro ubuntu-26-04 --with podman-rootless
 ```
 
 Configurations are repeatable:
 
 ```shell
 nix run .#test-guest -- \
-  --distro ubuntu \
+  --distro ubuntu-24-04 \
   --with docker \
   --with podman
 ```
@@ -138,7 +142,7 @@ The `test-guest-cache` app ensures a prepared disk exists for one exact distro, 
 
 ```shell
 nix run .#test-guest-cache -- \
-  --distro ubuntu \
+  --distro ubuntu-24-04 \
   --with docker
 ```
 
@@ -147,7 +151,7 @@ backing cache:
 
 ```shell
 nix run .#test-guest-cache -- \
-  --distro ubuntu \
+  --distro ubuntu-24-04 \
   --with docker \
   --repository ghcr.io/nvidia/openshell/test-guest-cache \
   --digest sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
@@ -157,7 +161,7 @@ The command never publishes implicitly. Add `--push` after authenticating ORAS t
 
 ```shell
 nix run .#test-guest-cache -- \
-  --distro ubuntu \
+  --distro ubuntu-24-04 \
   --with docker \
   --repository ghcr.io/nvidia/openshell/test-guest-cache \
   --push
@@ -184,7 +188,7 @@ The default cache directory is `${XDG_CACHE_HOME:-$HOME/.cache}/openshell/test-g
 Cache command options:
 
 ```text
---distro NAME       Base distro: ubuntu, centos, fedora, or rocky
+--distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
 --with NAME         Apply docker, podman, or selinux; repeatable
 --repository REF    OCI repository without a tag
 --digest DIGEST     Trusted OCI manifest digest required for pulls
@@ -209,7 +213,7 @@ Install the package in an Ubuntu VM and run a command:
 
 ```shell
 nix run .#test-guest -- \
-  --distro ubuntu \
+  --distro ubuntu-24-04 \
   --with docker \
   --install artifacts/openshell_0.0.0-local_arm64.deb \
   -- openshell --version
@@ -226,7 +230,7 @@ guest file preserves the source's ordinary permission bits:
 
 ```shell
 nix run .#test-guest -- \
-  --distro ubuntu \
+  --distro ubuntu-24-04 \
   --copy ./openshell:/usr/local/bin/openshell \
   -- openshell --version
 ```
@@ -241,7 +245,7 @@ gateway. On each failure it prints snapd and gateway journals.
 
 ```shell
 nix run .#test-guest -- \
-  --distro ubuntu \
+  --distro ubuntu-24-04 \
   --with snapd \
   --keep \
   --copy ./openshell_*.snap:/tmp/openshell.snap \
@@ -259,7 +263,7 @@ The destination must be an absolute guest path. Copied files are installed with 
 ## Runner options
 
 ```text
---distro NAME       Base distro: ubuntu, centos, fedora, or rocky
+--distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
 --with NAME         Apply docker, podman, or selinux; repeatable
 --install PATH      Install a .deb or .rpm package; repeatable
 --copy SRC:DEST     Copy a regular file into the guest, preserving its host mode;

@@ -193,22 +193,6 @@ jobs:
       interpreter: /lib/ld-linux-aarch64.so.1
     secrets: inherit
 
-  build-driver-podman:
-    needs: [pr_metadata, version]
-    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
-    permissions:
-      contents: read
-    uses: ./.github/workflows/build-binaries.yml
-    with:
-      package: openshell-driver-podman
-      binary: openshell-driver-podman
-      triple: x86_64-unknown-linux-gnu
-      runner: linux-amd64-cpu8
-      dev-shell: .#devShells.x86_64-linux.glibc-2-28
-      cargo-version: ${{ needs.version.outputs.cargo }}
-      interpreter: /lib64/ld-linux-x86-64.so.2
-    secrets: inherit
-
   build-driver-kubernetes:
     needs: [pr_metadata, version]
     if: needs.pr_metadata.outputs.run_core_e2e == 'true'
@@ -279,17 +263,13 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
 
   podman-e2e:
-    needs: [pr_metadata, build-cli, build-conformance, build-gateway, build-supervisor-image]
+    needs: [pr_metadata, build-cli, build-gateway, build-sandbox]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
       contents: read
       packages: read
     uses: ./.github/workflows/e2e-podman-test.yml
-    with:
-      image-tag: ${{ github.sha }}
-      conformance-artifact-prefix: openshell-conformance
-
   vm-e2e:
     needs: [pr_metadata, build-cli, build-conformance, build-gateway, build-vm-driver]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
@@ -317,22 +297,6 @@ jobs:
       conformance-artifact-prefix: openshell-conformance
       suite-matrix: >-
         [{"suite":"external-driver","cmd":"mise run --no-deps --skip-deps e2e:docker:external-driver","apt_packages":"openssh-client","python_proto":false,"mcp":false}]
-
-  podman-external-driver-e2e:
-    needs: [pr_metadata, build-cli, build-conformance, build-gateway-plain, build-driver-podman, build-supervisor-image]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
-    permissions:
-      actions: read
-      contents: read
-      packages: read
-    uses: ./.github/workflows/e2e-podman-test.yml
-    with:
-      image-tag: ${{ github.sha }}
-      gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
-      external-driver-binary: openshell-driver-podman
-      conformance-artifact-prefix: openshell-conformance
-      suite-matrix: >-
-        [{"suite":"external-driver","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:podman:external-driver"}]
 
   vm-external-driver-e2e:
     needs: [pr_metadata, build-cli, build-conformance, build-gateway-plain, build-vm-driver]
@@ -467,7 +431,7 @@ jobs:
 
   core-e2e-result:
     name: Core E2E result
-    needs: [pr_metadata, docker-e2e, podman-e2e, vm-e2e, docker-external-driver-e2e, podman-external-driver-e2e, vm-external-driver-e2e, kubernetes-e2e, kubernetes-external-driver-e2e, kubernetes-workspace-managed-e2e, kubernetes-workspace-operator-e2e]
+    needs: [pr_metadata, docker-e2e, podman-e2e, vm-e2e, docker-external-driver-e2e, vm-external-driver-e2e, kubernetes-e2e, kubernetes-external-driver-e2e, kubernetes-workspace-managed-e2e, kubernetes-workspace-operator-e2e]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
