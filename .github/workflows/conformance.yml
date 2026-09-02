@@ -120,7 +120,7 @@ jobs:
       rpm-release: ${{ needs.version.outputs.rpm_release }}
 
   fedora:
-    name: Fedora clean install
+    name: Fedora with Rootless Podman
     needs: [build-conformance, build-rpm]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
