@@ -9,7 +9,7 @@ Guide agents through using the `openshell` CLI for sandbox and platform manageme
 
 ## Overview
 
-The OpenShell CLI (`openshell`) is the primary interface for managing sandboxes, providers, policies, settings, exposed services, inference routes, and gateway registrations. Gateway service lifecycle is handled outside the CLI by packages, systemd, Helm, or development tasks. This skill teaches agents how to orchestrate CLI commands for common and complex workflows.
+The OpenShell CLI (`openshell`) is the primary interface for managing sandboxes, providers, policies, settings, exposed services, inference routes, and gateway registrations. Gateway service lifecycle is handled outside the CLI by packages, systemd, or Helm. This skill teaches agents how to orchestrate CLI commands for common and complex workflows.
 
 **Companion skill**: For creating or modifying sandbox policy YAML content (network rules, L7 inspection, access presets), use the `generate-sandbox-policy` skill. This skill covers the CLI *commands* for the policy lifecycle; `generate-sandbox-policy` covers policy *content authoring*.
 
@@ -25,14 +25,20 @@ This is your primary fallback. Use it freely -- the CLI's help output is authori
 
 ## Prerequisites
 
-- `openshell` is on the PATH (install via `cargo install --path crates/openshell-cli`)
+- `openshell` is on the PATH. Follow the published [installation guide](https://docs.nvidia.com/openshell/latest/about/installation.md) when it is not installed.
 - A reachable OpenShell gateway backed by Docker, Podman, Kubernetes, or the experimental VM driver
-- Docker is running only when using BYOC local builds or Docker-backed development workflows
+- Docker is running only when using BYOC local builds or a Docker-backed gateway
 - For Kubernetes deployments: `kubectl` and Helm access to the target cluster
 
-## Command Reference
+## Authoritative References
 
-See [cli-reference.md](cli-reference.md) for the current command tree and commonly used flags. Use it as a quick-reference, then confirm uncommon or security-sensitive options with `--help`.
+Use `openshell --help` and nested `--help` output as the authority for the installed CLI version. Use the published documentation for product concepts and supported workflows:
+
+- [Manage gateways](https://docs.nvidia.com/openshell/latest/sandboxes/manage-gateways.md)
+- [Manage sandboxes](https://docs.nvidia.com/openshell/latest/sandboxes/manage-sandboxes.md)
+- [Manage providers](https://docs.nvidia.com/openshell/latest/sandboxes/manage-providers.md)
+- [Sandbox policies](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md)
+- [Inference routing](https://docs.nvidia.com/openshell/latest/sandboxes/inference-routing.md)
 
 ---
 
@@ -820,48 +826,6 @@ $ openshell sandbox upload --help
 
 ---
 
-## Quick Reference
-
-| Task | Command |
-|------|---------|
-| Register local port-forwarded gateway | `openshell gateway add http://127.0.0.1:8080 --local --name local` |
-| Check gateway health and authentication | `openshell status` |
-| Show authenticated identity and subject | `openshell whoami` |
-| List/switch gateways | `openshell gateway select [name]` |
-| Connect directly to a gateway | `openshell --gateway-endpoint <url> status` |
-| Create sandbox (interactive) | `openshell sandbox create` |
-| Create sandbox with tool | `openshell sandbox create -- claude` |
-| Create sandbox with GPUs | `openshell sandbox create --gpu 1` |
-| Create with custom policy | `openshell sandbox create --policy ./p.yaml` |
-| Create from template | `openshell sandbox create --template gpu-kata` |
-| Create workload template | `openshell sandbox template create gpu-kata --image python:3.12` |
-| Connect to sandbox | `openshell sandbox connect <name>` |
-| Stop sandbox compute | `openshell sandbox stop [name]` |
-| Start sandbox compute | `openshell sandbox start [name]` |
-| Execute in sandbox | `openshell sandbox exec --name <name> -- <command>` |
-| Stream live logs | `openshell logs <name> --tail` |
-| Incremental policy update | `openshell policy update <name> --add-endpoint host:443:read-only:rest:enforce --binary /usr/bin/curl --wait` |
-| Pull current policy | `openshell policy get <name> --full > p.yaml` |
-| Push updated policy | `openshell policy set <name> --policy p.yaml --wait` |
-| Policy revision history | `openshell policy list <name>` |
-| View global policy | `openshell policy get --global --full` |
-| Review proposed rules | `openshell rule get <name> --status pending` |
-| Create sandbox from Dockerfile | `openshell sandbox create --from ./Dockerfile` |
-| Forward a port | `openshell forward start <port> <name> -d` |
-| Expose an HTTP service | `openshell service expose <name> <port> [service]` |
-| Upload files to sandbox | `openshell sandbox upload <name> <path>` |
-| Download files from sandbox | `openshell sandbox download <name> <path>` |
-| Create provider | `openshell provider create --name N --type T --from-existing` |
-| List providers | `openshell provider list` |
-| Discover provider profiles | `openshell provider list-profiles` |
-| List attached providers | `openshell sandbox provider list <name>` |
-| View settings | `openshell settings get [name]` |
-| Configure managed inference | `openshell inference set --provider P --model M` |
-| View managed inference | `openshell inference get` |
-| Delete sandbox | `openshell sandbox delete <name>` |
-| Remove gateway registration | `openshell gateway remove <name>` |
-| Self-teach any command | `openshell <group> <cmd> --help` |
-
 ## Companion Skills
 
 | Skill | When to use |
@@ -869,4 +833,3 @@ $ openshell sandbox upload --help
 | `generate-sandbox-policy` | Creating or modifying policy YAML content (network rules, L7 inspection, access presets, endpoint configuration, and network middleware) |
 | `debug-openshell-cluster` | Diagnosing gateway deployment, runtime, or health failures |
 | `debug-inference` | Diagnosing `inference.local`, host-backed local inference, and provider base URL issues |
-| `tui-development` | Developing features for the OpenShell TUI (`openshell term`) |

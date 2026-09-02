@@ -48,7 +48,7 @@ Search open and closed issues for the same need. Bug reports and feature request
 
 Feature requests must also propose a user-facing workflow and describe alternatives considered. Define the externally observable behavior and leave internal implementation choices open. Bug reports instead include minimal reproduction steps, the OpenShell version and relevant environment, and a small, redacted log excerpt when it materially clarifies the behavior.
 
-The project includes optional [agent skills](#agent-skills-for-contributors) for self-service troubleshooting and exploration. Use them when they help you, but summarize any useful result in your own words rather than pasting a diagnostic transcript.
+The project includes optional [agent skills](#agent-skills) for using OpenShell and contributing to the repository. Use them when they help you, but summarize any useful result in your own words rather than pasting a diagnostic transcript.
 
 ### When to Open an Issue
 
@@ -68,15 +68,29 @@ Do not start substantial issue-backed work until a maintainer has accepted the i
 
 Use agents and the repository skills as needed to understand the affected code, evaluate tradeoffs, implement the smallest coherent change, and verify it. The pull request should explain what changed and how it was tested; it should not substitute an agent transcript for the contributor's understanding.
 
-## Agent Skills for Contributors
+## Agent Skills
 
-Skills live in `.agents/skills/`. Your agent's harness can discover and load them natively. Here is the full inventory:
+OpenShell keeps skills for using the product separate from skills for developing the repository.
+
+### Skills for Using OpenShell
+
+Public skills live in `skills/` and work without an OpenShell source checkout. Install them with `npx skills add NVIDIA/OpenShell`.
+
+| Skill | Purpose |
+| --- | --- |
+| `openshell-cli` | CLI usage, sandbox lifecycle, provider management, and BYOC workflows |
+| `debug-openshell-cluster` | Diagnose gateway deployment and health issues |
+| `debug-inference` | Diagnose managed, system, local, and direct external inference issues |
+| `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API documentation |
+
+Public skills use `openshell --help` for installed command syntax and published OpenShell documentation for product concepts and configuration. They must not depend on repository-relative source or documentation files.
+
+### Agent Skills for Contributors
+
+Contributor and maintainer skills live in `.agents/skills/`. They are marked internal so the Agent Skills CLI excludes them from ordinary public discovery, but repository-aware agent harnesses can discover and load them natively. Internal metadata is a discovery filter, not an access-control boundary.
 
 | Category        | Skill                     | Purpose                                                                                             |
 | --------------- | ------------------------- | --------------------------------------------------------------------------------------------------- |
-| Getting Started | `openshell-cli`           | CLI usage, sandbox lifecycle, provider management, BYOC workflows                                   |
-| Getting Started | `debug-openshell-cluster` | Diagnose gateway deployment and health issues                                                       |
-| Getting Started | `debug-inference`         | Diagnose `inference.local`, host-backed local inference, and direct external inference setup issues |
 | Contributing    | `create-spike`            | Investigate a problem, produce a structured GitHub issue                                            |
 | Contributing    | `create-rfc`              | Create RFC proposals from the repository template                                                   |
 | Contributing    | `build-from-issue`        | Plan and implement work from a GitHub issue (maintainer workflow)                                   |
@@ -89,11 +103,10 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Reviewing       | `launch-openshell-gator`  | Launch and supervise OpenShell gator agents for issue and PR monitoring                             |
 | Reviewing       | `test-release-canary`     | Dispatch and iterate on the Release Canary workflow that smoke-tests published artifacts            |
 | Triage          | `triage-issue`            | Assess, classify, and route community-filed issues                                                  |
-| Platform        | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API docs                                        |
 | Platform        | `helm-dev-environment`    | Start and manage the local Kubernetes development environment                                       |
 | Platform        | `tui-development`         | Development guide for the ratatui-based terminal UI                                                 |
 | Platform        | `build-openshell-mxc-windows` | Maintain and validate the build-only x64 and ARM64 Windows MSVC lane                             |
-| Documentation   | `update-docs`             | Scan recent commits and draft doc updates for user-facing changes                                   |
+| Documentation   | `update-docs-from-commits` | Scan recent commits and draft doc updates for user-facing changes                                  |
 | Maintenance     | `sync-agent-infra`        | Detect and fix drift across agent-first infrastructure files                                        |
 | Reference       | `sbom`                    | Generate SBOMs and resolve dependency licenses                                                      |
 
@@ -429,7 +442,8 @@ These are the primary `mise` tasks for day-to-day development:
 | `fern/`         | Fern site config, components, and theme assets |
 | `architecture/` | Architecture docs and plans                   |
 | `rfc/`          | Request for Comments proposals                |
-| `.agents/`      | Agent skills and persona definitions          |
+| `skills/`       | Public skills for using and operating OpenShell |
+| `.agents/`      | Contributor skills and persona definitions    |
 
 ## RFCs
 
@@ -439,7 +453,7 @@ New features always start as GitHub issues using the feature request template. F
 
 If your change affects user-facing behavior (new flags, changed defaults, new features, bug fixes that contradict existing docs), update the relevant pages under `docs/` in the same PR and adjust `docs/index.yml` if navigation changes. For explicit navigation entries, keep `page:` aligned with `sidebar-title` when present and put relative `slug:` values in `docs/index.yml`. Reserve frontmatter `slug` for folder-discovered pages or absolute URL overrides.
 
-To ensure your doc changes follow NVIDIA documentation style, use the `update-docs` skill.
+To ensure your doc changes follow NVIDIA documentation style, use the `update-docs-from-commits` skill.
 It scans commits, identifies doc pages that need updates, and drafts content that follows the style guide in `docs/CONTRIBUTING.mdx`.
 
 To preview Fern docs locally:

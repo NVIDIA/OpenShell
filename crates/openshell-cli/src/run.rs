@@ -5629,17 +5629,39 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
     }
 
     let mut client = grpc_client(server, tls).await?;
+
+    // Look up the stored provider so the update can carry its type and profile
+    // workspace. Policy interceptors evaluate the request before the gateway
+    // merges it with stored state, so an update that omits them cannot be
+    // authorized against the profile that owns the provider.
+    //
+    // The read is best-effort. A caller holding `provider:write` without
+    // `provider:read` must still be able to rotate credentials, so a denied
+    // read keeps the previous behavior of sending empty metadata rather than
+    // failing the update. `--from-existing` and `--from-oidc-token` need the
+    // stored type, so they surface the error instead.
+    let existing = match client
+        .get_provider(GetProviderRequest {
+            name: name.to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await
+    {
+        Ok(response) => response.into_inner().provider,
+        Err(status)
+            if status.code() == Code::PermissionDenied && !from_existing && !from_oidc_token =>
+        {
+            None
+        }
+        Err(status) => return Err(status).into_diagnostic(),
+    };
+
+    if existing.is_none() && (from_existing || from_oidc_token) {
+        return Err(miette::miette!("provider '{name}' not found"));
+    }
+
     let oidc_profile = if from_oidc_token {
-        let existing = client
-            .get_provider(GetProviderRequest {
-                name: name.to_string(),
-                workspace: workspace.to_string(),
-            })
-            .await
-            .into_diagnostic()?
-            .into_inner()
-            .provider
-            .ok_or_else(|| miette::miette!("provider '{name}' not found"))?;
+        let existing = existing.as_ref().expect("checked above");
         Some(
             fetch_provider_profile(&mut client, &existing.r#type, &existing.profile_workspace)
                 .await?,
@@ -5658,25 +5680,11 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
     credential_expires_at_ms.extend(oidc_credential_expires_at_ms);
 
     if from_existing {
-        // Fetch the existing provider to discover its type for credential lookup.
-        let existing = client
-            .get_provider(GetProviderRequest {
-                name: name.to_string(),
-                workspace: workspace.to_string(),
-            })
-            .await
-            .into_diagnostic()?
-            .into_inner()
-            .provider
-            .ok_or_else(|| miette::miette!("provider '{name}' not found"))?;
-
-        let provider_type = existing.r#type;
-        let discovered = discover_existing_provider_data(
-            &mut client,
-            &provider_type,
-            &existing.profile_workspace,
-        )
-        .await?;
+        let stored = existing.as_ref().expect("checked above");
+        let provider_type = stored.r#type.clone();
+        let discovered =
+            discover_existing_provider_data(&mut client, &provider_type, &stored.profile_workspace)
+                .await?;
         let Some(discovered) = discovered else {
             return Err(miette::miette!(
                 "no existing local credentials/config found for provider type '{provider_type}'"
@@ -5704,11 +5712,17 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
                     workspace: workspace.to_string(),
                     deletion_timestamp_ms: 0,
                 }),
-                r#type: String::new(),
+                r#type: existing
+                    .as_ref()
+                    .map(|provider| provider.r#type.clone())
+                    .unwrap_or_default(),
                 credentials: credential_map,
                 config: config_map,
                 credential_expires_at_ms: HashMap::new(),
-                profile_workspace: String::new(),
+                profile_workspace: existing
+                    .as_ref()
+                    .map(|provider| provider.profile_workspace.clone())
+                    .unwrap_or_default(),
                 credential_handles: HashMap::new(),
             }),
             credential_expires_at_ms,

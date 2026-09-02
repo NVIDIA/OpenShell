@@ -16,7 +16,7 @@
 
 OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments that protect your data, credentials, and infrastructure — governed by declarative YAML policies that prevent unauthorized file access, data exfiltration, and uncontrolled network activity.
 
-OpenShell is built agent-first. The project ships with agent skills for everything from gateway troubleshooting to policy generation, and we expect contributors to use them.
+OpenShell is built agent-first. It ships public agent skills for using and operating OpenShell, plus separate repository-aware workflows for contributors and maintainers.
 
 ## Quickstart
 
@@ -206,35 +206,33 @@ openshell sandbox create --from registry.io/img:v1 # container image
 
 See the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog and the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for details.
 
-## Explore with Your Agent
+## Use OpenShell with Your Agent
 
-Clone the repo and point your coding agent at it. The project includes agent skills that can answer questions, walk you through workflows, and diagnose problems — no issue filing required.
+OpenShell provides four portable skills for users and operators: CLI workflows (`openshell-cli`), gateway troubleshooting (`debug-openshell-cluster`), inference troubleshooting (`debug-inference`), and policy generation (`generate-sandbox-policy`). Install them with the Agent Skills CLI:
 
 ```bash
-git clone https://github.com/NVIDIA/OpenShell.git   # or git@github.com:NVIDIA/OpenShell.git
-cd OpenShell
-# Point your agent here — it will discover the skills in .agents/skills/ automatically
+npx skills add NVIDIA/OpenShell
 ```
 
-Your agent can load skills for CLI usage (`openshell-cli`), gateway troubleshooting (`debug-openshell-cluster`), inference troubleshooting (`debug-inference`), policy generation (`generate-sandbox-policy`), and more. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full skills table.
+These public, installable skills live in [`skills/`](skills/) and use the installed CLI help and [published documentation](https://docs.nvidia.com/openshell/latest/index.html) as their sources of truth. They do not require an OpenShell source checkout.
 
 ## Built With Agents
 
-OpenShell is developed using the same agent-driven workflows it enables. The `.agents/skills/` directory contains workflow automation that powers the project's development cycle:
+OpenShell is developed using the same agent-driven workflows it enables. Contributor and maintainer skills live separately in [`.agents/skills/`](.agents/skills/); they automate work on the OpenShell repository and are not included when users install the public skills:
 
 - **Spike and build:** Investigate a problem with `create-spike`; a human accepts it with `state:accepted` or [roadmap](https://github.com/orgs/NVIDIA/projects/233) placement, or declines it. Accepted work can remain human-owned or enter the optional, human-gated `agent:*` planning and implementation workflow.
 - **Triage and route:** Community issues are assessed with `triage-issue`. Agents establish technical validity and impact; humans decide whether the project should act and where the work sits on the roadmap.
 - **Security review:** `review-security-issue` produces a severity assessment and remediation plan. `fix-security-issue` implements it.
-- **Policy authoring:** `generate-sandbox-policy` creates YAML policies from plain-language requirements or API documentation.
+- **Repository maintenance:** `sync-agent-infra`, `update-docs-from-commits`, and other internal workflows keep code, documentation, and agent infrastructure consistent.
 
-All agent implementation work is human-gated: maintainers explicitly request a plan, agents propose it, maintainers approve it, and agents build. See [AGENTS.md](AGENTS.md) for the full workflow chain documentation.
+Agent implementation is human-directed: a user may request a phase directly, or maintainers may use the optional `agent:*` workflow to queue and approve planning and implementation. See [AGENTS.md](AGENTS.md) for the full workflow chain documentation.
 
 ## Getting Help
 
 - **Questions and discussion:** [GitHub Discussions](https://github.com/NVIDIA/OpenShell/discussions)
 - **Bug reports:** [GitHub Issues](https://github.com/NVIDIA/OpenShell/issues) — use the bug report template
 - **Security vulnerabilities:** See [SECURITY.md](SECURITY.md) — do not use GitHub Issues
-- **Agent-assisted help:** Clone the repo and use the agent skills in `.agents/skills/` for self-service diagnostics
+- **Agent-assisted help:** Install the public OpenShell skills with `npx skills add NVIDIA/OpenShell`
 
 ## Learn More
 
@@ -250,7 +248,7 @@ All agent implementation work is human-gated: maintainers explicitly request a p
 
 ## Contributing
 
-OpenShell is built agent-first. Issues should include a user story, problem statement, impact, and acceptance criteria. The impact should explain the consequences of the current behavior and why existing workarounds are insufficient. Feature requests also require a workflow-level proposed design and alternatives; bug reports add reproduction steps, environment details, and relevant logs. Once maintainers accept work, contributors should use the skills in `.agents/skills/` to investigate the current code and behavior, implement the change, and verify it. If an issue contains earlier diagnostics, verify them rather than relying on them. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full agent skills table, contribution workflow, and development setup.
+OpenShell is built agent-first. Issues should include a user story, problem statement, impact, and acceptance criteria. The impact should explain the consequences of the current behavior and why existing workarounds are insufficient. Feature requests also require a workflow-level proposed design and alternatives; bug reports add reproduction steps, environment details, and relevant logs. Once work is authorized through the project workflow or a direct request, contributors should use the skills in `.agents/skills/` to investigate the current code and behavior, implement the change, and verify it. If an issue contains earlier diagnostics, verify them rather than relying on them. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full agent skills table, contribution workflow, and development setup.
 
 ## Telemetry
 

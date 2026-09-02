@@ -13,7 +13,7 @@ Use `openshell` first to identify the active endpoint. Then use the platform too
 
 The target deployment flow is:
 
-1. Operator starts or deploys the gateway with system packages, systemd, Helm, or a development task. The CLI does not start, stop, or destroy gateway services.
+1. Operator starts or deploys the gateway with system packages, systemd, or Helm. The CLI does not start, stop, or destroy gateway services.
 2. Operator configures the compute driver.
 3. Operator provides the CLI and supervisor authentication material required by the deployment mode: edge or OIDC user auth, optional CLI mTLS, and gateway-minted sandbox JWTs.
 4. The CLI registers a reachable gateway endpoint with `openshell gateway add`.
@@ -36,6 +36,8 @@ For local evaluation only, TLS may be disabled and the gateway can be reached th
 - Know the compute platform: Docker, Podman, Kubernetes, VM, or an out-of-tree driver.
 - For Kubernetes: `kubectl` must target the cluster that hosts OpenShell and Helm version 3 or later must be available.
 - For Docker or Podman: the runtime socket must be reachable from the gateway host.
+
+Use `openshell --help` and nested `--help` output as the authority for the installed CLI version. Use the published [installation guide](https://docs.nvidia.com/openshell/latest/about/installation.md), [compute-driver reference](https://docs.nvidia.com/openshell/latest/reference/sandbox-compute-drivers.md), [gateway configuration reference](https://docs.nvidia.com/openshell/latest/reference/gateway-config.md), and [Kubernetes setup guide](https://docs.nvidia.com/openshell/latest/kubernetes/setup.md) as the authority for deployment and configuration behavior.
 
 ## Workflow
 
@@ -193,15 +195,9 @@ Common findings:
   `127.0.0.1:17670` primary listener, and reuse it for authenticated sandbox
   callbacks. On an older release, set `bind_address = "127.0.0.1:17670"` or
   upgrade.
-- Supervisor image exits before printing `openshell-sandbox --version`: the image should be the scratch supervisor image from `deploy/docker/Dockerfile.supervisor` and must contain a static executable at `/openshell-sandbox`.
+- Supervisor image exits before printing `openshell-sandbox --version`: verify the configured supervisor image contains a static executable at `/openshell-sandbox`.
 - A sandbox with explicit `protocol: tcp` endpoints fails before workload readiness: confirm the Docker or Podman driver supplied the `policy-dns-transparent-tcp` runtime capability and inspect supervisor logs for missing `nft`, synthetic-route overlap, or namespace-local DNS/TCP listener bind failures. Kubernetes, VM, sidecar, and out-of-tree drivers must reject this policy until they provide the complete substrate; use omitted protocol with an explicit proxy on those runtimes.
-- `mise run e2e:docker:gpu` fails with `docker info --format json did not report any discovered NVIDIA CDI GPU devices`: Docker may report `CDISpecDirs` while still having no generated NVIDIA CDI specs. Verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. NVIDIA recommends enabling the path and service units, and restarting `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs. If specs are generated but Docker still reports no discovered devices, restart Docker or reload the daemon and re-check `docker info`.
-
-For source checkout development, restart the local gateway with:
-
-```bash
-mise run gateway:docker
-```
+- A GPU sandbox fails because Docker reports no discovered NVIDIA CDI devices: verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. Restart `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs, then restart or reload Docker and re-check `docker info`.
 
 During a graceful gateway restart, Docker, Podman, and VM sandboxes with
 running intent should stop before the gateway exits and restart after it
@@ -298,13 +294,13 @@ mentioning `server.credentialDrivers` means the values selected multiple
 external credential backends.
 
 For HA or PostgreSQL-backed installs, also check the external database Secret
-referenced by `server.externalDbSecret` and the PostgreSQL workload if the test
-or operator deployed one in-cluster:
+referenced by `server.externalDbSecret` and the PostgreSQL workload when it is
+deployed in-cluster:
 
 ```bash
-kubectl -n openshell get secret openshell-ha-pg -o yaml
-kubectl -n openshell get deployment,service,pod -l app.kubernetes.io/name=openshell-e2e-postgres
-kubectl -n openshell logs deployment/openshell-e2e-postgres --tail=200
+kubectl -n <namespace> get secret <external-db-secret> -o yaml
+kubectl -n <namespace> get deployment,service,pod -l app.kubernetes.io/name=<postgres-workload>
+kubectl -n <namespace> logs deployment/<postgres-workload> --tail=200
 ```
 
 Check required Helm deployment secrets:
@@ -417,11 +413,7 @@ kubectl -n openshell get statefulset openshell -o jsonpath="{.spec.template.spec
 helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage|workload'
 ```
 
-The gateway image built from `deploy/docker/Dockerfile.gateway` and the scratch supervisor image built from `deploy/docker/Dockerfile.supervisor` should use the same build tag in branch and E2E deploys. A stale supervisor image can make sandbox behavior lag behind gateway policy or proto changes.
-
-For local/external pull mode (the default local path via `mise run cluster`), local images are tagged to the configured local registry base, pushed to that registry, and pulled by k3s via the `registries.yaml` mirror endpoint. The `cluster` task pushes prebuilt local tags (`openshell/*:dev`, falling back to `localhost:5000/openshell/*:dev` or `127.0.0.1:5000/openshell/*:dev`).
-
-Gateway image builds stage a partial Rust workspace from `deploy/docker/Dockerfile.images`. If cargo fails with a missing manifest under `/build/crates/...`, or an imported symbol exists locally but is missing in the image build, verify that every current gateway dependency crate, including `openshell-driver-docker`, `openshell-driver-kubernetes`, and `openshell-ocsf`, is copied into the staged workspace there.
+The gateway and supervisor images should use the same release tag. A stale supervisor image can make sandbox behavior lag behind gateway policy or protocol changes.
 
 For plaintext local evaluation, confirm the chart has:
 
@@ -447,17 +439,15 @@ kubectl -n openshell get endpoints openshell
 For local port-forward testing:
 
 ```bash
-mise run helm:k3s:forward
-openshell gateway list
-openshell status
+kubectl -n openshell port-forward service/openshell 8080:8080
 ```
 
-The forwarding task always exposes the collector on ports `4317` and `18888`.
-It exposes the gateway on port `8090` only when the `openshell` Service exists,
-so collector-only Docker or Podman development remains valid before a Skaffold
-deployment. A successful plaintext `helm:skaffold:run` registers the local
-gateway and selects it as active; the forwarding task does not modify gateway
-metadata.
+Leave the port forward running. In another terminal, register the local endpoint if needed and verify it:
+
+```bash
+openshell gateway add http://127.0.0.1:8080 --local --name local-kubernetes
+openshell status
+```
 
 If the gateway is healthy but sandbox creation fails:
 
@@ -692,7 +682,7 @@ configuration — check that the gateway spawned the driver binary you expect
 | Gateway exits while resolving compute-driver listener requirements | Callback alias topology is unsupported, the Podman network cannot be inspected, or the selected address is not private/authorized | Gateway startup error, `podman info --debug`, Podman network inspection, host IPv4 default route |
 | Admin, health, reflection, or HTTP request is denied on an additional Docker/Podman callback-only listener | Additional callback listeners intentionally expose only sandbox-callable gRPC methods | Retry through the gateway's primary endpoint; inspect the listener-purpose startup log if the address was unexpected |
 | Docker or Podman sandbox never registers | Wrong callback endpoint or supervisor startup failure | Gateway logs and sandbox container logs |
-| Docker GPU e2e fails before GPU sandbox comparison | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |
+| Docker GPU sandbox fails before startup | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
 | Kubernetes sandbox pod stuck pending, workspace PVC unbound | Cluster has no default `StorageClass` and OpenShell does not set `storageClassName` on the workspace PVC (clusters with a default `StorageClass` bind fine without it) | `kubectl -n openshell describe pvc`; set `server.workspaceStorageClass` (gateway config `workspace_storage_class`) to a valid `StorageClass` |
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
@@ -713,7 +703,7 @@ configuration — check that the gateway spawned the driver binary you expect
 | Custom compute driver is unavailable | Driver process/socket missing, inaccessible, or selected name does not match its endpoint/config key | Socket ownership/mode, driver service logs, gateway `GetCapabilities` logs |
 | Sandbox remains `Stopping` or `Starting` | Driver stop/start failed, retained resource is missing, or a fresh supervisor has not connected | Gateway and driver logs; `docker inspect`, `podman inspect`, Agent Sandbox status/PVC, or VM state marker and launcher process |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
-| `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only after Envoy Gateway is installed and `grpcRoute` is enabled |
+| Gateway API resources fail with `the server could not find the requested resource` | Optional Gateway API resources were applied without Envoy Gateway CRDs | Install Envoy Gateway and enable `grpcRoute` before applying the optional ingress resources |
 | HTTPS ingress (`grpcRoute.gateway.listener.protocol=HTTPS`) connection resets or TLS handshake hangs | Envoy terminates TLS but the gateway pod still expects TLS, so the plaintext backend hop fails | Set `server.disableTls=true` so Envoy forwards plaintext to the pod; verify the listener `certificateRefs` Secret exists in the release namespace and `openshell status` over `https://<host>` |
 | HTTPS ingress returns `Unauthenticated` after connecting | TLS terminates at Envoy, so the gateway never sees a client cert; no OIDC issuer is configured for identity | Configure `server.oidc.issuer` and register with `openshell gateway add https://<host> --oidc-issuer <url>`, or set `server.auth.allowUnauthenticatedUsers=true` for a trusted-proxy/dev cluster |
 | External server `Certificate` never becomes Ready with `certManager.serverIssuerRef` set | ACME issuer rejected internal-only SANs, a loopback IP, or a `commonName` absent from the SANs | `kubectl -n openshell describe certificate openshell-server-external`; confirm `certManager.serverDnsNames` lists only real, externally-resolvable hostnames |

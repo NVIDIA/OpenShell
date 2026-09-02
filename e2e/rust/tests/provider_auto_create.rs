@@ -93,6 +93,7 @@ async fn auto_created_provider_credential_available_in_sandbox() {
         .arg("--provider")
         .arg("claude-code")
         .arg("--auto-providers")
+        .args(["--", "sh", "-c", "exec sleep infinity"])
         .env("ANTHROPIC_API_KEY", TEST_API_KEY)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

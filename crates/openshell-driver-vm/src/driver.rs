@@ -24,6 +24,7 @@ use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use oci_client::client::{Client as OciClient, ClientConfig};
+use oci_client::errors::{OciDistributionError, OciErrorCode};
 use oci_client::manifest::{
     ImageIndexEntry, OCI_IMAGE_MEDIA_TYPE, OciDescriptor, OciImageManifest,
 };
@@ -59,6 +60,7 @@ use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::future::Future;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr};
 #[cfg(unix)]
@@ -86,6 +88,9 @@ const DEFAULT_MEM_MIB: u32 = 2048;
 const DEFAULT_OVERLAY_DISK_MIB: u64 = 4096;
 const DEFAULT_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY: usize = 4;
 const MAX_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY: usize = 16;
+const REGISTRY_REQUEST_MAX_ATTEMPTS: usize = 4;
+const REGISTRY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const REGISTRY_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -2313,14 +2318,15 @@ impl VmDriver {
                 ("image_source".to_string(), "registry".to_string()),
             ]),
         );
-        client
-            .auth(&reference, &auth, RegistryOperation::Pull)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to authenticate registry access for vm sandbox image '{image_ref}': {err}"
-                ))
-            })?;
+        retry_registry_request("authenticate with registry", || {
+            client.auth(&reference, &auth, RegistryOperation::Pull)
+        })
+        .await
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to authenticate registry access for vm sandbox image '{image_ref}': {err}"
+            ))
+        })?;
         info!(image_ref = %image_ref, "vm driver: fetching manifest digest");
         self.publish_vm_progress(
             sandbox_id,
@@ -2331,14 +2337,15 @@ impl VmDriver {
                 ("image_source".to_string(), "registry".to_string()),
             ]),
         );
-        let source_image_identity = client
-            .fetch_manifest_digest(&reference, &auth)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to resolve vm sandbox image '{image_ref}': {err}"
-                ))
-            })?;
+        let source_image_identity = retry_registry_request("fetch manifest digest", || {
+            client.fetch_manifest_digest(&reference, &auth)
+        })
+        .await
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to resolve vm sandbox image '{image_ref}': {err}"
+            ))
+        })?;
         info!(
             image_ref = %image_ref,
             image_identity = %source_image_identity,
@@ -2715,14 +2722,15 @@ impl VmDriver {
                 ("image_source".to_string(), "registry".to_string()),
             ]),
         );
-        client
-            .auth(&reference, &auth, RegistryOperation::Pull)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to authenticate registry access for vm sandbox image '{image_ref}': {err}"
-                ))
-            })?;
+        retry_registry_request("authenticate with registry", || {
+            client.auth(&reference, &auth, RegistryOperation::Pull)
+        })
+        .await
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to authenticate registry access for vm sandbox image '{image_ref}': {err}"
+            ))
+        })?;
 
         self.publish_vm_progress(
             sandbox_id,
@@ -2733,14 +2741,15 @@ impl VmDriver {
                 ("image_source".to_string(), "registry".to_string()),
             ]),
         );
-        let source_image_identity = client
-            .fetch_manifest_digest(&reference, &auth)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to resolve vm sandbox image '{image_ref}': {err}"
-                ))
-            })?;
+        let source_image_identity = retry_registry_request("fetch manifest digest", || {
+            client.fetch_manifest_digest(&reference, &auth)
+        })
+        .await
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to resolve vm sandbox image '{image_ref}': {err}"
+            ))
+        })?;
         let cache_identity = prepared_image_cache_identity(&source_image_identity);
         let image_path = image_cache_rootfs_image(&self.config.state_dir, &cache_identity);
 
@@ -2766,14 +2775,15 @@ impl VmDriver {
         self.reset_image_staging_dir(&staging_dir).await?;
         let layout_dir = staging_dir.join(GUEST_IMAGE_OCI_LAYOUT_DIR);
 
-        let (manifest, _) = client
-            .pull_image_manifest(&reference, &auth)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to pull vm sandbox image manifest '{image_ref}': {err}"
-                ))
-            })?;
+        let (manifest, _) = retry_registry_request("pull image manifest", || {
+            client.pull_image_manifest(&reference, &auth)
+        })
+        .await
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to pull vm sandbox image manifest '{image_ref}': {err}"
+            ))
+        })?;
         tokio::fs::create_dir_all(oci_layout_blobs_dir(&layout_dir))
             .await
             .map_err(|err| Status::internal(format!("create guest OCI layout failed: {err}")))?;
@@ -3966,6 +3976,134 @@ fn registry_client() -> OciClient {
     })
 }
 
+async fn retry_registry_request<T, F, Fut>(
+    operation: &str,
+    request: F,
+) -> Result<T, OciDistributionError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, OciDistributionError>>,
+{
+    retry_registry_request_with_delay(operation, REGISTRY_RETRY_INITIAL_DELAY, request).await
+}
+
+async fn retry_registry_request_with_delay<T, F, Fut>(
+    operation: &str,
+    initial_delay: Duration,
+    mut request: F,
+) -> Result<T, OciDistributionError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, OciDistributionError>>,
+{
+    let mut delay = initial_delay;
+    for attempt in 1..=REGISTRY_REQUEST_MAX_ATTEMPTS {
+        match request().await {
+            Ok(value) => return Ok(value),
+            Err(err)
+                if attempt < REGISTRY_REQUEST_MAX_ATTEMPTS && registry_error_is_retryable(&err) =>
+            {
+                warn!(
+                    operation,
+                    attempt,
+                    max_attempts = REGISTRY_REQUEST_MAX_ATTEMPTS,
+                    retry_delay_ms = delay.as_millis(),
+                    error = %err,
+                    "vm driver: transient registry request failed; retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2).min(REGISTRY_RETRY_MAX_DELAY);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    unreachable!("registry request retry loop always returns")
+}
+
+fn registry_error_is_retryable(err: &OciDistributionError) -> bool {
+    match err {
+        OciDistributionError::AuthenticationFailure(message) => {
+            registry_message_is_retryable(message)
+        }
+        OciDistributionError::RegistryError { envelope, .. } => {
+            envelope.errors.iter().any(|error| {
+                error.code == OciErrorCode::Toomanyrequests
+                    || registry_message_is_retryable(&error.message)
+            })
+        }
+        OciDistributionError::RequestError(err) => {
+            err.is_connect()
+                || err.is_timeout()
+                || err
+                    .status()
+                    .is_some_and(|status| matches!(status.as_u16(), 408 | 425 | 429 | 500..=599))
+        }
+        OciDistributionError::ServerError { code, message, .. } => {
+            matches!(code, 408 | 425 | 429 | 500..=599) || registry_message_is_retryable(message)
+        }
+        OciDistributionError::IoError(err) => matches!(
+            err.kind(),
+            std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::WouldBlock
+        ),
+        _ => false,
+    }
+}
+
+fn registry_message_is_retryable(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("retry-after")
+        || message.contains("too many requests")
+        || message.contains("rate limit")
+}
+
+enum RegistryBlobPullError {
+    CreateFile(std::io::Error),
+    Registry(OciDistributionError),
+}
+
+async fn pull_registry_blob_file(
+    operation: &str,
+    client: &OciClient,
+    reference: &Reference,
+    descriptor: &OciDescriptor,
+    blob_path: &Path,
+) -> Result<tokio::fs::File, RegistryBlobPullError> {
+    let mut delay = REGISTRY_RETRY_INITIAL_DELAY;
+    for attempt in 1..=REGISTRY_REQUEST_MAX_ATTEMPTS {
+        let mut file = tokio::fs::File::create(blob_path)
+            .await
+            .map_err(RegistryBlobPullError::CreateFile)?;
+        match client.pull_blob(reference, descriptor, &mut file).await {
+            Ok(()) => return Ok(file),
+            Err(err)
+                if attempt < REGISTRY_REQUEST_MAX_ATTEMPTS && registry_error_is_retryable(&err) =>
+            {
+                warn!(
+                    operation,
+                    attempt,
+                    max_attempts = REGISTRY_REQUEST_MAX_ATTEMPTS,
+                    retry_delay_ms = delay.as_millis(),
+                    error = %err,
+                    "vm driver: transient registry request failed; retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2).min(REGISTRY_RETRY_MAX_DELAY);
+            }
+            Err(err) => return Err(RegistryBlobPullError::Registry(err)),
+        }
+    }
+
+    unreachable!("registry blob retry loop always returns")
+}
+
 fn linux_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
     let expected_arch = linux_oci_arch();
     manifests
@@ -4050,22 +4188,24 @@ impl VmDriver {
         staging_dir: &Path,
         rootfs: &Path,
     ) -> Result<(), Status> {
-        client
-            .auth(reference, auth, RegistryOperation::Pull)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to authenticate registry access for vm sandbox image '{image_ref}': {err}"
-                ))
-            })?;
-        let (manifest, _) = client
-            .pull_image_manifest(reference, auth)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to pull vm sandbox image manifest '{image_ref}': {err}"
-                ))
-            })?;
+        retry_registry_request("authenticate with registry", || {
+            client.auth(reference, auth, RegistryOperation::Pull)
+        })
+        .await
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to authenticate registry access for vm sandbox image '{image_ref}': {err}"
+            ))
+        })?;
+        let (manifest, _) = retry_registry_request("pull image manifest", || {
+            client.pull_image_manifest(reference, auth)
+        })
+        .await
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to pull vm sandbox image manifest '{image_ref}': {err}"
+            ))
+        })?;
 
         tokio::fs::create_dir_all(rootfs)
             .await
@@ -4185,18 +4325,23 @@ async fn download_registry_layer_blob(
         .join("layers")
         .join(format!("{index:02}-{digest_component}.root"));
 
-    let mut file = tokio::fs::File::create(&blob_path)
-        .await
-        .map_err(|err| Status::internal(format!("create layer blob failed: {err}")))?;
-    client
-        .pull_blob(reference, &layer, &mut file)
-        .await
-        .map_err(|err| {
-            Status::failed_precondition(format!(
-                "failed to download layer '{}' for vm sandbox image '{image_ref}': {err}",
-                layer.digest
-            ))
-        })?;
+    let mut file = pull_registry_blob_file(
+        "download image layer",
+        client,
+        reference,
+        &layer,
+        &blob_path,
+    )
+    .await
+    .map_err(|err| match err {
+        RegistryBlobPullError::CreateFile(err) => {
+            Status::internal(format!("create layer blob failed: {err}"))
+        }
+        RegistryBlobPullError::Registry(err) => Status::failed_precondition(format!(
+            "failed to download layer '{}' for vm sandbox image '{image_ref}': {err}",
+            layer.digest
+        )),
+    })?;
     file.flush()
         .await
         .map_err(|err| Status::internal(format!("flush layer blob failed: {err}")))?;
@@ -4283,18 +4428,23 @@ async fn download_registry_descriptor_blob_file(
             .map_err(|err| Status::internal(format!("create OCI blob dir failed: {err}")))?;
     }
 
-    let mut file = tokio::fs::File::create(&blob_path)
-        .await
-        .map_err(|err| Status::internal(format!("create OCI {kind} blob failed: {err}")))?;
-    client
-        .pull_blob(reference, descriptor, &mut file)
-        .await
-        .map_err(|err| {
-            Status::failed_precondition(format!(
-                "failed to download {kind} '{}' for vm sandbox image '{image_ref}': {err}",
-                descriptor.digest
-            ))
-        })?;
+    let mut file = pull_registry_blob_file(
+        "download image blob",
+        client,
+        reference,
+        descriptor,
+        &blob_path,
+    )
+    .await
+    .map_err(|err| match err {
+        RegistryBlobPullError::CreateFile(err) => {
+            Status::internal(format!("create OCI {kind} blob failed: {err}"))
+        }
+        RegistryBlobPullError::Registry(err) => Status::failed_precondition(format!(
+            "failed to download {kind} '{}' for vm sandbox image '{image_ref}': {err}",
+            descriptor.digest
+        )),
+    })?;
     file.flush()
         .await
         .map_err(|err| Status::internal(format!("flush OCI {kind} blob failed: {err}")))?;
@@ -5993,12 +6143,59 @@ mod tests {
     use prost_types::{Struct, Value, value::Kind};
     use std::fs;
     use std::path::Path;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tonic::Code;
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    #[test]
+    fn registry_throttling_errors_are_retryable() {
+        let error = OciDistributionError::RegistryError {
+            envelope: oci_client::errors::OciEnvelope {
+                errors: vec![oci_client::errors::OciError {
+                    code: OciErrorCode::Toomanyrequests,
+                    message: "retry-after: 829.756µs, allowed: 44000/minute".to_string(),
+                    detail: serde_json::Value::Null,
+                }],
+            },
+            url: "https://ghcr.io/v2/example/manifests/latest".to_string(),
+        };
+
+        assert!(registry_error_is_retryable(&error));
+    }
+
+    #[test]
+    fn permanent_registry_errors_are_not_retryable() {
+        let error = OciDistributionError::UnauthorizedError {
+            url: "https://example.invalid/v2/image/manifests/latest".to_string(),
+        };
+
+        assert!(!registry_error_is_retryable(&error));
+    }
+
+    #[tokio::test]
+    async fn registry_request_retries_transient_errors_until_success() {
+        let attempts = AtomicUsize::new(0);
+        let result = retry_registry_request_with_delay("test request", Duration::ZERO, || async {
+            let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+            if attempt < 2 {
+                Err(OciDistributionError::ServerError {
+                    code: 503,
+                    url: "https://example.invalid/v2/".to_string(),
+                    message: "temporarily unavailable".to_string(),
+                })
+            } else {
+                Ok("success")
+            }
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), "success");
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
     struct TestTracing {
         exporter: opentelemetry_sdk::trace::InMemorySpanExporter,
         _provider: opentelemetry_sdk::trace::SdkTracerProvider,

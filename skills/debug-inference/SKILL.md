@@ -34,6 +34,8 @@ For local or self-hosted engines such as Ollama, vLLM, SGLang, TRT-LLM, and many
 - The active gateway is running
 - You know the failing setup, or can infer it from commands and config
 
+Use `openshell --help` and nested `--help` output as the authority for the installed CLI version. Use the published [inference routing guide](https://docs.nvidia.com/openshell/latest/sandboxes/inference-routing.md) for route behavior and [provider management guide](https://docs.nvidia.com/openshell/latest/sandboxes/manage-providers.md) for credential and profile concepts.
+
 ## Tools Available
 
 Use these commands first:
