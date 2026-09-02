@@ -47,14 +47,12 @@ versions:
 - display-name: Latest (v0.0.116)
   path: ./versions/latest.yml
   slug: latest
-- display-name: dev (0.0.117.dev56)
+- display-name: dev
   path: ./versions/dev.yml
   slug: dev
-  availability: beta
 - display-name: v0.0.36
   path: ./versions/v0.0.36.yml
   slug: v0.0.36
-  availability: deprecated
 redirects:
 - source: /openshell/index.html
   destination: /openshell/latest
