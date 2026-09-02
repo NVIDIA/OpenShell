@@ -12,8 +12,8 @@ Usage:
   nix run .#test-guest -- --distro DISTRO [OPTIONS] [-- COMMAND...]
 
 Options:
-  --distro NAME       Base distro: ubuntu, centos, fedora, or rocky
-  --with NAME         Apply a configuration; repeatable (docker, podman, selinux, snapd)
+  --distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
+  --with NAME         Apply a configuration; repeatable (docker, podman-rootless, selinux, snapd)
   --install PATH      Install a .deb or .rpm package; repeatable
   --copy SRC:DEST     Copy a regular file to an absolute guest path, preserving
                       its host mode; repeatable
@@ -48,12 +48,13 @@ preserved_file_mode() {
 	local source_path=$1
 	local source_mode
 
-	if [ "$(uname -s)" = Darwin ]; then
-		if ! source_mode=$(stat -f '%Lp' "${source_path}"); then
-			echo "could not determine mode for --copy source: ${source_path}" >&2
-			return 1
-		fi
-	elif ! source_mode=$(stat -c '%a' "${source_path}"); then
+	# Nix supplies GNU coreutils on macOS, so choose the supported stat format
+	# by probing rather than relying on the host kernel name.
+	if source_mode=$(stat -c '%a' "${source_path}" 2>/dev/null); then
+		:
+	elif source_mode=$(stat -f '%Lp' "${source_path}" 2>/dev/null); then
+		:
+	else
 		echo "could not determine mode for --copy source: ${source_path}" >&2
 		return 1
 	fi
@@ -141,6 +142,7 @@ if [ "${list}" -eq 1 ]; then
 	done
 	echo "Configurations:"
 	for entry in "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}"/*; do
+		[ -f "${entry}" ] || continue
 		printf '  %s\n' "${entry##*/}"
 	done
 	exit 0
@@ -160,9 +162,9 @@ fi
 # shellcheck disable=SC1090
 . "${OPENSHELL_TEST_GUEST_DISTROS}/${distro}"
 
-for item in "${configurations[@]}"; do
-	if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
-		[ ! -r "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}/${item}" ]; then
+	for item in "${configurations[@]}"; do
+		if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
+		[ ! -f "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}/${item}" ]; then
 		echo "unknown configuration: ${item:-<empty>}" >&2
 		exit 2
 	fi
