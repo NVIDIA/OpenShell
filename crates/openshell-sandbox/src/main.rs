@@ -111,7 +111,9 @@ impl std::str::FromStr for Mode {
 #[command(about = "Process sandbox and monitor", long_about = None)]
 struct Args {
     /// Command to execute in the sandbox.
-    /// Defaults to `/bin/bash -l` if neither this nor the driver specification is provided.
+    /// Defaults to a login shell if neither this nor the driver specification is
+    /// provided: `/bin/bash -l` when available, otherwise a shell detected in the
+    /// sandbox image (e.g. `/bin/sh` on Alpine).
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
 
@@ -659,23 +661,41 @@ fn main() -> Result<()> {
         // drivers otherwise provide a versioned JSON transport so argument
         // boundaries are never reconstructed with shell parsing.
         let workdir = args.workdir.clone();
-        let (command, interactive, await_main_process_attachment) = if !args.command.is_empty() {
-            (args.command, args.interactive, false)
-        } else if let Ok(json) = std::env::var(openshell_core::sandbox_env::MAIN_PROCESS_SPEC) {
-            let config = openshell_core::sandbox_env::MainProcessConfig::decode(&json)
-                .map_err(|error| miette::miette!("{error}"))?;
-            (
-                config.command,
-                config.tty,
-                config.await_main_process_attachment,
-            )
+        let (command, interactive, await_main_process_attachment, is_default_command) =
+            if !args.command.is_empty() {
+                (args.command, args.interactive, false, false)
+            } else if let Ok(json) = std::env::var(openshell_core::sandbox_env::MAIN_PROCESS_SPEC) {
+                let config = openshell_core::sandbox_env::MainProcessConfig::decode(&json)
+                    .map_err(|error| miette::miette!("{error}"))?;
+                // The driver bakes the built-in default (`scratch`) into the spec
+                // when the user supplies no command. Detect that case so the
+                // default shell can be resolved against the sandbox image below.
+                let is_default =
+                    config == openshell_core::sandbox_env::MainProcessConfig::scratch();
+                (
+                    config.command,
+                    config.tty,
+                    config.await_main_process_attachment,
+                    is_default,
+                )
+            } else {
+                let config = openshell_core::sandbox_env::MainProcessConfig::scratch();
+                (
+                    config.command,
+                    config.tty,
+                    config.await_main_process_attachment,
+                    true,
+                )
+            };
+
+        // The built-in default command is a login shell (`/bin/bash -l`), but
+        // minimal images (e.g. Alpine) don't ship bash. Only the default is
+        // remapped — an explicit user command is never rewritten. This runs in
+        // the supervisor, so it resolves against the sandbox image's filesystem.
+        let command = if is_default_command {
+            resolve_default_shell_command(command)
         } else {
-            let config = openshell_core::sandbox_env::MainProcessConfig::scratch();
-            (
-                config.command,
-                config.tty,
-                config.await_main_process_attachment,
-            )
+            command
         };
 
         info!(command = ?command, "Starting sandbox");
@@ -716,6 +736,28 @@ fn main() -> Result<()> {
     })?;
 
     std::process::exit(exit_code);
+}
+
+/// Remap the built-in default shell command to a shell that exists in the
+/// sandbox image. The default program (`/bin/bash`) is absent on minimal images
+/// such as Alpine; falling back to a detected login shell lets the sandbox
+/// start instead of failing with an opaque `No such file or directory`. Only the
+/// built-in default is remapped — explicit user commands never reach this path.
+fn resolve_default_shell_command(mut command: Vec<String>) -> Vec<String> {
+    let Some(program) = command.first().cloned() else {
+        return command;
+    };
+    if openshell_core::shell::is_executable(&program) {
+        return command;
+    }
+    let shell = openshell_core::shell::detect_login_shell();
+    warn!(
+        missing = %program,
+        fallback = %shell,
+        "default shell not found in sandbox image; falling back to a detected shell"
+    );
+    command[0] = shell;
+    command
 }
 
 #[cfg(test)]

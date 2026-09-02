@@ -1208,7 +1208,7 @@ fn apply_child_env(
         .env(openshell_core::sandbox_env::SANDBOX, "1")
         .env("HOME", session_home)
         .env("USER", session_user)
-        .env("SHELL", "/bin/bash")
+        .env("SHELL", openshell_core::shell::detect_login_shell())
         .env("PATH", &path)
         .env("TERM", term);
 
@@ -1435,18 +1435,22 @@ fn spawn_pipe_exec(
     resolved_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
 ) -> anyhow::Result<mpsc::Sender<Vec<u8>>> {
+    // Resolve a shell present in the sandbox image; minimal images (e.g. Alpine)
+    // don't ship bash, only `/bin/sh`. Runs in the supervisor, so it inspects
+    // the sandbox filesystem.
+    let shell = openshell_core::shell::detect_login_shell();
     let mut cmd = command.map_or_else(
         || {
             // No command — read from stdin.  Do *not* pass `-i`; interactive
             // mode reads .bashrc, writes prompts to stderr, and can introduce
             // just enough latency for VS Code Remote-SSH's platform detection
-            // to time out and fall back to "windows".  Plain `bash` with piped
+            // to time out and fall back to "windows".  Plain shell with piped
             // stdin already reads commands line-by-line (script mode), which is
             // exactly what VS Code's local server expects.
-            Command::new("/bin/bash")
+            Command::new(&shell)
         },
         |command| {
-            let mut c = Command::new("/bin/bash");
+            let mut c = Command::new(&shell);
             // Login shell (-l) sources .profile/.bashrc so tool env vars
             // (VIRTUAL_ENV, etc.) are available. Callers that need a predictable
             // environment opt out via OPENSHELL_NO_LOGIN_SHELL → plain -c.
