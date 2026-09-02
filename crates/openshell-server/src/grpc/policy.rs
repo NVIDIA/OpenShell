@@ -693,7 +693,14 @@ fn evaluate_proposal_candidate(
         };
         let bindings = policy_static_credential_endpoint_bindings(Some(&effective))?;
         if let Some(context) = validation_context.credential_binding {
-            validate_operator_merged_credential_policy(&mut effective, &bindings, context)?;
+            let inherited =
+                inherited_uninspected_credentialed_endpoints(base_policy, validation_context);
+            validate_operator_merged_credential_policy(
+                &mut effective,
+                &bindings,
+                context,
+                &inherited,
+            )?;
         }
         Ok(effective)
     })();
@@ -2130,6 +2137,35 @@ pub(super) async fn validate_candidate_sandbox_credential_policy(
     validate_uninspected_credentialed_endpoints(&effective)
 }
 
+/// Credential gate for a full policy replacement on an existing sandbox. Only
+/// the uninspected credentialed endpoints this replacement introduces are
+/// rejected; those the sandbox's current policy already carries are inherited,
+/// so an operator can round-trip `policy get --base` through `policy set` — and
+/// can edit the offending endpoint — instead of being locked out by a rule the
+/// sandbox image supplied.
+pub(super) async fn validate_updated_sandbox_credential_policy(
+    state: &ServerState,
+    workspace: &str,
+    sandbox: &Sandbox,
+    provider_names: &[String],
+    policy: &ProtoSandboxPolicy,
+) -> Result<(), Status> {
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), workspace)
+        .await?;
+    let current_base = current_base_policy_for_sandbox(state.store.as_ref(), sandbox).await?;
+    let current_effective =
+        effective_policy_for_source(state, &catalog, workspace, provider_names, current_base)
+            .await?;
+    let inherited = uninspected_credentialed_endpoint_keys(&current_effective);
+
+    let effective =
+        effective_policy_for_source(state, &catalog, workspace, provider_names, policy.clone())
+            .await?;
+    validate_uninspected_credentialed_endpoints_excluding(&effective, &inherited)
+}
+
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
     let mut chars = input.chars();
     let truncated: String = chars.by_ref().take(max_chars).collect();
@@ -2918,13 +2954,36 @@ struct UninspectedCredentialedEndpoint {
     mode: &'static str,
 }
 
+impl UninspectedCredentialedEndpoint {
+    fn key(&self) -> UninspectedCredentialedEndpointKey {
+        UninspectedCredentialedEndpointKey {
+            rule_name: self.rule_name.clone(),
+            host: self.host.to_ascii_lowercase(),
+            port: self.port,
+            mode: self.mode,
+        }
+    }
+}
+
+/// Identity of an uninspected credentialed endpoint. `mode` participates: moving
+/// an inherited L4-only endpoint to `tls: skip` is a fresh authoring act, not the
+/// same finding carried forward.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct UninspectedCredentialedEndpointKey {
+    rule_name: String,
+    host: String,
+    port: u32,
+    mode: &'static str,
+}
+
 /// Scan the effective policy for credentialed endpoints on uninspected modes.
 ///
 /// Explicit opt-ins are logged and skipped. Never logs credential names,
 /// placeholders, or secret values.
-fn find_uninspected_credentialed_endpoint(
+fn collect_uninspected_credentialed_endpoints(
     policy: &ProtoSandboxPolicy,
-) -> Option<UninspectedCredentialedEndpoint> {
+) -> Vec<UninspectedCredentialedEndpoint> {
+    let mut violations = Vec::new();
     for (rule_name, rule) in &policy.network_policies {
         for endpoint in &rule.endpoints {
             if !endpoint.provider_credentialed {
@@ -2950,7 +3009,7 @@ fn find_uninspected_credentialed_endpoint(
                 continue;
             }
 
-            return Some(UninspectedCredentialedEndpoint {
+            violations.push(UninspectedCredentialedEndpoint {
                 rule_name: rule_name.clone(),
                 host: endpoint.host.clone(),
                 port: endpoint_ports(endpoint)
@@ -2961,13 +3020,76 @@ fn find_uninspected_credentialed_endpoint(
             });
         }
     }
-    None
+    violations
 }
 
-/// Admission gate for policy-authoring paths (create, attach, operator config
-/// update). Rejects credentialed endpoints that would lose L7 inspection.
+fn find_uninspected_credentialed_endpoint(
+    policy: &ProtoSandboxPolicy,
+) -> Option<UninspectedCredentialedEndpoint> {
+    collect_uninspected_credentialed_endpoints(policy)
+        .into_iter()
+        .next()
+}
+
+/// The uninspected credentialed endpoints an already-stamped policy carries.
+///
+/// A sandbox syncing the policy baked into its image reaches the store without
+/// passing the admission gate, by design: rejecting that delivery would
+/// crash-loop the supervisor. Operator edits inherit those endpoints instead of
+/// being blocked by them, so an unrelated change is not held hostage by a rule
+/// the operator never authored — and so the operator can edit the offending
+/// endpoint itself.
+fn uninspected_credentialed_endpoint_keys(
+    policy: &ProtoSandboxPolicy,
+) -> HashSet<UninspectedCredentialedEndpointKey> {
+    collect_uninspected_credentialed_endpoints(policy)
+        .iter()
+        .map(UninspectedCredentialedEndpoint::key)
+        .collect()
+}
+
+/// Admission gate for policy-authoring paths (sandbox create, provider attach).
+/// Rejects credentialed endpoints that would lose L7 inspection.
 fn validate_uninspected_credentialed_endpoints(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
-    let Some(violation) = find_uninspected_credentialed_endpoint(policy) else {
+    validate_uninspected_credentialed_endpoints_excluding(policy, &HashSet::new())
+}
+
+/// Admission gate for edits to an existing sandbox policy. Rejects only the
+/// credentialed endpoints the edit introduces; endpoints already present in
+/// `inherited` are logged and admitted. The network supervisor still denies that
+/// traffic, so the boundary holds without making the policy uneditable.
+fn validate_uninspected_credentialed_endpoints_excluding(
+    policy: &ProtoSandboxPolicy,
+    inherited: &HashSet<UninspectedCredentialedEndpointKey>,
+) -> Result<(), Status> {
+    let violations = collect_uninspected_credentialed_endpoints(policy);
+    let mut introduced: Option<&UninspectedCredentialedEndpoint> = None;
+    for violation in &violations {
+        if inherited.contains(&violation.key()) {
+            warn!(
+                rule_name = %violation.rule_name,
+                host = %violation.host,
+                port = violation.port,
+                mode = violation.mode,
+                "policy edit inherits an uninspected credentialed endpoint; the sandbox proxy denies this traffic unless allow_uninspected_credentials is set"
+            );
+            continue;
+        }
+        // Rules iterate in map order, so pick the reported endpoint by name to
+        // keep the message stable when an edit introduces more than one.
+        let sort_key = |candidate: &UninspectedCredentialedEndpoint| {
+            (
+                candidate.rule_name.clone(),
+                candidate.host.clone(),
+                candidate.port,
+            )
+        };
+        if introduced.is_none_or(|current| sort_key(violation) < sort_key(current)) {
+            introduced = Some(violation);
+        }
+    }
+
+    let Some(violation) = introduced else {
         return Ok(());
     };
 
@@ -3660,11 +3782,12 @@ async fn handle_update_config_inner(
     // on disk. Rejecting it here would crash-loop the sandbox instead of
     // surfacing an operator decision, so only operator-authored updates gate.
     if !sandbox_caller {
-        validate_candidate_sandbox_credential_policy(
+        validate_updated_sandbox_credential_policy(
             state,
             &workspace,
+            &sandbox,
             &spec.providers,
-            Some(&new_policy),
+            &new_policy,
         )
         .await?;
     }
@@ -6310,17 +6433,15 @@ struct PolicyMergeValidationContext<'a> {
     credential_binding: Option<&'a PolicyCredentialBindingValidationContext<'a>>,
 }
 
-fn validate_operator_merged_credential_policy(
+/// Recompute the credentialed markers on an effective policy from the provider
+/// scopes plus any policy-declared bindings. The stamp is always a full
+/// recomputation, never a delta: a partial derivation would let a series of
+/// individually valid edits reach a state no single edit would have admitted.
+fn stamp_operator_merged_credential_policy(
     effective_policy: &mut ProtoSandboxPolicy,
     bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
     context: &PolicyCredentialBindingValidationContext<'_>,
-) -> Result<(), Status> {
-    validate_policy_credential_binding_context(
-        context.catalog,
-        context.records,
-        effective_policy,
-        bindings,
-    )?;
+) {
     let mut credentialed_scopes = context.credentialed_scopes.to_vec();
     extend_credentialed_scopes_from_policy_bindings(
         &mut credentialed_scopes,
@@ -6329,7 +6450,44 @@ fn validate_operator_merged_credential_policy(
     );
     clear_provider_credentialed_markers(effective_policy);
     stamp_provider_credentialed_endpoints(effective_policy, &credentialed_scopes);
-    validate_uninspected_credentialed_endpoints(effective_policy)
+}
+
+fn validate_operator_merged_credential_policy(
+    effective_policy: &mut ProtoSandboxPolicy,
+    bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    context: &PolicyCredentialBindingValidationContext<'_>,
+    inherited: &HashSet<UninspectedCredentialedEndpointKey>,
+) -> Result<(), Status> {
+    validate_policy_credential_binding_context(
+        context.catalog,
+        context.records,
+        effective_policy,
+        bindings,
+    )?;
+    stamp_operator_merged_credential_policy(effective_policy, bindings, context);
+    validate_uninspected_credentialed_endpoints_excluding(effective_policy, inherited)
+}
+
+/// The uninspected credentialed endpoints the sandbox's current policy already
+/// carries, composed and stamped exactly the way a candidate is. A baseline that
+/// cannot be evaluated yields an empty set, which keeps the gate strict.
+fn inherited_uninspected_credentialed_endpoints(
+    current_policy: &ProtoSandboxPolicy,
+    validation_context: PolicyMergeValidationContext<'_>,
+) -> HashSet<UninspectedCredentialedEndpointKey> {
+    let Some(context) = validation_context.credential_binding else {
+        return HashSet::new();
+    };
+    let mut effective = if validation_context.provider_layers.is_empty() {
+        current_policy.clone()
+    } else {
+        compose_effective_policy(current_policy, validation_context.provider_layers)
+    };
+    let Ok(bindings) = policy_static_credential_endpoint_bindings(Some(&effective)) else {
+        return HashSet::new();
+    };
+    stamp_operator_merged_credential_policy(&mut effective, &bindings, context);
+    uninspected_credentialed_endpoint_keys(&effective)
 }
 
 fn stage_validated_merge_operation(
@@ -6350,7 +6508,9 @@ fn stage_validated_merge_operation(
     };
     let bindings = policy_static_credential_endpoint_bindings(Some(&effective))?;
     if let Some(context) = validation_context.credential_binding {
-        validate_operator_merged_credential_policy(&mut effective, &bindings, context)?;
+        let inherited =
+            inherited_uninspected_credentialed_endpoints(current_policy, validation_context);
+        validate_operator_merged_credential_policy(&mut effective, &bindings, context, &inherited)?;
     }
     Ok(candidate)
 }
@@ -6380,6 +6540,9 @@ async fn apply_merge_operations_with_retry(
             baseline_policy.cloned().unwrap_or_default()
         };
 
+        let inherited =
+            inherited_uninspected_credentialed_endpoints(&current_policy, validation_context);
+
         if let Some(expected_hash) = expected_current_effective_hash {
             let mut current_effective = if provider_layers.is_empty() {
                 current_policy.clone()
@@ -6392,6 +6555,7 @@ async fn apply_merge_operations_with_retry(
                     &mut current_effective,
                     &bindings,
                     context,
+                    &inherited,
                 )?;
             }
             if deterministic_policy_hash(&current_effective) != expected_hash {
@@ -6417,7 +6581,12 @@ async fn apply_merge_operations_with_retry(
         };
         let bindings = policy_static_credential_endpoint_bindings(Some(&effective_policy))?;
         if let Some(context) = validation_context.credential_binding {
-            validate_operator_merged_credential_policy(&mut effective_policy, &bindings, context)?;
+            validate_operator_merged_credential_policy(
+                &mut effective_policy,
+                &bindings,
+                context,
+                &inherited,
+            )?;
         }
 
         if let Some(ref current) = latest
@@ -7044,6 +7213,68 @@ mod tests {
                     ports: vec![8443],
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn inherited_uninspected_endpoints_are_admitted_but_new_ones_are_not() {
+        let endpoint = |host: &str, protocol: &str, tls: &str| NetworkEndpoint {
+            host: host.to_string(),
+            port: 443,
+            protocol: protocol.to_string(),
+            tls: tls.to_string(),
+            provider_credentialed: true,
+            ..Default::default()
+        };
+        let policy = |rules: Vec<(&str, NetworkEndpoint)>| ProtoSandboxPolicy {
+            network_policies: rules
+                .into_iter()
+                .map(|(name, endpoint)| {
+                    (
+                        name.to_string(),
+                        NetworkPolicyRule {
+                            endpoints: vec![endpoint],
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        let baseline = policy(vec![("pypi", endpoint("github.com", "", ""))]);
+        let inherited = uninspected_credentialed_endpoint_keys(&baseline);
+        assert_eq!(inherited.len(), 1);
+
+        // The same finding, carried forward next to an unrelated addition.
+        let unchanged = policy(vec![
+            ("pypi", endpoint("github.com", "", "")),
+            ("npm", endpoint("registry.npmjs.org", "rest", "")),
+        ]);
+        assert!(
+            validate_uninspected_credentialed_endpoints_excluding(&unchanged, &inherited).is_ok()
+        );
+
+        // A second rule reaching the same credentialed host is newly authored.
+        let widened = policy(vec![
+            ("pypi", endpoint("github.com", "", "")),
+            ("mirror", endpoint("github.com", "", "")),
+        ]);
+        let error = validate_uninspected_credentialed_endpoints_excluding(&widened, &inherited)
+            .expect_err("a violation in a new rule must be rejected");
+        assert!(error.message().contains("mirror"), "{}", error.message());
+
+        // Switching the inherited endpoint to `tls: skip` is a fresh authoring
+        // act, not the same finding: `mode` is part of the identity.
+        let retuned = policy(vec![("pypi", endpoint("github.com", "rest", "skip"))]);
+        let error = validate_uninspected_credentialed_endpoints_excluding(&retuned, &inherited)
+            .expect_err("changing an inherited endpoint's uninspected mode must be rejected");
+        assert!(error.message().contains("tls: skip"), "{}", error.message());
+
+        // With no baseline the gate stays strict.
+        assert!(
+            validate_uninspected_credentialed_endpoints_excluding(&baseline, &HashSet::new())
+                .is_err()
         );
     }
 
@@ -8979,6 +9210,226 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// The sandbox image's baked policy reaches the store through the ungated
+    /// sandbox-sync path. Once a credentialed provider stamps one of its
+    /// L4-only endpoints, every later operator edit used to be rejected for a
+    /// rule the operator never authored (NVIDIA/OpenShell#2998).
+    async fn inherited_uninspected_gating_state()
+    -> (Arc<ServerState>, openshell_core::proto::SandboxPolicy) {
+        use openshell_core::proto::{
+            ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
+            StoredProviderProfile,
+        };
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-inherited-gating".to_string(),
+                    name: "inherited-gating".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                profile: Some(ProviderProfile {
+                    id: "inherited-gating".to_string(),
+                    display_name: "Inherited Gating".to_string(),
+                    category: ProviderProfileCategory::SourceControl as i32,
+                    credentials: vec![ProviderProfileCredential {
+                        name: "api_token".to_string(),
+                        env_vars: vec!["GITHUB_TOKEN".to_string()],
+                        required: true,
+                        auth_style: "bearer".to_string(),
+                        header_name: "authorization".to_string(),
+                        ..Default::default()
+                    }],
+                    endpoints: vec![
+                        NetworkEndpoint {
+                            host: "github.com".to_string(),
+                            port: 443,
+                            protocol: "rest".to_string(),
+                            access: "read-only".to_string(),
+                            enforcement: "enforce".to_string(),
+                            ..Default::default()
+                        },
+                        NetworkEndpoint {
+                            host: "api.github.com".to_string(),
+                            port: 443,
+                            protocol: "rest".to_string(),
+                            access: "read-only".to_string(),
+                            enforcement: "enforce".to_string(),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_provider("my-github", "inherited-gating"))
+            .await
+            .unwrap();
+
+        // The policy the sandbox image ships: an L4-only `github.com:443` in a
+        // rule the operator did not write.
+        let mut image_policy = test_policy_with_rule("pypi", "github.com");
+        image_policy
+            .network_policies
+            .extend(test_policy_with_rule("docs", "docs.example.com").network_policies);
+
+        let mut sandbox = test_sandbox(
+            "sb-inherited-gating",
+            "inherited-gating",
+            ProtoSandboxPolicy::default(),
+            vec!["my-github".to_string()],
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&sandbox).await.unwrap();
+
+        // Sandbox-authored sync: ungated by design, so this is how the
+        // offending endpoint legitimately reaches the store.
+        handle_update_config(
+            &state,
+            with_sandbox(
+                Request::new(UpdateConfigRequest {
+                    name: "inherited-gating".to_string(),
+                    workspace: "default".to_string(),
+                    policy: Some(image_policy.clone()),
+                    ..Default::default()
+                }),
+                "sb-inherited-gating",
+            ),
+        )
+        .await
+        .expect("sandbox-authored policy sync must not be gated");
+
+        (state, image_policy)
+    }
+
+    #[tokio::test]
+    async fn update_config_admits_edits_that_inherit_uninspected_credentialed_endpoints() {
+        let (state, image_policy) = inherited_uninspected_gating_state().await;
+
+        // An unrelated merge: the exact shape that failed in the field.
+        let mut added = image_policy.clone();
+        added
+            .network_policies
+            .extend(test_policy_with_rule("npm", "registry.npmjs.org").network_policies);
+        let npm_rule = added.network_policies["npm"].clone();
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "inherited-gating".to_string(),
+                workspace: "default".to_string(),
+                merge_operations: vec![PolicyMergeOperation {
+                    operation: Some(policy_merge_operation::Operation::AddRule(
+                        openshell_core::proto::AddNetworkRule {
+                            rule_name: "npm".to_string(),
+                            rule: Some(npm_rule),
+                        },
+                    )),
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("an unrelated merge must not be blocked by an inherited endpoint");
+
+        let stored = ProtoSandboxPolicy::decode(
+            state
+                .store
+                .get_latest_policy("sb-inherited-gating")
+                .await
+                .unwrap()
+                .expect("merge must persist a revision")
+                .policy_payload
+                .as_slice(),
+        )
+        .unwrap();
+        assert!(stored.network_policies.contains_key("npm"));
+
+        // A full replacement that replays the same base policy: the
+        // `policy get --base` -> `policy set` round trip from the issue.
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "inherited-gating".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(stored.clone()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("replaying the current base policy must round-trip");
+    }
+
+    #[tokio::test]
+    async fn update_config_still_rejects_newly_authored_uninspected_credentialed_endpoints() {
+        let (state, _image_policy) = inherited_uninspected_gating_state().await;
+
+        // A *new* rule reaching a credentialed host over L4. It has to be a host
+        // no existing rule covers: `merge_policy` folds a rule into whichever
+        // rule already owns that host and port.
+        let fresh_rule =
+            test_policy_with_rule("ghapi", "api.github.com").network_policies["ghapi"].clone();
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "inherited-gating".to_string(),
+                workspace: "default".to_string(),
+                merge_operations: vec![PolicyMergeOperation {
+                    operation: Some(policy_merge_operation::Operation::AddRule(
+                        openshell_core::proto::AddNetworkRule {
+                            rule_name: "ghapi".to_string(),
+                            rule: Some(fresh_rule),
+                        },
+                    )),
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("a newly authored L4-only credentialed endpoint must still be rejected");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("L4-only"));
+        assert!(error.message().contains("ghapi"));
+        assert!(error.message().contains("api.github.com"));
+    }
+
+    #[tokio::test]
+    async fn update_config_lets_operators_remove_an_inherited_uninspected_endpoint() {
+        let (state, image_policy) = inherited_uninspected_gating_state().await;
+
+        let mut fixed = image_policy;
+        fixed.network_policies.remove("pypi");
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "inherited-gating".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(fixed),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("removing the offending rule must be possible");
+
+        let stored = ProtoSandboxPolicy::decode(
+            state
+                .store
+                .get_latest_policy("sb-inherited-gating")
+                .await
+                .unwrap()
+                .expect("replacement must persist a revision")
+                .policy_payload
+                .as_slice(),
+        )
+        .unwrap();
+        assert!(!stored.network_policies.contains_key("pypi"));
     }
 
     #[tokio::test]

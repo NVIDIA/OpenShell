@@ -135,6 +135,23 @@ flag defaults to `false` and is security-flagged in policy approval flows.
 Incremental merges only ever add the flag to a matching endpoint; clearing it
 requires removing the endpoint or replacing the policy.
 
+Sandbox create and provider attach gate the whole effective policy. Edits to an
+existing sandbox policy — `policy set` and `policy update`, and the proposal
+evaluation behind them — gate the difference instead: an edit is rejected for
+the uninspected credentialed endpoints it introduces, while endpoints the
+sandbox's current policy already carries are logged and admitted. An endpoint's
+identity for this comparison is its rule name, host, port, and uninspected mode,
+so moving an inherited endpoint from L4-only to `tls: skip` is a fresh authoring
+act rather than the same finding carried forward. Stamping is unaffected and
+stays a full recomputation.
+
+The gate has to work this way because a supervisor syncing the policy baked into
+a sandbox image reaches the store without passing it — rejecting that delivery
+would crash-loop the sandbox. Gating the whole policy on every later edit would
+make a policy the gateway itself admitted permanently uneditable, including the
+edit that would fix the offending endpoint. Nothing is granted by admitting an
+inherited endpoint: the network supervisor still denies that traffic.
+
 The network supervisor independently enforces the same boundary. Credentialed
 WebSocket upgrades use the parsed relay, binary frames fail closed, and text
 placeholders require rewrite. REST bodies can continue streaming when body
