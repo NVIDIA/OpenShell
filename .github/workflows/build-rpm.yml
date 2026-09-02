@@ -1,0 +1,123 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build RPM
+
+on:
+  workflow_call:
+    inputs:
+      checkout-ref:
+        required: true
+        type: string
+      arch:
+        required: true
+        type: string
+      runner:
+        required: true
+        type: string
+      cli-target:
+        required: true
+        type: string
+      gateway-target:
+        required: true
+        type: string
+      rpm-version:
+        required: false
+        type: string
+        default: ""
+      rpm-release:
+        required: false
+        type: string
+        default: ""
+      cargo-version:
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build RPM Package (Linux ${{ inputs.arch }})
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+    container:
+      image: docker.io/library/fedora:44@sha256:be9d65e2344d805cc11114319c685ecaa96b6d9b4350a0a6460cdb931babbd19
+    steps:
+      - name: Install packaging dependencies
+        run: |
+          dnf install -y \
+            packit rpm-build \
+            cargo cargo-rpm-macros git-core \
+            pandoc python3-devel systemd-rpm-macros
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.checkout-ref }}
+          fetch-depth: 0
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: rpm-vendor-${{ inputs.arch }}
+          cache-targets: "false"
+          cache-bin: "false"
+          cache-on-failure: "true"
+
+      - name: Download CLI artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-${{ inputs.cli-target }}
+          path: package-binaries/
+
+      - name: Download gateway artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-gateway-${{ inputs.gateway-target }}
+          path: package-binaries/
+
+      - name: Configure package inputs
+        run: |
+          set -euo pipefail
+          chmod +x package-binaries/openshell{,-gateway}
+          ls -lah package-binaries
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Fetch tags
+        run: git fetch --tags --force
+
+      - name: Build RPMs via Packit
+        env:
+          OPENSHELL_RPM_VERSION: ${{ inputs.rpm-version }}
+          OPENSHELL_RPM_RELEASE: ${{ inputs.rpm-release }}
+          OPENSHELL_CARGO_VERSION: ${{ inputs.cargo-version }}
+          OPENSHELL_PREBUILT_BINARIES_DIR: ${{ github.workspace }}/package-binaries
+        run: packit build locally
+
+      - name: Collect RPM artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          mapfile -t rpms < <(find "$GITHUB_WORKSPACE" -maxdepth 3 -type f -name '*.rpm' ! -name '*.src.rpm' | sort)
+          if [ "${#rpms[@]}" -eq 0 ]; then
+            echo "::error::No RPM artifacts found under $GITHUB_WORKSPACE"
+            find "$GITHUB_WORKSPACE" -maxdepth 3 -type f | sort
+            exit 1
+          fi
+          cp "${rpms[@]}" artifacts/
+          echo "=== Built RPMs ==="
+          ls -lah artifacts/
+
+      - name: Upload RPM artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: rpm-linux-${{ inputs.arch }}
+          path: artifacts/*.rpm
+          retention-days: 5

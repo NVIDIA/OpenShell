@@ -1,0 +1,195 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Conformance
+
+on:
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pr_metadata:
+    name: Resolve PR metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: gate
+        uses: ./.github/actions/pr-gate
+
+  version:
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      cargo: ${{ steps.version.outputs.cargo }}
+      rpm_version: ${{ steps.version.outputs.rpm_version }}
+      rpm_release: ${{ steps.version.outputs.rpm_release }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Compute versions
+        id: version
+        run: |
+          cargo="$(python3 tasks/scripts/release.py get-version --cargo)"
+          rpm_version="$(python3 tasks/scripts/release.py get-version --rpm-version)"
+          rpm_release="$(python3 tasks/scripts/release.py get-version --rpm-release)"
+          {
+            echo "cargo=$cargo"
+            echo "rpm_version=$rpm_version"
+            echo "rpm_release=$rpm_release"
+          } >> "$GITHUB_OUTPUT"
+
+  build-cli:
+    needs: version
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      package: openshell-cli
+      binary: openshell
+      triple: x86_64-unknown-linux-musl
+      runner: linux-amd64-cpu8
+      dev-shell: .#devShells.x86_64-linux.musl
+      cargo-version: ${{ needs.version.outputs.cargo }}
+      checkout-ref: ${{ github.sha }}
+    secrets: inherit
+
+  build-conformance:
+    needs: version
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      package: openshell-conformance-cli
+      binary: openshell-conformance
+      triple: x86_64-unknown-linux-musl
+      runner: linux-amd64-cpu8
+      dev-shell: .#devShells.x86_64-linux.musl
+      cargo-version: ${{ needs.version.outputs.cargo }}
+      checkout-ref: ${{ github.sha }}
+    secrets: inherit
+
+  build-gateway:
+    needs: version
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      package: openshell-gateway
+      binary: openshell-gateway
+      triple: x86_64-unknown-linux-gnu
+      runner: linux-amd64-cpu8
+      dev-shell: .#devShells.x86_64-linux.glibc-2-28
+      cargo-version: ${{ needs.version.outputs.cargo }}
+      image-tag: dev
+      interpreter: /lib64/ld-linux-x86-64.so.2
+      checkout-ref: ${{ github.sha }}
+    secrets: inherit
+
+  build-rpm:
+    needs: [version, build-cli, build-gateway]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-rpm.yml
+    with:
+      checkout-ref: ${{ github.sha }}
+      arch: x86_64
+      runner: linux-amd64-cpu8
+      cli-target: x86_64-unknown-linux-musl
+      gateway-target: x86_64-unknown-linux-gnu
+      cargo-version: ${{ needs.version.outputs.cargo }}
+      rpm-version: ${{ needs.version.outputs.rpm_version }}
+      rpm-release: ${{ needs.version.outputs.rpm_release }}
+
+  fedora:
+    name: Fedora with Rootless Podman
+    needs: [build-conformance, build-rpm]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Enable KVM access
+        run: |
+          set -euo pipefail
+          if [[ ! -c /dev/kvm ]]; then
+            echo "::error::The runner did not expose /dev/kvm"
+            exit 1
+          fi
+          sudo chmod 0666 /dev/kvm
+          exec 3<>/dev/kvm
+          exec 3>&-
+
+      - uses: ./.github/actions/setup-nix
+
+      - name: Download RPM artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rpm-linux-x86_64
+          path: rpm-input
+
+      - name: Download conformance CLI
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-conformance-x86_64-unknown-linux-musl
+          path: conformance-input
+
+      - name: Install RPMs and check status
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x conformance-input/openshell-conformance
+          guest_script="$RUNNER_TEMP/conformance.sh"
+          cat > "$guest_script" <<'EOF'
+          set -euo pipefail
+
+          on_exit() {
+            rc=$?
+            trap - EXIT
+            if [ "$rc" -ne 0 ]; then
+              systemctl --user status openshell-gateway --no-pager || true
+              journalctl --user -u openshell-gateway --no-pager -n 200 || true
+              podman info || true
+              podman ps --all || true
+              getenforce || true
+            fi
+            exit "$rc"
+          }
+          trap on_exit EXIT
+
+          mkdir -p "$HOME/.config/openshell"
+          echo 'OPENSHELL_TELEMETRY_ENABLED=false' > "$HOME/.config/openshell/gateway.env"
+          systemctl --user enable --now openshell-gateway
+          openshell gateway add --local https://127.0.0.1:17670 --name openshell
+          /tmp/openshell-conformance run smoke
+          EOF
+
+          OPENSHELL_TEST_GUEST_CACHE_DISABLE=1 nix run .#test-guest -- \
+            --distro fedora \
+            --with podman-rootless \
+            --with selinux \
+            --install rpm-input/openshell-[0-9]*.rpm \
+            --install rpm-input/openshell-gateway-[0-9]*.rpm \
+            --copy "$guest_script:/tmp/conformance.sh" \
+            --copy conformance-input/openshell-conformance:/tmp/openshell-conformance \
+            -- bash /tmp/conformance.sh
