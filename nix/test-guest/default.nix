@@ -18,7 +18,8 @@ let
     if isAarch64 then "${qemu}/bin/qemu-system-aarch64" else "${qemu}/bin/qemu-system-x86_64";
 
   distros = {
-    ubuntu = import ./distros/ubuntu.nix { inherit pkgs architecture; };
+    ubuntu-24-04 = import ./distros/ubuntu-24-04.nix { inherit pkgs architecture; };
+    ubuntu-26-04 = import ./distros/ubuntu-26-04.nix { inherit pkgs architecture; };
     centos = import ./distros/centos.nix { inherit pkgs architecture; };
     fedora = import ./distros/fedora.nix { inherit pkgs architecture; };
     rocky = import ./distros/rocky.nix { inherit pkgs architecture; };

@@ -12,7 +12,7 @@ Usage:
   nix run .#test-guest-cache -- --distro DISTRO [OPTIONS]
 
 Options:
-  --distro NAME       Base distro: ubuntu, centos, fedora, or rocky
+  --distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
   --with NAME         Apply a configuration; repeatable (docker, podman, selinux)
   --repository REF    OCI repository without a tag
   --digest DIGEST     Trusted OCI manifest digest required for pulls
