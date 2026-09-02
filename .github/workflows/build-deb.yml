@@ -27,7 +27,6 @@ on:
 
 permissions:
   contents: read
-  packages: read
 
 defaults:
   run:
@@ -38,11 +37,6 @@ jobs:
     name: Build Debian Package (Linux ${{ inputs.arch }})
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 20
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

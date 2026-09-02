@@ -12,7 +12,6 @@ on:
 
 permissions:
   contents: read
-  packages: read
 
 defaults:
   run:

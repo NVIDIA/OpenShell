@@ -155,7 +155,6 @@ jobs:
     needs: [version, build-cli, build-gateway, build-vm-driver]
     permissions:
       contents: read
-      packages: read
     uses: ./.github/workflows/build-deb.yml
     with:
       deb-version: ${{ needs.version.outputs.deb_version }}
