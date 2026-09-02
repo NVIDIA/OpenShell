@@ -732,7 +732,6 @@ jobs:
   release-helm:
     name: Release Helm Chart (OCI)
     needs: [compute-versions, release, tag-ghcr-release]
-    if: needs.compute-versions.outputs.is_prerelease != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
