@@ -527,7 +527,7 @@ Structured output includes `sandbox`, `bind_address`, `port`, `pid`, and
 expected OpenShell SSH forward; it does not probe the forwarded socket. When no
 forwards are tracked, structured output returns an empty collection.
 
-The default table colorizes the `STATUS` column, but only when the stream it is written to is a terminal, so piping or redirecting gives plain text. Each stream is decided on its own, so redirecting one leaves the other styled. Prefer `--output json` for automation rather than matching on the table. Set `NO_COLOR` to any non-empty value or pass `--color never` to suppress color, and `--color always` to keep it when piping into a pager. `--color` applies to every `openshell` command and covers all styled output: tables, log lines from `-v`, progress spinners, prompts, and error messages.
+The default table colorizes the `STATUS` column only when both standard output and standard error are capable ANSI terminals; piping or redirecting either stream, or running under `TERM=dumb`, gives a plain-text table. Other styled output—including `-v` log lines, progress spinners, prompts, and error messages—is decided per stream, so redirecting one stream leaves the other styled. Prefer `--output json` for automation rather than matching on the table. Set `NO_COLOR` to any non-empty value or pass `--color never` to suppress ANSI formatting, and `--color always` to force it when piping into a pager. `--color` applies to every `openshell` command.
 
 <Tip>
 You can also forward a port at creation time with `--forward`:
