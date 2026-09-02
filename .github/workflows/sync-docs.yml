@@ -100,7 +100,7 @@ jobs:
         uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
         with:
           version: "0.10.12"
-          python-version: "3.14.5"
+          python-version: "3.13"
 
       - name: Update docs snapshot
         # Inputs flow in as quoted env vars to avoid shell injection; see the
