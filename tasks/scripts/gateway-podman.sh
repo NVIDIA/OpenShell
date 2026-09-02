@@ -21,6 +21,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=tasks/scripts/build-env.sh
+source "${ROOT}/tasks/scripts/build-env.sh"
+ensure_build_nofile_limit
+
 PORT="${OPENSHELL_SERVER_PORT:-18080}"
 GATEWAY_NAME="${OPENSHELL_PODMAN_GATEWAY_NAME:-podman-dev}"
 STATE_DIR="${OPENSHELL_PODMAN_GATEWAY_STATE_DIR:-${OPENSHELL_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-podman}}"
