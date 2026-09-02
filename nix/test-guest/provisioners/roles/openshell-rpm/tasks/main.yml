@@ -1,0 +1,29 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Verify RPM-provided OpenShell files
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ openshell_rpm_cli_bin }}"
+    - "{{ openshell_rpm_gateway_bin }}"
+    - /usr/lib/systemd/user/openshell-gateway.service
+  register: openshell_rpm_files
+
+- name: Require the installed OpenShell RPM
+  ansible.builtin.assert:
+    that: item.stat.exists
+    fail_msg: "missing required RPM-provided file: {{ item.item }}"
+  loop: "{{ openshell_rpm_files.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Publish RPM OpenShell installation
+  ansible.builtin.set_fact:
+    openshell_install_source: rpm
+    openshell_cli_bin: "{{ openshell_rpm_cli_bin }}"
+    openshell_gateway_bin: "{{ openshell_rpm_gateway_bin }}"
+    openshell_gateway_service: "{{ openshell_rpm_gateway_service }}"
+    openshell_gateway_endpoint: "{{ openshell_rpm_gateway_endpoint }}"
+    openshell_supervisor_source: package
