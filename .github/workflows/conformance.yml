@@ -186,7 +186,7 @@ jobs:
 
           OPENSHELL_TEST_GUEST_CACHE_DISABLE=1 nix run .#test-guest -- \
             --distro fedora \
-            --with podman \
+            --with podman-rootless \
             --with selinux \
             --install rpm-input/openshell-[0-9]*.rpm \
             --install rpm-input/openshell-gateway-[0-9]*.rpm \
