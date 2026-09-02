@@ -38,16 +38,18 @@ nix/test-guest/
 │   ├── centos.nix
 │   ├── fedora.nix
 │   └── rocky.nix
-└── configuration/
-    ├── docker.yml
-    ├── podman-rootless.yml
-    ├── tasks/
-    │   ├── podman-common.yml
-    │   └── podman-rootless/
-    │       ├── fedora.yml
-    │       ├── shared.yml
-    │       └── ubuntu.yml
-    └── selinux.yml
+├── configuration/
+│   ├── docker.yml
+│   ├── podman-rootless.yml
+│   ├── tasks/
+│   │   ├── podman-common.yml
+│   │   └── podman-rootless/
+│   │       ├── fedora.yml
+│   │       ├── shared.yml
+│   │       └── ubuntu.yml
+│   └── selinux.yml
+└── provisioners/
+    └── openshell-package.yml
 ```
 
 - `default.nix` assembles the guest and cache flake apps. It selects host architecture and acceleration, supplies the runtime tools, and exposes distro profiles and configuration playbooks as Nix-store catalogs.
@@ -57,6 +59,7 @@ nix/test-guest/
 - `cache-seal.sh` removes per-instance state and zeroes free space inside a prepared guest before capture.
 - `distros/*.nix` define the immutable base-image catalog. Each record pins and exports the image URL and hash and declares the expected OS ID, version, and package family.
 - `configuration/*.yml` are host-executed Ansible playbooks that layer optional capabilities onto a base guest. Configurations remain independent and run in the order supplied with repeated `--with` arguments.
+- `provisioners/*.yml` are host-executed Ansible playbooks that configure test-specific artifacts after installation. They run in the order supplied with repeated `--provision` arguments.
 - `README.md` documents the supported combinations and developer interface.
 
 The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-guest` and `test-guest-cache` apps. Debian artifact creation remains outside the guest harness in [`tasks/scripts/package-deb.sh`](../../tasks/scripts/package-deb.sh); the runner only installs or copies artifacts that already exist.
@@ -139,9 +142,28 @@ Configurations are Ansible playbooks stored under `nix/test-guest/configuration/
 
 Configurations run in the order provided on the command line. OpenShell packages and copied files are installed after all configurations succeed.
 
-`--install` packages and `--copy` files are applied by a dedicated per-run
-Ansible playbook. `--copy` preserves each source file's ordinary permission
-bits. They are not stored in prepared VM cache entries.
+`--install` packages and `--copy` files are applied during the per-run artifact
+phase. `--copy` preserves each source file's ordinary permission bits. They are
+not stored in prepared VM cache entries.
+
+## Ansible provisioners
+
+Provisioners are Ansible playbooks stored under `nix/test-guest/provisioners/`.
+They run after all packages and copied files are available and before the guest
+command. Provisioners affect only the disposable overlay and are not stored in
+prepared VM cache entries.
+
+The `openshell-package` provisioner configures and starts an installed OpenShell
+gateway. Select its compute driver explicitly in the host environment:
+
+```shell
+OPENSHELL_TEST_GUEST_DRIVER=docker nix run .#test-guest -- \
+  --distro ubuntu-24-04 \
+  --with docker \
+  --install artifacts/openshell_0.0.0-local_amd64.deb \
+  --provision openshell-package \
+  -- openshell status
+```
 
 ## Prepared VM cache
 
@@ -272,6 +294,7 @@ The destination must be an absolute guest path. Copied files are installed with 
 ```text
 --distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
 --with NAME         Apply docker, podman-rootless, selinux, or snapd; repeatable
+--provision NAME    Apply a post-artifact provisioner; repeatable
 --install PATH      Install a .deb or .rpm package; repeatable
 --copy SRC:DEST     Copy a regular file into the guest, preserving its host mode;
                     repeatable
@@ -279,7 +302,7 @@ The destination must be an absolute guest path. Copied files are installed with 
 --forward-port HOST_PORT:GUEST_PORT
                     Forward a loopback host port to a guest port; repeatable
 --keep              Preserve the disk overlay and logs after shutdown
---list              List distros and configurations
+--list              List distros, configurations, and provisioners
 ```
 
 Each `--forward-port` binds only `127.0.0.1` on the host. Both ports must be unprivileged values from 1024 through 65535, and each host port may appear only once.
@@ -298,8 +321,9 @@ The runner then:
 3. Creates a fresh cloud-init instance and ephemeral SSH key.
 4. Applies the selected Ansible configurations only when the base is not prepared.
 5. Installs or copies the supplied artifacts.
-6. Opens SSH or executes the requested guest command.
-7. Powers off QEMU and deletes the writable overlay.
+6. Applies the selected post-artifact Ansible provisioners.
+7. Opens SSH or executes the requested guest command.
+8. Powers off QEMU and deletes the writable overlay.
 
 Prepared cache disks remain read-only. Test-specific state exists only in the disposable overlay.
 

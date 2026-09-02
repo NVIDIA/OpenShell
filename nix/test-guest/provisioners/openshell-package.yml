@@ -1,0 +1,46 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Configure the gateway supplied by packages installed by test-guest.
+
+- name: Provision packaged OpenShell gateway
+  hosts: test_vm
+  gather_facts: false
+
+  vars:
+    openshell_driver: "{{ lookup('ansible.builtin.env', 'OPENSHELL_TEST_GUEST_DRIVER') }}"
+
+  tasks:
+    - name: Create the OpenShell configuration directory
+      ansible.builtin.file:
+        path: /home/openshell/.config/openshell
+        state: directory
+        mode: "0700"
+
+    - name: Configure the packaged gateway
+      ansible.builtin.copy:
+        dest: /home/openshell/.config/openshell/gateway.env
+        mode: "0600"
+        content: |
+          OPENSHELL_DRIVERS={{ openshell_driver }}
+          OPENSHELL_TELEMETRY_ENABLED=false
+
+    - name: Start the packaged gateway
+      ansible.builtin.systemd_service:
+        name: openshell-gateway
+        daemon_reload: true
+        enabled: true
+        state: started
+        scope: user
+
+    - name: Register the packaged gateway
+      ansible.builtin.command:
+        argv:
+          - openshell
+          - gateway
+          - add
+          - --local
+          - https://127.0.0.1:17670
+          - --name
+          - openshell

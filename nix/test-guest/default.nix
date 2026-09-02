@@ -32,6 +32,10 @@ let
     snapd = ./configuration/snapd.yml;
   };
 
+  provisioners = {
+    openshell-package = ./provisioners/openshell-package.yml;
+  };
+
   configurationTasks = [
     "podman-common.yml"
     "podman-rootless/fedora.yml"
@@ -67,6 +71,10 @@ let
     }) configurationTasks)
   );
 
+  provisionerCatalog = pkgs.linkFarm "openshell-test-guest-provisioners" (
+    pkgs.lib.mapAttrsToList (name: path: { inherit name path; }) provisioners
+  );
+
   runtimeInputs = [
     qemu
     pkgs.python3Packages.ansible-core
@@ -86,6 +94,7 @@ let
     export OPENSHELL_TEST_GUEST_RUNTIME=1
     export OPENSHELL_TEST_GUEST_DISTROS=${distroCatalog}
     export OPENSHELL_TEST_GUEST_CONFIGURATIONS=${configurationCatalog}
+    export OPENSHELL_TEST_GUEST_PROVISIONERS=${provisionerCatalog}
     export OPENSHELL_TEST_GUEST_CACHE_LIB=${./cache-lib.sh}
     export OPENSHELL_TEST_GUEST_CACHE_RUNNER=${./cache.sh}
     export OPENSHELL_TEST_GUEST_CACHE_SEAL=${./cache-seal.sh}

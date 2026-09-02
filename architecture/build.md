@@ -245,6 +245,8 @@ The Nix test guest harness under `nix/test-guest` boots native-architecture clou
 through QEMU for package, release, and E2E validation. A prepared cache entry is
 captured after the exact ordered Ansible configuration list and before
 test-specific packages, copied binaries, forwarded ports, or commands.
+Per-run Ansible provisioners execute after artifact installation and before the
+guest command, so package setup remains separate from conformance assertions.
 
 Prepared disks are flattened, sanitized QCOW2 images. The local cache keeps them
 read-only and each test receives a fresh writable overlay and cloud-init
