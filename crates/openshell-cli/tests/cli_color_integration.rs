@@ -205,6 +205,10 @@ fn split_streams_stdout_tty(args: &[&str]) -> (String, String) {
         .args(args)
         .env("XDG_CONFIG_HOME", tmpdir.path())
         .env("RUST_LOG", "debug")
+        // Pin TERM: `auto` now requires a capable terminal, and CI runners
+        // often leave TERM unset, which would make this test's outcome depend
+        // on the ambient environment.
+        .env("TERM", "xterm-256color")
         .env_remove("NO_COLOR")
         .env_remove("FORCE_COLOR")
         .env_remove("OPENSHELL_COLOR")
@@ -240,6 +244,94 @@ fn split_streams_stdout_tty(args: &[&str]) -> (String, String) {
         String::from_utf8_lossy(&stdout_buf).into_owned(),
         stderr_buf,
     )
+}
+
+/// Run `forward list` with *both* streams on one pseudo-terminal, under the
+/// given `TERM`, and return everything the terminal received.
+///
+/// Both streams share the terminal so the `owo-colors` table is styled too — it
+/// requires both streams to accept escapes. This is the shape of a real
+/// interactive session, which is the only place terminal capability matters.
+#[cfg(target_os = "linux")]
+fn forward_list_on_pty(term: &str, args: &[&str]) -> String {
+    use std::os::fd::{AsRawFd, OwnedFd};
+
+    let pty = nix::pty::openpty(None, None).expect("openpty");
+    let controller: OwnedFd = pty.master;
+    let follower: OwnedFd = pty.slave;
+
+    let tmpdir = tempfile::tempdir().expect("create tmpdir");
+    config_dir_with_forward(tmpdir.path());
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_openshell"))
+        .args(["forward", "list"])
+        .args(args)
+        .env("XDG_CONFIG_HOME", tmpdir.path())
+        .env("TERM", term)
+        .env_remove("NO_COLOR")
+        .env_remove("FORCE_COLOR")
+        .env_remove("OPENSHELL_COLOR")
+        .stdout(follower.try_clone().expect("dup pty follower"))
+        .stderr(follower.try_clone().expect("dup pty follower"))
+        .spawn()
+        .expect("spawn openshell");
+
+    // Drop every follower handle here, or the controller read never sees EIO.
+    drop(follower);
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match nix::unistd::read(controller.as_raw_fd(), &mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    child.wait().expect("wait for openshell");
+
+    let out = String::from_utf8_lossy(&buf).into_owned();
+    assert!(
+        out.contains(SANDBOX),
+        "expected the seeded forward in the table, got: {out:?}"
+    );
+    out
+}
+
+/// A terminal that does not render ANSI must not be styled under `auto`.
+///
+/// `TERM=dumb` is still a terminal, so an `is_terminal()` check alone reports it
+/// as styleable. `console` and `miette` apply their own `TERM` checks, but the
+/// color switch overrides both, so the check has to live here.
+#[cfg(target_os = "linux")]
+#[test]
+fn dumb_terminal_is_not_styled_under_auto() {
+    let dumb = forward_list_on_pty("dumb", &[]);
+    // Positive control: the same session on a capable terminal is styled, so a
+    // plain result below means capability was consulted, not that the pty setup
+    // silently produced nothing.
+    let capable = forward_list_on_pty("xterm-256color", &[]);
+
+    assert!(
+        capable.contains(ESC),
+        "expected styling on a capable terminal; got: {capable:?}"
+    );
+    assert!(
+        !dumb.contains(ESC),
+        "TERM=dumb must not be styled, got: {dumb:?}"
+    );
+}
+
+/// An explicit request outranks the capability check, for callers who know
+/// their terminal better than `TERM` does.
+#[cfg(target_os = "linux")]
+#[test]
+fn color_always_overrides_a_dumb_terminal() {
+    let forced = forward_list_on_pty("dumb", &["--color", "always"]);
+
+    assert!(
+        forced.contains(ESC),
+        "--color always must style even a dumb terminal, got: {forced:?}"
+    );
 }
 
 /// Regression test for a redirected stream inheriting the other stream's

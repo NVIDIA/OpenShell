@@ -12,7 +12,7 @@ Quick-reference for the `openshell` command-line interface. For workflow guidanc
 | `-g`, `--gateway <NAME>` | Gateway to operate on. Also settable via `OPENSHELL_GATEWAY` env var. Falls back to active gateway in `~/.config/openshell/active_gateway`. |
 | `--gateway-endpoint <URL>` | Connect directly to a gateway endpoint without looking up stored metadata. Also settable via `OPENSHELL_GATEWAY_ENDPOINT`. |
 | `--gateway-insecure` | Skip TLS certificate verification. Also settable via `OPENSHELL_GATEWAY_INSECURE`; use only for trusted development endpoints. |
-| `--color <WHEN>` | `auto` (default), `always`, or `never`. `auto` decides per stream, so a redirected stream is plain text while a stream still on the terminal stays styled. Covers tables, `-v` log lines, progress spinners, prompts, and error messages. Also settable via `OPENSHELL_COLOR`. |
+| `--color <WHEN>` | `auto` (default), `always`, or `never`. `auto` decides per stream, so a redirected stream is plain text while a stream still on the terminal stays styled, and it skips terminals that do not render ANSI (`TERM=dumb` or unset). Covers tables, `-v` log lines, progress spinners, prompts, and error messages. Also settable via `OPENSHELL_COLOR`. |
 
 ## Environment Variables
 
