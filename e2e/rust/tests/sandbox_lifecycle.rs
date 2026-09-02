@@ -424,9 +424,15 @@ async fn canonical_main_nonzero_exit_preserves_status() {
 
 #[tokio::test]
 async fn detached_canonical_main_exit_zero_reaches_completed() {
-    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-c", "exit 0"])
+    const RELEASE_PATH: &str = "/sandbox/.openshell-detached-success-release";
+    let script = format!("while [ ! -e '{RELEASE_PATH}' ]; do sleep 0.05; done; exit 0");
+    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-c", &script])
         .await
         .expect("create detached successful canonical main");
+    sandbox
+        .exec(&["touch", RELEASE_PATH])
+        .await
+        .expect("release detached successful canonical main");
 
     wait_for_sandbox_phase(&sandbox.name, "Completed", SANDBOX_PRESENCE_TIMEOUT)
         .await
@@ -442,9 +448,15 @@ async fn detached_canonical_main_exit_zero_reaches_completed() {
 
 #[tokio::test]
 async fn detached_canonical_main_nonzero_exit_reaches_error() {
-    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-c", "exit 11"])
+    const RELEASE_PATH: &str = "/sandbox/.openshell-detached-failure-release";
+    let script = format!("while [ ! -e '{RELEASE_PATH}' ]; do sleep 0.05; done; exit 11");
+    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-c", &script])
         .await
         .expect("create detached failing canonical main");
+    sandbox
+        .exec(&["touch", RELEASE_PATH])
+        .await
+        .expect("release detached failing canonical main");
 
     wait_for_sandbox_phase(&sandbox.name, "Error", SANDBOX_PRESENCE_TIMEOUT)
         .await
