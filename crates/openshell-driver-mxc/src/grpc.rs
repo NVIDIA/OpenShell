@@ -9,14 +9,15 @@
 use crate::driver::MxcComputeBackend;
 use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
-    CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DeleteWorkspaceRequest, DeleteWorkspaceResponse, EnsureWorkspaceRequest,
-    EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse,
-    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
-    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
-    StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
-    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
-    WatchSandboxesRequest, compute_driver_server::ComputeDriver,
+    AuthenticateSandboxRequest, AuthenticateSandboxResponse, CreateSandboxRequest,
+    CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse, DeleteWorkspaceRequest,
+    DeleteWorkspaceResponse, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
+    ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
+    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
+    compute_driver_server::ComputeDriver,
 };
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
@@ -34,6 +35,15 @@ impl ComputeDriverService {
 
 #[tonic::async_trait]
 impl ComputeDriver for ComputeDriverService {
+    async fn authenticate_sandbox(
+        &self,
+        _request: Request<AuthenticateSandboxRequest>,
+    ) -> Result<Response<AuthenticateSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "MXC driver does not authenticate sandbox credentials",
+        ))
+    }
+
     async fn get_capabilities(
         &self,
         _request: Request<GetCapabilitiesRequest>,
@@ -190,6 +200,20 @@ mod tests {
 
         assert_eq!(error.code(), tonic::Code::Unimplemented);
         assert!(error.message().contains("does not support restarting"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_authentication_is_not_supported() {
+        let service =
+            ComputeDriverService::new(MxcComputeBackend::new(MxcComputeConfig::default()));
+
+        let error = service
+            .authenticate_sandbox(Request::new(AuthenticateSandboxRequest::default()))
+            .await
+            .expect_err("MXC must not advertise sandbox credential authentication");
+
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+        assert!(error.message().contains("does not authenticate"));
     }
 
     #[tokio::test]

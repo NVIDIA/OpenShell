@@ -332,7 +332,7 @@ pub enum ConfigFileError {
     Parse {
         path: PathBuf,
         #[source]
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
     #[error(
         "unsupported gateway config version {version}; this build only supports version {SCHEMA_VERSION}"
@@ -387,7 +387,7 @@ pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
     }
     let file: ConfigFile = toml::from_str(&contents).map_err(|source| ConfigFileError::Parse {
         path: path.to_path_buf(),
-        source,
+        source: Box::new(source),
     })?;
 
     if let Some(version) = file.openshell.version

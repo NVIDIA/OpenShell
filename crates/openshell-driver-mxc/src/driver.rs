@@ -294,7 +294,7 @@ impl MxcComputeBackend {
         }
     }
 
-    fn validate_sandbox_fields(&self, sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
+    fn validate_sandbox_fields(sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
         if let Some(spec) = &sandbox.spec {
             if effective_driver_gpu_count(driver_gpu_requirements(
                 spec.resource_requirements.as_ref(),
@@ -335,7 +335,7 @@ impl MxcComputeBackend {
     }
 
     pub fn validate_sandbox_create(&self, sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
-        self.validate_sandbox_fields(sandbox)?;
+        Self::validate_sandbox_fields(sandbox)?;
         let policy = sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref());
         self.map_sandbox_policy(&sandbox.id, policy)?;
         Ok(())
@@ -356,7 +356,7 @@ impl MxcComputeBackend {
     pub async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
         let sandbox_id = sandbox.id.clone();
 
-        self.validate_sandbox_fields(sandbox)?;
+        Self::validate_sandbox_fields(sandbox)?;
         let sandbox_config = sandbox_config(sandbox)?;
 
         // Policy translation is deterministic and side-effect free. Do it before
