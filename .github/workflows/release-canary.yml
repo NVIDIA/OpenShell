@@ -202,6 +202,17 @@ jobs:
           sudo snap services openshell
           openshell gateway add http://127.0.0.1:17670 --local --name snap-docker
           openshell gateway select snap-docker
+
+          for _ in {1..60}; do
+            if openshell status >/dev/null 2>&1; then
+              openshell status
+              exit 0
+            fi
+            sleep 1
+          done
+
+          sudo snap services openshell
+          sudo snap logs openshell.gateway -n=100 || true
           openshell status
 
   kubernetes:
