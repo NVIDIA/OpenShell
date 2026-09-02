@@ -90,7 +90,7 @@ jobs:
       contents: read
     uses: ./.github/workflows/build-binaries.yml
     with:
-      package: openshell-server
+      package: openshell-gateway
       binary: openshell-gateway
       triple: x86_64-unknown-linux-gnu
       runner: linux-amd64-cpu8
