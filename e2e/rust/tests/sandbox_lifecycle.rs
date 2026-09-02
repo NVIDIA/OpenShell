@@ -471,6 +471,35 @@ async fn detached_canonical_main_nonzero_exit_reaches_error() {
 }
 
 #[tokio::test]
+async fn detached_main_exit_during_provisioning_is_classified_as_workload_result() {
+    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-c", "exit 11"])
+        .await
+        .expect("fast detached main exit should not be reported as a provisioning failure");
+
+    let mut get_cmd = openshell_cmd();
+    get_cmd
+        .args(["sandbox", "get", &sandbox.name])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let get_output = get_cmd.output().await.expect("spawn openshell sandbox get");
+    let details = normalize_output(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&get_output.stdout),
+        String::from_utf8_lossy(&get_output.stderr),
+    ));
+    assert!(
+        get_output.status.success(),
+        "sandbox get failed:\n{details}"
+    );
+    assert!(
+        details.contains("Phase: Error") && details.contains("Exit Code: 11"),
+        "fast detached main should retain its workload result:\n{details}"
+    );
+
+    sandbox.cleanup().await;
+}
+
+#[tokio::test]
 async fn canonical_tty_main_uses_sandbox_environment() {
     let script = r#"printf 'canonical_env home=%s user=%s term=%s\n' "$HOME" "$USER" "$TERM"; while true; do sleep 1; done"#;
     let mut sandbox =
