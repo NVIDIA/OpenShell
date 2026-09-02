@@ -256,6 +256,13 @@ pulls and explicit publication. OCI pulls require a trusted manifest digest
 and retain that provenance with the local entry; mutable tags are used only
 for explicit publication.
 
+CLI conformance runs after target provisioning. Action-free scenarios operate
+only through the configured OpenShell CLI. A versioned conformance plan may add
+an ordered sequence of target-supplied host-side actions, such as a gateway
+restart, while the scenario remains responsible for black-box sandbox
+continuity checks. The plan exposes opaque executable paths and timeouts rather
+than driver or package-manager configuration; target setup owns those details.
+
 ## Python Wheel Packaging
 
 The generated protobuf/gRPC stubs under `python/openshell/_proto/` are gitignored
