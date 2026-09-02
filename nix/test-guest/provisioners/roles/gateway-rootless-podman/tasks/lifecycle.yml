@@ -26,3 +26,41 @@
   retries: 60
   delay: 1
   until: gateway_health.rc == 0
+
+- name: Create the target gateway-control command directory
+  ansible.builtin.file:
+    path: "{{ openshell_gateway_restart_command | dirname }}"
+    state: directory
+    mode: "0700"
+
+- name: Install the target gateway restart command
+  ansible.builtin.copy:
+    dest: "{{ openshell_gateway_restart_command }}"
+    mode: "0700"
+    content: |
+      #!/usr/bin/env bash
+      set -Eeuo pipefail
+      systemctl --user restart {{ openshell_gateway_service }}
+      for _ in $(seq 1 60); do
+        if {{ openshell_cli_bin }} status >/dev/null 2>&1; then
+          exit 0
+        fi
+        sleep 1
+      done
+      systemctl --user status {{ openshell_gateway_service }} --no-pager >&2 || true
+      exit 1
+
+- name: Install the target gateway diagnostics command
+  ansible.builtin.copy:
+    dest: "{{ openshell_gateway_diagnostics_command }}"
+    mode: "0700"
+    content: |
+      #!/usr/bin/env bash
+      set -u
+      systemctl --user status {{ openshell_gateway_service }} --no-pager || true
+      journalctl --user -u {{ openshell_gateway_service }} --no-pager -n 200 || true
+      podman info || true
+      podman ps --all || true
+      if command -v getenforce >/dev/null 2>&1; then
+        getenforce || true
+      fi
