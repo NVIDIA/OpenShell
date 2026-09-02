@@ -127,13 +127,20 @@ openshell-driver-mxc = { path = "../openshell-driver-mxc" }
 
 [features]
 default = ["telemetry", "in-tree-compute-drivers"]
-## Link the first-party compute drivers into the standard gateway binary.
-## Disable this feature for a protocol-only gateway that uses external drivers.
+## Link every first-party compute driver into the standard gateway binary.
+## This compatibility alias preserves the historical all-drivers feature.
 in-tree-compute-drivers = [
-    "dep:openshell-driver-docker",
-    "dep:openshell-driver-kubernetes",
-    "dep:openshell-driver-podman",
+    "compute-driver-docker",
+    "compute-driver-kubernetes",
+    "compute-driver-podman",
+    "compute-driver-vm",
 ]
+## Link individual first-party compute drivers. Start with
+## `--no-default-features` when building a gateway with a selected subset.
+compute-driver-docker = ["dep:openshell-driver-docker"]
+compute-driver-kubernetes = ["dep:openshell-driver-kubernetes"]
+compute-driver-podman = ["dep:openshell-driver-podman"]
+compute-driver-vm = []
 ## Compile in anonymous telemetry emission (forwards to openshell-core/telemetry).
 ## On by default; build with `--no-default-features` for a telemetry-free gateway
 ## that contains no telemetry endpoint, HTTP client, or emission code.

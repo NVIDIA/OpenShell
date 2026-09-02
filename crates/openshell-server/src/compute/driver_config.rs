@@ -7,7 +7,15 @@
 //! driver-specific environment overrides, and applying gateway startup defaults.
 //! It does not acquire, connect to, or start compute drivers.
 
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+#[cfg(all(
+    not(target_os = "windows"),
+    any(
+        feature = "compute-driver-docker",
+        feature = "compute-driver-kubernetes",
+        feature = "compute-driver-podman",
+        feature = "compute-driver-vm"
+    )
+))]
 pub mod builtin;
 
 use crate::config_file;

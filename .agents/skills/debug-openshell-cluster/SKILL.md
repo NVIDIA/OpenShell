@@ -19,12 +19,17 @@ The target deployment flow is:
 4. The CLI registers a reachable gateway endpoint with `openshell gateway add`.
 5. The gateway creates sandboxes through the selected compute driver.
 
-The standard gateway binary explicitly installs its compiled Docker, Podman,
-Kubernetes, and VM registrations at startup. With no configured driver, the
-gateway probes only installed registrations in priority order (Kubernetes,
-Podman, then Docker); VM has no probe and remains opt-in. A custom gateway
-binary may install a different set, so confirm the binary's registered drivers
-when auto-detection reports that no suitable driver is available.
+The standard gateway binary's default feature set explicitly installs its
+compiled Docker, Podman, Kubernetes, and VM registrations at startup. Source
+builds can compile any subset with the `compute-driver-docker`,
+`compute-driver-podman`, `compute-driver-kubernetes`, and `compute-driver-vm`
+features. With no configured driver, the gateway probes only installed
+registrations in priority order (Kubernetes, Podman, then Docker); VM has no
+probe and remains opt-in. A subset or custom gateway build may install a
+different set, so confirm the binary's registered drivers when auto-detection
+reports that no suitable driver is available. If configuration selects a
+driver that was not compiled in, the gateway treats the name as an external
+driver and reports a missing `socket_path` unless an endpoint is configured.
 
 For local evaluation only, TLS may be disabled and the gateway can be reached through `http://127.0.0.1:<port>`.
 

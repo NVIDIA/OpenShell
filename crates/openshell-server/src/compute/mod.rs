@@ -5,16 +5,16 @@
 
 pub mod driver_config;
 pub mod lease;
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
 pub mod vm;
 
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-docker"))]
 pub use openshell_driver_docker::DockerComputeConfig;
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-kubernetes"))]
 pub use openshell_driver_kubernetes::KubernetesComputeConfig;
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-podman"))]
 pub use openshell_driver_podman::PodmanComputeConfig;
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
 pub use vm::VmComputeConfig;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
@@ -52,16 +52,16 @@ use openshell_core::proto::{
     SandboxTemplate, ServiceEndpoint, SshSession,
 };
 use openshell_core::{ObjectLabels, ObjectWorkspace};
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-docker"))]
 use openshell_driver_docker::{ComputeDriverService as DockerDriverService, DockerComputeDriver};
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-kubernetes"))]
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
     OperatorNamespaceAllowlist,
 };
 #[cfg(target_os = "windows")]
 use openshell_driver_mxc::{ComputeDriverService as MxcDriverService, MxcComputeConfig};
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-podman"))]
 use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
 use std::collections::HashMap;
@@ -306,7 +306,7 @@ pub struct ManagedDriverProcess {
 }
 
 impl ManagedDriverProcess {
-    #[cfg(all(unix, any(test, feature = "in-tree-compute-drivers")))]
+    #[cfg(all(unix, any(test, feature = "compute-driver-vm")))]
     pub(crate) fn new(child: tokio::process::Child, socket_path: PathBuf) -> Self {
         Self {
             child: std::sync::Mutex::new(Some(child)),
@@ -404,7 +404,7 @@ pub struct AcquiredRemoteDriverEndpoint {
 }
 
 impl AcquiredRemoteDriverEndpoint {
-    #[cfg(any(test, feature = "in-tree-compute-drivers"))]
+    #[cfg(feature = "compute-driver-vm")]
     pub(crate) fn managed_builtin(
         driver_kind: ComputeDriverKind,
         channel: Channel,
@@ -743,7 +743,7 @@ impl ComputeRuntime {
         self.lifecycle_gates.entry_count()
     }
 
-    #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+    #[cfg(all(not(target_os = "windows"), feature = "compute-driver-docker"))]
     pub async fn new_docker(
         config: openshell_core::Config,
         docker_config: DockerComputeConfig,
@@ -770,7 +770,7 @@ impl ComputeRuntime {
         .await
     }
 
-    #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+    #[cfg(all(not(target_os = "windows"), feature = "compute-driver-kubernetes"))]
     pub async fn new_kubernetes(
         config: KubernetesComputeConfig,
         store: Arc<Store>,
@@ -821,7 +821,7 @@ impl ComputeRuntime {
         .await
     }
 
-    #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+    #[cfg(all(not(target_os = "windows"), feature = "compute-driver-podman"))]
     pub async fn new_podman(
         config: PodmanComputeConfig,
         store: Arc<Store>,

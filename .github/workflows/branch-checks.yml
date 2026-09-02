@@ -176,6 +176,15 @@ jobs:
           cargo build -p openshell-sandbox --bin openshell-sandbox --no-default-features --features defaults-without-telemetry
           tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-sandbox
 
+      - name: Verify selective gateway compute-driver builds
+        run: |
+          cargo check -p openshell-server --all-targets --no-default-features
+          cargo check -p openshell-server --all-targets --no-default-features --features compute-driver-docker
+          cargo check -p openshell-server --all-targets --no-default-features --features compute-driver-kubernetes
+          cargo check -p openshell-server --all-targets --no-default-features --features compute-driver-podman
+          cargo check -p openshell-server --all-targets --no-default-features --features compute-driver-vm
+          cargo check -p openshell-server --all-targets --no-default-features --features compute-driver-docker,compute-driver-vm
+
       - name: Verify the defaults-without-telemetry feature alias tracks the default feature set
         run: tasks/scripts/verify-defaults-without-telemetry.sh
 

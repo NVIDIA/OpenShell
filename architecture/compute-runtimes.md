@@ -120,11 +120,15 @@ to `run_cli_with_compute_drivers`; factories receive merged driver config and
 finish through the same in-process runtime adapter. A configured UDS endpoint
 still takes precedence over a compiled registration with the same name.
 
-The standard server crate groups first-party registrations behind the
-`in-tree-compute-drivers` feature. Protocol-only gateway builds disable that
-feature and link no compute-driver crates. E2E lanes compose that gateway with
-Docker, Podman, Kubernetes, and VM driver executables over the public UDS gRPC
-contract so an in-tree driver cannot silently depend on a server-only API.
+The standard server crate exposes one feature per first-party registration:
+`compute-driver-kubernetes`, `compute-driver-docker`,
+`compute-driver-podman`, and `compute-driver-vm`. Builds can enable any subset.
+The default `in-tree-compute-drivers` feature remains an alias for all four, so
+existing gateway builds retain the full driver set. Protocol-only gateway
+builds disable the default features and link no compute-driver crates. E2E
+lanes compose that gateway with Docker, Podman, Kubernetes, and VM driver
+executables over the public UDS gRPC contract so an in-tree driver cannot
+silently depend on a server-only API.
 External Kubernetes drivers support shared and managed workspace modes.
 Operator mode requires an in-process dynamic namespace allowlist and is
 rejected when Kubernetes is configured through an external endpoint.

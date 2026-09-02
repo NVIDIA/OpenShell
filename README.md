@@ -268,6 +268,18 @@ cargo build --release -p openshell-driver-vm --no-default-features --features de
 
 The resulting binaries contain no telemetry endpoint, no telemetry HTTP client, and no emission code. With telemetry compiled out, the gateway emits nothing and reports telemetry disabled to the sandboxes it launches. Cargo has no way to subtract a single default feature, so `defaults-without-telemetry` must be paired with `--no-default-features`; passing it on its own leaves the defaults in place and fails the build rather than producing a binary that still emits.
 
+The gateway also exposes separate Cargo features for its built-in compute drivers: `compute-driver-kubernetes`, `compute-driver-docker`, `compute-driver-podman`, and `compute-driver-vm`. Disable the default feature set, then enable only the drivers and telemetry mode required by the target binary. For example:
+
+```shell
+# Docker only, with telemetry support.
+cargo build --release -p openshell-server --no-default-features --features telemetry,compute-driver-docker
+
+# Docker and VM only, with telemetry compiled out.
+cargo build --release -p openshell-server --no-default-features --features compute-driver-docker,compute-driver-vm
+```
+
+Regular builds still include all four drivers through the default `in-tree-compute-drivers` compatibility feature.
+
 Telemetry events are limited to anonymous operational categories and counts, such as sandbox lifecycle outcomes, provider profile buckets, policy decision counts, and aggregate network activity denial categories. OpenShell telemetry does not collect sandbox names or IDs, hostnames, file paths, binary paths, prompts, credentials, provider names, model names, or user content.
 
 Opting out applies only to telemetry emitted by OpenShell. Third-party services, model providers, inference endpoints, agents, or tools that you configure and use with OpenShell may have their own terms and privacy practices.

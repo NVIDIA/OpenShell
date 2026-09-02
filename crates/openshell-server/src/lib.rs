@@ -1228,7 +1228,7 @@ impl ComputeDriverRegistry {
 pub fn install_default_compute_drivers() -> ComputeDriverRegistry {
     #[allow(unused_mut)]
     let mut registry = ComputeDriverRegistry::new();
-    #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+    #[cfg(all(not(target_os = "windows"), feature = "compute-driver-kubernetes"))]
     {
         registry
             .install(
@@ -1241,6 +1241,9 @@ pub fn install_default_compute_drivers() -> ComputeDriverRegistry {
                 .expect("valid kubernetes registration"),
             )
             .expect("unique kubernetes registration");
+    }
+    #[cfg(all(not(target_os = "windows"), feature = "compute-driver-podman"))]
+    {
         registry
             .install(
                 ComputeDriverRegistration::new(
@@ -1252,6 +1255,9 @@ pub fn install_default_compute_drivers() -> ComputeDriverRegistry {
                 .expect("valid podman registration"),
             )
             .expect("unique podman registration");
+    }
+    #[cfg(all(not(target_os = "windows"), feature = "compute-driver-docker"))]
+    {
         registry
             .install(
                 ComputeDriverRegistration::new(
@@ -1263,6 +1269,9 @@ pub fn install_default_compute_drivers() -> ComputeDriverRegistry {
                 .expect("valid docker registration"),
             )
             .expect("unique docker registration");
+    }
+    #[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
+    {
         registry
             .install(
                 ComputeDriverRegistration::new("vm", u16::MAX, None, VmComputeDriverFactory)
@@ -1425,11 +1434,11 @@ impl ComputeDriverFactory for UnsupportedComputeDriverFactory {
     }
 }
 
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-kubernetes"))]
 #[derive(Clone, Copy)]
 struct KubernetesComputeDriverFactory;
 
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-kubernetes"))]
 #[async_trait::async_trait]
 impl ComputeDriverFactory for KubernetesComputeDriverFactory {
     async fn build(
@@ -1458,11 +1467,11 @@ impl ComputeDriverFactory for KubernetesComputeDriverFactory {
     }
 }
 
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-docker"))]
 #[derive(Clone, Copy)]
 struct DockerComputeDriverFactory;
 
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-docker"))]
 #[async_trait::async_trait]
 impl ComputeDriverFactory for DockerComputeDriverFactory {
     async fn build(
@@ -1489,11 +1498,11 @@ impl ComputeDriverFactory for DockerComputeDriverFactory {
     }
 }
 
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-podman"))]
 #[derive(Clone, Copy)]
 struct PodmanComputeDriverFactory;
 
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-podman"))]
 #[async_trait::async_trait]
 impl ComputeDriverFactory for PodmanComputeDriverFactory {
     async fn build(
@@ -1519,11 +1528,11 @@ impl ComputeDriverFactory for PodmanComputeDriverFactory {
     }
 }
 
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
 #[derive(Clone, Copy)]
 struct VmComputeDriverFactory;
 
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
 #[async_trait::async_trait]
 impl ComputeDriverFactory for VmComputeDriverFactory {
     async fn build(
@@ -1681,7 +1690,7 @@ fn resolve_configured_compute_driver(
     Ok(ConfiguredComputeDriver::Remote { name })
 }
 
-#[cfg(any(test, feature = "in-tree-compute-drivers"))]
+#[cfg(any(test, feature = "compute-driver-kubernetes"))]
 fn kubernetes_sandbox_jwt_expiry_disabled(config: &Config) -> bool {
     config
         .gateway_jwt
@@ -1689,7 +1698,7 @@ fn kubernetes_sandbox_jwt_expiry_disabled(config: &Config) -> bool {
         .is_some_and(|jwt| jwt.ttl_secs == 0)
 }
 
-#[cfg(feature = "in-tree-compute-drivers")]
+#[cfg(feature = "compute-driver-kubernetes")]
 fn warn_if_kubernetes_sandbox_jwt_expiry_disabled(config: &Config) {
     if kubernetes_sandbox_jwt_expiry_disabled(config) {
         warn!(
@@ -2353,6 +2362,29 @@ mod tests {
         assert!(err.to_string().contains("kubernetes,podman"));
     }
 
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn default_registry_contains_exactly_the_enabled_compute_drivers() {
+        let expected: Vec<&str> = vec![
+            #[cfg(feature = "compute-driver-docker")]
+            "docker",
+            #[cfg(feature = "compute-driver-kubernetes")]
+            "kubernetes",
+            #[cfg(feature = "compute-driver-podman")]
+            "podman",
+            #[cfg(feature = "compute-driver-vm")]
+            "vm",
+        ];
+
+        assert_eq!(
+            test_compute_drivers()
+                .installed_driver_names()
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[cfg(feature = "compute-driver-podman")]
     #[test]
     fn configured_compute_driver_accepts_podman() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Podman]);
@@ -2368,6 +2400,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "compute-driver-vm")]
     #[test]
     fn configured_compute_driver_accepts_vm() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Vm]);
@@ -2383,6 +2416,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "compute-driver-docker")]
     #[test]
     fn configured_compute_driver_accepts_docker() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Docker]);
