@@ -5191,6 +5191,9 @@ fn apply_supervisor_proxy_pod_topology(
             // proxy variables; the supervisor's own gateway dial is a direct
             // gRPC channel that does not consult them.
             let proxy_url = proxy_pod_proxy_url(&service_dns);
+            // The process supervisor clears relay-spawned child environments
+            // and reconstructs proxy variables from this canonical URL.
+            upsert_env(env, openshell_core::sandbox_env::PROXY_URL, &proxy_url);
             for name in [
                 "ALL_PROXY",
                 "HTTP_PROXY",
@@ -10048,10 +10051,14 @@ mod tests {
             Some("proxy-pod")
         );
         // The workload's children still egress through the remote proxy Service.
+        // Relay-spawned exec processes reconstruct their proxy variables from
+        // PROXY_URL after clearing the inherited supervisor environment.
+        let proxy_url = format!("http://{service_dns}:3128");
         assert_eq!(
-            rendered_env(agent, "HTTP_PROXY"),
-            Some(format!("http://{service_dns}:3128").as_str())
+            rendered_env(agent, openshell_core::sandbox_env::PROXY_URL),
+            Some(proxy_url.as_str())
         );
+        assert_eq!(rendered_env(agent, "HTTP_PROXY"), Some(proxy_url.as_str()));
         assert_eq!(
             rendered_env(agent, "SSL_CERT_FILE"),
             Some("/etc/openshell-tls/proxy/ca-bundle.pem")
