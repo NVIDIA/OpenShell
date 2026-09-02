@@ -20,72 +20,22 @@ defaults:
 
 jobs:
   build-deb-linux:
-    name: Build Debian Package (Linux ${{ matrix.arch }})
     strategy:
       matrix:
         include:
           - arch: amd64
             runner: linux-amd64-cpu8
-            deb_arch: amd64
             cli_target: x86_64-unknown-linux-musl
             gnu_target: x86_64-unknown-linux-gnu
           - arch: arm64
             runner: linux-arm64-cpu8
-            deb_arch: arm64
             cli_target: aarch64-unknown-linux-musl
             gnu_target: aarch64-unknown-linux-gnu
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs['checkout-ref'] }}
-
-      - name: Download CLI artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: openshell-${{ matrix.cli_target }}
-          path: package-binaries/
-
-      - name: Download gateway artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: openshell-gateway-${{ matrix.gnu_target }}
-          path: package-binaries/
-
-      - name: Download VM driver artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: openshell-driver-vm-${{ matrix.gnu_target }}
-          path: package-binaries/
-
-      - name: Configure package inputs
-        run: |
-          set -euo pipefail
-          chmod +x package-binaries/openshell{,-gateway,-driver-vm}
-          ls -lah package-binaries
-
-      - name: Build Debian package
-        run: |
-          set -euo pipefail
-          OPENSHELL_CLI_BINARY="${PWD}/package-binaries/openshell" \
-          OPENSHELL_GATEWAY_BINARY="${PWD}/package-binaries/openshell-gateway" \
-          OPENSHELL_DRIVER_VM_BINARY="${PWD}/package-binaries/openshell-driver-vm" \
-          OPENSHELL_DEB_VERSION="${INPUTS_DEB_VERSION}" \
-          OPENSHELL_DEB_ARCH="${{ matrix.deb_arch }}" \
-          OPENSHELL_OUTPUT_DIR=artifacts \
-            tasks/scripts/package-deb.sh
-        env:
-          INPUTS_DEB_VERSION: ${{ inputs['deb-version'] }}
-
-      - name: Upload Debian package artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: deb-linux-${{ matrix.arch }}
-          path: artifacts/*.deb
-          retention-days: 5
+    uses: ./.github/workflows/build-deb.yml
+    with:
+      deb-version: ${{ inputs['deb-version'] }}
+      checkout-ref: ${{ inputs['checkout-ref'] }}
+      arch: ${{ matrix.arch }}
+      runner: ${{ matrix.runner }}
+      cli-target: ${{ matrix.cli_target }}
+      gnu-target: ${{ matrix.gnu_target }}
