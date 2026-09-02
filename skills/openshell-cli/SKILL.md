@@ -770,6 +770,9 @@ openshell settings delete work-session --key ocsf_json_enabled
 
 openshell settings get --global --json
 openshell settings set --global --key ocsf_json_enabled --value true
+
+# OCSF schema version downgrade for SIEM compatibility (allowed: "1.1", "1.3")
+openshell settings set --global --key ocsf_schema_version --value "1.1"
 ```
 
 Global mutations prompt for confirmation. Use `--yes` only in reviewed automation.
