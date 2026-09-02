@@ -1,6 +1,8 @@
 ---
 name: update-docs-from-commits
 description: Scan recent git commits for changes that affect user-facing behavior, then draft or update the corresponding documentation pages. Use when docs have fallen behind code changes, after a batch of features lands, or when preparing a release. Trigger keywords - update docs, draft docs, docs from commits, sync docs, catch up docs, doc debt, docs behind, docs drift.
+metadata:
+  internal: true
 ---
 
 # Update Docs from Commits

@@ -1,6 +1,8 @@
 ---
 name: tui-development
 description: Guide for developing the OpenShell TUI — a ratatui-based terminal UI for the OpenShell platform. Covers architecture, navigation, data fetching, theming, UX conventions, and development workflow. Trigger keywords - term, TUI, terminal UI, ratatui, openshell-tui, tui development, tui feature, tui bug.
+metadata:
+  internal: true
 ---
 
 # OpenShell TUI Development Guide

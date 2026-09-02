@@ -1,6 +1,8 @@
 ---
 name: build-openshell-mxc-windows
 description: Maintain and validate OpenShell's build-only Windows MSVC lane for x64 and ARM64. Use when working on Windows compilation, `windows:*` mise tasks, unsupported Windows compute-driver contracts, or Windows build reports. This skill does not implement Docker, Kubernetes, Podman, VM, MXC driver, policy translation, MSI, service, or supervisor runtime support on Windows.
+metadata:
+  internal: true
 ---
 
 # Build OpenShell-MXC for Windows
