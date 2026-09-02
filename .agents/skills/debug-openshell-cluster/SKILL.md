@@ -19,8 +19,9 @@ The target deployment flow is:
 4. The CLI registers a reachable gateway endpoint with `openshell gateway add`.
 5. The gateway creates sandboxes through the selected compute driver.
 
-The standard gateway binary explicitly installs its compiled Docker, Podman,
-Kubernetes, and VM registrations at startup. With no configured driver, the
+The `openshell-gateway` composition crate explicitly installs its compiled
+Docker, Podman, Kubernetes, and VM registrations at startup; `openshell-server`
+does not link compute-driver crates. With no configured driver, the
 gateway probes only installed registrations in priority order (Kubernetes,
 Podman, then Docker); VM has no probe and remains opt-in. A custom gateway
 binary may install a different set, so confirm the binary's registered drivers
@@ -262,6 +263,10 @@ When `userns` is configured (e.g. `userns = "auto"` or `userns = "keep-id"`):
   rootful Podman uses absolute host IDs (e.g. `uidmap = ["0:1000:1", "1:100000:65536"]`).
 - `nomap` (without hyphen) is accepted as input but canonicalized to `no-map`
   for Podman's API.
+- A workload remains in `stopping` until Podman resorts to `SIGKILL`: inspect
+  supervisor logs for `failed to signal entrypoint process group`. The
+  supervisor must retain `CAP_KILL` so its root process can forward `SIGTERM`
+  to a workload that runs as the sandbox user.
 
 ### Step 6: Check Kubernetes Helm Gateways
 
@@ -311,6 +316,13 @@ kubectl -n openshell get secret \
   openshell-client-tls \
   openshell-jwt-keys
 ```
+
+When `server.tls.clientCaSecretName=""`, the chart intentionally omits
+`client_ca_path` and the `tls-client-ca` mount, even with built-in PKI or
+cert-manager. That is expected; do not treat a missing `tls-client-ca` pod
+mount as a defect (`openshell-server-client-ca` may still exist from PKI).
+User auth is OIDC or trusted proxy (`server.auth.allowUnauthenticatedUsers=true`);
+supervisor transport still uses `openshell-client-tls`.
 
 In cert-manager installs, `certManager.enabled=true` makes cert-manager own TLS
 generation. The Helm chart should still render the `openshell-certgen`
@@ -392,7 +404,7 @@ kubectl -n openshell get pod -l app.kubernetes.io/name=helm-chart -o jsonpath="{
 ```
 
 Sandbox pods using provider token grants should have an
-`openshell.io/sandbox-id` annotation, an `openshell.ai/managed-by=openshell`
+`openshell.ai/sandbox-id` annotation, an `openshell.ai/managed-by=openshell`
 label, supervisor env vars `OPENSHELL_K8S_SA_TOKEN_FILE` and
 `OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET`, plus both the projected
 `openshell-sa-token` volume and the `spiffe-workload-api` CSI volume.
@@ -464,10 +476,33 @@ helm -n openshell get values openshell | grep sandboxNamespace
 
 Then inspect sandbox resources in that namespace.
 
+For a split release, the gateway values should have
+`workspaceResources.enabled=false`, and the target namespace should contain a
+separate `openshell-workspace` release:
+
+```bash
+helm -n openshell get values openshell | grep -A2 workspaceResources
+helm -n <sandbox-namespace> status openshell-workspace
+kubectl -n <sandbox-namespace> get serviceaccount,role,rolebinding,networkpolicy \
+  -l app.kubernetes.io/instance=openshell-workspace
+kubectl auth can-i create sandboxes.agents.x-k8s.io \
+  --namespace <sandbox-namespace> \
+  --as system:serviceaccount:openshell:openshell
+```
+
+If the gateway cannot create or watch sandboxes, verify the workspace
+RoleBinding subject matches the gateway ServiceAccount name and namespace.
+If SSH relay connections fail, verify the workspace NetworkPolicy selects the
+gateway's actual `app.kubernetes.io/name` and
+`app.kubernetes.io/instance` labels.
+
 Check the configured sandbox service account when TokenReview bootstrap or
 sandbox registration fails. Helm creates a dedicated sandbox service account by
 default and writes it to `[openshell.drivers.kubernetes].service_account_name`;
-the gateway rejects projected tokens from other service accounts.
+the selected Kubernetes compute driver rejects projected tokens from other
+service accounts. For an external driver, inspect its logs and confirm it
+advertises `supports_sandbox_authentication`; the gateway delegates the opaque
+credential over the driver socket and never interprets Kubernetes settings.
 
 ```bash
 helm -n openshell get values openshell | grep -A3 sandboxServiceAccount
@@ -600,6 +635,7 @@ openshell logs <sandbox-name>
 | Symptom | Likely cause | Check |
 |---|---|---|
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
+| `BatchSpanProcessor.ExportError` repeatedly reports connection refused on `127.0.0.1:4317` | The local gateway started with OTLP configured but the collector forwarding task later stopped, or the config was created manually | Restart `gateway:docker`, `gateway:podman`, or `gateway:vm` so it re-detects the listener; inspect the generated `gateway.toml` for `[openshell.gateway.otlp]` |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
 | Gateway exits while resolving compute-driver listener requirements | Callback alias topology is unsupported, the Podman network cannot be inspected, or the selected address is not private/authorized | Gateway startup error, `podman info --debug`, Podman network inspection, host IPv4 default route |
 | Admin, health, reflection, or HTTP request is denied on an additional Docker/Podman callback-only listener | Additional callback listeners intentionally expose only sandbox-callable gRPC methods | Retry through the gateway's primary endpoint; inspect the listener-purpose startup log if the address was unexpected |
@@ -630,6 +666,7 @@ openshell logs <sandbox-name>
 | HTTPS ingress returns `Unauthenticated` after connecting | TLS terminates at Envoy, so the gateway never sees a client cert; no OIDC issuer is configured for identity | Configure `server.oidc.issuer` and register with `openshell gateway add https://<host> --oidc-issuer <url>`, or set `server.auth.allowUnauthenticatedUsers=true` for a trusted-proxy/dev cluster |
 | External server `Certificate` never becomes Ready with `certManager.serverIssuerRef` set | ACME issuer rejected internal-only SANs, a loopback IP, or a `commonName` absent from the SANs | `kubectl -n openshell describe certificate openshell-server-external`; confirm `certManager.serverDnsNames` lists only real, externally-resolvable hostnames |
 | Sandbox supervisors fail TLS handshake with `UnknownCA` after configuring `certManager.serverIssuerRef` | `server.grpcEndpoint` is set to the external hostname, forcing supervisors to receive the ACME cert (via SNI) which they can't verify against chart CA | Remove `server.grpcEndpoint` or set it to the internal service name; supervisors should connect via internal service name to receive the internal cert |
+| Browser `ERR_BAD_SSL_CLIENT_AUTH_CERT` or gateway logs show client cert verification when OIDC or direct HTTPS is expected | Listener client-CA verification still enabled (`clientCaSecretName` unset or `client_ca_path` in ConfigMap) | Set `server.tls.clientCaSecretName=""`, upgrade chart, confirm ConfigMap omits `client_ca_path` |
 
 ## Reporting
 

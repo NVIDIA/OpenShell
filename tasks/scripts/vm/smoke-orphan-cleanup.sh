@@ -37,7 +37,7 @@ trap cleanup_stray EXIT
 build_binaries() {
     echo "==> Ensuring binaries are built"
     if [ ! -x "$ROOT/target/debug/openshell-gateway" ] || [ ! -x "$ROOT/target/debug/openshell-driver-vm" ]; then
-        cargo build -p openshell-server -p openshell-driver-vm >&2
+        cargo build -p openshell-gateway -p openshell-driver-vm >&2
     fi
     if [ "$(uname -s)" = "Darwin" ]; then
         codesign \

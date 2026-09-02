@@ -827,7 +827,7 @@ fn policy_update_and_merge_are_denied() {
         .evaluate_inner(&evaluation(
             "UpdateConfig",
             GatewayInterceptorPhase::Validate,
-            json!({"global": true, "settingKey": "providers_v2_enabled"}),
+            json!({"global": true, "settingKey": "agent_policy_proposals_enabled"}),
         ))
         .unwrap();
     assert!(settings_update.allowed);

@@ -60,6 +60,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not used by this test server"))
     }
 
+    async fn finalize_main_process_exit(
+        &self,
+        _request: tonic::Request<openshell_core::proto::FinalizeMainProcessExitRequest>,
+    ) -> Result<Response<openshell_core::proto::FinalizeMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn get_current_user(
         &self,
         _request: tonic::Request<openshell_core::proto::GetCurrentUserRequest>,
@@ -89,6 +96,34 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         Ok(Response::new(SandboxResponse::default()))
+    }
+
+    async fn create_sandbox_template(
+        &self,
+        _request: tonic::Request<openshell_core::proto::CreateSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_sandbox_template(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_sandbox_templates(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListSandboxTemplatesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListSandboxTemplatesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteSandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn stop_sandbox(

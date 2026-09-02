@@ -60,6 +60,17 @@ default = ["telemetry", "bundled-ca-roots"]
 ## `--no-default-features --features system-ca-roots` to build a supervisor
 ## that uses the platform trust store with telemetry intact.
 system-ca-roots = ["telemetry"]
+## Convenience alias: every default feature except `telemetry`. Build a
+## telemetry-free supervisor with
+## `--no-default-features --features defaults-without-telemetry` and stay
+## correct as new default features are added. Cargo cannot subtract a single
+## default feature, so this alias must be paired with `--no-default-features`;
+## enabling it alongside `telemetry` is a compile error rather than a silent
+## telemetry-on build. Kept in sync with `default` by
+## `rust:verify:defaults-without-telemetry`. Do not pair it with
+## `system-ca-roots`, which re-enables `telemetry`; a build with neither
+## telemetry nor bundled CA roots is plain `--no-default-features`.
+defaults-without-telemetry = ["bundled-ca-roots"]
 
 telemetry = ["openshell-core/telemetry"]
 bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]

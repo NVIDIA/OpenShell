@@ -39,11 +39,17 @@ use crate::process::{
     ResolvedWorkspace,
 };
 
-pub type SidecarExitReport = (
-    String,
-    i32,
-    tokio::sync::oneshot::Sender<Result<(), String>>,
-);
+pub enum SidecarExitReport {
+    Exited {
+        instance_id: String,
+        exit_code: i32,
+        ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    Finalized {
+        instance_id: String,
+        ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+}
 
 fn ocsf_ctx() -> &'static openshell_ocsf::SandboxContext {
     openshell_ocsf::ctx::ctx()
@@ -63,6 +69,7 @@ pub async fn run_process(
     workspace: ResolvedWorkspace,
     timeout_secs: u64,
     interactive: bool,
+    await_main_process_attachment: bool,
     sandbox_id: Option<&str>,
     openshell_endpoint: Option<&str>,
     ssh_socket_path: Option<String>,
@@ -322,9 +329,9 @@ pub async fn run_process(
             }
         });
 
-        // Wait for the SSH server to bind its socket before spawning the
-        // entrypoint process. This prevents exec requests from racing against
-        // SSH server startup when Kubernetes marks the pod Ready.
+        // Wait for the SSH server to bind before advertising its relay. The
+        // main process is already supervised; MainSession retains any output
+        // produced while this endpoint is being prepared.
         match timeout(Duration::from_secs(10), ssh_ready_rx).await {
             Ok(Ok(Ok(()))) => {
                 ocsf_emit!(
@@ -354,16 +361,14 @@ pub async fn run_process(
 
     let supervisor_terminating = Arc::new(AtomicBool::new(false));
     // A canonical process may have completed while the SSH socket was being
-    // prepared. Never open a readiness-bearing supervisor session for a child
-    // that is already terminal.
+    // prepared. Detect that exit before entering the main wait path.
     let early_exit = handle.try_wait().into_diagnostic()?;
 
     // Spawn the persistent supervisor session if we have a gateway endpoint
     // and sandbox identity. The session provides relay channels for SSH
     // connect and ExecSandbox through the gateway.
-    let supervisor_session_task = if early_exit.is_none()
-        && let (Some(endpoint), Some(id), Some(socket)) =
-            (openshell_endpoint, sandbox_id, ssh_socket_path.as_ref())
+    let supervisor_session_task = if let (Some(endpoint), Some(id), Some(socket)) =
+        (openshell_endpoint, sandbox_id, ssh_socket_path.as_ref())
     {
         let task = crate::supervisor_session::spawn(
             endpoint.to_string(),
@@ -382,9 +387,7 @@ pub async fn run_process(
 
     // Store the entrypoint PID so the proxy can resolve TCP peer identity
     entrypoint_pid.store(handle.pid(), Ordering::Release);
-    if early_exit.is_none()
-        && let Some(tx) = entrypoint_started_tx
-    {
+    if let Some(tx) = entrypoint_started_tx {
         let _ = tx.send((handle.pid(), main_instance_id.clone()));
     }
     ocsf_emit!(
@@ -407,8 +410,8 @@ pub async fn run_process(
             .await?
     };
 
-    let rendered_code = match outcome {
-        ProcessWaitOutcome::Exited(status) => status.code(),
+    let (rendered_code, drain_terminal) = match outcome {
+        ProcessWaitOutcome::Exited(status) => (status.code(), true),
         ProcessWaitOutcome::TimedOut => {
             ocsf_emit!(
                 ProcessActivityBuilder::new(ocsf_ctx())
@@ -420,7 +423,7 @@ pub async fn run_process(
                     .message("Process timed out, killing")
                     .build()
             );
-            124
+            (124, false)
         }
         ProcessWaitOutcome::ShutdownSignal { signal, status } => {
             info!(
@@ -428,11 +431,15 @@ pub async fn run_process(
                 exit_code = status.code(),
                 "Entrypoint exited after supervisor shutdown signal"
             );
-            status.code()
+            (status.code(), false)
         }
     };
-    supervisor_terminating.store(true, Ordering::Release);
-    main_session.finish(rendered_code).await;
+    let terminal_delivery_pending = main_session
+        .finish(
+            rendered_code,
+            drain_terminal && await_main_process_attachment,
+        )
+        .await;
 
     ocsf_emit!(
         ProcessActivityBuilder::new(ocsf_ctx())
@@ -446,21 +453,39 @@ pub async fn run_process(
             .build()
     );
 
+    if outcome.should_report_main_process_exit() {
+        if let Some(tx) = sidecar_exit_tx.as_ref() {
+            report_sidecar_main_process_exit(tx, &main_instance_id, rendered_code).await?;
+        } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
+            report_main_process_exit_until_ack(endpoint, id, &main_instance_id, rendered_code)
+                .await;
+            info!(instance_id = %main_instance_id, "main-process exit acknowledged");
+        }
+    } else {
+        info!(
+            instance_id = %main_instance_id,
+            "skipping main-process exit report during supervisor shutdown"
+        );
+    }
+    main_session.mark_terminal_reported();
+    if outcome.should_report_main_process_exit() && drain_terminal && terminal_delivery_pending {
+        // The peer's SSH channel-close confirms that the terminal frames sent
+        // above traversed russh and the relay. Detached commands have no active
+        // attachment and never enter this wait.
+        main_session.wait_for_terminal_attachments().await;
+    }
+    if outcome.should_report_main_process_exit() {
+        if let Some(tx) = sidecar_exit_tx.as_ref() {
+            finalize_sidecar_main_process_exit(tx, &main_instance_id).await?;
+        } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
+            finalize_main_process_exit_until_ack(endpoint, id, &main_instance_id).await;
+            info!(instance_id = %main_instance_id, "main-process terminal delivery finalized");
+        }
+    }
+
+    supervisor_terminating.store(true, Ordering::Release);
     if let Some(task) = supervisor_session_task {
         task.abort();
-    }
-    if let Some(tx) = sidecar_exit_tx {
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        tx.send((main_instance_id.clone(), rendered_code, ack_tx))
-            .await
-            .map_err(|_| miette::miette!("sidecar exit reporter closed"))?;
-        ack_rx
-            .await
-            .map_err(|_| miette::miette!("sidecar exit reporter dropped acknowledgement"))?
-            .map_err(|error| miette::miette!(error))?;
-    } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
-        report_main_process_exit_until_ack(endpoint, id, &main_instance_id, rendered_code).await;
-        info!(instance_id = %main_instance_id, "main-process exit acknowledged");
     }
 
     Ok(rendered_code)
@@ -492,6 +517,62 @@ async fn report_main_process_exit_until_ack(
     }
 }
 
+async fn finalize_main_process_exit_until_ack(endpoint: &str, sandbox_id: &str, instance_id: &str) {
+    let mut retry_delay = Duration::from_millis(250);
+    loop {
+        match crate::supervisor_session::finalize_main_process_exit(
+            endpoint,
+            sandbox_id,
+            instance_id,
+        )
+        .await
+        {
+            Ok(()) => return,
+            Err(error) => {
+                tracing::warn!(%error, "main-process terminal finalization failed; retrying");
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(2));
+            }
+        }
+    }
+}
+
+async fn report_sidecar_main_process_exit(
+    tx: &tokio::sync::mpsc::Sender<SidecarExitReport>,
+    instance_id: &str,
+    exit_code: i32,
+) -> Result<()> {
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    tx.send(SidecarExitReport::Exited {
+        instance_id: instance_id.to_string(),
+        exit_code,
+        ack: ack_tx,
+    })
+    .await
+    .map_err(|_| miette::miette!("sidecar exit reporter closed"))?;
+    ack_rx
+        .await
+        .map_err(|_| miette::miette!("sidecar exit reporter dropped acknowledgement"))?
+        .map_err(|error| miette::miette!(error))
+}
+
+async fn finalize_sidecar_main_process_exit(
+    tx: &tokio::sync::mpsc::Sender<SidecarExitReport>,
+    instance_id: &str,
+) -> Result<()> {
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    tx.send(SidecarExitReport::Finalized {
+        instance_id: instance_id.to_string(),
+        ack: ack_tx,
+    })
+    .await
+    .map_err(|_| miette::miette!("sidecar exit reporter closed"))?;
+    ack_rx
+        .await
+        .map_err(|_| miette::miette!("sidecar exit reporter dropped acknowledgement"))?
+        .map_err(|error| miette::miette!(error))
+}
+
 enum ProcessWaitOutcome {
     Exited(ProcessStatus),
     TimedOut,
@@ -499,6 +580,16 @@ enum ProcessWaitOutcome {
         signal: &'static str,
         status: ProcessStatus,
     },
+}
+
+impl ProcessWaitOutcome {
+    /// A gateway acknowledgement is required for ordinary canonical-process
+    /// completion, but cannot be awaited after the supervisor itself has been
+    /// asked to terminate. At that point the gateway may already be shutting
+    /// down and no longer able to acknowledge the report.
+    fn should_report_main_process_exit(&self) -> bool {
+        !matches!(self, Self::ShutdownSignal { .. })
+    }
 }
 
 async fn wait_for_process_exit_or_shutdown(
@@ -515,7 +606,6 @@ async fn wait_for_process_exit_or_shutdown(
         tokio::pin!(deadline);
         tokio::select! {
             result = &mut wait => {
-                terminating.store(true, Ordering::Release);
                 Ok(ProcessWaitOutcome::Exited(result.into_diagnostic()?))
             }
             () = &mut deadline => {
@@ -533,7 +623,6 @@ async fn wait_for_process_exit_or_shutdown(
     } else {
         tokio::select! {
             result = &mut wait => {
-                terminating.store(true, Ordering::Release);
                 Ok(ProcessWaitOutcome::Exited(result.into_diagnostic()?))
             }
             signal = wait_for_supervisor_shutdown_signal() => {
@@ -719,5 +808,23 @@ mod tests {
         let policy = policy(NetworkMode::Allow, Some(([127, 0, 0, 1], 3128).into()));
 
         assert_eq!(ssh_proxy_url_for_policy(&policy, None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_shutdown_exit_skips_gateway_acknowledgement() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let status = ProcessStatus::from(std::process::ExitStatus::from_raw(libc::SIGTERM));
+
+        assert!(ProcessWaitOutcome::Exited(status).should_report_main_process_exit());
+        assert!(ProcessWaitOutcome::TimedOut.should_report_main_process_exit());
+        assert!(
+            !ProcessWaitOutcome::ShutdownSignal {
+                signal: "SIGTERM",
+                status,
+            }
+            .should_report_main_process_exit()
+        );
     }
 }

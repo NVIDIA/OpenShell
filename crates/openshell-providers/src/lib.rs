@@ -56,20 +56,9 @@ pub struct ProviderDiscoverySpec {
     pub credential_env_vars: &'static [&'static str],
 }
 
-pub trait ProviderPlugin: Send + Sync {
-    /// Canonical provider id (for example: "claude", "gitlab").
+trait ProviderPlugin: Send + Sync {
+    /// Canonical provider id.
     fn id(&self) -> &'static str;
-
-    /// Discover provider credentials and config from the local machine.
-    fn discover_existing(&self) -> Result<Option<DiscoveredProvider>, ProviderError>;
-
-    /// Return the known credential environment variable names for this provider type.
-    ///
-    /// Used by the TUI to label BYO key entry fields and to choose which
-    /// env var name to store a manually-entered credential under.
-    fn credential_env_vars(&self) -> &'static [&'static str] {
-        &[]
-    }
 
     /// Inject provider-specific environment variables into the sandbox env.
     ///
@@ -77,25 +66,6 @@ pub trait ProviderPlugin: Send + Sync {
     /// regions, SDK flags) into env vars the sandbox process will inherit.
     /// Default is a no-op; GCP and Vertex providers override this.
     fn inject_env(&self, _provider: &Provider, _env: &mut HashMap<String, String>) {}
-}
-
-/// Blanket implementation of [`ProviderPlugin`] for [`ProviderDiscoverySpec`].
-///
-/// Providers that only need standard env-var discovery can register their
-/// `SPEC` constant directly, instead of defining a dedicated struct and
-/// repeating the same three-method delegation.
-impl ProviderPlugin for ProviderDiscoverySpec {
-    fn id(&self) -> &'static str {
-        self.id
-    }
-
-    fn discover_existing(&self) -> Result<Option<DiscoveredProvider>, ProviderError> {
-        discover_with_spec(self, &RealDiscoveryContext)
-    }
-
-    fn credential_env_vars(&self) -> &'static [&'static str] {
-        self.credential_env_vars
-    }
 }
 
 #[derive(Default)]
@@ -107,24 +77,15 @@ impl ProviderRegistry {
     #[must_use]
     pub fn new() -> Self {
         let mut registry = Self::default();
-        registry.register(providers::claude::SPEC);
-        registry.register(providers::codex::SPEC);
-        registry.register(providers::copilot::SPEC);
-        registry.register(providers::opencode::OpencodeProvider);
-        registry.register(providers::generic::GenericProvider);
-        registry.register(providers::openai::SPEC);
-        registry.register(providers::anthropic::SPEC);
-        registry.register(providers::nvidia::SPEC);
-        registry.register(providers::deepinfra::SPEC);
-        registry.register(providers::github::SPEC);
-        registry.register(providers::gitlab::SPEC);
+        // Keep only the legacy config projectors required to run existing
+        // Google Cloud and Vertex records. Public provider discovery is
+        // profile-driven; this registry is an internal compatibility adapter.
         registry.register(providers::google_cloud::GoogleCloudProvider);
-        registry.register(providers::outlook::OutlookProvider);
         registry.register(providers::vertex::VertexProvider);
         registry
     }
 
-    pub fn register<P>(&mut self, plugin: P)
+    fn register<P>(&mut self, plugin: P)
     where
         P: ProviderPlugin + 'static,
     {
@@ -132,34 +93,8 @@ impl ProviderRegistry {
     }
 
     #[must_use]
-    pub fn get(&self, id: &str) -> Option<&dyn ProviderPlugin> {
+    fn get(&self, id: &str) -> Option<&dyn ProviderPlugin> {
         self.plugins.get(id).map(Box::as_ref)
-    }
-
-    pub fn discover_existing(&self, id: &str) -> Result<Option<DiscoveredProvider>, ProviderError> {
-        let Some(plugin) = self.get(id) else {
-            return Err(ProviderError::UnsupportedProvider(id.to_string()));
-        };
-        plugin.discover_existing()
-    }
-
-    /// Return the known credential env var names for a provider type.
-    #[must_use]
-    pub fn credential_env_vars(&self, id: &str) -> &'static [&'static str] {
-        self.get(id)
-            .map_or(&[], ProviderPlugin::credential_env_vars)
-    }
-
-    #[must_use]
-    pub fn profile(&self, id: &str) -> Option<&'static ProviderTypeProfile> {
-        builtin_profiles()
-            .iter()
-            .find(|profile| profile.id.eq_ignore_ascii_case(id))
-    }
-
-    #[must_use]
-    pub fn profiles(&self) -> Vec<&'static ProviderTypeProfile> {
-        builtin_profiles().iter().collect()
     }
 
     /// Inject provider-specific env vars via the registered plugin.
@@ -176,11 +111,18 @@ impl ProviderRegistry {
         }
     }
 
-    #[must_use]
-    pub fn known_types(&self) -> Vec<&'static str> {
-        let mut types = self.plugins.keys().copied().collect::<Vec<_>>();
-        types.sort_unstable();
-        types
+    /// Inject config for an already-resolved profile ID without alias
+    /// normalization. This prevents an exact custom profile whose ID resembles
+    /// a legacy alias from selecting an unrelated built-in compatibility plugin.
+    pub fn inject_env_for_profile_id(
+        &self,
+        provider: &Provider,
+        profile_id: &str,
+        env: &mut HashMap<String, String>,
+    ) {
+        if let Some(plugin) = self.get(profile_id) {
+            plugin.inject_env(provider, env);
+        }
     }
 }
 
@@ -196,12 +138,8 @@ pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
         "claude" | "claude-code" | "claude_code" => Some("claude-code"),
         "codex" => Some("codex"),
         "copilot" => Some("copilot"),
-        "opencode" => Some("opencode"),
         "gcp" | "google-cloud" => Some("google-cloud"),
-        "generic" => Some("generic"),
-        "gitlab" | "glab" => Some("gitlab"),
         "github" | "gh" => Some("github"),
-        "outlook" => Some("outlook"),
         _ => None,
     }
 }
@@ -222,12 +160,12 @@ mod tests {
 
     #[test]
     fn normalizes_known_provider_aliases() {
-        assert_eq!(normalize_provider_type("gitlab"), Some("gitlab"));
-        assert_eq!(normalize_provider_type("glab"), Some("gitlab"));
         assert_eq!(normalize_provider_type("gh"), Some("github"));
         assert_eq!(normalize_provider_type("CLAUDE"), Some("claude-code"));
         assert_eq!(normalize_provider_type("claude-code"), Some("claude-code"));
-        assert_eq!(normalize_provider_type("generic"), Some("generic"));
+        for retired in ["generic", "gitlab", "glab", "opencode", "outlook"] {
+            assert_eq!(normalize_provider_type(retired), None);
+        }
         assert_eq!(normalize_provider_type("openai"), Some("openai"));
         assert_eq!(normalize_provider_type("anthropic"), Some("anthropic"));
         assert_eq!(normalize_provider_type("nvidia"), Some("nvidia"));
@@ -252,7 +190,7 @@ mod tests {
         );
         assert_eq!(
             detect_provider_from_command(&["/usr/bin/glab".to_string()]),
-            Some("gitlab")
+            None
         );
         assert_eq!(
             detect_provider_from_command(&["/usr/bin/bash".to_string()]),

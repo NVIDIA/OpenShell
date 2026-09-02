@@ -28,6 +28,13 @@ fn looks_like_region(s: &str) -> bool {
 /// hostnames. The region is the label immediately before `amazonaws.com`
 /// (or `amazonaws.com.cn`).
 pub fn extract_aws_region(host: &str) -> Option<String> {
+    // The global S3 endpoint and its virtual-hosted bucket form always sign
+    // in us-east-1. This keeps policy metadata consistent across overlapping
+    // S3 hostname patterns while preserving correct global endpoint signing.
+    if host == "s3.amazonaws.com" || host.ends_with(".s3.amazonaws.com") {
+        return Some("us-east-1".to_string());
+    }
+
     let parts: Vec<&str> = host.split('.').collect();
     // China partition: *.amazonaws.com.cn
     if parts.len() >= 5
@@ -386,13 +393,19 @@ mod tests {
     }
 
     #[test]
-    fn global_endpoint_returns_none() {
-        assert!(extract_aws_region("s3.amazonaws.com").is_none());
+    fn global_s3_endpoint_uses_us_east_1() {
+        assert_eq!(
+            extract_aws_region("s3.amazonaws.com").as_deref(),
+            Some("us-east-1")
+        );
     }
 
     #[test]
-    fn virtual_hosted_global_endpoint_returns_none() {
-        assert!(extract_aws_region("my-bucket.s3.amazonaws.com").is_none());
+    fn virtual_hosted_global_s3_endpoint_uses_us_east_1() {
+        assert_eq!(
+            extract_aws_region("my-bucket.s3.amazonaws.com").as_deref(),
+            Some("us-east-1")
+        );
     }
 
     #[test]

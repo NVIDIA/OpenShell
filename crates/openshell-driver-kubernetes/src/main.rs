@@ -42,6 +42,9 @@ struct Args {
     #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
 
+    #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
+    gateway_name: Option<String>,
+
     #[arg(long, env = "OPENSHELL_WORKSPACE_MODE", default_value = "shared")]
     workspace_mode: WorkspaceMode,
 
@@ -215,8 +218,10 @@ async fn shutdown_signal() {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let (tracer_provider, setup_error) =
-        openshell_driver_kubernetes::otel_tracing::provider_for(args.otlp_endpoint.as_deref());
+    let (tracer_provider, setup_error) = openshell_driver_kubernetes::otel_tracing::provider_for(
+        args.otlp_endpoint.as_deref(),
+        args.gateway_name.as_deref(),
+    );
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)))
         .with(tracing_subscriber::fmt::layer())
@@ -349,11 +354,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_gateway_otlp_endpoint() {
+    fn accepts_gateway_otlp_configuration() {
         let args = Args::try_parse_from([
             "openshell-driver-kubernetes",
             "--otlp-endpoint",
             "http://collector.example:4317",
+            "--gateway-name",
+            "kubernetes-dev",
         ])
         .expect("OTLP endpoint should parse");
 
@@ -361,5 +368,6 @@ mod tests {
             args.otlp_endpoint.as_deref(),
             Some("http://collector.example:4317")
         );
+        assert_eq!(args.gateway_name.as_deref(), Some("kubernetes-dev"));
     }
 }

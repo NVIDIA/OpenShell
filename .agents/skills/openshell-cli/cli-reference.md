@@ -12,6 +12,7 @@ Quick-reference for the `openshell` command-line interface. For workflow guidanc
 | `-g`, `--gateway <NAME>` | Gateway to operate on. Also settable via `OPENSHELL_GATEWAY` env var. Falls back to active gateway in `~/.config/openshell/active_gateway`. |
 | `--gateway-endpoint <URL>` | Connect directly to a gateway endpoint without looking up stored metadata. Also settable via `OPENSHELL_GATEWAY_ENDPOINT`. |
 | `--gateway-insecure` | Skip TLS certificate verification. Also settable via `OPENSHELL_GATEWAY_INSECURE`; use only for trusted development endpoints. |
+| `--color <WHEN>` | `auto` (default), `always`, or `never`. `auto` decides per stream, so a redirected stream is plain text while a stream still on the terminal stays styled. Covers tables, `-v` log lines, progress spinners, prompts, and error messages. Also settable via `OPENSHELL_COLOR`. |
 
 ## Environment Variables
 
@@ -20,6 +21,9 @@ Quick-reference for the `openshell` command-line interface. For workflow guidanc
 | `OPENSHELL_GATEWAY` | Override active gateway name (same as `--gateway`) |
 | `OPENSHELL_GATEWAY_ENDPOINT` | Connect directly to a gateway endpoint (same as `--gateway-endpoint`) |
 | `OPENSHELL_GATEWAY_INSECURE` | Skip TLS verification when set (same as `--gateway-insecure`) |
+| `OPENSHELL_COLOR` | When to colorize output: `auto`, `always`, `never` (same as `--color`) |
+| `NO_COLOR` | Disable colorized output when set to any non-empty value ([no-color.org](https://no-color.org)) |
+| `FORCE_COLOR` | Force colorized output when set to any non-empty value ([force-color.org](https://force-color.org)) |
 | `OPENSHELL_SANDBOX_POLICY` | Path to default sandbox policy YAML (fallback when `--policy` is not provided) |
 | `OPENSHELL_COMMUNITY_REGISTRY` | Override the community sandbox image registry prefix used by `sandbox create --from <name>` |
 | `OPENSHELL_THEME` | TUI theme: `auto`, `dark`, or `light` |
@@ -56,18 +60,23 @@ openshell
 │   ├── upload <name> <path> [dest]
 │   ├── download <name> <path> [dest]
 │   ├── ssh-config [name]
-│   └── provider
-│       ├── list [name]
-│       ├── attach <name> <provider>
-│       └── detach <name> <provider>
+│   ├── provider
+│   │   ├── list [name] [-o table|yaml|json]
+│   │   ├── attach <name> <provider>
+│   │   └── detach <name> <provider>
+│   └── template
+│       ├── create <name> [opts]
+│       ├── get <name>
+│       ├── list [opts]
+│       └── delete <name>...
 ├── forward
 │   ├── start <port> [name] [-d]
 │   ├── stop <port> [name]
-│   ├── list
+│   ├── list [-o table|yaml|json]
 │   └── service [name] --target-port <port> [opts]
 ├── service
 │   ├── expose <sandbox> <target-port> [service]
-│   ├── list [sandbox]
+│   ├── list [sandbox] [-o table|yaml|json]
 │   ├── get <sandbox> [service]
 │   └── delete <sandbox> [service]
 ├── logs [name] [opts]
@@ -75,7 +84,7 @@ openshell
 │   ├── set [name] --policy <path> [--global] [--wait]
 │   ├── update [name] [opts]
 │   ├── get [name] [--full|--base] [--global]
-│   ├── list [name] [--global]
+│   ├── list [name] [--global] [-o table|yaml|json]
 │   ├── delete --global
 │   └── prove --policy <path> --credentials <path> [opts]
 ├── settings
@@ -107,6 +116,15 @@ openshell
 │   │   └── delete <id>
 │   ├── update <name> [opts]
 │   └── delete <name>...
+├── workspace
+│   ├── create <name>
+│   ├── get <name>
+│   ├── list [opts]
+│   ├── delete <name>...
+│   └── member
+│       ├── add --workspace <name> --subject <subject> --role <role>
+│       ├── remove --workspace <name> --subject <subject>
+│       └── list --workspace <name> [-o table|yaml|json]
 ├── doctor
 │   └── check
 ├── term
@@ -207,19 +225,30 @@ identity provider. Requires an authenticated gateway connection.
 Create a sandbox through the selected gateway and launch its canonical main
 process. By default, the CLI attaches to that retained process after the
 sandbox becomes ready. A trailing command defines the canonical main process;
-without one, the default is `/bin/bash -l` with a PTY.
+without one, the default is `/bin/bash -l` with a PTY. Explicit commands remain
+foreground in non-interactive automation: stdout and stderr stream to the
+caller and the CLI returns the command's exact status. Exit 0 leaves
+`Completed`; nonzero leaves `Error/MainProcessFailed`.
+Starting either retained terminal result invalidates SSH sessions from the
+previous runtime generation.
 
 | Flag | Description |
 |------|-------------|
 | `--name <NAME>` | Sandbox name (auto-generated if omitted) |
 | `--from <SOURCE>` | Community name, Dockerfile path, directory, or image reference (BYOC) |
-| `--no-keep` | Delete the sandbox after the initial command or shell exits |
+| `--no-keep` | Delete the sandbox after main output and the result drain |
 | `--detach` | Start the canonical main process without attaching |
 | `--editor vscode|cursor` | Launch a remote editor and keep the sandbox alive |
 | `--gpu [COUNT]` | Request the driver's default GPU selection or a specific count |
 | `--cpu <QUANTITY>` | CPU limit (for example: `500m`, `1`, `2.5`) |
 | `--memory <QUANTITY>` | Memory limit (for example: `512Mi`, `4Gi`, `8G`) |
+
+`--detach` adds no attachment grace period: the sandbox reports the canonical
+process result immediately when it exits. Foreground creation declares one
+expected main-process SSH attachment; cleanup finalizes after that connection
+drains and closes naturally.
 | `--driver-config-json <JSON>` | Experimental driver-keyed configuration object |
+| `--template <NAME>` | Create from a named sandbox workload template |
 | `--provider <NAME>` | Provider to attach (repeatable) |
 | `--policy <PATH>` | Custom policy YAML; overrides the built-in default and `OPENSHELL_SANDBOX_POLICY` |
 | `--forward <[BIND:]PORT>` | Start a local port forward and keep the sandbox alive |
@@ -237,6 +266,57 @@ without one, the default is `/bin/bash -l` with a PTY.
 currently complete after the canonical process starts. Create the default
 scratch sandbox, upload files, then use `sandbox exec`, or build the files into
 the image.
+
+`--template` uses the named template workload, so it conflicts with inline
+workload flags: `--from`, `--gpu`, `--cpu`, `--memory`, `--env`, and
+`--driver-config-json`. Direct `sandbox create --driver-config-json` remains
+valid when `--template` is not set.
+
+### `openshell sandbox template create NAME [OPTIONS]`
+
+Create a reusable sandbox workload template. Templates hold image,
+environment, resource, startup, and driver-specific configuration for later
+`sandbox create --template NAME` calls.
+
+| Flag | Description |
+|------|-------------|
+| `--image <IMAGE>` | OCI image reference; when omitted, the gateway default image is applied at sandbox create time |
+| `--env <KEY=VALUE>` | Set a non-secret template workload environment variable (repeatable) |
+| `--cpu <QUANTITY>` | CPU limit for sandboxes created from the template |
+| `--memory <QUANTITY>` | Memory limit for sandboxes created from the template |
+| `--gpu [COUNT]` | Request the driver's default GPU selection or a specific GPU count for sandboxes created from the template |
+| `--driver-config-json <JSON>` | Experimental driver-keyed configuration object owned by the template |
+| `--ready-within <DURATION>` | Target startup readiness duration, for example `30s`, `5m`, or `1h` |
+| `--max-burst <COUNT>` | Maximum startup burst associated with this template |
+| `--label <KEY=VALUE>` | Attach a template label (repeatable) |
+| `--annotation <KEY=VALUE>` | Attach a template annotation (repeatable) |
+| `--output table|yaml|json` | Output format |
+
+### `openshell sandbox template get NAME`
+
+Show a sandbox workload template.
+
+| Flag | Description |
+|------|-------------|
+| `--output table|yaml|json` | Output format |
+
+### `openshell sandbox template list`
+
+List sandbox workload templates.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--limit <N>` | 100 | Maximum templates |
+| `--offset <N>` | 0 | Pagination offset |
+| `--label-selector <KEY=VALUE,...>` | empty | Filter templates by labels |
+| `--names` | false | Print only template names |
+| `--all-workspaces` | false | List templates across all workspaces; requires platform-admin permissions |
+| `--output table|yaml|json` | `table` | Output format |
+
+### `openshell sandbox template delete NAME...`
+
+Delete one or more sandbox workload templates by name. Existing sandboxes
+created from a template are not deleted.
 
 ### `openshell sandbox get [name]`
 
@@ -269,8 +349,9 @@ and waits for the `Stopped` phase.
 
 ### `openshell sandbox start [name]`
 
-Start a stopped sandbox and wait for `Ready`. The name defaults to the
-last-used sandbox.
+Start a stopped, failed, or completed sandbox and wait for `Ready`. This
+launches a fresh canonical-main instance. The name defaults to the last-used
+sandbox.
 
 ### `openshell sandbox exec [OPTIONS] -- COMMAND...`
 
@@ -310,9 +391,12 @@ Print an SSH config `Host` block. The name defaults to the last-used sandbox.
 
 Manage providers on an existing sandbox:
 
-- `openshell sandbox provider list [name]`
+- `openshell sandbox provider list [name] [--output table|yaml|json]`
 - `openshell sandbox provider attach <name> <provider>`
 - `openshell sandbox provider detach <name> <provider>`
+
+Structured list output contains `name`, `type`, and sorted `credential_keys`
+and `config_keys` arrays. It excludes all credential, handle, and config values.
 
 ---
 
@@ -332,9 +416,15 @@ Start forwarding a local port to a sandbox.
 
 Stop a background port forward. When the sandbox name is omitted, it is inferred from active forwards.
 
-### `openshell forward list`
+### `openshell forward list [--output table|yaml|json]`
 
-List all active port forwards (sandbox, port, PID, status).
+List all tracked port forwards. Table output shows the sandbox, bind address,
+port, PID, and status. JSON and YAML output expose `sandbox`, `bind_address`,
+`port`, `pid`, and the boolean `alive`; an empty result is an empty collection.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-o`, `--output <FORMAT>` | `table` | Output format: `table`, `yaml`, or `json` |
 
 ### `openshell forward service [name] --target-port <port>`
 
@@ -353,9 +443,12 @@ Forward a local TCP port to a loopback service inside a sandbox over the gRPC re
 Gateway-managed HTTP service endpoints:
 
 - `openshell service expose <sandbox> <target-port> [service]`
-- `openshell service list [sandbox] [--limit N] [--offset N]`
+- `openshell service list [sandbox] [--limit N] [--offset N] [--output table|yaml|json]`
 - `openshell service get <sandbox> [service]`
 - `openshell service delete <sandbox> [service]`
+
+Structured list records contain `workspace`, `sandbox`, `service`,
+`target_port`, and `url`. Empty lists serialize as empty collections.
 
 ---
 
@@ -381,7 +474,7 @@ The sandbox name defaults to the last-used sandbox.
 
 ### `openshell policy update [name]`
 
-Incrementally merge live network policy changes into the current sandbox policy when the selected compute driver supports live updates. Multiple flags in one invocation are applied as one atomic batch and create at most one new revision. MXC rejects live policy merges; delete and recreate an MXC sandbox instead.
+Incrementally merge live network policy changes into the current sandbox policy when the selected compute driver supports live updates. Multiple flags in one invocation are applied as one atomic batch and create at most one new revision. Use `--wait` to verify that the active runtime loaded the new revision.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -411,7 +504,7 @@ Notes:
 
 ### `openshell policy set [name] --policy <PATH>`
 
-Replace the full policy on a live sandbox when the selected compute driver supports live updates. Only the dynamic `network_policies` field can be changed at runtime. MXC rejects live policy replacement; delete and recreate an MXC sandbox instead.
+Replace the full policy on a live sandbox when the selected compute driver supports live updates. Only dynamic policy fields can be changed at runtime. Use `--wait` to verify that the active runtime loaded the new revision.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -443,6 +536,11 @@ List policy revision history (version, hash, status, created, error).
 |------|---------|-------------|
 | `--limit <N>` | 20 | Max revisions to return |
 | `--global` | false | List global policy revisions |
+| `-o`, `--output <FORMAT>` | `table` | Output format: `table`, `yaml`, or `json` |
+
+Structured records use the policy metadata contract from `policy get`: scope,
+sandbox when applicable, version, full hash, normalized status, and available
+timestamps, load error, and provenance.
 
 ### `openshell policy delete --global`
 
@@ -472,6 +570,16 @@ Review agent-authored network rule proposals. This command group is intentionall
 - `openshell rule history [name]`
 
 Sandbox names default to the last-used sandbox. The CLI fetches and submits each proposal's current review token; a changed live candidate remains pending until it is reviewed again. Bulk approval of security-flagged proposals requires explicit `--include-security-flagged`.
+
+---
+
+## Workspace Member Commands
+
+### `openshell workspace member list --workspace <name>`
+
+List workspace members. Add `--output table|yaml|json` to select the format.
+Structured records contain `subject` and a normalized `role` of `admin`,
+`user`, or `unknown`; empty lists serialize as empty collections.
 
 ---
 
@@ -505,7 +613,9 @@ Create a provider configuration.
 | `--runtime-credentials` | Resolve required credentials at runtime in the gateway or sandbox |
 | `--config KEY=VALUE` | Config key/value pair. Repeatable. |
 
-Exactly one credential source is required. Credential-source flags conflict with one another.
+Credential-source flags conflict with one another when supplied. A credential
+source is optional when the selected profile declares no required static
+credentials or can resolve its required credentials at runtime.
 
 ### `openshell provider get <name>`
 
@@ -544,7 +654,7 @@ Delete one or more providers by name.
 - `openshell provider profile import (--file <path>|--from <dir>)`
 - `openshell provider profile update <id> --file <path>`
 - `openshell provider profile lint (--file <path>|--from <dir>)`
-- `openshell provider profile delete <id>`
+- `openshell provider profile delete <id>...`
 
 ### Provider credential refresh
 

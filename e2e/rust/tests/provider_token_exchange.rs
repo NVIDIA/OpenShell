@@ -835,19 +835,6 @@ async fn podman_provider_token_exchange_injects_bearer_header() {
     let _gateway_token = start_gateway_token_endpoint(token_port).await;
     let _target = start_protected_target(target_port).await;
 
-    run_cli(&[
-        "settings",
-        "set",
-        "--global",
-        "--key",
-        "providers_v2_enabled",
-        "--value",
-        "true",
-        "--yes",
-    ])
-    .await
-    .expect("enable providers v2");
-
     run_cli_ignore_error(&["provider", "delete", &provider_name, "--yes"]).await;
     run_cli_ignore_error(&["provider", "profile", "delete", &profile_type, "--yes"]).await;
 

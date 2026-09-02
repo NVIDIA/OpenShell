@@ -43,10 +43,12 @@ fn test_sandbox() -> DriverSandbox {
                 environment: HashMap::from([("TEMPLATE_ENV".to_string(), "template".to_string())]),
                 ..Default::default()
             }),
+            policy: None,
             resource_requirements: None,
             sandbox_token: String::new(),
             command: Vec::new(),
             tty: false,
+            await_main_process_attachment: false,
         }),
         status: None,
         workspace: String::new(),
@@ -3102,4 +3104,89 @@ fn lifecycle_fence_rejects_polled_exit_from_before_restart() {
 
     fences.remove("sandbox-1");
     assert!(fences.previous_exit("sandbox-1").is_none());
+}
+
+fn exited_sandbox_with_ready_reason(reason: &str) -> DriverSandbox {
+    DriverSandbox {
+        id: "sbx-exit".to_string(),
+        name: "demo".to_string(),
+        namespace: String::new(),
+        spec: None,
+        status: Some(DriverSandboxStatus {
+            sandbox_name: "demo".to_string(),
+            instance_id: "container-1".to_string(),
+            agent_fd: String::new(),
+            sandbox_fd: String::new(),
+            conditions: vec![DriverCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: reason.to_string(),
+                message: "Container exited".to_string(),
+                last_transition_time: String::new(),
+            }],
+            deleting: false,
+        }),
+        workspace: String::new(),
+    }
+}
+
+fn ready_reason(sandbox: &DriverSandbox) -> &str {
+    sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.conditions.iter().find(|c| c.r#type == "Ready"))
+        .map(|c| c.reason.as_str())
+        .expect("Ready condition present")
+}
+
+#[test]
+fn docker_signal_kill_reclassified_as_runtime_restart() {
+    // 137 (128+SIGKILL) and 143 (128+SIGTERM) mark an external termination —
+    // the signature of a machine/daemon restart — and become recoverable
+    // `ContainerRuntimeRestart`.
+    for exit_code in [137, 143] {
+        let mut sandbox = exited_sandbox_with_ready_reason(CONDITION_EXITED);
+        let state = ContainerState {
+            status: Some(ContainerStateStatusEnum::EXITED),
+            oom_killed: Some(false),
+            exit_code: Some(exit_code),
+            ..Default::default()
+        };
+        apply_docker_exit_classification(&mut sandbox, &state);
+        assert_eq!(
+            ready_reason(&sandbox),
+            CONDITION_RUNTIME_RESTART,
+            "exit code {exit_code} should reclassify as runtime restart"
+        );
+    }
+}
+
+#[test]
+fn docker_ordinary_exit_stays_terminal() {
+    // An application exit (non-zero error code) stays `ContainerExited` so its
+    // failure signal survives instead of being relaunched on startup.
+    let mut sandbox = exited_sandbox_with_ready_reason(CONDITION_EXITED);
+    let state = ContainerState {
+        status: Some(ContainerStateStatusEnum::EXITED),
+        oom_killed: Some(false),
+        exit_code: Some(1),
+        ..Default::default()
+    };
+    apply_docker_exit_classification(&mut sandbox, &state);
+    assert_eq!(ready_reason(&sandbox), CONDITION_EXITED);
+}
+
+#[test]
+fn docker_oom_kill_stays_terminal_despite_137() {
+    // An OOM kill reports exit 137 but must NOT be treated as a recoverable
+    // restart — it is a genuine failure and stays terminal.
+    let mut sandbox = exited_sandbox_with_ready_reason(CONDITION_EXITED);
+    let state = ContainerState {
+        status: Some(ContainerStateStatusEnum::EXITED),
+        oom_killed: Some(true),
+        exit_code: Some(137),
+        ..Default::default()
+    };
+    apply_docker_exit_classification(&mut sandbox, &state);
+    assert_eq!(ready_reason(&sandbox), CONDITION_EXITED);
 }

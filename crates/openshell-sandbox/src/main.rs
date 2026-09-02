@@ -659,15 +659,23 @@ fn main() -> Result<()> {
         // drivers otherwise provide a versioned JSON transport so argument
         // boundaries are never reconstructed with shell parsing.
         let workdir = args.workdir.clone();
-        let (command, interactive) = if !args.command.is_empty() {
-            (args.command, args.interactive)
+        let (command, interactive, await_main_process_attachment) = if !args.command.is_empty() {
+            (args.command, args.interactive, false)
         } else if let Ok(json) = std::env::var(openshell_core::sandbox_env::MAIN_PROCESS_SPEC) {
             let config = openshell_core::sandbox_env::MainProcessConfig::decode(&json)
                 .map_err(|error| miette::miette!("{error}"))?;
-            (config.command, config.tty)
+            (
+                config.command,
+                config.tty,
+                config.await_main_process_attachment,
+            )
         } else {
             let config = openshell_core::sandbox_env::MainProcessConfig::scratch();
-            (config.command, config.tty)
+            (
+                config.command,
+                config.tty,
+                config.await_main_process_attachment,
+            )
         };
 
         info!(command = ?command, "Starting sandbox");
@@ -689,6 +697,7 @@ fn main() -> Result<()> {
             workdir,
             args.timeout,
             interactive,
+            await_main_process_attachment,
             args.sandbox_id,
             args.sandbox,
             args.openshell_endpoint,

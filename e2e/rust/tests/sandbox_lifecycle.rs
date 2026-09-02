@@ -220,7 +220,7 @@ async fn sandbox_can_be_deleted_while_stopped() {
 }
 
 #[tokio::test]
-async fn canonical_main_exit_transitions_persistent_sandbox_to_error() {
+async fn canonical_main_exit_zero_completes_persistent_sandbox() {
     let mut cmd = openshell_tty_cmd(&["sandbox", "create", "--", "echo", "OK"]);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -229,9 +229,10 @@ async fn canonical_main_exit_transitions_persistent_sandbox_to_error() {
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = normalize_output(&format!("{stdout}{stderr}"));
 
+    assert!(output.status.success(), "create failed:\n{combined}");
     assert!(
-        !output.status.success(),
-        "main-process exit must fail create"
+        combined.contains("OK"),
+        "main output was not streamed:\n{combined}"
     );
     let sandbox_name =
         extract_sandbox_name(&combined).expect("sandbox name should be present in output");
@@ -260,10 +261,62 @@ async fn canonical_main_exit_transitions_persistent_sandbox_to_error() {
         "sandbox get failed:\n{details}"
     );
     assert!(
-        details.contains("Phase: Error"),
+        details.contains("Phase: Completed"),
         "expected terminal sandbox phase:\n{details}"
     );
 
+    delete_sandbox(&sandbox_name).await;
+}
+
+#[tokio::test]
+async fn canonical_main_nonzero_exit_preserves_status() {
+    let mut cmd = openshell_tty_cmd(&[
+        "sandbox",
+        "create",
+        "--",
+        "sh",
+        "-c",
+        "echo failed-main; exit 7",
+    ]);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let output = cmd.output().await.expect("spawn openshell sandbox create");
+    let combined = normalize_output(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    ));
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "unexpected result:\n{combined}"
+    );
+    assert!(
+        combined.contains("failed-main"),
+        "main output was not streamed:\n{combined}"
+    );
+    let sandbox_name =
+        extract_sandbox_name(&combined).expect("sandbox name should be present in output");
+
+    let mut get_cmd = openshell_cmd();
+    get_cmd
+        .args(["sandbox", "get", &sandbox_name])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let get_output = get_cmd.output().await.expect("spawn openshell sandbox get");
+    let details = normalize_output(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&get_output.stdout),
+        String::from_utf8_lossy(&get_output.stderr),
+    ));
+    assert!(
+        details.contains("Phase: Error"),
+        "unexpected phase:\n{details}"
+    );
+    assert!(
+        details.contains("Exit Code: 7"),
+        "missing exit code:\n{details}"
+    );
     delete_sandbox(&sandbox_name).await;
 }
 
@@ -431,9 +484,10 @@ async fn sandbox_create_with_no_keep_cleans_up_after_tty_command() {
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = normalize_output(&format!("{stdout}{stderr}"));
 
+    assert!(output.status.success(), "create failed:\n{combined}");
     assert!(
-        !output.status.success(),
-        "main-process exit must fail create"
+        combined.contains("OK"),
+        "main output was not streamed:\n{combined}"
     );
     let sandbox_name =
         extract_sandbox_name(&combined).expect("sandbox name should be present in output");

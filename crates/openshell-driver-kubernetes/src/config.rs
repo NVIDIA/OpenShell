@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-pub use openshell_core::OperatorNamespaceAllowlist;
+pub use openshell_core::DynamicStringAllowlist as OperatorNamespaceAllowlist;
 use openshell_core::config;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
@@ -303,7 +303,7 @@ pub struct KubernetesComputeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_namespace_file: Option<String>,
     /// Kubernetes `ServiceAccount` assigned to sandbox pods and accepted by
-    /// the gateway's `TokenReview` bootstrap authenticator.
+    /// the driver's `TokenReview` bootstrap authenticator.
     pub service_account_name: String,
     pub default_image: String,
     pub image_pull_policy: String,

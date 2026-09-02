@@ -16,8 +16,10 @@ workloads.
 - Coordinate supervisor relay sessions for connect, exec, file sync, and
   service forwarding.
 - Persist the canonical main-process instance ID and normalized exit code on
-  sandbox status. Any main process exit transitions the sandbox to `Error`,
-  including exit code zero.
+  sandbox status. Exit code zero transitions the sandbox to `Completed`;
+  nonzero results transition it to `Error/MainProcessFailed`. Infrastructure
+  failures also use `Error`, with a distinct reason and no fabricated command
+  result.
 
 The gateway does not enforce agent network policy at request time. That happens
 inside each sandbox, where the supervisor and proxy can observe local process
@@ -26,7 +28,15 @@ identity.
 The live supervisor session is the readiness authority for its main-process
 instance. The supervisor reports its normalized result through the
 sandbox-authenticated `ReportMainProcessExit` RPC, and the gateway rejects
-results from stale instance IDs.
+results from stale instance IDs. Foreground creation carries a one-shot
+attachment intent to the process supervisor. The supervisor durably reports the
+result immediately, accepts that declared SSH attachment even when the process
+has already exited, sends the retained output and exit status, and waits for the
+peer's channel close before finalizing the result for ephemeral cleanup.
+Detached commands carry no attachment intent, so they finalize and exit
+immediately without a grace period. Finalization is persisted separately from
+the exit result; the gateway deletes an ephemeral sandbox only after the
+finalized supervisor session disconnects.
 
 ## Protocol and Auth
 
@@ -225,11 +235,12 @@ identity inspection without client-side token decoding.
 Sandbox secrets are gateway-signed JWTs bound to a single sandbox ID. Docker,
 Podman, and VM drivers deliver the initial token through supervisor-only
 runtime material; Kubernetes supervisors exchange a projected ServiceAccount
-token through `IssueSandboxToken`. The gateway validates that projected token
-with Kubernetes `TokenReview`, requires the configured sandbox service account,
-checks the returned pod binding against the live pod UID, and verifies the pod's
-controlling `Sandbox` ownerReference against the live Sandbox CR UID and
-sandbox-id label before minting the gateway JWT. The bootstrap path accepts
+token through `IssueSandboxToken`. The gateway delegates that opaque credential
+to the selected compute driver's `AuthenticateSandbox` RPC. A capable driver is
+trusted to return the authenticated sandbox ID, while the gateway still requires
+a matching durable sandbox record before minting a JWT. The Kubernetes driver
+uses its own named configuration to run TokenReview and verify the live pod and
+controlling Sandbox CR. The bootstrap path accepts
 both `agents.x-k8s.io/v1beta1` ownerReferences from newer Agent Sandbox
 controllers and `agents.x-k8s.io/v1alpha1` ownerReferences from existing
 deployments. Supervisors renew gateway JWTs in memory before expiry only while
@@ -333,23 +344,33 @@ default WAL journal mode), which mirror the same sensitive contents.
 
 Persisted state includes sandboxes, providers, provider credential refresh
 state, SSH sessions, policy revisions, settings, inference configuration, and
-deployment records. Provider refresh state is stored as a separate object
-scoped to the provider instance through `objects.scope`. Its non-secret
-configuration remains inline, while refresh tokens, client secrets, private
-keys, and other secret source material are stored through the active credential
-driver and represented by opaque handles. The provider record keeps only the
-current injectable credential handles and optional per-credential expiry
-timestamps. A refresh normally mints one credential, but a strategy may
-co-mint several (AWS STS mints the access key, secret key, and session token in
-one call); the refresh state pins the resolved set of env keys it owns so
-collision checks reserve all of them before the first mint. Provider records
-keep inline credential values only for legacy records created before credential
-driver storage. New provider and refresh-material writes keep driver-owned
-credential handles. When no external credential driver is configured, gateways
-use server-owned encrypted database credential storage for defense in depth.
-Multi-replica deployments can use that default with a shared database and
-shared key-encryption key, or opt into an external backend such as Vault or
-Kubernetes Secrets.
+deployment records, and reusable sandbox workload templates. Provider refresh
+state is stored as a separate object scoped to the provider instance through
+`objects.scope`. Its non-secret configuration remains inline, while refresh
+tokens, client secrets, private keys, and other secret source material are
+stored through the active credential driver and represented by opaque handles.
+The provider record keeps only the current injectable credential handles and
+optional per-credential expiry timestamps. A refresh normally mints one
+credential, but a strategy may co-mint several (AWS STS mints the access key,
+secret key, and session token in one call); the refresh state pins the resolved
+set of env keys it owns so collision checks reserve all of them before the
+first mint. Provider records keep inline credential values only for legacy
+records created before credential driver storage. New provider and
+refresh-material writes keep driver-owned credential handles. When no external
+credential driver is configured, gateways use server-owned encrypted database
+credential storage for defense in depth. Multi-replica deployments can use that
+default with a shared database and shared key-encryption key, or opt into an
+external backend such as Vault or Kubernetes Secrets.
+
+Sandbox workload templates are workspace-scoped gateway resources. Workspace
+admins create and delete them; workspace users can read and list them. A
+template owns reusable workload intent: image, environment, CPU and memory
+limits, GPU request, driver-specific config, and service-level hints. A sandbox
+created from a template resolves that resource once and persists an ordinary
+`SandboxSpec` snapshot. The create request still owns per-sandbox governance:
+name, labels, annotations, provider attachments, and policy. The sandbox stores
+template provenance as the template name and resource version used for the
+snapshot, so later template edits or deletes do not mutate existing sandboxes.
 
 OAuth refresh failures retain a gateway-owned recovery classification alongside
 the refresh state. The gateway reads only a bounded error response and maps
@@ -673,6 +694,15 @@ Driver implementation settings live in the TOML driver tables. See
 `docs/reference/gateway-config.mdx` for worked per-driver examples and RFC
 0003 for the full schema.
 
+Each installation has an operator-assigned gateway name. Configure it with
+`[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`.
+The built-in default is `openshell`; the Helm chart defaults it to the chart
+fullname so every replica in one installation reports the same identity.
+Operators must set a globally distinct name when one telemetry collector serves
+installations in multiple Kubernetes namespaces or clusters.
+The name identifies the gateway installation independently of client-side
+aliases, network names, and the sandbox JWT issuer.
+
 `database_url` is env-only and rejected when present in the file
 (`OPENSHELL_DB_URL` / `--db-url`).
 
@@ -721,12 +751,14 @@ between a trace and its log lines. Store and compute-driver spans become
 children of the request span. Reconciliation, provider refresh, and
 driver-watch loops create their own operation spans because they have no
 inbound request to provide a parent. gRPC status is recorded when response
-trailers arrive.
+trailers arrive. Gateway spans carry resource attributes for the gateway
+identity and configured compute driver.
 
-The gateway forwards OTLP configuration and W3C trace context to managed
-external drivers. Built-in drivers use dedicated in-process providers that
-preserve the same RPC trace boundary. Each driver exports to the configured
-collector under its own service name.
+The gateway forwards OTLP configuration, its configured gateway name, and W3C
+trace context to managed external drivers. Built-in drivers use dedicated
+in-process providers that preserve the same RPC trace boundary. Each driver
+exports to the configured collector under its own service name and carries the
+gateway name as a resource attribute.
 
 Two invariants shape the failure behavior. Telemetry is diagnostic, so no OTLP
 failure stops the gateway from serving: a malformed endpoint is logged at

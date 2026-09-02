@@ -90,13 +90,28 @@ pub(crate) fn compute_driver_rpc_operation(path: &str) -> (&'static str, &'stati
     }
 }
 
+/// Build a tracer provider for the configured OTLP/gRPC endpoint and gateway.
 #[must_use]
-pub fn provider_for(endpoint: Option<&str>) -> (Option<SdkTracerProvider>, Option<SetupError>) {
-    openshell_otel::provider_for(endpoint.map(|endpoint| OtlpTraceConfig {
-        endpoint,
-        service_name: ServiceName::Fixed(SERVICE_NAME),
-        service_version: Some(openshell_core::VERSION),
-        resource_attributes: Vec::new(),
+pub fn provider_for(
+    endpoint: Option<&str>,
+    gateway_name: Option<&str>,
+) -> (Option<SdkTracerProvider>, Option<SetupError>) {
+    openshell_otel::provider_for(endpoint.map(|endpoint| {
+        OtlpTraceConfig {
+            endpoint,
+            service_name: ServiceName::Fixed(SERVICE_NAME),
+            service_version: Some(openshell_core::VERSION),
+            resource_attributes: gateway_name
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(|name| {
+                    vec![opentelemetry::KeyValue::new(
+                        "openshell.gateway.name",
+                        name.to_string(),
+                    )]
+                })
+                .unwrap_or_default(),
+        }
     }))
 }
 
@@ -151,11 +166,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tracing_docker_driver_spans_reach_otlp_collector_with_distinct_service_name() {
+    async fn tracing_docker_driver_spans_reach_otlp_collector_with_resource_identity() {
         let _tracing_lock = super::test_lock().await;
         let collector = OtlpTestServer::start().await;
 
-        let (provider, error) = super::provider_for(Some(collector.endpoint()));
+        let (provider, error) = super::provider_for(Some(collector.endpoint()), Some("docker-dev"));
         assert!(error.is_none());
         let provider = provider.expect("provider");
         let subscriber = tracing_subscriber::registry().with(super::layer(&provider));
@@ -175,6 +190,7 @@ mod tests {
                 .iter()
                 .any(|span| span.name == "docker.schedule_sandbox")
         );
+        assert_eq!(received.gateway_names, ["docker-dev"]);
         assert!(
             received
                 .service_names

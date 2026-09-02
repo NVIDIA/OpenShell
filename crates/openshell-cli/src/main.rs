@@ -7,7 +7,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
 use miette::Result;
-use owo_colors::OwoColorize;
+use openshell_cli::color::{self, ColorChoice, Colorize};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
@@ -368,10 +368,9 @@ const POLICY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
 const SETTINGS_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
   $ openshell settings get my-sandbox
   $ openshell settings get --global
-  $ openshell settings set --global --key providers_v2_enabled --value true
   $ openshell settings set my-sandbox --key ocsf_json_enabled --value true
   $ openshell settings set --global --key ocsf_json_enabled --value true
-  $ openshell settings delete --global --key providers_v2_enabled
+  $ openshell settings delete --global --key ocsf_json_enabled
 ";
 
 const PROVIDER_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
@@ -468,6 +467,18 @@ struct Cli {
     /// Increase verbosity (-v, -vv, -vvv).
     #[arg(short, long, action = clap::ArgAction::Count, global = true, help_heading = "GLOBAL FLAGS")]
     verbose: u8,
+
+    /// When to colorize output. `auto` colorizes only when stdout is a terminal.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value_t = ColorChoice::Auto,
+        value_name = "WHEN",
+        env = "OPENSHELL_COLOR",
+        help_heading = "GLOBAL FLAGS"
+    )]
+    color: ColorChoice,
 
     /// Print help.
     #[arg(short = 'h', long, action = clap::ArgAction::Help, global = true, help_heading = "GLOBAL FLAGS")]
@@ -742,7 +753,7 @@ fn normalize_completion_script(output: Vec<u8>, executable: &std::path::Path) ->
     Ok(script.replace(executable.to_string_lossy().as_ref(), "openshell"))
 }
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum OutputFormat {
     Table,
     Yaml,
@@ -811,7 +822,7 @@ impl From<CliEditor> for openshell_cli::ssh::Editor {
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
-    #[command(group = clap::ArgGroup::new("cred_source").required(true).multiple(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials", "from_oidc_token"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(group = clap::ArgGroup::new("cred_source").required(false).multiple(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials", "from_oidc_token"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
         /// Provider name.
         #[arg(long)]
@@ -1093,8 +1104,9 @@ enum ProviderProfileCommands {
     /// Delete a custom provider profile.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Delete {
-        /// Provider profile id.
-        id: String,
+        /// Provider profile id(s).
+        #[arg(required = true, num_args = 1.., value_name = "ID")]
+        ids: Vec<String>,
 
         /// Target platform-scoped profile (ignores --workspace).
         #[arg(long)]
@@ -1338,6 +1350,10 @@ enum SandboxCommands {
         /// Optional sandbox name (auto-generated when omitted).
         #[arg(long, add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
+
+        /// Create the sandbox from a named sandbox template.
+        #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs"])]
+        template: Option<String>,
 
         /// Sandbox source: a community sandbox name (e.g., `ollama`), a path
         /// to a Dockerfile or directory containing one, or a full container
@@ -1597,6 +1613,15 @@ enum SandboxCommands {
         #[arg(long, overrides_with = "tty")]
         no_tty: bool,
 
+        /// Run the command without sourcing shell login/profile startup files.
+        ///
+        /// Default sources them so tool-specific env (`VIRTUAL_ENV`, etc.) is
+        /// available. Use this for automation and managed checks that need
+        /// predictable startup behavior — sandbox-user startup files cannot run
+        /// before the requested command.
+        #[arg(long)]
+        no_login_shell: bool,
+
         /// Set a non-secret environment variable for the command.
         /// Do not use this option for API keys, tokens, or other secrets; attach
         /// a provider to the sandbox instead. Repeatable.
@@ -1672,6 +1697,10 @@ enum SandboxCommands {
     /// Manage providers attached to a sandbox.
     #[command(subcommand)]
     Provider(SandboxProviderCommands),
+
+    /// Manage reusable sandbox workload templates.
+    #[command(subcommand)]
+    Template(SandboxTemplateCommands),
 }
 
 #[derive(Subcommand, Debug)]
@@ -1682,6 +1711,10 @@ enum SandboxProviderCommands {
         /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// Attach a provider to a sandbox.
@@ -1706,6 +1739,121 @@ enum SandboxProviderCommands {
         /// Provider name to detach.
         #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
         provider: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+// `Create` carries several optional strings and repeated key-value flags. This
+// enum is only used for clap parsing, so boxing fields would add friction
+// without a meaningful runtime win.
+#[allow(clippy::large_enum_variant)]
+enum SandboxTemplateCommands {
+    /// Create a reusable sandbox workload template.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Create {
+        /// Template name.
+        name: String,
+
+        /// Container image for sandboxes created from this template.
+        /// When omitted, the gateway's default sandbox image is used at create time.
+        #[arg(long)]
+        image: Option<String>,
+
+        /// CPU limit for sandboxes created from this template (for example: 500m, 1, 2.5).
+        #[arg(long)]
+        cpu: Option<String>,
+
+        /// Memory limit for sandboxes created from this template (for example: 512Mi, 4Gi, 8G).
+        #[arg(long)]
+        memory: Option<String>,
+
+        /// Request GPU resources for sandboxes created from this template.
+        ///
+        /// Omit COUNT for the driver's default GPU selection, or pass COUNT
+        /// to request a specific number of GPUs.
+        #[arg(long, num_args = 0..=1, value_name = "COUNT", default_missing_value = "", value_parser = parse_gpu_request)]
+        gpu: Option<GpuCliRequest>,
+
+        /// Experimental driver-keyed JSON object for driver-specific sandbox settings.
+        #[arg(long, value_name = "JSON")]
+        driver_config_json: Option<String>,
+
+        /// Target startup readiness duration for this template (for example: 30s, 5m, 1h).
+        #[arg(long, value_name = "DURATION")]
+        ready_within: Option<String>,
+
+        /// Maximum startup burst associated with this template.
+        #[arg(long, value_name = "COUNT", value_parser = clap::value_parser!(u32).range(1..))]
+        max_burst: Option<u32>,
+
+        /// Attach labels to the template (key=value format, repeatable).
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
+
+        /// Attach annotations to the template (key=value format, repeatable).
+        #[arg(long = "annotation", value_name = "KEY=VALUE")]
+        annotations: Vec<String>,
+
+        /// Set a non-secret environment variable in sandboxes created from this template.
+        /// Do not use this option for API keys, tokens, or other secrets; create
+        /// a provider and attach it when creating sandboxes instead. Repeatable.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        envs: Vec<String>,
+
+        /// Suppress warnings when --env values look like credentials.
+        #[arg(long = "no-credential-warnings")]
+        no_credential_warnings: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Fetch a sandbox workload template by name.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Template name.
+        name: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// List sandbox workload templates.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Maximum number of templates to return.
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+
+        /// Offset into the template list.
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+
+        /// Filter templates by labels, e.g. env=prod,team=runtime.
+        #[arg(long)]
+        label_selector: Option<String>,
+
+        /// Print only template names (one per line).
+        #[arg(long, conflicts_with = "output")]
+        names: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with = "names")]
+        output: OutputFormat,
+
+        /// List templates across all workspaces (overrides --workspace).
+        #[arg(long)]
+        all_workspaces: bool,
+    },
+
+    /// Delete sandbox workload templates.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Template names.
+        #[arg(required = true, num_args = 1.., value_name = "NAME")]
+        names: Vec<String>,
     },
 }
 
@@ -1896,6 +2044,10 @@ enum PolicyCommands {
         /// List global policy revisions.
         #[arg(long)]
         global: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// Delete the gateway-global policy lock, restoring sandbox-level policy control.
@@ -2002,9 +2154,13 @@ enum ForwardCommands {
         name: Option<String>,
     },
 
-    /// List active port forwards.
+    /// List tracked port forwards.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    List,
+    List {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
 
     /// Forward a local TCP port to a loopback service inside a sandbox over gRPC.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
@@ -2062,6 +2218,10 @@ enum ServiceCommands {
         /// List services across all workspaces (overrides --workspace).
         #[arg(long)]
         all_workspaces: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// Show one exposed sandbox service endpoint.
@@ -2186,6 +2346,10 @@ enum WorkspaceMemberCommands {
         /// Offset into the member list.
         #[arg(long, default_value_t = 0)]
         offset: u32,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 }
 
@@ -2226,6 +2390,11 @@ async fn run_async() -> Result<()> {
     CompleteEnv::with_factory(Cli::command).complete();
 
     let cli = Cli::parse();
+
+    // Resolve colorization before anything is printed, so no command can emit
+    // escape sequences into a pipe.
+    color::init(cli.color);
+
     let mut tls = TlsOptions::default();
     tls.gateway_insecure = cli.gateway_insecure;
 
@@ -2237,7 +2406,11 @@ async fn run_async() -> Result<()> {
         _ => "trace",
     };
 
+    // The fmt formatter defaults to ANSI on with no terminal detection, and it
+    // writes to stdout, so without this `openshell -v ... | ...` pipes escapes
+    // to the caller.
     tracing_subscriber::fmt()
+        .with_ansi(color::stdout_enabled())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
@@ -2436,8 +2609,23 @@ async fn run_async() -> Result<()> {
                     );
                 }
             }
-            ForwardCommands::List => {
+            ForwardCommands::List { output } => {
                 let forwards = run::list_forwards()?;
+                if openshell_cli::output::print_output_collection(
+                    output.as_str(),
+                    &forwards,
+                    |forward| {
+                        serde_json::json!({
+                            "sandbox": forward.sandbox_name,
+                            "bind_address": forward.bind_addr,
+                            "port": forward.port,
+                            "pid": forward.pid,
+                            "alive": forward.validated_alive,
+                        })
+                    },
+                )? {
+                    return Ok(());
+                }
                 if forwards.is_empty() {
                     eprintln!("No active forwards.");
                 } else {
@@ -2565,6 +2753,7 @@ async fn run_async() -> Result<()> {
                     limit,
                     offset,
                     all_workspaces,
+                    output,
                 } => {
                     run::service_list(
                         &ctx.endpoint,
@@ -2573,6 +2762,7 @@ async fn run_async() -> Result<()> {
                         offset,
                         &cli.workspace,
                         all_workspaces,
+                        output.as_str(),
                         &tls,
                     )
                     .await?;
@@ -2736,14 +2926,28 @@ async fn run_async() -> Result<()> {
                     name,
                     limit,
                     global,
+                    output,
                 } => {
                     if global {
-                        run::sandbox_policy_list_global(&ctx.endpoint, limit, &cli.workspace, &tls)
-                            .await?;
+                        run::sandbox_policy_list_global(
+                            &ctx.endpoint,
+                            limit,
+                            output.as_str(),
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
                     } else {
                         let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
-                        run::sandbox_policy_list(&ctx.endpoint, &name, limit, &cli.workspace, &tls)
-                            .await?;
+                        run::sandbox_policy_list(
+                            &ctx.endpoint,
+                            &name,
+                            limit,
+                            output.as_str(),
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
                     }
                 }
                 PolicyCommands::Delete { global, yes } => {
@@ -2983,6 +3187,7 @@ async fn run_async() -> Result<()> {
             match command {
                 SandboxCommands::Create {
                     name,
+                    template,
                     from,
                     upload,
                     no_git_ignore,
@@ -3071,11 +3276,12 @@ async fn run_async() -> Result<()> {
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name);
-                    Box::pin(run::sandbox_create(
+                    let exit_code = Box::pin(run::sandbox_create(
                         endpoint,
                         &ctx.name,
                         run::SandboxCreateConfig {
                             name: name.as_deref(),
+                            template: template.as_deref(),
                             from: from.as_deref(),
                             uploads: &upload_specs,
                             keep,
@@ -3100,6 +3306,9 @@ async fn run_async() -> Result<()> {
                         &tls,
                     ))
                     .await?;
+                    if exit_code != 0 {
+                        std::process::exit(exit_code);
+                    }
                 }
                 SandboxCommands::Upload {
                     name,
@@ -3225,7 +3434,12 @@ async fn run_async() -> Result<()> {
                                 )
                                 .await?;
                             } else {
-                                run::sandbox_connect(endpoint, &name, &tls, &cli.workspace).await?;
+                                let exit_code =
+                                    run::sandbox_connect(endpoint, &name, &tls, &cli.workspace)
+                                        .await?;
+                                if exit_code != 0 {
+                                    std::process::exit(exit_code);
+                                }
                             }
                             let _ = save_last_sandbox(&ctx.name, &cli.workspace, &name);
                         }
@@ -3237,6 +3451,7 @@ async fn run_async() -> Result<()> {
                             no_tty,
                             envs,
                             command,
+                            no_login_shell,
                         } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                             // Resolve --tty / --no-tty into an Option<bool> override.
@@ -3256,6 +3471,7 @@ async fn run_async() -> Result<()> {
                                 timeout,
                                 tty_override,
                                 &env_map,
+                                no_login_shell,
                                 &tls,
                                 &cli.workspace,
                             )
@@ -3270,10 +3486,16 @@ async fn run_async() -> Result<()> {
                             run::print_ssh_config(&ctx.name, &name, &cli.workspace);
                         }
                         SandboxCommands::Provider(command) => match command {
-                            SandboxProviderCommands::List { name } => {
+                            SandboxProviderCommands::List { name, output } => {
                                 let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
-                                run::sandbox_provider_list(endpoint, &name, &cli.workspace, &tls)
-                                    .await?;
+                                run::sandbox_provider_list(
+                                    endpoint,
+                                    &name,
+                                    output.as_str(),
+                                    &cli.workspace,
+                                    &tls,
+                                )
+                                .await?;
                             }
                             SandboxProviderCommands::Attach { name, provider } => {
                                 run::sandbox_provider_attach(
@@ -3290,6 +3512,89 @@ async fn run_async() -> Result<()> {
                                     endpoint,
                                     &name,
                                     &provider,
+                                    &cli.workspace,
+                                    &tls,
+                                )
+                                .await?;
+                            }
+                        },
+                        SandboxCommands::Template(command) => match command {
+                            SandboxTemplateCommands::Create {
+                                name,
+                                image,
+                                cpu,
+                                memory,
+                                gpu,
+                                driver_config_json,
+                                ready_within,
+                                max_burst,
+                                labels,
+                                annotations,
+                                envs,
+                                no_credential_warnings,
+                                output,
+                            } => {
+                                let labels = run::parse_key_value_pairs(&labels, "--label")?;
+                                let annotations =
+                                    run::parse_key_value_pairs(&annotations, "--annotation")?;
+                                let environment = run::parse_env_pairs(&envs)?;
+                                run::warn_credential_env_vars(&environment, no_credential_warnings);
+                                let gpu_requirements: Option<GpuResourceRequirements> =
+                                    gpu.map(Into::into);
+                                run::sandbox_template_create(
+                                    endpoint,
+                                    &name,
+                                    image.as_deref(),
+                                    cpu.as_deref(),
+                                    memory.as_deref(),
+                                    gpu_requirements,
+                                    driver_config_json.as_deref(),
+                                    ready_within.as_deref(),
+                                    max_burst,
+                                    labels,
+                                    annotations,
+                                    environment,
+                                    output.as_str(),
+                                    &cli.workspace,
+                                    &tls,
+                                )
+                                .await?;
+                            }
+                            SandboxTemplateCommands::Get { name, output } => {
+                                run::sandbox_template_get(
+                                    endpoint,
+                                    &name,
+                                    output.as_str(),
+                                    &cli.workspace,
+                                    &tls,
+                                )
+                                .await?;
+                            }
+                            SandboxTemplateCommands::List {
+                                limit,
+                                offset,
+                                label_selector,
+                                names,
+                                output,
+                                all_workspaces,
+                            } => {
+                                run::sandbox_template_list(
+                                    endpoint,
+                                    limit,
+                                    offset,
+                                    label_selector.as_deref(),
+                                    names,
+                                    output.as_str(),
+                                    &cli.workspace,
+                                    all_workspaces,
+                                    &tls,
+                                )
+                                .await?;
+                            }
+                            SandboxTemplateCommands::Delete { names } => {
+                                run::sandbox_template_delete(
+                                    endpoint,
+                                    &names,
                                     &cli.workspace,
                                     &tls,
                                 )
@@ -3354,9 +3659,17 @@ async fn run_async() -> Result<()> {
                         workspace,
                         limit,
                         offset,
+                        output,
                     } => {
-                        run::workspace_member_list(endpoint, &workspace, limit, offset, &tls)
-                            .await?;
+                        run::workspace_member_list(
+                            endpoint,
+                            &workspace,
+                            limit,
+                            offset,
+                            output.as_str(),
+                            &tls,
+                        )
+                        .await?;
                     }
                 },
             }
@@ -3543,10 +3856,10 @@ async fn run_async() -> Result<()> {
                             )
                             .await?;
                         }
-                        ProviderProfileCommands::Delete { id, global } => {
+                        ProviderProfileCommands::Delete { ids, global } => {
                             run::provider_profile_delete(
                                 endpoint,
-                                &id,
+                                &ids,
                                 profile_workspace(global),
                                 &tls,
                             )
@@ -4494,18 +4807,170 @@ mod tests {
             }) if id == "custom-api"
         ));
 
-        let delete =
-            Cli::try_parse_from(["openshell", "provider", "profile", "delete", "custom-api"])
-                .expect("provider profile delete should parse");
+        let delete = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "profile",
+            "delete",
+            "custom-api",
+            "custom-alt",
+        ])
+        .expect("provider profile delete should parse");
         assert!(matches!(
             delete.command,
             Some(Commands::Provider {
                 command: Some(ProviderCommands::Profile(ProviderProfileCommands::Delete {
-                    id,
+                    ids,
                     ..
                 }))
-            }) if id == "custom-api"
+            }) if ids == vec!["custom-api".to_string(), "custom-alt".to_string()]
         ));
+    }
+
+    #[test]
+    fn forward_list_default_output_is_table() {
+        let cli = Cli::try_parse_from(["openshell", "forward", "list"])
+            .expect("forward list should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Forward {
+                command: Some(ForwardCommands::List {
+                    output: OutputFormat::Table,
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn forward_list_accepts_structured_output() {
+        for (format, expected) in [("json", OutputFormat::Json), ("yaml", OutputFormat::Yaml)] {
+            let cli = Cli::try_parse_from(["openshell", "forward", "list", "-o", format])
+                .unwrap_or_else(|error| panic!("forward list -o {format} should parse: {error}"));
+
+            let Some(Commands::Forward {
+                command: Some(ForwardCommands::List { output }),
+            }) = cli.command
+            else {
+                panic!("expected forward list command");
+            };
+            assert_eq!(output, expected, "unexpected output format for {format}");
+        }
+    }
+
+    #[test]
+    fn remaining_list_commands_default_output_to_table() {
+        let sandbox_provider = Cli::try_parse_from(["openshell", "sandbox", "provider", "list"])
+            .expect("sandbox provider list should parse");
+        assert!(matches!(
+            sandbox_provider.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Provider(SandboxProviderCommands::List {
+                    output: OutputFormat::Table,
+                    ..
+                })),
+            })
+        ));
+
+        let policy =
+            Cli::try_parse_from(["openshell", "policy", "list"]).expect("policy list should parse");
+        assert!(matches!(
+            policy.command,
+            Some(Commands::Policy {
+                command: Some(PolicyCommands::List {
+                    output: OutputFormat::Table,
+                    ..
+                }),
+            })
+        ));
+
+        let service = Cli::try_parse_from(["openshell", "service", "list"])
+            .expect("service list should parse");
+        assert!(matches!(
+            service.command,
+            Some(Commands::Service {
+                command: Some(ServiceCommands::List {
+                    output: OutputFormat::Table,
+                    ..
+                }),
+            })
+        ));
+
+        let workspace_member = Cli::try_parse_from([
+            "openshell",
+            "workspace",
+            "member",
+            "list",
+            "--workspace",
+            "default",
+        ])
+        .expect("workspace member list should parse");
+        assert!(matches!(
+            workspace_member.command,
+            Some(Commands::Workspace {
+                command: Some(WorkspaceCommands::Member(WorkspaceMemberCommands::List {
+                    output: OutputFormat::Table,
+                    ..
+                })),
+            })
+        ));
+    }
+
+    #[test]
+    fn remaining_list_commands_accept_structured_output() {
+        for (format, expected) in [("json", OutputFormat::Json), ("yaml", OutputFormat::Yaml)] {
+            let sandbox_provider =
+                Cli::try_parse_from(["openshell", "sandbox", "provider", "list", "-o", format])
+                    .unwrap_or_else(|error| panic!("sandbox provider list -o {format}: {error}"));
+            let Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Provider(SandboxProviderCommands::List { output, .. })),
+            }) = sandbox_provider.command
+            else {
+                panic!("expected sandbox provider list command");
+            };
+            assert_eq!(output, expected);
+
+            let policy = Cli::try_parse_from(["openshell", "policy", "list", "--output", format])
+                .unwrap_or_else(|error| panic!("policy list --output {format}: {error}"));
+            let Some(Commands::Policy {
+                command: Some(PolicyCommands::List { output, .. }),
+            }) = policy.command
+            else {
+                panic!("expected policy list command");
+            };
+            assert_eq!(output, expected);
+
+            let service = Cli::try_parse_from(["openshell", "service", "list", "-o", format])
+                .unwrap_or_else(|error| panic!("service list -o {format}: {error}"));
+            let Some(Commands::Service {
+                command: Some(ServiceCommands::List { output, .. }),
+            }) = service.command
+            else {
+                panic!("expected service list command");
+            };
+            assert_eq!(output, expected);
+
+            let workspace_member = Cli::try_parse_from([
+                "openshell",
+                "workspace",
+                "member",
+                "list",
+                "--workspace",
+                "default",
+                "-o",
+                format,
+            ])
+            .unwrap_or_else(|error| panic!("workspace member list -o {format}: {error}"));
+            let Some(Commands::Workspace {
+                command:
+                    Some(WorkspaceCommands::Member(WorkspaceMemberCommands::List { output, .. })),
+            }) = workspace_member.command
+            else {
+                panic!("expected workspace member list command");
+            };
+            assert_eq!(output, expected);
+        }
     }
 
     #[test]
@@ -4714,8 +5179,8 @@ mod tests {
     }
 
     #[test]
-    fn provider_create_requires_credential_source() {
-        let err = Cli::try_parse_from([
+    fn provider_create_accepts_no_credential_source() {
+        let cli = Cli::try_parse_from([
             "openshell",
             "provider",
             "create",
@@ -4724,9 +5189,21 @@ mod tests {
             "--type",
             "spiffe-token-demo",
         ])
-        .expect_err("provider create should require a credential source");
+        .expect("provider create should allow profiles without static credentials");
 
-        assert!(err.to_string().contains("--runtime-credentials"));
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Create {
+                    from_existing: false,
+                    credentials,
+                    from_gcloud_adc: false,
+                    from_oidc_token: false,
+                    runtime_credentials: false,
+                    ..
+                })
+            }) if credentials.is_empty()
+        ));
     }
 
     #[test]
@@ -5339,6 +5816,226 @@ mod tests {
                 assert_eq!(driver_config_json.as_deref(), Some(json));
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_template_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--template",
+            "gpu-kata",
+            "--provider",
+            "github",
+        ])
+        .expect("sandbox create template flag should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        template,
+                        providers,
+                        ..
+                    }),
+                ..
+            }) => {
+                assert_eq!(template.as_deref(), Some("gpu-kata"));
+                assert_eq!(providers, vec!["github".to_string()]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_template_conflicts_with_inline_workload_flags() {
+        for (label, extra_args) in [
+            ("--from", &["--from", "python:3.12"][..]),
+            ("--gpu", &["--gpu"][..]),
+            ("--cpu", &["--cpu", "1"][..]),
+            ("--memory", &["--memory", "2Gi"][..]),
+            ("--env", &["--env", "FOO=bar"][..]),
+            (
+                "--driver-config-json",
+                &["--driver-config-json", r#"{"kubernetes":{}}"#][..],
+            ),
+        ] {
+            let args = ["openshell", "sandbox", "create", "--template", "base"]
+                .into_iter()
+                .chain(extra_args.iter().copied());
+            let result = Cli::try_parse_from(args);
+            assert!(result.is_err(), "--template should conflict with {label}");
+        }
+    }
+
+    #[test]
+    fn sandbox_template_create_parses_workload_flags() {
+        let json = r#"{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}"#;
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "template",
+            "create",
+            "gpu-kata",
+            "--image",
+            "registry.example.com/agent:latest",
+            "--cpu",
+            "2",
+            "--memory",
+            "4Gi",
+            "--gpu",
+            "1",
+            "--driver-config-json",
+            json,
+            "--ready-within",
+            "5m",
+            "--max-burst",
+            "3",
+            "--label",
+            "team=runtime",
+            "--annotation",
+            "owner=platform",
+            "--env",
+            "FEATURE_FLAG=on",
+            "--no-credential-warnings",
+            "--output",
+            "json",
+        ])
+        .expect("sandbox template create should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Template(SandboxTemplateCommands::Create {
+                        name,
+                        image,
+                        cpu,
+                        memory,
+                        gpu,
+                        driver_config_json,
+                        ready_within,
+                        max_burst,
+                        labels,
+                        annotations,
+                        envs,
+                        no_credential_warnings,
+                        output,
+                    })),
+                ..
+            }) => {
+                assert_eq!(name, "gpu-kata");
+                assert_eq!(image.as_deref(), Some("registry.example.com/agent:latest"));
+                assert_eq!(cpu.as_deref(), Some("2"));
+                assert_eq!(memory.as_deref(), Some("4Gi"));
+                assert_eq!(gpu, Some(GpuCliRequest::Count(1)));
+                assert_eq!(driver_config_json.as_deref(), Some(json));
+                assert_eq!(ready_within.as_deref(), Some("5m"));
+                assert_eq!(max_burst, Some(3));
+                assert_eq!(labels, vec!["team=runtime".to_string()]);
+                assert_eq!(annotations, vec!["owner=platform".to_string()]);
+                assert_eq!(envs, vec!["FEATURE_FLAG=on".to_string()]);
+                assert!(no_credential_warnings);
+                assert!(matches!(output, OutputFormat::Json));
+            }
+            other => panic!("expected SandboxTemplateCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_template_list_parses_names_and_all_workspaces() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "template",
+            "list",
+            "--names",
+            "--all-workspaces",
+            "--label-selector",
+            "team=runtime",
+            "--limit",
+            "25",
+            "--offset",
+            "5",
+        ])
+        .expect("sandbox template list should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Template(SandboxTemplateCommands::List {
+                        limit,
+                        offset,
+                        label_selector,
+                        names,
+                        all_workspaces,
+                        ..
+                    })),
+                ..
+            }) => {
+                assert_eq!(limit, 25);
+                assert_eq!(offset, 5);
+                assert_eq!(label_selector.as_deref(), Some("team=runtime"));
+                assert!(names);
+                assert!(all_workspaces);
+            }
+            other => panic!("expected SandboxTemplateCommands::List, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_template_list_names_conflicts_with_output() {
+        let result = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "template",
+            "list",
+            "--names",
+            "--output",
+            "json",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sandbox_template_create_image_is_optional() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "template", "create", "base"])
+            .expect("sandbox template create without --image should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Template(SandboxTemplateCommands::Create { image, .. })),
+                ..
+            }) => {
+                assert_eq!(image, None);
+            }
+            other => panic!("expected SandboxTemplateCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_template_create_gpu_parses_driver_default() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "template",
+            "create",
+            "gpu-kata",
+            "--gpu",
+        ])
+        .expect("sandbox template create --gpu should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Template(SandboxTemplateCommands::Create { gpu, .. })),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::DriverDefault));
+            }
+            other => panic!("expected SandboxTemplateCommands::Create, got: {other:?}"),
         }
     }
 

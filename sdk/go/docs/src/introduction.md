@@ -4,7 +4,7 @@ The OpenShell Go SDK provides an idiomatic Go client for the OpenShell gateway A
 
 ## Key Features
 
-- **Sub-client pattern**: A single `Client` provides typed accessors for each API domain (Sandboxes, Exec, Providers, Files, Health, SSH, TCP, Config, Policy, Services)
+- **Sub-client pattern**: A single `Client` provides typed accessors for each API domain (Sandboxes, SandboxTemplates, Exec, Providers, Files, Health, SSH, TCP, Config, Policy, Services)
 - **Clean types**: SDK types are self-contained, so your code works with idiomatic Go types without extra dependencies
 - **Fake client for testing**: An in-memory implementation of the full `ClientInterface` for testing without a live gateway
 - **Watch and streaming**: First-class support for watching sandbox state changes and streaming command output

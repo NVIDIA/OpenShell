@@ -105,13 +105,8 @@ OpenShell exposes Anthropic Vertex routes for inference only. It does not advert
 
 ## Configure Inference Routing
 
-Before configuring inference routing, enable provider endpoint injection so the Vertex AI network endpoints are automatically included in sandbox policies:
-
-```shell
-openshell settings set --global --key providers_v2_enabled --value true --yes
-```
-
-Then point `inference.local` at the provider:
+Point `inference.local` at the provider. The Vertex AI profile contributes its
+network endpoints to sandbox policies automatically:
 
 ```shell
 openshell inference set \
@@ -137,10 +132,7 @@ Agents inside sandboxes should reach Vertex AI through `inference.local`, not by
 The complete setup from scratch:
 
 ```shell
-# 1. Enable provider endpoint injection
-openshell settings set --global --key providers_v2_enabled --value true --yes
-
-# 2. Create the provider
+# 1. Create the provider
 openshell provider create \
   --name vertex-local \
   --type google-vertex-ai \
@@ -148,10 +140,10 @@ openshell provider create \
   --config VERTEX_AI_PROJECT_ID=my-gcp-project \
   --config VERTEX_AI_REGION=us-central1
 
-# 3. Configure inference routing
+# 2. Configure inference routing
 openshell inference set --provider vertex-local --model claude-sonnet-4-6 --no-verify
 
-# 4. Create a sandbox with the provider attached
+# 3. Create a sandbox with the provider attached
 openshell sandbox create --name my-sandbox --provider vertex-local
 ```
 

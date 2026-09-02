@@ -33,6 +33,7 @@ go = "1.26"
 buf = "1.72.0"
 helm = { version = "4.2.0", version_prefix = "v" }
 helm-docs = "1.14.2"
+yq = "4.53.6"
 skaffold = { version = "2.20.0", os = ["linux", "macos"], version_prefix = "v" }
 # Keep k3d out of Linux CI images until upstream ships a release rebuilt with
 # patched Go/container dependencies. Linux Kubernetes E2E uses kind or an

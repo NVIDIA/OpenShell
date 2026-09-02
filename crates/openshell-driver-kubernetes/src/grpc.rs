@@ -5,14 +5,15 @@
 
 use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
-    CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DeleteWorkspaceRequest, DeleteWorkspaceResponse, EnsureWorkspaceRequest,
-    EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse,
-    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
-    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
-    StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
-    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
-    WatchSandboxesRequest, compute_driver_server::ComputeDriver,
+    AuthenticateSandboxRequest, AuthenticateSandboxResponse, CreateSandboxRequest,
+    CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse, DeleteWorkspaceRequest,
+    DeleteWorkspaceResponse, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
+    ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
+    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
+    compute_driver_server::ComputeDriver,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -122,6 +123,18 @@ impl ComputeDriverService {
 
 #[tonic::async_trait]
 impl ComputeDriver for ComputeDriverService {
+    async fn authenticate_sandbox(
+        &self,
+        request: Request<AuthenticateSandboxRequest>,
+    ) -> Result<Response<AuthenticateSandboxResponse>, Status> {
+        let credential = request.into_inner().credential;
+        if credential.is_empty() {
+            return Err(Status::invalid_argument("credential is required"));
+        }
+        let sandbox_id = self.driver.authenticate_sandbox(&credential).await?;
+        Ok(Response::new(AuthenticateSandboxResponse { sandbox_id }))
+    }
+
     async fn get_capabilities(
         &self,
         _request: Request<GetCapabilitiesRequest>,

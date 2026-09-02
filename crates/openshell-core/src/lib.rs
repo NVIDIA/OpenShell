@@ -16,6 +16,7 @@ pub mod container_paths;
 pub mod denial;
 pub mod driver_mounts;
 pub mod driver_utils;
+pub mod dynamic_string_allowlist;
 pub mod endpoint_path;
 pub mod error;
 #[cfg(unix)]
@@ -28,12 +29,12 @@ pub mod host_pattern;
 pub mod image;
 pub mod inference;
 pub mod jwt;
+pub mod local_api_socket;
 pub mod metadata;
 pub mod middleware;
 pub mod net;
 #[cfg(feature = "oauth")]
 pub mod oauth;
-pub mod operator_namespace_allowlist;
 pub mod paths;
 pub mod policy;
 pub mod progress;
@@ -50,16 +51,16 @@ pub mod time;
 pub mod transport_errors;
 
 pub use config::{
-    ComputeDriverKind, Config, GatewayAuthConfig, GatewayInterceptorBindingOverride,
-    GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
-    GatewayInterceptorPhaseConfig, GatewayJwtConfig, GatewayProviderProfileSourceConfig,
-    MtlsAuthConfig, OidcConfig, PolicyValidationFailureMode, TlsConfig,
+    Config, GatewayAuthConfig, GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy,
+    GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig,
+    GatewayJwtConfig, GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig,
+    PolicyValidationFailureMode, TlsConfig,
 };
+pub use dynamic_string_allowlist::DynamicStringAllowlist;
 pub use error::{ComputeDriverError, Error, Result};
 pub use metadata::{
     GetResourceVersion, ObjectId, ObjectLabels, ObjectName, ObjectWorkspace, SetResourceVersion,
 };
-pub use operator_namespace_allowlist::OperatorNamespaceAllowlist;
 
 /// Build version string derived from git metadata.
 ///

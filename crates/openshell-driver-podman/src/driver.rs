@@ -311,11 +311,21 @@ fn podman_gpu_selection_error(err: CdiGpuSelectionError) -> ComputeDriverError {
     ComputeDriverError::Precondition(err.to_string())
 }
 
+/// Return the first responsive local Podman API socket.
+#[must_use]
+pub fn detect_socket() -> Option<PathBuf> {
+    crate::socket_discovery::detect_socket()
+}
+
+#[must_use]
+pub fn is_available() -> bool {
+    detect_socket().is_some()
+}
+
 /// Resolve the socket to connect to: explicit configuration wins, otherwise
 /// fall back to `detect`. Returns an error if neither resolves.
 ///
-/// Takes `detect` as a parameter (rather than calling
-/// [`openshell_core::config::detect_podman_socket`] directly) so tests can
+/// Takes `detect` as a parameter so tests can
 /// exercise the precedence deterministically, without touching real
 /// environment variables or the filesystem.
 fn resolve_socket_path(
@@ -337,10 +347,7 @@ impl PodmanComputeDriver {
         const MAX_PING_RETRIES: u32 = 5;
         const PING_RETRY_DELAY: Duration = Duration::from_secs(2);
 
-        let socket_path = resolve_socket_path(
-            config.socket_path.clone(),
-            openshell_core::config::detect_podman_socket,
-        )?;
+        let socket_path = resolve_socket_path(config.socket_path.clone(), detect_socket)?;
         config.socket_path = Some(socket_path.clone());
 
         if !socket_path.exists() {
@@ -507,6 +514,8 @@ impl PodmanComputeDriver {
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,
+            supports_sandbox_authentication: false,
+            driver_reports_runtime_readiness: false,
         })
     }
 

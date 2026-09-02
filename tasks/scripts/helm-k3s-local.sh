@@ -142,12 +142,15 @@ k3d_cluster_exists() {
 
 merge_kubeconfig() {
   require_kubectl
-  local tmp k3d_cfg merged_dir
+  local tmp merged_dir
   tmp="$(mktemp)"
   k3d kubeconfig get "${CLUSTER_NAME}" >"${tmp}"
 
   if [[ -s "${KUBECONFIG_TARGET}" ]]; then
-    KUBECONFIG="${KUBECONFIG_TARGET}:${tmp}" kubectl config view --flatten >"${tmp}.out"
+    # Put the freshly generated k3d config first so its cluster, context, and
+    # user entries replace stale entries with the same names. The API server's
+    # random host port can change when Docker recreates the load balancer.
+    KUBECONFIG="${tmp}:${KUBECONFIG_TARGET}" kubectl config view --flatten >"${tmp}.out"
     mv "${tmp}.out" "${KUBECONFIG_TARGET}"
   else
     merged_dir="$(dirname "${KUBECONFIG_TARGET}")"
@@ -394,7 +397,8 @@ EOF
   local lb_port_map="${HOST_LB_PORT}:80@loadbalancer"
 
   if k3d_cluster_exists; then
-    echo "k3d cluster '${CLUSTER_NAME}' already exists; merging kubeconfig."
+    echo "k3d cluster '${CLUSTER_NAME}' already exists; ensuring it is running."
+    k3d cluster start "${CLUSTER_NAME}"
   else
     echo "Creating k3d cluster '${CLUSTER_NAME}'..."
     k3d cluster create "${CLUSTER_NAME}" \

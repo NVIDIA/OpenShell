@@ -438,6 +438,34 @@ url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-x86_64-pc-wi
 url_api = "https://api.github.com/repos/astral-sh/uv/releases/assets/377491992"
 provenance = "github-attestations"
 
+[[tools.yq]]
+version = "4.53.6"
+backend = "aqua:mikefarah/yq"
+
+[tools.yq."platforms.linux-arm64"]
+checksum = "sha256:88a1016bc1d657375a35864e4f44b6f333df8ff97b559f51bba0adcb2169df09"
+url = "https://github.com/mikefarah/yq/releases/download/v4.53.6/yq_linux_arm64"
+url_api = "https://api.github.com/repos/mikefarah/yq/releases/assets/522028007"
+provenance = "cosign"
+
+[tools.yq."platforms.linux-x64"]
+checksum = "sha256:c5f056448f973ae7d39b5401949648a78f2dc1947d6a8eb65be60d5c504b9385"
+url = "https://github.com/mikefarah/yq/releases/download/v4.53.6/yq_linux_amd64"
+url_api = "https://api.github.com/repos/mikefarah/yq/releases/assets/522028022"
+provenance = "cosign"
+
+[tools.yq."platforms.macos-arm64"]
+checksum = "sha256:cceb0b8d71ea5294334121f8429f33f92b920e7217d904a2f9f35443968ac424"
+url = "https://github.com/mikefarah/yq/releases/download/v4.53.6/yq_darwin_arm64"
+url_api = "https://api.github.com/repos/mikefarah/yq/releases/assets/522028033"
+provenance = "cosign"
+
+[tools.yq."platforms.windows-x64"]
+checksum = "sha256:ece3dd8bb50d39f93610506273ea262feb91e5c486bbddbb10abf91b2a6c0f14"
+url = "https://github.com/mikefarah/yq/releases/download/v4.53.6/yq_windows_amd64.exe"
+url_api = "https://api.github.com/repos/mikefarah/yq/releases/assets/522027974"
+provenance = "cosign"
+
 [[tools.zig]]
 version = "0.14.1"
 backend = "core:zig"

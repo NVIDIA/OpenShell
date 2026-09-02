@@ -40,6 +40,9 @@ struct Args {
     #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
 
+    #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
+    gateway_name: Option<String>,
+
     /// Path to the Podman API Unix socket.
     #[arg(long, env = "OPENSHELL_PODMAN_SOCKET")]
     podman_socket: Option<PathBuf>,
@@ -174,8 +177,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let (tracer_provider, setup_error) =
-        openshell_driver_podman::otel_tracing::provider_for(args.otlp_endpoint.as_deref());
+    let (tracer_provider, setup_error) = openshell_driver_podman::otel_tracing::provider_for(
+        args.otlp_endpoint.as_deref(),
+        args.gateway_name.as_deref(),
+    );
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)))
         .with(tracing_subscriber::fmt::layer())
@@ -306,17 +311,20 @@ mod tests {
     }
 
     #[test]
-    fn accepts_gateway_otlp_endpoint() {
+    fn accepts_gateway_otlp_configuration() {
         let args = Args::try_parse_from([
             "openshell-driver-podman",
             "--otlp-endpoint",
             "http://collector.internal:4317",
+            "--gateway-name",
+            "production-us-west",
         ])
-        .expect("OTLP endpoint should be accepted");
+        .expect("OTLP configuration should be accepted");
 
         assert_eq!(
             args.otlp_endpoint.as_deref(),
             Some("http://collector.internal:4317")
         );
+        assert_eq!(args.gateway_name.as_deref(), Some("production-us-west"));
     }
 }

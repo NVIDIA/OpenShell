@@ -102,6 +102,14 @@ sandboxServiceAccount:
   # -- Existing service account name for sandbox pods when sandboxServiceAccount.create is false.
   name: ""
 
+# Namespace-scoped resources needed to run sandboxes. Disable this when the
+# gateway and workspace prerequisites are managed as separate Helm releases
+# using the openshell-workspace chart.
+workspaceResources:
+  # -- Create the sandbox ServiceAccount, Role, RoleBinding, and NetworkPolicy
+  # from this chart. Disable for a gateway-only release.
+  enabled: true
+
 # -- Extra annotations to add to the gateway pod.
 podAnnotations: {}
 # -- Extra labels to add to the gateway pod.
@@ -189,6 +197,10 @@ affinity: {}
 
 # Server configuration
 server:
+  # -- Operator-facing gateway name. Defaults to the chart fullname so all
+  # replicas in one installation share an identity. Set explicitly when one
+  # telemetry collector receives spans from multiple namespaces or clusters.
+  name: ""
   # -- Gateway log level.
   logLevel: info
   # OpenTelemetry trace export over OTLP/gRPC. Leave endpoint empty to disable.
@@ -355,6 +367,7 @@ server:
     certSecretName: openshell-server-tls
     # -- K8s secret with ca.crt for client certificate verification (mTLS).
     # Set to "" to disable mTLS and run HTTPS-only (use OIDC for auth instead).
+    # Do not set to null; omit the key to use the default secret name above.
     clientCaSecretName: openshell-server-client-ca
     # -- K8s secret mounted into sandbox pods for mTLS to the server.
     clientTlsSecretName: openshell-client-tls

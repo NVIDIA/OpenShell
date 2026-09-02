@@ -21,12 +21,27 @@ openshell sandbox create -- claude
 ```
 
 The trailing command is the sandbox's canonical main process. OpenShell starts
-it once and attaches your terminal to it. With no trailing command, OpenShell
+it once, streams its output, and returns its exit status. Exit code 0 leaves a
+retained sandbox in `Completed`; a nonzero exit leaves it in `Error` with a
+`MainProcessFailed` condition. With no trailing command, OpenShell
 starts `/bin/bash -l` in a retained pseudo-terminal. Add `--detach` to create
 the sandbox without attaching:
 
 ```shell
 openshell sandbox create --name worker --detach -- ./worker
+```
+
+Detached commands have no attachment grace period. When the command exits,
+OpenShell records its terminal phase immediately. For a foreground command,
+the create request declares one expected SSH attachment. OpenShell retains the
+terminal transport until that connection drains and closes naturally, then
+finalizes ephemeral cleanup.
+
+Use `--no-keep` for an ephemeral command. OpenShell drains stdout and stderr,
+captures the command result, and deletes the sandbox after the command exits:
+
+```shell
+openshell sandbox create --no-keep -- sh -c 'echo done; exit 0'
 ```
 
 `--upload` cannot yet be combined with a trailing main command because uploads
@@ -142,6 +157,59 @@ Local directories and Dockerfiles require a local gateway because the CLI builds
 through the local Docker daemon. Use a registry image reference for remote
 gateways.
 
+## Reuse Workload Templates
+
+Sandbox workload templates let workspace admins define reusable runtime shapes for a workspace. A template stores the image, environment, resource requests, and driver-specific configuration that sandboxes should inherit. When you create a sandbox from a template, the create request can still attach providers, labels, and policy, but the workload comes from the named template.
+
+Create a template:
+
+```shell
+openshell sandbox template create gpu-kata \
+  --image registry.example.com/agent:latest \
+  --cpu 2 \
+  --memory 4Gi \
+  --gpu 1 \
+  --label team=runtime \
+  --env FEATURE_FLAG=on
+```
+
+Use `--gpu` without a count when the template should request the active
+driver's default GPU assignment. Use `--gpu COUNT` when the template needs a
+specific number of GPUs.
+
+Add driver-specific settings when the active compute driver needs them:
+
+```shell
+openshell sandbox template create gpu-kata \
+  --image registry.example.com/agent:latest \
+  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","node_selector":{"pool":"gpu"}}}}'
+```
+
+If you omit `--image`, the gateway applies its default sandbox image when a sandbox is created from the template. Use this when the template should only define resource, environment, or driver settings.
+
+Create a sandbox from a template:
+
+```shell
+openshell sandbox create --template gpu-kata --provider github -- claude
+```
+
+The `--template` flag cannot be combined with inline workload flags such as `--from`, `--cpu`, `--memory`, `--gpu`, `--env`, or `--driver-config-json`. Put those values on the template instead. Create-time policy and provider attachments remain part of the sandbox request, so each sandbox can keep its own access boundary.
+
+Inspect and manage templates:
+
+```shell
+openshell sandbox template list
+openshell sandbox template list --label-selector team=runtime
+openshell sandbox template get gpu-kata
+openshell sandbox template delete gpu-kata
+```
+
+Use `--all-workspaces` with `sandbox template list` when you need an admin view across workspaces:
+
+```shell
+openshell sandbox template list --all-workspaces
+```
+
 ## Base Sandbox Container
 
 The `base` sandbox container is the default runtime image for standard OpenShell sandboxes unless the gateway overrides its default sandbox image. It is published as `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` and maintained in the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) repository.
@@ -206,14 +274,27 @@ openshell sandbox exec -n my-sandbox --tty -- /bin/bash
 
 OpenShell allocates a TTY automatically when both stdin and stdout are terminals. Force the behavior with `--tty` or disable it with `--no-tty`.
 
-| Flag           | Purpose                                                  |
-| -------------- | -------------------------------------------------------- |
-| `-n`, `--name` | Sandbox to target.                                       |
-| `--workdir`    | Working directory for the command inside the sandbox.    |
-| `--timeout`    | Command timeout in seconds. `0` disables the timeout.    |
-| `--tty`        | Force TTY allocation.                                    |
-| `--no-tty`     | Disable TTY allocation even when attached to a terminal. |
-| `--env`        | Set an environment variable for the command (`KEY=VALUE`, repeatable). |
+| Flag              | Purpose                                                  |
+| ----------------- | -------------------------------------------------------- |
+| `-n`, `--name`    | Sandbox to target.                                       |
+| `--workdir`       | Working directory for the command inside the sandbox.    |
+| `--timeout`       | Command timeout in seconds. `0` disables the timeout.    |
+| `--tty`           | Force TTY allocation.                                    |
+| `--no-tty`        | Disable TTY allocation even when attached to a terminal. |
+| `--no-login-shell`| Run the command without sourcing shell login startup files. |
+| `--env`           | Set an environment variable for the command (`KEY=VALUE`, repeatable). |
+
+### Skip shell startup files
+
+By default `sandbox exec` runs the command through a login shell (`bash -lc`), so the sandbox user's first available `.bash_profile`, `.bash_login`, or `.profile` is sourced first (and `.bashrc` only if that login file sources it). This makes tool-specific environment configuration available automatically, which suits interactive and tool-discovery use.
+
+For automation and managed checks that need predictable output and side effects, pass `--no-login-shell` so those startup files are not sourced before the command runs:
+
+```shell
+openshell sandbox exec -n my-sandbox --no-login-shell -- /usr/local/bin/managed-probe
+```
+
+In this mode a sandbox user's login startup files cannot write to the command's output, create files, or otherwise affect the requested command before it starts. The command still runs under `bash -c`, which reads `BASH_ENV` if it is set in the command's environment. The default (login-shell) behavior is unchanged when the flag is omitted.
 
 ## Set Environment Variables
 
@@ -225,7 +306,7 @@ openshell sandbox create --env API_KEY=sk-test --env DEBUG=1 -- my-agent
 
 Variables set with `--env` are available to all processes in the sandbox, including interactive shells and exec commands.
 
-When an `--env` key looks like a credential — a known provider variable, or a name whose underscore-separated segments include a credential word such as `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `API_KEY`, `ACCESS_KEY`, or `SECRET_KEY` (for example `DB_TOKEN` or `MY_ACCESS_KEY`) — `sandbox create` prints a non-blocking warning. Matching is on whole segments, so unrelated names like `TOKENIZERS_PARALLELISM` or `PASSWORDLESS_LOGIN` do not warn. The agent inside the sandbox can read plain environment values directly, so to hide a secret from the agent, attach it through a [provider](/sandboxes/providers-v2) with `--provider` instead. Suppress the warning with `--no-credential-warnings`. Detection uses the key name only; values are never inspected or printed.
+When an `--env` key looks like a credential — a known provider variable, or a name whose underscore-separated segments include a credential word such as `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `API_KEY`, `ACCESS_KEY`, or `SECRET_KEY` (for example `DB_TOKEN` or `MY_ACCESS_KEY`) — `sandbox create` prints a non-blocking warning. Matching is on whole segments, so unrelated names like `TOKENIZERS_PARALLELISM` or `PASSWORDLESS_LOGIN` do not warn. The agent inside the sandbox can read plain environment values directly, so to hide a secret from the agent, attach it through a [profile-backed provider](/providers/profiles) with `--provider` instead. Suppress the warning with `--no-credential-warnings`. Detection uses the key name only; values are never inspected or printed.
 
 You can also set per-command environment variables with `sandbox exec`:
 
@@ -267,6 +348,24 @@ with SandboxClient.from_active_cluster() as client:
     assert sandbox.id in {s.id for s in matches}
 ```
 
+Create reusable sandbox templates through the Python SDK when several runs
+should share the same workload shape:
+
+```python
+from openshell import SandboxClient
+
+with SandboxClient.from_active_cluster() as client:
+    templates = client.sandbox_templates()
+
+    templates.create(
+        workspace="default",
+        name="python",
+        image="ghcr.io/nvidia/openshell-community/sandboxes/python:latest",
+    )
+
+    sandbox = client.create_from_template(workspace="default", template_name="python")
+```
+
 For non-interactive automation, pass a renewable client-credentials provider.
 Omitted issuer, client ID, audience, and scopes are read from the active
 gateway's metadata. The client requires TLS for non-loopback gateways:
@@ -306,6 +405,17 @@ List endpoints for one sandbox:
 ```shell
 openshell service list my-sandbox
 ```
+
+Use structured output for automation:
+
+```shell
+openshell service list --output json
+openshell service list my-sandbox --output yaml
+```
+
+Each record contains `workspace`, `sandbox`, `service`, `target_port`, and
+`url`. The unnamed service uses an empty `service` string. An empty result is
+an empty collection.
 
 Show or delete one endpoint:
 
@@ -405,6 +515,20 @@ openshell forward list
 openshell forward stop 8000 my-sandbox
 ```
 
+Use JSON or YAML output when inspecting tracked forwards from automation:
+
+```shell
+openshell forward list --output json
+openshell forward list --output yaml
+```
+
+Structured output includes `sandbox`, `bind_address`, `port`, `pid`, and
+`alive`. The `alive` boolean reports whether the tracked PID still matches the
+expected OpenShell SSH forward; it does not probe the forwarded socket. When no
+forwards are tracked, structured output returns an empty collection.
+
+The default table colorizes the `STATUS` column, but only when the stream it is written to is a terminal, so piping or redirecting gives plain text. Each stream is decided on its own, so redirecting one leaves the other styled. Prefer `--output json` for automation rather than matching on the table. Set `NO_COLOR` to any non-empty value or pass `--color never` to suppress color, and `--color always` to keep it when piping into a pager. `--color` applies to every `openshell` command and covers all styled output: tables, log lines from `-v`, progress spinners, prompts, and error messages.
+
 <Tip>
 You can also forward a port at creation time with `--forward`:
 
@@ -490,8 +614,11 @@ commands, transfer files, forward ports, or reach exposed services. Policies,
 provider attachments, settings, service definitions, and persistent workspace
 data remain associated with the sandbox.
 
-Stop and start are idempotent. Delete a stopped sandbox normally when you
-no longer need its retained state.
+Stop and start are idempotent. You can also start a retained `Completed` or
+`Error/MainProcessFailed` sandbox to launch a fresh instance of its canonical
+command. Starting a fresh instance invalidates SSH sessions issued for the
+previous runtime generation. Delete an inactive sandbox normally when you no
+longer need its retained state.
 
 ## Delete Sandboxes
 
@@ -500,6 +627,16 @@ Deleting a sandbox stops all processes, releases resources, and purges injected 
 ```shell
 openshell sandbox delete my-sandbox
 ```
+
+Delete multiple sandboxes by listing their names in one command:
+
+```shell
+openshell sandbox delete sandbox-a sandbox-b
+```
+
+When a multi-sandbox delete fails for one entry, the CLI reports that sandbox's
+failure and continues with the remaining names. The command exits with an error
+after it attempts every requested deletion if any entry failed.
 
 ## Sandbox Lifecycle
 
@@ -510,9 +647,10 @@ Every sandbox moves through a defined set of phases:
 | Provisioning | The runtime is setting up the sandbox environment, or the gateway is waiting for the sandbox supervisor to establish its authenticated control session.       |
 | Ready        | The sandbox is running and its supervisor control session is connected. You can connect, execute commands, sync files, and view logs.                          |
 | Stopping     | The gateway accepted a stop request and is stopping compute while retaining persistent state.                                                         |
-| Stopped      | Compute is stopped and access is unavailable. The sandbox record and driver-owned persistent workspace remain.                                       |
+| Stopped      | Compute was stopped explicitly and access is unavailable.                                                                                 |
 | Starting     | Compute is starting. The sandbox becomes usable only after a fresh supervisor session connects.                                                       |
-| Error        | Provisioning failed or the canonical main process exited unexpectedly. Main-process exit is terminal even with exit code 0. Check logs with `openshell logs`.       |
+| Completed    | The canonical main process exited with code 0. Its normalized result is available in `status.exit_code`.                                           |
+| Error        | The canonical main process failed, or sandbox infrastructure failed. Inspect the condition reason and `status.exit_code`.                  |
 | Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                                          |
 
 The compute backend can become ready before the sandbox supervisor connects to
@@ -522,10 +660,11 @@ After a gateway restart, an existing sandbox can return to `Provisioning`
 temporarily while its supervisor reconnects. Wait for the phase to return to
 `Ready` before you connect to the sandbox or execute commands.
 
-The gateway records a canonical main-process exit as `Ready=False` with reason
-`MainProcessExited`. It also sets `status.exit_code`; signal exits use the
-standard `128 + signal` convention. Compute runtimes do not automatically
-restart that process.
+The gateway records a successful canonical main-process exit as `Ready=False`
+with reason `MainProcessCompleted`. Nonzero and signal-normalized results use
+`MainProcessFailed` and the `Error` phase. It also sets `status.exit_code`;
+signal exits use the standard `128 + signal` convention. Compute runtimes do
+not automatically restart that process.
 
 ## Sandbox Compute Drivers
 

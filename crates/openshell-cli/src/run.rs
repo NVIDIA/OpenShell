@@ -22,6 +22,7 @@ pub use crate::commands::gateway::{
     gateway_logout, gateway_remove, gateway_select, gateway_status, gateway_use,
 };
 
+use crate::color::Colorize;
 use crate::policy_update::build_policy_update_plan;
 use crate::tls::{TlsOptions, grpc_client, grpc_inference_client};
 use dialoguer::Confirm;
@@ -36,35 +37,36 @@ use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AttachSandboxProviderRequest,
     ClearDraftChunksRequest, ConfigureProviderRefreshRequest, CreateProviderRequest,
-    CreateSandboxRequest, CreateSshSessionRequest, DeleteInferenceRouteRequest,
-    DeleteProviderProfileRequest, DeleteProviderRefreshRequest, DeleteProviderRequest,
-    DeleteSandboxRequest, DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest,
-    ExposeServiceRequest, GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
-    GetGatewayConfigRequest, GetInferenceRouteRequest, GetProviderProfileRequest,
-    GetProviderRefreshStatusRequest, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest,
-    GetSandboxRequest, GetServiceRequest, GpuResourceRequirements, ImportProviderProfilesRequest,
-    LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
+    CreateSandboxRequest, CreateSandboxTemplateRequest, CreateSshSessionRequest,
+    DeleteInferenceRouteRequest, DeleteProviderProfileRequest, DeleteProviderRefreshRequest,
+    DeleteProviderRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
+    DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest, ExposeServiceRequest,
+    GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
+    GetInferenceRouteRequest, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
+    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetSandboxTemplateRequest, GetServiceRequest,
+    GpuResourceRequirements, ImportProviderProfilesRequest, LintProviderProfilesRequest,
+    ListProviderProfilesRequest, ListProvidersRequest, ListSandboxPoliciesRequest,
+    ListSandboxProvidersRequest, ListSandboxTemplatesRequest, ListSandboxesRequest,
     ListServicesRequest, PolicySource, PolicyStatus, Provider,
     ProviderCredentialRefreshRecoveryAction, ProviderCredentialRefreshStatus,
     ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantType, ProviderProfile,
     ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
     ResourceRequirements, RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox,
-    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceEndpointResponse,
-    SetInferenceRouteRequest, SettingScope, StartSandboxRequest, StopSandboxRequest,
-    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
-    UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
-    setting_value, tcp_forward_init,
+    SandboxPhase, SandboxPolicy, SandboxResources, SandboxServiceLevel, SandboxSpec,
+    SandboxStartup, SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate,
+    SandboxWorkloadTemplateSpec, ServiceEndpointResponse, SetInferenceRouteRequest, SettingScope,
+    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest,
+    exec_sandbox_event, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 use openshell_providers::{
-    ProviderRegistry, ProviderTypeProfile, RealDiscoveryContext, detect_provider_from_command,
-    discover_from_profile, normalize_provider_type, parse_profile_json, parse_profile_yaml,
+    ProviderTypeProfile, RealDiscoveryContext, detect_provider_from_command, discover_from_profile,
+    normalize_profile_id, normalize_provider_type, parse_profile_json, parse_profile_yaml,
     profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml,
 };
-use owo_colors::OwoColorize;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, IsTerminal, Read, Write};
@@ -116,6 +118,20 @@ impl ProgressOutput {
 
     fn is_plain(&self) -> bool {
         matches!(self, Self::Plain)
+    }
+}
+
+fn aggregate_delete_failures(resource: &str, failures: &[String]) -> Result<()> {
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(miette!(
+            "failed to delete {} {}{}: {}",
+            failures.len(),
+            resource,
+            if failures.len() == 1 { "" } else { "s" },
+            failures.join(", ")
+        ))
     }
 }
 
@@ -222,6 +238,23 @@ pub fn doctor_check() -> Result<()> {
 
 fn sandbox_should_persist(keep: bool, forward: Option<&ForwardSpec>) -> bool {
     keep || forward.is_some()
+}
+
+fn has_main_process_result(sandbox: &Sandbox) -> bool {
+    let Some(status) = sandbox.status.as_ref() else {
+        return false;
+    };
+    if status.exit_code.is_none() {
+        return false;
+    }
+
+    let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+    phase != SandboxPhase::Error
+        || status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready"
+                && condition.status.eq_ignore_ascii_case("false")
+                && condition.reason == "MainProcessFailed"
+        })
 }
 
 fn build_sandbox_resource_limits(
@@ -339,19 +372,21 @@ async fn finalize_sandbox_create_session(
     server: &str,
     sandbox_name: &str,
     persist: bool,
-    session_result: Result<()>,
+    session_result: Result<i32>,
     workspace: &str,
     tls: &TlsOptions,
     gateway: &str,
-) -> Result<()> {
+) -> Result<i32> {
     if persist {
         return session_result;
     }
 
     let names = [sandbox_name.to_string()];
     if let Err(err) = sandbox_delete(server, &names, false, workspace, tls, gateway).await {
-        if session_result.is_ok() {
-            return Err(err);
+        if let Ok(exit_code) = session_result.as_ref() {
+            return Err(miette::miette!(
+                "sandbox command exited with status {exit_code}, but ephemeral cleanup failed: {err}"
+            ));
         }
         eprintln!("Failed to delete sandbox {sandbox_name}: {err}");
     }
@@ -367,6 +402,7 @@ async fn finalize_sandbox_create_session(
 #[derive(Debug)]
 pub struct SandboxCreateConfig<'a> {
     pub name: Option<&'a str>,
+    pub template: Option<&'a str>,
     pub from: Option<&'a str>,
     pub uploads: &'a [(String, Option<String>, bool)],
     pub keep: bool,
@@ -392,6 +428,7 @@ impl Default for SandboxCreateConfig<'_> {
     fn default() -> Self {
         Self {
             name: None,
+            template: None,
             from: None,
             uploads: &[],
             keep: false,
@@ -422,9 +459,10 @@ pub async fn sandbox_create(
     config: SandboxCreateConfig<'_>,
     workspace: &str,
     tls: &TlsOptions,
-) -> Result<()> {
+) -> Result<i32> {
     let SandboxCreateConfig {
         name,
+        template,
         from,
         uploads,
         keep,
@@ -456,6 +494,11 @@ pub async fn sandbox_create(
             "--upload cannot be combined with a trailing main command yet because uploads complete after the canonical process starts"
         ));
     }
+    if output != "table" && !command.is_empty() && !detach {
+        return Err(miette::miette!(
+            "structured output cannot be combined with an attached trailing command; use table output to stream the command or add --detach"
+        ));
+    }
 
     // Check port availability *before* creating the sandbox so we don't
     // leave an orphaned sandbox behind when the forward would fail.
@@ -473,36 +516,44 @@ pub async fn sandbox_create(
     let effective_server = server.to_string();
     let effective_tls = tls.clone();
 
+    if template.is_some()
+        && (from.is_some()
+            || gpu_requirements.is_some()
+            || cpu.is_some()
+            || memory.is_some()
+            || driver_config_json.is_some()
+            || !environment.is_empty())
+    {
+        return Err(miette::miette!(
+            "--template cannot be combined with inline workload flags"
+        ));
+    }
+
     // Resolve the --from flag into a container image reference, building from
-    // a Dockerfile first if necessary.
-    let image: Option<String> = match from {
-        Some(val) => {
-            let resolved = resolve_from(val)?;
-            match resolved {
-                ResolvedSource::Image(img) => Some(img),
-                ResolvedSource::Dockerfile {
-                    dockerfile,
-                    context,
-                } => {
-                    let tag = build_from_dockerfile(&dockerfile, &context, gateway_name).await?;
-                    Some(tag)
+    // a Dockerfile first if necessary. Template creates resolve workload shape
+    // on the gateway and skip local image handling.
+    let image: Option<String> = if template.is_some() {
+        None
+    } else {
+        match from {
+            Some(val) => {
+                let resolved = resolve_from(val)?;
+                match resolved {
+                    ResolvedSource::Image(img) => Some(img),
+                    ResolvedSource::Dockerfile {
+                        dockerfile,
+                        context,
+                    } => {
+                        let tag =
+                            build_from_dockerfile(&dockerfile, &context, gateway_name).await?;
+                        Some(tag)
+                    }
                 }
             }
+            None => None,
         }
-        None => None,
     };
-    let inferred_provider = inferred_provider_type(command);
-    let providers_v2_enabled =
-        if inferred_provider.is_some() && auto_providers_override != Some(false) {
-            gateway_providers_v2_enabled(&mut client).await?
-        } else {
-            false
-        };
-    let inferred_types: Vec<String> = if providers_v2_enabled {
-        Vec::new()
-    } else {
-        inferred_provider.into_iter().collect()
-    };
+    let inferred_types: Vec<String> = inferred_provider_type(command).into_iter().collect();
     let configured_providers = ensure_required_providers(
         &mut client,
         providers,
@@ -513,12 +564,21 @@ pub async fn sandbox_create(
     .await?;
 
     let policy = load_sandbox_policy(policy)?;
-    let resource_limits = build_sandbox_resource_limits(cpu, memory)?;
-    let driver_config = driver_config_json
-        .map(parse_driver_config_json)
-        .transpose()?;
+    let resource_limits = if template.is_none() {
+        build_sandbox_resource_limits(cpu, memory)?
+    } else {
+        None
+    };
+    let driver_config = if template.is_none() {
+        driver_config_json
+            .map(parse_driver_config_json)
+            .transpose()?
+    } else {
+        None
+    };
 
-    let template = if image.is_some() || resource_limits.is_some() || driver_config.is_some() {
+    let inline_template = if image.is_some() || resource_limits.is_some() || driver_config.is_some()
+    {
         Some(SandboxTemplate {
             image: image.unwrap_or_default(),
             resources: resource_limits,
@@ -538,21 +598,41 @@ pub async fn sandbox_create(
     } else {
         command.to_vec()
     };
+    let persist = sandbox_should_persist(keep, forward.as_ref());
+    let create_detaches = detach
+        || (persist
+            && command.is_empty()
+            && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()));
+    let await_main_process_attachment = output == "table" && editor.is_none() && !create_detaches;
+    let annotations = if persist {
+        HashMap::new()
+    } else {
+        HashMap::from([(
+            "openshell.nvidia.com/retention".to_string(),
+            "ephemeral".to_string(),
+        )])
+    };
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
             resource_requirements,
-            environment,
+            environment: if template.is_none() {
+                environment
+            } else {
+                HashMap::new()
+            },
             policy,
             providers: configured_providers,
-            template,
+            template: inline_template,
             command: main_command,
             tty: main_terminal,
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),
         labels,
-        annotations: HashMap::new(),
+        annotations,
         workspace: workspace.to_string(),
+        await_main_process_attachment,
+        workload_template_name: template.unwrap_or_default().to_string(),
     };
 
     let response = match client.create_sandbox(request).await {
@@ -571,7 +651,6 @@ pub async fn sandbox_create(
         .ok_or_else(|| miette::miette!("sandbox missing from response"))?;
 
     let interactive = std::io::stdout().is_terminal();
-    let persist = sandbox_should_persist(keep, forward.as_ref());
     let sandbox_name = if sandbox.object_name().is_empty() {
         "unknown".to_string()
     } else {
@@ -748,8 +827,20 @@ pub async fn sandbox_create(
                     saw_non_ready = true;
                 }
 
-                // Capture error reason from conditions only when phase is Error
-                // to avoid showing stale transient error reasons
+                let main_process_result = has_main_process_result(&s);
+                if matches!(
+                    phase,
+                    SandboxPhase::Completed | SandboxPhase::Error | SandboxPhase::Stopped
+                ) && main_process_result
+                {
+                    if let Some(d) = display.as_interactive_mut() {
+                        d.clear();
+                    }
+                    break;
+                }
+
+                // Capture infrastructure error reasons only after excluding a
+                // canonical-command result, which must attach and drain output.
                 if phase == SandboxPhase::Error
                     && let Some(status) = &s.status
                 {
@@ -828,7 +919,11 @@ pub async fn sandbox_create(
 
     // If we exited the loop without hitting the Ready break, finish the display.
     let final_phase = SandboxPhase::try_from(last_phase).unwrap_or(SandboxPhase::Unknown);
-    if final_phase != SandboxPhase::Ready
+    let final_has_main_process_result = has_main_process_result(&last_sandbox);
+    if !(matches!(
+        final_phase,
+        SandboxPhase::Ready | SandboxPhase::Completed | SandboxPhase::Stopped
+    ) || final_phase == SandboxPhase::Error && final_has_main_process_result)
         && let Some(d) = display.as_interactive_mut()
     {
         if final_phase == SandboxPhase::Error {
@@ -941,7 +1036,7 @@ pub async fn sandbox_create(
 
             if structured_output {
                 crate::output::print_output_single(output, &last_sandbox, sandbox_to_json)?;
-                return Ok(());
+                return Ok(0);
             }
 
             if let Some(editor) = editor {
@@ -955,18 +1050,18 @@ pub async fn sandbox_create(
                     workspace,
                 )
                 .await?;
-                return Ok(());
+                return Ok(0);
             }
 
-            // Persistent non-interactive creates detach implicitly. An
-            // explicitly ephemeral (`--no-keep`) create must still attach so
-            // it can observe the canonical process and delete the sandbox when
-            // that session ends.
+            // An explicit trailing command is foreground regardless of TTY
+            // detection. Only --detach opts out. Scratch shells retain the
+            // non-interactive implicit-detach behavior.
             if detach
                 || (persist
+                    && command.is_empty()
                     && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()))
             {
-                return Ok(());
+                return Ok(0);
             }
 
             let connect_result = if persist {
@@ -981,6 +1076,32 @@ pub async fn sandbox_create(
                 .await
             };
 
+            finalize_sandbox_create_session(
+                &effective_server,
+                &sandbox_name,
+                persist,
+                connect_result,
+                workspace,
+                &effective_tls,
+                gateway_name,
+            )
+            .await
+        }
+        SandboxPhase::Completed | SandboxPhase::Stopped | SandboxPhase::Error
+            if final_has_main_process_result =>
+        {
+            drop(stream);
+            drop(client);
+            if detach {
+                return Ok(0);
+            }
+            let connect_result = crate::ssh::sandbox_connect_terminal_main(
+                &effective_server,
+                &sandbox_name,
+                &effective_tls,
+                workspace,
+            )
+            .await;
             finalize_sandbox_create_session(
                 &effective_server,
                 &sandbox_name,
@@ -1326,6 +1447,9 @@ pub async fn sandbox_get(
     println!("  {} {}", "Id:".dimmed(), id);
     println!("  {} {}", "Name:".dimmed(), name);
     println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase()));
+    if let Some(exit_code) = sandbox.status.as_ref().and_then(|status| status.exit_code) {
+        println!("  {} {}", "Exit Code:".dimmed(), exit_code);
+    }
     println!(
         "  {} {}",
         "Resource version:".dimmed(),
@@ -1353,6 +1477,15 @@ pub async fn sandbox_get(
         for (key, value) in annotations {
             println!("    {key}: {value}");
         }
+    }
+
+    if let Some(provenance) = &sandbox.created_from_workload_template {
+        println!(
+            "  {} {}@{}",
+            "Workload template:".dimmed(),
+            provenance.name,
+            provenance.resource_version
+        );
     }
 
     let policy_from_global = config.policy_source == PolicySource::Global as i32;
@@ -1394,9 +1527,16 @@ pub async fn sandbox_get(
 /// data into memory before the server rejects an oversized message.
 const MAX_STDIN_PAYLOAD: usize = 4 * 1024 * 1024;
 
+fn local_terminal_size() -> Option<(u32, u32)> {
+    crossterm::terminal::size()
+        .ok()
+        .map(|(cols, rows)| (u32::from(cols), u32::from(rows)))
+}
+
 /// Execute a command in a running sandbox via gRPC, streaming output to the terminal.
 ///
-/// Returns the remote command's exit code.
+/// Returns the remote command's exit code, or an error if the event stream
+/// closes before the command reports an exit status.
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
 pub async fn sandbox_exec_grpc(
     server: &str,
@@ -1406,6 +1546,7 @@ pub async fn sandbox_exec_grpc(
     timeout_seconds: u32,
     tty_override: Option<bool>,
     environment: &HashMap<String, String>,
+    no_login_shell: bool,
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<i32> {
@@ -1461,7 +1602,7 @@ pub async fn sandbox_exec_grpc(
     let tty = tty_override
         .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
 
-    if tty_override == Some(true) && std::io::stdin().is_terminal() {
+    if tty && std::io::stdin().is_terminal() {
         return sandbox_exec_interactive_grpc(
             client,
             &sandbox,
@@ -1469,9 +1610,16 @@ pub async fn sandbox_exec_grpc(
             workdir,
             timeout_seconds,
             environment,
+            no_login_shell,
         )
         .await;
     }
+
+    let (cols, rows) = if tty {
+        local_terminal_size().unwrap_or_default()
+    } else {
+        (0, 0)
+    };
 
     // Make the streaming gRPC call.
     let mut stream = client
@@ -1483,7 +1631,9 @@ pub async fn sandbox_exec_grpc(
             timeout_seconds,
             stdin: stdin_payload,
             tty,
-            ..Default::default()
+            cols,
+            rows,
+            no_login_shell,
         })
         .await
         .into_diagnostic()?
@@ -1491,6 +1641,7 @@ pub async fn sandbox_exec_grpc(
 
     // Stream output to terminal in real-time.
     let mut exit_code = 0i32;
+    let mut exit_seen = false;
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
 
@@ -1509,9 +1660,19 @@ pub async fn sandbox_exec_grpc(
             }
             Some(exec_sandbox_event::Payload::Exit(exit)) => {
                 exit_code = exit.exit_code;
+                exit_seen = true;
             }
             None => {}
         }
+    }
+
+    // A stream that closes without an Exit event means we never observed the
+    // command's outcome. The server treats the same condition as a relay
+    // failure; mirror that here so exit 0 stays meaningful.
+    if !exit_seen {
+        return Err(miette::miette!(
+            "sandbox exec relay closed before the command reported an exit status"
+        ));
     }
 
     Ok(exit_code)
@@ -1832,13 +1993,14 @@ async fn sandbox_exec_interactive_grpc(
     workdir: Option<&str>,
     timeout_seconds: u32,
     environment: &HashMap<String, String>,
+    no_login_shell: bool,
 ) -> Result<i32> {
     #[cfg(unix)]
     use openshell_core::proto::ExecSandboxWindowResize;
     use openshell_core::proto::{ExecSandboxInput, exec_sandbox_input};
     use tokio_stream::wrappers::ReceiverStream;
 
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (cols, rows) = local_terminal_size().unwrap_or((80, 24));
 
     let (input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(4096);
 
@@ -1850,11 +2012,12 @@ async fn sandbox_exec_interactive_grpc(
                 command: command.to_vec(),
                 workdir: workdir.unwrap_or_default().to_string(),
                 environment: environment.clone(),
+                no_login_shell,
                 timeout_seconds,
                 stdin: Vec::new(),
                 tty: true,
-                cols: u32::from(cols),
-                rows: u32::from(rows),
+                cols,
+                rows,
             })),
         })
         .await
@@ -1904,13 +2067,10 @@ async fn sandbox_exec_interactive_grpc(
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
                     .expect("failed to register SIGWINCH handler");
             while sig.recv().await.is_some() {
-                if let Ok((c, r)) = crossterm::terminal::size() {
+                if let Some((cols, rows)) = local_terminal_size() {
                     let msg = ExecSandboxInput {
                         payload: Some(exec_sandbox_input::Payload::Resize(
-                            ExecSandboxWindowResize {
-                                cols: u32::from(c),
-                                rows: u32::from(r),
-                            },
+                            ExecSandboxWindowResize { cols, rows },
                         )),
                     };
                     if resize_tx.send(msg).await.is_err() {
@@ -1924,6 +2084,7 @@ async fn sandbox_exec_interactive_grpc(
     let _resize_guard = TaskGuard(resize_task);
 
     let mut exit_code = 0i32;
+    let mut exit_seen = false;
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
 
@@ -1942,6 +2103,7 @@ async fn sandbox_exec_interactive_grpc(
             }
             Some(exec_sandbox_event::Payload::Exit(exit)) => {
                 exit_code = exit.exit_code;
+                exit_seen = true;
                 break;
             }
             None => {}
@@ -1952,6 +2114,15 @@ async fn sandbox_exec_interactive_grpc(
 
     // Drop the raw mode guard to restore the terminal before returning.
     drop(raw_guard);
+
+    // A stream that closes without an Exit event means we never observed the
+    // command's outcome. Treat it as a relay failure rather than reporting a
+    // successful (0) exit.
+    if !exit_seen {
+        return Err(miette::miette!(
+            "sandbox exec relay closed before the command reported an exit status"
+        ));
+    }
 
     Ok(exit_code)
 }
@@ -2059,8 +2230,16 @@ pub async fn sandbox_list(
     for sandbox in sandboxes {
         let phase = phase_name(sandbox.phase());
         let phase_colored = match SandboxPhase::try_from(sandbox.phase()) {
-            Ok(SandboxPhase::Ready) => phase.green().to_string(),
+            Ok(SandboxPhase::Ready | SandboxPhase::Completed) => phase.green().to_string(),
             Ok(SandboxPhase::Error) => phase.red().to_string(),
+            Ok(SandboxPhase::Stopped)
+                if sandbox
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.exit_code.is_some()) =>
+            {
+                phase.red().to_string()
+            }
             Ok(SandboxPhase::Provisioning) => phase.yellow().to_string(),
             Ok(SandboxPhase::Deleting) => phase.dimmed().to_string(),
             _ => phase.to_string(),
@@ -2094,6 +2273,16 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         || serde_json::json!({}),
         |m| serde_json::json!(m.annotations),
     );
+    let created_from_workload_template =
+        sandbox
+            .created_from_workload_template
+            .as_ref()
+            .map(|provenance| {
+                serde_json::json!({
+                    "name": provenance.name,
+                    "resource_version": provenance.resource_version,
+                })
+            });
     serde_json::json!({
         "id": sandbox.object_id(),
         "name": sandbox.object_name(),
@@ -2104,6 +2293,8 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "created_at": format_epoch_ms(meta.map_or(0, |m| m.created_at_ms)),
         "phase": phase_name(sandbox.phase()),
         "current_policy_version": sandbox.current_policy_version(),
+        "exit_code": sandbox.status.as_ref().and_then(|status| status.exit_code),
+        "created_from_workload_template": created_from_workload_template,
     })
 }
 
@@ -2152,6 +2343,7 @@ fn sandbox_detail_to_json(
 pub async fn sandbox_provider_list(
     server: &str,
     name: &str,
+    output: &str,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -2164,6 +2356,10 @@ pub async fn sandbox_provider_list(
         .await
         .into_diagnostic()?;
     let providers = response.into_inner().providers;
+
+    if crate::output::print_output_collection(output, &providers, attached_provider_to_json)? {
+        return Ok(());
+    }
 
     if providers.is_empty() {
         println!("No providers attached to sandbox {name}.");
@@ -2290,6 +2486,18 @@ fn print_provider_attachment_table(providers: &[Provider]) {
     print!("{}", format_provider_attachment_table(providers, true));
 }
 
+fn attached_provider_to_json(provider: &Provider) -> serde_json::Value {
+    let mut config_keys = provider.config.keys().cloned().collect::<Vec<_>>();
+    config_keys.sort();
+
+    serde_json::json!({
+        "name": provider.object_name(),
+        "type": provider.r#type,
+        "credential_keys": provider_credential_keys(provider),
+        "config_keys": config_keys,
+    })
+}
+
 fn format_provider_attachment_table(providers: &[Provider], color: bool) -> String {
     use std::fmt::Write as _;
 
@@ -2346,6 +2554,583 @@ fn format_provider_attachment_table(providers: &[Provider], color: bool) -> Stri
     output
 }
 
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+pub async fn sandbox_template_create(
+    server: &str,
+    name: &str,
+    image: Option<&str>,
+    cpu: Option<&str>,
+    memory: Option<&str>,
+    gpu_requirements: Option<GpuResourceRequirements>,
+    driver_config_json: Option<&str>,
+    ready_within: Option<&str>,
+    max_burst: Option<u32>,
+    labels: HashMap<String, String>,
+    annotations: HashMap<String, String>,
+    environment: HashMap<String, String>,
+    output: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let resources = if cpu.is_some() || memory.is_some() || gpu_requirements.is_some() {
+        Some(SandboxResources {
+            cpu: cpu
+                .map(validate_cpu_quantity)
+                .transpose()?
+                .unwrap_or_default(),
+            memory: memory
+                .map(validate_memory_quantity)
+                .transpose()?
+                .unwrap_or_default(),
+            gpu: gpu_requirements,
+        })
+    } else {
+        None
+    };
+    let driver_config = driver_config_json
+        .map(parse_driver_config_json)
+        .transpose()?;
+    let desired_service_level = build_template_service_level(ready_within, max_burst)?;
+
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .create_sandbox_template(CreateSandboxTemplateRequest {
+            template: Some(SandboxWorkloadTemplate {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: name.to_string(),
+                    created_at_ms: 0,
+                    labels,
+                    resource_version: 0,
+                    annotations,
+                    workspace: String::new(),
+                    deletion_timestamp_ms: 0,
+                }),
+                spec: Some(SandboxWorkloadTemplateSpec {
+                    workload: Some(SandboxWorkloadConfig {
+                        image: image.unwrap_or_default().to_string(),
+                        environment,
+                        resources,
+                    }),
+                    driver_config,
+                    desired_service_level,
+                }),
+            }),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+
+    let template = response
+        .into_inner()
+        .template
+        .ok_or_else(|| miette!("sandbox template missing from response"))?;
+    if crate::output::print_output_single(output, &template, sandbox_template_to_json)? {
+        return Ok(());
+    }
+    println!(
+        "{} Created sandbox template {}",
+        "✓".green().bold(),
+        template.object_name().bold()
+    );
+    Ok(())
+}
+
+fn build_template_service_level(
+    ready_within: Option<&str>,
+    max_burst: Option<u32>,
+) -> Result<Option<SandboxServiceLevel>> {
+    if ready_within.is_none() && max_burst.is_none() {
+        return Ok(None);
+    }
+    let ready_within = ready_within
+        .map(parse_duration_to_ms)
+        .transpose()?
+        .map(|ms| {
+            if ms <= 0 {
+                Err(miette!("--ready-within must be greater than zero"))
+            } else {
+                Ok(duration_ms_to_proto(ms))
+            }
+        })
+        .transpose()?;
+    Ok(Some(SandboxServiceLevel {
+        startup: Some(SandboxStartup {
+            ready_within,
+            max_burst: max_burst.unwrap_or_default(),
+        }),
+    }))
+}
+
+fn duration_ms_to_proto(ms: i64) -> prost_types::Duration {
+    prost_types::Duration {
+        seconds: ms / 1_000,
+        nanos: i32::try_from((ms % 1_000) * 1_000_000)
+            .expect("duration millisecond remainder fits in protobuf nanos"),
+    }
+}
+
+pub async fn sandbox_template_get(
+    server: &str,
+    name: &str,
+    output: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .get_sandbox_template(GetSandboxTemplateRequest {
+            name: name.to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+    let template = response
+        .into_inner()
+        .template
+        .ok_or_else(|| miette!("sandbox template missing from response"))?;
+
+    if crate::output::print_output_single(output, &template, sandbox_template_to_json)? {
+        return Ok(());
+    }
+
+    print_sandbox_template_detail(&template);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn sandbox_template_list(
+    server: &str,
+    limit: u32,
+    offset: u32,
+    label_selector: Option<&str>,
+    names_only: bool,
+    output: &str,
+    workspace: &str,
+    all_workspaces: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .list_sandbox_templates(ListSandboxTemplatesRequest {
+            limit,
+            offset,
+            workspace: if all_workspaces {
+                String::new()
+            } else {
+                workspace.to_string()
+            },
+            all_workspaces,
+            label_selector: label_selector.unwrap_or_default().to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+    let templates = response.into_inner().templates;
+
+    if crate::output::print_output_collection(output, &templates, sandbox_template_to_json)? {
+        return Ok(());
+    }
+
+    if templates.is_empty() {
+        if !names_only {
+            println!("No sandbox templates found.");
+        }
+        return Ok(());
+    }
+
+    if names_only {
+        for template in &templates {
+            if all_workspaces {
+                println!("{}/{}", template.object_workspace(), template.object_name());
+            } else {
+                println!("{}", template.object_name());
+            }
+        }
+        return Ok(());
+    }
+
+    print_sandbox_template_table(&templates, all_workspaces);
+    Ok(())
+}
+
+pub async fn sandbox_template_delete(
+    server: &str,
+    names: &[String],
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    for name in names {
+        let response = client
+            .delete_sandbox_template(DeleteSandboxTemplateRequest {
+                name: name.clone(),
+                workspace: workspace.to_string(),
+            })
+            .await
+            .into_diagnostic()?;
+        if response.into_inner().deleted {
+            println!("{} Deleted sandbox template {name}", "✓".green().bold());
+        } else {
+            println!("Sandbox template {name} not found.");
+        }
+    }
+    Ok(())
+}
+
+fn sandbox_template_to_json(template: &SandboxWorkloadTemplate) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("id".to_string(), serde_json::json!(template.object_id()));
+    obj.insert(
+        "name".to_string(),
+        serde_json::json!(template.object_name()),
+    );
+    obj.insert(
+        "workspace".to_string(),
+        serde_json::json!(template.object_workspace()),
+    );
+
+    if let Some(metadata) = &template.metadata {
+        if metadata.resource_version != 0 {
+            obj.insert(
+                "resource_version".to_string(),
+                serde_json::json!(metadata.resource_version),
+            );
+        }
+        if metadata.created_at_ms != 0 {
+            obj.insert(
+                "created_at".to_string(),
+                serde_json::json!(format_epoch_ms(metadata.created_at_ms)),
+            );
+        }
+        if !metadata.labels.is_empty() {
+            obj.insert("labels".to_string(), serde_json::json!(metadata.labels));
+        }
+        if !metadata.annotations.is_empty() {
+            obj.insert(
+                "annotations".to_string(),
+                serde_json::json!(metadata.annotations),
+            );
+        }
+    }
+
+    if let Some(spec) = &template.spec {
+        if let Some(workload) = &spec.workload {
+            obj.insert("image".to_string(), serde_json::json!(workload.image));
+            if !workload.environment.is_empty() {
+                obj.insert(
+                    "environment".to_string(),
+                    serde_json::json!(workload.environment),
+                );
+            }
+            if let Some(resources) = &workload.resources {
+                let mut resources_json = serde_json::Map::new();
+                if !resources.cpu.is_empty() {
+                    resources_json.insert("cpu".to_string(), serde_json::json!(resources.cpu));
+                }
+                if !resources.memory.is_empty() {
+                    resources_json
+                        .insert("memory".to_string(), serde_json::json!(resources.memory));
+                }
+                if let Some(gpu) = &resources.gpu {
+                    let value = gpu
+                        .count
+                        .map_or_else(|| serde_json::json!("default"), serde_json::Value::from);
+                    resources_json.insert("gpu".to_string(), value);
+                }
+                if !resources_json.is_empty() {
+                    obj.insert(
+                        "resources".to_string(),
+                        serde_json::Value::Object(resources_json),
+                    );
+                }
+            }
+        }
+        if let Some(driver_config) = &spec.driver_config {
+            obj.insert(
+                "driver_config".to_string(),
+                openshell_core::proto_struct::struct_to_json_value(driver_config),
+            );
+        }
+        if let Some(service_level) = &spec.desired_service_level
+            && let Some(startup) = &service_level.startup
+        {
+            let mut startup_json = serde_json::Map::new();
+            if let Some(ready_within) = &startup.ready_within {
+                startup_json.insert(
+                    "ready_within_ms".to_string(),
+                    serde_json::json!(duration_to_ms(ready_within)),
+                );
+            }
+            if startup.max_burst != 0 {
+                startup_json.insert(
+                    "max_burst".to_string(),
+                    serde_json::json!(startup.max_burst),
+                );
+            }
+            if !startup_json.is_empty() {
+                obj.insert(
+                    "startup".to_string(),
+                    serde_json::Value::Object(startup_json),
+                );
+            }
+        }
+    }
+
+    serde_json::Value::Object(obj)
+}
+
+fn print_sandbox_template_detail(template: &SandboxWorkloadTemplate) {
+    println!("{}", "Sandbox template:".cyan().bold());
+    println!();
+    println!("  {} {}", "Name:".dimmed(), template.object_name());
+    println!(
+        "  {} {}",
+        "Workspace:".dimmed(),
+        template.object_workspace()
+    );
+    if let Some(metadata) = &template.metadata {
+        println!("  {} {}", "Id:".dimmed(), metadata.id);
+        println!(
+            "  {} {}",
+            "Resource version:".dimmed(),
+            metadata.resource_version
+        );
+        if metadata.created_at_ms != 0 {
+            println!(
+                "  {} {}",
+                "Created:".dimmed(),
+                format_epoch_ms(metadata.created_at_ms)
+            );
+        }
+        let labels = labels_display(&metadata.labels);
+        println!(
+            "  {} {}",
+            "Labels:".dimmed(),
+            non_empty_or(&labels, "<none>")
+        );
+    }
+    if let Some(spec) = &template.spec
+        && let Some(workload) = &spec.workload
+    {
+        println!(
+            "  {} {}",
+            "Image:".dimmed(),
+            non_empty_or(&workload.image, "<default>")
+        );
+        println!(
+            "  {} {}",
+            "Environment:".dimmed(),
+            workload.environment.len()
+        );
+        if let Some(resources) = &workload.resources {
+            println!(
+                "  {} {}",
+                "CPU:".dimmed(),
+                non_empty_or(&resources.cpu, "<default>")
+            );
+            println!(
+                "  {} {}",
+                "Memory:".dimmed(),
+                non_empty_or(&resources.memory, "<default>")
+            );
+            println!(
+                "  {} {}",
+                "GPU:".dimmed(),
+                template_resources_gpu_display(resources).unwrap_or_else(|| "<none>".to_string())
+            );
+        }
+    }
+    if let Some(startup) = template_startup(template) {
+        println!(
+            "  {} {}",
+            "Ready within:".dimmed(),
+            startup
+                .ready_within
+                .as_ref()
+                .map_or_else(|| "<default>".to_string(), duration_display)
+        );
+        println!(
+            "  {} {}",
+            "Max burst:".dimmed(),
+            if startup.max_burst == 0 {
+                "<default>".to_string()
+            } else {
+                startup.max_burst.to_string()
+            }
+        );
+    }
+}
+
+fn print_sandbox_template_table(templates: &[SandboxWorkloadTemplate], show_workspace: bool) {
+    let name_width = templates
+        .iter()
+        .map(|template| template.object_name().len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let workspace_width = if show_workspace {
+        templates
+            .iter()
+            .map(|template| template.object_workspace().len())
+            .max()
+            .unwrap_or(9)
+            .max(9)
+    } else {
+        0
+    };
+    let image_width = templates
+        .iter()
+        .map(|template| template_image(template).len())
+        .max()
+        .unwrap_or(5)
+        .clamp(5, 48);
+
+    if show_workspace {
+        println!(
+            "{:<workspace_width$}  {:<name_width$}  {:<image_width$}  {:<10}  {:<10}  {:<5}  {:<12}  {:<5}  {}",
+            "WORKSPACE".bold(),
+            "NAME".bold(),
+            "IMAGE".bold(),
+            "CPU".bold(),
+            "MEMORY".bold(),
+            "GPU".bold(),
+            "READY".bold(),
+            "BURST".bold(),
+            "LABELS".bold(),
+        );
+    } else {
+        println!(
+            "{:<name_width$}  {:<image_width$}  {:<10}  {:<10}  {:<5}  {:<12}  {:<5}  {}",
+            "NAME".bold(),
+            "IMAGE".bold(),
+            "CPU".bold(),
+            "MEMORY".bold(),
+            "GPU".bold(),
+            "READY".bold(),
+            "BURST".bold(),
+            "LABELS".bold(),
+        );
+    }
+
+    for template in templates {
+        let resources = template_resources(template);
+        let cpu = resources
+            .map(|resources| resources.cpu.as_str())
+            .filter(|cpu| !cpu.is_empty())
+            .unwrap_or("-");
+        let memory = resources
+            .map(|resources| resources.memory.as_str())
+            .filter(|memory| !memory.is_empty())
+            .unwrap_or("-");
+        let gpu = resources
+            .and_then(template_resources_gpu_display)
+            .unwrap_or_else(|| "-".to_string());
+        let image = truncate_status_field(&template_image(template), image_width);
+        let startup = template_startup(template);
+        let ready = startup
+            .and_then(|startup| startup.ready_within.as_ref())
+            .map_or_else(|| "-".to_string(), duration_display);
+        let burst = startup
+            .map(|startup| startup.max_burst)
+            .filter(|burst| *burst != 0)
+            .map_or_else(|| "-".to_string(), |burst| burst.to_string());
+        let labels = template
+            .metadata
+            .as_ref()
+            .map_or_else(String::new, |metadata| labels_display(&metadata.labels));
+
+        if show_workspace {
+            println!(
+                "{:<workspace_width$}  {:<name_width$}  {:<image_width$}  {:<10}  {:<10}  {:<5}  {:<12}  {:<5}  {}",
+                template.object_workspace(),
+                template.object_name(),
+                image,
+                cpu,
+                memory,
+                gpu,
+                ready,
+                burst,
+                labels,
+            );
+        } else {
+            println!(
+                "{:<name_width$}  {:<image_width$}  {:<10}  {:<10}  {:<5}  {:<12}  {:<5}  {}",
+                template.object_name(),
+                image,
+                cpu,
+                memory,
+                gpu,
+                ready,
+                burst,
+                labels,
+            );
+        }
+    }
+}
+
+fn template_image(template: &SandboxWorkloadTemplate) -> String {
+    template
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.workload.as_ref())
+        .map_or_else(
+            || "<default>".to_string(),
+            |workload| non_empty_or(&workload.image, "<default>").to_string(),
+        )
+}
+
+fn template_resources(template: &SandboxWorkloadTemplate) -> Option<&SandboxResources> {
+    template
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.workload.as_ref())
+        .and_then(|workload| workload.resources.as_ref())
+}
+
+fn template_resources_gpu_display(resources: &SandboxResources) -> Option<String> {
+    if let Some(gpu) = &resources.gpu {
+        return Some(
+            gpu.count
+                .map_or_else(|| "default".to_string(), |count| count.to_string()),
+        );
+    }
+    None
+}
+
+fn template_startup(template: &SandboxWorkloadTemplate) -> Option<&SandboxStartup> {
+    template
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.desired_service_level.as_ref())
+        .and_then(|service_level| service_level.startup.as_ref())
+}
+
+fn duration_to_ms(duration: &prost_types::Duration) -> i64 {
+    duration.seconds.saturating_mul(1_000) + i64::from(duration.nanos / 1_000_000)
+}
+
+fn duration_display(duration: &prost_types::Duration) -> String {
+    let total_ms = duration_to_ms(duration);
+    if total_ms % 3_600_000 == 0 {
+        format!("{}h", total_ms / 3_600_000)
+    } else if total_ms % 60_000 == 0 {
+        format!("{}m", total_ms / 60_000)
+    } else if total_ms % 1_000 == 0 {
+        format!("{}s", total_ms / 1_000)
+    } else {
+        format!("{total_ms}ms")
+    }
+}
+
+fn labels_display(labels: &HashMap<String, String>) -> String {
+    let mut pairs = labels
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
+    pairs.sort();
+    pairs.join(", ")
+}
+
 /// Delete a sandbox by name, or all sandboxes when `all` is true.
 pub async fn sandbox_delete(
     server: &str,
@@ -2382,6 +3167,7 @@ pub async fn sandbox_delete(
         names.to_vec()
     };
 
+    let mut failures = Vec::new();
     for name in &names_to_delete {
         // Stop any background port forwards for this sandbox before deleting.
         if let Ok(stopped) = stop_forwards_for_sandbox(name) {
@@ -2393,13 +3179,28 @@ pub async fn sandbox_delete(
             }
         }
 
-        let response = client
+        let response = match client
             .delete_sandbox(DeleteSandboxRequest {
                 name: name.clone(),
                 workspace: workspace.to_string(),
             })
             .await
-            .into_diagnostic()?;
+        {
+            Ok(response) => response,
+            Err(status) if status.code() == Code::NotFound => {
+                clear_last_sandbox_if_matches(gateway, workspace, name);
+                println!("{} Sandbox {name} already deleted", "✓".green().bold());
+                continue;
+            }
+            Err(status) => {
+                eprintln!(
+                    "{} Failed to delete sandbox {name}: {status}",
+                    "!".red().bold()
+                );
+                failures.push(name.clone());
+                continue;
+            }
+        };
 
         let deleted = response.into_inner().deleted;
         if deleted {
@@ -2410,7 +3211,7 @@ pub async fn sandbox_delete(
         }
     }
 
-    Ok(())
+    aggregate_delete_failures("sandbox", &failures)
 }
 
 /// Stop a sandbox while retaining its persistent workspace.
@@ -2478,9 +3279,9 @@ async fn wait_for_lifecycle_phase(
         return Ok(sandbox);
     }
     if current == SandboxPhase::Error {
-        return Err(miette!(
-            "sandbox entered Error while waiting for {target:?}"
-        ));
+        let detail = ready_false_condition_message(sandbox.status.as_ref())
+            .unwrap_or_else(|| "sandbox entered Error".to_string());
+        return Err(miette!("{detail} while waiting for {target:?}"));
     }
 
     let timeout = Duration::from_secs(
@@ -2616,10 +3417,20 @@ pub async fn ensure_required_providers(
             if seen_names.insert(name.clone()) {
                 configured_names.push(name.clone());
             }
-        } else if let Some(provider_type) = normalize_provider_type(name) {
+        } else {
+            let profile_id = name.trim();
+            let profile = fetch_provider_profile(client, profile_id, workspace)
+                .await
+                .map_err(|_| {
+                    miette::miette!(
+                        "provider '{name}' not found and no provider profile named '{profile_id}' is available. \
+                         Create or import the profile first, then create the provider"
+                    )
+                })?;
+            let provider_type = profile.id;
             auto_create_provider(
                 client,
-                provider_type,
+                &provider_type,
                 Some(name),
                 auto_providers_override,
                 &mut seen_names,
@@ -2632,11 +3443,6 @@ pub async fn ensure_required_providers(
             type_to_name
                 .entry(provider_type.to_ascii_lowercase())
                 .or_insert_with(|| name.clone());
-        } else {
-            return Err(miette::miette!(
-                "provider '{name}' not found and '{name}' is not a recognized provider type. \
-                 Create it first with `openshell provider create --type <type> --name {name}`"
-            ));
         }
     }
 
@@ -2727,17 +3533,21 @@ async fn auto_create_provider(
         return Ok(());
     }
 
+    let profile = fetch_provider_profile(client, provider_type, workspace).await?;
     let discovered = discover_existing_provider_data(client, provider_type, workspace)
         .await
         .map_err(|err| miette::miette!("failed to discover provider '{provider_type}': {err}"))?;
-    let Some(discovered) = discovered else {
-        eprintln!(
-            "{} No existing local credentials/config found for '{}'. You can configure it from inside the sandbox.",
-            "!".yellow(),
-            provider_type
-        );
-        eprintln!();
-        return Ok(());
+    let discovered = match discovered {
+        Some(discovered) => discovered,
+        None if provider_profile_allows_empty_credentials(&profile) => {
+            openshell_providers::DiscoveredProvider::default()
+        }
+        None => {
+            return Err(miette::miette!(
+                "no existing local credentials found for provider profile '{provider_type}'. \
+                 Create it first with `openshell provider create --type {provider_type} --name {provider_type} --credential <KEY>`"
+            ));
+        }
     };
 
     if let Some(exact_name) = preferred_name {
@@ -2898,6 +3708,7 @@ fn service_expose_status_error(status: Status) -> miette::Report {
     service_status_error("expose service", "sandbox:write", status)
 }
 
+#[allow(clippy::too_many_arguments)] // user-facing CLI command
 pub async fn service_list(
     server: &str,
     sandbox: Option<&str>,
@@ -2905,6 +3716,7 @@ pub async fn service_list(
     offset: u32,
     workspace: &str,
     all_workspaces: bool,
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
@@ -2923,6 +3735,15 @@ pub async fn service_list(
         .await
         .map_err(|status| service_status_error("list services", "sandbox:read", status))?
         .into_inner();
+
+    let services = response
+        .services
+        .iter()
+        .filter_map(|response| service_endpoint_to_json(response, server))
+        .collect::<Vec<_>>();
+    if crate::output::print_output_collection(output, &services, Clone::clone)? {
+        return Ok(());
+    }
 
     if response.services.is_empty() {
         if let Some(sandbox) = sandbox {
@@ -3112,6 +3933,30 @@ fn print_service_endpoint_table(
     }
 }
 
+fn service_endpoint_to_json(
+    response: &ServiceEndpointResponse,
+    gateway_endpoint: &str,
+) -> Option<serde_json::Value> {
+    let endpoint = response.endpoint.as_ref()?;
+    let workspace = endpoint
+        .metadata
+        .as_ref()
+        .map_or("", |metadata| metadata.workspace.as_str());
+    let url = if response.url.is_empty() {
+        String::new()
+    } else {
+        service_url_for_gateway(&response.url, gateway_endpoint)
+    };
+
+    Some(serde_json::json!({
+        "workspace": workspace,
+        "sandbox": endpoint.sandbox_name,
+        "service": endpoint.service_name,
+        "target_port": endpoint.target_port,
+        "url": url,
+    }))
+}
+
 fn service_display_name(service: &str) -> &str {
     if service.is_empty() { "-" } else { service }
 }
@@ -3261,50 +4106,57 @@ fn service_url_for_gateway(service_url: &str, gateway_endpoint: &str) -> String 
     service_url.to_string()
 }
 
-async fn gateway_providers_v2_enabled(client: &mut crate::tls::GrpcClient) -> Result<bool> {
-    let response = client
-        .get_gateway_config(GetGatewayConfigRequest {})
-        .await
-        .into_diagnostic()?
-        .into_inner();
-    let Some(setting) = response.settings.get(settings::PROVIDERS_V2_ENABLED_KEY) else {
-        return Ok(false);
-    };
-    match setting.value.as_ref() {
-        Some(setting_value::Value::BoolValue(enabled)) => Ok(*enabled),
-        None => Ok(false),
-        Some(_) => Err(miette::miette!(
-            "gateway setting '{}' has invalid value type; expected bool",
-            settings::PROVIDERS_V2_ENABLED_KEY
-        )),
-    }
-}
-
 async fn fetch_provider_profile(
     client: &mut crate::tls::GrpcClient,
     provider_type: &str,
     workspace: &str,
 ) -> Result<ProviderProfile> {
-    let response = client
+    let requested = provider_type.trim();
+    let response = match fetch_provider_profile_exact(client, requested, workspace).await {
+        Ok(response) => response,
+        Err(status) if status.code() == Code::NotFound => {
+            let Some(alias) = normalize_provider_type(requested)
+                .filter(|alias| normalize_profile_id(requested).as_deref() != Some(*alias))
+            else {
+                return Err(miette::miette!(
+                    "provider profile '{requested}' not found; import a matching profile before using this provider type"
+                ));
+            };
+            fetch_provider_profile_exact(client, alias, workspace)
+                .await
+                .map_err(|fallback_status| {
+                    if fallback_status.code() == Code::NotFound {
+                        miette::miette!(
+                            "provider profile '{requested}' not found; import a matching profile before using this provider type"
+                        )
+                    } else {
+                        miette::miette!(fallback_status.to_string())
+                    }
+                })?
+        }
+        Err(status) => return Err(miette::miette!(status.to_string())),
+    };
+
+    Ok(response)
+}
+
+async fn fetch_provider_profile_exact(
+    client: &mut crate::tls::GrpcClient,
+    provider_type: &str,
+    workspace: &str,
+) -> std::result::Result<ProviderProfile, Status> {
+    client
         .get_provider_profile(GetProviderProfileRequest {
             id: provider_type.to_string(),
             workspace: workspace.to_string(),
         })
         .await
-        .map_err(|status| {
-            if status.code() == Code::NotFound {
-                miette::miette!(
-                    "provider profile '{provider_type}' not found; providers v2 discovery requires a provider profile"
-                )
-            } else {
-                miette::miette!(status.to_string())
-            }
-        })?;
-
-    response
-        .into_inner()
-        .profile
-        .ok_or_else(|| miette::miette!("provider profile '{provider_type}' missing from response"))
+        .and_then(|response| {
+            response
+                .into_inner()
+                .profile
+                .ok_or_else(|| Status::internal("provider profile missing from response"))
+        })
 }
 
 async fn discover_existing_provider_data(
@@ -3312,36 +4164,13 @@ async fn discover_existing_provider_data(
     provider_type: &str,
     workspace: &str,
 ) -> Result<Option<openshell_providers::DiscoveredProvider>> {
-    if gateway_providers_v2_enabled(client).await? {
-        let profile = fetch_provider_profile(client, provider_type, workspace).await?;
-        let profile = ProviderTypeProfile::from_proto(&profile);
-        let mut discovered =
-            discover_from_profile(&profile, &RealDiscoveryContext).map_err(|err| {
-                miette::miette!("failed to discover existing provider data from profile: {err}")
-            })?;
+    let profile = fetch_provider_profile(client, provider_type, workspace).await?;
+    let profile = ProviderTypeProfile::from_proto(&profile);
+    let discovered = discover_from_profile(&profile, &RealDiscoveryContext).map_err(|err| {
+        miette::miette!("failed to discover existing provider data from profile: {err}")
+    })?;
 
-        // Vertex AI config keys (project ID, region, base URL, publisher) are not
-        // declared in the profile's discovery.credentials list, so discover_from_profile
-        // does not scan them. Scan them directly here so --from-existing captures them.
-        if provider_type == VERTEX_AI_PROVIDER_TYPE {
-            let discovered = discovered.get_or_insert_with(Default::default);
-            for key in openshell_core::inference::VERTEX_AI_CONFIG_KEY_NAMES {
-                if let Ok(val) = std::env::var(key) {
-                    let val = val.trim().to_string();
-                    if !val.is_empty() {
-                        discovered.config.entry(key.to_string()).or_insert(val);
-                    }
-                }
-            }
-        }
-
-        Ok(discovered)
-    } else {
-        let registry = ProviderRegistry::new();
-        registry
-            .discover_existing(provider_type)
-            .map_err(|err| miette::miette!("failed to discover existing provider data: {err}"))
-    }
+    Ok(discovered)
 }
 
 /// Canonical provider type string for Google Vertex AI.
@@ -3588,44 +4417,19 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
 
     let mut client = grpc_client(server, tls).await?;
 
-    let provider_type = if let Some(provider_type) = normalize_provider_type(provider_type) {
-        provider_type.to_string()
-    } else {
-        let profile_id = provider_type.trim();
-        if profile_id.is_empty() {
-            return Err(miette::miette!("provider type is required"));
-        }
-        let response = client
-            .get_provider_profile(GetProviderProfileRequest {
-                id: profile_id.to_string(),
-                workspace: profile_workspace.to_string(),
-            })
-            .await;
-        match response {
-            Ok(response) => response
-                .into_inner()
-                .profile
-                .map(|profile| profile.id)
-                .filter(|id| !id.trim().is_empty())
-                .unwrap_or_else(|| profile_id.to_string()),
-            Err(status) if status.code() == Code::NotFound => {
-                return Err(miette::miette!(
-                    "unsupported provider type or profile: {provider_type}"
-                ));
-            }
-            Err(status) => return Err(status).into_diagnostic(),
-        }
-    };
+    let profile_id = provider_type.trim();
+    if profile_id.is_empty() {
+        return Err(miette::miette!("provider type is required"));
+    }
+    let provider_profile = fetch_provider_profile(&mut client, profile_id, profile_workspace)
+        .await
+        .map_err(|err| {
+            miette::miette!("unsupported provider type or profile: {profile_id} ({err})")
+        })?;
+    let provider_type = provider_profile.id.clone();
 
     let adc_credential_key = if from_gcloud_adc {
-        let profile = fetch_provider_profile(&mut client, &provider_type, profile_workspace)
-            .await
-            .map_err(|err| {
-                miette::miette!(
-                    "--from-gcloud-adc is not supported for '{provider_type}' providers ({err})"
-                )
-            })?;
-        let profile = ProviderTypeProfile::from_proto(&profile);
+        let profile = ProviderTypeProfile::from_proto(&provider_profile);
         let adc_cred = profile.adc_credential().ok_or_else(|| {
             miette::miette!(
                 "--from-gcloud-adc is not supported for '{provider_type}' providers \
@@ -3648,7 +4452,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
     };
 
     let oidc_profile = if from_oidc_token {
-        Some(fetch_provider_profile(&mut client, &provider_type, profile_workspace).await?)
+        Some(provider_profile.clone())
     } else {
         None
     };
@@ -3681,25 +4485,12 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
         if from_existing {
             return Err(missing_credentials_error(&provider_type));
         }
-        if !from_gcloud_adc && !runtime_credentials {
-            return Err(missing_credentials_error(&provider_type));
+        if runtime_credentials && !provider_profile_allows_runtime_credentials(&provider_profile) {
+            return Err(miette::miette!(
+                "--runtime-credentials is only valid for provider profiles whose required credentials are resolved at runtime"
+            ));
         }
-        let allows_empty_credentials = if runtime_credentials {
-            provider_profile_allows_empty_credentials(
-                &fetch_provider_profile(&mut client, &provider_type, profile_workspace).await?,
-            )
-        } else {
-            fetch_provider_profile(&mut client, &provider_type, profile_workspace)
-                .await
-                .ok()
-                .is_some_and(|profile| provider_profile_allows_empty_credentials(&profile))
-        };
-        if !allows_empty_credentials {
-            if runtime_credentials {
-                return Err(miette::miette!(
-                    "--runtime-credentials is only valid for provider profiles whose required credentials are resolved at runtime"
-                ));
-            }
+        if !provider_profile_allows_empty_credentials(&provider_profile) {
             return Err(missing_credentials_error(&provider_type));
         }
     }
@@ -3808,6 +4599,10 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
 
 fn provider_profile_allows_empty_credentials(profile: &ProviderProfile) -> bool {
     ProviderTypeProfile::from_proto(profile).allows_empty_provider_credentials()
+}
+
+fn provider_profile_allows_runtime_credentials(profile: &ProviderProfile) -> bool {
+    ProviderTypeProfile::from_proto(profile).allows_runtime_provider_credentials()
 }
 
 pub async fn provider_get(
@@ -4280,25 +5075,37 @@ pub async fn provider_profile_lint(
 
 pub async fn provider_profile_delete(
     server: &str,
-    id: &str,
+    ids: &[String],
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .delete_provider_profile(DeleteProviderProfileRequest {
-            id: id.to_string(),
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner();
-    if response.deleted {
-        println!("Deleted provider profile '{id}'.");
-    } else {
-        println!("Provider profile '{id}' was not deleted.");
+    let mut failures = Vec::new();
+    for id in ids {
+        let response = match client
+            .delete_provider_profile(DeleteProviderProfileRequest {
+                id: id.clone(),
+                workspace: workspace.to_string(),
+            })
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(status) => {
+                eprintln!(
+                    "{} Failed to delete provider profile {id}: {status}",
+                    "!".red().bold()
+                );
+                failures.push(id.clone());
+                continue;
+            }
+        };
+        if response.deleted {
+            println!("{} Deleted provider profile {id}", "✓".green().bold());
+        } else {
+            println!("{} Provider profile {id} not found", "!".yellow());
+        }
     }
-    Ok(())
+    aggregate_delete_failures("provider profile", &failures)
 }
 
 pub async fn provider_refresh_status(
@@ -4822,7 +5629,6 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
     }
 
     let mut client = grpc_client(server, tls).await?;
-
     let oidc_profile = if from_oidc_token {
         let existing = client
             .get_provider(GetProviderRequest {
@@ -4834,12 +5640,10 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
             .into_inner()
             .provider
             .ok_or_else(|| miette::miette!("provider '{name}' not found"))?;
-        let profile_workspace = if existing.profile_workspace.is_empty() {
-            workspace
-        } else {
-            &existing.profile_workspace
-        };
-        Some(fetch_provider_profile(&mut client, &existing.r#type, profile_workspace).await?)
+        Some(
+            fetch_provider_profile(&mut client, &existing.r#type, &existing.profile_workspace)
+                .await?,
+        )
     } else {
         None
     };
@@ -4867,8 +5671,12 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
             .ok_or_else(|| miette::miette!("provider '{name}' not found"))?;
 
         let provider_type = existing.r#type;
-        let discovered =
-            discover_existing_provider_data(&mut client, &provider_type, workspace).await?;
+        let discovered = discover_existing_provider_data(
+            &mut client,
+            &provider_type,
+            &existing.profile_workspace,
+        )
+        .await?;
         let Some(discovered) = discovered else {
             return Err(miette::miette!(
                 "no existing local credentials/config found for provider type '{provider_type}'"
@@ -4929,21 +5737,32 @@ pub async fn provider_delete(
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
+    let mut failures = Vec::new();
     for name in names {
-        let response = client
+        let response = match client
             .delete_provider(DeleteProviderRequest {
                 name: name.clone(),
                 workspace: workspace.to_string(),
             })
             .await
-            .into_diagnostic()?;
+        {
+            Ok(response) => response,
+            Err(status) => {
+                eprintln!(
+                    "{} Failed to delete provider {name}: {status}",
+                    "!".red().bold()
+                );
+                failures.push(name.clone());
+                continue;
+            }
+        };
         if response.into_inner().deleted {
             println!("{} Deleted provider {name}", "✓".green().bold());
         } else {
             println!("{} Provider {name} not found", "!".yellow());
         }
     }
-    Ok(())
+    aggregate_delete_failures("provider", &failures)
 }
 
 // ---------------------------------------------------------------------------
@@ -5213,9 +6032,10 @@ pub async fn workspace_member_list(
     workspace: &str,
     limit: u32,
     offset: u32,
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    use openshell_core::proto::{ListWorkspaceMembersRequest, WorkspaceRole};
+    use openshell_core::proto::ListWorkspaceMembersRequest;
 
     let mut client = grpc_client(server, tls).await?;
     let response = client
@@ -5227,6 +6047,10 @@ pub async fn workspace_member_list(
         .await
         .into_diagnostic()?;
     let members = response.into_inner().members;
+
+    if crate::output::print_output_collection(output, &members, workspace_member_to_json)? {
+        return Ok(());
+    }
 
     if members.is_empty() {
         println!("No members found in workspace {workspace}.");
@@ -5243,15 +6067,28 @@ pub async fn workspace_member_list(
     println!("{:<subject_width$}  {}", "SUBJECT".bold(), "ROLE".bold());
 
     for member in &members {
-        let role_str = match WorkspaceRole::try_from(member.role) {
-            Ok(WorkspaceRole::Admin) => "admin",
-            Ok(WorkspaceRole::User) => "user",
-            _ => "unknown",
-        };
+        let role_str = workspace_member_role_name(member.role);
         println!("{:<subject_width$}  {}", member.principal_subject, role_str);
     }
 
     Ok(())
+}
+
+fn workspace_member_role_name(role: i32) -> &'static str {
+    use openshell_core::proto::WorkspaceRole;
+
+    match WorkspaceRole::try_from(role) {
+        Ok(WorkspaceRole::Admin) => "admin",
+        Ok(WorkspaceRole::User) => "user",
+        _ => "unknown",
+    }
+}
+
+fn workspace_member_to_json(member: &openshell_core::proto::WorkspaceMember) -> serde_json::Value {
+    serde_json::json!({
+        "subject": member.principal_subject,
+        "role": workspace_member_role_name(member.role),
+    })
 }
 
 fn workspace_phase_str(workspace: &openshell_core::proto::Workspace) -> &'static str {
@@ -6820,6 +7657,7 @@ pub async fn sandbox_policy_list(
     server: &str,
     name: &str,
     limit: u32,
+    output: &str,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -6837,6 +7675,11 @@ pub async fn sandbox_policy_list(
         .into_diagnostic()?;
 
     let revisions = resp.into_inner().revisions;
+    let structured = policy_revision_list_json("sandbox", Some(name), &revisions)?;
+    if crate::output::print_output_collection(output, &structured, Clone::clone)? {
+        return Ok(());
+    }
+
     if revisions.is_empty() {
         eprintln!("No policy history found for sandbox '{name}'");
         return Ok(());
@@ -6849,6 +7692,7 @@ pub async fn sandbox_policy_list(
 pub async fn sandbox_policy_list_global(
     server: &str,
     limit: u32,
+    output: &str,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -6866,6 +7710,11 @@ pub async fn sandbox_policy_list_global(
         .into_diagnostic()?;
 
     let revisions = resp.into_inner().revisions;
+    let structured = policy_revision_list_json("global", None, &revisions)?;
+    if crate::output::print_output_collection(output, &structured, Clone::clone)? {
+        return Ok(());
+    }
+
     if revisions.is_empty() {
         eprintln!("No global policy history found");
         return Ok(());
@@ -6873,6 +7722,28 @@ pub async fn sandbox_policy_list_global(
 
     print_policy_revision_table(&revisions);
     Ok(())
+}
+
+fn policy_revision_list_json(
+    scope: &str,
+    sandbox: Option<&str>,
+    revisions: &[openshell_core::proto::SandboxPolicyRevision],
+) -> Result<Vec<serde_json::Value>> {
+    revisions
+        .iter()
+        .map(|revision| {
+            let status =
+                PolicyStatus::try_from(revision.status).unwrap_or(PolicyStatus::Unspecified);
+            policy_revision_to_json(
+                scope,
+                sandbox,
+                None,
+                revision,
+                status,
+                PolicyGetView::Metadata,
+            )
+        })
+        .collect()
 }
 
 fn print_policy_revision_table(revisions: &[openshell_core::proto::SandboxPolicyRevision]) {
@@ -7013,6 +7884,10 @@ pub async fn sandbox_logs(
 }
 
 fn print_log_line(log: &openshell_core::proto::SandboxLogLine) {
+    println!("{}", format_log_line(log));
+}
+
+fn format_log_line(log: &openshell_core::proto::SandboxLogLine) -> String {
     let source = if log.source.is_empty() {
         "gateway"
     } else {
@@ -7021,10 +7896,10 @@ fn print_log_line(log: &openshell_core::proto::SandboxLogLine) {
     let secs = log.timestamp_ms / 1000;
     let millis = log.timestamp_ms % 1000;
     if log.fields.is_empty() {
-        println!(
+        format!(
             "[{secs}.{millis:03}] [{source:<7}] [{:<5}] [{}] {}",
             log.level, log.target, log.message
-        );
+        )
     } else {
         let mut fields_str = String::new();
         let mut entries: Vec<_> = log.fields.iter().collect();
@@ -7037,10 +7912,10 @@ fn print_log_line(log: &openshell_core::proto::SandboxLogLine) {
             fields_str.push('=');
             fields_str.push_str(v);
         }
-        println!(
+        format!(
             "[{secs}.{millis:03}] [{source:<7}] [{:<5}] [{}] {} {}",
             log.level, log.target, log.message, fields_str
-        );
+        )
     }
 }
 
@@ -7404,15 +8279,16 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 #[cfg(test)]
 mod tests {
     use super::{
-        PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
-        dockerfile_sources_supported_for_gateway, format_endpoint,
-        format_provider_attachment_table, git_sync_files, inferred_provider_type,
-        parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
-        parse_credential_pairs, parse_driver_config_json, parse_secret_material_env_pairs,
-        policy_revision_to_json, provider_profile_allows_empty_credentials,
-        provisioning_timeout_message, ready_false_condition_message, refresh_status_header,
-        refresh_status_row, resolve_from, sandbox_should_persist, sandbox_upload_plan,
-        service_expose_status_error, service_url_for_gateway,
+        PolicyGetView, ProvisioningStep, attached_provider_to_json, build_sandbox_resource_limits,
+        dockerfile_sources_supported_for_gateway, format_endpoint, format_log_line,
+        format_provider_attachment_table, git_sync_files, has_main_process_result,
+        inferred_provider_type, parse_cli_setting_value, parse_credential_expiry_cli_value,
+        parse_credential_expiry_pairs, parse_credential_pairs, parse_driver_config_json,
+        parse_secret_material_env_pairs, policy_revision_list_json, policy_revision_to_json,
+        provider_profile_allows_empty_credentials, provisioning_timeout_message,
+        ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
+        sandbox_should_persist, sandbox_upload_plan, service_endpoint_to_json,
+        service_expose_status_error, service_url_for_gateway, workspace_member_to_json,
     };
     use crate::TEST_ENV_LOCK;
     use crate::commands::common::progress_step_from_metadata;
@@ -7429,12 +8305,15 @@ mod tests {
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
-        GetSandboxConfigResponse, GpuResourceRequirements, PolicySource, PolicyStatus, Provider,
-        ProviderCredentialRefresh, ProviderCredentialRefreshRecoveryAction,
+        CredentialHandle, GetSandboxConfigResponse, GpuResourceRequirements, PolicySource,
+        PolicyStatus, Provider, ProviderCredentialRefresh, ProviderCredentialRefreshRecoveryAction,
         ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
         ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
-        ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicyRevision,
-        SandboxStatus, datamodel::v1::ObjectMeta,
+        ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
+        SandboxPolicyRevision, SandboxResources, SandboxStatus, SandboxWorkloadConfig,
+        SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec,
+        ServiceEndpoint, ServiceEndpointResponse, WorkspaceMember, WorkspaceRole,
+        datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -7463,6 +8342,174 @@ mod tests {
             json["provenance"]["openshell.nvidia.com/policy-signature"],
             "signed"
         );
+    }
+
+    #[test]
+    fn policy_list_json_reuses_metadata_contract() {
+        let load_error = "policy failed after checking café.example/非常に長いパス";
+        let revisions = vec![SandboxPolicyRevision {
+            version: 7,
+            policy_hash: "0123456789abcdef".to_string(),
+            status: PolicyStatus::Failed as i32,
+            load_error: load_error.to_string(),
+            created_at_ms: 100,
+            loaded_at_ms: 200,
+            policy: Some(SandboxPolicy::default()),
+            provenance: std::collections::HashMap::from([(
+                "source".to_string(),
+                "provider-composition".to_string(),
+            )]),
+        }];
+
+        let values = policy_revision_list_json("sandbox", Some("dev"), &revisions)
+            .expect("policy list JSON");
+
+        assert_eq!(
+            values[0],
+            serde_json::json!({
+                "scope": "sandbox",
+                "sandbox": "dev",
+                "version": 7,
+                "hash": "0123456789abcdef",
+                "status": "failed",
+                "created_at_ms": 100,
+                "loaded_at_ms": 200,
+                "load_error": load_error,
+                "provenance": {"source": "provider-composition"},
+            })
+        );
+        assert!(values[0].get("policy").is_none());
+        assert!(values[0].get("active_version").is_none());
+
+        let unknown = policy_revision_list_json(
+            "global",
+            None,
+            &[SandboxPolicyRevision {
+                version: 8,
+                status: 999,
+                ..Default::default()
+            }],
+        )
+        .expect("global policy list JSON");
+        assert_eq!(unknown[0]["scope"], "global");
+        assert_eq!(unknown[0]["status"], "unspecified");
+        assert!(unknown[0].get("sandbox").is_none());
+    }
+
+    #[test]
+    fn attached_provider_json_is_sorted_and_secret_safe() {
+        let provider = Provider {
+            metadata: Some(ObjectMeta {
+                name: "github".to_string(),
+                ..Default::default()
+            }),
+            r#type: "github".to_string(),
+            credentials: std::collections::HashMap::from([
+                ("Z_TOKEN".to_string(), "inline-secret".to_string()),
+                ("SHARED".to_string(), "shared-secret".to_string()),
+            ]),
+            config: std::collections::HashMap::from([
+                ("Z_URL".to_string(), "https://secret.example".to_string()),
+                ("A_MODE".to_string(), "sensitive-config".to_string()),
+            ]),
+            credential_expires_at_ms: std::collections::HashMap::from([(
+                "Z_TOKEN".to_string(),
+                123,
+            )]),
+            profile_workspace: "internal".to_string(),
+            credential_handles: std::collections::HashMap::from([
+                (
+                    "A_HANDLE".to_string(),
+                    CredentialHandle {
+                        driver: "vault".to_string(),
+                        handle: "opaque-secret-handle".to_string(),
+                        metadata: std::collections::HashMap::from([(
+                            "internal".to_string(),
+                            "metadata-value".to_string(),
+                        )]),
+                    },
+                ),
+                ("SHARED".to_string(), CredentialHandle::default()),
+            ]),
+        };
+
+        let value = attached_provider_to_json(&provider);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "name": "github",
+                "type": "github",
+                "credential_keys": ["A_HANDLE", "SHARED", "Z_TOKEN"],
+                "config_keys": ["A_MODE", "Z_URL"],
+            })
+        );
+        let serialized = value.to_string();
+        for secret in [
+            "inline-secret",
+            "shared-secret",
+            "https://secret.example",
+            "sensitive-config",
+            "opaque-secret-handle",
+            "metadata-value",
+            "internal",
+            "123",
+        ] {
+            assert!(!serialized.contains(secret), "leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn service_endpoint_json_has_raw_fields_and_normalized_url() {
+        let response = ServiceEndpointResponse {
+            endpoint: Some(ServiceEndpoint {
+                metadata: Some(ObjectMeta {
+                    workspace: "team-a".to_string(),
+                    ..Default::default()
+                }),
+                sandbox_name: "api".to_string(),
+                service_name: String::new(),
+                target_port: 8080,
+                ..Default::default()
+            }),
+            url: "https://api.openshell.localhost:3000/".to_string(),
+        };
+
+        let value = service_endpoint_to_json(&response, "https://gateway.example:17670")
+            .expect("service endpoint JSON");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "workspace": "team-a",
+                "sandbox": "api",
+                "service": "",
+                "target_port": 8080,
+                "url": "https://api.openshell.localhost:17670/",
+            })
+        );
+        assert!(service_endpoint_to_json(&ServiceEndpointResponse::default(), "unused").is_none());
+    }
+
+    #[test]
+    fn workspace_member_json_uses_stable_role_names() {
+        for (role, expected) in [
+            (WorkspaceRole::Admin as i32, "admin"),
+            (WorkspaceRole::User as i32, "user"),
+            (999, "unknown"),
+        ] {
+            let value = workspace_member_to_json(&WorkspaceMember {
+                metadata: Some(ObjectMeta {
+                    id: "internal-id".to_string(),
+                    ..Default::default()
+                }),
+                principal_subject: "oidc-subject".to_string(),
+                role,
+            });
+            assert_eq!(
+                value,
+                serde_json::json!({"subject": "oidc-subject", "role": expected})
+            );
+            assert!(!value.to_string().contains("internal-id"));
+        }
     }
 
     #[test]
@@ -7930,9 +8977,10 @@ mod tests {
 
     #[test]
     fn inferred_provider_type_normalizes_aliases() {
-        // `glab` should resolve to `gitlab`
+        // Retired legacy types are not inferred, even when a custom profile
+        // with the same ID could be imported and attached explicitly.
         let result = inferred_provider_type(&["glab".to_string()]);
-        assert_eq!(result, Some("gitlab".to_string()));
+        assert_eq!(result, None);
 
         // `gh` should resolve to `github`
         let result = inferred_provider_type(&["gh".to_string()]);
@@ -7959,6 +9007,48 @@ mod tests {
     fn sandbox_should_persist_when_forward_is_requested() {
         let spec = openshell_core::forward::ForwardSpec::new(8080);
         assert!(sandbox_should_persist(false, Some(&spec)));
+    }
+
+    #[test]
+    fn infrastructure_error_with_observed_exit_is_not_a_main_process_result() {
+        let mut sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                exit_code: Some(137),
+                conditions: vec![SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "ComputeResourceMissing".to_string(),
+                    message: "sandbox runtime disappeared".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Error as i32);
+
+        assert!(!has_main_process_result(&sandbox));
+    }
+
+    #[test]
+    fn main_process_failed_condition_identifies_command_result() {
+        let mut sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                exit_code: Some(7),
+                conditions: vec![SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "MainProcessFailed".to_string(),
+                    message: "canonical main process exited with status 7".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Error as i32);
+
+        assert!(has_main_process_result(&sandbox));
     }
 
     #[test]
@@ -8687,6 +9777,74 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_template_to_json_includes_metadata_labels_and_annotations() {
+        let template = SandboxWorkloadTemplate {
+            metadata: Some(ObjectMeta {
+                id: "template-123".to_string(),
+                name: "gpu-kata".to_string(),
+                labels: std::collections::HashMap::from([(
+                    "team".to_string(),
+                    "runtime".to_string(),
+                )]),
+                annotations: std::collections::HashMap::from([(
+                    "owner".to_string(),
+                    "platform".to_string(),
+                )]),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let json = super::sandbox_template_to_json(&template);
+
+        assert_eq!(json["labels"]["team"], "runtime");
+        assert_eq!(json["annotations"]["owner"], "platform");
+    }
+
+    #[test]
+    fn sandbox_template_to_json_formats_default_gpu_like_display_output() {
+        let template = SandboxWorkloadTemplate {
+            spec: Some(SandboxWorkloadTemplateSpec {
+                workload: Some(SandboxWorkloadConfig {
+                    resources: Some(SandboxResources {
+                        gpu: Some(GpuResourceRequirements { count: None }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let json = super::sandbox_template_to_json(&template);
+
+        assert_eq!(json["resources"]["gpu"], "default");
+    }
+
+    #[test]
+    fn sandbox_template_to_json_preserves_explicit_gpu_count_as_number() {
+        let template = SandboxWorkloadTemplate {
+            spec: Some(SandboxWorkloadTemplateSpec {
+                workload: Some(SandboxWorkloadConfig {
+                    resources: Some(SandboxResources {
+                        gpu: Some(GpuResourceRequirements { count: Some(2) }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let json = super::sandbox_template_to_json(&template);
+
+        assert_eq!(json["resources"]["gpu"], 2);
+    }
+
+    #[test]
     fn provider_to_json_omits_zero_metadata_fields() {
         let metadata = ObjectMeta {
             id: "prov-123".to_string(),
@@ -8784,6 +9942,10 @@ mod tests {
                 created_at_ms: 1_609_459_200_000,
                 ..Default::default()
             }),
+            created_from_workload_template: Some(SandboxWorkloadTemplateProvenance {
+                name: "gpu-kata".to_string(),
+                resource_version: "7".to_string(),
+            }),
             ..Default::default()
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
@@ -8803,6 +9965,11 @@ mod tests {
         assert_eq!(json["policy_source"], "global");
         assert_eq!(json["revision"], 3);
         assert!(json["policy"].is_null());
+        assert_eq!(json["created_from_workload_template"]["name"], "gpu-kata");
+        assert_eq!(
+            json["created_from_workload_template"]["resource_version"],
+            "7"
+        );
     }
 
     #[test]
@@ -8826,5 +9993,107 @@ mod tests {
         assert_eq!(json["policy_source"], "sandbox");
         assert!(json["revision"].is_null());
         assert!(json["policy"].is_null());
+    }
+
+    fn log_line(
+        level: &str,
+        target: &str,
+        message: &str,
+        source: &str,
+        fields: &[(&str, &str)],
+    ) -> openshell_core::proto::SandboxLogLine {
+        openshell_core::proto::SandboxLogLine {
+            sandbox_id: "sb-1".to_string(),
+            timestamp_ms: 1_234_567,
+            level: level.to_string(),
+            target: target.to_string(),
+            message: message.to_string(),
+            source: source.to_string(),
+            fields: fields
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn format_log_line_without_fields() {
+        let log = log_line("INFO", "openshell_server", "hello world", "sandbox", &[]);
+        assert_eq!(
+            format_log_line(&log),
+            "[1234.567] [sandbox] [INFO ] [openshell_server] hello world"
+        );
+    }
+
+    #[test]
+    fn format_log_line_empty_source_defaults_to_gateway() {
+        let log = log_line("WARN", "t", "msg", "", &[]);
+        assert_eq!(
+            format_log_line(&log),
+            "[1234.567] [gateway] [WARN ] [t] msg"
+        );
+    }
+
+    #[test]
+    fn format_log_line_pads_source_and_level() {
+        let log = log_line("OCSF", "ocsf", "NET:OPEN", "gateway", &[]);
+        assert_eq!(
+            format_log_line(&log),
+            "[1234.567] [gateway] [OCSF ] [ocsf] NET:OPEN"
+        );
+
+        let short_source = log_line("ERROR", "t", "m", "vm", &[]);
+        assert_eq!(
+            format_log_line(&short_source),
+            "[1234.567] [vm     ] [ERROR] [t] m"
+        );
+    }
+
+    #[test]
+    fn format_log_line_sorts_fields_alphabetically() {
+        let log = log_line(
+            "INFO",
+            "ocsf",
+            "CONNECT",
+            "sandbox",
+            &[("dst_port", "443"), ("action", "allow"), ("dst_host", "x")],
+        );
+        assert_eq!(
+            format_log_line(&log),
+            "[1234.567] [sandbox] [INFO ] [ocsf] CONNECT action=allow dst_host=x dst_port=443"
+        );
+    }
+
+    #[test]
+    fn format_log_line_keeps_empty_field_values() {
+        let log = log_line("INFO", "t", "m", "sandbox", &[("a", ""), ("b", "1")]);
+        assert_eq!(
+            format_log_line(&log),
+            "[1234.567] [sandbox] [INFO ] [t] m a= b=1"
+        );
+    }
+
+    #[test]
+    fn format_log_line_renders_empty_target_as_empty_brackets() {
+        let log = log_line("INFO", "", "m", "sandbox", &[]);
+        assert_eq!(format_log_line(&log), "[1234.567] [sandbox] [INFO ] [] m");
+    }
+
+    #[test]
+    fn format_log_line_zero_pads_millis() {
+        let mut log = log_line("INFO", "t", "m", "sandbox", &[]);
+        log.timestamp_ms = 1_000_007;
+        assert_eq!(format_log_line(&log), "[1000.007] [sandbox] [INFO ] [t] m");
+
+        log.timestamp_ms = 0;
+        assert_eq!(format_log_line(&log), "[0.000] [sandbox] [INFO ] [t] m");
+    }
+
+    #[test]
+    fn format_log_line_preserves_message_verbatim() {
+        // OCSF shorthand must pass through unchanged.
+        let message = "NET:OPEN [MED] DENIED /usr/bin/curl(4711) -> api.example.com:443";
+        let log = log_line("OCSF", "ocsf", message, "sandbox", &[]);
+        assert!(format_log_line(&log).ends_with(message));
     }
 }

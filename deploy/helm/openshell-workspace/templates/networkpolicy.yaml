@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- include "openshell-workspace.validateValues" . }}
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "openshell-workspace.fullname" . }}-sandbox-ssh
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell-workspace.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      openshell.ai/managed-by: openshell
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.gateway.serviceAccount.namespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.gateway.networkPolicy.podSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 2222
+{{- end }}

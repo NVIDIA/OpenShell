@@ -1,0 +1,143 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build Rust Binary
+description: Build, verify, package, and upload an auditable Rust binary
+
+inputs:
+  package:
+    description: Cargo package that owns the binary
+    required: true
+  binary:
+    description: Cargo binary name
+    required: true
+  triple:
+    description: Rust target triple
+    required: true
+  dev-shell:
+    description: Nix development shell used to build the binary
+    required: true
+  cargo-version:
+    description: Cargo package version embedded in the binary
+    required: true
+  image-tag:
+    description: Default supervisor image tag embedded in the binary
+    required: false
+    default: ""
+  artifact-name:
+    description: GitHub artifact name
+    required: false
+    default: ""
+  extra-cargo-flags:
+    description: Additional flags passed to cargo build
+    required: false
+    default: ""
+  interpreter:
+    description: ELF interpreter for a dynamically linked Linux binary
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Hash development shell
+      id: dev-shell
+      shell: bash
+      env:
+        DEV_SHELL: ${{ inputs.dev-shell }}
+      run: echo "hash=$(nix hash file --type sha256 --base16 "$(nix eval --raw "${DEV_SHELL}.drvPath")")" >> "$GITHUB_OUTPUT"
+
+    - name: Cache Rust artifacts
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        shared-key: binaries-${{ inputs.binary }}-${{ inputs.triple }}-${{ steps.dev-shell.outputs.hash }}
+        cache-on-failure: "true"
+        cache-workspace-crates: "true"
+        cache-bin: "false"
+        cmd-format: nix develop ${{ inputs.dev-shell }} -c {0}
+
+    - name: Set version
+      shell: nix develop ${{ inputs.dev-shell }} -c bash -euo pipefail {0}
+      env:
+        INPUTS_CARGO_VERSION: ${{ inputs.cargo-version }}
+      run: sed -i "s/^version = \"0\\.0\\.0\"$/version = \"${INPUTS_CARGO_VERSION}\"/" Cargo.toml
+
+    - name: Build ${{ inputs.binary }}
+      shell: nix develop ${{ inputs.dev-shell }} -c bash -euo pipefail {0}
+      env:
+        OPENSHELL_IMAGE_TAG: ${{ inputs.image-tag }}
+        INPUTS_PACKAGE: ${{ inputs.package }}
+        INPUTS_BINARY: ${{ inputs.binary }}
+        INPUTS_EXTRA_CARGO_FLAGS: ${{ inputs.extra-cargo-flags }}
+      run: GIT_DIR=/nonexistent cargo auditable build --release --package "${INPUTS_PACKAGE}" --bin "${INPUTS_BINARY}" ${INPUTS_EXTRA_CARGO_FLAGS}
+
+    - name: Normalize Darwin dynamic binary
+      if: endsWith(inputs.triple, '-apple-darwin')
+      shell: bash -euo pipefail {0}
+      env:
+        INPUTS_BINARY: ${{ inputs.binary }}
+      run: |
+        binary=target/release/${INPUTS_BINARY}
+        nix_iconv_paths=$(otool -L "$binary" | awk '$1 ~ "^/nix/store/.*/lib/libiconv\\.2\\.dylib$" { print $1 }')
+        if [[ -n "$nix_iconv_paths" ]]; then
+          while IFS= read -r nix_iconv_path; do
+            install_name_tool -change "$nix_iconv_path" /usr/lib/libiconv.2.dylib "$binary"
+          done <<< "$nix_iconv_paths"
+          codesign --force --sign - "$binary"
+        fi
+
+    - name: Verify Darwin portability
+      if: endsWith(inputs.triple, '-apple-darwin')
+      shell: bash -euo pipefail {0}
+      env:
+        INPUTS_BINARY: ${{ inputs.binary }}
+      run: |
+        binary=target/release/${INPUTS_BINARY}
+        nix_dependencies=$(otool -L "$binary" | awk '$1 ~ "^/nix/store/" { print $1 }')
+        if [[ -n "$nix_dependencies" ]]; then
+          echo "error: $binary has non-portable Nix store dependencies:" >&2
+          printf '  %s\n' "$nix_dependencies" >&2
+          exit 1
+        fi
+        codesign --verify --verbose=2 "$binary"
+
+    - name: Verify ${{ inputs.binary }}
+      shell: nix develop ${{ inputs.dev-shell }} -c bash -euo pipefail {0}
+      env:
+        INPUTS_BINARY: ${{ inputs.binary }}
+      run: |
+        # Confirm the binary runs and reports the expected name.
+        target/release/${INPUTS_BINARY} --version | grep -q "^${INPUTS_BINARY} "
+        # Confirm Syft can decode the embedded cargo-auditable metadata.
+        SYFT_CHECK_FOR_APP_UPDATE=false syft file:target/release/${INPUTS_BINARY} -o cyclonedx-json | grep 'pkg:cargo/' > /dev/null
+
+    - name: Verify static linkage
+      if: endsWith(inputs.triple, '-linux-musl')
+      shell: nix develop ${{ inputs.dev-shell }} -c bash -euo pipefail {0}
+      env:
+        INPUTS_BINARY: ${{ inputs.binary }}
+      run: tasks/scripts/verify-static-binary.sh target/release/${INPUTS_BINARY}
+
+    - name: Normalize Linux dynamic binary
+      if: endsWith(inputs.triple, '-linux-gnu')
+      shell: nix develop ${{ inputs.dev-shell }} -c bash -euo pipefail {0}
+      env:
+        INPUTS_BINARY: ${{ inputs.binary }}
+        INPUTS_INTERPRETER: ${{ inputs.interpreter }}
+      run: |
+        binary=target/release/${INPUTS_BINARY}
+        # Remove Nix store paths so the binary can run on other distributions.
+        patchelf --set-interpreter "${INPUTS_INTERPRETER}" --remove-rpath "$binary"
+        # Z3 must be embedded instead of loaded from the target system.
+        test -z "$(patchelf --print-needed "$binary" | grep '^libz3')"
+        # Reject symbols introduced after glibc 2.28.
+        tasks/scripts/verify-glibc-symbols.sh 2.28 "$binary"
+
+    - name: Upload ${{ inputs.binary }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      with:
+        name: ${{ inputs.artifact-name || format('{0}-{1}', inputs.binary, inputs.triple) }}
+        path: target/release/${{ inputs.binary }}
+        compression-level: 0
+        retention-days: 5
+        if-no-files-found: error

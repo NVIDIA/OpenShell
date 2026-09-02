@@ -37,7 +37,26 @@ const DEFAULT_SERVICE_NAME: &str = "openshell-gateway";
 /// Instrumentation scope recorded on spans this gateway emits.
 const INSTRUMENTATION_SCOPE: &str = "openshell-gateway";
 
-fn trace_config(cfg: &OtlpConfig) -> OtlpTraceConfig<'_> {
+/// Gateway identity recorded on every exported span.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GatewayResourceAttributes<'a> {
+    name: Option<&'a str>,
+    compute_driver: Option<&'a str>,
+}
+
+impl<'a> GatewayResourceAttributes<'a> {
+    pub fn new(name: Option<&'a str>, compute_driver: Option<&'a str>) -> Self {
+        Self {
+            name,
+            compute_driver,
+        }
+    }
+}
+
+fn trace_config<'cfg>(
+    cfg: &'cfg OtlpConfig,
+    gateway: GatewayResourceAttributes<'_>,
+) -> OtlpTraceConfig<'cfg> {
     let service_name = cfg
         .service_name
         .as_deref()
@@ -48,17 +67,35 @@ fn trace_config(cfg: &OtlpConfig) -> OtlpTraceConfig<'_> {
             ServiceName::Fixed,
         );
 
+    let mut resource_attributes = Vec::new();
+    if let Some(name) = gateway.name.map(str::trim).filter(|s| !s.is_empty()) {
+        resource_attributes.push(opentelemetry::KeyValue::new(
+            "openshell.gateway.name",
+            name.to_string(),
+        ));
+    }
+    if let Some(compute_driver) = gateway
+        .compute_driver
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        resource_attributes.push(opentelemetry::KeyValue::new(
+            "openshell.gateway.compute_driver",
+            compute_driver.to_string(),
+        ));
+    }
+
     OtlpTraceConfig {
         endpoint: &cfg.endpoint,
         service_name,
         service_version: Some(openshell_core::VERSION),
-        resource_attributes: Vec::new(),
+        resource_attributes,
     }
 }
 
 #[cfg(test)]
-fn build_resource(cfg: &OtlpConfig) -> Resource {
-    openshell_otel::resource_for(&trace_config(cfg))
+fn build_resource(cfg: &OtlpConfig, gateway: GatewayResourceAttributes<'_>) -> Resource {
+    openshell_otel::resource_for(&trace_config(cfg, gateway))
 }
 
 /// Build a tracer provider exporting over OTLP/gRPC to the configured endpoint.
@@ -70,8 +107,11 @@ fn build_resource(cfg: &OtlpConfig) -> Resource {
 /// The sampler and span limits are left at the SDK's defaults, which are
 /// themselves resolved from `OTEL_*` env vars (see the module docs).
 #[cfg(test)]
-fn build_provider(cfg: &OtlpConfig) -> Result<SdkTracerProvider, SetupError> {
-    openshell_otel::build_provider(&trace_config(cfg))
+fn build_provider(
+    cfg: &OtlpConfig,
+    gateway: GatewayResourceAttributes<'_>,
+) -> Result<SdkTracerProvider, SetupError> {
+    openshell_otel::build_provider(&trace_config(cfg, gateway))
 }
 
 /// Resolve the tracer provider for a gateway config file's optional
@@ -82,15 +122,20 @@ fn build_provider(cfg: &OtlpConfig) -> Result<SdkTracerProvider, SetupError> {
 ///
 /// The error is returned rather than logged because the provider is built
 /// before the subscriber it attaches to, so logging here would go nowhere.
-pub fn provider_for(cfg: Option<&OtlpConfig>) -> (Option<SdkTracerProvider>, Option<SetupError>) {
-    openshell_otel::provider_for(cfg.map(trace_config))
+pub fn provider_for(
+    cfg: Option<&OtlpConfig>,
+    gateway: GatewayResourceAttributes<'_>,
+) -> (Option<SdkTracerProvider>, Option<SetupError>) {
+    openshell_otel::provider_for(cfg.map(|cfg| trace_config(cfg, gateway)))
 }
 
-/// Build the gateway layer while routing one selected in-process driver to
-/// its own tracer provider.
-pub fn layer_excluding_driver<S>(
+/// Build the `tracing` layer that forwards spans to `provider`.
+///
+/// Events stay on the gateway's logging layers. Spans emitted by the
+/// OpenTelemetry crates are excluded to prevent recursive export traffic.
+pub fn layer<S>(
     provider: &SdkTracerProvider,
-    driver_target_prefix: Option<&'static str>,
+    excluded_target_prefix: Option<&'static str>,
 ) -> openshell_otel::TargetOtlpLayer<S>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
@@ -98,7 +143,7 @@ where
     openshell_otel::layer_excluding_target_prefix(
         provider,
         INSTRUMENTATION_SCOPE,
-        driver_target_prefix,
+        excluded_target_prefix,
     )
 }
 
@@ -132,8 +177,7 @@ pub mod test_exporter {
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber =
-            tracing_subscriber::registry().with(super::layer_excluding_driver(&provider, None));
+        let subscriber = tracing_subscriber::registry().with(super::layer(&provider, None));
         let dispatch = tracing::Dispatch::new(subscriber);
         TracingTestGuard {
             _default: tracing::dispatcher::set_default(&dispatch),
@@ -259,6 +303,10 @@ mod tests {
         }
     }
 
+    fn build_test_resource(cfg: &OtlpConfig) -> Resource {
+        build_resource(cfg, GatewayResourceAttributes::default())
+    }
+
     #[test]
     fn resource_defaults_the_service_name() {
         let _lock = crate::TEST_ENV_LOCK
@@ -267,7 +315,7 @@ mod tests {
         let _env = EnvVarGuard::remove("OTEL_SERVICE_NAME");
 
         assert_eq!(
-            service_name_of(&build_resource(&config())),
+            service_name_of(&build_test_resource(&config())),
             Some(DEFAULT_SERVICE_NAME.to_string())
         );
     }
@@ -276,7 +324,7 @@ mod tests {
     fn resource_honors_configured_service_name_and_carries_version() {
         let mut cfg = config();
         cfg.service_name = Some("gateway-staging".into());
-        let resource = build_resource(&cfg);
+        let resource = build_test_resource(&cfg);
 
         assert_eq!(
             resource
@@ -289,6 +337,31 @@ mod tests {
                 .get(&opentelemetry::Key::from_static_str("service.version"))
                 .map(|v| v.to_string()),
             Some(openshell_core::VERSION.to_string())
+        );
+    }
+
+    #[test]
+    fn resource_carries_gateway_name_and_compute_driver() {
+        let resource = build_resource(
+            &config(),
+            GatewayResourceAttributes::new(Some("vm-dev"), Some("vm")),
+        );
+
+        assert_eq!(
+            resource
+                .get(&opentelemetry::Key::from_static_str(
+                    "openshell.gateway.name",
+                ))
+                .map(|v| v.to_string()),
+            Some("vm-dev".to_string())
+        );
+        assert_eq!(
+            resource
+                .get(&opentelemetry::Key::from_static_str(
+                    "openshell.gateway.compute_driver",
+                ))
+                .map(|v| v.to_string()),
+            Some("vm".to_string())
         );
     }
 
@@ -346,7 +419,7 @@ mod tests {
         cfg.service_name = Some("from-config".into());
 
         assert_eq!(
-            service_name_of(&build_resource(&cfg)),
+            service_name_of(&build_test_resource(&cfg)),
             Some("from-config".to_string())
         );
     }
@@ -361,7 +434,7 @@ mod tests {
         let _env = EnvVarGuard::set("OTEL_SERVICE_NAME", "from-env");
 
         assert_eq!(
-            service_name_of(&build_resource(&config())),
+            service_name_of(&build_test_resource(&config())),
             Some("from-env".to_string())
         );
     }
@@ -376,7 +449,7 @@ mod tests {
         let mut cfg = config();
         cfg.service_name = Some("   ".into());
         assert_eq!(
-            service_name_of(&build_resource(&cfg)),
+            service_name_of(&build_test_resource(&cfg)),
             Some(DEFAULT_SERVICE_NAME.to_string())
         );
     }
@@ -385,7 +458,8 @@ mod tests {
     fn provider_rejects_a_malformed_endpoint() {
         let mut cfg = config();
         cfg.endpoint = "definitely not a url".into();
-        let err = build_provider(&cfg).expect_err("malformed endpoint");
+        let err = build_provider(&cfg, GatewayResourceAttributes::default())
+            .expect_err("malformed endpoint");
         assert!(
             err.to_string().contains("definitely not a url"),
             "error names the offending endpoint: {err}"
@@ -396,7 +470,10 @@ mod tests {
     fn provider_rejects_an_empty_endpoint() {
         let mut cfg = config();
         cfg.endpoint = "   ".into();
-        assert!(build_provider(&cfg).is_err(), "empty endpoint is rejected");
+        assert!(
+            build_provider(&cfg, GatewayResourceAttributes::default()).is_err(),
+            "empty endpoint is rejected"
+        );
     }
 
     #[tokio::test]
@@ -404,7 +481,8 @@ mod tests {
         // The OTLP batch exporter connects lazily, so a valid endpoint must
         // build even when nothing is listening — the gateway must not fail to
         // start because its collector is down.
-        let provider = build_provider(&config()).expect("provider builds");
+        let provider = build_provider(&config(), GatewayResourceAttributes::default())
+            .expect("provider builds");
         provider.shutdown().ok();
     }
 
@@ -413,7 +491,7 @@ mod tests {
     /// error for the caller to log — see the misconfigured-endpoint test.
     #[tokio::test]
     async fn absent_otlp_table_disables_export() {
-        let (provider, err) = provider_for(None);
+        let (provider, err) = provider_for(None, GatewayResourceAttributes::default());
         assert!(provider.is_none(), "export is off");
         assert!(
             err.is_none(),
@@ -423,7 +501,7 @@ mod tests {
 
     #[tokio::test]
     async fn present_otlp_table_enables_export() {
-        let (provider, err) = provider_for(Some(&config()));
+        let (provider, err) = provider_for(Some(&config()), GatewayResourceAttributes::default());
         assert!(err.is_none());
         provider.expect("provider is present").shutdown().ok();
     }
@@ -436,7 +514,7 @@ mod tests {
         let mut cfg = config();
         cfg.endpoint = "definitely not a url".into();
 
-        let (provider, err) = provider_for(Some(&cfg));
+        let (provider, err) = provider_for(Some(&cfg), GatewayResourceAttributes::default());
         assert!(
             provider.is_none(),
             "a bad endpoint degrades to no export rather than failing startup"

@@ -1,0 +1,244 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Codex Security Release Qualification
+
+on:
+  push:
+    tags:
+      - "v*.*.*-pre.*"
+  workflow_call:
+    inputs:
+      candidate_ref:
+        description: Pre-release tag to scan (vMAJOR.MINOR.PATCH-pre.N)
+        required: true
+        type: string
+      stable_ref:
+        description: Optional previous stable tag override
+        required: false
+        default: ""
+        type: string
+      allow_full_bootstrap:
+        description: Allow a full scan when no previous stable tag exists
+        required: false
+        default: false
+        type: boolean
+    outputs:
+      base_sha:
+        description: Previous stable commit, empty for a full bootstrap scan
+        value: ${{ jobs.analyze.outputs.base_sha }}
+      candidate_sha:
+        description: Qualified pre-release commit
+        value: ${{ jobs.analyze.outputs.candidate_sha }}
+      category:
+        description: Code Scanning category for the release train
+        value: ${{ jobs.analyze.outputs.category }}
+      train:
+        description: Stable version targeted by the pre-release train
+        value: ${{ jobs.analyze.outputs.train }}
+    secrets:
+      CODEX_SECURITY_API_KEY:
+        required: true
+  workflow_dispatch:
+    inputs:
+      candidate_ref:
+        description: Pre-release tag to scan (vMAJOR.MINOR.PATCH-pre.N)
+        required: true
+        type: string
+      stable_ref:
+        description: Optional previous stable tag override
+        required: false
+        type: string
+      allow_full_bootstrap:
+        description: Allow a full scan when no previous stable tag exists
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+concurrency:
+  group: codex-security-release-qualification
+  cancel-in-progress: true
+
+env:
+  CODEX_SECURITY_REASONING_EFFORT: medium
+  NVIDIA_INFERENCE_BASE_URL: https://inference-api.nvidia.com/v1
+  NVIDIA_INFERENCE_MODEL: openai/openai/gpt-5.6-sol
+
+jobs:
+  analyze:
+    name: Codex Security (${{ inputs.candidate_ref || github.ref_name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      base_sha: ${{ steps.range.outputs.base_sha }}
+      candidate_sha: ${{ steps.range.outputs.candidate_sha }}
+      category: ${{ steps.range.outputs.category }}
+      train: ${{ steps.range.outputs.train }}
+    steps:
+      # Install the trusted scanner before repository-controlled files exist in
+      # the workspace, and invoke it later through its absolute path.
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "26"
+          package-manager-cache: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Install Codex Security
+        run: |
+          set -euo pipefail
+          npm install \
+            --prefix "$RUNNER_TEMP/codex-security" \
+            --ignore-scripts \
+            --no-audit \
+            --no-fund \
+            @openai/codex-security@0.1.24
+
+      - name: Verify Codex Security
+        env:
+          CODEX_SECURITY_BIN: ${{ runner.temp }}/codex-security/node_modules/.bin/codex-security
+        run: |
+          set -euo pipefail
+          test -x "$CODEX_SECURITY_BIN"
+          "$CODEX_SECURITY_BIN" --version
+
+      - name: Check out the pre-release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.candidate_ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve release range
+        id: range
+        env:
+          ALLOW_FULL_BOOTSTRAP: ${{ inputs.allow_full_bootstrap || false }}
+          CANDIDATE_REF: ${{ inputs.candidate_ref || github.ref_name }}
+          STABLE_REF: ${{ inputs.stable_ref || '' }}
+        run: |
+          set -euo pipefail
+          git show-ref --verify --quiet refs/remotes/origin/main
+
+          args=(
+            --candidate "$CANDIDATE_REF"
+            --main-ref origin/main
+          )
+          if [ -n "$STABLE_REF" ]; then
+            args+=(--stable "$STABLE_REF")
+          fi
+          if [ "$ALLOW_FULL_BOOTSTRAP" = "true" ]; then
+            args+=(--allow-full-bootstrap)
+          fi
+
+          node tasks/scripts/codex-security-release-range.mjs "${args[@]}"
+
+      - name: Scan changes since the previous stable
+        env:
+          BASE_SHA: ${{ steps.range.outputs.base_sha }}
+          CODEX_SECURITY_BIN: ${{ runner.temp }}/codex-security/node_modules/.bin/codex-security
+          CODEX_SECURITY_STATE_DIR: ${{ runner.temp }}/codex-security-state
+          HEAD_SHA: ${{ steps.range.outputs.candidate_sha }}
+          NVIDIA_INFERENCE_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
+          SCAN_DIR: ${{ runner.temp }}/codex-security-results
+          SCAN_SCOPE: ${{ steps.range.outputs.scan_scope }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$CODEX_SECURITY_STATE_DIR" "$SCAN_DIR"
+
+          target_args=()
+          if [ "$SCAN_SCOPE" = "diff" ]; then
+            target_args=(--diff "$BASE_SHA" --head "$HEAD_SHA")
+          elif [ "$SCAN_SCOPE" != "full" ]; then
+            echo "::error::Unsupported Codex Security scan scope: $SCAN_SCOPE"
+            exit 2
+          fi
+
+          "$CODEX_SECURITY_BIN" scan . \
+            "${target_args[@]}" \
+            --auth api-key \
+            --model "$NVIDIA_INFERENCE_MODEL" \
+            --effort "$CODEX_SECURITY_REASONING_EFFORT" \
+            --codex 'model_provider="nvidia"' \
+            --codex 'model_providers.nvidia.name="NVIDIA Inference"' \
+            --codex "model_providers.nvidia.base_url=\"$NVIDIA_INFERENCE_BASE_URL\"" \
+            --codex 'model_providers.nvidia.env_key="NVIDIA_INFERENCE_API_KEY"' \
+            --codex 'model_providers.nvidia.wire_api="responses"' \
+            --codex 'model_providers.nvidia.supports_websockets=false' \
+            --output-dir "$SCAN_DIR" \
+            --headless > /dev/null
+
+      - name: Export SARIF
+        env:
+          CODEX_SECURITY_BIN: ${{ runner.temp }}/codex-security/node_modules/.bin/codex-security
+          SARIF_FILE: ${{ runner.temp }}/codex-security.sarif
+          SCAN_DIR: ${{ runner.temp }}/codex-security-results
+        run: |
+          set -euo pipefail
+          "$CODEX_SECURITY_BIN" export "$SCAN_DIR" \
+            --export-format sarif \
+            --source-root "$GITHUB_WORKSPACE" \
+            --output "$SARIF_FILE"
+
+      - name: Summarize findings
+        env:
+          BASE_TAG: ${{ steps.range.outputs.base_tag }}
+          CANDIDATE_TAG: ${{ steps.range.outputs.candidate_tag }}
+          COMMIT_COUNT: ${{ steps.range.outputs.commit_count }}
+          SARIF_FILE: ${{ runner.temp }}/codex-security.sarif
+          SCAN_SCOPE: ${{ steps.range.outputs.scan_scope }}
+          TRAIN: ${{ steps.range.outputs.train }}
+        run: |
+          set -euo pipefail
+          finding_count=$(jq '[.runs[]?.results[]?] | length' "$SARIF_FILE")
+          {
+            echo "### Codex Security release qualification"
+            echo
+            echo "- Train: \`$TRAIN\`"
+            echo "- Candidate: \`$CANDIDATE_TAG\`"
+            if [ "$SCAN_SCOPE" = "diff" ]; then
+              echo "- Previous stable: \`$BASE_TAG\`"
+              echo "- Commits in cumulative diff: $COMMIT_COUNT"
+            else
+              echo "- Scope: approved full bootstrap scan"
+            fi
+            echo "- Coverage: complete"
+            echo "- Findings: $finding_count"
+            echo
+            echo "Findings are informational during the observation phase."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload SARIF to Code Scanning
+        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          sarif_file: ${{ runner.temp }}/codex-security.sarif
+          ref: refs/heads/main
+          sha: ${{ steps.range.outputs.candidate_sha }}
+          category: ${{ steps.range.outputs.category }}
+
+  result:
+    name: OpenShell / Codex Security (informational)
+    if: always()
+    needs: analyze
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Evaluate scanner execution
+        env:
+          ANALYZE_RESULT: ${{ needs.analyze.result }}
+        run: |
+          set -euo pipefail
+          if [ "$ANALYZE_RESULT" != "success" ]; then
+            echo "::error::Codex Security release qualification did not complete successfully."
+            exit 1
+          fi
+          echo "Codex Security completed; findings remain informational."

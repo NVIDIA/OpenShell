@@ -27,16 +27,19 @@ pub struct LogPushLayer {
 
 impl LogPushLayer {
     pub fn new(sandbox_id: String, tx: mpsc::Sender<SandboxLogLine>) -> Self {
-        let max_level = std::env::var("OPENSHELL_LOG_PUSH_LEVEL")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(tracing::Level::INFO);
+        let max_level = parse_max_level(std::env::var("OPENSHELL_LOG_PUSH_LEVEL").ok().as_deref());
         Self {
             sandbox_id,
             tx,
             max_level,
         }
     }
+}
+
+/// Resolve the push level filter, defaulting to `INFO` when unset or unparseable.
+fn parse_max_level(raw: Option<&str>) -> tracing::Level {
+    raw.and_then(|s| s.parse().ok())
+        .unwrap_or(tracing::Level::INFO)
 }
 
 impl<S: Subscriber> Layer<S> for LogPushLayer {
@@ -307,5 +310,211 @@ impl tracing::field::Visit for LogVisitor {
             self.fields
                 .push((field.name().to_string(), format!("{value:?}")));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openshell_ocsf::{
+        ActionId, ActivityId, DispositionId, Endpoint, NetworkActivityBuilder, SandboxContext,
+        SeverityId, StatusId, ocsf_emit,
+    };
+    use tracing_subscriber::layer::SubscriberExt;
+
+    fn ocsf_ctx() -> SandboxContext {
+        SandboxContext {
+            sandbox_id: "sb-test".to_string(),
+            sandbox_name: "test-sandbox".to_string(),
+            container_image: "openshell/sandbox:test".to_string(),
+            hostname: "test-host".to_string(),
+            product_version: "0.0.0".to_string(),
+            proxy_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            proxy_port: 8888,
+        }
+    }
+
+    /// Capture lines emitted by `f` with an `INFO` level filter.
+    fn capture(capacity: usize, f: impl FnOnce()) -> Vec<SandboxLogLine> {
+        let (tx, mut rx) = mpsc::channel::<SandboxLogLine>(capacity);
+        let layer = LogPushLayer {
+            sandbox_id: "sb-test".to_string(),
+            tx,
+            max_level: tracing::Level::INFO,
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, f);
+
+        let mut out = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            out.push(line);
+        }
+        out
+    }
+
+    #[test]
+    fn ocsf_events_push_shorthand_with_ocsf_level_and_no_fields() {
+        let event = NetworkActivityBuilder::new(&ocsf_ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::Medium)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_domain("blocked.example.com", 443))
+            .message("CONNECT denied blocked.example.com:443".to_string())
+            .build();
+        let expected_shorthand = event.format_shorthand();
+
+        let lines = capture(16, || ocsf_emit!(event));
+
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0];
+        assert_eq!(line.level, "OCSF");
+        assert_eq!(line.target, openshell_ocsf::OCSF_TARGET);
+        assert_eq!(line.source, "sandbox");
+        assert_eq!(line.sandbox_id, "sb-test");
+        assert_eq!(line.message, expected_shorthand);
+        assert!(line.fields.is_empty());
+        assert!(line.timestamp_ms > 0);
+    }
+
+    #[test]
+    fn non_ocsf_events_use_visitor_extraction() {
+        let lines = capture(16, || {
+            tracing::info!(target: "test_target", answer = 42, name = "widget", "hello");
+        });
+
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0];
+        assert_eq!(line.level, "INFO");
+        assert_eq!(line.target, "test_target");
+        assert_eq!(line.source, "sandbox");
+        assert_eq!(line.message, "hello");
+        assert_eq!(line.fields.get("name").map(String::as_str), Some("widget"));
+        assert_eq!(line.fields.get("answer").map(String::as_str), Some("42"));
+        assert!(!line.fields.contains_key("message"));
+    }
+
+    #[test]
+    fn events_without_a_message_field_fall_back_to_the_event_name() {
+        let lines = capture(16, || {
+            tracing::info!(target: "test_target", answer = 1);
+        });
+
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].message.starts_with("event "),
+            "expected event-name fallback, got {:?}",
+            lines[0].message
+        );
+    }
+
+    #[test]
+    fn events_below_the_max_level_are_filtered() {
+        let lines = capture(16, || {
+            tracing::debug!(target: "test_target", "debug line");
+            tracing::trace!(target: "test_target", "trace line");
+            tracing::info!(target: "test_target", "info line");
+            tracing::warn!(target: "test_target", "warn line");
+        });
+
+        let messages: Vec<_> = lines.iter().map(|l| l.message.as_str()).collect();
+        assert_eq!(messages, vec!["info line", "warn line"]);
+    }
+
+    #[test]
+    fn lines_are_dropped_when_the_channel_is_full() {
+        let lines = capture(2, || {
+            for i in 0..3 {
+                tracing::info!(target: "test_target", "line {i}");
+            }
+        });
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].message, "line 0");
+        assert_eq!(lines[1].message, "line 1");
+    }
+
+    #[test]
+    fn parse_max_level_defaults_to_info() {
+        assert_eq!(parse_max_level(None), tracing::Level::INFO);
+        assert_eq!(parse_max_level(Some("not-a-level")), tracing::Level::INFO);
+        assert_eq!(parse_max_level(Some("debug")), tracing::Level::DEBUG);
+        assert_eq!(parse_max_level(Some("TRACE")), tracing::Level::TRACE);
+        assert_eq!(parse_max_level(Some("warn")), tracing::Level::WARN);
+    }
+
+    fn test_line(message: &str) -> SandboxLogLine {
+        SandboxLogLine {
+            sandbox_id: "sb-test".to_string(),
+            timestamp_ms: 1,
+            level: "INFO".to_string(),
+            target: "t".to_string(),
+            message: message.to_string(),
+            source: "sandbox".to_string(),
+            fields: std::collections::HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_during_backoff_buffers_up_to_the_cap_and_drops_the_rest() {
+        let (tx, mut rx) = mpsc::channel::<SandboxLogLine>(1024);
+        for i in 0..250 {
+            tx.try_send(test_line(&format!("line {i}"))).unwrap();
+        }
+        drop(tx);
+
+        let mut batch = Vec::new();
+        drain_during_backoff(&mut rx, &mut batch, tokio::time::Duration::from_secs(30)).await;
+
+        assert_eq!(batch.len(), 200);
+        assert_eq!(batch[0].message, "line 0");
+        assert_eq!(batch[199].message, "line 199");
+    }
+
+    #[tokio::test]
+    async fn drain_during_backoff_preserves_an_existing_batch() {
+        let (tx, mut rx) = mpsc::channel::<SandboxLogLine>(16);
+        tx.try_send(test_line("new")).unwrap();
+        drop(tx);
+
+        let mut batch = vec![test_line("buffered")];
+        drain_during_backoff(&mut rx, &mut batch, tokio::time::Duration::from_secs(30)).await;
+
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].message, "buffered");
+        assert_eq!(batch[1].message, "new");
+    }
+
+    #[tokio::test]
+    async fn drain_during_backoff_returns_early_when_the_channel_closes() {
+        let (tx, mut rx) = mpsc::channel::<SandboxLogLine>(16);
+        tx.try_send(test_line("last")).unwrap();
+        drop(tx);
+
+        let mut batch = Vec::new();
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            drain_during_backoff(&mut rx, &mut batch, tokio::time::Duration::from_secs(30)),
+        )
+        .await
+        .expect("closed channel should end the backoff drain");
+
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn log_visitor_into_parts_uses_the_fallback_only_without_a_message() {
+        let visitor = LogVisitor {
+            message: Some("explicit".to_string()),
+            fields: vec![("k".to_string(), "v".to_string())],
+        };
+        let (msg, fields) = visitor.into_parts("fallback");
+        assert_eq!(msg, "explicit");
+        assert_eq!(fields.get("k").map(String::as_str), Some("v"));
+
+        let (msg, fields) = LogVisitor::default().into_parts("fallback");
+        assert_eq!(msg, "fallback");
+        assert!(fields.is_empty());
     }
 }

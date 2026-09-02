@@ -21,15 +21,13 @@ use bollard::query_parameters::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use openshell_core::config::{
-    DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_SANDBOX_PIDS_LIMIT, DEFAULT_STOP_TIMEOUT_SECS,
-};
+use openshell_core::config::{DEFAULT_SANDBOX_PIDS_LIMIT, DEFAULT_STOP_TIMEOUT_SECS};
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
-    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE, SUPERVISOR_IMAGE_BINARY_PATH,
-    extract_first_tar_entry, supervisor_image_should_refresh, temp_extract_container_name,
-    validate_linux_elf_binary, write_cache_binary_atomic,
+    CONDITION_EXITED, CONDITION_RUNTIME_RESTART, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
+    LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE,
+    SUPERVISOR_IMAGE_BINARY_PATH, extract_first_tar_entry, supervisor_image_should_refresh,
+    temp_extract_container_name, validate_linux_elf_binary, write_cache_binary_atomic,
 };
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
@@ -56,7 +54,7 @@ use openshell_core::proto::compute::v1::{
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
-use openshell_core::{Config, Error, Result as CoreResult};
+use openshell_core::{Error, Result as CoreResult};
 use opentelemetry::trace::TraceContextExt as _;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -528,12 +526,45 @@ impl ComputeDriverService {
     }
 }
 
+/// Return the first responsive local Docker API socket.
+#[must_use]
+pub fn detect_socket() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(host) = std::env::var("DOCKER_HOST")
+        && let Some(path) = host.trim().strip_prefix("unix://")
+        && !path.is_empty()
+    {
+        candidates.push(PathBuf::from(path));
+    }
+    candidates.push(PathBuf::from("/var/run/docker.sock"));
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join(".docker/run/docker.sock"));
+    }
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        candidates.push(PathBuf::from(runtime_dir).join("docker.sock"));
+    }
+    openshell_core::local_api_socket::first_responsive_socket(&candidates, |response| {
+        openshell_core::local_api_socket::http_response_is_success(response)
+            && openshell_core::local_api_socket::contains_ascii(response, b"Api-Version:")
+            && !openshell_core::local_api_socket::contains_ascii(response, b"Libpod-Api-Version:")
+    })
+}
+
+#[must_use]
+pub fn is_available() -> bool {
+    detect_socket().is_some()
+}
+
 impl DockerComputeDriver {
-    pub async fn new(config: &Config, docker_config: &DockerComputeConfig) -> CoreResult<Self> {
+    pub async fn new(
+        gateway_bind_address: SocketAddr,
+        gateway_log_level: &str,
+        docker_config: &DockerComputeConfig,
+    ) -> CoreResult<Self> {
         let socket_path = docker_config
             .socket_path
             .clone()
-            .or_else(openshell_core::config::detect_docker_socket)
+            .or_else(detect_socket)
             .unwrap_or_else(|| PathBuf::from("/var/run/docker.sock"));
         let socket_path_str = socket_path.to_str().ok_or_else(|| {
             Error::config(format!(
@@ -559,7 +590,7 @@ impl DockerComputeDriver {
         let cdi_gpu_inventory = docker_cdi_gpu_inventory(&info);
         let allow_all_default_gpu = docker_info_reports_wsl2(&info);
         validate_sandbox_pids_limit(docker_config.sandbox_pids_limit)?;
-        let gateway_port = config.bind_address.port();
+        let gateway_port = gateway_bind_address.port();
         if gateway_port == 0 {
             return Err(Error::config(
                 "docker compute driver requires a fixed non-zero gateway bind port",
@@ -571,7 +602,7 @@ impl DockerComputeDriver {
         let gateway_route =
             docker_gateway_route(&info, bridge_gateway_ip, gateway_port, host_gateway_ip);
         let gateway_callback_bind_address =
-            docker_gateway_callback_bind_address(&gateway_route, config.bind_address);
+            docker_gateway_callback_bind_address(&gateway_route, gateway_bind_address);
         let mut docker_config = docker_config.clone();
         if docker_config.grpc_endpoint.trim().is_empty() {
             let scheme = if docker_guest_tls_configured(&docker_config) {
@@ -603,7 +634,7 @@ impl DockerComputeDriver {
                 gateway_callback_bind_address,
                 ssh_socket_path: docker_config.ssh_socket_path.clone(),
                 stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
-                log_level: config.log_level.clone(),
+                log_level: gateway_log_level.to_string(),
                 supervisor_bin,
                 guest_tls,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
@@ -635,6 +666,8 @@ impl DockerComputeDriver {
             driver_version: self.config.daemon_version.clone(),
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,
+            supports_sandbox_authentication: false,
+            driver_reports_runtime_readiness: false,
         }
     }
 
@@ -829,10 +862,37 @@ impl DockerComputeDriver {
 
     async fn current_snapshots(&self) -> Result<Vec<DriverSandbox>, Status> {
         let containers = self.list_managed_container_summaries().await?;
-        let container_sandboxes = containers
-            .iter()
-            .filter_map(sandbox_from_container_summary)
-            .collect::<Vec<_>>();
+        let mut container_sandboxes = Vec::with_capacity(containers.len());
+        for summary in &containers {
+            let Some(mut sandbox) = sandbox_from_container_summary(summary) else {
+                continue;
+            };
+            // Docker's list summary carries no exit code, so an exited
+            // container is reported as the generic terminal `ContainerExited`.
+            // Inspect it to tell a machine/daemon-restart signal kill apart
+            // from an ordinary application exit, mirroring the Podman driver,
+            // so startup recovery can revive restart victims while leaving
+            // crashes terminal.
+            if summary.state == Some(ContainerSummaryStateEnum::EXITED)
+                && let Some(container_id) = summary.id.as_deref()
+            {
+                match self.docker.inspect_container(container_id, None).await {
+                    Ok(inspected) => {
+                        if let Some(state) = inspected.state.as_ref() {
+                            apply_docker_exit_classification(&mut sandbox, state);
+                        }
+                    }
+                    Err(err) => {
+                        debug!(
+                            container_id,
+                            error = %err,
+                            "Could not inspect exited Docker container to classify its exit"
+                        );
+                    }
+                }
+            }
+            container_sandboxes.push(sandbox);
+        }
         let mut by_id = self.pending_snapshot_map().await;
         for sandbox in container_sandboxes {
             by_id.insert(sandbox.id.clone(), sandbox);
@@ -1713,6 +1773,19 @@ impl DockerComputeDriver {
 impl ComputeDriver for ComputeDriverService {
     type WatchSandboxesStream = WatchStream;
 
+    async fn authenticate_sandbox(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>, Status>
+    {
+        self.trace_rpc(
+            "driver.authenticate_sandbox",
+            "authenticate_sandbox",
+            ComputeDriver::authenticate_sandbox(&self.driver, request),
+        )
+        .await
+    }
+
     async fn get_capabilities(
         &self,
         request: Request<GetCapabilitiesRequest>,
@@ -1873,6 +1946,16 @@ impl ComputeDriver for ComputeDriverService {
 
 #[tonic::async_trait]
 impl ComputeDriver for DockerComputeDriver {
+    async fn authenticate_sandbox(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>, Status>
+    {
+        Err(Status::unimplemented(
+            "docker does not authenticate sandbox credentials",
+        ))
+    }
+
     type WatchSandboxesStream = WatchStream;
 
     async fn get_capabilities(
@@ -3491,6 +3574,34 @@ fn driver_status_from_summary(
     }
 }
 
+/// Refine an exited Docker sandbox's `Ready` condition from inspected state.
+///
+/// A signal kill (exit 137/143 = SIGKILL/SIGTERM, not OOM) is the signature of
+/// a machine/daemon restart terminating a running container. Reclassify it from
+/// the generic terminal `ContainerExited` to the recoverable
+/// `ContainerRuntimeRestart` so gateway startup can revive it. OOM kills and
+/// ordinary application exits stay `ContainerExited` and terminal.
+fn apply_docker_exit_classification(sandbox: &mut DriverSandbox, state: &ContainerState) {
+    if state.oom_killed == Some(true) {
+        return;
+    }
+    let Some(code) = state.exit_code.filter(|&code| matches!(code, 137 | 143)) else {
+        return;
+    };
+    let Some(condition) = sandbox
+        .status
+        .as_mut()
+        .and_then(|status| status.conditions.iter_mut().find(|c| c.r#type == "Ready"))
+    else {
+        return;
+    };
+    if condition.reason != CONDITION_EXITED {
+        return;
+    }
+    condition.reason = CONDITION_RUNTIME_RESTART.to_string();
+    condition.message = format!("Container terminated by signal (exit code {code})");
+}
+
 fn container_ready_condition(
     state: ContainerSummaryStateEnum,
 ) -> (&'static str, &'static str, &'static str, bool) {
@@ -3514,9 +3625,7 @@ fn container_ready_condition(
         ContainerSummaryStateEnum::PAUSED => {
             ("False", "ContainerPaused", "Container is paused", false)
         }
-        ContainerSummaryStateEnum::EXITED => {
-            ("False", "ContainerExited", "Container exited", false)
-        }
+        ContainerSummaryStateEnum::EXITED => ("False", CONDITION_EXITED, "Container exited", false),
         ContainerSummaryStateEnum::DEAD => ("False", "ContainerDead", "Container is dead", false),
     }
 }
@@ -4063,3 +4172,4 @@ fn internal_status(operation: &str, err: BollardError) -> Status {
 
 #[cfg(test)]
 mod tests;
+pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";

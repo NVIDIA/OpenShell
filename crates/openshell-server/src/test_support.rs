@@ -95,6 +95,8 @@ impl FakeComputeDriver {
                     driver_version: "test".to_string(),
                     default_image: "openshell/sandbox:test".to_string(),
                     gateway_manages_lifecycle: false,
+                    supports_sandbox_authentication: false,
+                    driver_reports_runtime_readiness: false,
                 },
                 gateway_listener_requirements: Vec::new(),
                 gateway_listener_requirements_supported: true,
@@ -235,6 +237,16 @@ impl Stream for UnixIncoming {
 
 #[tonic::async_trait]
 impl ComputeDriver for FakeComputeDriver {
+    async fn authenticate_sandbox(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>, Status>
+    {
+        Err(Status::unimplemented(
+            "fake driver does not authenticate sandbox credentials",
+        ))
+    }
+
     type WatchSandboxesStream = WatchStream;
 
     async fn get_capabilities(
@@ -273,11 +285,13 @@ impl ComputeDriver for FakeComputeDriver {
         request: Request<ValidateSandboxCreateRequest>,
     ) -> Result<Response<ValidateSandboxCreateResponse>, Status> {
         self.record_traceparent(request.metadata());
-        let sandbox = request.into_inner().sandbox;
+        let request = request.into_inner();
         self.with_state(|state| {
             state
                 .calls
-                .push(FakeComputeDriverCall::ValidateSandboxCreate { sandbox });
+                .push(FakeComputeDriverCall::ValidateSandboxCreate {
+                    sandbox: request.sandbox,
+                });
         });
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
@@ -326,7 +340,8 @@ impl ComputeDriver for FakeComputeDriver {
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<CreateSandboxResponse>, Status> {
         self.record_traceparent(request.metadata());
-        let sandbox = request.into_inner().sandbox;
+        let request = request.into_inner();
+        let sandbox = request.sandbox;
         self.with_state(|state| {
             if let Some(sandbox) = sandbox.as_ref() {
                 state.sandboxes.insert(sandbox.id.clone(), sandbox.clone());

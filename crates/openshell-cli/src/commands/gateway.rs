@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::color::Colorize;
 use crate::tls::{
     TlsOptions, build_insecure_rustls_config, build_rustls_config, grpc_client,
     require_tls_materials,
@@ -20,7 +21,6 @@ use openshell_bootstrap::{
 };
 use openshell_bootstrap::{GatewayMetadataSource, ListedGateway};
 use openshell_core::proto::{GetGatewayInfoRequest, HealthRequest, ServiceStatus};
-use owo_colors::OwoColorize;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use tonic::{Code, Status};

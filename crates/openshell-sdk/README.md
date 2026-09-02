@@ -9,7 +9,8 @@ gateway-name resolution.
 ## Two layers
 
 - `OpenShellClient` — the curated, sandbox-focused surface: health, sandbox
-  CRUD, readiness/deletion waits, and non-streaming exec.
+  CRUD, reusable sandbox template CRUD, readiness/deletion waits, and
+  non-streaming exec.
 - `raw` — direct access to the generated tonic clients for RPCs the curated
   surface doesn't yet cover (inference, providers, policy, logs, settings, SSH,
   forwarding).
@@ -44,10 +45,53 @@ mTLS (client certificates) is not supported.
 
 `OpenShellClient::connect(ClientConfig)` returns a connected client exposing
 `health`, `create_sandbox`, `get_sandbox`, `list_sandboxes`, `delete_sandbox`,
+`create_sandbox_from_template`, `create_sandbox_template`,
+`get_sandbox_template`, `list_sandbox_templates`, `delete_sandbox_template`,
 `wait_ready`, `wait_deleted`, and `exec`. Curated types (`SandboxSpec`,
-`SandboxRef`, `Health`, `ListOptions`, `ExecOptions`, `SandboxPhase`) use
-SDK-shaped enums rather than raw proto integers. Failures map to a typed
-`SdkError` with a discriminable kind.
+`SandboxRef`, `Health`, `ListOptions`, `SandboxTemplateListOptions`,
+`ExecOptions`, `SandboxPhase`) use SDK-shaped enums rather than raw proto
+integers where practical. Reusable template resources are exposed as
+`SandboxWorkloadTemplate` proto aliases so callers can populate the full
+portable workload shape and driver config. Failures map to a typed `SdkError`
+with a discriminable kind.
+
+```rust
+use openshell_sdk::{
+    ClientConfig, OpenShellClient, SandboxTemplateCreateSpec,
+    SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
+};
+
+# async fn run() -> Result<(), openshell_sdk::SdkError> {
+let client = OpenShellClient::connect(ClientConfig::new("http://127.0.0.1:8080")).await?;
+client
+    .create_sandbox_template(SandboxWorkloadTemplate {
+        metadata: Some(openshell_sdk::raw::proto::datamodel::v1::ObjectMeta {
+            name: "python".to_string(),
+            ..Default::default()
+        }),
+        spec: Some(SandboxWorkloadTemplateSpec {
+            workload: Some(SandboxWorkloadConfig {
+                image: "ghcr.io/nvidia/openshell-community/sandboxes/python:latest".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    })
+    .await?;
+
+let _sandbox = client
+    .create_sandbox_from_template(SandboxTemplateCreateSpec {
+        template_name: "python".to_string(),
+        policy: Some(openshell_sdk::raw::proto::SandboxPolicy {
+            version: 1,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .await?;
+# Ok(())
+# }
+```
 
 ## Modules
 

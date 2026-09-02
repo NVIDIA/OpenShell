@@ -437,6 +437,7 @@ ensure_sandbox_image_available() {
 }
 
 e2e_build_gateway_binaries "${ROOT}" TARGET_DIR GATEWAY_BIN CLI_BIN
+export OPENSHELL_BIN="${CLI_BIN}"
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   e2e_build_external_driver \
     "${ROOT}" openshell-driver-docker openshell-driver-docker DRIVER_BIN

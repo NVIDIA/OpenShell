@@ -90,8 +90,8 @@ regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 
 # AWS SDK
-aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
-aws-sdk-sts = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+aws-sdk-sts = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 
 # WebSocket
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-native-roots"] }

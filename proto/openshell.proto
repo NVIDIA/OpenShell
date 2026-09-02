@@ -6,6 +6,7 @@ syntax = "proto3";
 package openshell.v1;
 
 import "datamodel.proto";
+import "google/protobuf/duration.proto";
 import "google/protobuf/struct.proto";
 import "options.proto";
 import "sandbox.proto";
@@ -66,6 +67,46 @@ service OpenShell {
       auth_mode: "bearer"
       scope: "sandbox:read"
       workspace_role: "user"
+    };
+  }
+
+  // Create a reusable sandbox workload template.
+  rpc CreateSandboxTemplate(CreateSandboxTemplateRequest)
+      returns (SandboxTemplateResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "admin"
+    };
+  }
+
+  // Fetch a reusable sandbox workload template by name.
+  rpc GetSandboxTemplate(GetSandboxTemplateRequest)
+      returns (SandboxTemplateResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
+  // List reusable sandbox workload templates.
+  rpc ListSandboxTemplates(ListSandboxTemplatesRequest)
+      returns (ListSandboxTemplatesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
+  // Delete a reusable sandbox workload template by name.
+  rpc DeleteSandboxTemplate(DeleteSandboxTemplateRequest)
+      returns (DeleteSandboxTemplateResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "admin"
     };
   }
 
@@ -364,9 +405,8 @@ service OpenShell {
     };
   }
 
-  // Get gateway-global settings (read-only feature flags; any authenticated
-  // user may read these so the CLI and TUI can discover capabilities like
-  // providers_v2_enabled without requiring Platform Admin).
+  // Get gateway-global settings (read-only runtime configuration; any
+  // authenticated user may read these without requiring Platform Admin).
   //
   // Scope-only (no role): scopes are granted by the IdP at token issuance,
   // orthogonal to workspace membership. Deployments that enable scope
@@ -466,6 +506,14 @@ service OpenShell {
 
   // Persist the canonical main process result before the supervisor exits.
   rpc ReportMainProcessExit(ReportMainProcessExitRequest) returns (ReportMainProcessExitResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
+  // Confirm that foreground terminal delivery completed naturally.
+  rpc FinalizeMainProcessExit(FinalizeMainProcessExitRequest)
+      returns (FinalizeMainProcessExitResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "sandbox"
     };
@@ -806,6 +854,8 @@ message Sandbox {
   SandboxSpec spec = 2;
   // Latest user-facing observed status derived by the gateway.
   SandboxStatus status = 3;
+  // Read-only provenance for sandboxes created from a reusable workload template.
+  SandboxWorkloadTemplateProvenance created_from_workload_template = 20;
 
   reserved 4, 5;
   reserved "phase", "current_policy_version";
@@ -854,7 +904,12 @@ message GpuResourceRequirements {
   optional uint32 count = 1;
 }
 
-// Public sandbox template mapped onto compute-driver template inputs.
+// Historical inline compute template mapped onto compute-driver template inputs.
+//
+// Despite its name, this is not a reusable named sandbox template resource. It
+// is an inline part of `SandboxSpec` kept for v1 compatibility. A future
+// breaking API cleanup may rename this message to free `SandboxTemplate` for
+// the reusable template resource now represented by `SandboxWorkloadTemplate`.
 message SandboxTemplate {
   // Fully-qualified OCI image reference used to boot the sandbox.
   string image = 1;
@@ -885,6 +940,62 @@ message SandboxTemplate {
   google.protobuf.Struct driver_config = 11;
 }
 
+// Reusable named sandbox workload template resource.
+//
+// This is the actual workspace-scoped template resource used to create
+// sandboxes by reference. It uses the longer name in v1 to avoid colliding with
+// the historical inline `SandboxTemplate` message. A future breaking API
+// cleanup may rename this resource to `SandboxTemplate`.
+message SandboxWorkloadTemplate {
+  // Kubernetes-style metadata (id, name, labels, timestamps, resource version).
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  // Desired reusable workload shape and template-owned driver config.
+  SandboxWorkloadTemplateSpec spec = 2;
+}
+
+message SandboxWorkloadTemplateSpec {
+  // Portable workload shape.
+  SandboxWorkloadConfig workload = 1;
+  // Driver-keyed opaque config envelope supplied by the template owner.
+  google.protobuf.Struct driver_config = 2;
+  // Desired service level associated with this template.
+  SandboxServiceLevel desired_service_level = 3;
+}
+
+message SandboxWorkloadConfig {
+  // Fully-qualified OCI image reference used to boot the sandbox.
+  string image = 1;
+  // Environment variables injected into the sandbox runtime.
+  map<string, string> environment = 2;
+  // Portable resource requirements for sandboxes created from this workload.
+  SandboxResources resources = 3;
+}
+
+message SandboxResources {
+  // Portable CPU quantity, for example "500m" or "2".
+  string cpu = 1;
+  // Portable memory quantity, for example "512Mi" or "2Gi".
+  string memory = 2;
+  // GPU requirements for the sandbox workload. Presence indicates a GPU
+  // request. When count is omitted, the request uses the selected driver's
+  // default GPU assignment behavior.
+  GpuResourceRequirements gpu = 3;
+}
+
+message SandboxServiceLevel {
+  SandboxStartup startup = 1;
+}
+
+message SandboxStartup {
+  google.protobuf.Duration ready_within = 1;
+  uint32 max_burst = 2;
+}
+
+message SandboxWorkloadTemplateProvenance {
+  string name = 1;
+  string resource_version = 2;
+}
+
 // User-facing sandbox status derived by the gateway from compute-driver observations.
 //
 // Public status does not embed driver-only flags such as `deleting`.
@@ -907,7 +1018,8 @@ message SandboxStatus {
   // The gateway uses this to reject stale exit reports after a restart.
   string main_process_instance_id = 8;
   // Normalized main process result. Signal exits use 128 + signal number.
-  // Presence indicates that the main process exited and the sandbox is in Error.
+  // Presence indicates that the canonical main process exited. Exit code 0
+  // produces Completed; nonzero and signal-normalized exits produce Error.
   optional int32 exit_code = 9;
 }
 
@@ -939,6 +1051,8 @@ enum SandboxPhase {
   SANDBOX_PHASE_STOPPING = 6;
   SANDBOX_PHASE_STOPPED = 7;
   SANDBOX_PHASE_STARTING = 8;
+  // The canonical main process exited successfully and its result is final.
+  SANDBOX_PHASE_COMPLETED = 9;
 }
 
 // Public platform event exposed on the sandbox watch stream.
@@ -968,6 +1082,53 @@ message CreateSandboxRequest {
   map<string, string> annotations = 4;
   // Workspace for the sandbox. Empty defaults to "default".
   string workspace = 5;
+  // One-shot launch hint indicating that the creating client will attach to
+  // the canonical main process. The supervisor keeps the terminal transport
+  // alive until that attachment connects and closes naturally.
+  bool await_main_process_attachment = 6;
+  // Workspace-scoped SandboxWorkloadTemplate name to resolve at creation time.
+  string workload_template_name = 7;
+}
+
+message CreateSandboxTemplateRequest {
+  SandboxWorkloadTemplate template = 1;
+  // Workspace for the template. Empty defaults to "default".
+  string workspace = 2;
+}
+
+message GetSandboxTemplateRequest {
+  string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
+}
+
+message ListSandboxTemplatesRequest {
+  uint32 limit = 1;
+  uint32 offset = 2;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 3;
+  // List across all workspaces. Mutually exclusive with workspace.
+  bool all_workspaces = 4;
+  // Optional label selector in key=value comma-separated form.
+  string label_selector = 5;
+}
+
+message DeleteSandboxTemplateRequest {
+  string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
+}
+
+message SandboxTemplateResponse {
+  SandboxWorkloadTemplate template = 1;
+}
+
+message ListSandboxTemplatesResponse {
+  repeated SandboxWorkloadTemplate templates = 1;
+}
+
+message DeleteSandboxTemplateResponse {
+  bool deleted = 1;
 }
 
 // Get sandbox request.
@@ -1247,6 +1408,13 @@ message ExecSandboxRequest {
 
   // Initial terminal rows (used when tty=true, 0 = use default).
   uint32 rows = 9;
+
+  // Skip sourcing shell login/profile startup files before running the command.
+  // When false (the default), the command runs through a login shell
+  // (`bash -lc`) so user startup files (.bash_profile/.profile, and .bashrc if
+  // sourced by them) are applied. When true, the command runs without those
+  // files (`bash -c`), for automation that needs predictable startup behavior.
+  bool no_login_shell = 10;
 }
 
 // One stdout chunk from a sandbox exec.
@@ -1355,7 +1523,8 @@ message WatchSandboxRequest {
   // Replay the last N platform events (best-effort) before following.
   uint32 event_tail = 6;
 
-  // Stop streaming once the sandbox reaches a terminal phase (READY or ERROR).
+  // Stop streaming once the sandbox reaches READY or a terminal result phase
+  // (COMPLETED, STOPPED, or ERROR).
   bool stop_on_terminal = 7;
 
   // Only include log lines with timestamp >= this value (milliseconds since epoch).
@@ -2239,6 +2408,15 @@ message ReportMainProcessExitRequest {
 }
 
 message ReportMainProcessExitResponse {}
+
+// Terminal-delivery completion reported after all expected foreground SSH
+// attachments close. A successful response permits ephemeral cleanup.
+message FinalizeMainProcessExitRequest {
+  string sandbox_id = 1;
+  string instance_id = 2;
+}
+
+message FinalizeMainProcessExitResponse {}
 
 // Gateway requests the supervisor to open a relay channel.
 //

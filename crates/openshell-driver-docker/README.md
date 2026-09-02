@@ -8,6 +8,10 @@ spans export to the same OTLP/gRPC collector with the service name
 context and emits the compute-driver RPC boundary that a standalone driver
 would expose.
 
+`mise run gateway:docker` enables this export only when a local collector is
+listening on `127.0.0.1:4317`. Otherwise, it omits the gateway OTLP configuration
+so the development gateway does not repeatedly report export failures.
+
 The standalone `openshell-driver-docker` binary accepts
 `OPENSHELL_OTLP_ENDPOINT`. When set, it exports Docker driver spans to that
 collector, continues W3C trace context from gateway RPC metadata, and flushes

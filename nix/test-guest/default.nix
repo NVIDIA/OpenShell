@@ -18,7 +18,8 @@ let
     if isAarch64 then "${qemu}/bin/qemu-system-aarch64" else "${qemu}/bin/qemu-system-x86_64";
 
   distros = {
-    ubuntu = import ./distros/ubuntu.nix { inherit pkgs architecture; };
+    ubuntu-24-04 = import ./distros/ubuntu-24-04.nix { inherit pkgs architecture; };
+    ubuntu-26-04 = import ./distros/ubuntu-26-04.nix { inherit pkgs architecture; };
     centos = import ./distros/centos.nix { inherit pkgs architecture; };
     fedora = import ./distros/fedora.nix { inherit pkgs architecture; };
     rocky = import ./distros/rocky.nix { inherit pkgs architecture; };
@@ -26,10 +27,17 @@ let
 
   configurations = {
     docker = ./configuration/docker.yml;
-    podman = ./configuration/podman.yml;
+    podman-rootless = ./configuration/podman-rootless.yml;
     selinux = ./configuration/selinux.yml;
     snapd = ./configuration/snapd.yml;
   };
+
+  configurationTasks = [
+    "podman-common.yml"
+    "podman-rootless/fedora.yml"
+    "podman-rootless/shared.yml"
+    "podman-rootless/ubuntu.yml"
+  ];
 
   mkDistroProfile =
     name: distro:
@@ -52,7 +60,11 @@ let
   );
 
   configurationCatalog = pkgs.linkFarm "openshell-test-guest-configurations" (
-    pkgs.lib.mapAttrsToList (name: path: { inherit name path; }) configurations
+    (pkgs.lib.mapAttrsToList (name: path: { inherit name path; }) configurations)
+    ++ (map (name: {
+      name = "tasks/${name}";
+      path = ./configuration/tasks/${name};
+    }) configurationTasks)
   );
 
   runtimeInputs = [

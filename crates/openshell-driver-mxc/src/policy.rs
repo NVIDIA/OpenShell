@@ -78,8 +78,8 @@ fn format_loss(items: &[LossItem]) -> String {
 /// Translates an `OpenShell` `SandboxPolicy` into an MXC `ContainerConfig`
 /// fragment, returning a loss report of anything unrepresentable.
 pub trait PolicyMapper: Send + Sync {
-    /// `policy` is `None` only when the gateway failed to stage one (the MXC
-    /// path treats that as a hard error — the demo's whole point is enforcement).
+    /// `policy` is `None` only when the create request omitted it. The MXC path
+    /// treats that as a hard error because it cannot launch without enforcement.
     fn map(&self, policy: Option<&SandboxPolicy>, ctx: &MapCtx) -> Result<MappedConfig, MapError>;
 }
 

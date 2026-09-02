@@ -65,7 +65,7 @@ impl RegisteredSetting {
 ///
 /// 1. Add a [`RegisteredSetting`] entry to this array with the key name and
 ///    [`SettingValueKind`].
-/// 2. Recompile `openshell-server` (gateway) and `openshell-sandbox`
+/// 2. Recompile `openshell-gateway` and `openshell-sandbox`
 ///    (supervisor). No database migration is needed -- new keys are stored in
 ///    the existing settings JSON blob.
 /// 3. Add sandbox-side consumption in `openshell-sandbox` to read and act on
@@ -74,8 +74,7 @@ impl RegisteredSetting {
 ///    settable via `settings set`. The server validates that only registered
 ///    keys are accepted.
 /// 5. Add a unit test in this module's `tests` section to cover the new key.
-pub const PROVIDERS_V2_ENABLED_KEY: &str = "providers_v2_enabled";
-
+///
 /// Sandbox-level opt-in for the agent-driven policy proposal surface.
 ///
 /// When true, the supervisor installs the `policy_advisor` skill, serves
@@ -108,14 +107,7 @@ pub const PROPOSAL_APPROVAL_MODE_KEY: &str = "proposal_approval_mode";
 pub const PROPOSAL_APPROVAL_MODE_VALUES: &[&str] = &["manual", "auto"];
 
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
-    // Gateway-level opt-in for provider profile policy composition. Defaults
-    // to false when unset.
-    RegisteredSetting {
-        key: PROVIDERS_V2_ENABLED_KEY,
-        kind: SettingValueKind::Bool,
-        allowed_string_values: None,
-    },
-    // When true the sandbox writes OCSF v1.7.0 JSONL records to
+    // When true the sandbox writes OCSF v1.8.0 JSONL records to
     // `/var/log/openshell-ocsf*.log` (daily rotation, 3 files) in addition
     // to the human-readable shorthand log. Defaults to false (no JSONL written).
     RegisteredSetting {
@@ -168,9 +160,8 @@ pub fn parse_bool_like(raw: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PROPOSAL_APPROVAL_MODE_KEY, PROPOSAL_APPROVAL_MODE_VALUES, PROVIDERS_V2_ENABLED_KEY,
-        REGISTERED_SETTINGS, RegisteredSetting, SettingValueKind, parse_bool_like,
-        registered_keys_csv, setting_for_key,
+        PROPOSAL_APPROVAL_MODE_KEY, PROPOSAL_APPROVAL_MODE_VALUES, REGISTERED_SETTINGS,
+        RegisteredSetting, SettingValueKind, parse_bool_like, registered_keys_csv, setting_for_key,
     };
 
     #[test]
@@ -185,18 +176,16 @@ mod tests {
     }
 
     #[test]
-    fn setting_for_key_returns_providers_v2_enabled() {
-        let setting = setting_for_key(PROVIDERS_V2_ENABLED_KEY)
-            .expect("providers_v2_enabled should be registered");
-        assert_eq!(setting.kind, SettingValueKind::Bool);
+    fn setting_for_key_rejects_removed_providers_v2_enabled() {
+        assert!(setting_for_key("providers_v2_enabled").is_none());
     }
 
     // ---- RegisteredSetting::validate_string_value ----
 
     #[test]
     fn validate_string_value_accepts_anything_when_unconstrained() {
-        let setting = setting_for_key(PROVIDERS_V2_ENABLED_KEY)
-            .expect("providers_v2_enabled should be registered");
+        let setting =
+            setting_for_key("ocsf_json_enabled").expect("ocsf_json_enabled should be registered");
         // Bool-kind entries currently leave `allowed_string_values = None`;
         // the helper still returns Ok for arbitrary strings.
         assert!(setting.validate_string_value("anything").is_ok());

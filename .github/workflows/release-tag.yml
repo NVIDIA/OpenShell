@@ -48,6 +48,7 @@ jobs:
       semver: ${{ steps.v.outputs.semver }}
       # Commit resolved from RELEASE_TAG, used for image tags and downstream metadata
       source_sha: ${{ steps.v.outputs.source_sha }}
+      is_prerelease: ${{ steps.v.outputs.is_prerelease }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -64,72 +65,196 @@ jobs:
         id: v
         run: |
           set -euo pipefail
-          echo "python=$(uv run python tasks/scripts/release.py get-version --python)" >> "$GITHUB_OUTPUT"
-          echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
-          echo "npm=$(uv run python tasks/scripts/release.py get-version --npm)" >> "$GITHUB_OUTPUT"
-          echo "deb=$(uv run python tasks/scripts/release.py get-version --deb)" >> "$GITHUB_OUTPUT"
-          echo "rpm_version=$(uv run python tasks/scripts/release.py get-version --rpm-version)" >> "$GITHUB_OUTPUT"
-          echo "rpm_release=$(uv run python tasks/scripts/release.py get-version --rpm-release)" >> "$GITHUB_OUTPUT"
-          echo "semver=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
-          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*$ ]]; then
+            is_prerelease=true
+          elif [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            is_prerelease=false
+          else
+            echo "Unsupported release tag: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+          {
+            echo "is_prerelease=${is_prerelease}"
+            echo "python=$(uv run python tasks/scripts/release.py get-version --python)"
+            echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)"
+            echo "npm=$(uv run python tasks/scripts/release.py get-version --npm)"
+            echo "deb=$(uv run python tasks/scripts/release.py get-version --deb)"
+            echo "rpm_version=$(uv run python tasks/scripts/release.py get-version --rpm-version)"
+            echo "rpm_release=$(uv run python tasks/scripts/release.py get-version --rpm-release)"
+            echo "semver=${RELEASE_TAG#v}"
+            echo "source_sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+  build-cli:
+    needs: compute-versions
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-cli-binaries.yml
+    with:
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      image-tag: ${{ needs.compute-versions.outputs.semver }}
+      checkout-ref: ${{ inputs.tag || github.ref }}
+    secrets: inherit
+
+  build-conformance:
+    needs: compute-versions
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-musl
+            runner: linux-amd64-cpu8
+            dev_shell: .#devShells.x86_64-linux.musl
+          - triple: aarch64-unknown-linux-musl
+            runner: linux-arm64-cpu8
+            dev_shell: .#devShells.aarch64-linux.musl
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      package: openshell-conformance-cli
+      binary: openshell-conformance
+      artifact-name: openshell-conformance-${{ matrix.triple }}
+      triple: ${{ matrix.triple }}
+      runner: ${{ matrix.runner }}
+      dev-shell: ${{ matrix.dev_shell }}
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      checkout-ref: ${{ inputs.tag || github.ref }}
+    secrets: inherit
 
   build-gateway:
-    needs: [compute-versions]
+    needs: compute-versions
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-gateway-binaries.yml
+    with:
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      image-tag: ${{ needs.compute-versions.outputs.semver }}
+      checkout-ref: ${{ inputs.tag || github.ref }}
+    secrets: inherit
+
+  build-sandbox:
+    needs: compute-versions
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-sandbox-binaries.yml
+    with:
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      image-tag: ${{ needs.compute-versions.outputs.semver }}
+      checkout-ref: ${{ inputs.tag || github.ref }}
+    secrets: inherit
+
+  build-vm-driver:
+    needs: [compute-versions, build-sandbox]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-vm-driver.yml
+    with:
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      image-tag: ${{ needs.compute-versions.outputs.semver }}
+      checkout-ref: ${{ inputs.tag || github.ref }}
+    secrets: inherit
+
+  package-binaries:
+    needs: [build-cli, build-gateway, build-sandbox, build-vm-driver]
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/package-release-binaries.yml
+
+  build-gateway-image:
+    needs: [compute-versions, build-gateway]
+    permissions:
+      contents: read
+      packages: write
     uses: ./.github/workflows/docker-build.yml
     with:
       component: gateway
-      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      binary: openshell-gateway
+      target-suffix: unknown-linux-gnu
       image-tag: ${{ needs.compute-versions.outputs.source_sha }}
       checkout-ref: ${{ inputs.tag || github.ref }}
-      auditable: true
+    secrets: inherit
 
-  build-supervisor:
-    needs: [compute-versions]
+  build-supervisor-image:
+    needs: [compute-versions, build-sandbox]
+    permissions:
+      contents: read
+      packages: write
     uses: ./.github/workflows/docker-build.yml
     with:
       component: supervisor
-      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      binary: openshell-sandbox
+      target-suffix: unknown-linux-musl
       image-tag: ${{ needs.compute-versions.outputs.source_sha }}
       checkout-ref: ${{ inputs.tag || github.ref }}
-      auditable: true
+    secrets: inherit
 
-  e2e:
-    needs: [compute-versions, build-gateway, build-supervisor]
+  docker-e2e:
+    needs: [compute-versions, build-cli, build-conformance, build-gateway, build-supervisor-image]
     permissions:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-test.yml
+    uses: ./.github/workflows/e2e-docker-test.yml
     with:
       image-tag: ${{ needs.compute-versions.outputs.source_sha }}
       checkout-ref: ${{ inputs.tag || github.ref }}
       runner: linux-arm64-cpu8
+      conformance-artifact-prefix: openshell-conformance
+
+  podman-e2e:
+    needs: [compute-versions, build-cli, build-conformance, build-gateway, build-supervisor-image]
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-podman-test.yml
+    with:
+      image-tag: ${{ needs.compute-versions.outputs.source_sha }}
+      checkout-ref: ${{ inputs.tag || github.ref }}
+      conformance-artifact-prefix: openshell-conformance
+
+  vm-e2e:
+    needs: [compute-versions, build-cli, build-conformance, build-gateway, build-vm-driver]
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-vm-test.yml
+    with:
+      checkout-ref: ${{ inputs.tag || github.ref }}
+      conformance-artifact-prefix: openshell-conformance
 
   tag-ghcr-release:
-    name: Tag GHCR Images for Release
-    needs: [compute-versions, build-gateway, build-supervisor, release]
+    name: Tag GHCR Images
+    needs: [compute-versions, build-gateway-image, build-supervisor-image, release]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     steps:
       - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
-      - name: Tag images with version and latest
+      - name: Tag images with release version
+        env:
+          IS_PRERELEASE: ${{ needs.compute-versions.outputs.is_prerelease }}
         run: |
           set -euo pipefail
           REGISTRY="ghcr.io/nvidia/openshell"
           VERSION="${{ needs.compute-versions.outputs.semver }}"
           SOURCE_TAG="${{ needs.compute-versions.outputs.source_sha }}"
           for component in gateway supervisor; do
-            echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${VERSION} and latest..."
+            echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${VERSION}..."
             docker buildx imagetools create \
               --prefer-index=false \
               -t "${REGISTRY}/${component}:${VERSION}" \
               "${REGISTRY}/${component}:${SOURCE_TAG}"
-            docker buildx imagetools create \
-              --prefer-index=false \
-              -t "${REGISTRY}/${component}:latest" \
-              "${REGISTRY}/${component}:${SOURCE_TAG}"
+            if [[ "${IS_PRERELEASE}" != "true" ]]; then
+              echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as latest..."
+              docker buildx imagetools create \
+                --prefer-index=false \
+                -t "${REGISTRY}/${component}:latest" \
+                "${REGISTRY}/${component}:${SOURCE_TAG}"
+            fi
           done
 
   build-python-wheel:
@@ -170,461 +295,9 @@ jobs:
           path: target/wheels/*.whl
           retention-days: 5
 
-  # ---------------------------------------------------------------------------
-  # Build CLI binaries (Linux musl — static, native on each arch)
-  #
-  # Builds run directly on the CI host (glibc Ubuntu).  Zig provides musl
-  # C/C++ toolchains for bundled-z3 and ring, and is also used as the linker.
-  # ---------------------------------------------------------------------------
-  build-cli-linux:
-    name: Build CLI (Linux ${{ matrix.arch }})
-    needs: [compute-versions]
-    strategy:
-      matrix:
-        include:
-          - arch: amd64
-            runner: linux-amd64-cpu8
-            target: x86_64-unknown-linux-musl
-            zig_target: x86_64-linux-musl
-          - arch: arm64
-            runner: linux-arm64-cpu8
-            target: aarch64-unknown-linux-musl
-            zig_target: aarch64-linux-musl
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --privileged
-    env:
-      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      OPENSHELL_IMAGE_TAG: ${{ needs.compute-versions.outputs.semver }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.tag || github.ref }}
-          fetch-depth: 0
-
-      - name: Mark workspace safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Fetch tags
-        run: git fetch --tags --force
-
-      - name: Install tools
-        run: mise install --locked
-
-      - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          shared-key: cli-musl-${{ matrix.arch }}
-          cache-directories: .cache/sccache
-          cache-targets: "true"
-
-      - name: Add Rust musl target
-        run: mise x -- rustup target add ${{ matrix.target }}
-
-      - name: Set up zig musl wrappers
-        run: |
-          set -euo pipefail
-          ZIG="$(mise which zig)"
-          ZIG_TARGET="${{ matrix.zig_target }}"
-          mkdir -p /tmp/zig-musl
-
-          # cc-rs injects --target=<rust-triple> (for example
-          # aarch64-unknown-linux-musl), which zig does not parse.  Strip any
-          # caller-provided --target and use the wrapper's zig-native target.
-          for tool in cc c++; do
-            printf '#!/bin/bash\nargs=()\nfor arg in "$@"; do\n  case "$arg" in\n    --target=*) ;;\n    *) args+=("$arg") ;;\n  esac\ndone\nexec "%s" %s --target=%s "${args[@]}"\n' \
-              "$ZIG" "$tool" "$ZIG_TARGET" > "/tmp/zig-musl/${tool}"
-            chmod +x "/tmp/zig-musl/${tool}"
-          done
-
-          TARGET_ENV=$(echo "${{ matrix.target }}" | tr '-' '_')
-          TARGET_ENV_UPPER=${TARGET_ENV^^}
-
-          # Use zig for C/C++ compilation and final linking.
-          echo "CC_${TARGET_ENV}=/tmp/zig-musl/cc" >> "$GITHUB_ENV"
-          echo "CXX_${TARGET_ENV}=/tmp/zig-musl/c++" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_${TARGET_ENV_UPPER}_LINKER=/tmp/zig-musl/cc" >> "$GITHUB_ENV"
-
-          # Let zig own CRT/startfiles to avoid duplicate _start symbols.
-          echo "CARGO_TARGET_${TARGET_ENV_UPPER}_RUSTFLAGS=-Clink-self-contained=no" >> "$GITHUB_ENV"
-
-          # z3 built with zig c++ uses libc++ symbols (std::__1::*).
-          # Override z3-sys default (stdc++) so Rust links the matching runtime.
-          echo "CXXSTDLIB=c++" >> "$GITHUB_ENV"
-
-      - name: Patch workspace version
-        if: needs.compute-versions.outputs.cargo_version != ''
-        run: |
-          set -euo pipefail
-          sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ needs.compute-versions.outputs.cargo_version }}"'"/}' Cargo.toml
-
-      - name: Build ${{ matrix.target }}
-        run: mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-cli
-
-      - name: sccache stats
-        if: always()
-        run: mise x -- sccache --show-stats
-
-      - name: Package binary
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          tar -czf artifacts/openshell-${{ matrix.target }}.tar.gz \
-            -C target/${{ matrix.target }}/release openshell
-          ls -lh artifacts/
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: cli-linux-${{ matrix.arch }}
-          path: artifacts/*.tar.gz
-          retention-days: 5
-
-  # ---------------------------------------------------------------------------
-  # Build CLI binary (macOS aarch64 via osxcross)
-  # ---------------------------------------------------------------------------
-  build-cli-macos:
-    name: Build CLI (macOS)
-    needs: [compute-versions]
-    runs-on: linux-amd64-cpu8
-    timeout-minutes: 60
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --privileged
-      volumes:
-        - /var/run/docker.sock:/var/run/docker.sock
-    env:
-      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.tag || github.ref }}
-          fetch-depth: 0
-
-      - name: Mark workspace safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Fetch tags
-        run: git fetch --tags --force
-
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Set up Docker Buildx
-        uses: ./.github/actions/setup-buildx
-
-      - name: Build macOS binary via Docker
-        run: |
-          set -euo pipefail
-          docker buildx build \
-            --file deploy/docker/Dockerfile.cli-macos \
-            --build-arg OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" \
-            --build-arg OPENSHELL_IMAGE_TAG="${{ needs.compute-versions.outputs.semver }}" \
-            --build-arg CARGO_TARGET_CACHE_SCOPE="${{ github.sha }}" \
-            --target binary \
-            --output type=local,dest=out/ \
-            .
-
-      - name: Package binary
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          tar -czf artifacts/openshell-aarch64-apple-darwin.tar.gz \
-            -C out openshell
-          ls -lh artifacts/
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: cli-macos
-          path: artifacts/*.tar.gz
-          retention-days: 5
-
-  # ---------------------------------------------------------------------------
-  # Build standalone gateway binaries (Linux GNU — glibc 2.28 floor)
-  # ---------------------------------------------------------------------------
-  build-gateway-binary-linux:
-    name: Build Gateway Binary (Linux ${{ matrix.arch }})
-    needs: [compute-versions]
-    strategy:
-      matrix:
-        include:
-          - arch: amd64
-            runner: linux-amd64-cpu8
-            target: x86_64-unknown-linux-gnu
-            zig_target: x86_64-unknown-linux-gnu.2.28
-          - arch: arm64
-            runner: linux-arm64-cpu8
-            target: aarch64-unknown-linux-gnu
-            zig_target: aarch64-unknown-linux-gnu.2.28
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --privileged
-    env:
-      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.tag || github.ref }}
-          fetch-depth: 0
-
-      - name: Mark workspace safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Fetch tags
-        run: git fetch --tags --force
-
-      - name: Install tools
-        run: mise install --locked
-
-      - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          shared-key: gateway-binary-gnu-${{ matrix.arch }}-zig-wrapper-${{ hashFiles('tasks/scripts/setup-zig-cc-wrapper.sh') }}
-          cache-directories: .cache/sccache
-          cache-targets: "true"
-
-      - name: Patch workspace version
-        if: needs.compute-versions.outputs.cargo_version != ''
-        run: |
-          set -euo pipefail
-          sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ needs.compute-versions.outputs.cargo_version }}"'"/}' Cargo.toml
-
-      - name: Set up Zig C/C++ wrappers
-        run: tasks/scripts/setup-zig-cc-wrapper.sh ${{ matrix.zig_target }} ${{ matrix.zig_target }} /tmp/zig-gnu
-
-      - name: Build ${{ matrix.zig_target }}
-        env:
-          OPENSHELL_IMAGE_TAG: ${{ needs.compute-versions.outputs.source_sha }}
-        run: |
-          set -euo pipefail
-          mise x -- rustup target add ${{ matrix.target }}
-          mise x -- cargo zigbuild --release --target ${{ matrix.zig_target }} -p openshell-server --bin openshell-gateway --features bundled-z3
-          mkdir -p artifacts/bin
-          install -m 0755 target/${{ matrix.target }}/release/openshell-gateway artifacts/bin/openshell-gateway
-
-      - name: Verify packaged binary
-        run: |
-          set -euo pipefail
-          OUTPUT="$(artifacts/bin/openshell-gateway --version)"
-          echo "$OUTPUT"
-          grep -q '^openshell-gateway ' <<<"$OUTPUT"
-          ldd artifacts/bin/openshell-gateway || true
-          if ldd artifacts/bin/openshell-gateway | grep -q 'libz3'; then
-            echo "gateway binary must not require shared libz3; keep z3 bundled for portable release artifacts" >&2
-            exit 1
-          fi
-
-      - name: Verify glibc symbol floor
-        run: tasks/scripts/verify-glibc-symbols.sh 2.28 artifacts/bin/openshell-gateway
-
-      - name: sccache stats
-        if: always()
-        run: mise x -- sccache --show-stats
-
-      - name: Package binary
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          tar -czf artifacts/openshell-gateway-${{ matrix.target }}.tar.gz \
-            -C artifacts/bin openshell-gateway
-          ls -lh artifacts/
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: gateway-binary-linux-${{ matrix.arch }}
-          path: artifacts/*.tar.gz
-          retention-days: 5
-
-  # ---------------------------------------------------------------------------
-  # Build standalone supervisor binaries (Linux GNU — native on each arch)
-  # ---------------------------------------------------------------------------
-  build-supervisor-binary-linux:
-    name: Build Supervisor Binary (Linux ${{ matrix.arch }})
-    needs: [compute-versions]
-    strategy:
-      matrix:
-        include:
-          - arch: amd64
-            runner: linux-amd64-cpu8
-            target: x86_64-unknown-linux-gnu
-          - arch: arm64
-            runner: linux-arm64-cpu8
-            target: aarch64-unknown-linux-gnu
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --privileged
-    env:
-      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.tag || github.ref }}
-          fetch-depth: 0
-
-      - name: Mark workspace safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Fetch tags
-        run: git fetch --tags --force
-
-      - name: Install tools
-        run: mise install --locked
-
-      - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          shared-key: supervisor-binary-gnu-${{ matrix.arch }}
-          cache-directories: .cache/sccache
-          cache-targets: "true"
-
-      - name: Patch workspace version
-        if: needs.compute-versions.outputs.cargo_version != ''
-        run: |
-          set -euo pipefail
-          sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ needs.compute-versions.outputs.cargo_version }}"'"/}' Cargo.toml
-
-      - name: Build ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-sandbox --bin openshell-sandbox
-
-      - name: Verify packaged binary
-        run: |
-          set -euo pipefail
-          OUTPUT="$(target/${{ matrix.target }}/release/openshell-sandbox --version)"
-          echo "$OUTPUT"
-          grep -q '^openshell-sandbox ' <<<"$OUTPUT"
-
-      - name: sccache stats
-        if: always()
-        run: mise x -- sccache --show-stats
-
-      - name: Package binary
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          tar -czf artifacts/openshell-sandbox-${{ matrix.target }}.tar.gz \
-            -C target/${{ matrix.target }}/release openshell-sandbox
-          ls -lh artifacts/
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: supervisor-binary-linux-${{ matrix.arch }}
-          path: artifacts/*.tar.gz
-          retention-days: 5
-
-  # ---------------------------------------------------------------------------
-  # Build standalone gateway binary (macOS aarch64 via osxcross)
-  # ---------------------------------------------------------------------------
-  build-gateway-binary-macos:
-    name: Build Gateway Binary (macOS)
-    needs: [compute-versions]
-    runs-on: linux-amd64-cpu8
-    timeout-minutes: 60
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --privileged
-      volumes:
-        - /var/run/docker.sock:/var/run/docker.sock
-    env:
-      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.tag || github.ref }}
-          fetch-depth: 0
-
-      - name: Mark workspace safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Fetch tags
-        run: git fetch --tags --force
-
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Set up Docker Buildx
-        uses: ./.github/actions/setup-buildx
-
-      - name: Build macOS binary via Docker
-        run: |
-          set -euo pipefail
-          docker buildx build \
-            --file deploy/docker/Dockerfile.gateway-macos \
-            --build-arg OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" \
-            --build-arg OPENSHELL_IMAGE_TAG="${{ needs.compute-versions.outputs.semver }}" \
-            --build-arg CARGO_TARGET_CACHE_SCOPE="${{ github.sha }}" \
-            --target binary \
-            --output type=local,dest=out/ \
-            .
-
-      - name: Verify packaged binary shape
-        run: |
-          set -euo pipefail
-          test -x out/openshell-gateway
-
-      - name: Package binary
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          tar -czf artifacts/openshell-gateway-aarch64-apple-darwin.tar.gz \
-            -C out openshell-gateway
-          ls -lh artifacts/
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: gateway-binary-macos
-          path: artifacts/*.tar.gz
-          retention-days: 5
-
-  build-driver-vm-linux:
-    name: Build Driver VM Linux
-    needs: [compute-versions]
-    uses: ./.github/workflows/driver-vm-linux.yml
-    with:
-      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
-      image-tag: ${{ needs.compute-versions.outputs.semver }}
-      checkout-ref: ${{ inputs.tag || github.ref }}
-    secrets: inherit
-
-  build-driver-vm-macos:
-    name: Build Driver VM macOS
-    needs: [compute-versions]
-    uses: ./.github/workflows/driver-vm-macos.yml
-    with:
-      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
-      image-tag: ${{ needs.compute-versions.outputs.semver }}
-      checkout-ref: ${{ inputs.tag || github.ref }}
-    secrets: inherit
-
   build-deb:
     name: Build Debian Packages
-    needs: [compute-versions, build-cli-linux, build-gateway-binary-linux, build-driver-vm-linux]
+    needs: [compute-versions, build-cli, build-gateway, build-vm-driver]
     uses: ./.github/workflows/deb-package.yml
     with:
       deb-version: ${{ needs.compute-versions.outputs.deb_version }}
@@ -633,18 +306,19 @@ jobs:
 
   build-snap:
     name: Build Snap
-    needs: [compute-versions, build-cli-linux, build-gateway-binary-linux, build-supervisor-binary-linux]
+    needs: [compute-versions, build-cli, build-gateway, build-sandbox]
     uses: ./.github/workflows/snap-package.yml
     with:
       checkout-ref: ${{ inputs.tag || github.ref }}
-      upload-channel: latest/stable
-      github-environment: latest/stable
+      upload-channel: ${{ needs.compute-versions.outputs.is_prerelease == 'true' && 'latest/edge' || 'latest/stable' }}
+      github-environment: ${{ needs.compute-versions.outputs.is_prerelease == 'true' && 'latest/edge' || 'latest/stable' }}
+      publish: ${{ needs.compute-versions.outputs.is_prerelease != 'true' }}
     secrets:
       publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
   build-rpm:
     name: Build RPM Packages
-    needs: [compute-versions, build-cli-linux, build-gateway-binary-linux]
+    needs: [compute-versions, build-cli, build-gateway]
     uses: ./.github/workflows/rpm-package.yml
     with:
       checkout-ref: ${{ inputs.tag || github.ref }}
@@ -655,7 +329,7 @@ jobs:
 
   smoke-linux-release-artifacts:
     name: Smoke Linux Release Artifacts (${{ matrix.name }})
-    needs: [build-gateway-binary-linux, build-driver-vm-linux, build-deb, build-rpm, build-python-wheel]
+    needs: [package-binaries, build-deb, build-rpm, build-python-wheel]
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -792,7 +466,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release:
     name: Release
-    needs: [compute-versions, build-cli-linux, build-cli-macos, build-gateway-binary-linux, build-gateway-binary-macos, build-supervisor-binary-linux, build-python-wheel, e2e, build-driver-vm-linux, build-driver-vm-macos, build-deb, build-rpm, build-snap, smoke-linux-release-artifacts]
+    needs: [compute-versions, package-binaries, build-python-wheel, docker-e2e, podman-e2e, vm-e2e, build-deb, build-rpm, build-snap, smoke-linux-release-artifacts]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     permissions:
@@ -896,11 +570,12 @@ jobs:
             openshell-gateway-aarch64-apple-darwin.tar.gz > openshell-gateway-checksums-sha256.txt
           cat openshell-gateway-checksums-sha256.txt
           sha256sum \
-            openshell-sandbox-x86_64-unknown-linux-gnu.tar.gz \
-            openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz > openshell-sandbox-checksums-sha256.txt
+            openshell-sandbox-x86_64-unknown-linux-musl.tar.gz \
+            openshell-sandbox-aarch64-unknown-linux-musl.tar.gz > openshell-sandbox-checksums-sha256.txt
           cat openshell-sandbox-checksums-sha256.txt
 
       - name: Generate Homebrew formula
+        if: needs.compute-versions.outputs.is_prerelease != 'true'
         run: |
           set -euo pipefail
           python3 tasks/scripts/release.py generate-homebrew-formula \
@@ -919,6 +594,7 @@ jobs:
             release/*.whl
 
       - name: Prune removed VM checksum asset
+        if: needs.compute-versions.outputs.is_prerelease != 'true'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
           script: |
@@ -941,6 +617,7 @@ jobs:
             }
 
       - name: Create GitHub Release
+        if: needs.compute-versions.outputs.is_prerelease != 'true'
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           name: OpenShell ${{ env.RELEASE_TAG }}
@@ -966,8 +643,8 @@ jobs:
             release/openshell-gateway-x86_64-unknown-linux-gnu.tar.gz
             release/openshell-gateway-aarch64-unknown-linux-gnu.tar.gz
             release/openshell-gateway-aarch64-apple-darwin.tar.gz
-            release/openshell-sandbox-x86_64-unknown-linux-gnu.tar.gz
-            release/openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz
+            release/openshell-sandbox-x86_64-unknown-linux-musl.tar.gz
+            release/openshell-sandbox-aarch64-unknown-linux-musl.tar.gz
             release/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz
             release/openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz
             release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
@@ -977,9 +654,19 @@ jobs:
             release/openshell-gateway-checksums-sha256.txt
             release/openshell-sandbox-checksums-sha256.txt
 
+      - name: Upload pre-release artifacts
+        if: needs.compute-versions.outputs.is_prerelease == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openshell-${{ env.RELEASE_TAG }}
+          path: release/
+          retention-days: 90
+          if-no-files-found: error
+
   publish-fern-docs:
     name: Publish Fern Docs
-    needs: [release]
+    needs: [compute-versions, release]
+    if: needs.compute-versions.outputs.is_prerelease != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -1006,6 +693,7 @@ jobs:
   publish-sdk-typescript:
     name: Publish TypeScript SDK
     needs: [compute-versions, release]
+    if: needs.compute-versions.outputs.is_prerelease != 'true'
     runs-on: linux-amd64-cpu8
     timeout-minutes: 15
     permissions:
@@ -1062,6 +750,7 @@ jobs:
   trigger-wheel-publish:
     name: Trigger Wheel Publish
     needs: [compute-versions, release]
+    if: needs.compute-versions.outputs.is_prerelease != 'true'
     runs-on: [self-hosted, nv]
     timeout-minutes: 10
     steps:

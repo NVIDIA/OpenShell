@@ -21,11 +21,11 @@ For how the CLI resolves gateways and stores credentials, refer to [Gateway Auth
 
 ## Sandbox Supervisor Identity
 
-Kubernetes sandbox supervisors authenticate back to the gateway as sandbox workloads. By default, the gateway mints its own sandbox JWTs and Kubernetes sandboxes bootstrap them with a projected ServiceAccount token.
+Kubernetes sandbox supervisors authenticate back to the gateway as sandbox workloads. By default, the Kubernetes compute driver validates each projected ServiceAccount token and returns the authenticated sandbox ID to the gateway. The gateway verifies the sandbox still exists and mints its own sandbox JWT.
 
 Dynamic provider token grants can use SPIFFE without changing supervisor-to-gateway authentication. Set `server.providerTokenGrants.spiffe.enabled=true` to mount the SPIFFE CSI Workload API socket into gateway and sandbox pods while keeping the projected ServiceAccount token bootstrap and gateway-minted sandbox JWT path.
 
-Provider token grants require a SPIFFE implementation such as SPIRE and identities for the gateway and sandbox pods. The repository's local SPIRE overlay assigns sandbox IDs from the pod's `openshell.io/sandbox-id` annotation, but the gateway validation path only requires the supervisor SVID to be valid and in the same SPIFFE trust domain as the gateway SVID. Provider profiles with `token_grant` metadata cause the sandbox supervisor to request JWT-SVIDs and exchange them for upstream OAuth2 access tokens. Token-exchange profiles also require a gateway SPIFFE identity because the gateway brokers the intermediate token exchange with its own JWT-SVID.
+Provider token grants require a SPIFFE implementation such as SPIRE and identities for the gateway and sandbox pods. The repository's local SPIRE overlay assigns sandbox IDs from the pod's `openshell.ai/sandbox-id` annotation, but the gateway validation path only requires the supervisor SVID to be valid and in the same SPIFFE trust domain as the gateway SVID. Provider profiles with `token_grant` metadata cause the sandbox supervisor to request JWT-SVIDs and exchange them for upstream OAuth2 access tokens. Token-exchange profiles also require a gateway SPIFFE identity because the gateway brokers the intermediate token exchange with its own JWT-SVID.
 
 The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the SPIFFE Workload API, so intermediate token exchange does not require gateway access to the SPIRE OIDC discovery endpoint or its TLS CA.
 
@@ -39,8 +39,11 @@ helm upgrade openshell \
   --version <version> \
   --namespace openshell \
   --set server.oidc.issuer=https://your-idp.example.com/realms/openshell \
-  --set server.oidc.audience=openshell-cli
+  --set server.oidc.audience=openshell-cli \
+  --set server.tls.clientCaSecretName=""
 ```
+
+Set `server.tls.clientCaSecretName=""` when the gateway terminates TLS directly and browsers or CLI clients connect without client certificates. The chart omits `client_ca_path` from `gateway.toml` and does not mount the client-CA volume, leaving HTTPS-only transport with OIDC for user authentication. Do not set the value to `null`; omit the key to use the chart default, or set it to `""` to disable client certificate verification.
 
 The `audience` value must match the client ID configured in your identity provider for the OpenShell resource server.
 
@@ -69,6 +72,7 @@ helm upgrade openshell \
   --namespace openshell \
   --set server.oidc.issuer=https://your-idp.example.com/realms/openshell \
   --set server.oidc.audience=openshell-cli \
+  --set server.tls.clientCaSecretName="" \
   --set server.oidc.rolesClaim=realm_access.roles \
   --set server.oidc.adminRole=openshell-admin \
   --set server.oidc.userRole=openshell-user
@@ -99,6 +103,8 @@ helm upgrade openshell \
 ```
 
 The gateway still serves TLS and sandbox supervisors still authenticate with gateway-minted sandbox JWTs. User-facing CLI/API calls without OIDC or mTLS credentials are accepted as an unauthenticated local developer principal. The proxy is responsible for authenticating callers and forwarding only authorized traffic.
+
+When the gateway terminates TLS directly and callers connect without client certificates, also set `server.tls.clientCaSecretName=""` as described in the OIDC section above.
 
 To also disable TLS entirely (when the proxy terminates TLS before the request reaches the gateway):
 

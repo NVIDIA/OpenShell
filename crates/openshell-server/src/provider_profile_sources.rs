@@ -15,7 +15,7 @@ use openshell_gateway_interceptors::{
 };
 use openshell_providers::{
     ProfileValidationDiagnostic, ProviderTypeProfile, builtin_profiles, normalize_profile_id,
-    validate_profile_set,
+    normalize_provider_type, validate_profile_set,
 };
 use prost::Message as _;
 use sha2::{Digest, Sha256};
@@ -238,6 +238,7 @@ struct ScopedProfileEntry {
 struct EffectiveProfileEntry {
     effective: ScopedProfileEntry,
     platform_fallback: Option<ScopedProfileEntry>,
+    static_fallback: Option<ScopedProfileEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -415,6 +416,9 @@ impl EffectiveProviderProfileCatalog {
             if let Some(fallback) = &entry.platform_fallback {
                 result.push((fallback.scope, fallback.response.clone()));
             }
+            if let Some(fallback) = &entry.static_fallback {
+                result.push((fallback.scope, fallback.response.clone()));
+            }
         }
         result
     }
@@ -427,6 +431,7 @@ impl EffectiveProviderProfileCatalog {
             .map(|entry| entry.effective.response.clone())
     }
 
+    #[cfg(test)]
     pub(crate) fn get_type_profile(&self, id: &str) -> Option<ProviderTypeProfile> {
         let id = normalize_profile_id(id)?;
         self.profiles
@@ -448,6 +453,22 @@ impl EffectiveProviderProfileCatalog {
         id: &str,
         profile_workspace: &str,
     ) -> Option<&ScopedProfileEntry> {
+        if let Some(entry) = self.exact_scoped_type_profile_for_scope(id, profile_workspace) {
+            return Some(entry);
+        }
+
+        let alias = normalize_provider_type(id)?;
+        if normalize_profile_id(id).as_deref() == Some(alias) {
+            return None;
+        }
+        self.exact_scoped_type_profile_for_scope(alias, profile_workspace)
+    }
+
+    fn exact_scoped_type_profile_for_scope(
+        &self,
+        id: &str,
+        profile_workspace: &str,
+    ) -> Option<&ScopedProfileEntry> {
         let id = normalize_profile_id(id)?;
         let entry = self.profiles.get(&id)?;
 
@@ -459,7 +480,7 @@ impl EffectiveProviderProfileCatalog {
             match &entry.platform_fallback {
                 Some(fallback) => Some(fallback),
                 None if entry.effective.scope == ProfileScope::Platform => Some(&entry.effective),
-                None => None,
+                None => entry.static_fallback.as_ref(),
             }
         } else {
             Some(&entry.effective)
@@ -470,8 +491,14 @@ impl EffectiveProviderProfileCatalog {
         let id = normalize_profile_id(id)?;
         self.profiles
             .get(&id)
-            .filter(|entry| !entry.effective.user_managed)
-            .map(|entry| entry.effective.source_id.clone())
+            .and_then(|entry| {
+                if entry.effective.user_managed {
+                    entry.static_fallback.as_ref()
+                } else {
+                    Some(&entry.effective)
+                }
+            })
+            .map(|entry| entry.source_id.clone())
     }
 
     pub(crate) fn hash_type_profile_revision_for_scope(
@@ -623,6 +650,19 @@ fn build_effective_profiles(
                 let new_scope = new_entry.scope;
 
                 match (existing_scope, new_scope) {
+                    (ProfileScope::Static, _)
+                        if existing.effective.source_id == BUILTIN_SOURCE_ID
+                            && new_entry.user_managed =>
+                    {
+                        let fallback = std::mem::replace(&mut existing.effective, new_entry);
+                        existing.static_fallback = Some(fallback);
+                    }
+                    (_, ProfileScope::Static)
+                        if new_entry.source_id == BUILTIN_SOURCE_ID
+                            && existing.effective.user_managed =>
+                    {
+                        existing.static_fallback = Some(new_entry);
+                    }
                     (ProfileScope::Static, _) | (_, ProfileScope::Static) => {
                         let location = if existing.effective.source_id == source_id {
                             format!("within source '{source_id}'")
@@ -656,6 +696,7 @@ fn build_effective_profiles(
                     EffectiveProfileEntry {
                         effective: new_entry,
                         platform_fallback: None,
+                        static_fallback: None,
                     },
                 );
             }
@@ -1505,28 +1546,46 @@ mod tests {
     }
 
     #[test]
-    fn same_id_static_vs_user_still_errors() {
-        let err = build_effective_profiles(vec![
+    fn user_managed_profiles_shadow_new_builtins_in_scope() {
+        let catalog = build_effective_profiles(vec![
             CollectedProviderProfileSnapshot {
                 source_id: "builtin".to_string(),
                 revision: "v1".to_string(),
-                profiles: vec![scoped(ProfileScope::Static, "openai")],
+                profiles: vec![
+                    scoped(ProfileScope::Static, "openai"),
+                    scoped(ProfileScope::Static, "anthropic"),
+                ],
                 user_managed: false,
                 allow_empty: false,
             },
             CollectedProviderProfileSnapshot {
                 source_id: "user".to_string(),
                 revision: "v1".to_string(),
-                profiles: vec![scoped(ProfileScope::Platform, "openai")],
+                profiles: vec![
+                    scoped(ProfileScope::Platform, "openai"),
+                    scoped(ProfileScope::Workspace, "anthropic"),
+                ],
                 user_managed: true,
                 allow_empty: true,
             },
         ])
-        .unwrap_err();
+        .unwrap();
 
-        assert!(
-            err.message()
-                .contains("duplicate provider profile id 'openai'")
+        let openai = catalog
+            .get_type_profile_for_scope("openai", "default")
+            .expect("platform override");
+        assert_eq!(openai.source, "user");
+        let anthropic = catalog
+            .get_type_profile_for_scope("anthropic", "default")
+            .expect("workspace override");
+        assert_eq!(anthropic.source, "user");
+        let platform_anthropic = catalog
+            .get_type_profile_for_scope("anthropic", "")
+            .expect("built-in fallback outside workspace scope");
+        assert_eq!(platform_anthropic.source, "builtin");
+        assert_eq!(
+            catalog.static_source_for_profile("openai").as_deref(),
+            Some("builtin")
         );
     }
 
@@ -1791,5 +1850,71 @@ mod tests {
         let result = catalog.get_type_profile_for_scope("anthropic", "default");
         assert!(result.is_some());
         assert_eq!(result.unwrap().display_name, "Workspace Anthropic");
+    }
+
+    #[test]
+    fn exact_alias_shaped_profile_wins_before_builtin_alias_fallback() {
+        let mut builtin = profile("github");
+        builtin.display_name = "Built-in GitHub".to_string();
+        let mut custom = profile("gh");
+        custom.display_name = "Enterprise GitHub".to_string();
+
+        let catalog = build_effective_profiles(vec![
+            CollectedProviderProfileSnapshot {
+                source_id: "builtin".to_string(),
+                revision: "builtin-v1".to_string(),
+                profiles: vec![ScopedSnapshotProfile {
+                    scope: ProfileScope::Static,
+                    profile: builtin,
+                }],
+                user_managed: false,
+                allow_empty: false,
+            },
+            CollectedProviderProfileSnapshot {
+                source_id: "user".to_string(),
+                revision: "user-v1".to_string(),
+                profiles: vec![ScopedSnapshotProfile {
+                    scope: ProfileScope::Workspace,
+                    profile: custom,
+                }],
+                user_managed: true,
+                allow_empty: true,
+            },
+        ])
+        .unwrap();
+
+        let exact = catalog
+            .get_type_profile_for_scope("gh", "default")
+            .expect("exact custom profile");
+        assert_eq!(exact.id, "gh");
+        assert_eq!(exact.display_name, "Enterprise GitHub");
+
+        let builtin = catalog
+            .get_type_profile_for_scope("github", "default")
+            .expect("built-in profile");
+        assert_eq!(builtin.id, "github");
+    }
+
+    #[test]
+    fn custom_profile_can_reuse_default_id_when_builtin_source_is_not_loaded() {
+        let mut custom = profile("github");
+        custom.display_name = "Private GitHub".to_string();
+        let catalog = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: "user".to_string(),
+            revision: "user-v1".to_string(),
+            profiles: vec![ScopedSnapshotProfile {
+                scope: ProfileScope::Workspace,
+                profile: custom,
+            }],
+            user_managed: true,
+            allow_empty: true,
+        }])
+        .unwrap();
+
+        let resolved = catalog
+            .get_type_profile_for_scope("github", "default")
+            .expect("custom profile reusing unloaded default ID");
+        assert_eq!(resolved.id, "github");
+        assert_eq!(resolved.display_name, "Private GitHub");
     }
 }

@@ -127,7 +127,7 @@ components_for_target() {
 resolve_component() {
   case "$1" in
     gateway)
-      crate=openshell-server
+      crate=openshell-gateway
       binary=openshell-gateway
       target_libc=gnu
       ;;

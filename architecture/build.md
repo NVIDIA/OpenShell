@@ -10,8 +10,9 @@ OpenShell builds these main artifacts:
 
 | Artifact | Source |
 |---|---|
-| Gateway binary | `crates/openshell-server` |
+| Gateway binary | `crates/openshell-gateway` |
 | CLI binaries and system packages | `crates/openshell-cli` plus release packaging |
+| E2E conformance CLI | `crates/openshell-conformance-cli` |
 | Python SDK wheel | `python/openshell` |
 | TypeScript SDK package | `sdk/typescript` |
 | Gateway container image | `deploy/docker/Dockerfile.gateway` |
@@ -27,19 +28,34 @@ Sandbox community images are built outside this repository.
 Anonymous telemetry emission is gated behind a default-on `telemetry` Cargo
 feature. It is defined in `openshell-core` (where the emission code, HTTP
 client, and endpoint live) and forwarded by the binary crates that emit or
-collect telemetry: `openshell-server` (gateway), `openshell-sandbox`
+collect telemetry: `openshell-gateway`, `openshell-sandbox`
 (supervisor), and `openshell-driver-vm`. Every crate depends on
 `openshell-core` with `default-features = false`, so the binary crate's feature
 is the single switch that enables `openshell-core/telemetry` for its build
 graph. In-process drivers (`docker`, `kubernetes`, `podman`) inherit the
 gateway's setting through feature unification and carry no passthrough.
 
-Building a binary with `--no-default-features` compiles out telemetry entirely:
-no endpoint, no telemetry HTTP client, and no emission code. With telemetry
-compiled out, `telemetry::enabled()` is always `false` and the `emit_*` helpers
-are no-ops, so the data-model types stay available and dependent crates compile
-unchanged. The runtime `OPENSHELL_TELEMETRY_ENABLED` switch remains the way to
-disable telemetry in a default (telemetry-enabled) build.
+Building a binary without the `telemetry` feature compiles out telemetry
+entirely: no endpoint, no telemetry HTTP client, and no emission code. With
+telemetry compiled out, `telemetry::enabled()` is always `false` and the
+`emit_*` helpers are no-ops, so the data-model types stay available and
+dependent crates compile unchanged. The runtime `OPENSHELL_TELEMETRY_ENABLED`
+switch remains the way to disable telemetry in a default (telemetry-enabled)
+build.
+
+Cargo cannot subtract a single default feature, so each of the three binary
+crates also defines a `defaults-without-telemetry` alias listing every default
+except `telemetry`. Telemetry-free builds use
+`--no-default-features --features defaults-without-telemetry` and stay correct
+as the default set grows, instead of dropping unrelated defaults the way a bare
+`--no-default-features` does on `openshell-sandbox`. The alias is a keep-list,
+not a switch: enabling it on top of the defaults would otherwise yield a
+telemetry-on binary that reads as telemetry-free, so each crate root carries a
+`compile_error!` for the `telemetry` + `defaults-without-telemetry` combination.
+`rust:verify:defaults-without-telemetry` guards both properties — that each
+alias still equals its crate's defaults minus `telemetry`, and that the
+mutual-exclusion error is wired up — and `rust:verify:telemetry-off` builds
+through the alias and inspects the resulting binaries for telemetry markers.
 
 Supervisor upstream TLS root-store selection is controlled by the
 `bundled-ca-roots` Cargo feature (on by default). Default builds use Mozilla
@@ -104,7 +120,7 @@ and the supervisor image from `deploy/docker/Dockerfile.supervisor`. Neither
 Dockerfile compiles Rust — both copy a staged binary out of
 `deploy/docker/.build/prebuilt-binaries/<arch>/` into the final image.
 
-Binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`. Because
+Local binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`. Because
 staging cross-compiles on the host, it sources `tasks/scripts/build-env.sh` and
 raises the per-process open-file limit before invoking `cargo zigbuild` on
 macOS — the static musl link opens hundreds of `.rlib` files at once and would
@@ -126,9 +142,9 @@ host GNU libc target. The `glibc-static` variant uses plain `cargo build` with
 target architecture from `DOCKER_PLATFORM` when set. Otherwise, they require
 valid container engine host metadata and fail when the engine query is
 unavailable or reports an unsupported architecture, avoiding host-kernel
-fallbacks that can target the wrong architecture. CI invokes the same staging
-step via the `rust-native-build.yml` workflow (per-architecture, per-component)
-and uploads the result as an artifact that the image build job downloads back
+fallbacks that can target the wrong architecture. CI instead compiles binaries
+in platform-specific Nix development shells through reusable workflows and the
+shared `build-rust-binary` action. The image build downloads each binary artifact
 into the staging directory before running Buildx.
 
 Gateway and supervisor binaries staged into branch E2E, Release Dev, and Release
@@ -141,17 +157,16 @@ is a different artifact from the source SBOM produced by `syft dir:.` in
 `tasks/sbom.toml`, which describes the checkout, and from the image SBOM
 attestation below, which describes a published image.
 
-`docker-build.yml` and `rust-native-build.yml` take an `auditable` input that
-defaults to false. The branch E2E gateway and supervisor image builds set it to
-true so E2E exercises release-parity image binaries; other PR image builds and
-standalone release artifacts stay non-auditable. The CI image gains the pinned
-`cargo-auditable` tool through `mise install --locked` but ships no auditable
-OpenShell binary of its own. Local staging opts in with
-`OPENSHELL_AUDITABLE=1`. sccache's `RUSTC_WRAPPER` is unset only around auditable
-builds, because it would otherwise wrap `cargo-auditable`'s workspace wrapper and
-be misidentified as `rustc`. Auditable builds are verified by scanning the built
-binary with Syft and requiring at least one decoded Cargo package; the check runs
-only for those builds.
+The shared binary build action compiles release artifacts with `cargo auditable`.
+Branch E2E, Release Dev, and Release Tag image jobs stage those same artifacts
+instead of rebuilding binaries in Docker. Each binary build scans its output with
+Syft and requires at least one decoded Cargo package before uploading the
+artifact. Darwin builds replace Nix's `libiconv` load command with the macOS
+system install name, ad-hoc sign the modified binary, and fail if `otool -L`
+reports any remaining `/nix/store` dependency. Runtime and Syft verification
+run after that normalization. The CI image gains the pinned `cargo-auditable`
+tool through `mise install --locked` but ships no auditable OpenShell binary of
+its own.
 
 Pushed Docker images carry minimal SLSA provenance and a per-platform SPDX SBOM
 generated by BuildKit's default Syft scanner. The registry exporter uses OCI
@@ -175,7 +190,12 @@ Runtime layout:
   `/usr/libexec/openshell/openshell-driver-vm` in Linux packages and published
   as a release artifact. Linux GNU VM driver binaries must not reference
   `GLIBC_*` symbols newer than `GLIBC_2.28`; release workflows verify this
-  before publishing artifacts.
+  before publishing artifacts. Nix produces the platform-specific compressed
+  runtime inputs. CI combines them with the matching supervisor artifact in a
+  runner-temporary directory outside Cargo's `target/` before the shared Rust
+  cache action runs. An explicitly configured VM runtime bundle is required to
+  contain every non-empty embedding input; the driver build fails before
+  packaging when an input is absent or empty.
 - **Supervisor**: Alpine base with `nftables`, static binary at
   `/openshell-sandbox` (musl by default; see `SUPERVISOR_LIBC` above). Static
   linkage keeps the binary usable when the image is mounted/extracted into
@@ -285,18 +305,31 @@ disables emission for Rust tests, E2E runs, and release canaries. This prevents
 synthetic activity from contributing to product usage metrics.
 
 Static security checks are deliberately outside the mirror-branch path. They run
-directly on GitHub-hosted runners with no secrets, so they also cover fork pull
-requests and consume no NVIDIA self-hosted capacity. Scanner jobs request
-`security-events: write` and upload SARIF to Code Scanning directly on every
-event they run on, including fork and Dependabot pull requests, which Code
-Scanning permits for `pull_request` runs despite their read-only `GITHUB_TOKEN`.
-Each scanner also retains its report as a workflow artifact. No privileged
-intermediate workflow relays those uploads.
-Triggers differ by workflow: `.github/workflows/workflow-security.yml` and
-`.github/workflows/codeql.yml` run on `pull_request`, `merge_group`, `main`, and
-a weekly schedule; `.github/workflows/dependency-review.yml` runs on
-`pull_request` and `merge_group` only, because it needs a base and head commit
-to compare.
+directly on GitHub-hosted runners and none of them consume NVIDIA self-hosted
+capacity. The change-oriented ones receive no secrets, so they also cover fork
+pull requests; Codex Security release qualification is the exception because it
+needs a scoped API key. That key routes Codex Security's model calls to
+NVIDIA-hosted inference; the job itself still runs on a GitHub-hosted runner and
+uses no NVIDIA self-hosted runner. Scanner jobs request `security-events: write`
+and upload SARIF to Code Scanning directly on every event they run on, including
+fork and Dependabot pull requests, which Code Scanning permits for
+`pull_request` runs despite their read-only `GITHUB_TOKEN`. No privileged
+intermediate workflow relays those uploads. Report retention differs by scanner:
+Actionlint, Zizmor, and CodeQL keep their reports as workflow artifacts, and
+Codex Security keeps no raw report.
+Triggers differ by workflow: `.github/workflows/workflow-security.yml` runs on
+`pull_request`, `merge_group`, `main`, and a weekly schedule;
+`.github/workflows/dependency-review.yml` runs on `pull_request` and
+`merge_group` only, because it needs a base and head commit to compare;
+`.github/workflows/codeql.yml` runs nightly on the default branch (`main`) via
+`schedule`, with `workflow_dispatch` kept for manual diagnostics; and
+`.github/workflows/codex-security.yml` runs on pushed `v*.*.*-pre.*` tags, and is
+also callable through `workflow_call` and `workflow_dispatch`. CodeQL does
+not run on `pull_request`, `merge_group`, or pushes to `main`, so it reports
+repository-level Code Scanning state on the default branch instead of per-PR
+results, and its four-language matrix stays off the per-change critical path.
+Codex Security is release-scoped rather than change-scoped, so it never runs on
+a pull request or merge group.
 
 - **Actionlint and Zizmor** analyze the workflow definitions themselves.
   Repository configuration lives in `.github/actionlint.yml` (self-hosted runner
@@ -312,16 +345,58 @@ to compare.
   reporting on its own once the feature is enabled. Reviews run in warn-only
   mode.
 - **CodeQL** analyzes product Rust code, examples, and the Go, Python, and
-  TypeScript SDKs, scoped by `.github/codeql/codeql-config.yml`; E2E test code is
-  excluded. Only Go requires a build; the other languages use build mode `none`.
-  Results are uploaded to Code Scanning and always retained as workflow
-  artifacts.
+  TypeScript SDKs, scoped by `.github/codeql/codeql-config.yml`. Rust test code
+  is excluded in two layers: the analyze job sets
+  `CODEQL_EXTRACTOR_RUST_OPTION_CARGO_CFG_OVERRIDES=-test` so the extractor skips
+  `#[cfg(test)]` blocks, and `paths-ignore` drops `crates/*/tests`, whose
+  integration targets the cfg override does not reach. Examples remain in scope,
+  and E2E test code stays excluded because `e2e/` is not an analyzed path. Only
+  Go requires a build; the other languages use build mode `none`. Analysis runs
+  on the nightly schedule or by manual dispatch. Results are uploaded to Code
+  Scanning and always retained as workflow artifacts.
+- **Codex Security** qualifies release candidates rather than individual
+  changes. The job installs a pinned `@openai/codex-security` release into the
+  runner temp directory before the repository is checked out and invokes it by
+  absolute path, so repository-controlled files cannot shadow the scanner. Model
+  calls go to NVIDIA-hosted inference at `https://inference-api.nvidia.com/v1`,
+  declared as a custom Codex provider named `nvidia` that uses the Responses
+  wire API with WebSockets disabled. The scan runs `openai/openai/gpt-5.6-sol`
+  at `medium` reasoning effort. The `CODEX_SECURITY_API_KEY` secret holds the
+  NVIDIA key and is exposed to the scan step alone, as `OPENAI_API_KEY` so the
+  CLI selects API-key auth and as `NVIDIA_INFERENCE_API_KEY`, the provider
+  `env_key` read by the Codex child process.
+  `tasks/scripts/codex-security-release-range.mjs` resolves the scan range: the
+  candidate must be a `vX.Y.Z-pre.N` tag that is an ancestor of `origin/main`,
+  and the base is the newest stable `vX.Y.Z` tag merged into the candidate that
+  is strictly older than the release train `vX.Y.Z` the candidate targets. A
+  full-repository scan is only possible when no such stable tag exists and the
+  caller passes `allow_full_bootstrap`. Each candidate scans the cumulative
+  stable-to-candidate diff, so later candidates re-cover earlier ones. SARIF is
+  uploaded against `refs/heads/main` at the candidate commit under the
+  train-scoped category `codex-security/vX.Y.Z`, which makes each candidate's
+  analysis replace the previous one for that train. Codex Security 0.1.24 cannot
+  apply `--max-cost` to a slash-qualified model identifier, so the run has no
+  CLI-enforced cost ceiling. Spend is bounded instead by the 120-minute job
+  timeout, a single repository-wide concurrency group that serializes
+  qualification so starting a newer candidate cancels an in-flight one, and
+  NVIDIA account-side controls. No raw report is retained.
 
 Findings never fail these checks; scanner and build failures do. A scanner that
-cannot run, a CodeQL analyzer that does not complete, and an unexpected
-Dependency Graph API error are all errors, which keeps an informational check
-from silently degrading into a no-op. None of these checks are required
-statuses, so they do not gate merges.
+cannot run, a CodeQL analyzer that does not complete, an unexpected Dependency
+Graph API error, and a Codex Security range, scan, or export failure are all
+errors, which keeps an informational check from silently degrading into a no-op.
+Codex Security also rejects any scan scope other than the resolved
+cumulative diff or an approved full bootstrap, so a qualification run either
+covers the whole stable-to-candidate range or fails; a separate no-permission
+job republishes the analysis job's outcome as the
+`OpenShell / Codex Security (informational)` status. None of these checks are
+required statuses, so they do not gate merges.
+
+Codex Security findings are informational during the observation phase, and the
+workflow only reports on candidates that already exist. Creating pre-release
+tags and gating stable promotion on qualification results are part of
+[RFC 0014](../rfc/0014-release-stability/release-qualification.md) and are not
+implemented yet.
 
 See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
 

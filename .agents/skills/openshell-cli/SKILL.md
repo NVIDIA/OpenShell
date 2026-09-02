@@ -74,6 +74,12 @@ This creates a sandbox whose canonical main process is `/bin/bash -l` and
 attaches your terminal to that retained process. Add `--detach` to return after
 the sandbox becomes ready without attaching.
 
+An explicit trailing command is foreground even when stdin or stdout is not a
+terminal. The CLI streams its stdout and stderr and returns its exact exit
+status. Exit code 0 leaves a retained sandbox in `Completed`; nonzero leaves it
+in `Error` with `MainProcessFailed`. Use `--no-keep` to delete either result
+after output drains, or `--detach` for a long-running service.
+
 When supplying `--name`, use a portable DNS-1123 label: at most 63 lowercase alphanumeric or `-` characters, beginning and ending with an alphanumeric character. The Kubernetes driver rejects uppercase letters, underscores, dots, and other names that cannot become Kubernetes resource labels.
 
 **Shortcut for known tools**: When the trailing command is a recognized tool, the CLI auto-creates the required provider from local credentials:
@@ -115,9 +121,8 @@ The `--from-existing` flag discovers credentials from local state (e.g., `gh aut
 ### Create a provider with explicit credentials
 
 ```bash
-openshell provider create --name my-api --type generic \
-  --credential API_KEY \
-  --config base_url=https://api.example.com
+openshell provider create --name my-openai --type openai \
+  --credential OPENAI_API_KEY
 ```
 
 Bare `KEY` reads the value from the environment variable of that name and avoids placing the secret in shell history. Use `KEY=VALUE` only when the user explicitly accepts that exposure.
@@ -137,14 +142,9 @@ must match. For a tunnel to `api.example.com:8443`, send
 port and is rejected. An absolute-form request target must use the same
 authority.
 
-Profile-backed provider policy composition is controlled by the gateway-global
-`providers_v2_enabled` setting. Static credential endpoint binding remains
-active even when policy composition is disabled:
-
-```bash
-openshell settings get --global
-openshell settings set --global --key providers_v2_enabled --value true
-```
+Profile-backed providers always contribute policy unless a gateway-global
+policy is active. Static credential endpoint binding remains independently
+enforced.
 
 ### Inspect and manage provider profiles
 
@@ -171,13 +171,13 @@ openshell provider delete my-github
 Use refresh commands only when the provider profile and gateway support refreshable credentials:
 
 ```bash
-openshell provider refresh status my-outlook
-openshell provider refresh configure my-outlook \
+openshell provider refresh status my-provider
+openshell provider refresh configure my-provider \
   --credential-key MS_GRAPH_ACCESS_TOKEN \
   --strategy oauth2-refresh-token \
   --secret-material-env REFRESH_TOKEN=MS_GRAPH_REFRESH_TOKEN \
   --credential-expires-at 2026-07-16T00:00:00Z
-openshell provider refresh rotate my-outlook --credential-key MS_GRAPH_ACCESS_TOKEN
+openshell provider refresh rotate my-provider --credential-key ACCESS_TOKEN
 ```
 
 Prefer `--secret-material-env KEY[=ENVVAR]` for secret refresh material. `--material KEY=VALUE` is for non-secret material; `--secret-material-key` marks supplied material keys as secret.
@@ -242,20 +242,65 @@ Key flags:
 - `--gpu [COUNT]`: Request the driver's default GPU selection or a specific GPU count
 - `--cpu`, `--memory`: Set per-sandbox compute sizing. Docker/Podman apply limits; Kubernetes applies matching requests and limits.
 - `--driver-config-json`: Pass experimental driver-specific sandbox configuration
+- `--template NAME`: Create from a named sandbox workload template. Conflicts with inline workload flags such as `--from`, `--gpu`, `--cpu`, `--memory`, `--env`, and `--driver-config-json`.
 - `--label KEY=VALUE`: Add labels for later selection (repeatable)
 - `--env KEY=VALUE`: Set non-secret sandbox environment variables (repeatable); use `--provider` for credentials
 - `--tty`: Allocate a retained PTY for the canonical main process
 - `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default
 - `--upload <PATH>[:<DEST>]`: Upload local files into the container working directory or an explicit destination
 - `--no-git-ignore`: Disable `.gitignore` filtering for uploads
-- `--no-keep`: Delete the sandbox after the initial command or shell exits
+- `--no-keep`: Delete the sandbox after main output and the exit result drain
 - `--detach`: Start the canonical main process without attaching
 - `--forward [BIND_ADDRESS:]PORT`: Forward a local port and keep the sandbox alive
 - `--editor vscode|cursor`: Open a remote editor after creation and keep the sandbox alive
 
+`--detach` adds no attachment grace period. When the canonical process exits,
+its terminal phase is reported immediately. A foreground create declares one
+expected main-process SSH attachment; cleanup finalizes after that connection
+closes naturally.
+
 Do not combine `--upload` with a trailing main command. Uploads currently finish
 after the canonical process starts; create a scratch sandbox and use
 `sandbox exec`, or build the files into the image.
+
+Create from a reusable workload template when several sandboxes should share
+image, environment, sizing, or driver-specific configuration:
+
+```bash
+openshell sandbox template create gpu-kata \
+  --image ghcr.io/nvidia/openshell-community/sandboxes/python:latest \
+  --cpu 2 \
+  --memory 4Gi \
+  --gpu 1 \
+  --driver-config-json '{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}'
+
+openshell sandbox create --name my-sandbox --template gpu-kata --provider my-github -- claude
+```
+
+Direct `sandbox create --driver-config-json` remains valid for one-off
+creates. Put driver config on a template only when it should be reused.
+
+### Manage sandbox workload templates
+
+```bash
+openshell sandbox template create gpu-kata \
+  --image ghcr.io/nvidia/openshell-community/sandboxes/python:latest \
+  --cpu 2 \
+  --memory 4Gi \
+  --gpu 1 \
+  --label team=runtime \
+  --env FEATURE_FLAG=on
+openshell sandbox template list
+openshell sandbox template list --label-selector team=runtime
+openshell sandbox template list --all-workspaces --output json
+openshell sandbox template get gpu-kata
+openshell sandbox template delete gpu-kata
+```
+
+Template `--image` accepts an OCI image reference. If omitted, the gateway
+applies its default sandbox image when creating a sandbox from the template.
+Create-time policy, providers, labels, uploads, forwarding, editor launch, and
+the initial command stay on `sandbox create`.
 
 ### List and inspect sandboxes
 
@@ -322,9 +367,14 @@ provider instead of passing API keys, tokens, or other secrets to `sandbox exec`
 
 ```bash
 openshell sandbox provider list my-sandbox
+openshell sandbox provider list my-sandbox --output json
 openshell sandbox provider attach my-sandbox my-github
 openshell sandbox provider detach my-sandbox my-github
 ```
+
+Structured attachment output contains provider names, types, and sorted
+credential and config key names. It never contains credential, handle, or
+config values.
 
 ### View logs
 
@@ -363,7 +413,10 @@ openshell sandbox start [name]
 Both commands default to the last-used sandbox. Stop stops background
 forwards and waits for `Stopped`; start waits for `Ready`. Connect, exec,
 file transfer, forwarding, and exposed services are unavailable while
-stopped. Delete remains the operation that removes retained state.
+stopped or completed. Starting a retained `Completed` or
+`Error/MainProcessFailed` sandbox launches a fresh canonical-main instance and
+invalidates SSH sessions from the previous runtime generation. Delete remains
+the operation that removes retained state.
 
 ---
 
@@ -371,7 +424,7 @@ stopped. Delete remains the operation that removes retained state.
 
 This is the most important multi-step workflow. It enables a tight feedback cycle where sandbox policy is refined based on observed activity.
 
-**Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. MXC rejects live policy replacement and merge updates; delete and recreate an MXC sandbox instead.
+**Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. Drivers without the standard supervisor fetch revisions through the sandbox configuration API and report whether they loaded them.
 
 An endpoint with omitted `protocol` retains explicit-proxy behavior. Explicit
 `protocol: tcp` requests policy DNS and transparent TCP and currently requires
@@ -441,7 +494,7 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - Binary matching patterns
 - Ordered `network_middlewares`, host selection, HTTP and WebSocket bindings, and `fail_open` or `fail_closed` behavior
 
-`network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. MXC rejects live policy replacement and merge updates; delete and recreate an MXC sandbox instead. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
+`network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. Use `--wait` to verify that the active runtime loaded the revision; do not infer enforcement from the gateway accepting the update. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
 
 Middleware can inspect parsed HTTP request bodies and complete client-to-upstream WebSocket text messages over both `ws://` and `wss://` when the implementation advertises the matching binding. The built-in `openshell/regex` advertises both bindings and applies its fixed patterns to UTF-8 text. A host-matched HTTP-only attachment can inspect the upgrade GET but does not join the WebSocket chain; look for `binding_not_selected` coverage. Binary messages pass under both `on_error` modes and active stages emit `unsupported_message_type` coverage; upstream-to-client messages remain uninspected. A broken fail-open WebSocket stage is disabled for the rest of that connection; inspect sandbox OCSF logs for `openshell.middleware.websocket_stage_disabled`.
 
@@ -484,6 +537,7 @@ View all revisions to understand how the policy evolved:
 
 ```bash
 openshell policy list dev --limit 50
+openshell policy list dev --output json
 ```
 
 Fetch a specific historical revision:
@@ -561,6 +615,17 @@ openshell forward stop 8080 my-app
 openshell sandbox delete my-app
 openshell sandbox create --from ./Dockerfile --name my-app --forward 8080
 ```
+
+Use structured output when automation needs the tracked forward metadata and
+validated process state:
+
+```bash
+openshell forward list --output json
+```
+
+Each record includes `sandbox`, `bind_address`, `port`, `pid`, and `alive`.
+The `alive` boolean validates the tracked process identity; it does not probe
+the forwarded socket.
 
 Create and forward in one command:
 
@@ -698,7 +763,7 @@ openshell settings set work-session --key ocsf_json_enabled --value true
 openshell settings delete work-session --key ocsf_json_enabled
 
 openshell settings get --global --json
-openshell settings set --global --key providers_v2_enabled --value true
+openshell settings set --global --key ocsf_json_enabled --value true
 ```
 
 Global mutations prompt for confirmation. Use `--yes` only in reviewed automation.
@@ -724,6 +789,7 @@ openshell forward service my-app --target-port 8000 --local 127.0.0.1:0
 # Expose and manage an HTTP service through the gateway.
 openshell service expose my-app 8080 web
 openshell service list my-app
+openshell service list my-app --output json
 openshell service get my-app web
 openshell service delete my-app web
 ```
@@ -746,7 +812,7 @@ The CLI help is always authoritative. If the help output contradicts this skill,
 
 ```bash
 $ openshell sandbox --help
-# Shows: create, get, list, stop, start, delete, exec, connect, upload, download, ssh-config, provider
+# Shows: create, get, list, stop, start, delete, exec, connect, upload, download, ssh-config, provider, template
 
 $ openshell sandbox upload --help
 # Shows: positional arguments (name, path, dest), usage examples
@@ -767,6 +833,8 @@ $ openshell sandbox upload --help
 | Create sandbox with tool | `openshell sandbox create -- claude` |
 | Create sandbox with GPUs | `openshell sandbox create --gpu 1` |
 | Create with custom policy | `openshell sandbox create --policy ./p.yaml` |
+| Create from template | `openshell sandbox create --template gpu-kata` |
+| Create workload template | `openshell sandbox template create gpu-kata --image python:3.12` |
 | Connect to sandbox | `openshell sandbox connect <name>` |
 | Stop sandbox compute | `openshell sandbox stop [name]` |
 | Start sandbox compute | `openshell sandbox start [name]` |

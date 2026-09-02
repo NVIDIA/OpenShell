@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- include "openshell-workspace.validateValues" . }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "openshell-workspace.fullname" . }}-sandbox
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell-workspace.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "openshell-workspace.fullname" . }}-sandbox
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.gateway.serviceAccount.name }}
+    namespace: {{ .Values.gateway.serviceAccount.namespace }}

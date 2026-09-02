@@ -5,29 +5,13 @@ use std::collections::HashMap;
 
 use openshell_core::google_cloud;
 
-use crate::{
-    DiscoveredProvider, Provider, ProviderDiscoverySpec, ProviderError, ProviderPlugin,
-    RealDiscoveryContext, discover_with_spec,
-};
+use crate::{Provider, ProviderPlugin};
 
 pub struct GoogleCloudProvider;
 
-const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
-    id: "google-cloud",
-    credential_env_vars: google_cloud::TOKEN_ENV_KEYS,
-};
-
 impl ProviderPlugin for GoogleCloudProvider {
     fn id(&self) -> &'static str {
-        SPEC.id
-    }
-
-    fn discover_existing(&self) -> Result<Option<DiscoveredProvider>, ProviderError> {
-        discover_with_spec(&SPEC, &RealDiscoveryContext)
-    }
-
-    fn credential_env_vars(&self) -> &'static [&'static str] {
-        SPEC.credential_env_vars
+        "google-cloud"
     }
 
     fn inject_env(&self, provider: &Provider, env: &mut HashMap<String, String>) {

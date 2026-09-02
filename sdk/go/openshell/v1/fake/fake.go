@@ -4,6 +4,7 @@
 package fake
 
 import (
+	"context"
 	"sync"
 
 	v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1"
@@ -15,23 +16,26 @@ import (
 // real gRPC connection. Create one with NewClient.
 type Client struct {
 	sandboxStore       *objectStore[*types.Sandbox]
+	templateStore      *objectStore[*types.SandboxWorkloadTemplate]
 	providerStore      *objectStore[*types.Provider]
 	workspaceStore     *objectStore[*types.Workspace]
 	memberStore        *objectStore[*types.WorkspaceMember]
 	sandboxBroadcaster *watchBroadcaster[*types.Sandbox]
 
-	sandboxes  v1.SandboxInterface
-	providers  v1.ProviderInterface
-	services   v1.ServiceInterface
-	exec       v1.ExecInterface
-	files      v1.FileInterface
-	health     v1.HealthInterface
-	ssh        v1.SSHInterface
-	tcp        v1.TCPInterface
-	cfg        v1.ConfigInterface
-	policy     v1.PolicyInterface
-	workspaces v1.WorkspaceInterface
-	inference  v1.InferenceInterface
+	sandboxes      v1.SandboxInterface
+	templateCreate v1.SandboxTemplateCreateInterface
+	templates      v1.SandboxTemplateInterface
+	providers      v1.ProviderInterface
+	services       v1.ServiceInterface
+	exec           v1.ExecInterface
+	files          v1.FileInterface
+	health         v1.HealthInterface
+	ssh            v1.SSHInterface
+	tcp            v1.TCPInterface
+	cfg            v1.ConfigInterface
+	policy         v1.PolicyInterface
+	workspaces     v1.WorkspaceInterface
+	inference      v1.InferenceInterface
 
 	closeOnce sync.Once
 	closed    bool
@@ -70,13 +74,17 @@ func WithCurrentUser(user *types.CurrentUser) ClientOption {
 func NewClient(opts ...ClientOption) *Client {
 	fc := &Client{
 		sandboxStore:       newobjectStore(sandboxName, copySandbox),
+		templateStore:      newobjectStore(sandboxWorkloadTemplateName, copySandboxWorkloadTemplate),
 		providerStore:      newobjectStore(providerName, copyProvider),
 		workspaceStore:     newobjectStore(workspaceName, copyWorkspace),
 		memberStore:        newobjectStore(memberName, copyMember),
 		sandboxBroadcaster: newWatchBroadcaster[*types.Sandbox](),
 	}
 
-	fc.sandboxes = newFakeSandboxClient(fc.sandboxStore, fc.sandboxBroadcaster, fc.isClosed)
+	sandboxes := newFakeSandboxClient(fc.sandboxStore, fc.templateStore, fc.sandboxBroadcaster, fc.isClosed)
+	fc.sandboxes = sandboxes
+	fc.templateCreate = sandboxes
+	fc.templates = newFakeSandboxTemplateClient(fc.templateStore, fc.isClosed)
 	fc.providers = newFakeProviderClient(fc.providerStore, fc.isClosed)
 	fc.services = newFakeServiceClient(fc.isClosed)
 	fc.exec = newFakeExecClient(fc.isClosed)
@@ -106,6 +114,15 @@ func (fc *Client) isClosed() bool {
 
 // Sandboxes returns the sandbox sub-client.
 func (fc *Client) Sandboxes() v1.SandboxInterface { return fc.sandboxes }
+
+// SandboxTemplates returns the reusable sandbox template sub-client.
+func (fc *Client) SandboxTemplates() v1.SandboxTemplateInterface { return fc.templates }
+
+// CreateSandboxFromTemplate creates a sandbox from a named workload template
+// without changing the legacy Sandboxes() interface.
+func (fc *Client) CreateSandboxFromTemplate(ctx context.Context, workspace, name, templateName string, spec *types.SandboxSpec, labels map[string]string, opts ...types.CreateOptions) (*types.Sandbox, error) {
+	return fc.templateCreate.CreateFromTemplate(ctx, workspace, name, templateName, spec, labels, opts...)
+}
 
 // Providers returns the provider sub-client.
 func (fc *Client) Providers() v1.ProviderInterface { return fc.providers }
@@ -162,6 +179,16 @@ func (fc *Client) AddSandbox(workspace string, sb *types.Sandbox) {
 		return
 	}
 	fc.sandboxStore.Insert(workspace, sb)
+}
+
+// AddSandboxTemplate inserts a sandbox workload template directly into the store.
+// This is intended for pre-seeding test fixtures before the test begins. The
+// template is deep-copied on insert.
+func (fc *Client) AddSandboxTemplate(workspace string, template *types.SandboxWorkloadTemplate) {
+	if template == nil {
+		return
+	}
+	fc.templateStore.Insert(workspace, template)
 }
 
 // AddProvider inserts a provider directly into the store without triggering

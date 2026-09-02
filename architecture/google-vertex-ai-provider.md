@@ -375,7 +375,7 @@ The `discovery` section lists `[service_account_token, gcloud_adc_token]` as the
 credential sources the gateway will scan during `--from-existing`.
 
 The `endpoints` section enumerates all Vertex AI API hosts that sandbox network
-policies must permit when `providers_v2_enabled=true`:
+policies permit through provider profile composition:
 
 - `*-aiplatform.googleapis.com:443` (regional endpoints)
 - `aiplatform.googleapis.com:443` (global endpoint)

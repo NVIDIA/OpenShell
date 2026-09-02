@@ -13,7 +13,9 @@ AI agents typically need credentials to access external services: an API key for
 Create and manage providers that supply credentials to sandboxes.
 
 <Info>
-Providers v2 is available for profile-backed provider policy, provider-owned network rules, and gateway-managed credential refresh. This page remains the credential-focused provider command reference. For the new workflow, see [Providers v2](/sandboxes/providers-v2).
+Provider profiles define provider credentials, policy, and refresh behavior. See
+[Profiles](/providers/profiles) for the profile format and custom
+profile workflow.
 </Info>
 
 Provider profiles include metadata for known endpoints and binaries. View
@@ -89,22 +91,22 @@ the stored gateway access token is expired and a refresh token is available, the
 CLI refreshes it before storing the provider credential. It does not store the
 OIDC refresh token in the provider.
 
-Provider profile metadata is available for known provider types. Provider profile
-network policy is gateway opt-in:
-
-```shell
-openshell settings set --global --key providers_v2_enabled --value true
-```
-
-Without `providers_v2_enabled=true`, attached provider profiles do not contribute
-network policy to the sandbox. Static credential endpoint binding remains active
-in either mode.
-
-When `providers_v2_enabled=true`, `--from-existing` uses profile-backed
-discovery instead of the legacy provider registry. The requested `--type` must
+`--from-existing` uses profile-backed discovery. The requested `--type` must
 have a built-in or imported provider profile with a `discovery` section. If no
 matching profile exists, the CLI returns an error instead of falling back to
 legacy discovery.
+
+Create a provider whose profile requires no static credentials without a
+credential source:
+
+```shell
+openshell provider create --name public-pypi --type pypi
+```
+
+Provider creation rejects profileless types. For a custom GitLab deployment,
+import a profile with the deployment's endpoints and then create an instance
+using that profile ID. Existing profileless provider records remain usable, but
+OpenShell does not create new ones.
 
 Update a custom provider profile after exporting it, editing its endpoints,
 binaries, or credential metadata, and preserving the exported `resource_version`:
@@ -117,9 +119,18 @@ openshell provider profile update my-api -f my-api-profile.yaml
 Import remains create-only and fails if the profile ID already exists. Use
 `provider profile update <id>` for existing custom profiles. Built-in profiles are
 read-only. The target ID must match the profile ID in the file. Update accepts
-one file at a time and rejects stale resource versions. When
-`providers_v2_enabled=true`, updated profile policy applies to all provider
-instances of that type on the next sandbox config sync.
+one file at a time and rejects stale resource versions. Updated profile policy
+applies to all provider instances of that type on the next sandbox config sync.
+
+Delete one or more custom provider profiles by ID:
+
+```shell
+openshell provider profile delete custom-api custom-alt
+```
+
+When a multi-profile delete fails for one entry, the CLI reports that profile's
+failure and continues with the remaining IDs. The command exits with an error
+after it attempts every requested deletion if any entry failed.
 
 <Warning>
 Static credentials require a built-in or imported provider profile. Profiles
@@ -218,17 +229,15 @@ openshell provider refresh rotate my-graph --credential-key MS_GRAPH_ACCESS_TOKE
 
 ### AWS STS
 
-AWS STS refresh requires `providers_v2_enabled=true`. The gateway calls
-`sts:AssumeRole` and writes three short-lived credentials (`AWS_ACCESS_KEY_ID`,
-`AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) to the provider record atomically.
+The gateway calls `sts:AssumeRole` and writes three short-lived credentials
+(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) to the
+provider record atomically.
 The `aws` and `aws-s3` profiles declare `AWS_SECRET_ACCESS_KEY` and
 `AWS_SESSION_TOKEN` as `additional_outputs` of the `AWS_ACCESS_KEY_ID` refresh,
 so all three credentials are gateway-minted. Create the provider with
 `--runtime-credentials` — no placeholder credential is needed.
 
 ```shell
-openshell settings set --global --key providers_v2_enabled --value true --yes
-
 openshell provider create --name my-aws --type aws-s3 --runtime-credentials
 
 openshell provider refresh configure my-aws \
@@ -278,6 +287,16 @@ Delete a provider:
 openshell provider delete my-claude
 ```
 
+Delete multiple providers by listing their names in one command:
+
+```shell
+openshell provider delete my-claude my-github
+```
+
+When a multi-provider delete fails for one entry, the CLI reports that
+provider's failure and continues with the remaining names. The command exits
+with an error after it attempts every requested deletion if any entry failed.
+
 ## Attach Providers to Sandboxes
 
 Pass one or more `--provider` flags when creating a sandbox:
@@ -291,25 +310,23 @@ credentials from every attached provider as placeholders at runtime. Each
 static credential resolves only for endpoints in that provider's profile, or
 for explicitly bound sandbox policy endpoints when the profile is endpointless.
 Profile-managed providers also contribute provider-generated network policy
-entries when `providers_v2_enabled` is enabled at the gateway. When the setting
-is disabled, endpoint binding still applies, but provider-generated policy does
-not.
+entries. Endpoint binding independently limits where each static credential can
+be resolved.
 
-<Warning>
-Legacy provider attachment is fixed at sandbox creation time. Providers v2 adds
-`openshell sandbox provider attach` and `openshell sandbox provider detach` for
-running sandboxes. See [Providers v2](/sandboxes/providers-v2#attach-and-detach-providers)
-for runtime attach and detach behavior.
+<Info>
+Use `--provider` to attach providers when creating a sandbox. To change the
+providers attached to a running sandbox, use `openshell sandbox provider attach`
+and `openshell sandbox provider detach`. See
+[Profiles](/providers/profiles#attach-and-detach-providers) for details.
 
-</Warning>
+</Info>
 
 ### Auto-Discovery Shortcut
 
-When `providers_v2_enabled=false` and the trailing command in
-`openshell sandbox create` is a recognized tool name (`claude`, `codex`, or
-`opencode`), the CLI auto-creates the required provider from your local
-credentials if one does not already exist. You do not need to create the
-provider separately:
+When the trailing command in `openshell sandbox create` maps to an available
+profile, the CLI auto-creates the required provider from local profile
+discovery if one does not already exist. You do not need to create the provider
+separately:
 
 ```shell
 openshell sandbox create -- claude
@@ -318,9 +335,8 @@ openshell sandbox create -- claude
 This detects `claude` as a known tool, finds your `ANTHROPIC_API_KEY`, creates
 a provider, attaches it to the sandbox, and launches Claude Code.
 
-Providers v2 disables command-derived provider inference. When
-`providers_v2_enabled=true`, create or import the provider profile, create the
-provider instance, and pass `--provider <name>` explicitly.
+If the inferred type has no built-in or imported profile, creation fails. Import
+a custom profile first or pass an existing provider with `--provider <name>`.
 
 ## How Credential Injection Works
 
@@ -343,15 +359,13 @@ request. A plain sandbox policy endpoint does not grant credential use unless
 the profile already covers it or the endpoint explicitly binds an endpointless
 provider.
 
-Endpoint binding applies whether `providers_v2_enabled` is enabled or disabled.
-The setting controls provider policy composition only. Every static credential
-declared by a provider receives the complete endpoint set from that provider's
+Every static credential declared by a provider receives the complete endpoint set from that provider's
 profile, or the explicitly bound sandbox policy endpoints for an endpointless
 profile.
 
 Credential resolution requires the proxy to handle the request as HTTP. Raw
 `tls: skip` and non-HTTP tunnels remain opaque and do not support credential
-rewrite. Refer to [Providers v2](/sandboxes/providers-v2#understand-static-credential-endpoint-binding)
+rewrite. Refer to [Profiles](/providers/profiles#understand-static-credential-endpoint-binding)
 for endpoint matching and migration guidance.
 
 ### Supported injection locations
@@ -397,8 +411,8 @@ there returns `credential_endpoint_mismatch`.
 
 For a custom service, define the credential in a custom provider profile. Put
 stable endpoints in the profile, or leave the profile endpointless and bind
-each concrete provider instance from sandbox policy. Refer to [Provider
-Profiles](/sandboxes/providers-v2#provider-profiles) for the profile workflow
+each concrete provider instance from sandbox policy. Refer to
+[Profiles](/providers/profiles#provider-profiles) for the profile workflow
 and schema.
 
 ## Supported Provider Types
@@ -413,12 +427,9 @@ The following provider types are supported.
 | `codex` | `OPENAI_API_KEY` | OpenAI Codex |
 | `copilot` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` | GitHub Copilot CLI |
 | `deepinfra` | `DEEPINFRA_API_KEY` | DeepInfra inference API |
-| `generic` | User-defined | Legacy credential storage. Import an endpoint-bearing custom profile for credentials attached to a sandbox. |
 | `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API and `gh` CLI. Refer to [GitHub Sandbox](/get-started/tutorials/github-sandbox). |
-| `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
 | `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
-| `openai` | `OPENAI_API_KEY` | Any OpenAI-compatible endpoint. Set `--config OPENAI_BASE_URL` to point to the provider. Refer to [Inference Routing](/sandboxes/inference-routing). |
-| `opencode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | OpenCode |
+| `openai` | `OPENAI_API_KEY` | OpenAI API. An `OPENAI_BASE_URL` override remains available for gateway inference routing but does not authorize the fixed public OpenAI endpoint for sandbox traffic. Refer to [Inference Routing](/sandboxes/inference-routing). |
 
 <Note>
 `ANTHROPIC_API_KEY` is an API key from [console.anthropic.com](https://console.anthropic.com), not a subscription token. Subscription users must generate a separate API key from the Anthropic Console.
@@ -433,7 +444,7 @@ ID as the provider `--type`.
 
 ## Supported Inference Providers
 
-The following providers have been tested with `inference.local`. Any provider that exposes an OpenAI-compatible API works with the `openai` type. Set `--config OPENAI_BASE_URL` to the provider's base URL and `--credential OPENAI_API_KEY` to your API key.
+The following providers have been tested with `inference.local`. Any provider that exposes an OpenAI-compatible API works with the `openai` routing type. Set `--config OPENAI_BASE_URL` to the provider's base URL and `--credential OPENAI_API_KEY` to your API key. A base URL override makes the provider route-only: it does not contribute the built-in public OpenAI endpoint to sandbox policy or make the key substitutable there. Import an endpoint-bearing custom profile when a sandbox needs direct access to the alternate upstream.
 
 | Provider | Name | Type | Base URL | API Key Variable |
 |---|---|---|---|---|

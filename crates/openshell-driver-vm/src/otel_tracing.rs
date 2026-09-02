@@ -11,14 +11,28 @@ use tracing_subscriber::registry::LookupSpan;
 const SERVICE_NAME: &str = "openshell-driver-vm";
 const INSTRUMENTATION_SCOPE: &str = "openshell-driver-vm";
 
-/// Build a tracer provider for the configured OTLP/gRPC endpoint.
+/// Build a tracer provider for the configured OTLP/gRPC endpoint and gateway.
 #[must_use]
-pub fn provider_for(endpoint: Option<&str>) -> (Option<SdkTracerProvider>, Option<SetupError>) {
-    openshell_otel::provider_for(endpoint.map(|endpoint| OtlpTraceConfig {
-        endpoint,
-        service_name: ServiceName::Fixed(SERVICE_NAME),
-        service_version: Some(openshell_core::VERSION),
-        resource_attributes: Vec::new(),
+pub fn provider_for(
+    endpoint: Option<&str>,
+    gateway_name: Option<&str>,
+) -> (Option<SdkTracerProvider>, Option<SetupError>) {
+    openshell_otel::provider_for(endpoint.map(|endpoint| {
+        OtlpTraceConfig {
+            endpoint,
+            service_name: ServiceName::Fixed(SERVICE_NAME),
+            service_version: Some(openshell_core::VERSION),
+            resource_attributes: gateway_name
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(|name| {
+                    vec![opentelemetry::KeyValue::new(
+                        "openshell.gateway.name",
+                        name.to_string(),
+                    )]
+                })
+                .unwrap_or_default(),
+        }
     }))
 }
 
@@ -83,10 +97,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn vm_driver_spans_reach_otlp_collector_with_distinct_service_name() {
+    async fn vm_driver_spans_reach_otlp_collector_with_resource_identity() {
         let collector = OtlpTestServer::start().await;
 
-        let (provider, error) = super::provider_for(Some(collector.endpoint()));
+        let (provider, error) =
+            super::provider_for(Some(collector.endpoint()), Some("production-us-west"));
         assert!(error.is_none(), "valid OTLP endpoint should configure");
         let provider = provider.expect("provider");
         let subscriber = tracing_subscriber::registry().with(super::layer(&provider));
@@ -113,5 +128,6 @@ mod tests {
             "VM spans should use a distinct service name, got {:?}",
             received.service_names
         );
+        assert_eq!(received.gateway_names, ["production-us-west"]);
     }
 }

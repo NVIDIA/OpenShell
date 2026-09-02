@@ -18,6 +18,8 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 
 `database_url` is env-only. The loader rejects it when it appears in the file. When `OPENSHELL_DB_URL` is unset, the gateway stores its SQLite database under `$XDG_STATE_HOME/openshell/gateway/openshell.db`.
 
+`name` assigns an operator-facing identity to the gateway installation. Set it with `[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`. It defaults to `openshell`; the Helm chart defaults it to the chart fullname so all replicas in one installation share a name. Chart fullnames are only unique within their Kubernetes namespace, so set `server.name` explicitly when one collector receives telemetry from multiple namespaces or clusters. This identity is independent of client-side gateway aliases, TLS names, and `gateway_jwt.gateway_id`.
+
 ## Package-Managed Locations
 
 Package-managed gateways do not require a TOML file. Create one at the package's optional config location when you need to override built-in defaults. Set `OPENSHELL_GATEWAY_CONFIG` in the launch environment to use a different file.
@@ -69,6 +71,7 @@ A complete gateway configuration covering every section. Trim to the fields you 
 version = 1
 
 [openshell.gateway]
+name                  = "production-us-west"
 bind_address          = "0.0.0.0:8080"
 health_bind_address   = "0.0.0.0:8081"
 metrics_bind_address  = "0.0.0.0:9090"
@@ -137,6 +140,8 @@ max_payload_bytes = 262144
 timeout = "500ms"
 
 # Gateway listener TLS (distinct from the per-driver guest_tls_*).
+# client_ca_path is optional; omit it for HTTPS-only listeners that do not
+# verify client certificates.
 [openshell.gateway.tls]
 cert_path             = "/etc/openshell/certs/gateway.pem"
 key_path              = "/etc/openshell/certs/gateway-key.pem"
@@ -228,11 +233,11 @@ The transport is **OTLP over gRPC only**. HTTP/protobuf and HTTP/JSON are not su
 
 The OpenTelemetry SDK logs export failures after startup. Spans in a failed batch are dropped rather than retried.
 
-`service_name` sets the gateway's `service.name` resource attribute and defaults to `openshell-gateway`. The gateway also reports `service.version`.
+`service_name` sets the gateway's `service.name` resource attribute and defaults to `openshell-gateway`. The gateway also reports `service.version`, `openshell.gateway.name` from the gateway's configured `name`, and `openshell.gateway.compute_driver`.
 
 Only OpenTelemetry traces are exported. Inbound gRPC and HTTP requests produce server spans named for the RPC or HTTP method. Store and compute-driver operations appear as child spans. Internal reconciliation, credential-refresh, and driver-watch loops create operation roots for their store work because no inbound request supplies a parent. The gateway continues valid W3C `traceparent` context and starts a new trace when none is supplied. Request spans carry `method`, `path`, and the `request_id` that also appears in gateway logs. Health endpoint spans use DEBUG level and are not exported by the default INFO filter.
 
-The gateway forwards the OTLP configuration and W3C trace context to managed external drivers. Built-in Docker and Podman drivers also export their spans to the same collector through dedicated in-process providers. Driver spans retain the gateway trace context and use a distinct service name such as `openshell-driver-docker` or `openshell-driver-podman`.
+The gateway forwards the OTLP configuration, configured gateway name, and W3C trace context to managed external drivers. Built-in drivers also export their spans to the same collector through dedicated in-process providers. Driver spans retain the gateway trace context, use a distinct service name such as `openshell-driver-docker` or `openshell-driver-podman`, and carry the gateway name as the `openshell.gateway.name` resource attribute. Operator-run external drivers own their own telemetry configuration.
 
 For Helm deployments, set `server.otlp.endpoint` to render this table. The
 optional `server.otlp.serviceName` value overrides the gateway service name;
@@ -242,6 +247,11 @@ The local `mise run helm:k3s:create` workflow installs a trace collector and UI,
 enables Agent Sandbox controller tracing on supported releases, and configures
 both the controller and the existing Skaffold deployment to export traces to it
 automatically.
+The local `gateway`, `gateway:docker`, `gateway:podman`, and `gateway:vm` tasks
+also set the gateway installation name in their generated configuration. Their
+defaults are driver-specific (`kubernetes-dev`, `docker-dev`, `podman-dev`, and
+`vm-dev`), and their documented `OPENSHELL_*_GATEWAY_NAME` overrides update both
+CLI registration and exported telemetry identity.
 Run `mise run helm:k3s:forward` to forward OTLP/gRPC to local port `4317` and
 the trace UI to local port `18888`. When Skaffold has deployed a Kubernetes
 gateway, the task also forwards it to local port `8090`; otherwise it continues
@@ -249,6 +259,8 @@ with the collector ports only. The Skaffold run task registers the forwarded
 gateway under the worktree-specific k3d cluster name; select it with
 `openshell gateway select <name>`. The local Podman, Docker, and VM gateway
 tasks export to the forwarded receiver automatically.
+
+In-process compute drivers read their backend-specific settings from `[openshell.drivers.<name>]`. An external driver's gateway table supplies only its `socket_path`; configure the external driver process itself through that binary's flags or environment variables. A driver that advertises `supports_sandbox_authentication` may authenticate an opaque bootstrap credential through the compute-driver protocol. The gateway trusts the returned sandbox ID only for `IssueSandboxToken`, verifies that the sandbox still exists, and then mints its own JWT. The in-process Kubernetes driver reads `service_account_name`, `workspace_mode`, and namespace discovery from `[openshell.drivers.kubernetes]`; an external Kubernetes driver receives the equivalent values through its own CLI or environment contract.
 
 ### Tuning
 

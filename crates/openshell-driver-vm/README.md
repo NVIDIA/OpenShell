@@ -9,7 +9,7 @@ Standalone libkrun-backed [`ComputeDriver`](../../proto/compute_driver.proto) fo
 ```mermaid
 flowchart LR
     subgraph host["Host process"]
-        gateway["openshell-server<br/>(compute::vm::spawn)"]
+        gateway["openshell-gateway<br/>(vm::spawn)"]
         driver["openshell-driver-vm<br/>├── libkrun (VM)<br/>├── gvproxy (net)<br/>└── openshell-sandbox.zst"]
         gateway <-->|"gRPC over UDS<br/>compute-driver.sock"| driver
     end
@@ -40,10 +40,14 @@ First run takes a few minutes while `mise run vm:setup` stages libkrun/libkrunfw
 By default `mise run gateway:vm`:
 
 - Listens on plaintext HTTP at `127.0.0.1:18081`.
-- Registers the CLI gateway `vm-dev` by writing `~/.config/openshell/gateways/vm-dev/metadata.json`. It does not modify the workspace `.env`.
+- Configures the gateway installation name as `vm-dev` and registers the same
+  name with the CLI by writing
+  `~/.config/openshell/gateways/vm-dev/metadata.json`. It does not modify the
+  workspace `.env`.
 - Persists the gateway SQLite DB under `.cache/gateway-vm/gateway.db`.
 - Places the VM driver state (per-sandbox `overlay.ext4`, image cache, and `run/compute-driver.sock`) under `/tmp/openshell-vm-driver-$USER-vm-dev/` so the AF_UNIX socket path stays under macOS `SUN_LEN`.
 - Writes `.cache/gateway-vm/gateway.toml` with `[openshell.drivers.vm].driver_dir = "$PWD/target/debug"` so the freshly built `openshell-driver-vm` is used instead of an older installed copy from `~/.local/libexec/openshell`, `/usr/libexec/openshell`, or `/usr/local/libexec`.
+- Enables OTLP trace export to `http://127.0.0.1:4317` only when a local collector is listening there. Otherwise, it omits the OTLP configuration to avoid repeated export failures.
 
 For GPU passthrough (VFIO), pass `-- --gpu` and run with root privileges:
 
@@ -68,7 +72,7 @@ Override defaults via environment:
 # custom port (fails fast if in use)
 OPENSHELL_SERVER_PORT=18091 mise run gateway:vm
 
-# custom CLI gateway name + namespace
+# custom gateway installation/CLI name + namespace
 OPENSHELL_VM_GATEWAY_NAME=vm-feature-a \
 OPENSHELL_SANDBOX_NAMESPACE=vm-feature-a \
 mise run gateway:vm
@@ -98,7 +102,7 @@ mise run vm:supervisor          # if openshell-sandbox.zst is not already presen
 
 # 2. Build both binaries with the staged artifacts embedded
 OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=$PWD/target/vm-runtime-compressed \
-  cargo build -p openshell-server -p openshell-driver-vm
+  cargo build -p openshell-gateway -p openshell-driver-vm
 
 # 3. macOS only: codesign the driver for Hypervisor.framework
 codesign \
@@ -287,5 +291,5 @@ the user explicitly overrides it.
 
 ## TODOs
 
-- The gateway still configures the driver via CLI args; this will move to a gRPC bootstrap call so the driver interface is uniform across backends. See the `TODO(driver-abstraction)` notes in `crates/openshell-server/src/lib.rs` and `crates/openshell-server/src/compute/vm.rs`.
+- The gateway still configures the driver via CLI args; this will move to a gRPC bootstrap call so the driver interface is uniform across backends. See the `TODO(driver-abstraction)` note in `crates/openshell-gateway/src/vm.rs`.
 - macOS local builds are codesigned by `tasks/scripts/gateway-vm.sh`; the generated Homebrew formula signs the release tarball driver for local installs.

@@ -148,16 +148,16 @@ async fn managed_creates_namespace_with_labels() {
         &ws,
         "--name",
         "mgd-sb",
-        "--detach",
         "--",
-        "sh",
-        "-c",
-        DURABLE_MAIN_SCRIPT,
-        "_",
+        "echo",
         "managed-ok",
     ])
     .await;
     assert!(ok, "sandbox create failed: {out}");
+    assert!(
+        out.contains("managed-ok"),
+        "sandbox output missing expected string: {out}"
+    );
 
     // Verify the managed namespace was created.
     let (ok, out) = kubectl(&["get", "namespace", &ns]).await;
@@ -281,10 +281,7 @@ async fn managed_namespace_survives_with_remaining_sandboxes() {
         "--name",
         "sb-a",
         "--",
-        "sh",
-        "-c",
-        DURABLE_MAIN_SCRIPT,
-        "_",
+        "echo",
         "a",
     ])
     .await;
@@ -298,10 +295,7 @@ async fn managed_namespace_survives_with_remaining_sandboxes() {
         "--name",
         "sb-b",
         "--",
-        "sh",
-        "-c",
-        DURABLE_MAIN_SCRIPT,
-        "_",
+        "echo",
         "b",
     ])
     .await;
@@ -363,10 +357,7 @@ async fn managed_isolates_workspaces_into_separate_namespaces() {
         "--name",
         "sb-iso-a",
         "--",
-        "sh",
-        "-c",
-        DURABLE_MAIN_SCRIPT,
-        "_",
+        "echo",
         "a",
     ])
     .await;
@@ -380,10 +371,7 @@ async fn managed_isolates_workspaces_into_separate_namespaces() {
         "--name",
         "sb-iso-b",
         "--",
-        "sh",
-        "-c",
-        DURABLE_MAIN_SCRIPT,
-        "_",
+        "echo",
         "b",
     ])
     .await;
@@ -457,16 +445,16 @@ async fn managed_workspace_delete_removes_namespace() {
         &ws,
         "--name",
         "del-sb",
-        "--detach",
         "--",
-        "sh",
-        "-c",
-        DURABLE_MAIN_SCRIPT,
-        "_",
+        "echo",
         "del-ok",
     ])
     .await;
     assert!(ok, "sandbox create failed: {out}");
+    assert!(
+        out.contains("del-ok"),
+        "sandbox output missing expected string: {out}"
+    );
 
     let (ok, _) = kubectl(&["get", "namespace", &ns]).await;
     assert!(
@@ -529,16 +517,16 @@ async fn managed_tls_secret_copied_to_namespace() {
         &ws,
         "--name",
         "tls-sb",
-        "--detach",
         "--",
-        "sh",
-        "-c",
-        DURABLE_MAIN_SCRIPT,
-        "_",
+        "echo",
         "tls-ok",
     ])
     .await;
     assert!(ok, "sandbox create failed: {out}");
+    assert!(
+        out.contains("tls-ok"),
+        "sandbox output missing expected string: {out}"
+    );
 
     let (ok, out) = kubectl(&["get", "secret", "openshell-client-tls", "-n", &ns]).await;
     assert!(
@@ -596,10 +584,7 @@ async fn managed_rejects_namespace_owned_by_different_gateway() {
         "--name",
         "conflict-sb",
         "--",
-        "sh",
-        "-c",
-        DURABLE_MAIN_SCRIPT,
-        "_",
+        "echo",
         "nope",
     ])
     .await;
@@ -629,10 +614,7 @@ async fn managed_full_lifecycle_with_multiple_sandboxes() {
         "--name",
         "lc-a",
         "--",
-        "sh",
-        "-c",
-        DURABLE_MAIN_SCRIPT,
-        "_",
+        "echo",
         "a",
     ])
     .await;
@@ -646,10 +628,7 @@ async fn managed_full_lifecycle_with_multiple_sandboxes() {
         "--name",
         "lc-b",
         "--",
-        "sh",
-        "-c",
-        DURABLE_MAIN_SCRIPT,
-        "_",
+        "echo",
         "b",
     ])
     .await;
@@ -727,6 +706,7 @@ async fn managed_stop_waits_for_workspace_pod_to_disappear() {
         &ws,
         "--name",
         sandbox,
+        "--detach",
         "--",
         "sh",
         "-c",
@@ -780,10 +760,7 @@ async fn managed_rejects_invalid_dns1123_sandbox_name() {
         "--name",
         "my_bad_name",
         "--",
-        "sh",
-        "-c",
-        DURABLE_MAIN_SCRIPT,
-        "_",
+        "echo",
         "nope",
     ])
     .await;
@@ -804,10 +781,7 @@ async fn managed_rejects_invalid_dns1123_sandbox_name() {
         "--name",
         "MyBadName",
         "--",
-        "sh",
-        "-c",
-        DURABLE_MAIN_SCRIPT,
-        "_",
+        "echo",
         "nope",
     ])
     .await;
@@ -825,10 +799,7 @@ async fn managed_rejects_invalid_dns1123_sandbox_name() {
         "--name",
         "trailing-",
         "--",
-        "sh",
-        "-c",
-        DURABLE_MAIN_SCRIPT,
-        "_",
+        "echo",
         "nope",
     ])
     .await;

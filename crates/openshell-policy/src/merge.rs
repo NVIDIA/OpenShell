@@ -45,9 +45,11 @@ pub fn canonicalize_advisor_add_rule(
         })
         .cloned()
         .map(|mut endpoint| {
-            // This marker is derived from provider/credential context by the
-            // gateway and must never be persisted from an advisor proposal.
+            // Provenance does not change the endpoint contract. The gateway
+            // derives the credential marker, and the advisor marker records
+            // where a persisted endpoint came from.
             endpoint.provider_credentialed = false;
+            endpoint.advisor_proposed = false;
             // A denial observes one binary-to-port authorization. Preserve the
             // existing inspection contract, but never copy sibling ports from
             // a multi-port endpoint into the proposal.
@@ -84,6 +86,7 @@ pub fn canonicalize_advisor_add_rule(
                 .any(|endpoint| {
                     let mut normalized = endpoint.clone();
                     normalized.provider_credentialed = false;
+                    normalized.advisor_proposed = false;
                     normalize_endpoint(&mut normalized);
                     normalized == contract
                 })
@@ -92,6 +95,12 @@ pub fn canonicalize_advisor_add_rule(
         .collect::<Vec<_>>();
     sandbox_owners.sort();
 
+    let mut contract = contract;
+    if sandbox_owners.is_empty() {
+        // A provider-owned contract is mirrored into a new sandbox-owned
+        // advisor overlay, so retain the incoming proposal provenance.
+        contract.advisor_proposed = incoming_endpoint.advisor_proposed;
+    }
     let target_name = sandbox_owners
         .first()
         .cloned()
@@ -632,7 +641,8 @@ fn endpoint_attributes_cover(loaded: &NetworkEndpoint, proposed: &NetworkEndpoin
         return false;
     }
 
-    // Widened fields (list appends and `|=` flags) use containment: merging
+    // Widened fields (list appends and authorization flags) use containment:
+    // merging
     // into an endpoint that already carries them leaves the loaded copy a
     // superset of the proposal, so equality would report "not covered" for a
     // proposal that did land.
@@ -648,7 +658,6 @@ fn endpoint_attributes_cover(loaded: &NetworkEndpoint, proposed: &NetworkEndpoin
             loaded.request_body_credential_rewrite,
             proposed.request_body_credential_rewrite,
         )
-        && flag_covers(loaded.advisor_proposed, proposed.advisor_proposed)
         // Fields the merge neither widens nor retains: it drops them entirely.
         // An unset proposal value asks for nothing and is satisfied by whatever
         // is loaded; a set value that differs was dropped, so the proposal is
@@ -1374,7 +1383,11 @@ fn merge_endpoint(
     existing.websocket_credential_rewrite |= incoming.websocket_credential_rewrite;
     existing.request_body_credential_rewrite |= incoming.request_body_credential_rewrite;
     existing.allow_uninspected_credentials |= incoming.allow_uninspected_credentials;
-    existing.advisor_proposed |= incoming.advisor_proposed;
+    // Provenance is not an authorization bit. If either declaration came
+    // directly from a user or provider, keep the endpoint explicit. This
+    // mirrors binary provenance and prevents an advisor overlay from tainting
+    // an already explicit endpoint for exact-host SSRF evaluation.
+    existing.advisor_proposed &= incoming.advisor_proposed;
     normalize_endpoint(existing);
     Ok(())
 }
@@ -2216,10 +2229,63 @@ mod tests {
         assert_eq!(canonical.endpoints[0].protocol, "rest");
         assert_eq!(canonical.endpoints[0].access, "read-only");
         assert!(!canonical.endpoints[0].provider_credentialed);
+        assert!(canonical.endpoints[0].advisor_proposed);
         assert_eq!(
             effective.network_policies["_provider_example"].endpoints[0],
             provider_endpoint
         );
+    }
+
+    #[test]
+    fn canonicalize_advisor_ignores_endpoint_provenance_when_inferring_contract() {
+        let mut provider_endpoint = endpoint("api.example.com", 443);
+        provider_endpoint.protocol = "rest".to_string();
+        provider_endpoint.enforcement = "enforce".to_string();
+        provider_endpoint.access = "read-only".to_string();
+        provider_endpoint.provider_credentialed = true;
+
+        let mut advisor_endpoint = provider_endpoint.clone();
+        advisor_endpoint.provider_credentialed = false;
+        advisor_endpoint.advisor_proposed = true;
+
+        let mut base = SandboxPolicy::default();
+        base.network_policies.insert(
+            "existing_advisor".to_string(),
+            NetworkPolicyRule {
+                name: "existing-advisor".to_string(),
+                endpoints: vec![advisor_endpoint],
+                binaries: vec![advisor_binary("/usr/bin/curl")],
+            },
+        );
+
+        let mut effective = base.clone();
+        effective.network_policies.insert(
+            "_provider_example".to_string(),
+            NetworkPolicyRule {
+                name: "provider-example".to_string(),
+                endpoints: vec![provider_endpoint],
+                binaries: vec![binary("/usr/bin/gh")],
+            },
+        );
+
+        let incoming = NetworkPolicyRule {
+            name: "advisor_example".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                advisor_proposed: true,
+                ..Default::default()
+            }],
+            binaries: vec![advisor_binary("/usr/bin/python")],
+        };
+
+        let (rule_name, canonical) =
+            canonicalize_advisor_add_rule(&base, &effective, "advisor_example", &incoming)
+                .expect("provenance alone must not create multiple endpoint contracts");
+
+        assert_eq!(rule_name, "existing_advisor");
+        assert_eq!(canonical.endpoints[0].protocol, "rest");
+        assert_eq!(canonical.endpoints[0].access, "read-only");
     }
 
     #[test]
@@ -3025,7 +3091,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_coverage_requires_endpoint_advisor_provenance_to_be_loaded() {
+    fn policy_coverage_ignores_endpoint_advisor_provenance() {
         let loaded_endpoint = endpoint("api.example.com", 443);
         let mut proposed_endpoint = loaded_endpoint.clone();
         proposed_endpoint.advisor_proposed = true;
@@ -3036,7 +3102,37 @@ mod tests {
         let proposed =
             rule_with_authorizations("proposed", vec![proposed_endpoint], &["/usr/bin/client"]);
 
-        assert!(!policy_covers_rule(&loaded, &proposed));
+        assert!(policy_covers_rule(&loaded, &proposed));
+    }
+
+    #[test]
+    fn explicit_endpoint_provenance_wins_in_either_merge_order() {
+        let explicit_endpoint = endpoint("api.example.com", 443);
+        let mut proposed_endpoint = explicit_endpoint.clone();
+        proposed_endpoint.advisor_proposed = true;
+
+        for (existing_endpoint, incoming_endpoint) in [
+            (explicit_endpoint.clone(), proposed_endpoint.clone()),
+            (proposed_endpoint, explicit_endpoint),
+        ] {
+            let incoming =
+                rule_with_authorizations("api", vec![incoming_endpoint], &["/usr/bin/client"]);
+            let merged = merge_policy(
+                policy_with_rule(
+                    "api",
+                    rule_with_authorizations("api", vec![existing_endpoint], &["/usr/bin/client"]),
+                ),
+                &[PolicyMergeOp::AddRule {
+                    rule_name: "api".to_string(),
+                    rule: incoming.clone(),
+                }],
+            )
+            .expect("compatible explicit and advisor rules should merge");
+
+            let endpoint = &merged.policy.network_policies["api"].endpoints[0];
+            assert!(!endpoint.advisor_proposed);
+            assert!(policy_covers_rule(&merged.policy, &incoming));
+        }
     }
 
     #[test]

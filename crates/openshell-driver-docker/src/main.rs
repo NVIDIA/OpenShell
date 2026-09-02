@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
+use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
-use openshell_core::{Config, VERSION};
 use openshell_driver_docker::otel_tracing::compute_driver_rpc_layer;
 use openshell_driver_docker::{ComputeDriverService, DockerComputeConfig, DockerComputeDriver};
 use tracing::info;
@@ -38,13 +38,18 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
+    gateway_name: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let (tracer_provider, setup_error) =
-        openshell_driver_docker::otel_tracing::provider_for(args.otlp_endpoint.as_deref());
+    let (tracer_provider, setup_error) = openshell_driver_docker::otel_tracing::provider_for(
+        args.otlp_endpoint.as_deref(),
+        args.gateway_name.as_deref(),
+    );
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)))
         .with(tracing_subscriber::fmt::layer())
@@ -62,8 +67,7 @@ async fn main() -> Result<()> {
 
     let config_source = std::fs::read_to_string(&args.config).into_diagnostic()?;
     let docker_config: DockerComputeConfig = toml::from_str(&config_source).into_diagnostic()?;
-    let gateway_config = Config::new(None).with_bind_address(args.gateway_bind);
-    let driver = DockerComputeDriver::new(&gateway_config, &docker_config)
+    let driver = DockerComputeDriver::new(args.gateway_bind, &args.log_level, &docker_config)
         .await
         .into_diagnostic()?;
 

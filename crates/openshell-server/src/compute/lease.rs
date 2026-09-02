@@ -242,10 +242,10 @@ impl ReconcilerLease {
 
 /// Derive a stable replica identity for lease ownership.
 ///
-/// Kubernetes sets `HOSTNAME` to the pod name, Docker sets it to the
-/// container ID, and systemd units inherit the machine hostname.
-/// `OPENSHELL_REPLICA_ID` allows explicit override. The UUID fallback
-/// handles edge cases where neither env var is set.
+/// Managed workloads commonly receive a stable runtime identity through
+/// `HOSTNAME`, while systemd units inherit the machine hostname.
+/// `OPENSHELL_REPLICA_ID` allows an explicit override. The UUID fallback
+/// handles environments where neither variable is set.
 pub fn replica_id() -> String {
     std::env::var("OPENSHELL_REPLICA_ID")
         .or_else(|_| std::env::var("HOSTNAME"))

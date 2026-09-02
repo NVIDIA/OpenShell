@@ -41,6 +41,30 @@ pub fn openshell_sandbox_label_selector() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Sandbox condition reason strings set by compute drivers.
+// ---------------------------------------------------------------------------
+
+/// Ready-condition reason when a container exits on its own.
+///
+/// Covers an ordinary application exit or crash (exit 0, a non-zero error code,
+/// or an uncaught fault). This is a terminal reason: gateway startup does NOT
+/// auto-restart it, so a genuine failure keeps its error signal instead of
+/// being relaunched.
+pub const CONDITION_EXITED: &str = "ContainerExited";
+
+/// Ready-condition reason when a container was terminated by an external signal.
+///
+/// SIGKILL/SIGTERM (exit 137/143) is what a Podman/Docker machine or daemon
+/// restart does to running containers. Distinct from `CONDITION_EXITED` so
+/// gateway startup can recover machine-restart victims while leaving ordinary
+/// application exits terminal.
+pub const CONDITION_RUNTIME_RESTART: &str = "ContainerRuntimeRestart";
+
+/// Ready-condition reason when a container is explicitly stopped via the
+/// runtime API (e.g. `podman stop`, gateway-initiated shutdown).
+pub const CONDITION_STOPPED: &str = "ContainerStopped";
+
+// ---------------------------------------------------------------------------
 
 /// Path to the sandbox supervisor binary inside the container image.
 ///
@@ -413,9 +437,9 @@ pub const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str = "/spiffe-workloa
 ///
 /// The resulting path is `$XDG_STATE_HOME/openshell/<driver_subdir>[/<namespace>]/<sandbox_id>/sandbox.jwt`.
 ///
-/// `driver_subdir` is driver-specific, e.g. `"docker-sandbox-tokens"` or
-/// `"podman-sandbox-tokens"`.  When `namespace` is `Some`, it is appended as
-/// an additional path component (with `/` and `\` replaced by `-`).
+/// `driver_subdir` is driver-specific. When `namespace` is `Some`, it is
+/// appended as an additional path component (with `/` and `\` replaced by
+/// `-`).
 ///
 /// # Errors
 /// Returns an error if the XDG state directory cannot be resolved.
@@ -448,7 +472,7 @@ pub fn sandbox_log_level(sandbox: &DriverSandbox, default_level: &str) -> String
 }
 
 // ---------------------------------------------------------------------------
-// Supervisor image helpers (shared by Docker and Podman drivers)
+// Supervisor image helpers shared by container-backed drivers
 // ---------------------------------------------------------------------------
 
 /// Return the tag portion of a supervisor image reference, or `None` if the
@@ -483,7 +507,7 @@ pub fn supervisor_image_should_refresh(image: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Supervisor binary extraction helpers (shared by Docker and Podman drivers)
+// Supervisor binary extraction helpers shared by container-backed drivers
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "driver-extraction")]
@@ -560,8 +584,7 @@ pub fn write_cache_binary_atomic(final_path: &Path, bytes: &[u8]) -> Result<(), 
 /// Return the host-side cache path for an extracted supervisor binary.
 ///
 /// The path is `$XDG_DATA_HOME/openshell/<driver_subdir>/<sanitized-digest>/openshell-sandbox`.
-/// `driver_subdir` distinguishes caches across drivers (e.g. `"docker-supervisor"`,
-/// `"podman-supervisor"`).
+/// `driver_subdir` distinguishes caches across drivers.
 pub fn supervisor_cache_path(driver_subdir: &str, digest: &str) -> Result<PathBuf, String> {
     let base = crate::paths::xdg_data_dir()
         .map_err(|err| format!("failed to resolve XDG data dir: {err}"))?;

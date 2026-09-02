@@ -3,21 +3,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Gateway image build.
-#
-# The Rust binary is built natively before this image build runs and staged at:
+# The GNU-linked gateway binary is staged at:
 #   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-gateway
 #
-# Use tasks/scripts/docker-build-image.sh gateway (or `mise run build:docker:gateway`)
-# to stage the binary and build the image in one step. CI builds the binary
-# per-architecture via the `rust-native-build.yml` workflow and uploads it as
-# an artifact, which is downloaded into the same staging directory before the
-# image build job runs.
-#
-# The runtime is distroless Debian 13, which provides glibc and the dynamic
-# loader needed by the GNU-linked gateway binary while keeping the attack
-# surface small. The default digest currently carries Debian glibc
-# 2.41-12+deb13u3.
+# Distroless Debian provides the glibc runtime required by the binary.
 
 ARG GATEWAY_BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775
 FROM ${GATEWAY_BASE_IMAGE} AS gateway

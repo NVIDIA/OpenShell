@@ -29,6 +29,10 @@ const (
 	OpenShell_CreateSandbox_FullMethodName                 = "/openshell.v1.OpenShell/CreateSandbox"
 	OpenShell_GetSandbox_FullMethodName                    = "/openshell.v1.OpenShell/GetSandbox"
 	OpenShell_ListSandboxes_FullMethodName                 = "/openshell.v1.OpenShell/ListSandboxes"
+	OpenShell_CreateSandboxTemplate_FullMethodName         = "/openshell.v1.OpenShell/CreateSandboxTemplate"
+	OpenShell_GetSandboxTemplate_FullMethodName            = "/openshell.v1.OpenShell/GetSandboxTemplate"
+	OpenShell_ListSandboxTemplates_FullMethodName          = "/openshell.v1.OpenShell/ListSandboxTemplates"
+	OpenShell_DeleteSandboxTemplate_FullMethodName         = "/openshell.v1.OpenShell/DeleteSandboxTemplate"
 	OpenShell_ListSandboxProviders_FullMethodName          = "/openshell.v1.OpenShell/ListSandboxProviders"
 	OpenShell_AttachSandboxProvider_FullMethodName         = "/openshell.v1.OpenShell/AttachSandboxProvider"
 	OpenShell_DetachSandboxProvider_FullMethodName         = "/openshell.v1.OpenShell/DetachSandboxProvider"
@@ -71,6 +75,7 @@ const (
 	OpenShell_PushSandboxLogs_FullMethodName               = "/openshell.v1.OpenShell/PushSandboxLogs"
 	OpenShell_ConnectSupervisor_FullMethodName             = "/openshell.v1.OpenShell/ConnectSupervisor"
 	OpenShell_ReportMainProcessExit_FullMethodName         = "/openshell.v1.OpenShell/ReportMainProcessExit"
+	OpenShell_FinalizeMainProcessExit_FullMethodName       = "/openshell.v1.OpenShell/FinalizeMainProcessExit"
 	OpenShell_RelayStream_FullMethodName                   = "/openshell.v1.OpenShell/RelayStream"
 	OpenShell_WatchSandbox_FullMethodName                  = "/openshell.v1.OpenShell/WatchSandbox"
 	OpenShell_SubmitPolicyAnalysis_FullMethodName          = "/openshell.v1.OpenShell/SubmitPolicyAnalysis"
@@ -118,6 +123,14 @@ type OpenShellClient interface {
 	GetSandbox(ctx context.Context, in *GetSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
 	// List sandboxes.
 	ListSandboxes(ctx context.Context, in *ListSandboxesRequest, opts ...grpc.CallOption) (*ListSandboxesResponse, error)
+	// Create a reusable sandbox workload template.
+	CreateSandboxTemplate(ctx context.Context, in *CreateSandboxTemplateRequest, opts ...grpc.CallOption) (*SandboxTemplateResponse, error)
+	// Fetch a reusable sandbox workload template by name.
+	GetSandboxTemplate(ctx context.Context, in *GetSandboxTemplateRequest, opts ...grpc.CallOption) (*SandboxTemplateResponse, error)
+	// List reusable sandbox workload templates.
+	ListSandboxTemplates(ctx context.Context, in *ListSandboxTemplatesRequest, opts ...grpc.CallOption) (*ListSandboxTemplatesResponse, error)
+	// Delete a reusable sandbox workload template by name.
+	DeleteSandboxTemplate(ctx context.Context, in *DeleteSandboxTemplateRequest, opts ...grpc.CallOption) (*DeleteSandboxTemplateResponse, error)
 	// List provider records attached to a sandbox.
 	ListSandboxProviders(ctx context.Context, in *ListSandboxProvidersRequest, opts ...grpc.CallOption) (*ListSandboxProvidersResponse, error)
 	// Attach a provider record to an existing sandbox.
@@ -182,9 +195,8 @@ type OpenShellClient interface {
 	DeleteProviderProfile(ctx context.Context, in *DeleteProviderProfileRequest, opts ...grpc.CallOption) (*DeleteProviderProfileResponse, error)
 	// Get sandbox settings by id (called by sandbox entrypoint and poll loop).
 	GetSandboxConfig(ctx context.Context, in *sandboxv1.GetSandboxConfigRequest, opts ...grpc.CallOption) (*sandboxv1.GetSandboxConfigResponse, error)
-	// Get gateway-global settings (read-only feature flags; any authenticated
-	// user may read these so the CLI and TUI can discover capabilities like
-	// providers_v2_enabled without requiring Platform Admin).
+	// Get gateway-global settings (read-only runtime configuration; any
+	// authenticated user may read these without requiring Platform Admin).
 	//
 	// Scope-only (no role): scopes are granted by the IdP at token issuance,
 	// orthogonal to workspace membership. Deployments that enable scope
@@ -218,6 +230,8 @@ type OpenShellClient interface {
 	ConnectSupervisor(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SupervisorMessage, GatewayMessage], error)
 	// Persist the canonical main process result before the supervisor exits.
 	ReportMainProcessExit(ctx context.Context, in *ReportMainProcessExitRequest, opts ...grpc.CallOption) (*ReportMainProcessExitResponse, error)
+	// Confirm that foreground terminal delivery completed naturally.
+	FinalizeMainProcessExit(ctx context.Context, in *FinalizeMainProcessExitRequest, opts ...grpc.CallOption) (*FinalizeMainProcessExitResponse, error)
 	// Raw byte relay between supervisor and gateway.
 	//
 	// The supervisor initiates this call after receiving a RelayOpen message
@@ -346,6 +360,46 @@ func (c *openShellClient) ListSandboxes(ctx context.Context, in *ListSandboxesRe
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListSandboxesResponse)
 	err := c.cc.Invoke(ctx, OpenShell_ListSandboxes_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) CreateSandboxTemplate(ctx context.Context, in *CreateSandboxTemplateRequest, opts ...grpc.CallOption) (*SandboxTemplateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SandboxTemplateResponse)
+	err := c.cc.Invoke(ctx, OpenShell_CreateSandboxTemplate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) GetSandboxTemplate(ctx context.Context, in *GetSandboxTemplateRequest, opts ...grpc.CallOption) (*SandboxTemplateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SandboxTemplateResponse)
+	err := c.cc.Invoke(ctx, OpenShell_GetSandboxTemplate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) ListSandboxTemplates(ctx context.Context, in *ListSandboxTemplatesRequest, opts ...grpc.CallOption) (*ListSandboxTemplatesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListSandboxTemplatesResponse)
+	err := c.cc.Invoke(ctx, OpenShell_ListSandboxTemplates_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) DeleteSandboxTemplate(ctx context.Context, in *DeleteSandboxTemplateRequest, opts ...grpc.CallOption) (*DeleteSandboxTemplateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteSandboxTemplateResponse)
+	err := c.cc.Invoke(ctx, OpenShell_DeleteSandboxTemplate_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -793,6 +847,16 @@ func (c *openShellClient) ReportMainProcessExit(ctx context.Context, in *ReportM
 	return out, nil
 }
 
+func (c *openShellClient) FinalizeMainProcessExit(ctx context.Context, in *FinalizeMainProcessExitRequest, opts ...grpc.CallOption) (*FinalizeMainProcessExitResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FinalizeMainProcessExitResponse)
+	err := c.cc.Invoke(ctx, OpenShell_FinalizeMainProcessExit_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *openShellClient) RelayStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[RelayFrame, RelayFrame], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[5], OpenShell_RelayStream_FullMethodName, cOpts...)
@@ -1030,6 +1094,14 @@ type OpenShellServer interface {
 	GetSandbox(context.Context, *GetSandboxRequest) (*SandboxResponse, error)
 	// List sandboxes.
 	ListSandboxes(context.Context, *ListSandboxesRequest) (*ListSandboxesResponse, error)
+	// Create a reusable sandbox workload template.
+	CreateSandboxTemplate(context.Context, *CreateSandboxTemplateRequest) (*SandboxTemplateResponse, error)
+	// Fetch a reusable sandbox workload template by name.
+	GetSandboxTemplate(context.Context, *GetSandboxTemplateRequest) (*SandboxTemplateResponse, error)
+	// List reusable sandbox workload templates.
+	ListSandboxTemplates(context.Context, *ListSandboxTemplatesRequest) (*ListSandboxTemplatesResponse, error)
+	// Delete a reusable sandbox workload template by name.
+	DeleteSandboxTemplate(context.Context, *DeleteSandboxTemplateRequest) (*DeleteSandboxTemplateResponse, error)
 	// List provider records attached to a sandbox.
 	ListSandboxProviders(context.Context, *ListSandboxProvidersRequest) (*ListSandboxProvidersResponse, error)
 	// Attach a provider record to an existing sandbox.
@@ -1094,9 +1166,8 @@ type OpenShellServer interface {
 	DeleteProviderProfile(context.Context, *DeleteProviderProfileRequest) (*DeleteProviderProfileResponse, error)
 	// Get sandbox settings by id (called by sandbox entrypoint and poll loop).
 	GetSandboxConfig(context.Context, *sandboxv1.GetSandboxConfigRequest) (*sandboxv1.GetSandboxConfigResponse, error)
-	// Get gateway-global settings (read-only feature flags; any authenticated
-	// user may read these so the CLI and TUI can discover capabilities like
-	// providers_v2_enabled without requiring Platform Admin).
+	// Get gateway-global settings (read-only runtime configuration; any
+	// authenticated user may read these without requiring Platform Admin).
 	//
 	// Scope-only (no role): scopes are granted by the IdP at token issuance,
 	// orthogonal to workspace membership. Deployments that enable scope
@@ -1130,6 +1201,8 @@ type OpenShellServer interface {
 	ConnectSupervisor(grpc.BidiStreamingServer[SupervisorMessage, GatewayMessage]) error
 	// Persist the canonical main process result before the supervisor exits.
 	ReportMainProcessExit(context.Context, *ReportMainProcessExitRequest) (*ReportMainProcessExitResponse, error)
+	// Confirm that foreground terminal delivery completed naturally.
+	FinalizeMainProcessExit(context.Context, *FinalizeMainProcessExitRequest) (*FinalizeMainProcessExitResponse, error)
 	// Raw byte relay between supervisor and gateway.
 	//
 	// The supervisor initiates this call after receiving a RelayOpen message
@@ -1221,6 +1294,18 @@ func (UnimplementedOpenShellServer) GetSandbox(context.Context, *GetSandboxReque
 }
 func (UnimplementedOpenShellServer) ListSandboxes(context.Context, *ListSandboxesRequest) (*ListSandboxesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListSandboxes not implemented")
+}
+func (UnimplementedOpenShellServer) CreateSandboxTemplate(context.Context, *CreateSandboxTemplateRequest) (*SandboxTemplateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateSandboxTemplate not implemented")
+}
+func (UnimplementedOpenShellServer) GetSandboxTemplate(context.Context, *GetSandboxTemplateRequest) (*SandboxTemplateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSandboxTemplate not implemented")
+}
+func (UnimplementedOpenShellServer) ListSandboxTemplates(context.Context, *ListSandboxTemplatesRequest) (*ListSandboxTemplatesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListSandboxTemplates not implemented")
+}
+func (UnimplementedOpenShellServer) DeleteSandboxTemplate(context.Context, *DeleteSandboxTemplateRequest) (*DeleteSandboxTemplateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteSandboxTemplate not implemented")
 }
 func (UnimplementedOpenShellServer) ListSandboxProviders(context.Context, *ListSandboxProvidersRequest) (*ListSandboxProvidersResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListSandboxProviders not implemented")
@@ -1347,6 +1432,9 @@ func (UnimplementedOpenShellServer) ConnectSupervisor(grpc.BidiStreamingServer[S
 }
 func (UnimplementedOpenShellServer) ReportMainProcessExit(context.Context, *ReportMainProcessExitRequest) (*ReportMainProcessExitResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReportMainProcessExit not implemented")
+}
+func (UnimplementedOpenShellServer) FinalizeMainProcessExit(context.Context, *FinalizeMainProcessExitRequest) (*FinalizeMainProcessExitResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method FinalizeMainProcessExit not implemented")
 }
 func (UnimplementedOpenShellServer) RelayStream(grpc.BidiStreamingServer[RelayFrame, RelayFrame]) error {
 	return status.Error(codes.Unimplemented, "method RelayStream not implemented")
@@ -1533,6 +1621,78 @@ func _OpenShell_ListSandboxes_Handler(srv interface{}, ctx context.Context, dec 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(OpenShellServer).ListSandboxes(ctx, req.(*ListSandboxesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_CreateSandboxTemplate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateSandboxTemplateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).CreateSandboxTemplate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_CreateSandboxTemplate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).CreateSandboxTemplate(ctx, req.(*CreateSandboxTemplateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_GetSandboxTemplate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSandboxTemplateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).GetSandboxTemplate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_GetSandboxTemplate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).GetSandboxTemplate(ctx, req.(*GetSandboxTemplateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_ListSandboxTemplates_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListSandboxTemplatesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).ListSandboxTemplates(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_ListSandboxTemplates_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).ListSandboxTemplates(ctx, req.(*ListSandboxTemplatesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_DeleteSandboxTemplate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteSandboxTemplateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).DeleteSandboxTemplate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_DeleteSandboxTemplate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).DeleteSandboxTemplate(ctx, req.(*DeleteSandboxTemplateRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2242,6 +2402,24 @@ func _OpenShell_ReportMainProcessExit_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _OpenShell_FinalizeMainProcessExit_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FinalizeMainProcessExitRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).FinalizeMainProcessExit(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_FinalizeMainProcessExit_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).FinalizeMainProcessExit(ctx, req.(*FinalizeMainProcessExitRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _OpenShell_RelayStream_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(OpenShellServer).RelayStream(&grpc.GenericServerStream[RelayFrame, RelayFrame]{ServerStream: stream})
 }
@@ -2616,6 +2794,22 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _OpenShell_ListSandboxes_Handler,
 		},
 		{
+			MethodName: "CreateSandboxTemplate",
+			Handler:    _OpenShell_CreateSandboxTemplate_Handler,
+		},
+		{
+			MethodName: "GetSandboxTemplate",
+			Handler:    _OpenShell_GetSandboxTemplate_Handler,
+		},
+		{
+			MethodName: "ListSandboxTemplates",
+			Handler:    _OpenShell_ListSandboxTemplates_Handler,
+		},
+		{
+			MethodName: "DeleteSandboxTemplate",
+			Handler:    _OpenShell_DeleteSandboxTemplate_Handler,
+		},
+		{
 			MethodName: "ListSandboxProviders",
 			Handler:    _OpenShell_ListSandboxProviders_Handler,
 		},
@@ -2762,6 +2956,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReportMainProcessExit",
 			Handler:    _OpenShell_ReportMainProcessExit_Handler,
+		},
+		{
+			MethodName: "FinalizeMainProcessExit",
+			Handler:    _OpenShell_FinalizeMainProcessExit_Handler,
 		},
 		{
 			MethodName: "SubmitPolicyAnalysis",

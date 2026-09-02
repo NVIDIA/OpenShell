@@ -47,16 +47,20 @@
         testGuestPkgs = import nixpkgs-test-guest { inherit system; };
         commonDevShellPackages = with pkgs; [
           actionlint
+          cargo-auditable
           cargo-deny
           cargo-nextest
           # Assemble Debian artifacts on macOS and Linux.
           dpkg
+          git
           # Required to find packages.
           pkg-config
           # Coverage.
           lcov
+          syft
           uv
           zizmor
+          zstd
         ];
         treefmtEval = treefmt-nix.lib.evalModule pkgs {
           projectRootFile = "flake.nix";
@@ -65,6 +69,7 @@
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         z3-static = pkgs.callPackage ./nix/pkgs/z3-static.nix { };
         aws-lc-static = pkgs.callPackage ./nix/pkgs/aws-lc-static.nix { };
+        vmRuntime = pkgs.callPackage ./nix/pkgs/vm-runtime.nix { };
         testGuest = import ./nix/test-guest {
           inherit pkgs;
           qemuPkgs = testGuestPkgs;
@@ -74,6 +79,8 @@
       {
         apps.test-guest = testGuest.app;
         apps.test-guest-cache = testGuest.cacheApp;
+
+        packages.vm-runtime = vmRuntime;
 
         devShells = {
           default =
