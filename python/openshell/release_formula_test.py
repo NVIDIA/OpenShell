@@ -202,3 +202,15 @@ def test_deb_user_service_uses_gateway_defaults_without_config_helper() -> None:
     assert "ExecStart=/usr/bin/openshell-gateway" in unit
     assert "--config" not in unit
     assert "--db-url" not in unit
+
+
+def test_rpm_migration_exec_start_pre_argument_order() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    spec = (repo_root / "openshell.spec").read_text(encoding="utf-8")
+
+    assert (
+        "ExecStartPre=%{_libexecdir}/%{name}-gateway-migrate-config "
+        "%%E/openshell/gateway.toml "
+        "/usr/share/openshell-gateway/gateway.toml.default "
+        "/usr/share/openshell-gateway/gateway.toml.default.v1"
+    ) in spec

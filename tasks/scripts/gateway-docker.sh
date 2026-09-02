@@ -24,6 +24,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=tasks/scripts/gateway-toml.sh
+source "${ROOT}/tasks/scripts/gateway-toml.sh"
 # shellcheck source=tasks/scripts/gateway-pull-policy.sh
 source "${ROOT}/tasks/scripts/gateway-pull-policy.sh"
 PORT="${OPENSHELL_SERVER_PORT:-18080}"
@@ -52,18 +54,6 @@ linux_target_triple() {
       exit 2
       ;;
   esac
-}
-
-# Escape a value for a TOML basic string before copying an operator-provided
-# proxy path or URL into the generated local configuration.
-toml_escape() {
-  local s=$1
-  s=${s//\\/\\\\}
-  s=${s//\"/\\\"}
-  s=${s//$'\n'/\\n}
-  s=${s//$'\r'/\\r}
-  s=${s//$'\t'/\\t}
-  printf '%s' "${s}"
 }
 
 port_is_in_use() {

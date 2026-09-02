@@ -21,6 +21,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=tasks/scripts/gateway-toml.sh
+source "${ROOT}/tasks/scripts/gateway-toml.sh"
 # shellcheck source=tasks/scripts/gateway-pull-policy.sh
 source "${ROOT}/tasks/scripts/gateway-pull-policy.sh"
 PORT="${OPENSHELL_SERVER_PORT:-18080}"
@@ -90,19 +92,6 @@ ensure_podman_supervisor_image() {
     echo "ERROR: expected supervisor image '${supervisor_image}' after build" >&2
     exit 1
   fi
-}
-
-# Escape a value for embedding in a double-quoted TOML basic string, so
-# quotes, backslashes, or control characters in an environment value cannot
-# corrupt gateway.toml or inject extra configuration keys.
-toml_escape() {
-  local s=$1
-  s=${s//\\/\\\\}
-  s=${s//\"/\\\"}
-  s=${s//$'\n'/\\n}
-  s=${s//$'\r'/\\r}
-  s=${s//$'\t'/\\t}
-  printf '%s' "${s}"
 }
 
 port_is_in_use() {
