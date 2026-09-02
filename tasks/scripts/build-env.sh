@@ -24,7 +24,7 @@ ensure_build_nofile_limit() {
     local target=""
 
     [ "$(uname -s)" = "Darwin" ] || return 0
-    current="$(ulimit -n 2>/dev/null || echo "")"
+    current="$(ulimit -Sn 2>/dev/null || echo "")"
     case "${current}" in
         ''|*[!0-9]*)
             return 0
@@ -49,11 +49,11 @@ ensure_build_nofile_limit() {
             ;;
     esac
 
-    if [ "${target}" -gt "${current}" ] && ulimit -n "${target}" 2>/dev/null; then
-        echo "==> Raised open file limit for host Cargo build: ${current} -> $(ulimit -n)"
+    if [ "${target}" -gt "${current}" ] && ulimit -Sn "${target}" 2>/dev/null; then
+        echo "==> Raised open file limit for host Cargo build: ${current} -> $(ulimit -Sn)"
     fi
 
-    current="$(ulimit -n 2>/dev/null || echo "${current}")"
+    current="$(ulimit -Sn 2>/dev/null || echo "${current}")"
     case "${current}" in
         ''|*[!0-9]*)
             return 0
@@ -66,7 +66,7 @@ ensure_build_nofile_limit() {
 
     if [ "${current}" -lt "${minimum}" ]; then
         echo "ERROR: Open file limit (${current}) is too low for host Cargo builds on macOS." >&2
-        echo "       Run: ulimit -n ${desired}" >&2
+        echo "       Run: ulimit -Sn ${desired}" >&2
         echo "       Then re-run this script." >&2
         exit 1
     fi
