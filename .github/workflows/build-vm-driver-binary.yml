@@ -1,0 +1,87 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build VM Driver Binary
+
+on:
+  workflow_call:
+    inputs:
+      arch:
+        required: true
+        type: string
+      triple:
+        required: true
+        type: string
+      runner:
+        required: true
+        type: string
+      dev-shell:
+        required: true
+        type: string
+      interpreter:
+        required: false
+        type: string
+        default: ""
+      cargo-version:
+        required: true
+        type: string
+      image-tag:
+        required: false
+        type: string
+        default: ""
+      checkout-ref:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      CACHIX_AUTH_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: openshell-driver-vm (${{ inputs.triple }})
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: nix develop ${{ inputs['dev-shell'] }} -c bash -euo pipefail {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Download openshell-sandbox
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-sandbox-${{ inputs.arch }}-unknown-linux-musl
+          path: sandbox
+
+      - name: Build VM runtime
+        run: nix build .#vm-runtime
+
+      - name: Assemble compressed VM runtime
+        run: |
+          compressed_dir="${RUNNER_TEMP}/vm-runtime-compressed"
+          install -d "$compressed_dir"
+          cp result/compressed/*.zst "$compressed_dir/"
+          zstd -19 -T1 sandbox/openshell-sandbox -o "$compressed_dir/openshell-sandbox.zst"
+
+      - name: Build openshell-driver-vm
+        uses: ./.github/actions/build-rust-binary
+        env:
+          OPENSHELL_VM_RUNTIME_COMPRESSED_DIR: ${{ runner.temp }}/vm-runtime-compressed
+        with:
+          package: openshell-driver-vm
+          binary: openshell-driver-vm
+          triple: ${{ inputs.triple }}
+          dev-shell: ${{ inputs['dev-shell'] }}
+          cargo-version: ${{ inputs['cargo-version'] }}
+          image-tag: ${{ inputs['image-tag'] }}
+          interpreter: ${{ inputs.interpreter }}
