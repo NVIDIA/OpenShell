@@ -48,7 +48,7 @@ RUN mkdir -p /tmp/z3-src \
     && if [ -n "$VER" ]; then export OPENSHELL_GIT_VERSION="$VER"; fi \
     && Z3_SYS_BUNDLED_DIR_OVERRIDE=/tmp/z3-src \
     cargo build --release \
-        --package openshell-server \
+        --package openshell-gateway \
         --features bundled-z3
 
 # ---------------------------------------------------------------------------
