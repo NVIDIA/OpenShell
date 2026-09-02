@@ -189,7 +189,7 @@ A middleware result can return ordered header mutations before OpenShell injects
 
 A `remove` mutation removes every value for a case-insensitive header name. OpenShell applies each successful stage's mutations before invoking the next middleware, so later stages observe the accumulated header state.
 
-Header writes must use the `x-openshell-middleware-` prefix. Removes may target other middleware-visible request headers. Protected credential, routing, framing, and hop-by-hop headers are always rejected. Header values must not contain control characters.
+Writes and removals may target middleware-visible end-to-end request headers. Protected credential, routing, framing, and hop-by-hop headers are always rejected. Header values must not contain control characters or OpenShell credential placeholder syntax. Middleware runs before credential injection, but it cannot introduce a value that the later injection step would resolve.
 
 OpenShell validates and applies each stage's mutations atomically. An invalid operation discards every mutation from that stage and follows its `on_error` behavior. Built-in failures can name the offending header. Operator-run failures use a platform-owned error code so request-derived header text cannot reach logs or denied responses.
 

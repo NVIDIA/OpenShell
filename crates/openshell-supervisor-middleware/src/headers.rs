@@ -3,7 +3,10 @@
 
 //! Validation and logical application of HTTP middleware header mutations.
 
-use openshell_core::proto::{ExistingHeaderAction, HeaderMutation, HttpHeader, header_mutation};
+use openshell_core::{
+    proto::{ExistingHeaderAction, HeaderMutation, HttpHeader, header_mutation},
+    secrets::header_value_contains_reserved_credential_marker,
+};
 
 pub const MAX_HEADER_MUTATIONS: usize = 64;
 pub const MAX_HEADER_MUTATION_BYTES: usize = 32 * 1024;
@@ -22,6 +25,7 @@ pub enum HeaderMutationError {
     Protected { name: String },
     HopByHop { name: String },
     UnsafeValue { name: String },
+    CredentialPlaceholder { name: String },
     TooLarge,
     InvalidExistingAction,
     MissingExistingAction { name: String },
@@ -38,6 +42,7 @@ impl HeaderMutationError {
             Self::Protected { .. } => "header_mutation_protected_header",
             Self::HopByHop { .. } => "header_mutation_hop_by_hop_header",
             Self::UnsafeValue { .. } => "header_mutation_unsafe_value",
+            Self::CredentialPlaceholder { .. } => "header_mutation_credential_placeholder",
             Self::TooLarge => "header_mutation_bytes_over_capacity",
             Self::InvalidExistingAction => "header_mutation_invalid_existing_action",
             Self::MissingExistingAction { .. } => "header_mutation_missing_existing_action",
@@ -78,6 +83,10 @@ impl std::fmt::Display for HeaderMutationError {
                     "middleware cannot write header '{name}' with an unsafe value"
                 )
             }
+            Self::CredentialPlaceholder { name } => write!(
+                formatter,
+                "middleware cannot write credential placeholder in header '{name}'"
+            ),
             Self::TooLarge => write!(
                 formatter,
                 "middleware header mutations exceed {MAX_HEADER_MUTATION_BYTES} bytes"
@@ -131,6 +140,11 @@ pub fn apply(
                 }
                 if !is_safe_value(&write.value) {
                     return Err(HeaderMutationError::UnsafeValue {
+                        name: write.name.clone(),
+                    });
+                }
+                if header_value_contains_reserved_credential_marker(&write.value) {
+                    return Err(HeaderMutationError::CredentialPlaceholder {
                         name: write.name.clone(),
                     });
                 }
@@ -380,6 +394,57 @@ mod tests {
         )
         .expect_err("CRLF value");
         assert!(error.to_string().contains("unsafe value"));
+    }
+
+    #[test]
+    fn credential_placeholder_header_values_are_rejected() {
+        for value in [
+            "openshell:resolve:env:API_KEY",
+            "Bearer openshell:resolve:env:API_KEY",
+            "provider-OPENSHELL-RESOLVE-ENV-API_KEY",
+            "openshell%3Aresolve%3Aenv%3AAPI_KEY",
+            "Basic dXNlcjpvcGVuc2hlbGw6cmVzb2x2ZTplbnY6QVBJX0tFWQ==",
+        ] {
+            for authority in [HeaderAuthority::Request, HeaderAuthority::Response] {
+                let error = apply(
+                    authority,
+                    &[],
+                    &[],
+                    &[write("x-api-key", value, ExistingHeaderAction::Overwrite)],
+                )
+                .expect_err("credential placeholder write");
+                assert_eq!(
+                    error,
+                    HeaderMutationError::CredentialPlaceholder {
+                        name: "x-api-key".to_string()
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn existing_credential_placeholder_header_value_is_preserved() {
+        let existing = [header("x-api-key", "openshell:resolve:env:API_KEY")];
+        let updated = apply(
+            HeaderAuthority::Request,
+            &existing,
+            &[],
+            &[write(
+                "cache-control",
+                "no-store",
+                ExistingHeaderAction::Overwrite,
+            )],
+        )
+        .expect("ordinary mutation beside an existing placeholder");
+
+        assert_eq!(
+            updated,
+            vec![
+                header("x-api-key", "openshell:resolve:env:API_KEY"),
+                header("cache-control", "no-store"),
+            ]
+        );
     }
 
     #[test]

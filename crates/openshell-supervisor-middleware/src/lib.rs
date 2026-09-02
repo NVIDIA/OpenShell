@@ -4237,6 +4237,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credential_placeholder_header_mutation_follows_on_error() {
+        let placeholder = "openshell:resolve:env:API_KEY";
+        let service = Arc::new(ScriptedService {
+            manifest_name: "test/middleware".into(),
+            max_body_bytes: 4096,
+            result: openshell_core::proto::HttpRequestResult {
+                header_mutations: vec![write_header(
+                    "x-api-key",
+                    placeholder,
+                    ExistingHeaderAction::Overwrite,
+                )],
+                ..allow_result()
+            },
+        });
+        let registry = registry_with_external(service, external_registration(4096)).await;
+        let runner = ChainRunner::from_registry(registry);
+
+        for (on_error, allowed) in [(OnError::FailClosed, false), (OnError::FailOpen, true)] {
+            let outcome = runner
+                .evaluate(
+                    &[ChainEntry {
+                        name: "guard".into(),
+                        implementation: "local-guard-service".into(),
+                        order: 0,
+                        config: prost_types::Struct::default(),
+                        on_error,
+                    }],
+                    input("hello"),
+                )
+                .await
+                .expect("evaluate credential placeholder mutation");
+
+            assert_eq!(outcome.allowed, allowed);
+            assert!(outcome.header_mutations.is_empty());
+            assert_eq!(outcome.applied.len(), 1);
+            assert!(outcome.applied[0].failed);
+            assert!(!format!("{outcome:?}").contains(placeholder));
+            if !allowed {
+                assert_eq!(
+                    outcome.reason,
+                    "middleware_failed: header_mutation_credential_placeholder"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn connection_nominated_write_and_remove_are_rejected_after_filtering() {
         let mutations = [
             write_header(
