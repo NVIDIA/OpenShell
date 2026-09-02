@@ -27,10 +27,17 @@ let
 
   configurations = {
     docker = ./configuration/docker.yml;
-    podman = ./configuration/podman.yml;
+    podman-rootless = ./configuration/podman-rootless.yml;
     selinux = ./configuration/selinux.yml;
     snapd = ./configuration/snapd.yml;
   };
+
+  configurationTasks = [
+    "podman-common.yml"
+    "podman-rootless/fedora.yml"
+    "podman-rootless/shared.yml"
+    "podman-rootless/ubuntu.yml"
+  ];
 
   mkDistroProfile =
     name: distro:
@@ -53,7 +60,11 @@ let
   );
 
   configurationCatalog = pkgs.linkFarm "openshell-test-guest-configurations" (
-    pkgs.lib.mapAttrsToList (name: path: { inherit name path; }) configurations
+    (pkgs.lib.mapAttrsToList (name: path: { inherit name path; }) configurations)
+    ++ (map (name: {
+      name = "tasks/${name}";
+      path = ./configuration/tasks/${name};
+    }) configurationTasks)
   );
 
   runtimeInputs = [

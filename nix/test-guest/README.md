@@ -40,7 +40,13 @@ nix/test-guest/
 │   └── rocky.nix
 └── configuration/
     ├── docker.yml
-    ├── podman.yml
+    ├── podman-rootless.yml
+    ├── tasks/
+    │   ├── podman-common.yml
+    │   └── podman-rootless/
+    │       ├── fedora.yml
+    │       ├── shared.yml
+    │       └── ubuntu.yml
     └── selinux.yml
 ```
 
@@ -57,23 +63,26 @@ The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-gues
 
 ## Supported configurations
 
-| Distro | Docker | Podman | SELinux | Package format |
+| Distro | Docker | Rootless Podman | SELinux | Package format |
 | --- | --- | --- | --- | --- |
-| Ubuntu 24.04 | Yes | Yes | No | `.deb` |
+| Ubuntu 24.04 | Yes | No | No | `.deb` |
 | Ubuntu 26.04 | Yes | Yes | No | `.deb` |
-| CentOS Stream 10 | No | Yes | Yes | `.rpm` |
+| CentOS Stream 10 | No | No | Yes | `.rpm` |
 | Fedora 44 | No | Yes | Yes | `.rpm` |
-| Rocky Linux 9 | Yes | Yes | Yes | `.rpm` |
+| Rocky Linux 9 | Yes | No | Yes | `.rpm` |
 
 The `snapd` configuration is available for Ubuntu and prepares snapd for
 local Snap lifecycle experiments. It does not install Docker, because the Snap
 gateway reproduction uses the Docker **Snap** and its `docker:docker-daemon`
 interface rather than the host-package Docker configuration.
 
-The Ubuntu 24.04 Podman configuration is available for runtime and packaging
-checks, but its Podman 4 release does not provide the `pasta` rootless network
-helper required by OpenShell sandbox callbacks. OpenShell Podman E2E runs use
-the Fedora guest, which provides Podman 5 and `pasta`.
+`podman-rootless` configures the explicit rootless Podman guest setup used by
+OpenShell tests. It supports Fedora and Ubuntu 26.04 or later. Ubuntu adds the
+AppArmor rule that permits `pasta` to receive Podman stop signals. Fedora
+installs the subordinate-ID utilities and rootless storage and network helpers.
+Both configurations verify rootless mode and the `pasta` network helper
+required by OpenShell sandbox callbacks. Ubuntu 24.04 ships Podman 4, which
+does not provide that helper.
 
 List the available distros and configurations:
 
@@ -99,8 +108,8 @@ Other combinations use the same interface:
 
 ```shell
 nix run .#test-guest -- --distro rocky --with docker
-nix run .#test-guest -- --distro centos --with podman
-nix run .#test-guest -- --distro fedora --with podman
+nix run .#test-guest -- --distro ubuntu-26-04 --with podman-rootless
+nix run .#test-guest -- --distro fedora --with podman-rootless
 ```
 
 Configurations are repeatable:
@@ -109,7 +118,7 @@ Configurations are repeatable:
 nix run .#test-guest -- \
   --distro ubuntu-24-04 \
   --with docker \
-  --with podman
+  --with podman-rootless
 ```
 
 Ensure SELinux is enforcing on CentOS, Fedora, or Rocky:
@@ -187,7 +196,7 @@ Cache command options:
 
 ```text
 --distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
---with NAME         Apply docker, podman, or selinux; repeatable
+--with NAME         Apply docker, podman-rootless, selinux, or snapd; repeatable
 --repository REF    OCI repository without a tag
 --digest DIGEST     Trusted OCI manifest digest required for pulls
 --cache-dir PATH    Override the local prepared-disk cache directory
@@ -262,7 +271,7 @@ The destination must be an absolute guest path. Copied files are installed with 
 
 ```text
 --distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
---with NAME         Apply docker, podman, or selinux; repeatable
+--with NAME         Apply docker, podman-rootless, selinux, or snapd; repeatable
 --install PATH      Install a .deb or .rpm package; repeatable
 --copy SRC:DEST     Copy a regular file into the guest, preserving its host mode;
                     repeatable

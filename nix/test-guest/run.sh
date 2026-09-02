@@ -13,7 +13,7 @@ Usage:
 
 Options:
   --distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
-  --with NAME         Apply a configuration; repeatable (docker, podman, selinux, snapd)
+  --with NAME         Apply a configuration; repeatable (docker, podman-rootless, selinux, snapd)
   --install PATH      Install a .deb or .rpm package; repeatable
   --copy SRC:DEST     Copy a regular file to an absolute guest path, preserving
                       its host mode; repeatable
@@ -142,6 +142,7 @@ if [ "${list}" -eq 1 ]; then
 	done
 	echo "Configurations:"
 	for entry in "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}"/*; do
+		[ -f "${entry}" ] || continue
 		printf '  %s\n' "${entry##*/}"
 	done
 	exit 0
@@ -161,9 +162,9 @@ fi
 # shellcheck disable=SC1090
 . "${OPENSHELL_TEST_GUEST_DISTROS}/${distro}"
 
-for item in "${configurations[@]}"; do
-	if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
-		[ ! -r "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}/${item}" ]; then
+	for item in "${configurations[@]}"; do
+		if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
+		[ ! -f "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}/${item}" ]; then
 		echo "unknown configuration: ${item:-<empty>}" >&2
 		exit 2
 	fi
