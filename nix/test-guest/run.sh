@@ -48,12 +48,13 @@ preserved_file_mode() {
 	local source_path=$1
 	local source_mode
 
-	if [ "$(uname -s)" = Darwin ]; then
-		if ! source_mode=$(stat -f '%Lp' "${source_path}"); then
-			echo "could not determine mode for --copy source: ${source_path}" >&2
-			return 1
-		fi
-	elif ! source_mode=$(stat -c '%a' "${source_path}"); then
+	# Nix supplies GNU coreutils on macOS, so choose the supported stat format
+	# by probing rather than relying on the host kernel name.
+	if source_mode=$(stat -c '%a' "${source_path}" 2>/dev/null); then
+		:
+	elif source_mode=$(stat -f '%Lp' "${source_path}" 2>/dev/null); then
+		:
+	else
 		echo "could not determine mode for --copy source: ${source_path}" >&2
 		return 1
 	fi
