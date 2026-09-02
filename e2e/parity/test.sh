@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Deterministic contract tests for e2e/parity/run.sh. No container runtime is
+# invoked; the Podman wrapper and all three artifacts are tiny local fakes.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/openshell-parity-test.XXXXXX")"
+trap 'rm -rf "${WORKDIR}"' EXIT
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+assert_contains() { grep -F -- "$2" "$1" >/dev/null || fail "expected $1 to contain: $2"; }
+assert_not_contains() { ! grep -F -- "$2" "$1" >/dev/null || fail "expected $1 not to contain: $2"; }
+assert_status() { [ "$1" -eq "$2" ] || fail "expected status $2, got $1"; }
+
+# Schema generator behavior is separately deterministic and does not need a
+# gateway, certificates, or Podman.
+# shellcheck source=e2e/support/gateway-common.sh
+source "${ROOT}/e2e/support/gateway-common.sh"
+# shellcheck source=e2e/support/podman-gateway-config.sh
+source "${ROOT}/e2e/support/podman-gateway-config.sh"
+mkdir -p "${WORKDIR}/pki/client" "${WORKDIR}/jwt"
+e2e_write_podman_gateway_config "${WORKDIR}/v1.toml" 1 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 0 socket network 18181 image:test 15 supervisor:test '' '' 0 ''
+e2e_write_podman_gateway_config "${WORKDIR}/v2.toml" 2 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 0 socket network 18181 image:test 15 supervisor:test '' '' 0 ''
+assert_contains "${WORKDIR}/v1.toml" 'version = 1'
+assert_contains "${WORKDIR}/v1.toml" 'compute_drivers = ["podman"]'
+assert_contains "${WORKDIR}/v1.toml" 'image_pull_policy = "missing"'
+assert_contains "${WORKDIR}/v1.toml" 'health_check_interval_secs = 0'
+assert_contains "${WORKDIR}/v1.toml" 'guest_tls_ca = '
+assert_contains "${WORKDIR}/v2.toml" 'version = 2'
+assert_contains "${WORKDIR}/v2.toml" 'compute_driver = "podman"'
+assert_contains "${WORKDIR}/v2.toml" 'image_pull_policy = "if_not_present"'
+assert_not_contains "${WORKDIR}/v2.toml" 'health_check_interval_secs = 0'
+# V2 guest TLS is emitted before its driver table; V1 is driver-local.
+v1_driver_line="$(grep -n '^\[openshell.drivers.podman\]' "${WORKDIR}/v1.toml" | cut -d: -f1)"
+v1_tls_line="$(grep -n '^guest_tls_ca' "${WORKDIR}/v1.toml" | cut -d: -f1)"
+v2_driver_line="$(grep -n '^\[openshell.drivers.podman\]' "${WORKDIR}/v2.toml" | cut -d: -f1)"
+v2_tls_line="$(grep -n '^guest_tls_ca' "${WORKDIR}/v2.toml" | cut -d: -f1)"
+[ "${v1_tls_line}" -gt "${v1_driver_line}" ] || fail 'v1 TLS must be driver-local'
+[ "${v2_tls_line}" -lt "${v2_driver_line}" ] || fail 'v2 TLS must be gateway-owned'
+if OPENSHELL_E2E_CONFIG_SCHEMA_VERSION=3 e2e_podman_config_schema_version >/dev/null 2>&1; then
+  fail 'invalid schema version unexpectedly accepted'
+fi
+set +e
+env -u OPENSHELL_GATEWAY_ENDPOINT \
+  OPENSHELL_E2E_CONFIG_SCHEMA_VERSION=3 \
+  bash "${ROOT}/e2e/with-podman-gateway.sh" true >"${WORKDIR}/wrapper-schema.out" 2>&1
+status=$?
+set -e
+assert_status "${status}" 2
+assert_contains "${WORKDIR}/wrapper-schema.out" 'must be 1 or 2'
+
+HEAD_SHA="$(git -C "${ROOT}" rev-parse HEAD)"
+cat >"${WORKDIR}/manifest.toml" <<EOF
+manifest_version = 1
+baseline_ref = "origin/main"
+baseline_commit = "${HEAD_SHA}"
+EOF
+mkdir -p "${WORKDIR}/bin"
+cat >"${WORKDIR}/bin/fake-wrapper" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s|%s|%s|%s|%s\n' "$OPENSHELL_PARITY_VARIANT" "$OPENSHELL_E2E_CONFIG_SCHEMA_VERSION" "$OPENSHELL_GATEWAY_BIN" "$OPENSHELL_BIN" "$OPENSHELL_CONFORMANCE_BIN" >>"$OPENSHELL_PARITY_TEST_CALLS"
+exec "$@"
+EOF
+cat >"${WORKDIR}/bin/fake-conformance" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${OPENSHELL_PARITY_FAIL_VARIANT:-}" = "${OPENSHELL_PARITY_VARIANT:-}" ] || [ "${OPENSHELL_PARITY_FAIL_VARIANT:-}" = both ]; then
+  exit 17
+fi
+printf '{"untrusted":"raw output is intentionally not normalized"}\n'
+EOF
+for artifact in baseline-gateway baseline-cli candidate-gateway candidate-cli; do
+  cat >"${WORKDIR}/bin/${artifact}" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+done
+chmod +x "${WORKDIR}/bin/"*
+
+run_harness() {
+  OPENSHELL_PARITY_CAPABILITY_MANIFEST="${WORKDIR}/manifest.toml" \
+  OPENSHELL_PARITY_BASELINE_WORKTREE="${ROOT}" \
+  OPENSHELL_PARITY_PODMAN_WRAPPER="${WORKDIR}/bin/fake-wrapper" \
+  OPENSHELL_PARITY_BASELINE_GATEWAY_BIN="${WORKDIR}/bin/baseline-gateway" \
+  OPENSHELL_PARITY_BASELINE_CLI_BIN="${WORKDIR}/bin/baseline-cli" \
+  OPENSHELL_PARITY_BASELINE_CONFORMANCE_BIN="${WORKDIR}/bin/fake-conformance" \
+  OPENSHELL_PARITY_CANDIDATE_GATEWAY_BIN="${WORKDIR}/bin/candidate-gateway" \
+  OPENSHELL_PARITY_CANDIDATE_CLI_BIN="${WORKDIR}/bin/candidate-cli" \
+  OPENSHELL_PARITY_CANDIDATE_CONFORMANCE_BIN="${WORKDIR}/bin/fake-conformance" \
+  OPENSHELL_PARITY_RESULTS_DIR="${WORKDIR}/results" \
+  OPENSHELL_PARITY_TEST_CALLS="${WORKDIR}/calls" \
+  bash "${ROOT}/e2e/parity/run.sh" --driver podman
+}
+
+run_harness
+assert_contains "${WORKDIR}/calls" "baseline|1|${WORKDIR}/bin/baseline-gateway|${WORKDIR}/bin/baseline-cli|${WORKDIR}/bin/fake-conformance"
+assert_contains "${WORKDIR}/calls" "candidate|2|${WORKDIR}/bin/candidate-gateway|${WORKDIR}/bin/candidate-cli|${WORKDIR}/bin/fake-conformance"
+[ "$(sed -n '1s/|.*//p' "${WORKDIR}/calls")" = baseline ] || fail 'baseline was not invoked first'
+[ "$(sed -n '2s/|.*//p' "${WORKDIR}/calls")" = candidate ] || fail 'candidate was not invoked second'
+assert_contains "${WORKDIR}/results/baseline.json" "\"source_sha\":\"${HEAD_SHA}\""
+assert_contains "${WORKDIR}/results/baseline.json" '"schema_version":1'
+assert_contains "${WORKDIR}/results/candidate.json" '"schema_version":2'
+assert_contains "${WORKDIR}/results/candidate.json" "\"source_sha\":\"${HEAD_SHA}\""
+assert_contains "${WORKDIR}/results/candidate.json" '"success":true'
+assert_contains "${WORKDIR}/results/comparison.json" '"parity":true'
+assert_not_contains "${WORKDIR}/results/baseline.json" 'raw output'
+assert_contains "${WORKDIR}/results/baseline.log" 'raw output is intentionally not normalized'
+
+set +e
+OPENSHELL_PARITY_FAIL_VARIANT=both run_harness >"${WORKDIR}/failure.out" 2>&1
+status=$?
+set -e
+assert_status "${status}" 1
+assert_contains "${WORKDIR}/results/baseline.json" '"success":false'
+assert_contains "${WORKDIR}/results/candidate.json" '"success":false'
+assert_contains "${WORKDIR}/results/comparison.json" '"parity":false'
+[ "$(wc -l <"${WORKDIR}/calls")" -eq 4 ] || fail 'candidate did not run after baseline failure'
+
+set +e
+bash "${ROOT}/e2e/parity/run.sh" --driver docker >"${WORKDIR}/driver.out" 2>&1
+status=$?
+set -e
+assert_status "${status}" 2
+assert_contains "${WORKDIR}/driver.out" 'only --driver podman is supported'
+
+set +e
+bash "${ROOT}/e2e/parity/run.sh" --driver >"${WORKDIR}/option.out" 2>&1
+status=$?
+set -e
+assert_status "${status}" 2
+assert_contains "${WORKDIR}/option.out" '--driver requires a value'
+
+echo 'e2e parity deterministic tests passed.'

@@ -14,6 +14,7 @@ depends = [
   "test:build-env",
   "test:gateway-pull-policy",
   "test:gateway-config",
+  "test:e2e-parity",
   "test:packaging-assets",
   "test:codex-security-release-range",
   "test:docs-website",
