@@ -1,0 +1,398 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Inventory for the schema-v2 live capability-parity campaign. Every entry is a
+# test case contract, not a result. `status = "not_run"` deliberately means no
+# live assertion has been made. Keep the oracle observable and put the runtime
+# prerequisites in `required_environment`; this lets later waves select a lane
+# without rediscovering the migration's intended behavior.
+manifest_version = 1
+baseline_ref = "origin/main"
+baseline_schema_version = 1
+candidate_ref = "HEAD"
+candidate_schema_version = 2
+
+# Allowed lane names: deterministic, e2e-docker, e2e-podman, e2e-kubernetes,
+# e2e-vm, windows-mxc, extension-driver, auth-oidc, observability, packaging.
+# Allowed statuses: not_run, blocked, planned. A live pass is intentionally not
+# a status in this first-wave manifest.
+
+[[capabilities]]
+id = "configuration-source-precedence"
+topics = ["configuration_producers"]
+origin_main_access_paths = ["--config", "OPENSHELL_GATEWAY_CONFIG", "CLI > OPENSHELL_* > [openshell.gateway] > defaults"]
+schema_v2_access_paths = ["--config", "OPENSHELL_GATEWAY_CONFIG", "CLI > OPENSHELL_* > [openshell.gateway] > defaults"]
+behavioral_oracle = "A CLI or environment value wins over the corresponding file value; an unset value uses the file value."
+required_environment = "none; parse and startup-config construction only"
+test_lane = "deterministic"
+status = "not_run"
+
+[[capabilities]]
+id = "schema-version-and-strict-layout"
+topics = ["configuration_producers"]
+origin_main_access_paths = ["[openshell] version = 1", "[openshell.gateway] inherited driver defaults"]
+schema_v2_access_paths = ["[openshell] version = 2", "[openshell.gateway] gateway-only fields", "[openshell.drivers.<name>] driver-owned fields"]
+behavioral_oracle = "Missing, v1, future, unknown, misplaced, and non-table driver values fail before runtime construction."
+required_environment = "none; TOML parser only"
+test_lane = "deterministic"
+status = "not_run"
+
+[[capabilities]]
+id = "gateway-identity-and-logging"
+topics = ["configuration_producers", "observability"]
+origin_main_access_paths = ["--name / OPENSHELL_GATEWAY_NAME", "--log-level / OPENSHELL_LOG_LEVEL", "[openshell.gateway].name", "[openshell.gateway].log_level"]
+schema_v2_access_paths = ["[openshell.gateway].name", "[openshell.gateway].log_level", "same CLI and environment variables"]
+behavioral_oracle = "The configured name and log filter are retained after v2 file merge and identify emitted gateway telemetry."
+required_environment = "gateway process with captured logs"
+test_lane = "observability"
+status = "not_run"
+
+[[capabilities]]
+id = "primary-health-and-metrics-listeners"
+topics = ["listeners"]
+origin_main_access_paths = ["--bind-address / OPENSHELL_BIND_ADDRESS", "--port / OPENSHELL_SERVER_PORT", "--health-port / OPENSHELL_HEALTH_PORT", "--metrics-port / OPENSHELL_METRICS_PORT", "[openshell.gateway].{bind_address,health_bind_address,metrics_bind_address}"]
+schema_v2_access_paths = ["[openshell.gateway].bind_address", "[openshell.gateway].health_bind_address", "[openshell.gateway].metrics_bind_address", "same CLI and environment variables"]
+behavioral_oracle = "The primary multiplexed endpoint and optional health/metrics endpoints bind their configured addresses; a zero auxiliary port disables only that auxiliary listener."
+required_environment = "loopback TCP ports"
+test_lane = "e2e-docker"
+status = "not_run"
+
+[[capabilities]]
+id = "database-url-and-persistence-backends"
+topics = ["database"]
+origin_main_access_paths = ["--db-url / OPENSHELL_DB_URL", "[openshell.gateway].database_url (rejected)"]
+schema_v2_access_paths = ["--db-url / OPENSHELL_DB_URL only", "[openshell.gateway].database_url (rejected)"]
+behavioral_oracle = "A SQLite or Postgres URL supplied outside TOML opens the store; a URL embedded in TOML is rejected without exposing credentials."
+required_environment = "SQLite temporary directory; Postgres service for backend variant"
+test_lane = "deterministic"
+status = "not_run"
+
+[[capabilities]]
+id = "ssh-rate-limit-and-policy-posture"
+topics = ["listeners"]
+origin_main_access_paths = ["[openshell.gateway].ssh_session_ttl_secs", "[openshell.gateway].grpc_rate_limit_{requests,window_seconds}", "[openshell.gateway].policy_validation_failure_mode"]
+schema_v2_access_paths = ["same [openshell.gateway] fields"]
+behavioral_oracle = "SSH TTL, paired rate-limit behavior, and fail_closed versus retain_last_valid policy posture survive migration with their documented validation rules."
+required_environment = "gateway with a controllable clock and policy fixture"
+test_lane = "e2e-docker"
+status = "not_run"
+
+[[capabilities]]
+id = "sandbox-service-routing"
+topics = ["listeners"]
+origin_main_access_paths = ["--server-san / OPENSHELL_SERVER_SAN", "--enable-loopback-service-http / OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP", "[openshell.gateway].{server_sans,enable_loopback_service_http}"]
+schema_v2_access_paths = ["[openshell.gateway].server_sans", "[openshell.gateway].enable_loopback_service_http", "same CLI and environment variables"]
+behavioral_oracle = "Wildcard SAN routing and loopback-only plaintext sandbox-service HTTP remain available while gateway APIs stay unavailable on that plaintext route."
+required_environment = "TLS certificate with sandbox wildcard SAN and loopback HTTP client"
+test_lane = "e2e-docker"
+status = "not_run"
+
+[[capabilities]]
+id = "gateway-listener-tls-and-sni"
+topics = ["auth_tls_jwt", "listeners"]
+origin_main_access_paths = ["--tls-cert / OPENSHELL_TLS_CERT", "--tls-key / OPENSHELL_TLS_KEY", "--tls-client-ca / OPENSHELL_TLS_CLIENT_CA", "[openshell.gateway.tls]"]
+schema_v2_access_paths = ["[openshell.gateway.tls].{cert_path,key_path,client_ca_path,require_client_auth,external_cert_path,external_key_path,external_server_names}", "same CLI and environment variables for primary bundle"]
+behavioral_oracle = "The listener presents the primary or configured SNI certificate, validates client certificates when required, and rejects incomplete TLS bundles."
+required_environment = "test CA, primary and external certificates, TLS client"
+test_lane = "e2e-docker"
+status = "not_run"
+
+[[capabilities]]
+id = "plaintext-listener-mode"
+topics = ["auth_tls_jwt", "listeners"]
+origin_main_access_paths = ["--disable-tls / OPENSHELL_DISABLE_TLS", "[openshell.gateway].disable_tls"]
+schema_v2_access_paths = ["[openshell.gateway].disable_tls", "same CLI and environment variable"]
+behavioral_oracle = "An explicit plaintext listener starts without a listener TLS table and is usable behind a trusted TLS-terminating proxy."
+required_environment = "loopback HTTP client"
+test_lane = "e2e-docker"
+status = "not_run"
+
+[[capabilities]]
+id = "guest-callback-tls-ownership"
+topics = ["auth_tls_jwt", "docker", "podman", "vm"]
+origin_main_access_paths = ["[openshell.gateway].{guest_tls_ca,guest_tls_cert,guest_tls_key} inherited by local drivers", "driver-local guest_tls_* overrides"]
+schema_v2_access_paths = ["[openshell.gateway].{guest_tls_ca,guest_tls_cert,guest_tls_key} injected only into selected Docker, Podman, or VM driver", "driver tables reject guest_tls_*"]
+behavioral_oracle = "A TLS-enabled selected local driver receives one complete guest bundle; partial, misplaced, and plaintext-incompatible bundles fail closed."
+required_environment = "test CA and client certificate bundle"
+test_lane = "e2e-docker"
+status = "not_run"
+
+[[capabilities]]
+id = "oidc-bearer-authentication"
+topics = ["auth_tls_jwt"]
+origin_main_access_paths = ["--oidc-* / OPENSHELL_OIDC_*", "[openshell.gateway.oidc].{issuer,audience,jwks_ttl_secs,roles_claim,admin_role,user_role,scopes_claim}"]
+schema_v2_access_paths = ["same [openshell.gateway.oidc] fields", "same CLI and environment variables"]
+behavioral_oracle = "A token from the configured issuer is accepted only with the expected audience, role, and optional scope; invalid JWTs are rejected."
+required_environment = "OIDC issuer with JWKS and signed test tokens"
+test_lane = "auth-oidc"
+status = "not_run"
+
+[[capabilities]]
+id = "mtls-user-authentication"
+topics = ["auth_tls_jwt"]
+origin_main_access_paths = ["--enable-mtls-auth / OPENSHELL_ENABLE_MTLS_AUTH", "[openshell.gateway.mtls_auth].enabled"]
+schema_v2_access_paths = ["[openshell.gateway.mtls_auth].enabled", "same CLI and environment variable"]
+behavioral_oracle = "A verified local client certificate maps to a user principal only when mTLS user auth is enabled and no stronger auth policy replaces it."
+required_environment = "local driver, test CA, client certificate"
+test_lane = "e2e-docker"
+status = "not_run"
+
+[[capabilities]]
+id = "unsafe-unauthenticated-user-mode"
+topics = ["auth_tls_jwt"]
+origin_main_access_paths = ["[openshell.gateway.auth].allow_unauthenticated_users"]
+schema_v2_access_paths = ["same [openshell.gateway.auth].allow_unauthenticated_users"]
+behavioral_oracle = "The explicit trusted-development switch admits user requests without a credential while sandbox callbacks retain sandbox authentication."
+required_environment = "isolated gateway with no public exposure"
+test_lane = "e2e-docker"
+status = "not_run"
+
+[[capabilities]]
+id = "gateway-minted-sandbox-jwt"
+topics = ["auth_tls_jwt"]
+origin_main_access_paths = ["[openshell.gateway.gateway_jwt].{signing_key_path,public_key_path,kid_path,gateway_id,ttl_secs}"]
+schema_v2_access_paths = ["same [openshell.gateway.gateway_jwt] fields"]
+behavioral_oracle = "The gateway mints sandbox and extension tokens with the configured identity, key ID, audience, and positive or omitted TTL semantics; explicit zero is rejected."
+required_environment = "Ed25519 keypair and sandbox callback fixture"
+test_lane = "e2e-docker"
+status = "not_run"
+
+[[capabilities]]
+id = "otlp-observability"
+topics = ["observability"]
+origin_main_access_paths = ["[openshell.gateway.otlp].{endpoint,service_name}", "OTEL_* SDK tuning environment"]
+schema_v2_access_paths = ["same [openshell.gateway.otlp] fields", "same OTEL_* tuning environment"]
+behavioral_oracle = "A configured OTLP/gRPC collector receives gateway and in-tree driver traces with gateway name and selected-driver resource attributes; collector failure does not prevent serving."
+required_environment = "loopback OTLP/gRPC collector"
+test_lane = "observability"
+status = "not_run"
+
+[[capabilities]]
+id = "gateway-interceptor-registration"
+topics = ["interceptors", "auth_tls_jwt"]
+origin_main_access_paths = ["[[openshell.gateway.interceptors]] including endpoint, TLS CA, audience, ordering, failure, timeout, limits, binding policy, and bindings"]
+schema_v2_access_paths = ["same [[openshell.gateway.interceptors]] table and [[openshell.gateway.interceptors.bindings]]"]
+behavioral_oracle = "Startup validates Describe metadata and configured binding policy; an allowed interceptor observes or modifies only its selected non-secret unary RPC phases."
+required_environment = "test interceptor gRPC service; optional private CA or Unix socket"
+test_lane = "extension-driver"
+status = "not_run"
+
+[[capabilities]]
+id = "supervisor-middleware-registration"
+topics = ["middleware", "auth_tls_jwt"]
+origin_main_access_paths = ["[[openshell.supervisor.middleware]] including endpoint, TLS CA, audience, payload limit, timeout, and insecure transport"]
+schema_v2_access_paths = ["same [[openshell.supervisor.middleware]] table"]
+behavioral_oracle = "Gateway startup validates middleware Describe and policy configuration, applies payload/time limits, and distributes only validated registration data to supervisors."
+required_environment = "test supervisor middleware gRPC service and sandbox supervisor"
+test_lane = "extension-driver"
+status = "not_run"
+
+[[capabilities]]
+id = "provider-profile-sources"
+topics = ["inference", "interceptors"]
+origin_main_access_paths = ["[openshell.gateway].provider_profile_sources"]
+schema_v2_access_paths = ["same [openshell.gateway].provider_profile_sources"]
+behavioral_oracle = "Configured builtin, user, and interceptor sources form one ordered validated catalog; duplicate normalized profile IDs or invalid interceptor source selections fail closed."
+required_environment = "provider records and profile-capable interceptor fixture"
+test_lane = "extension-driver"
+status = "not_run"
+
+[[capabilities]]
+id = "inference-control-plane-configuration"
+topics = ["inference"]
+origin_main_access_paths = ["OpenShell inference configuration RPCs and persisted gateway settings; not a startup TOML field"]
+schema_v2_access_paths = ["unchanged OpenShell inference configuration RPCs and persisted gateway settings; not a startup TOML field"]
+behavioral_oracle = "A provider and route configured through the control plane resolves the same effective inference bundle after a schema-v2 gateway starts."
+required_environment = "gateway, provider fixture, and sandbox supervisor"
+test_lane = "e2e-docker"
+status = "not_run"
+
+[[capabilities]]
+id = "credential-driver-selection-and-kek"
+topics = ["credentials"]
+origin_main_access_paths = ["[openshell.gateway].credential_drivers", "[openshell.gateway].default_credential_driver", "[openshell.gateway.credential_storage]"]
+schema_v2_access_paths = ["same [openshell.gateway] fields"]
+behavioral_oracle = "Omission selects encrypted database storage; an explicit empty or multi-driver selection fails, and KEK path/environment configuration preserves credential confidentiality."
+required_environment = "temporary gateway database and KEK fixture"
+test_lane = "deterministic"
+status = "not_run"
+
+[[capabilities]]
+id = "credential-driver-backend-tables"
+topics = ["credentials", "external_drivers"]
+origin_main_access_paths = ["[openshell.credential_drivers.kubernetes-secrets]", "[openshell.credential_drivers.vault]", "[openshell.credential_drivers.<external>]"]
+schema_v2_access_paths = ["same credential-driver tables, including in_tree or uds transport, socket_path, command, args, and startup_timeout_secs"]
+behavioral_oracle = "Built-in and remote credential driver tables validate their transport contract and store/retrieve opaque credential material without inline secrets in TOML."
+required_environment = "credential-driver mock over UDS; Kubernetes or Vault for backend variants"
+test_lane = "extension-driver"
+status = "not_run"
+
+[[capabilities]]
+id = "docker-image-and-callback-configuration"
+topics = ["docker"]
+origin_main_access_paths = ["[openshell.gateway].{default_image,supervisor_image,host_gateway_ip} inherited by Docker", "[openshell.drivers.docker].{socket_path,default_image,image_pull_policy,sandbox_namespace,grpc_endpoint,supervisor_bin,supervisor_image,network_name,host_gateway_ip,ssh_socket_path}"]
+schema_v2_access_paths = ["[openshell.drivers.docker].{socket_path,default_image,image_pull_policy,sandbox_label,grpc_endpoint,supervisor_bin,supervisor_image,network_name,host_gateway_ip,ssh_socket_path}"]
+behavioral_oracle = "Docker starts a sandbox using its driver table, maps the canonical sandbox label, honors image policy, and derives or honors a callback endpoint."
+required_environment = "Linux Docker daemon, bridge network, sandbox and supervisor images"
+test_lane = "e2e-docker"
+status = "not_run"
+
+[[capabilities]]
+id = "docker-security-and-provider-configuration"
+topics = ["docker", "credentials"]
+origin_main_access_paths = ["[openshell.drivers.docker].{sandbox_pids_limit,enable_bind_mounts,https_proxy,no_proxy,proxy_auth_file,proxy_auth_allow_insecure,proxy_connect_by_hostname,provider_spiffe_workload_api_socket,app_armor_profile}"]
+schema_v2_access_paths = ["same [openshell.drivers.docker] fields"]
+behavioral_oracle = "Docker rejects unsafe proxy or PID inputs, preserves explicit bind-mount and AppArmor posture, and mounts authorized SPIFFE/proxy material only into the supervisor."
+required_environment = "Linux Docker daemon, proxy fixture, optional SPIFFE Unix socket and AppArmor support"
+test_lane = "e2e-docker"
+status = "not_run"
+
+[[capabilities]]
+id = "podman-image-and-callback-configuration"
+topics = ["podman"]
+origin_main_access_paths = ["[openshell.gateway].{default_image,supervisor_image,host_gateway_ip} inherited by Podman", "[openshell.drivers.podman].{socket_path,default_image,image_pull_policy,grpc_endpoint,gateway_port,network_name,host_gateway_ip,stop_timeout_secs,supervisor_image}"]
+schema_v2_access_paths = ["same [openshell.drivers.podman] fields; gateway_port is runtime-derived"]
+behavioral_oracle = "Podman starts a sandbox with its selected socket, image and policy, derives the callback route, and applies stop timeout without v1 gateway inheritance."
+required_environment = "Podman service socket, user bridge network, sandbox and supervisor images"
+test_lane = "e2e-podman"
+status = "not_run"
+
+[[capabilities]]
+id = "podman-runtime-security-and-health"
+topics = ["podman", "credentials"]
+origin_main_access_paths = ["[openshell.drivers.podman].{sandbox_ssh_socket_path,sandbox_pids_limit,enable_bind_mounts,provider_spiffe_workload_api_socket,app_armor_profile,health_check_interval_secs,https_proxy,no_proxy,proxy_auth_file,proxy_auth_allow_insecure,proxy_connect_by_hostname,proxy_ca_bundle,userns,uidmap,gidmap}"]
+schema_v2_access_paths = ["[openshell.drivers.podman].{ssh_socket_path,sandbox_pids_limit,enable_bind_mounts,provider_spiffe_workload_api_socket,app_armor_profile,health_check_interval_secs,https_proxy,no_proxy,proxy_auth_file,proxy_auth_allow_insecure,proxy_connect_by_hostname,proxy_ca_bundle,userns,uidmap,gidmap}"]
+behavioral_oracle = "Podman uses the renamed SSH path and validates PID, health, user namespace mappings, AppArmor, proxy, CA, and SPIFFE contracts before a sandbox can run."
+required_environment = "Podman service socket, optional proxy/CA/SPIFFE fixture, rootless and rootful variants"
+test_lane = "e2e-podman"
+status = "not_run"
+
+[[capabilities]]
+id = "kubernetes-core-placement-and-images"
+topics = ["kubernetes"]
+origin_main_access_paths = ["[openshell.gateway].{default_image,supervisor_image,client_tls_secret_name,service_account_name,host_gateway_ip,enable_user_namespaces,sa_token_ttl_secs} inherited by Kubernetes", "[openshell.drivers.kubernetes].{namespace,default_image,image_pull_policy,image_pull_secrets,service_account_name,supervisor_image,supervisor_image_pull_policy,grpc_endpoint,ssh_socket_path,client_tls_secret_name,host_gateway_ip,enable_user_namespaces,sa_token_ttl_secs}"]
+schema_v2_access_paths = ["same fields exclusively in [openshell.drivers.kubernetes]"]
+behavioral_oracle = "The Kubernetes driver creates a sandbox Pod with driver-owned namespace, service account, image, pull policy, callback endpoint, SSH socket, TLS Secret, and token TTL."
+required_environment = "Kubernetes cluster, namespace, service account, image pull secret, and client TLS Secret"
+test_lane = "e2e-kubernetes"
+status = "not_run"
+
+[[capabilities]]
+id = "kubernetes-workspace-isolation"
+topics = ["kubernetes"]
+origin_main_access_paths = ["[openshell.drivers.kubernetes].{workspace_mode,gateway_id,operator_namespace_label,operator_namespace_file,workspace_default_storage_size,workspace_storage_class,default_runtime_class_name}"]
+schema_v2_access_paths = ["same [openshell.drivers.kubernetes] fields"]
+behavioral_oracle = "Shared, managed, and operator workspace modes select or create the expected namespace and workspace storage with configured discovery, class, and runtime class."
+required_environment = "Kubernetes cluster with namespaces, PVC provisioning, and optional RuntimeClass"
+test_lane = "e2e-kubernetes"
+status = "not_run"
+
+[[capabilities]]
+id = "kubernetes-supervisor-topology"
+topics = ["kubernetes", "middleware"]
+origin_main_access_paths = ["[openshell.drivers.kubernetes].{supervisor_sideload_method,topology}", "[openshell.drivers.kubernetes.sidecar].{proxy_uid,process_binary_aware_network_policy}", "[openshell.drivers.kubernetes.managed_ssh_ingress].{enabled,gateway_namespace,gateway_pod_selector}"]
+schema_v2_access_paths = ["same Kubernetes driver subtables and fields"]
+behavioral_oracle = "The rendered sandbox Pod matches the selected combined or sidecar supervisor topology, sideload method, ingress selector, and sidecar security posture."
+required_environment = "Kubernetes cluster supporting selected image-volume or init-container method"
+test_lane = "e2e-kubernetes"
+status = "not_run"
+
+[[capabilities]]
+id = "kubernetes-egress-spiffe-and-security"
+topics = ["kubernetes", "credentials"]
+origin_main_access_paths = ["[openshell.drivers.kubernetes].{https_proxy,no_proxy,proxy_auth_secret_name,proxy_auth_secret_key,proxy_auth_allow_insecure,proxy_connect_by_hostname,app_armor_profile,provider_spiffe_workload_api_socket_path,sandbox_uid,sandbox_gid}"]
+schema_v2_access_paths = ["same [openshell.drivers.kubernetes] fields"]
+behavioral_oracle = "Kubernetes validates proxy/Secret and sidecar-topology relationships, projects SPIFFE only from an allowed path, and applies valid non-root identity and AppArmor settings."
+required_environment = "Kubernetes cluster, proxy credential Secret, optional SPIFFE socket, AppArmor-capable node"
+test_lane = "e2e-kubernetes"
+status = "not_run"
+
+[[capabilities]]
+id = "vm-launch-and-resource-configuration"
+topics = ["vm"]
+origin_main_access_paths = ["[openshell.gateway].{default_image,guest_tls_ca,guest_tls_cert,guest_tls_key} inherited by VM", "[openshell.drivers.vm].{openshell_endpoint,state_dir,launcher_bin,default_image,bootstrap_image,log_level,krun_log_level,vcpus,mem_mib,overlay_disk_mib,gpu_enabled,gpu_mem_mib,gpu_vcpus}"]
+schema_v2_access_paths = ["[openshell.drivers.vm].{grpc_endpoint,state_dir,launcher_bin,default_image,bootstrap_image,log_level,krun_log_level,vcpus,mem_mib,overlay_disk_mib,gpu_enabled,gpu_mem_mib,gpu_vcpus}"]
+behavioral_oracle = "The VM driver receives its renamed callback endpoint and launches a guest with selected state, images, resources, and optional GPU configuration."
+required_environment = "Linux libkrun/KVM host, VM driver binary, OCI image, optional GPU/VFIO hardware"
+test_lane = "e2e-vm"
+status = "not_run"
+
+[[capabilities]]
+id = "vm-guest-security-and-spiffe"
+topics = ["vm", "credentials"]
+origin_main_access_paths = ["[openshell.drivers.vm].{sandbox_uid,sandbox_gid}"]
+schema_v2_access_paths = ["[openshell.drivers.vm].{sandbox_uid,sandbox_gid,https_proxy,no_proxy,proxy_auth_file,proxy_auth_allow_insecure,proxy_connect_by_hostname,provider_spiffe_workload_api_tcp_endpoint,provider_spiffe_allow_guest_tcp}", "gateway-owned guest_tls_* bundle"]
+behavioral_oracle = "VM validates non-root guest ownership, callback TLS, proxy safety, and requires an explicit opt-in before exposing a guest-reachable SPIFFE TCP endpoint."
+required_environment = "Linux libkrun/KVM host, TLS and optional proxy/SPIFFE TCP fixture"
+test_lane = "e2e-vm"
+status = "not_run"
+
+[[capabilities]]
+id = "mxc-windows-driver-configuration"
+topics = ["mxc"]
+origin_main_access_paths = ["[openshell.drivers.mxc].{wxc_exec_path,backend,pc_least_privilege,pc_capabilities,default_configuration_id,debug}"]
+schema_v2_access_paths = ["same [openshell.drivers.mxc] fields"]
+behavioral_oracle = "The Windows gateway selects MXC and passes the configured wxc-exec path, backend, AppContainer capabilities, isolation configuration, and debug flag to MXC."
+required_environment = "Windows host with MXC/wxc-exec; mock fixture for deterministic smoke variant"
+test_lane = "windows-mxc"
+status = "not_run"
+
+[[capabilities]]
+id = "external-compute-driver-socket"
+topics = ["external_drivers"]
+origin_main_access_paths = ["--drivers / --driver / OPENSHELL_DRIVERS plus --compute-driver-socket / OPENSHELL_COMPUTE_DRIVER_SOCKET", "[openshell.drivers.<name>] remote socket table"]
+schema_v2_access_paths = ["--compute-driver / OPENSHELL_COMPUTE_DRIVER plus --compute-driver-socket / OPENSHELL_COMPUTE_DRIVER_SOCKET", "[openshell.drivers.<name>].socket_path"]
+behavioral_oracle = "A selected non-reserved external driver connects through its configured Unix socket; legacy plural selector flags and environment variables are rejected."
+required_environment = "external compute-driver gRPC fixture over Unix socket"
+test_lane = "extension-driver"
+status = "not_run"
+
+[[capabilities]]
+id = "helm-configuration-producer"
+topics = ["configuration_producers", "kubernetes"]
+origin_main_access_paths = ["Helm rendered schema-v1 gateway TOML and environment-backed overrides"]
+schema_v2_access_paths = ["deploy/helm/openshell/templates/gateway-config.yaml renders [openshell] version = 2 and Kubernetes driver table", "Secret-backed OPENSHELL_DB_URL and certificate inputs"]
+behavioral_oracle = "helm template renders schema-v2 TOML, derives the Kubernetes callback endpoint, and keeps database and secret material outside the ConfigMap."
+required_environment = "Helm and chart test plugin; Kubernetes cluster only for live install variant"
+test_lane = "deterministic"
+status = "not_run"
+
+[[capabilities]]
+id = "local-launch-script-producers"
+topics = ["configuration_producers", "docker", "podman", "vm", "kubernetes"]
+origin_main_access_paths = ["tasks/scripts/gateway{,-docker,-podman,-vm}.sh generated schema-v1 TOML"]
+schema_v2_access_paths = ["tasks/scripts/gateway{,-docker,-podman,-vm}.sh generated schema-v2 TOML with per-driver tables"]
+behavioral_oracle = "Each local launch script emits parseable v2 TOML with a scalar driver and its canonical driver-owned values before it executes the gateway binary."
+required_environment = "shell, uv, and fake gateway executable; no runtime daemon required"
+test_lane = "deterministic"
+status = "not_run"
+
+[[capabilities]]
+id = "e2e-fixture-producers"
+topics = ["configuration_producers", "docker", "podman"]
+origin_main_access_paths = ["e2e/configs/gateway/docker.toml and podman.toml schema-v1 fixtures"]
+schema_v2_access_paths = ["e2e/configs/gateway/docker.toml and podman.toml schema-v2 fixtures"]
+behavioral_oracle = "Docker and Podman E2E fixtures parse as v2, select one scalar driver, and contain canonical renamed policy and callback fields."
+required_environment = "none; TOML parser only"
+test_lane = "deterministic"
+status = "not_run"
+
+[[capabilities]]
+id = "rpm-schema-upgrade"
+topics = ["packaging_upgrades", "configuration_producers"]
+origin_main_access_paths = ["deploy/rpm/gateway.toml.default version 1", "systemd user config seeded from package default"]
+schema_v2_access_paths = ["deploy/rpm/gateway.toml.default version 2", "deploy/rpm/migrate-gateway-config.sh exact-v1 replacement"]
+behavioral_oracle = "RPM first start seeds the v2 default and upgrade replaces only an exact package-generated v1 file, preserving edited files, modes, and symlink safety."
+required_environment = "temporary filesystem and shell; RPM install test host for package variant"
+test_lane = "packaging"
+status = "not_run"
+
+[[capabilities]]
+id = "homebrew-debian-and-snap-upgrades"
+topics = ["packaging_upgrades"]
+origin_main_access_paths = ["Homebrew prefix config and migration helper", "Debian XDG user-service config", "Snap $SNAP_COMMON/gateway.toml"]
+schema_v2_access_paths = ["package-managed schema-v2 defaults and documented exact-v1/manual migration paths"]
+behavioral_oracle = "Each package resolves its documented config location, starts from v2 defaults, and never overwrites operator-edited legacy configuration during upgrade."
+required_environment = "macOS Homebrew, Debian/Ubuntu user-service, and Snap test environments"
+test_lane = "packaging"
+status = "not_run"
