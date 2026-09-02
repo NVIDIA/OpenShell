@@ -283,6 +283,17 @@ through the driver configuration. The Helm chart defaults sandbox agents to
 `Unconfined` so runtime/default AppArmor profiles do not block supervisor
 network namespace setup on AppArmor-enabled nodes.
 
+The Kubernetes deployment packaging has two ownership boundaries. The gateway
+chart owns the gateway workload, configuration, Services, PKI, and
+cluster-scoped gateway resources. It can retain the legacy combined behavior,
+or omit workspace resources. The workspace chart is installed into a
+pre-provisioned sandbox namespace and owns only the sandbox ServiceAccount,
+namespaced RBAC, and sandbox ingress NetworkPolicy. Its RoleBinding names the
+gateway ServiceAccount and namespace explicitly, so the two releases have
+disjoint lifecycle ownership. A shared-mode gateway can target one external
+namespace, while operator mode maps workspace names to multiple
+platform-provisioned namespaces.
+
 Resource requirements enter the driver layer through `SandboxSpec.resource_requirements`. This includes a set of GPU requirements, where a user
 can request a specific number of GPUs or the driver-specific default behaviour.
 For all in-tree drivers, this is equivalent to selecting a single GPU.

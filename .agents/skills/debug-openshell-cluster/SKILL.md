@@ -476,6 +476,26 @@ helm -n openshell get values openshell | grep sandboxNamespace
 
 Then inspect sandbox resources in that namespace.
 
+For a split release, the gateway values should have
+`workspaceResources.enabled=false`, and the target namespace should contain a
+separate `openshell-workspace` release:
+
+```bash
+helm -n openshell get values openshell | grep -A2 workspaceResources
+helm -n <sandbox-namespace> status openshell-workspace
+kubectl -n <sandbox-namespace> get serviceaccount,role,rolebinding,networkpolicy \
+  -l app.kubernetes.io/instance=openshell-workspace
+kubectl auth can-i create sandboxes.agents.x-k8s.io \
+  --namespace <sandbox-namespace> \
+  --as system:serviceaccount:openshell:openshell
+```
+
+If the gateway cannot create or watch sandboxes, verify the workspace
+RoleBinding subject matches the gateway ServiceAccount name and namespace.
+If SSH relay connections fail, verify the workspace NetworkPolicy selects the
+gateway's actual `app.kubernetes.io/name` and
+`app.kubernetes.io/instance` labels.
+
 Check the configured sandbox service account when TokenReview bootstrap or
 sandbox registration fails. Helm creates a dedicated sandbox service account by
 default and writes it to `[openshell.drivers.kubernetes].service_account_name`;
