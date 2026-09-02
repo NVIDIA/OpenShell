@@ -1,0 +1,7 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+openshell_rpm_upgrade_cli: /var/lib/openshell-conformance/candidate/openshell.rpm
+openshell_rpm_upgrade_gateway: /var/lib/openshell-conformance/candidate/openshell-gateway.rpm
+openshell_rpm_upgrade_command: /home/openshell/.local/bin/openshell-test-guest-gateway-upgrade
