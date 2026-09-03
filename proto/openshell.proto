@@ -1566,6 +1566,9 @@ message SandboxLogLine {
   string source = 6;
   // Structured key-value fields from the tracing event (e.g. dst_host, action).
   map<string, string> fields = 7;
+  // Full OCSF event as JSON, for OCSF lines only. When empty, `message` is
+  // used as-is.
+  bytes ocsf_json = 8;
 }
 
 message SandboxStreamWarning {

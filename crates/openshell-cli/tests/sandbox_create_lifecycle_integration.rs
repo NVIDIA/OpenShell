@@ -641,6 +641,7 @@ impl OpenShell for TestOpenShell {
                                 message: message.to_string(),
                                 source: "gateway".to_string(),
                                 fields: HashMap::new(),
+                                ocsf_json: Vec::new(),
                             })),
                         }))
                         .await;

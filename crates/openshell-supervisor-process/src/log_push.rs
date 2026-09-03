@@ -51,22 +51,27 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
             return;
         }
 
-        // OCSF events carry their payload in a thread-local; extract the
-        // shorthand representation for the push message. Non-OCSF events
-        // use the original visitor-based extraction.
-        let (msg, fields) = if meta.target() == openshell_ocsf::OCSF_TARGET {
-            if let Some(ocsf_event) = openshell_ocsf::clone_current_event() {
-                (
-                    ocsf_event.format_shorthand(),
-                    std::collections::HashMap::new(),
-                )
-            } else {
+        // OCSF events carry their payload in a thread-local. Send both the
+        // structured event and shorthand display text: older gateways ignore
+        // `ocsf_json`, so `message` remains the mixed-version fallback.
+        let (msg, fields, ocsf_json) = if meta.target() == openshell_ocsf::OCSF_TARGET {
+            let Some(ocsf_event) = openshell_ocsf::clone_current_event() else {
                 return;
-            }
+            };
+            let shorthand = ocsf_event.format_shorthand();
+            let Ok(json) = ocsf_event.to_json_line() else {
+                return;
+            };
+            (
+                shorthand,
+                std::collections::HashMap::new(),
+                json.into_bytes(),
+            )
         } else {
             let mut visitor = LogVisitor::default();
             event.record(&mut visitor);
-            visitor.into_parts(meta.name())
+            let (msg, fields) = visitor.into_parts(meta.name());
+            (msg, fields, Vec::new())
         };
 
         let ts = openshell_core::time::now_ms();
@@ -85,6 +90,7 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
             message: msg,
             source: "sandbox".to_string(),
             fields,
+            ocsf_json,
         };
 
         // Best-effort: drop if the channel is full (don't block tracing).
@@ -102,7 +108,6 @@ pub fn spawn_log_push_task(
     sandbox_id: String,
 ) -> (mpsc::Sender<SandboxLogLine>, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<SandboxLogLine>(1024);
-
     let handle = tokio::spawn(run_push_loop(endpoint, sandbox_id, rx));
 
     (tx, handle)
@@ -354,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn ocsf_events_push_shorthand_with_ocsf_level_and_no_fields() {
+    fn ocsf_events_push_the_structured_event_with_shorthand_fallback() {
         let event = NetworkActivityBuilder::new(&ocsf_ctx())
             .activity(ActivityId::Open)
             .action(ActionId::Denied)
@@ -364,8 +369,66 @@ mod tests {
             .dst_endpoint(Endpoint::from_domain("blocked.example.com", 443))
             .message("CONNECT denied blocked.example.com:443".to_string())
             .build();
+        let expected_json = event.to_json().expect("serialize");
         let expected_shorthand = event.format_shorthand();
 
+        let lines = capture(16, || ocsf_emit!(event));
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0];
+
+        assert!(
+            !line.ocsf_json.is_empty(),
+            "structured event should be sent"
+        );
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&line.ocsf_json).expect("payload should be valid JSON");
+        assert_eq!(decoded, expected_json);
+
+        // Older gateways ignore `ocsf_json`, so the shorthand remains in the
+        // legacy message field as a mixed-version fallback.
+        assert_eq!(line.message, expected_shorthand);
+
+        // What the receiver will render must match what the sandbox would have.
+        let decoded_event: openshell_ocsf::OcsfEvent =
+            serde_json::from_slice(&line.ocsf_json).expect("payload should decode");
+        assert_eq!(decoded_event.format_shorthand(), expected_shorthand);
+    }
+
+    #[test]
+    fn remove_mixed_version_shorthand_fallback_after_2026_10_15() {
+        const REMOVE_FALLBACK_AFTER_UNIX_SECS: u64 = 1_792_022_400;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_secs();
+
+        assert!(
+            now < REMOVE_FALLBACK_AFTER_UNIX_SECS,
+            "remove the OCSF shorthand message fallback now that gateways predating ocsf_json are no longer supported"
+        );
+    }
+
+    #[test]
+    fn non_ocsf_lines_carry_no_ocsf_payload() {
+        let lines = capture(16, || {
+            tracing::info!(target: "test_target", "plain line");
+        });
+        assert!(lines[0].ocsf_json.is_empty());
+        assert_eq!(lines[0].message, "plain line");
+    }
+
+    #[test]
+    fn ocsf_events_push_with_ocsf_level_and_no_fields() {
+        let event = NetworkActivityBuilder::new(&ocsf_ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::Medium)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_domain("blocked.example.com", 443))
+            .message("CONNECT denied blocked.example.com:443".to_string())
+            .build();
         let lines = capture(16, || ocsf_emit!(event));
 
         assert_eq!(lines.len(), 1);
@@ -374,7 +437,6 @@ mod tests {
         assert_eq!(line.target, openshell_ocsf::OCSF_TARGET);
         assert_eq!(line.source, "sandbox");
         assert_eq!(line.sandbox_id, "sb-test");
-        assert_eq!(line.message, expected_shorthand);
         assert!(line.fields.is_empty());
         assert!(line.timestamp_ms > 0);
     }
@@ -454,6 +516,7 @@ mod tests {
             message: message.to_string(),
             source: "sandbox".to_string(),
             fields: std::collections::HashMap::new(),
+            ocsf_json: Vec::new(),
         }
     }
 

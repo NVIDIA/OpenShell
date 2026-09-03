@@ -5367,7 +5367,10 @@ type SandboxLogLine struct {
 	// Empty is treated as "gateway" for backward compatibility.
 	Source string `protobuf:"bytes,6,opt,name=source,proto3" json:"source,omitempty"`
 	// Structured key-value fields from the tracing event (e.g. dst_host, action).
-	Fields        map[string]string `protobuf:"bytes,7,rep,name=fields,proto3" json:"fields,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Fields map[string]string `protobuf:"bytes,7,rep,name=fields,proto3" json:"fields,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Full OCSF event as JSON, for OCSF lines only. When empty, `message` is
+	// used as-is.
+	OcsfJson      []byte `protobuf:"bytes,8,opt,name=ocsf_json,json=ocsfJson,proto3" json:"ocsf_json,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -5447,6 +5450,13 @@ func (x *SandboxLogLine) GetSource() string {
 func (x *SandboxLogLine) GetFields() map[string]string {
 	if x != nil {
 		return x.Fields
+	}
+	return nil
+}
+
+func (x *SandboxLogLine) GetOcsfJson() []byte {
+	if x != nil {
+		return x.OcsfJson
 	}
 	return nil
 }
@@ -15219,7 +15229,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\x05event\x18\x03 \x01(\v2\x1b.openshell.v1.PlatformEventH\x00R\x05event\x12>\n" +
 	"\awarning\x18\x04 \x01(\v2\".openshell.v1.SandboxStreamWarningH\x00R\awarning\x12Q\n" +
 	"\x13draft_policy_update\x18\x05 \x01(\v2\x1f.openshell.v1.DraftPolicyUpdateH\x00R\x11draftPolicyUpdateB\t\n" +
-	"\apayload\"\xaf\x02\n" +
+	"\apayload\"\xcc\x02\n" +
 	"\x0eSandboxLogLine\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12!\n" +
@@ -15228,7 +15238,8 @@ const file_openshell_proto_rawDesc = "" +
 	"\x06target\x18\x04 \x01(\tR\x06target\x12\x18\n" +
 	"\amessage\x18\x05 \x01(\tR\amessage\x12\x16\n" +
 	"\x06source\x18\x06 \x01(\tR\x06source\x12@\n" +
-	"\x06fields\x18\a \x03(\v2(.openshell.v1.SandboxLogLine.FieldsEntryR\x06fields\x1a9\n" +
+	"\x06fields\x18\a \x03(\v2(.openshell.v1.SandboxLogLine.FieldsEntryR\x06fields\x12\x1b\n" +
+	"\tocsf_json\x18\b \x01(\fR\bocsfJson\x1a9\n" +
 	"\vFieldsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"0\n" +

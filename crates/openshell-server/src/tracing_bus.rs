@@ -113,6 +113,10 @@ impl TracingLogBus {
         if log.sandbox_id.is_empty() {
             return;
         }
+        let mut log = log;
+        if let Some(event) = decode_ocsf_event(&log) {
+            log.message = event.format_shorthand();
+        }
         let evt = SandboxStreamEvent {
             payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
                 log.clone(),
@@ -163,6 +167,26 @@ impl TracingLogBus {
     }
 }
 
+/// Decode the structured OCSF event a sandbox line carries, if any.
+///
+/// A malformed payload is logged and ignored rather than dropping the line.
+fn decode_ocsf_event(log: &SandboxLogLine) -> Option<openshell_ocsf::OcsfEvent> {
+    if log.ocsf_json.is_empty() {
+        return None;
+    }
+    match serde_json::from_slice(&log.ocsf_json) {
+        Ok(event) => Some(event),
+        Err(error) => {
+            tracing::warn!(
+                sandbox_id = %log.sandbox_id,
+                %error,
+                "discarding undecodable OCSF payload from sandbox log line"
+            );
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SandboxLogLayer {
     bus: TracingLogBus,
@@ -208,6 +232,7 @@ where
             message: msg,
             source: "gateway".to_string(),
             fields: HashMap::new(),
+            ocsf_json: Vec::new(),
         };
         let evt = SandboxStreamEvent {
             payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
@@ -274,6 +299,7 @@ mod tests {
             message: message.to_string(),
             source: "gateway".to_string(),
             fields: HashMap::new(),
+            ocsf_json: Vec::new(),
         }
     }
 
@@ -337,6 +363,56 @@ mod tests {
         let bus = TracingLogBus::new();
         // Should not panic
         bus.remove("nonexistent");
+    }
+
+    #[test]
+    fn external_lines_render_shorthand_from_the_structured_event() {
+        use openshell_ocsf::{
+            ActionId, ActivityId, DispositionId, Endpoint, NetworkActivityBuilder, SeverityId,
+            StatusId,
+        };
+
+        let event = NetworkActivityBuilder::new(&ocsf_ctx("sb-wire"))
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::Medium)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_domain("blocked.example.com", 443))
+            .message("CONNECT denied blocked.example.com:443")
+            .build();
+        let expected = event.format_shorthand();
+
+        let bus = TracingLogBus::new();
+        let mut line = make_log_event("sb-wire", "");
+        line.ocsf_json = event.to_json_line().unwrap().into_bytes();
+        bus.publish_external(line);
+
+        let tail = bus.tail("sb-wire", 10);
+        assert_eq!(tail.len(), 1);
+        assert_eq!(log_message(&tail[0]).message, expected);
+    }
+
+    #[test]
+    fn external_lines_without_ocsf_json_keep_their_message() {
+        let bus = TracingLogBus::new();
+        bus.publish_external(make_log_event("sb-plain", "already rendered"));
+
+        let tail = bus.tail("sb-plain", 10);
+        assert_eq!(log_message(&tail[0]).message, "already rendered");
+    }
+
+    #[test]
+    fn undecodable_ocsf_json_does_not_drop_the_line() {
+        let bus = TracingLogBus::new();
+        let mut line = make_log_event("sb-bad", "fallback text");
+        line.ocsf_json = b"{not valid json".to_vec();
+        bus.publish_external(line);
+
+        // A malformed payload must not silently swallow the record.
+        let tail = bus.tail("sb-bad", 10);
+        assert_eq!(tail.len(), 1);
+        assert_eq!(log_message(&tail[0]).message, "fallback text");
     }
 
     #[test]
