@@ -22,17 +22,31 @@ struct SandboxListEntry {
     phase: String,
 }
 
-/// Certify status -> create -> list Ready -> exec -> delete -> list empty.
-pub const SMOKE_SCENARIO: Scenario = Scenario {
-    name: "smoke",
-    description: "Create, inspect, execute in, and delete a base sandbox.",
-    requires_plan: false,
-    run: run_smoke,
-    validate_plan_run: None,
-};
+struct SmokeScenario;
 
-fn run_smoke<'a>(runner: &'a mut OpenShellRunner, _plan_run: &'a PlanRun) -> ScenarioFuture<'a> {
-    Box::pin(async move { run_smoke_inner(runner).await })
+/// Certify status -> create -> list Ready -> exec -> delete -> list empty.
+pub static SMOKE_SCENARIO: &dyn Scenario = &SmokeScenario;
+
+impl Scenario for SmokeScenario {
+    fn name(&self) -> &'static str {
+        "smoke"
+    }
+
+    fn description(&self) -> &'static str {
+        "Create, inspect, execute in, and delete a base sandbox."
+    }
+
+    fn run<'a>(
+        &self,
+        runner: &'a mut OpenShellRunner,
+        plan_run: &'a PlanRun,
+    ) -> ScenarioFuture<'a> {
+        let validation = self.validate_plan_run(plan_run);
+        Box::pin(async move {
+            validation?;
+            run_smoke_inner(runner).await
+        })
+    }
 }
 
 async fn run_smoke_inner(runner: &mut OpenShellRunner) -> Result<(), String> {
