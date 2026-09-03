@@ -63,7 +63,16 @@ mkdir -p "${WORKDIR}/bin"
 cat >"${WORKDIR}/bin/fake-wrapper" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '%s|%s|%s|%s|%s\n' "$OPENSHELL_PARITY_VARIANT" "$OPENSHELL_E2E_CONFIG_SCHEMA_VERSION" "$OPENSHELL_GATEWAY_BIN" "$OPENSHELL_BIN" "$OPENSHELL_CONFORMANCE_BIN" >>"$OPENSHELL_PARITY_TEST_CALLS"
+printf '%s|%s|%s|%s|%s|%s\n' "$OPENSHELL_PARITY_VARIANT" "$OPENSHELL_E2E_CONFIG_SCHEMA_VERSION" "$OPENSHELL_GATEWAY_BIN" "$OPENSHELL_BIN" "$OPENSHELL_CONFORMANCE_BIN" "$MISE_TRUSTED_CONFIG_PATHS" >>"$OPENSHELL_PARITY_TEST_CALLS"
+mkdir -p "$XDG_DATA_HOME/containers/storage"
+exec "$@"
+EOF
+cat >"${WORKDIR}/bin/fake-podman" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$OPENSHELL_PARITY_TEST_PODMAN_CALLS"
+[ "$1" = unshare ] || exit 19
+shift
 exec "$@"
 EOF
 cat >"${WORKDIR}/bin/fake-conformance" <<'EOF'
@@ -86,6 +95,7 @@ run_harness() {
   OPENSHELL_PARITY_CAPABILITY_MANIFEST="${WORKDIR}/manifest.toml" \
   OPENSHELL_PARITY_BASELINE_WORKTREE="${ROOT}" \
   OPENSHELL_PARITY_PODMAN_WRAPPER="${WORKDIR}/bin/fake-wrapper" \
+  OPENSHELL_PARITY_PODMAN_BIN="${WORKDIR}/bin/fake-podman" \
   OPENSHELL_PARITY_BASELINE_GATEWAY_BIN="${WORKDIR}/bin/baseline-gateway" \
   OPENSHELL_PARITY_BASELINE_CLI_BIN="${WORKDIR}/bin/baseline-cli" \
   OPENSHELL_PARITY_BASELINE_CONFORMANCE_BIN="${WORKDIR}/bin/fake-conformance" \
@@ -94,12 +104,15 @@ run_harness() {
   OPENSHELL_PARITY_CANDIDATE_CONFORMANCE_BIN="${WORKDIR}/bin/fake-conformance" \
   OPENSHELL_PARITY_RESULTS_DIR="${WORKDIR}/results" \
   OPENSHELL_PARITY_TEST_CALLS="${WORKDIR}/calls" \
+  OPENSHELL_PARITY_TEST_PODMAN_CALLS="${WORKDIR}/podman-calls" \
+  MISE_TRUSTED_CONFIG_PATHS= \
   bash "${ROOT}/e2e/parity/run.sh" --driver podman
 }
 
 run_harness
 assert_contains "${WORKDIR}/calls" "baseline|1|${WORKDIR}/bin/baseline-gateway|${WORKDIR}/bin/baseline-cli|${WORKDIR}/bin/fake-conformance"
 assert_contains "${WORKDIR}/calls" "candidate|2|${WORKDIR}/bin/candidate-gateway|${WORKDIR}/bin/candidate-cli|${WORKDIR}/bin/fake-conformance"
+assert_contains "${WORKDIR}/calls" "|${ROOT}"
 [ "$(sed -n '1s/|.*//p' "${WORKDIR}/calls")" = baseline ] || fail 'baseline was not invoked first'
 [ "$(sed -n '2s/|.*//p' "${WORKDIR}/calls")" = candidate ] || fail 'candidate was not invoked second'
 assert_contains "${WORKDIR}/results/baseline.json" "\"source_sha\":\"${HEAD_SHA}\""
@@ -110,6 +123,8 @@ assert_contains "${WORKDIR}/results/candidate.json" '"success":true'
 assert_contains "${WORKDIR}/results/comparison.json" '"parity":true'
 assert_not_contains "${WORKDIR}/results/baseline.json" 'raw output'
 assert_contains "${WORKDIR}/results/baseline.log" 'raw output is intentionally not normalized'
+assert_contains "${WORKDIR}/podman-calls" 'unshare rm -rf -- '
+assert_contains "${WORKDIR}/podman-calls" 'openshell-parity-run.'
 
 set +e
 OPENSHELL_PARITY_FAIL_VARIANT=both run_harness >"${WORKDIR}/failure.out" 2>&1

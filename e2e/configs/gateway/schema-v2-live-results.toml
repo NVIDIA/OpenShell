@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+manifest_version = 1
+baseline_commit = "74960ebfaeec4673885089ed995fad902459749f"
+candidate_start_commit = "8c868e430e9cd3284d7e274628419ab484ebcee0"
+
+# Step 5 establishes the portable status/create/Ready/list/exec/delete/list-empty
+# contract. A platform-blocked result is not parity evidence; each blocked row
+# names the lane that must replace it before the final release gate can pass.
+
+[[result]]
+id = "portable-lifecycle-podman"
+step = 5
+capability = "Portable sandbox lifecycle on the in-tree Podman compute driver"
+driver = "podman"
+status = "pass"
+validated_baseline_commit = "74960ebfaeec4673885089ed995fad902459749f"
+validated_candidate_commit = "a3860084d019ed2ac979e3eaa1ddf085a96b773c"
+lane = "local-linux-x86_64-rootless-podman-5.8.2"
+evidence = [
+  "Paired conformance smoke connected with authenticated mTLS on both variants.",
+  "Both variants passed status, create, Ready inspection, paginated list visibility, exact-output exec, delete, and eventual empty-list checks.",
+  "Normalized comparison recorded baseline_success=true, candidate_success=true, and parity=true; equal failures are rejected by the harness.",
+]
+
+[[result]]
+id = "portable-lifecycle-docker"
+step = 5
+capability = "Portable sandbox lifecycle on the in-tree Docker compute driver"
+driver = "docker"
+status = "platform_blocked"
+owner = "OpenShell Linux Docker CI lane"
+lane = "linux-x86_64-docker"
+blocker = "The validation host has no Docker CLI or Docker daemon socket. Step 7 and Step 13 must execute and assign this lane."
+
+[[result]]
+id = "portable-lifecycle-kubernetes"
+step = 5
+capability = "Portable sandbox lifecycle on the in-tree Kubernetes compute driver"
+driver = "kubernetes"
+status = "platform_blocked"
+owner = "OpenShell Kubernetes CI lane"
+lane = "ephemeral-kind-or-managed-kubernetes"
+blocker = "The active kubectl context is an external OpenShift cluster that this validation must not modify. The installed kind cluster belongs to another project; Step 8 and Step 13 must use a dedicated OpenShell cluster."
+
+[[result]]
+id = "portable-lifecycle-vm"
+step = 5
+capability = "Portable sandbox lifecycle on the standalone VM compute driver"
+driver = "vm"
+status = "platform_blocked"
+owner = "OpenShell Linux VM CI lane"
+lane = "linux-x86_64-kvm-libkrun"
+blocker = "The validation host has no prepared VM runtime bundle or built openshell-driver-vm executable. Step 9 and Step 13 must execute and assign this lane."
+
+[[result]]
+id = "portable-lifecycle-mxc"
+step = 5
+capability = "Portable sandbox lifecycle on the Windows MXC compute driver"
+driver = "mxc"
+status = "platform_blocked"
+owner = "OpenShell Windows MXC CI lane"
+lane = "windows-x64-and-windows-arm64-mxc"
+blocker = "The validation host is Linux and cannot execute the Windows MXC runtime. Step 13 must assign native Windows validation."
