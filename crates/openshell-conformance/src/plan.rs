@@ -124,9 +124,19 @@ fn validate_command(label: &str, command: &Path, timeout_secs: u64) -> Result<()
 mod tests {
     use super::*;
 
+    #[cfg(not(windows))]
+    const RESTART_GATEWAY_COMMAND: &str = "/usr/local/libexec/restart-gateway";
+    #[cfg(windows)]
+    const RESTART_GATEWAY_COMMAND: &str = r"C:\usr\local\libexec\restart-gateway";
+
+    #[cfg(not(windows))]
+    const DIAGNOSTICS_COMMAND: &str = "/usr/local/libexec/diagnostics";
+    #[cfg(windows)]
+    const DIAGNOSTICS_COMMAND: &str = r"C:\usr\local\libexec\diagnostics";
+
     #[test]
     fn parses_a_smoke_and_continuity_plan() {
-        let plan = ConformancePlan::parse(
+        let plan = ConformancePlan::parse(&format!(
             r#"
                 version = 1
 
@@ -139,10 +149,10 @@ mod tests {
 
                 [[runs.actions]]
                 name = "gateway-upgrade"
-                command = "/usr/local/libexec/restart-gateway"
+                command = '{RESTART_GATEWAY_COMMAND}'
                 timeout_secs = 120
             "#,
-        )
+        ))
         .expect("valid plan");
 
         assert_eq!(plan.runs.len(), 2);
@@ -151,18 +161,18 @@ mod tests {
 
     #[test]
     fn parses_plan_diagnostics() {
-        let plan = ConformancePlan::parse(
+        let plan = ConformancePlan::parse(&format!(
             r#"
                 version = 1
 
                 [diagnostics]
-                command = "/usr/local/libexec/diagnostics"
+                command = '{DIAGNOSTICS_COMMAND}'
                 timeout_secs = 60
 
                 [[runs]]
                 scenario = "smoke"
             "#,
-        )
+        ))
         .expect("valid plan with diagnostics");
 
         assert_eq!(
