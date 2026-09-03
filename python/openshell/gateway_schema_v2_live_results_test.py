@@ -36,6 +36,10 @@ REQUIRED_STEP_7_IDS = {
     "podman-driver-option-parity",
     "podman-qualified-security-option-parity",
 }
+REQUIRED_STEP_8_IDS = {
+    "kubernetes-core-option-parity",
+    "kubernetes-qualified-option-parity",
+}
 ALLOWED_STATUSES = {
     "pass",
     "intentional_change",
@@ -150,6 +154,17 @@ def test_step_7_records_driver_option_dispositions() -> None:
     assert statuses["podman-driver-option-parity"] == "intentional_change"
     assert statuses["docker-driver-option-parity"] == "platform_blocked"
     assert statuses["podman-qualified-security-option-parity"] == "platform_blocked"
+
+
+def test_step_8_records_kubernetes_option_dispositions() -> None:
+    results = [
+        result for result in load_toml(RESULTS_PATH)["result"] if result["step"] == 8
+    ]
+
+    assert {result["id"] for result in results} == REQUIRED_STEP_8_IDS
+    statuses = {result["id"]: result["status"] for result in results}
+    assert statuses["kubernetes-core-option-parity"] == "pass"
+    assert statuses["kubernetes-qualified-option-parity"] == "platform_blocked"
 
 
 def test_platform_blocked_results_name_owner_lane_and_blocker() -> None:
