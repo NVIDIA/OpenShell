@@ -5,8 +5,6 @@
 
 use crate::child_env;
 use crate::main_session::{MainOutput, MainSession};
-#[cfg(target_os = "linux")]
-use crate::managed_children;
 use crate::process::{
     ProcessEnforcementMode, ResolvedProcessIdentity, ResolvedWorkspace,
     drop_privileges_with_identity, is_supervisor_only_env_var, session_user_and_home,
@@ -1341,15 +1339,7 @@ fn spawn_pty_shell(
         );
     }
 
-    #[cfg(target_os = "linux")]
-    let mut child = managed_children::spawn_registered(
-        || crate::process::spawn_std_command_with_supervisor_identity_namespace(cmd),
-        |child| Some(child.id()),
-    )?;
-    #[cfg(not(target_os = "linux"))]
-    let mut child = cmd.spawn()?;
-    #[cfg(target_os = "linux")]
-    let child_pid = child.id();
+    let mut child = crate::process::spawn_managed_std_command(cmd)?;
     let master_file = master;
 
     let (sender, receiver) = mpsc::channel::<Vec<u8>>();
@@ -1394,8 +1384,6 @@ fn spawn_pty_shell(
     let runtime_exit = runtime;
     std::thread::spawn(move || {
         let status = child.wait().ok();
-        #[cfg(target_os = "linux")]
-        managed_children::unregister(child_pid);
         let code = status.and_then(|s| s.code()).unwrap_or(1).unsigned_abs();
         // Wait for the reader thread to finish forwarding all output before
         // sending exit-status and closing the channel.  This prevents the
@@ -1501,18 +1489,10 @@ fn spawn_pipe_exec(
         );
     }
 
-    #[cfg(target_os = "linux")]
-    let mut child = managed_children::spawn_registered(
-        || crate::process::spawn_std_command_with_supervisor_identity_namespace(cmd),
-        |child| Some(child.id()),
-    )?;
-    #[cfg(not(target_os = "linux"))]
-    let mut child = cmd.spawn()?;
-    #[cfg(target_os = "linux")]
-    let child_pid = child.id();
-    let child_stdin = child.stdin.take();
-    let child_stdout = child.stdout.take().expect("stdout must be piped");
-    let child_stderr = child.stderr.take().expect("stderr must be piped");
+    let mut child = crate::process::spawn_managed_std_command(cmd)?;
+    let child_stdin = child.take_stdin();
+    let child_stdout = child.take_stdout().expect("stdout must be piped");
+    let child_stderr = child.take_stderr().expect("stderr must be piped");
 
     // stdin writer thread
     let (sender, receiver) = mpsc::channel::<Vec<u8>>();
@@ -1579,8 +1559,6 @@ fn spawn_pipe_exec(
     let runtime_exit = runtime;
     std::thread::spawn(move || {
         let status = child.wait().ok();
-        #[cfg(target_os = "linux")]
-        managed_children::unregister(child_pid);
         let code = status.and_then(|s| s.code()).unwrap_or(1).unsigned_abs();
         // Wait for both reader threads.
         let _ = reader_done_rx.recv_timeout(Duration::from_secs(2));

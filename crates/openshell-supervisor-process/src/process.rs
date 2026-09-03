@@ -4,7 +4,6 @@
 //! Process management and signal handling.
 
 use crate::child_env;
-#[cfg(target_os = "linux")]
 use crate::managed_children;
 #[cfg(target_os = "linux")]
 use crate::netns::NetworkNamespace;
@@ -450,9 +449,7 @@ pub fn supervisor_identity_mount_from_env() -> Result<Option<SupervisorIdentityN
 }
 
 #[cfg(target_os = "linux")]
-pub fn spawn_command_with_supervisor_identity_namespace(
-    mut cmd: Command,
-) -> std::io::Result<Child> {
+fn spawn_command_with_supervisor_identity_namespace(mut cmd: Command) -> std::io::Result<Child> {
     let namespace = supervisor_identity_mount_from_env()
         .map_err(|err| std::io::Error::other(err.to_string()))?;
     let Some(namespace) = namespace else {
@@ -462,7 +459,7 @@ pub fn spawn_command_with_supervisor_identity_namespace(
 }
 
 #[cfg(target_os = "linux")]
-pub fn spawn_std_command_with_supervisor_identity_namespace(
+fn spawn_std_command_with_supervisor_identity_namespace(
     mut cmd: std::process::Command,
 ) -> std::io::Result<std::process::Child> {
     let namespace = supervisor_identity_mount_from_env()
@@ -471,6 +468,25 @@ pub fn spawn_std_command_with_supervisor_identity_namespace(
         return cmd.spawn();
     };
     namespace.spawn_std_command(cmd)
+}
+
+/// Spawn a standard child through the supervisor identity namespace when one
+/// is active, while retaining managed lifecycle ownership on every platform.
+pub(crate) fn spawn_managed_std_command(
+    mut cmd: std::process::Command,
+) -> std::io::Result<managed_children::ManagedChild<std::process::Child>> {
+    #[cfg(target_os = "linux")]
+    {
+        managed_children::ManagedChild::spawn(
+            || spawn_std_command_with_supervisor_identity_namespace(cmd),
+            |child| Some(child.id()),
+        )
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        managed_children::ManagedChild::spawn(|| cmd.spawn(), |child| Some(child.id()))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -653,7 +669,7 @@ fn mount_empty_tmpfs(target: &CString) -> std::io::Result<()> {
 
 /// Handle to a running process.
 pub struct ProcessHandle {
-    child: Child,
+    child: managed_children::ManagedChild<Child>,
     pid: u32,
     io: Option<ProcessIo>,
 }
@@ -900,29 +916,21 @@ impl ProcessHandle {
             }
         }
 
-        #[cfg(target_os = "linux")]
-        let mut child = managed_children::spawn_registered(
+        let mut child = managed_children::ManagedChild::spawn(
             || spawn_command_with_supervisor_identity_namespace(cmd),
             Child::id,
         )
         .into_diagnostic()
         .wrap_err("failed to spawn sandbox entrypoint process")?;
-        #[cfg(not(target_os = "linux"))]
-        let mut child = cmd
-            .spawn()
-            .into_diagnostic()
-            .wrap_err("failed to spawn sandbox entrypoint process")?;
         let pid = child.id().unwrap_or(0);
-        let io = if let Some(master) = pty_master {
-            ProcessIo::Pty(master)
-        } else {
-            ProcessIo::Pipes {
-                stdin: child.stdin.take().expect("canonical stdin must be piped"),
-                stdout: child.stdout.take().expect("canonical stdout must be piped"),
-                stderr: child.stderr.take().expect("canonical stderr must be piped"),
-            }
-        };
-
+        let io = pty_master.map_or_else(
+            || ProcessIo::Pipes {
+                stdin: child.take_stdin().expect("canonical stdin must be piped"),
+                stdout: child.take_stdout().expect("canonical stdout must be piped"),
+                stderr: child.take_stderr().expect("canonical stderr must be piped"),
+            },
+            ProcessIo::Pty,
+        );
         debug!(pid, program, "Process spawned");
 
         Ok(Self {
@@ -1054,20 +1062,20 @@ impl ProcessHandle {
             }
         }
 
-        let mut child = cmd.spawn().into_diagnostic()?;
+        let mut child =
+            managed_children::ManagedChild::spawn(|| cmd.spawn(), Child::id).into_diagnostic()?;
         let pid = child.id().unwrap_or(0);
 
         debug!(pid, program, "Process spawned");
 
-        let io = if let Some(master) = pty_master {
-            ProcessIo::Pty(master)
-        } else {
-            ProcessIo::Pipes {
-                stdin: child.stdin.take().expect("canonical stdin must be piped"),
-                stdout: child.stdout.take().expect("canonical stdout must be piped"),
-                stderr: child.stderr.take().expect("canonical stderr must be piped"),
-            }
-        };
+        let io = pty_master.map_or_else(
+            || ProcessIo::Pipes {
+                stdin: child.take_stdin().expect("canonical stdin must be piped"),
+                stdout: child.take_stdout().expect("canonical stdout must be piped"),
+                stderr: child.take_stderr().expect("canonical stderr must be piped"),
+            },
+            ProcessIo::Pty,
+        );
 
         Ok(Self {
             child,
@@ -1094,8 +1102,6 @@ impl ProcessHandle {
     /// Returns an error if waiting fails.
     pub async fn wait(&mut self) -> std::io::Result<ProcessStatus> {
         let status = self.child.wait().await;
-        #[cfg(target_os = "linux")]
-        managed_children::unregister(self.pid);
         let status = status?;
         Ok(ProcessStatus::from(status))
     }
@@ -1103,10 +1109,6 @@ impl ProcessHandle {
     /// Observe an already-terminated child without blocking.
     pub fn try_wait(&mut self) -> std::io::Result<Option<ProcessStatus>> {
         let status = self.child.try_wait()?;
-        if status.is_some() {
-            #[cfg(target_os = "linux")]
-            managed_children::unregister(self.pid);
-        }
         Ok(status.map(ProcessStatus::from))
     }
 
@@ -1149,13 +1151,6 @@ impl ProcessHandle {
         }
 
         Ok(())
-    }
-}
-
-impl Drop for ProcessHandle {
-    fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
-        managed_children::unregister(self.pid);
     }
 }
 
