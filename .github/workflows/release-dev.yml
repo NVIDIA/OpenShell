@@ -256,7 +256,6 @@ jobs:
     with:
       checkout-ref: ${{ github.sha }}
       upload-channel: latest/edge
-      github-environment: latest/edge
     secrets:
       publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
