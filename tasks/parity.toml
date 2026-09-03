@@ -17,3 +17,12 @@ run = "bash e2e/parity/run.sh --driver podman --scenario podman-options"
 ["e2e:parity:gateway-options"]
 description = "Compare process-level gateway option behavior across schema v1 and v2 (opt-in live test)"
 run = "bash e2e/parity/gateway-options.sh"
+
+["test:e2e-parity:kubernetes-options"]
+description = "Run deterministic Kubernetes schema parity harness tests"
+run = "bash e2e/parity/kubernetes-options-test.sh"
+hide = true
+
+["e2e:parity:kubernetes-options"]
+description = "Compare Kubernetes driver options on an explicitly supplied disposable kind cluster"
+run = "bash e2e/parity/kubernetes-options.sh"
