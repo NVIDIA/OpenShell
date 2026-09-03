@@ -166,6 +166,56 @@ fn direct_child_pids() -> io::Result<HashSet<i32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
+    use nix::unistd::Pid;
+    use std::process::Command;
+
+    #[test]
+    fn fast_child_remains_waitable_after_orphan_reap_attempt() {
+        let mut registry = lock();
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 11"])
+            .spawn()
+            .expect("spawn fast child");
+        let child_pid = child.id();
+        let managed_child = registry
+            .register(child_pid)
+            .expect("register fast child");
+        drop(registry);
+        let pid = Pid::from_raw(i32::try_from(child_pid).unwrap());
+
+        // Observe the completed child without consuming its status, exactly
+        // as the orphan reaper does before its managed-PID check.
+        loop {
+            match waitid(
+                Id::Pid(pid),
+                WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+            ) {
+                Ok(WaitStatus::StillAlive) => std::thread::yield_now(),
+                Ok(_) => break,
+                Err(error) => panic!("observe fast child: {error}"),
+            }
+        }
+
+        let registry = lock();
+        let reaped = if registry.contains(pid.as_raw()) {
+            None
+        } else {
+            Some(waitpid(pid, Some(WaitPidFlag::WNOHANG)))
+        };
+        drop(registry);
+        assert!(
+            reaped.is_none(),
+            "the orphan reaper must leave a registered child to its explicit waiter"
+        );
+
+        let wait = child.wait();
+        unregister(managed_child);
+        assert!(
+            wait.is_ok(),
+            "the explicit child waiter must retain the exit status"
+        );
+    }
 
     #[test]
     fn stale_unregister_preserves_reused_pid_registration() {
@@ -182,7 +232,7 @@ mod tests {
 
     #[test]
     fn child_pid_parser_observes_a_live_child() {
-        let mut child = std::process::Command::new("sleep")
+        let mut child = Command::new("sleep")
             .arg("30")
             .spawn()
             .expect("spawn child");
