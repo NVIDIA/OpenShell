@@ -2335,6 +2335,8 @@ message PushSandboxLogsRequest {
   string sandbox_id = 1;
   // Log lines to ingest.
   repeated SandboxLogLine logs = 2;
+  // Cumulative count of lines the sandbox dropped, for gap accounting.
+  uint64 dropped_total = 3;
 }
 
 // Push sandbox logs response.

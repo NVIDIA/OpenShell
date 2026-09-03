@@ -10192,7 +10192,9 @@ type PushSandboxLogsRequest struct {
 	// The sandbox ID.
 	SandboxId string `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
 	// Log lines to ingest.
-	Logs          []*SandboxLogLine `protobuf:"bytes,2,rep,name=logs,proto3" json:"logs,omitempty"`
+	Logs []*SandboxLogLine `protobuf:"bytes,2,rep,name=logs,proto3" json:"logs,omitempty"`
+	// Cumulative count of lines the sandbox dropped, for gap accounting.
+	DroppedTotal  uint64 `protobuf:"varint,3,opt,name=dropped_total,json=droppedTotal,proto3" json:"dropped_total,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -10239,6 +10241,13 @@ func (x *PushSandboxLogsRequest) GetLogs() []*SandboxLogLine {
 		return x.Logs
 	}
 	return nil
+}
+
+func (x *PushSandboxLogsRequest) GetDroppedTotal() uint64 {
+	if x != nil {
+		return x.DroppedTotal
+	}
+	return 0
 }
 
 // Push sandbox logs response.
@@ -15639,11 +15648,12 @@ const file_openshell_proto_rawDesc = "" +
 	"\bsince_ms\x18\x03 \x01(\x03R\asinceMs\x12\x18\n" +
 	"\asources\x18\x04 \x03(\tR\asources\x12\x1b\n" +
 	"\tmin_level\x18\x05 \x01(\tR\bminLevel\x12\x1c\n" +
-	"\tworkspace\x18\x06 \x01(\tR\tworkspace\"i\n" +
+	"\tworkspace\x18\x06 \x01(\tR\tworkspace\"\x8e\x01\n" +
 	"\x16PushSandboxLogsRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x120\n" +
-	"\x04logs\x18\x02 \x03(\v2\x1c.openshell.v1.SandboxLogLineR\x04logs\"\x19\n" +
+	"\x04logs\x18\x02 \x03(\v2\x1c.openshell.v1.SandboxLogLineR\x04logs\x12#\n" +
+	"\rdropped_total\x18\x03 \x01(\x04R\fdroppedTotal\"\x19\n" +
 	"\x17PushSandboxLogsResponse\"m\n" +
 	"\x16GetSandboxLogsResponse\x120\n" +
 	"\x04logs\x18\x01 \x03(\v2\x1c.openshell.v1.SandboxLogLineR\x04logs\x12!\n" +

@@ -26,6 +26,7 @@ rand = "0.10"
 russh = "0.62"
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+prost = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }

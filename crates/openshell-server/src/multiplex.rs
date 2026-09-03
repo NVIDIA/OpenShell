@@ -271,7 +271,8 @@ impl MultiplexService {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let openshell = OpenShellServer::new(OpenShellService::new(self.state.clone()))
-            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
+            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE)
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
         let openshell = GatewayInterceptorGrpcService::new(
             openshell,
             self.state.gateway_interceptors.clone(),

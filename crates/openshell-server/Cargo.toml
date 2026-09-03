@@ -38,7 +38,7 @@ socket2 = { workspace = true }
 nix = { workspace = true }
 
 # gRPC
-tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
+tonic = { workspace = true, features = ["channel", "gzip", "tls-native-roots"] }
 prost = { workspace = true }
 prost-reflect = { workspace = true }
 prost-types = { workspace = true }

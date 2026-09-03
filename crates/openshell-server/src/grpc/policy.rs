@@ -4088,7 +4088,32 @@ pub(super) async fn handle_push_sandbox_logs(
         )
         .await?;
 
-        for log in batch.logs.into_iter().take(100) {
+        let sandbox_dropped = state
+            .tracing_log_bus
+            .sandbox_drop_delta(&batch.sandbox_id, batch.dropped_total);
+        if sandbox_dropped > 0 {
+            metrics::counter!("openshell_sandbox_log_push_dropped_total")
+                .increment(sandbox_dropped);
+            warn!(
+                sandbox_id = %batch.sandbox_id,
+                dropped = sandbox_dropped,
+                "sandbox dropped log lines before delivery"
+            );
+        }
+
+        let dropped = log_batch_overflow(batch.logs.len());
+        if dropped > 0 {
+            metrics::counter!("openshell_sandbox_log_ingest_dropped_total")
+                .increment(dropped as u64);
+            warn!(
+                sandbox_id = %batch.sandbox_id,
+                dropped,
+                cap = MAX_LOG_LINES_PER_BATCH,
+                "sandbox log batch exceeded the per-batch cap; lines discarded"
+            );
+        }
+
+        for log in batch.logs.into_iter().take(MAX_LOG_LINES_PER_BATCH) {
             let mut log = log;
             log.source = "sandbox".to_string();
             log.sandbox_id.clone_from(&batch.sandbox_id);
@@ -4097,6 +4122,17 @@ pub(super) async fn handle_push_sandbox_logs(
     }
 
     Ok(Response::new(PushSandboxLogsResponse {}))
+}
+
+/// Maximum log lines accepted from a single `PushSandboxLogs` batch.
+///
+/// The supervisor flushes at 50 but can carry up to 200 after a reconnect, so
+/// this is headroom rather than a limit it hits in normal operation.
+const MAX_LOG_LINES_PER_BATCH: usize = 200;
+
+/// Lines a batch exceeds the per-batch cap by, and so loses.
+const fn log_batch_overflow(len: usize) -> usize {
+    len.saturating_sub(MAX_LOG_LINES_PER_BATCH)
 }
 
 async fn ensure_log_stream_sandbox_scope(
@@ -15463,6 +15499,16 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(undo_err.code(), Code::NotFound);
+    }
+
+    #[test]
+    fn log_batch_overflow_counts_only_lines_past_the_cap() {
+        assert_eq!(log_batch_overflow(0), 0);
+        assert_eq!(log_batch_overflow(50), 0);
+        // The supervisor's post-reconnect flush carries up to 200, which must
+        // fit without loss.
+        assert_eq!(log_batch_overflow(200), 0);
+        assert_eq!(log_batch_overflow(250), 50);
     }
 
     #[test]
