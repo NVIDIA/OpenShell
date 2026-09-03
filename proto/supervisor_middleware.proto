@@ -368,7 +368,7 @@ message RemoveHeader {
   string name = 1;
 }
 
-// HeaderMutation is one ordered request-header operation.
+// HeaderMutation is one ordered HTTP header operation.
 message HeaderMutation {
   oneof operation {
     WriteHeader write = 1;
@@ -388,10 +388,10 @@ message HttpRequestResult {
   // True when body should replace the request body, including with an empty body.
   bool has_body = 4;
   // Ordered request-header mutations applied before the next middleware and
-  // before forwarding. Header writes are restricted to the
-  // "x-openshell-middleware-" namespace. Removes may target other visible
+  // before forwarding. Writes and removals may target visible end-to-end
   // request headers, but credential, routing, framing, and hop-by-hop headers
-  // are always protected. A violating result is a middleware failure handled
+  // are always protected. Written values cannot contain OpenShell credential
+  // placeholder syntax. A violating result is a middleware failure handled
   // according to the policy failure mode. At most 64 operations, 32 KiB of
   // validated name/value data, and 64 KiB encoded are accepted.
   repeated HeaderMutation header_mutations = 5;

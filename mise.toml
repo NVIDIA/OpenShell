@@ -25,7 +25,7 @@ node = "24.15.0"
 kubectl = { version = "1.36.1", version_prefix = "v" }
 uv = "0.10.12"
 protoc = "29.6"
-go = "1.26"
+go = "1.26.7"
 "go:github.com/golangci/golangci-lint/v2/cmd/golangci-lint" = "2.12"
 "go:google.golang.org/protobuf/cmd/protoc-gen-go" = "1.36.11"
 "go:google.golang.org/grpc/cmd/protoc-gen-go-grpc" = "1.6.2"

@@ -3,7 +3,7 @@
 
 //! Supervisor middleware registration and chain execution.
 
-mod headers;
+pub mod headers;
 mod remote;
 mod websocket;
 
@@ -1848,6 +1848,7 @@ impl ChainRunner {
                 None
             } else {
                 match headers::apply(
+                    headers::HeaderAuthority::Request,
                     &headers,
                     &connection_nominated_headers,
                     &result.header_mutations,
@@ -3025,6 +3026,56 @@ mod tests {
         received: std::sync::Mutex<Vec<HttpRequestEvaluation>>,
     }
 
+    struct InProcessHeaderChainService {
+        received: std::sync::Mutex<Vec<Vec<HttpHeader>>>,
+    }
+
+    #[tonic::async_trait]
+    impl InProcessMiddleware for InProcessHeaderChainService {
+        async fn describe(&self) -> MiddlewareManifest {
+            MiddlewareManifest {
+                name: "test/in-process-header-chain".into(),
+                service_version: "test".into(),
+                bindings: vec![MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_payload_bytes: 4096,
+                    timeout: String::new(),
+                }],
+                expected_audience: String::new(),
+            }
+        }
+
+        async fn validate_config(
+            &self,
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            request: HttpRequestView<'_>,
+        ) -> Result<openshell_core::proto::HttpRequestResult> {
+            let invocation = {
+                let mut received = self.received.lock().expect("in-process header chain lock");
+                let invocation = received.len();
+                received.push(request.headers().to_vec());
+                invocation
+            };
+            let mut result = allow_result();
+            if invocation == 0 {
+                result.header_mutations.push(write_header(
+                    "cache-control",
+                    "no-store",
+                    ExistingHeaderAction::Overwrite,
+                ));
+            }
+            Ok(result)
+        }
+    }
+
     #[tonic::async_trait]
     impl SupervisorMiddleware for HeaderChainService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
@@ -3081,13 +3132,13 @@ mod tests {
             let mut result = allow_result();
             if invocation == 0 {
                 result.header_mutations.push(write_header(
-                    "x-openshell-middleware-chain",
+                    "cache-control",
                     "first",
                     ExistingHeaderAction::Overwrite,
                 ));
             } else if invocation == 1 {
                 result.header_mutations.push(write_header(
-                    "x-openshell-middleware-chain",
+                    "cache-control",
                     "second",
                     self.second_action,
                 ));
@@ -3141,11 +3192,54 @@ mod tests {
             let observed: Vec<&str> = received[2]
                 .headers
                 .iter()
-                .filter(|header| header.name == "x-openshell-middleware-chain")
+                .filter(|header| header.name == "cache-control")
                 .map(|header| header.value.as_str())
                 .collect();
             assert_eq!(observed, expected, "action {action:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn in_process_request_middleware_writes_end_to_end_header_without_namespace() {
+        let service = Arc::new(InProcessHeaderChainService {
+            received: std::sync::Mutex::new(Vec::new()),
+        });
+        let runner = ChainRunner::new(service.clone());
+        let entries = [
+            ChainEntry {
+                name: "writer".into(),
+                implementation: "test/in-process-header-chain".into(),
+                order: 0,
+                config: prost_types::Struct::default(),
+                on_error: OnError::FailClosed,
+            },
+            ChainEntry {
+                name: "observer".into(),
+                implementation: "test/in-process-header-chain".into(),
+                order: 10,
+                config: prost_types::Struct::default(),
+                on_error: OnError::FailClosed,
+            },
+        ];
+
+        let outcome = runner
+            .evaluate(&entries, input("payload"))
+            .await
+            .expect("evaluate in-process header chain");
+        let received = service
+            .received
+            .lock()
+            .expect("recorded in-process headers");
+
+        assert!(outcome.allowed);
+        assert_eq!(
+            received[1]
+                .iter()
+                .filter(|header| header.name == "cache-control")
+                .map(|header| header.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["no-store"]
+        );
     }
 
     #[tokio::test]
@@ -4140,6 +4234,53 @@ mod tests {
         );
         assert!(outcome.findings.is_empty());
         assert!(!format!("{outcome:?}").contains(secret));
+    }
+
+    #[tokio::test]
+    async fn credential_placeholder_header_mutation_follows_on_error() {
+        let placeholder = "openshell:resolve:env:API_KEY";
+        let service = Arc::new(ScriptedService {
+            manifest_name: "test/middleware".into(),
+            max_body_bytes: 4096,
+            result: openshell_core::proto::HttpRequestResult {
+                header_mutations: vec![write_header(
+                    "x-api-key",
+                    placeholder,
+                    ExistingHeaderAction::Overwrite,
+                )],
+                ..allow_result()
+            },
+        });
+        let registry = registry_with_external(service, external_registration(4096)).await;
+        let runner = ChainRunner::from_registry(registry);
+
+        for (on_error, allowed) in [(OnError::FailClosed, false), (OnError::FailOpen, true)] {
+            let outcome = runner
+                .evaluate(
+                    &[ChainEntry {
+                        name: "guard".into(),
+                        implementation: "local-guard-service".into(),
+                        order: 0,
+                        config: prost_types::Struct::default(),
+                        on_error,
+                    }],
+                    input("hello"),
+                )
+                .await
+                .expect("evaluate credential placeholder mutation");
+
+            assert_eq!(outcome.allowed, allowed);
+            assert!(outcome.header_mutations.is_empty());
+            assert_eq!(outcome.applied.len(), 1);
+            assert!(outcome.applied[0].failed);
+            assert!(!format!("{outcome:?}").contains(placeholder));
+            if !allowed {
+                assert_eq!(
+                    outcome.reason,
+                    "middleware_failed: header_mutation_credential_placeholder"
+                );
+            }
+        }
     }
 
     #[tokio::test]

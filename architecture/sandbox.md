@@ -204,8 +204,9 @@ polling runs far more frequently than credentials expire, so the loop rotates
 only when a credential is missing or has passed four fifths of its lifetime,
 and bounds its sleep by the soonest rotation deadline.
 
-Middleware cannot observe injected credentials or mutate supervisor-owned
-credential, routing, or framing headers. Body transformations are re-evaluated
+Middleware cannot observe injected credentials, introduce credential
+placeholders, or mutate supervisor-owned credential, routing, or framing
+headers. Body transformations are re-evaluated
 against body-aware L7 policy before later stages or the upstream can observe
 them. Requests, results, chain length, execution time, and diagnostics are
 bounded; external free-form diagnostic text is not exposed in responses or
