@@ -1814,62 +1814,6 @@ message ProviderProfileDiscovery {
   repeated string credentials = 1;
 }
 
-message StoredProviderCredentialRefreshState {
-  openshell.datamodel.v1.ObjectMeta metadata = 1;
-  string provider_id = 2;
-  string provider_name = 3;
-  string credential_key = 4;
-  ProviderCredentialRefreshStrategy strategy = 5;
-  map<string, string> material = 6 [(openshell.options.v1.secret) = true];
-  // Material names classified as secret. Newly configured values live in the
-  // active credential driver and are absent from material. Legacy inline values
-  // are not automatically migrated before OpenShell 0.1.0.
-  repeated string secret_material_keys = 7;
-  int64 expires_at_ms = 8;
-  // int64 max parks the refresh until an explicit rotation or reconfiguration.
-  int64 next_refresh_at_ms = 9;
-  int64 last_refresh_at_ms = 10;
-  string status = 11;
-  string last_error = 12;
-  string token_url = 13;
-  repeated string scopes = 14;
-  int64 refresh_before_seconds = 15;
-  int64 max_lifetime_seconds = 16;
-  // Resolved mapping of strategy-defined output id -> concrete env key, pinned
-  // at configure time from the profile's additional_outputs. Read by minting,
-  // collision reservation, and env-key surfacing so later profile edits cannot
-  // silently redirect writes.
-  map<string, string> additional_output_keys = 17;
-  // Opaque gateway-owned authorization epoch for the configured refresh
-  // grant. Explicit refresh configuration creates a new epoch; automatic and
-  // manual token rotation preserve it. It is never derived from or exposed
-  // with refresh material.
-  string authorization_epoch = 18;
-  // Secret refresh material is stored through the gateway's active credential
-  // driver. The persisted refresh state keeps only opaque handles; resolved
-  // values exist in gateway memory for the duration of one mint operation.
-  map<string, openshell.datamodel.v1.CredentialHandle> secret_material_handles = 19;
-  // Handles replaced by reconfiguration or issuer-driven refresh-token
-  // rotation. This is a repeated entry rather than a material-keyed map so
-  // multiple superseded generations of the same material remain recoverable.
-  // Cleanup is retried by the refresh worker so a gateway crash or temporary
-  // credential-backend outage does not lose the deletion reference.
-  repeated StoredRefreshMaterialDeletion pending_secret_deletions = 20;
-  // Structured recovery details for the most recent refresh failure. These
-  // fields contain only gateway-owned codes and recognized bounded values.
-  ProviderCredentialRefreshRecoveryAction recovery_action = 21;
-  string failure_code = 22;
-  string provider_error_subtype = 23;
-  int64 last_error_at_ms = 24;
-}
-
-message StoredRefreshMaterialDeletion {
-  // Original material name used to derive the credential driver's storage key.
-  string material_key = 1;
-  // Opaque handle for the superseded secret object.
-  openshell.datamodel.v1.CredentialHandle handle = 2;
-}
-
 message GetProviderRefreshStatusRequest {
   string provider = 1;
   string credential_key = 2;
@@ -1956,12 +1900,6 @@ message ProviderProfile {
   // Server-set visibility: "platform", "workspace", or empty for
   // non-scoped sources. Ignored on import/update payloads.
   string scope = 13;
-}
-
-// Stored custom provider profile object.
-message StoredProviderProfile {
-  openshell.datamodel.v1.ObjectMeta metadata = 1;
-  ProviderProfile profile = 2;
 }
 
 // Provider profile response.
@@ -2826,101 +2764,6 @@ message DraftHistoryEntry {
 message GetDraftHistoryResponse {
   // Chronological decision history.
   repeated DraftHistoryEntry entries = 1;
-}
-
-// Stored payload for a policy revision row in the generic objects table.
-message PolicyRevisionPayload {
-  // Serialized policy contents.
-  openshell.sandbox.v1.SandboxPolicy policy = 1;
-  // Deterministic hash of the policy payload.
-  string hash = 2;
-  // Load error reported by the sandbox, if any.
-  string load_error = 3;
-  // When the policy version was reported as loaded (ms since epoch). 0 if unset.
-  int64 loaded_at_ms = 4;
-  // Immutable provenance supplied when this revision was created.
-  map<string, string> provenance = 5;
-}
-
-// Stored payload for a draft policy chunk row in the generic objects table.
-message DraftChunkPayload {
-  // Proposed network_policies map key.
-  string rule_name = 1;
-  // Proposed network policy rule.
-  openshell.sandbox.v1.NetworkPolicyRule proposed_rule = 2;
-  // Human-readable explanation of why this rule is proposed.
-  string rationale = 3;
-  // Security concerns flagged by analysis (empty if none).
-  string security_notes = 4;
-  // Analysis confidence (0.0-1.0). 0 for mechanistic mode.
-  float confidence = 5;
-  // When the user approved/rejected (ms since epoch). 0 if undecided.
-  int64 decided_at_ms = 6;
-  // Denormalized endpoint host for dedup and display.
-  string host = 7;
-  // Denormalized endpoint port for dedup and display.
-  int32 port = 8;
-  // Binary path that triggered the denial.
-  string binary = 9;
-  // Current draft version for the owning sandbox.
-  int64 draft_version = 10;
-  // Gateway prover verdict for this chunk; empty until prover runs.
-  // Mirrors PolicyChunk.validation_result.
-  string validation_result = 11;
-  // Operator-supplied free-form rejection text; empty for non-rejected
-  // chunks. Mirrors PolicyChunk.rejection_reason.
-  string rejection_reason = 12;
-  string application_error = 13;
-  string review_token = 14;
-  string current_effective_policy_hash = 15;
-  string candidate_effective_policy_hash = 16;
-  openshell.sandbox.v1.SandboxPolicy current_effective_policy = 17;
-  openshell.sandbox.v1.SandboxPolicy candidate_effective_policy = 18;
-}
-
-// Internal stored policy revision row materialized from the generic objects table.
-message StoredPolicyRevision {
-  string id = 1;
-  string sandbox_id = 2;
-  int64 version = 3;
-  bytes policy_payload = 4;
-  string policy_hash = 5;
-  string status = 6;
-  optional string load_error = 7;
-  int64 created_at_ms = 8;
-  optional int64 loaded_at_ms = 9;
-  map<string, string> provenance = 10;
-}
-
-// Internal stored draft chunk row materialized from the generic objects table.
-message StoredDraftChunk {
-  string id = 1;
-  string sandbox_id = 2;
-  int64 draft_version = 3;
-  string status = 4;
-  string rule_name = 5;
-  bytes proposed_rule = 6;
-  string rationale = 7;
-  string security_notes = 8;
-  double confidence = 9;
-  int64 created_at_ms = 10;
-  optional int64 decided_at_ms = 11;
-  string host = 12;
-  int32 port = 13;
-  string binary = 14;
-  int32 hit_count = 15;
-  int64 first_seen_ms = 16;
-  int64 last_seen_ms = 17;
-  // Gateway prover verdict; empty until the prover runs. See PolicyChunk.
-  string validation_result = 18;
-  // Operator-supplied free-form rejection text. See PolicyChunk.
-  string rejection_reason = 19;
-  string application_error = 20;
-  string review_token = 21;
-  string current_effective_policy_hash = 22;
-  string candidate_effective_policy_hash = 23;
-  openshell.sandbox.v1.SandboxPolicy current_effective_policy = 24;
-  openshell.sandbox.v1.SandboxPolicy candidate_effective_policy = 25;
 }
 
 // ---------------------------------------------------------------------------

@@ -378,10 +378,6 @@ mod tests {
             ("openshell.v1.RevokeSshSessionRequest", "token"),
             ("openshell.v1.TcpForwardInit", "authorization_token"),
             ("openshell.v1.SshSession", "token"),
-            (
-                "openshell.v1.StoredProviderCredentialRefreshState",
-                "material",
-            ),
             ("openshell.v1.ConfigureProviderRefreshRequest", "material"),
             (
                 "openshell.v1.GetSandboxProviderEnvironmentResponse",

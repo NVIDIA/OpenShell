@@ -11,7 +11,6 @@ use openshell_core::ObjectWorkspace;
 use openshell_core::proto::{
     CredentialHandle, Provider, ProviderCredentialRefreshRecoveryAction,
     ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
-    StoredProviderCredentialRefreshState, StoredRefreshMaterialDeletion,
 };
 use openshell_core::{ObjectId, ObjectName, SetResourceVersion};
 use prost::Message;
@@ -20,6 +19,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tonic::{Code, Status};
 use tracing::{info, warn};
+
+use crate::storage_proto::{StoredProviderCredentialRefreshState, StoredRefreshMaterialDeletion};
 
 const DEFAULT_REFRESH_BEFORE_SECONDS: i64 = 300;
 const DEFAULT_MAX_LIFETIME_SECONDS: i64 = 3600;
@@ -2016,12 +2017,12 @@ mod tests {
     };
     use crate::credentials::CredentialRuntime;
     use crate::persistence::{current_time_ms, test_store};
+    use crate::storage_proto::StoredProviderCredentialRefreshState;
     use openshell_core::Config;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::proto::{
         CredentialHandle, Provider, ProviderCredentialRefreshRecoveryAction,
         ProviderCredentialRefreshStrategy, Sandbox, SandboxSpec,
-        StoredProviderCredentialRefreshState,
     };
     use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
     use std::collections::HashMap;
