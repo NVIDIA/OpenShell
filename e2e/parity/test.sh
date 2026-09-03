@@ -35,6 +35,17 @@ assert_contains "${WORKDIR}/v2.toml" 'compute_driver = "podman"'
 assert_contains "${WORKDIR}/v2.toml" 'image_pull_policy = "if_not_present"'
 assert_not_contains "${WORKDIR}/v2.toml" 'health_check_interval_secs = 0'
 # V2 guest TLS is emitted before its driver table; V1 is driver-local.
+OPENSHELL_E2E_PODMAN_OPTION_PROFILE=podman-options e2e_write_podman_gateway_config "${WORKDIR}/v1-options.toml" 1 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 0 socket network 18181 image:test 15 supervisor:test "" "" 0 ""
+OPENSHELL_E2E_PODMAN_OPTION_PROFILE=podman-options e2e_write_podman_gateway_config "${WORKDIR}/v2-options.toml" 2 "${ROOT}" "${WORKDIR}/pki" "${WORKDIR}/jwt" test-gateway 0 socket network 18181 image:test 15 supervisor:test "" "" 0 ""
+for config in "${WORKDIR}/v1-options.toml" "${WORKDIR}/v2-options.toml"; do
+  assert_contains "${config}" 'sandbox_pids_limit = 31'
+  assert_contains "${config}" 'health_check_interval_secs = 7'
+  assert_not_contains "${config}" 'app_armor_profile = '
+done
+assert_contains "${WORKDIR}/v1-options.toml" 'sandbox_ssh_socket_path = "/run/openshell/parity-ssh.sock"'
+assert_contains "${WORKDIR}/v2-options.toml" 'ssh_socket_path = "/run/openshell/parity-ssh.sock"'
+if OPENSHELL_E2E_PODMAN_OPTION_PROFILE=unknown e2e_podman_option_profile >/dev/null 2>&1; then fail 'unknown option profile unexpectedly accepted'; fi
+
 v1_driver_line="$(grep -n '^\[openshell.drivers.podman\]' "${WORKDIR}/v1.toml" | cut -d: -f1)"
 v1_tls_line="$(grep -n '^guest_tls_ca' "${WORKDIR}/v1.toml" | cut -d: -f1)"
 v2_driver_line="$(grep -n '^\[openshell.drivers.podman\]' "${WORKDIR}/v2.toml" | cut -d: -f1)"
@@ -63,8 +74,16 @@ mkdir -p "${WORKDIR}/bin"
 cat >"${WORKDIR}/bin/fake-wrapper" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '%s|%s|%s|%s|%s|%s\n' "$OPENSHELL_PARITY_VARIANT" "$OPENSHELL_E2E_CONFIG_SCHEMA_VERSION" "$OPENSHELL_GATEWAY_BIN" "$OPENSHELL_BIN" "$OPENSHELL_CONFORMANCE_BIN" "$MISE_TRUSTED_CONFIG_PATHS" >>"$OPENSHELL_PARITY_TEST_CALLS"
+printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$OPENSHELL_PARITY_VARIANT" "$OPENSHELL_E2E_CONFIG_SCHEMA_VERSION" "$OPENSHELL_GATEWAY_BIN" "$OPENSHELL_BIN" "$OPENSHELL_CONFORMANCE_BIN" "$MISE_TRUSTED_CONFIG_PATHS" "${OPENSHELL_E2E_PODMAN_OPTION_PROFILE:-}" "${OPENSHELL_PARITY_ORACLE_RESULT:-}" >>"$OPENSHELL_PARITY_TEST_CALLS"
 mkdir -p "$XDG_DATA_HOME/containers/storage"
+if [ "${OPENSHELL_E2E_PODMAN_OPTION_PROFILE:-}" = podman-options ]; then
+  case "${OPENSHELL_PARITY_VARIANT}" in baseline) pids=2048 ;; candidate) pids=31 ;; esac
+  stable=true
+  if [ "${OPENSHELL_PARITY_TEST_SEMANTIC_DRIFT:-0}" = 1 ] && [ "${OPENSHELL_PARITY_VARIANT}" = candidate ]; then stable=false; fi
+  if [ "${OPENSHELL_PARITY_TEST_SKIP_RESULT:-}" != "${OPENSHELL_PARITY_VARIANT}" ]; then
+    printf '%s\n' "{\"scenario\":\"podman-options\",\"stable\":${stable},\"pids_limit\":${pids}}" > "${OPENSHELL_PARITY_ORACLE_RESULT}"
+  fi
+fi
 exec "$@"
 EOF
 cat >"${WORKDIR}/bin/fake-podman" <<'EOF'
@@ -96,6 +115,7 @@ run_harness() {
   OPENSHELL_PARITY_BASELINE_WORKTREE="${ROOT}" \
   OPENSHELL_PARITY_PODMAN_WRAPPER="${WORKDIR}/bin/fake-wrapper" \
   OPENSHELL_PARITY_PODMAN_BIN="${WORKDIR}/bin/fake-podman" \
+  OPENSHELL_PARITY_PODMAN_OPTIONS_ORACLE="${WORKDIR}/bin/fake-conformance" \
   OPENSHELL_PARITY_BASELINE_GATEWAY_BIN="${WORKDIR}/bin/baseline-gateway" \
   OPENSHELL_PARITY_BASELINE_CLI_BIN="${WORKDIR}/bin/baseline-cli" \
   OPENSHELL_PARITY_BASELINE_CONFORMANCE_BIN="${WORKDIR}/bin/fake-conformance" \
@@ -106,7 +126,7 @@ run_harness() {
   OPENSHELL_PARITY_TEST_CALLS="${WORKDIR}/calls" \
   OPENSHELL_PARITY_TEST_PODMAN_CALLS="${WORKDIR}/podman-calls" \
   MISE_TRUSTED_CONFIG_PATHS= \
-  bash "${ROOT}/e2e/parity/run.sh" --driver podman
+  bash "${ROOT}/e2e/parity/run.sh" --driver podman "$@"
 }
 
 run_harness
@@ -126,6 +146,40 @@ assert_contains "${WORKDIR}/results/baseline.log" 'raw output is intentionally n
 assert_contains "${WORKDIR}/podman-calls" 'unshare rm -rf -- '
 assert_contains "${WORKDIR}/podman-calls" 'openshell-parity-run.'
 
+run_harness --scenario podman-options
+assert_contains "${WORKDIR}/calls" "baseline|1|${WORKDIR}/bin/baseline-gateway|${WORKDIR}/bin/baseline-cli|${WORKDIR}/bin/fake-conformance|${ROOT}|podman-options"
+assert_contains "${WORKDIR}/calls" "candidate|2|${WORKDIR}/bin/candidate-gateway|${WORKDIR}/bin/candidate-cli|${WORKDIR}/bin/fake-conformance|${ROOT}|podman-options"
+assert_contains "${WORKDIR}/results/baseline.json" '"scenario":"podman-options"'
+assert_contains "${WORKDIR}/results/baseline.json" '"command_class":"podman_options"'
+assert_contains "${WORKDIR}/results/baseline.json" '"normalized_result":"baseline.normalized.json"'
+assert_contains "${WORKDIR}/results/baseline.normalized.json" '"stable":true'
+assert_contains "${WORKDIR}/results/baseline.normalized.json" '"pids_limit":2048'
+assert_contains "${WORKDIR}/results/candidate.normalized.json" '"pids_limit":31'
+assert_not_contains "${WORKDIR}/results/baseline.json" 'raw output'
+assert_contains "${WORKDIR}/results/baseline.log" 'raw output is intentionally not normalized'
+assert_contains "${WORKDIR}/results/comparison.json" '"scenario":"podman-options"'
+assert_contains "${WORKDIR}/results/comparison.json" '"parity":false'
+assert_contains "${WORKDIR}/results/comparison.json" '"classification":"intentional_change"'
+assert_contains "${WORKDIR}/results/comparison.json" '"intentional_change_id":"podman-pid-limit-restored"'
+assert_contains "${WORKDIR}/results/comparison.json" '"accepted":true'
+
+set +e
+OPENSHELL_PARITY_TEST_SEMANTIC_DRIFT=1 run_harness --scenario podman-options >"${WORKDIR}/drift.out" 2>&1
+status=$?
+set -e
+assert_status "${status}" 1
+assert_contains "${WORKDIR}/results/comparison.json" '"classification":"regression"'
+assert_contains "${WORKDIR}/results/comparison.json" '"accepted":false'
+
+rm -f "${WORKDIR}/results/candidate.normalized.json"
+set +e
+OPENSHELL_PARITY_TEST_SKIP_RESULT=candidate run_harness --scenario podman-options >"${WORKDIR}/missing-result.out" 2>&1
+status=$?
+set -e
+assert_status "${status}" 1
+assert_contains "${WORKDIR}/results/comparison.json" '"classification":"regression"'
+assert_contains "${WORKDIR}/results/comparison.json" '"accepted":false'
+
 set +e
 OPENSHELL_PARITY_FAIL_VARIANT=both run_harness >"${WORKDIR}/failure.out" 2>&1
 status=$?
@@ -134,7 +188,7 @@ assert_status "${status}" 1
 assert_contains "${WORKDIR}/results/baseline.json" '"success":false'
 assert_contains "${WORKDIR}/results/candidate.json" '"success":false'
 assert_contains "${WORKDIR}/results/comparison.json" '"parity":false'
-[ "$(wc -l <"${WORKDIR}/calls")" -eq 4 ] || fail 'candidate did not run after baseline failure'
+[ "$(wc -l <"${WORKDIR}/calls")" -eq 10 ] || fail 'candidate did not run after baseline failure'
 
 set +e
 bash "${ROOT}/e2e/parity/run.sh" --driver docker >"${WORKDIR}/driver.out" 2>&1

@@ -31,6 +31,11 @@ REQUIRED_STEP_6_IDS = {
     "gateway-tls-client-auth-policy",
     "gateway-wide-process-options",
 }
+REQUIRED_STEP_7_IDS = {
+    "docker-driver-option-parity",
+    "podman-driver-option-parity",
+    "podman-qualified-security-option-parity",
+}
 ALLOWED_STATUSES = {
     "pass",
     "intentional_change",
@@ -133,6 +138,18 @@ def test_step_6_records_gateway_option_and_tls_dispositions() -> None:
     statuses = {result["id"]: result["status"] for result in results}
     assert statuses["gateway-wide-process-options"] == "pass"
     assert statuses["gateway-tls-client-auth-policy"] == "intentional_change"
+
+
+def test_step_7_records_driver_option_dispositions() -> None:
+    results = [
+        result for result in load_toml(RESULTS_PATH)["result"] if result["step"] == 7
+    ]
+
+    assert {result["id"] for result in results} == REQUIRED_STEP_7_IDS
+    statuses = {result["id"]: result["status"] for result in results}
+    assert statuses["podman-driver-option-parity"] == "intentional_change"
+    assert statuses["docker-driver-option-parity"] == "platform_blocked"
+    assert statuses["podman-qualified-security-option-parity"] == "platform_blocked"
 
 
 def test_platform_blocked_results_name_owner_lane_and_blocker() -> None:

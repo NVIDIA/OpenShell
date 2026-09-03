@@ -10,6 +10,10 @@ hide = true
 description = "Compare frozen schema-v1 and current schema-v2 conformance against Podman (opt-in live test)"
 run = "bash e2e/parity/run.sh --driver podman"
 
+["e2e:parity:podman-options"]
+description = "Compare paired Podman sandbox option semantics across schema v1 and v2 (opt-in live test)"
+run = "bash e2e/parity/run.sh --driver podman --scenario podman-options"
+
 ["e2e:parity:gateway-options"]
 description = "Compare process-level gateway option behavior across schema v1 and v2 (opt-in live test)"
 run = "bash e2e/parity/gateway-options.sh"
