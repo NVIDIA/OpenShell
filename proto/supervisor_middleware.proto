@@ -197,6 +197,8 @@ message HttpResponsePreflight {
 }
 
 // Selects skip, inspect, or block. Diagnostic fields apply to every action.
+// Invalid diagnostics make the entire result a middleware failure handled
+// according to on_error.
 message HttpResponsePreflightResult {
   oneof action {
     // Deliver unchanged without invoking on_error.
@@ -209,8 +211,8 @@ message HttpResponsePreflightResult {
   // Service diagnostic, never sent to the sandbox or security logs. Maximum
   // 4 KiB.
   string reason = 3;
-  // Optional audit code using HttpRequestResult.reason_code format. Returned to
-  // the sandbox only for block_delivery.
+  // Optional audit code using the HttpRequestResult.reason_code format and
+  // 64-byte maximum. Returned to the sandbox only for block_delivery.
   string reason_code = 4;
   // Up to 32 audit-safe findings, each limited to 4 KiB encoded.
   repeated Finding findings = 5;
@@ -295,9 +297,11 @@ message HttpResponseBodyUnit {
 }
 
 // Result for one body unit. Units are processed in lockstep; V1 does not
-// support ownership transfer. OpenShell enforces input and replacement size
-// bounds and validates the event lifecycle. It cannot distinguish bytes
-// intentionally deleted from bytes retained privately by middleware.
+// support ownership transfer. Diagnostic fields apply to every action. Invalid
+// diagnostics make the entire result a middleware failure handled according to
+// on_error. OpenShell enforces input and replacement size bounds and validates
+// the event lifecycle. It cannot distinguish bytes intentionally deleted from
+// bytes retained privately by middleware.
 message HttpResponseBodyResult {
   // Must match the next unit. Zero, gaps, duplicates, and regressions fail.
   uint64 sequence = 1;
@@ -315,9 +319,10 @@ message HttpResponseBodyResult {
   // Service diagnostic, never sent to the sandbox or security logs. Maximum
   // 4 KiB.
   string reason = 4;
-  // Optional audit code using preflight reason_code format. When OpenShell
-  // accepts block_delivery before response commitment, it includes this code
-  // in the canonical denial response. It is never returned after commitment.
+  // Optional audit code using the HttpRequestResult.reason_code format and
+  // 64-byte maximum. When OpenShell accepts block_delivery before response
+  // commitment, it includes this code in the canonical denial response. It is
+  // never returned after commitment.
   string reason_code = 5;
   // Up to 32 audit-safe findings, each limited to 4 KiB encoded.
   repeated Finding findings = 6;
@@ -368,8 +373,10 @@ message HttpResponseTrailers {
 // preserves the current trailers. A write may target only a case-insensitive
 // name present in the trailers event; V1 cannot create a trailer name. Removal
 // of an absent name is a no-op. Credential, routing, framing, coding, range,
-// hop-by-hop, and connection-nominated fields are protected. A violating result
-// is a middleware failure handled according to on_error.
+// hop-by-hop, and connection-nominated fields are protected. Diagnostic fields
+// apply whether mutations are empty or nonempty. Invalid diagnostics or
+// mutations make the entire result a middleware failure handled according to
+// on_error.
 message HttpResponseTrailersResult {
   // At most 64 operations, 32 KiB of validated name/value data, and 64 KiB
   // encoded are accepted.
@@ -377,8 +384,8 @@ message HttpResponseTrailersResult {
   // Service diagnostic, never sent to the sandbox or security logs. Maximum
   // 4 KiB.
   string reason = 2;
-  // Optional audit code using preflight reason_code format. Never sent to the
-  // sandbox.
+  // Optional audit code using the HttpRequestResult.reason_code format and
+  // 64-byte maximum. Never sent to the sandbox.
   string reason_code = 3;
   // Up to 32 audit-safe findings, each limited to 4 KiB encoded.
   repeated Finding findings = 4;
