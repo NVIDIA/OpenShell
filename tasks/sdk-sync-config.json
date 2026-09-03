@@ -1,0 +1,32 @@
+{
+  "include": [
+    {
+      "name": "go",
+      "display_name": "Go",
+      "label": "sdk:go:sync",
+      "drift_task": "go:proto:drift",
+      "build_check_task": "go:proto:build-check",
+      "proto_task": "go:proto:gen",
+      "build_task": "go:build",
+      "test_task": "go:test",
+      "source_dirs": [
+        "sdk/go/openshell/v1/internal/converter/",
+        "sdk/go/openshell/v1/types/",
+        "sdk/go/openshell/v1/"
+      ]
+    },
+    {
+      "name": "typescript",
+      "display_name": "TypeScript",
+      "label": "sdk:typescript:sync",
+      "drift_task": "sdk:ts:proto:drift",
+      "build_check_task": "sdk:ts:proto:build-check",
+      "proto_task": "sdk:ts:proto",
+      "build_task": "sdk:ts:build",
+      "test_task": "sdk:ts:test",
+      "source_dirs": [
+        "sdk/typescript/src/"
+      ]
+    }
+  ]
+}

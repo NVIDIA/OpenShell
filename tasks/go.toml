@@ -138,110 +138,13 @@ hide = true
 ["go:proto:check"]
 description = "Verify generated Go SDK proto files are up to date"
 dir = "sdk/go"
-run = """
-#!/usr/bin/env bash
-set -euo pipefail
-
-SDK_ROOT=$(pwd -P)
-REPO_ROOT=$(cd ../.. && pwd -P)
-
-for tool in buf protoc-gen-go protoc-gen-go-grpc; do
-  if ! command -v "$tool" &>/dev/null; then
-    echo "ERROR: $tool not found. Run 'mise install' to install it."
-    exit 1
-  fi
-done
-
-WORK_DIR=$(mktemp -d)
-trap 'rm -rf "$WORK_DIR"' EXIT
-
-if find proto -maxdepth 1 -name '*.proto' -print -quit | grep -q .; then
-  echo "ERROR: sdk/go/proto contains copied proto sources."
-  echo "Proto sources belong in the repository root proto/ directory."
-  exit 1
-fi
-
-# Generate to temp directory with adjusted output path
-CHECK_TEMPLATE=$(sed 's|out: sdk/go|out: '"$WORK_DIR"'|' buf.gen.yaml)
-(cd "$REPO_ROOT" && buf generate --template "$CHECK_TEMPLATE")
-
-DIFF_OUTPUT=$(diff -r "$WORK_DIR/proto" "$SDK_ROOT/proto" 2>&1) || true
-
-if [ -n "$DIFF_OUTPUT" ]; then
-  echo "ERROR: Generated proto files are out of date."
-  echo "Run 'mise run go:proto:gen' to regenerate."
-  echo ""
-  echo "$DIFF_OUTPUT"
-  exit 1
-fi
-
-echo "Proto check passed: generated files are up to date."
-"""
+run = 'bash ../../tasks/scripts/go_proto_check.sh text'
 hide = true
 
 ["go:proto:drift"]
 description = "Check Go SDK proto drift and output a JSON report"
 dir = "sdk/go"
-run = """
-#!/usr/bin/env bash
-set -euo pipefail
-
-SDK_ROOT=$(pwd -P)
-REPO_ROOT=$(cd ../.. && pwd -P)
-
-for tool in buf protoc-gen-go protoc-gen-go-grpc jq; do
-  if ! command -v "$tool" &>/dev/null; then
-    echo '{"sdk":"go","synced":false,"error":"'"$tool"' not found"}'
-    exit 1
-  fi
-done
-
-WORK_DIR=$(mktemp -d)
-trap 'rm -rf "$WORK_DIR"' EXIT
-
-CHECK_TEMPLATE=$(sed 's|out: sdk/go|out: '"$WORK_DIR"'|' buf.gen.yaml)
-if ! (cd "$REPO_ROOT" && buf generate --template "$CHECK_TEMPLATE") >/dev/null 2>&1; then
-  jq -n -c --arg sdk "go" '{sdk:$sdk, synced:false, files:[], summary:"buf generate failed"}'
-  exit 1
-fi
-
-NDJSON_FILE=$(mktemp)
-
-for f in $(find "$WORK_DIR/proto" -name '*.go' -type f | sort); do
-  REL=${f#"$WORK_DIR/proto/"}
-  COMMITTED="$SDK_ROOT/proto/$REL"
-
-  if [ ! -f "$COMMITTED" ]; then
-    printf '%s\t%s\t%s\n' "$REL" "added" "0" >> "$NDJSON_FILE"
-  else
-    DIFF_LINES=$(diff -u "$COMMITTED" "$f" 2>/dev/null | wc -l | tr -d ' ') || true
-    if [ "$DIFF_LINES" -gt 0 ]; then
-      printf '%s\t%s\t%s\n' "$REL" "modified" "$DIFF_LINES" >> "$NDJSON_FILE"
-    fi
-  fi
-done
-
-for f in $(find "$SDK_ROOT/proto" -name '*.go' -type f | sort); do
-  REL=${f#"$SDK_ROOT/proto/"}
-  REGEN="$WORK_DIR/proto/$REL"
-  if [ ! -f "$REGEN" ]; then
-    printf '%s\t%s\t%s\n' "$REL" "removed" "0" >> "$NDJSON_FILE"
-  fi
-done
-
-jq -R -c -s --arg sdk "go" '
-  split("\n") | map(select(length > 0) | split("\t") |
-    {name: .[0], status: .[1], diff_lines: (.[2] | tonumber)}) |
-  {sdk: $sdk, synced: (length == 0), files: .,
-   summary: (if length == 0 then "all files synced"
-             else "\\(length) file(s) drifted" end)}
-' "$NDJSON_FILE"
-
-DRIFTED=$(wc -l < "$NDJSON_FILE" | tr -d ' ')
-rm -f "$NDJSON_FILE"
-
-[ "$DRIFTED" -eq 0 ] && exit 0 || exit 1
-"""
+run = 'bash ../../tasks/scripts/go_proto_check.sh json'
 hide = true
 
 ["go:proto:build-check"]
