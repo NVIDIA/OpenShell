@@ -175,6 +175,19 @@ use crate::enums::StatusId;
 use crate::events::base_event::BaseEventData;
 use crate::objects::{Container, Device, Endpoint, Image, Metadata, Product};
 
+/// Which `OpenShell` component produced an event.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EventOrigin {
+    /// The sandbox supervisor, running inside a sandbox container.
+    #[default]
+    Sandbox,
+    /// The gateway process, which has no sandbox or container of its own.
+    Gateway {
+        /// Operator-assigned gateway name (`[openshell.gateway] name`).
+        name: String,
+    },
+}
+
 /// Immutable context created once at sandbox startup.
 ///
 /// Passed to every event builder to populate shared OCSF fields
@@ -195,37 +208,49 @@ pub struct SandboxContext {
     pub proxy_ip: IpAddr,
     /// Proxy listen port.
     pub proxy_port: u16,
+    /// Which component is emitting.
+    pub origin: EventOrigin,
 }
 
 impl SandboxContext {
     /// Build the OCSF `Metadata` object for any event.
     #[must_use]
     pub fn metadata(&self, profiles: &[&str]) -> Metadata {
+        let product = match self.origin {
+            EventOrigin::Sandbox => Product::openshell_sandbox(&self.product_version),
+            EventOrigin::Gateway { .. } => Product::openshell_gateway(&self.product_version),
+        };
         Metadata {
             version: OCSF_VERSION.to_string(),
-            product: Product::openshell_sandbox(&self.product_version),
+            product,
             profiles: profiles.iter().map(|s| (*s).to_string()).collect(),
-            uid: Some(self.sandbox_id.clone()),
+            uid: Some(uuid::Uuid::new_v4().to_string()),
             log_source: None,
         }
     }
 
-    /// Build the OCSF `Container` object.
+    /// Build the OCSF `Container` object when the event concerns a sandbox.
     #[must_use]
-    pub fn container(&self) -> Container {
-        Container {
+    pub fn container(&self) -> Option<Container> {
+        if self.sandbox_id.is_empty() {
+            return None;
+        }
+        Some(Container {
             name: self.sandbox_name.clone(),
             uid: Some(self.sandbox_id.clone()),
-            image: Some(Image {
+            image: (!self.container_image.is_empty()).then(|| Image {
                 name: self.container_image.clone(),
             }),
-        }
+        })
     }
 
     /// Build the OCSF `Device` object.
     #[must_use]
     pub fn device(&self) -> Device {
-        Device::linux(&self.hostname)
+        match &self.origin {
+            EventOrigin::Sandbox => Device::linux(&self.hostname),
+            EventOrigin::Gateway { name } => Device::gateway(&self.hostname, name),
+        }
     }
 
     /// Build the `proxy_endpoint` object for the Network Proxy profile.
@@ -249,7 +274,9 @@ impl SandboxContext {
             base.set_message(m);
         }
         base.set_device(self.device());
-        base.set_container(self.container());
+        if let Some(container) = self.container() {
+            base.set_container(container);
+        }
     }
 }
 
@@ -263,6 +290,7 @@ pub(crate) fn test_sandbox_context() -> SandboxContext {
         product_version: "0.1.0".to_string(),
         proxy_ip: "10.42.0.1".parse().unwrap(),
         proxy_port: 3128,
+        origin: EventOrigin::Sandbox,
     }
 }
 
@@ -277,13 +305,15 @@ mod tests {
         assert_eq!(meta.version, "1.8.0");
         assert_eq!(meta.product.name, "OpenShell Sandbox Supervisor");
         assert_eq!(meta.profiles.len(), 2);
-        assert_eq!(meta.uid.as_deref(), Some("sandbox-abc123"));
+        let uid = meta.uid.as_deref().expect("uid is set");
+        assert!(!uid.is_empty());
+        assert_ne!(uid, "sandbox-abc123");
     }
 
     #[test]
     fn test_sandbox_context_container() {
         let ctx = test_sandbox_context();
-        let container = ctx.container();
+        let container = ctx.container().expect("sandbox context has a container");
         assert_eq!(container.name, "my-sandbox");
         assert_eq!(container.uid.as_deref(), Some("sandbox-abc123"));
     }

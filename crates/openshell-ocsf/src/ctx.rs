@@ -8,7 +8,7 @@
 //! not been set (e.g. unit tests that exercise builders without booting the
 //! sandbox).
 
-use crate::SandboxContext;
+use crate::{EventOrigin, SandboxContext};
 use std::sync::{LazyLock, OnceLock};
 
 static OCSF_CTX: OnceLock<SandboxContext> = OnceLock::new();
@@ -21,6 +21,7 @@ static OCSF_CTX_FALLBACK: LazyLock<SandboxContext> = LazyLock::new(|| SandboxCon
     product_version: env!("CARGO_PKG_VERSION").to_string(),
     proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
     proxy_port: 3128,
+    origin: EventOrigin::Sandbox,
 });
 
 /// Initialise the process-wide OCSF sandbox context.

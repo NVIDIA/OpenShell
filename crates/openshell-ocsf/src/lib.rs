@@ -44,8 +44,8 @@ pub use events::{
 
 // --- Enum types ---
 pub use enums::{
-    ActionId, ActivityId, AuthTypeId, ConfidenceId, DispositionId, HttpMethod, LaunchTypeId,
-    OcsfEnum, RiskLevelId, SecurityLevelId, SeverityId, StateId, StatusId,
+    ActionId, ActivityId, AuthTypeId, ConfidenceId, DeviceTypeId, DispositionId, HttpMethod,
+    LaunchTypeId, OcsfEnum, RiskLevelId, SecurityLevelId, SeverityId, StateId, StatusId,
 };
 
 // --- Object types ---
@@ -58,8 +58,8 @@ pub use objects::{
 // --- Builders ---
 pub use builders::{
     ApiActivityBuilder, AppLifecycleBuilder, BaseEventBuilder, ConfigStateChangeBuilder,
-    DetectionFindingBuilder, HttpActivityBuilder, NetworkActivityBuilder, ProcessActivityBuilder,
-    SandboxContext, SshActivityBuilder,
+    DetectionFindingBuilder, EventOrigin, HttpActivityBuilder, NetworkActivityBuilder,
+    ProcessActivityBuilder, SandboxContext, SshActivityBuilder,
 };
 
 // --- Tracing layers ---

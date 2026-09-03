@@ -464,15 +464,7 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 
 /// Build an OCSF context for gateway-level (non-sandbox) events.
 fn tls_ocsf_ctx() -> SandboxContext {
-    SandboxContext {
-        sandbox_id: String::new(),
-        sandbox_name: String::new(),
-        container_image: "openshell/gateway".to_string(),
-        hostname: "openshell-gateway".to_string(),
-        product_version: openshell_core::VERSION.to_string(),
-        proxy_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        proxy_port: 0,
-    }
+    crate::gateway_ocsf::context("", "")
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ pub struct Metadata {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub profiles: Vec<String>,
 
-    /// Unique event source identifier (sandbox ID).
+    /// Unique event identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
 
@@ -47,6 +47,16 @@ impl Product {
     pub fn openshell_sandbox(version: &str) -> Self {
         Self {
             name: "OpenShell Sandbox Supervisor".to_string(),
+            vendor_name: "OpenShell".to_string(),
+            version: Some(version.to_string()),
+        }
+    }
+
+    /// Create the `OpenShell` Gateway product, for control-plane events.
+    #[must_use]
+    pub fn openshell_gateway(version: &str) -> Self {
+        Self {
+            name: "OpenShell Gateway".to_string(),
             vendor_name: "OpenShell".to_string(),
             version: Some(version.to_string()),
         }
