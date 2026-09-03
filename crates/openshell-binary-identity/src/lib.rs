@@ -245,11 +245,10 @@ fn cmdline_absolute_paths(pid: u32) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn resolves_current_process_from_live_executable() {
         let identity = ProcfsIdentityResolver::for_pid_namespace()
@@ -260,7 +259,6 @@ mod tests {
         assert!(identity.binary_digest.is_some());
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn process_tree_root_does_not_escape_into_host_ancestry() {
         let pid = std::process::id();
