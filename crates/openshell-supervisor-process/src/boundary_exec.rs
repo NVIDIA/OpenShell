@@ -376,16 +376,24 @@ impl LocalExecProcess {
                 let mut child = child;
                 #[cfg(target_os = "linux")]
                 {
-                    crate::managed_children::wait_until_terminal(pid)?;
+                    let terminal_observed = crate::managed_children::wait_until_terminal(pid);
                     let _signal_guard = signal_lock_for_wait
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    terminal_for_wait.store(true, std::sync::atomic::Ordering::Release);
                     let result = child.wait();
+                    terminal_for_wait.store(true, std::sync::atomic::Ordering::Release);
                     if let Some(managed_child) = managed_child {
                         crate::managed_children::unregister(managed_child);
                     }
-                    result
+                    match (terminal_observed, result) {
+                        (_, Ok(status)) => Ok(status),
+                        (Err(observe_error), Err(wait_error)) => Err(std::io::Error::other(
+                            format!(
+                                "observe exec terminal state: {observe_error}; reap exec: {wait_error}"
+                            ),
+                        )),
+                        (Ok(()), Err(wait_error)) => Err(wait_error),
+                    }
                 }
                 #[cfg(not(target_os = "linux"))]
                 {

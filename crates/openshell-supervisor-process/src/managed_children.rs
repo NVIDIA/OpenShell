@@ -26,29 +26,6 @@ pub struct ManagedChild {
     generation: u64,
 }
 
-/// A managed-child registration accepted by [`unregister`].
-///
-/// New boundary-owned processes retain a generation-bearing token. Legacy
-/// supervisor paths still identify their child by PID; supporting both keeps
-/// the registry race-safe for new code without forcing an unrelated rewrite
-/// of the canonical main-process and SSH paths.
-pub enum ManagedChildRegistration {
-    Token(ManagedChild),
-    Pid(u32),
-}
-
-impl From<ManagedChild> for ManagedChildRegistration {
-    fn from(value: ManagedChild) -> Self {
-        Self::Token(value)
-    }
-}
-
-impl From<u32> for ManagedChildRegistration {
-    fn from(value: u32) -> Self {
-        Self::Pid(value)
-    }
-}
-
 /// Exclusive access to the managed-child registry.
 ///
 /// A process spawner holds this guard from immediately before `spawn` or
@@ -89,28 +66,18 @@ pub fn lock() -> RegistryGuard {
     )
 }
 
-/// Register a child for a legacy caller that cannot retain a generation token.
-pub fn register(pid: u32) {
-    let _ = lock().register(pid);
+/// Register a child and return the generation-bearing removal token.
+pub fn register(pid: u32) -> Option<ManagedChild> {
+    lock().register(pid)
 }
 
 /// Remove exactly this supervised-child registration. A newer registration
 /// for a reused PID is preserved.
-pub fn unregister(child: impl Into<ManagedChildRegistration>) {
-    if let Ok(mut children) = MANAGED_CHILDREN.lock() {
-        match child.into() {
-            ManagedChildRegistration::Token(child)
-                if children.get(&child.pid) == Some(&child.generation) =>
-            {
-                children.remove(&child.pid);
-            }
-            ManagedChildRegistration::Pid(pid) => {
-                if let Ok(pid) = i32::try_from(pid) {
-                    children.remove(&pid);
-                }
-            }
-            ManagedChildRegistration::Token(_) => {}
-        }
+pub fn unregister(child: ManagedChild) {
+    if let Ok(mut children) = MANAGED_CHILDREN.lock()
+        && children.get(&child.pid) == Some(&child.generation)
+    {
+        children.remove(&child.pid);
     }
 }
 

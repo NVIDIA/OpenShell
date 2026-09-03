@@ -1368,7 +1368,7 @@ fn spawn_pty_shell(
     #[cfg(target_os = "linux")]
     let child_pid = child.id();
     #[cfg(target_os = "linux")]
-    managed_children::register(child_pid);
+    let managed_child = managed_children::register(child_pid);
     let master_file = master;
 
     let (sender, receiver) = mpsc::channel::<Vec<u8>>();
@@ -1414,7 +1414,9 @@ fn spawn_pty_shell(
     std::thread::spawn(move || {
         let status = child.wait().ok();
         #[cfg(target_os = "linux")]
-        managed_children::unregister(child_pid);
+        if let Some(child) = managed_child {
+            managed_children::unregister(child);
+        }
         let code = status.and_then(|s| s.code()).unwrap_or(1).unsigned_abs();
         // Wait for the reader thread to finish forwarding all output before
         // sending exit-status and closing the channel.  This prevents the
@@ -1517,7 +1519,7 @@ fn spawn_pipe_exec(
     #[cfg(target_os = "linux")]
     let child_pid = child.id();
     #[cfg(target_os = "linux")]
-    managed_children::register(child_pid);
+    let managed_child = managed_children::register(child_pid);
 
     let child_stdin = child.stdin.take();
     let child_stdout = child.stdout.take().expect("stdout must be piped");
@@ -1589,7 +1591,9 @@ fn spawn_pipe_exec(
     std::thread::spawn(move || {
         let status = child.wait().ok();
         #[cfg(target_os = "linux")]
-        managed_children::unregister(child_pid);
+        if let Some(child) = managed_child {
+            managed_children::unregister(child);
+        }
         let code = status.and_then(|s| s.code()).unwrap_or(1).unsigned_abs();
         // Wait for both reader threads.
         let _ = reader_done_rx.recv_timeout(Duration::from_secs(2));
