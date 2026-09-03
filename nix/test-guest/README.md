@@ -40,6 +40,7 @@ nix/test-guest/
 │   └── rocky.nix
 └── configuration/
     ├── docker.yml
+    ├── docker-snap.yml
     ├── podman-rootless.yml
     ├── tasks/
     │   ├── podman-common.yml
@@ -284,7 +285,7 @@ Cache command options:
 
 ```text
 --distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
---with NAME         Apply docker, podman-rootless, selinux, or snapd; repeatable
+--with NAME         Apply docker, docker-snap, podman-rootless, selinux, or snapd; repeatable
 --repository REF    OCI repository without a tag
 --digest DIGEST     Trusted OCI manifest digest required for pulls
 --cache-dir PATH    Override the local prepared-disk cache directory
@@ -331,12 +332,16 @@ nix run .#test-guest -- \
   -- openshell --version
 ```
 
-## Verify Snap gateway status
+## Run Snap smoke conformance
 
-The candidate Snap must be native to the guest architecture. The `openshell-snap`
-provisioner installs it, connects the Docker/log/system interfaces, registers the
-local gateway, and waits for `openshell status`, matching the Release Canary
-validation flow.
+The gateway Snap must be native to the guest architecture. `docker-snap`
+installs the Docker Snap as a cacheable guest dependency. After the Snap and
+conformance binary are copied, the temporary
+`openshell-snap-package-bootstrap-workaround` uses the prebuilt gateway binary
+in the guest to generate the PKI and sandbox JWT bundle before the Snap is
+installed. `openshell-snap` then only installs the Snap and connects its
+required interfaces, then registers the local gateway and waits for
+`openshell status`. The guest command runs smoke conformance.
 
 ```shell
 nix run .#test-guest -- \
@@ -345,8 +350,12 @@ nix run .#test-guest -- \
   --with docker-snap \
   --keep \
   --copy ./openshell_*.snap:/var/lib/openshell-conformance/candidate/openshell.snap \
+   --copy ./openshell-conformance:/var/lib/openshell-conformance/candidate/openshell-conformance \
+   --copy ./openshell-gateway:/var/lib/openshell-conformance/workarounds/openshell-gateway \
+  --provision openshell-snap-package-bootstrap-workaround \
   --provision openshell-snap \
-  -- true
+   -- /var/lib/openshell-conformance/candidate/openshell-conformance \
+     run smoke --openshell-bin /snap/bin/openshell
 ```
 
 `--keep` retains the overlay and serial log when diagnosing a failure. The
