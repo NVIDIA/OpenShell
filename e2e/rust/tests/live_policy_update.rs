@@ -517,8 +517,10 @@ async fn live_policy_update_from_empty_network_policies() {
 ///
 /// NOTE: This exercises the Docker-backed supervisor built from this branch.
 /// The exact `policy list` status wording ("Loaded"/"Superseded") may differ by
-/// CLI version; the assertions below key on the effective version reaching 2 and
-/// no revision remaining `Pending` once the acknowledgement lands.
+/// CLI version; the assertions below key on the effective version reaching at
+/// least 2 and no revision remaining `Pending` once the acknowledgement lands.
+/// Multi-supervisor topologies may create a later revision while their network
+/// and process leaves reconcile their runtime-specific policy views.
 #[tokio::test]
 async fn initial_sparse_policy_is_acknowledged_as_loaded() {
     // Repo-relative path to the sparse network-only policy fixture.
@@ -543,7 +545,8 @@ async fn initial_sparse_policy_is_acknowledged_as_loaded() {
 
     // The enriched revision (2) is synced during startup; the acknowledgement
     // (LOADED) is delivered by the supervisor's poll loop shortly after Ready.
-    // Poll until the effective policy is version 2 and no revision is Pending.
+    // Poll until the effective policy is at least version 2 and no revision is
+    // Pending. A proxy-pod network supervisor may legitimately advance it again.
     let mut acknowledged = false;
     let mut last_list = String::new();
     for _ in 0..30 {
@@ -554,7 +557,7 @@ async fn initial_sparse_policy_is_acknowledged_as_loaded() {
         last_list = list.output.clone();
         let pending = list.output.to_lowercase().contains("pending");
 
-        if version == Some(2) && list.success && !pending {
+        if version.is_some_and(|version| version >= 2) && list.success && !pending {
             acknowledged = true;
             break;
         }
@@ -563,7 +566,7 @@ async fn initial_sparse_policy_is_acknowledged_as_loaded() {
 
     assert!(
         acknowledged,
-        "enriched initial policy should reach revision 2 with no Pending revision.\n\
+        "enriched initial policy should reach at least revision 2 with no Pending revision.\n\
          last `policy list` output:\n{last_list}"
     );
 

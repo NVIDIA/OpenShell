@@ -15,6 +15,29 @@
 //! to prevent cross-sandbox access (see issue #1354).
 
 use super::identity::Identity;
+use serde::{Deserialize, Serialize};
+
+/// The authority a gateway-minted sandbox credential carries.
+///
+/// The credential is always bound to exactly one sandbox; this narrows *which
+/// of that sandbox's* RPCs it may call. It is serialized into the sandbox JWT
+/// (`caller_kind` claim) and read back onto [`SandboxPrincipal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxCallerKind {
+    /// Full supervisor authority (network + process halves in one place, as in
+    /// `combined`/`sidecar`). The default so tokens minted before this claim
+    /// existed keep working unchanged.
+    #[default]
+    Full,
+    /// Process-supervisor-only authority, for a topology where the network proxy
+    /// runs in a separate pod (proxy-pod). Denied the network-supervisor RPCs
+    /// that read provider secrets or mint upstream credentials
+    /// (`GetSandboxProviderEnvironment`, `ExchangeProviderSubjectToken`,
+    /// `GetInferenceBundle`); still permitted its own relays, logs, config, and
+    /// token refresh.
+    Process,
+}
 
 /// Who is calling.
 ///
@@ -57,6 +80,18 @@ pub struct SandboxPrincipal {
     pub trust_domain: Option<String>,
 }
 
+impl SandboxPrincipal {
+    /// The authority this credential carries. Only a gateway-minted JWT can be
+    /// scoped; every other source (bootstrap SA token, client cert) is `Full`.
+    #[must_use]
+    pub fn caller_kind(&self) -> SandboxCallerKind {
+        match self.source {
+            SandboxIdentitySource::BootstrapJwt { caller_kind, .. } => caller_kind,
+            _ => SandboxCallerKind::Full,
+        }
+    }
+}
+
 /// How a [`SandboxPrincipal`] was authenticated.
 ///
 /// Variant fields are populated by the producing authenticator and consumed
@@ -66,12 +101,21 @@ pub struct SandboxPrincipal {
 pub enum SandboxIdentitySource {
     /// Gateway-minted JWT validated against the gateway's signing key.
     /// Produced by [`super::sandbox_jwt::SandboxJwtAuthenticator`].
-    BootstrapJwt { issuer: String },
+    BootstrapJwt {
+        issuer: String,
+        /// Authority carried by the token's `caller_kind` claim.
+        caller_kind: SandboxCallerKind,
+    },
     /// Per-sandbox client certificate. Reserved for channel-bound sandbox
     /// identity.
     BootstrapCert { fingerprint: String },
     /// Driver-native credential used to bootstrap a gateway-minted JWT via
     /// `IssueSandboxToken`. The named compute driver authenticated only the
-    /// sandbox identity; the gateway still authorizes the exchange.
-    ComputeDriver { driver_name: String },
+    /// sandbox identity; the gateway still authorizes the exchange. `caller_kind`
+    /// narrows the minted token when the driver reports a process-scoped caller
+    /// (e.g. a proxy-pod agent pod), otherwise `Full`.
+    ComputeDriver {
+        driver_name: String,
+        caller_kind: SandboxCallerKind,
+    },
 }

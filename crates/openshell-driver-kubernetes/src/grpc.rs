@@ -131,8 +131,12 @@ impl ComputeDriver for ComputeDriverService {
         if credential.is_empty() {
             return Err(Status::invalid_argument("credential is required"));
         }
-        let sandbox_id = self.driver.authenticate_sandbox(&credential).await?;
-        Ok(Response::new(AuthenticateSandboxResponse { sandbox_id }))
+        let (sandbox_id, scoped_process_caller) =
+            self.driver.authenticate_sandbox(&credential).await?;
+        Ok(Response::new(AuthenticateSandboxResponse {
+            sandbox_id,
+            scoped_process_caller,
+        }))
     }
 
     async fn get_capabilities(
@@ -224,17 +228,23 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<CreateSandboxResponse>, Status> {
-        self.trace_rpc("driver.create_sandbox", "create_sandbox", async {
-            let sandbox = request
-                .into_inner()
-                .sandbox
-                .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-            self.driver
-                .create_sandbox(&sandbox)
-                .await
-                .map_err(|e| Status::from(openshell_core::ComputeDriverError::from(e)))?;
-            Ok(Response::new(CreateSandboxResponse {}))
-        })
+        // Boxed: the create path awaits large sandbox spec/status types, so the
+        // future exceeds the `large_futures` threshold when kept inline.
+        self.trace_rpc(
+            "driver.create_sandbox",
+            "create_sandbox",
+            Box::pin(async {
+                let sandbox = request
+                    .into_inner()
+                    .sandbox
+                    .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
+                self.driver
+                    .create_sandbox(&sandbox)
+                    .await
+                    .map_err(|e| Status::from(openshell_core::ComputeDriverError::from(e)))?;
+                Ok(Response::new(CreateSandboxResponse {}))
+            }),
+        )
         .await
     }
 

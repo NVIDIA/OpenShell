@@ -48,6 +48,8 @@ supervisor:
   # "combined" runs the current single supervisor container in the agent pod.
   # "sidecar" runs network enforcement in a dedicated sidecar and the process
   # supervisor as a low-capability wrapper in the agent container.
+  # "proxy-pod" runs network enforcement in a separate supervisor Deployment and
+  # restricts the agent pod to that supervisor through NetworkPolicy.
   topology: "combined"
   sidecar:
     # -- UID for relaxed long-running network sidecars in sidecar topology.
@@ -61,6 +63,48 @@ supervisor:
     # inspection capabilities, and enforces endpoint/L7 policy without matching
     # policy.binaries.
     processBinaryAwareNetworkPolicy: true
+  proxyPod:
+    # -- Render the proxy-pod companion, fence, and pod-inspection RBAC even when
+    # supervisor.topology is not proxy-pod, and tell the gateway to keep running
+    # background upkeep (periodic companion reconciliation and the shared-mode
+    # supervisor Deployment readiness watch) for those sandboxes. Set this true
+    # as a migration mode when switching a gateway away from proxy-pod while
+    # proxy-pod sandboxes still exist: the driver keeps managing them by their
+    # persisted creation-time topology, and without this flag their RBAC and
+    # upkeep would stop, breaking readiness, stop/start, repair, and safe fence
+    # cleanup. Renders `proxy_pod.retain_companion_management` in gateway.toml.
+    # Leave it true until all proxy-pod sandboxes have been deleted, then remove it.
+    retainCompanionRbac: false
+    # -- UID for the network supervisor in proxy-pod topology. The configured
+    # UID must not match the sandbox UID.
+    proxyUid: 1337
+    # -- Same-node scheduling relationship between the workload pod and its
+    # paired proxy supervisor: disabled, preferred, or required.
+    affinity: disabled
+    # -- Cluster DNS peers permitted by the proxy-pod agent egress
+    # NetworkPolicy. Each entry sets `namespaceLabels`, `podLabels`, or both.
+    # Empty uses the upstream kube-system/kube-dns and kube-system/coredns
+    # conventions, which do NOT match OpenShift (cluster DNS runs in
+    # `openshift-dns`) or NodeLocal DNSCache. An agent pod with no matching DNS
+    # peer cannot resolve its own paired supervisor Service.
+    #
+    # `port` is the DNS *pod* port, not the Service port: egress rules with a
+    # podSelector match after Service address translation. Upstream CoreDNS
+    # listens on 53; OpenShift's dns-default listens on 5353 and maps 53 to it.
+    # For OpenShift:
+    #   dnsPeers:
+    #     - namespaceLabels:
+    #         kubernetes.io/metadata.name: openshift-dns
+    #       podLabels:
+    #         dns.operator.openshift.io/daemonset-dns: default
+    #       port: 5353
+    dnsPeers: []
+    # -- Gateway peers the proxy-pod agent egress NetworkPolicy permits, so the
+    # in-pod process supervisor can reach the gateway for its session. Same shape
+    # as dnsPeers (namespaceLabels/podLabels + port). Empty (default) auto-renders
+    # a peer matching THIS chart's own gateway pods on the service port; override
+    # only for an external or differently-labeled gateway.
+    gatewayPeers: []
 
 # -- Operator-owned corporate forward proxy for policy-approved TLS egress
 # from Kubernetes sandboxes. The workload cannot select or override it.
@@ -101,6 +145,20 @@ sandboxServiceAccount:
   annotations: {}
   # -- Existing service account name for sandbox pods when sandboxServiceAccount.create is false.
   name: ""
+  openshift:
+    # -- Grant the built-in OpenShift `nonroot-v2` SCC to the sandbox
+    # ServiceAccount. Required on OpenShift for "proxy-pod" topology: the
+    # driver assigns explicit non-root UIDs, which `restricted-v2` rejects
+    # because it only admits UIDs inside the namespace's
+    # openshift.io/sa.scc.uid-range annotation. No custom SCC is created —
+    # `nonroot-v2` ships with OpenShift and already permits exactly what this
+    # topology needs, keeping drop-ALL capabilities, no privilege escalation,
+    # and no host namespaces. Creates a ClusterRole + ClusterRoleBinding.
+    # Supported only with server.drivers.kubernetes.workspaceMode=shared: the
+    # ClusterRoleBinding is scoped to the static sandbox namespace, so it does
+    # not reach the dynamically created workspace namespaces used by managed and
+    # operator modes. Enabling it with a non-shared mode fails the Helm render.
+    nonrootSCC: false
 
 # Namespace-scoped resources needed to run sandboxes. Disable this when the
 # gateway and workspace prerequisites are managed as separate Helm releases

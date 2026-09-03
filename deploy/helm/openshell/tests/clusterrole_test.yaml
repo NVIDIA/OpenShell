@@ -122,3 +122,35 @@ tests:
             apiGroups: [""]
             resources: ["secrets"]
           any: true
+
+  - it: grants proxy-pod Deployment RBAC without cluster-wide list/watch (managed)
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      supervisor.topology: proxy-pod
+    asserts:
+      # create/get/patch only: readiness watch (list/watch) is shared-mode only,
+      # via the namespaced Role, to avoid cluster-wide Deployment enumeration.
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - apps
+            resources:
+              - deployments
+            verbs:
+              - create
+              - get
+              - patch
+      - notContains:
+          path: rules
+          content:
+            apiGroups:
+              - apps
+            resources:
+              - deployments
+            verbs:
+              - create
+              - get
+              - list
+              - patch
+              - watch

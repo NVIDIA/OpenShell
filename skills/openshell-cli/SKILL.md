@@ -229,6 +229,17 @@ remains usable only until its recorded expiry.
 
 ## Workflow 3: Sandbox Lifecycle
 
+> **Proxy-pod topology is sessionless.** When the Kubernetes driver runs with
+> `supervisor.topology=proxy-pod`, the sandbox has no in-pod supervisor session,
+> so relay-backed operations — a trailing `-- <command>`, `--upload`,
+> `--forward`, `--editor`, `sandbox connect`, `sandbox exec`, `sandbox upload`,
+> and `sandbox download` — are rejected with a topology-specific error. Run the
+> workload as the container entrypoint via
+> `--driver-config-json '{"kubernetes":{"containers":{"agent":{"command":[...]}}}}'`
+> and create with `--detach`. Bake required files into the image instead of
+> uploading. The rest of this workflow applies to `combined` and `sidecar`
+> topologies.
+
 ### Create with options
 
 ```bash

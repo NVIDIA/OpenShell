@@ -3,14 +3,15 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Kubernetes Sandbox Topology"
 sidebar-title: "Topology"
-description: "Choose between combined and sidecar supervisor topology for Kubernetes sandbox pods."
+description: "Choose between combined, sidecar, and proxy-pod topology for Kubernetes sandbox pods."
 keywords: "Generative AI, Cybersecurity, Kubernetes, Sandboxing, Sidecar, Network Policy, RuntimeClass"
 position: 2
 ---
 
-Kubernetes sandbox pods can run the OpenShell supervisor in `combined` or
-`sidecar` topology. Choose the topology based on which controls you need inside
-the pod and how much privilege your cluster allows on the agent container.
+Kubernetes sandbox pods can run the OpenShell supervisor in `combined`,
+`sidecar`, or `proxy-pod` topology. Choose the topology based on which controls
+you need inside the pod, how much privilege your cluster allows on the agent
+container, and whether the cluster enforces Kubernetes NetworkPolicies.
 
 ## Choose a Topology
 
@@ -22,6 +23,7 @@ lower-privilege agent container.
 |---|---|---|
 | `combined` | You need OpenShell network, filesystem, and process controls in the sandbox workload. | The agent container carries the Linux capabilities the supervisor needs. |
 | `sidecar` | You need the agent container to run as non-root without added Linux capabilities, and network policy is the primary control. | Privilege-dropping and supervisor mount isolation do not run in the agent container. |
+| `proxy-pod` | You need the network proxy (and its credentials) out of the agent pod with no in-pod network privilege, keep the full interactive feature set, and your cluster enforces Kubernetes NetworkPolicies. | Two pods per sandbox; requires a NetworkPolicy-enforcing CNI; the agent pod holds a scoped (process-kind) gateway credential. |
 
 ## Privilege Model
 
@@ -33,6 +35,8 @@ The long-running container permissions differ by topology:
 | `sidecar` | Agent container, process-only supervisor (`network-only`) | `sandbox_uid:sandbox_gid` | `false` | Drops `ALL` | Agent and workload run without added Linux capabilities. |
 | `sidecar` | Network supervisor sidecar, binary-aware mode (default) | `0:sandbox_gid` | `false` | Drops `ALL`; adds `SYS_PTRACE` and `DAC_READ_SEARCH` | Root sidecar inspects cross-UID workload `/proc` entries. The nftables fence exempts UID 0, so do not inject other root containers into these pods. |
 | `sidecar` | Network supervisor sidecar, endpoint/L7-only mode | `proxyUid:sandbox_gid` | `false` | Drops `ALL` | Non-root sidecar enforces endpoint and L7 policy without matching `policy.binaries`. |
+| `proxy-pod` | Agent pod container, process supervisor + workload | `sandbox_uid:sandbox_gid` | `false` | Drops `ALL` | Runs the process supervisor (`--mode=process`); no added capabilities and no `NET_ADMIN` (network enforcement is external). |
+| `proxy-pod` | Supervisor pod container, network proxy only | `proxyPod.proxyUid:sandbox_gid` | `false` | Drops `ALL` | Long-running proxy runs outside the agent pod without added capabilities. |
 
 Short-lived setup containers still have the permissions needed to prepare the
 pod:
@@ -41,6 +45,9 @@ pod:
 |---|---|---|---|---|---|
 | `combined` | Supervisor install init container | `0` | Not set | Not set | Copies the supervisor binary into the agent container volume. |
 | `sidecar` | Network init container | `0` | `false` | Drops `ALL`; adds `NET_ADMIN`, `NET_RAW`, `CHOWN`, and `FOWNER` | Installs pod-local nftables rules and prepares shared sidecar state. |
+| `combined` / `sidecar` | Workspace persistence init container | `0` | Not set | Not set | Seeds the default workspace PVC while preserving the existing topology behavior. |
+| `proxy-pod` | Proxy CA install init container | `sandbox_uid:sandbox_gid` | `false` | Drops `ALL` | Copies proxy CA material into the agent pod TLS volume with a read-only root filesystem. |
+| `proxy-pod` | Workspace persistence init container | `sandbox_uid:sandbox_gid` | `false` | Drops `ALL` | Seeds the default workspace PVC without granting UID 0 to the agent pod. |
 
 ## Combined Topology
 
@@ -158,6 +165,105 @@ Sidecar pods use `shareProcessNamespace: true` so the network sidecar can
 resolve workload process and binary identity through `/proc/<entrypoint-pid>`.
 </Warning>
 
+## Proxy-Pod Topology
+
+Proxy-pod topology moves only the **network proxy** — L4/L7 enforcement, gateway
+forwarding, and credential injection — into a separate per-sandbox supervisor
+Deployment. The **process supervisor stays in the agent pod** alongside the
+workload (running as `--mode=process`), so filesystem/process policy, SSH,
+`exec`, upload/download, sync, and provider injection keep working. The agent
+pod reaches the network proxy through a per-sandbox headless Service, and egress
+is confined by Kubernetes NetworkPolicy rather than pod-local nftables — so the
+agent pod needs no `NET_ADMIN`, no privileged init container, and no node
+component.
+
+The in-pod process supervisor holds a **scoped, process-kind gateway
+credential**: it can serve its sandbox's relays, push logs, read policy, and
+refresh its token, but it cannot read provider secrets or mint upstream
+credentials — those stay only in the separate proxy pod. Under a VM-based
+RuntimeClass (Kata), the workload and the credential-bearing proxy are in
+separate pods and therefore separate VMs/kernels.
+
+```mermaid
+flowchart TB
+  Sandbox["agents.x-k8s.io Sandbox"]
+
+  subgraph Namespace["Sandbox namespace"]
+    subgraph AgentPod["Agent pod"]
+      ProcSup["process supervisor<br/>--mode=process"]
+      Workload["Sandbox workload"]
+    end
+
+    SupervisorDeployment["Supervisor Deployment<br/>1 replica"]
+    subgraph SupervisorPod["Supervisor pod"]
+      NetworkProxy["network supervisor proxy<br/>proxyUid"]
+    end
+
+    Service["Headless Service"]
+    ProxyCA["Proxy CA Secret"]
+    AgentEgressPolicy["NetworkPolicy<br/>agent egress to supervisor + DNS"]
+    SupervisorIngressPolicy["NetworkPolicy<br/>supervisor ingress from paired agent"]
+  end
+
+  Gateway["OpenShell Gateway"]
+  External["External services"]
+
+  Sandbox --> AgentPod
+  Sandbox --> SupervisorDeployment
+  SupervisorDeployment --> SupervisorPod
+  AgentPod -->|"egress allowed by NetworkPolicy"| Service
+  Service --> NetworkProxy
+  NetworkProxy -->|"gateway forwarding"| Gateway
+  NetworkProxy -->|"policy-enforced egress"| External
+  ProxyCA -. mounted .- AgentPod
+  ProxyCA -. mounted .- SupervisorPod
+  AgentEgressPolicy -. selects .- AgentPod
+  SupervisorIngressPolicy -. selects .- SupervisorPod
+```
+
+OpenShell creates these per-sandbox resources:
+
+- Agent pod labeled `openshell.ai/sandbox-role=agent`.
+- Supervisor Deployment with one pod labeled `openshell.ai/sandbox-role=supervisor`.
+- Headless Service for the supervisor pod.
+- Proxy CA Secret shared through mounts.
+- NetworkPolicy that limits agent egress to the supervisor pod and DNS.
+- NetworkPolicy that accepts supervisor ingress only from the paired agent pod.
+
+The supervisor Deployment has a controlling `Sandbox` ownerReference so
+Kubernetes garbage collection removes it when the sandbox is deleted. The
+Deployment recreates the supervisor pod if the pod is deleted independently.
+
+Same-node scheduling is disabled by default. Set `proxy_pod.affinity` (or Helm
+`supervisor.proxyPod.affinity`) to `preferred` for soft same-node placement or
+`required` for hard same-node placement. Both modes match the paired supervisor
+on `kubernetes.io/hostname` and preserve any affinity supplied by the workload.
+
+The agent container runs the OpenShell process supervisor, which launches the
+workload the same way `combined` and `sidecar` do — from the sandbox spec, or
+the command passed to `openshell sandbox create -- <cmd>`. Because the
+supervisor is the container entrypoint, `containers.agent.command`/`args`
+overrides are rejected (as in the other topologies).
+
+The workload's children egress through the paired network proxy: the driver
+injects standard proxy variables and the proxy CA trust into the agent
+container, and the agent-egress NetworkPolicy allows the workload to reach only
+that proxy (plus DNS). The in-pod process supervisor reaches the gateway
+directly for its own session (relays, policy, log push) — the agent-egress
+NetworkPolicy permits that via `proxy_pod.gateway_peers` (the Helm chart renders
+it from the gateway's own pod labels by default). Network policy (L4/L7) is
+enforced by the proxy pod; filesystem/process policy, SSH/`connect`, `exec`,
+upload/download, sync, and provider injection are enforced by the in-pod process
+supervisor.
+
+<Warning>
+Proxy-pod topology requires NetworkPolicy enforcement to work as OpenShell
+expects. The target cluster must have a policy-enforcing CNI or equivalent
+NetworkPolicy controller before deploying this topology. Without enforcement,
+the agent pod is not forced through its paired supervisor proxy, so the
+agent-to-supervisor isolation policy is only declarative.
+</Warning>
+
 ## Credential Exposure
 
 Sidecar topology keeps gateway credentials in the network sidecar. The agent
@@ -182,6 +288,18 @@ of the already-running workload entrypoint. Use `combined` topology when you
 need the full single-supervisor enforcement path; use additional runtime
 isolation when you need a stronger container boundary around sidecar workloads.
 
+Proxy-pod topology keeps the process supervisor in the agent pod, so that pod
+holds a gateway credential — but a **scoped, process-kind** one. The gateway
+mints it (keyed on the pod's `sandbox-role=agent` label) so the agent pod can
+serve its own relays, push logs, read policy, and refresh its token, but is
+denied the network-supervisor RPCs that read provider secrets
+(`GetSandboxProviderEnvironment`) or mint upstream credentials
+(`ExchangeProviderSubjectToken`, `GetInferenceBundle`). Those run only in the
+separate proxy pod, which holds the full-authority credential and all provider
+secrets. A compromised agent pod is therefore bounded to its own sandbox's
+control plane and never reaches provider secrets. Network egress is isolated by
+the per-sandbox NetworkPolicies described above.
+
 ## RuntimeClass Isolation
 
 Sidecar topology has been validated with Kata Containers. It does not currently
@@ -195,6 +313,13 @@ mount-isolation controls that sidecar mode relaxes. Use them as an additional
 workload boundary, not as a replacement for the combined topology's full
 supervisor controls.
 
+Proxy-pod topology has been tested with Kata Containers and gVisor and is
+functional when the cluster enforces NetworkPolicies. Under Kata, the workload
+(agent pod) and the credential-bearing network proxy (supervisor pod) run in
+separate VMs with separate kernels, so a workload-VM kernel escape does not by
+itself reach the proxy or its provider secrets — an isolation boundary unique to
+proxy-pod among the topologies.
+
 You can set a default runtime class in the Kubernetes driver configuration or
 override it per sandbox with driver config:
 
@@ -204,9 +329,10 @@ openshell sandbox create \
   -- claude
 ```
 
-## Enable Sidecar Mode
+## Enable Alternate Topologies
 
-For direct gateway TOML configuration, set the Kubernetes driver fields:
+For direct gateway TOML configuration, set the Kubernetes driver fields for
+sidecar mode:
 
 ```toml
 [openshell.drivers.kubernetes]
@@ -222,7 +348,22 @@ runs the sidecar as UID 0 instead. The network init container exempts the
 effective sidecar UID from proxy redirection so the sidecar can reach the
 gateway.
 
-When the Helm chart renders `gateway.toml`, set the equivalent chart values:
+Set `topology="proxy-pod"` to use proxy-pod mode:
+
+```toml
+[openshell.drivers.kubernetes]
+topology = "proxy-pod"
+
+[openshell.drivers.kubernetes.proxy_pod]
+proxy_uid = 1337
+affinity = "disabled" # disabled | preferred | required
+```
+
+`proxy_pod.proxy_uid` must be a non-root UID and must not match the sandbox UID.
+It is used by the proxy supervisor pod created by the Deployment.
+
+When the Helm chart renders `gateway.toml`, set the equivalent chart values for
+sidecar mode:
 
 ```yaml
 supervisor:
@@ -231,6 +372,47 @@ supervisor:
     proxyUid: 1337
     processBinaryAwareNetworkPolicy: true
 ```
+
+Set `supervisor.topology=proxy-pod` to use proxy-pod mode:
+
+```yaml
+supervisor:
+  topology: proxy-pod
+  proxyPod:
+    proxyUid: 1337
+    affinity: disabled
+```
+
+On OpenShift (and any cluster whose DNS is not the upstream
+`kube-system`/`kube-dns` convention) you must also declare the cluster DNS peer
+and grant the built-in `nonroot-v2` SCC — otherwise the agent pod cannot resolve
+its supervisor Service and the supervisor pod is inadmissible:
+
+```yaml
+supervisor:
+  topology: proxy-pod
+  proxyPod:
+    proxyUid: 1337
+    affinity: disabled
+    # OpenShift runs cluster DNS in openshift-dns on container port 5353, not
+    # kube-system/53. Without this the agent egress NetworkPolicy denies DNS.
+    dnsPeers:
+      - namespaceLabels:
+          kubernetes.io/metadata.name: openshift-dns
+        podLabels:
+          dns.operator.openshift.io/daemonset-dns: default
+        port: 5353
+sandboxServiceAccount:
+  openshift:
+    # restricted-v2 rejects the driver's explicit non-root UIDs; nonroot-v2
+    # accepts them. Supported only with shared workspace mode.
+    nonrootSCC: true
+```
+
+Changing `supervisor.topology` away from proxy-pod while proxy-pod sandboxes
+still exist removes the RBAC those sandboxes need for lifecycle and cleanup. Set
+`supervisor.proxyPod.retainCompanionRbac=true` during such a migration and leave
+it set until every proxy-pod sandbox has been deleted.
 
 Leave `topology` unset, or set it to `combined`, to keep the original
 single-container supervisor path. For Helm installs, leave

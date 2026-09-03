@@ -57,6 +57,147 @@ tests:
           path: metadata.namespace
           value: other-ns
 
+  - it: grants only pod get for sandbox token bootstrap
+    template: templates/role.yaml
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - pods
+            verbs:
+              - get
+
+  - it: grants sandbox RBAC for proxy-pod supervisor Deployments
+    template: templates/role.yaml
+    set:
+      supervisor.topology: proxy-pod
+    asserts:
+      # No delete: companions are garbage-collected with the Sandbox CR.
+      # list + watch back the supervisor Deployment readiness watch.
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - apps
+            resources:
+              - deployments
+            verbs:
+              - create
+              - get
+              - list
+              - patch
+              - watch
+
+  - it: grants ReplicaSet get for proxy-pod supervisor token bootstrap
+    template: templates/role.yaml
+    set:
+      supervisor.topology: proxy-pod
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - apps
+            resources:
+              - replicasets
+            verbs:
+              - get
+
+  - it: grants proxy-pod Service Secret and NetworkPolicy RBAC only in proxy-pod mode
+    template: templates/role.yaml
+    set:
+      supervisor.topology: proxy-pod
+    asserts:
+      # Services: create + get (get for 409-verify), no delete (GC-owned).
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - services
+            verbs:
+              - create
+              - get
+      # Secrets: create only — the gateway never reads or deletes Secret contents.
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - secrets
+            verbs:
+              - create
+      # NetworkPolicies: the gateway-managed egress fence needs delete + list
+      # for ordered teardown and orphan reaping.
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - networking.k8s.io
+            resources:
+              - networkpolicies
+            verbs:
+              - create
+              - delete
+              - get
+              - list
+
+  - it: omits proxy-pod RBAC in the default combined topology
+    template: templates/role.yaml
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups:
+              - apps
+            resources:
+              - deployments
+            verbs:
+              - create
+              - delete
+              - get
+      - notContains:
+          path: rules
+          content:
+            apiGroups:
+              - apps
+            resources:
+              - replicasets
+            verbs:
+              - get
+      - notContains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - services
+              - secrets
+            verbs:
+              - create
+              - delete
+              - get
+              - list
+              - watch
+      - notContains:
+          path: rules
+          content:
+            apiGroups:
+              - networking.k8s.io
+            resources:
+              - networkpolicies
+            verbs:
+              - create
+              - delete
+              - get
+              - list
+              - watch
+
   - it: uses explicit sandboxNamespace for sandbox RoleBinding
     template: templates/rolebinding.yaml
     set:

@@ -82,6 +82,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::timeout;
 
 const SIDECAR_NETWORK_ENFORCEMENT_MODE: &str = "sidecar-nftables";
+const PROXY_POD_NETWORK_ENFORCEMENT_MODE: &str = "proxy-pod";
 const SIDECAR_TLS_DIR: &str = openshell_core::container_paths::SIDECAR_TLS_DIR;
 const SIDECAR_CA_CERT: &str = "openshell-ca.pem";
 const SIDECAR_CA_BUNDLE: &str = "ca-bundle.pem";
@@ -155,7 +156,9 @@ pub async fn run_sandbox(
         }
     }
 
+    let external_network_enforcement = external_network_enforcement_enabled();
     let sidecar_network_enforcement = sidecar_network_enforcement_enabled();
+    let proxy_pod_network_enforcement = proxy_pod_network_enforcement_enabled();
     let process_enforcement_mode = process_enforcement_mode();
     let process_uses_sidecar_control =
         process_enabled && !network_enabled && sidecar_network_enforcement;
@@ -177,7 +180,6 @@ pub async fn run_sandbox(
     } else {
         None
     };
-
     // Extension credentials are owned by this supervisor and shared by every
     // gateway connection it opens, so the middleware registry's bearer slots
     // and the policy poll loop that rotates them stay the same objects.
@@ -401,7 +403,7 @@ pub async fn run_sandbox(
     // it via setns(). The RAII handle lives in this frame for the duration
     // of the sandbox.
     #[cfg(target_os = "linux")]
-    let netns = if network_enabled && !sidecar_network_enforcement {
+    let netns = if network_enabled && !external_network_enforcement {
         openshell_supervisor_process::netns::create_netns_for_proxy(&policy)?
     } else {
         None
@@ -566,7 +568,7 @@ pub async fn run_sandbox(
     let sidecar_control_server = if network_enabled && sidecar_network_enforcement {
         if !matches!(policy.network.mode, NetworkMode::Proxy) {
             return Err(miette::miette!(
-                "sidecar network enforcement requires proxy network mode"
+                "external network enforcement requires proxy network mode"
             ));
         }
         let socket = sidecar_control_socket().ok_or_else(|| {
@@ -635,9 +637,9 @@ pub async fn run_sandbox(
     }
 
     #[cfg(not(target_os = "linux"))]
-    if network_enabled && sidecar_network_enforcement {
+    if network_enabled && external_network_enforcement {
         return Err(miette::miette!(
-            "sidecar network enforcement is only supported on Linux"
+            "external network enforcement is only supported on Linux"
         ));
     }
 
@@ -858,6 +860,8 @@ pub async fn run_sandbox(
                     sidecar_bootstrap_ca_file_paths
                         .clone()
                         .or_else(sidecar_ca_file_paths)
+                } else if proxy_pod_network_enforcement {
+                    sidecar_ca_file_paths()
                 } else {
                     None
                 }
@@ -1181,12 +1185,26 @@ fn sidecar_network_enforcement_enabled() -> bool {
         .is_ok_and(|value| value == SIDECAR_NETWORK_ENFORCEMENT_MODE)
 }
 
+fn proxy_pod_network_enforcement_enabled() -> bool {
+    std::env::var(openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE)
+        .is_ok_and(|value| value == PROXY_POD_NETWORK_ENFORCEMENT_MODE)
+}
+
+fn external_network_enforcement_enabled() -> bool {
+    std::env::var(openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE).is_ok_and(|value| {
+        matches!(
+            value.as_str(),
+            SIDECAR_NETWORK_ENFORCEMENT_MODE | PROXY_POD_NETWORK_ENFORCEMENT_MODE
+        )
+    })
+}
+
 fn process_enforcement_mode() -> ProcessEnforcementMode {
     match std::env::var(openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY)
         .ok()
         .as_deref()
     {
-        Some("sidecar") => ProcessEnforcementMode::NetworkOnly,
+        Some("sidecar" | "proxy-pod") => ProcessEnforcementMode::NetworkOnly,
         _ => ProcessEnforcementMode::Full,
     }
 }

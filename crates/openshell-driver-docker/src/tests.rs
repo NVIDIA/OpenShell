@@ -15,7 +15,7 @@ use openshell_core::progress::{
 use openshell_core::proto::compute::v1::{
     DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
     GetGatewayListenerRequirementsRequest, GpuResourceRequirements, ResourceRequirements,
-    gateway_listener_requirement::Selector,
+    SupervisorSessionModel, gateway_listener_requirement::Selector,
 };
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -3125,6 +3125,7 @@ fn exited_sandbox_with_ready_reason(reason: &str) -> DriverSandbox {
                 last_transition_time: String::new(),
             }],
             deleting: false,
+            supervisor_session_model: SupervisorSessionModel::Unspecified as i32,
         }),
         workspace: String::new(),
     }

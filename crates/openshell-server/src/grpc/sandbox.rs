@@ -120,6 +120,23 @@ impl Drop for WatchSandboxStream {
 /// Fetch a sandbox by ID and authorize the caller in one step, returning
 /// `NOT_FOUND` for both missing and unauthorized sandboxes so that callers
 /// cannot distinguish the two cases (CWE-203).
+/// Reject a relay-backed RPC when the sandbox's topology has no in-sandbox
+/// supervisor session. Reads the durable `SupervisorSession=NotApplicable`
+/// condition from the stored status so this holds on every gateway replica —
+/// not only the reconciler lease holder that populates the in-memory set — and
+/// returns the terminal `FailedPrecondition` the CLI must not retry, instead of
+/// making the caller wait out a session that will never arrive.
+fn reject_if_sessionless(sandbox: &Sandbox) -> Result<(), Status> {
+    if let Some(status) = sandbox.status.as_ref()
+        && crate::compute::sandbox_status_is_sessionless(status)
+    {
+        return Err(Status::failed_precondition(
+            openshell_core::error::no_supervisor_session_message(),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) async fn fetch_and_authorize_sandbox(
     state: &Arc<ServerState>,
     principal: &crate::auth::principal::Principal,
@@ -1695,6 +1712,8 @@ pub(super) async fn handle_exec_sandbox(
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
+    reject_if_sessionless(&sandbox)?;
+
     // Open a relay channel through the supervisor session. Use a 15s
     // session-wait timeout, enough to cover a transient supervisor reconnect
     // while still failing quickly during normal operation.
@@ -1702,7 +1721,15 @@ pub(super) async fn handle_exec_sandbox(
         .supervisor_sessions
         .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
         .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+        .map_err(|e| {
+            // Preserve the original code: a sessionless topology returns
+            // FailedPrecondition (terminal), which the CLI must not retry as it
+            // would a transient Unavailable.
+            Status::new(
+                e.code(),
+                format!("supervisor relay failed: {}", e.message()),
+            )
+        })?;
 
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
@@ -1813,6 +1840,7 @@ pub(super) async fn handle_forward_tcp(
     if !sandbox_relay_reachable(state, &sandbox) {
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
+    reject_if_sessionless(&sandbox)?;
 
     let connection_guard = acquire_forward_connection_guard(state, &init, &sandbox).await?;
     let (channel_id, relay_rx) = state
@@ -1824,7 +1852,15 @@ pub(super) async fn handle_forward_tcp(
             std::time::Duration::from_secs(15),
         )
         .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+        .map_err(|e| {
+            // Preserve the original code: a sessionless topology returns
+            // FailedPrecondition (terminal), which the CLI must not retry as it
+            // would a transient Unavailable.
+            Status::new(
+                e.code(),
+                format!("supervisor relay failed: {}", e.message()),
+            )
+        })?;
 
     let sandbox_id = sandbox.object_id().to_string();
     let (tx, rx) = mpsc::channel::<Result<TcpForwardFrame, Status>>(256);
@@ -2136,11 +2172,25 @@ pub(super) async fn handle_exec_sandbox_interactive(
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
+    // A sessionless topology (e.g. proxy-pod) has no in-sandbox supervisor to
+    // relay to. Reject from the durable status on every replica, so a follower
+    // returns the terminal FailedPrecondition immediately instead of waiting out
+    // the relay-open timeout and returning retryable Unavailable.
+    reject_if_sessionless(&sandbox)?;
+
     let (channel_id, relay_rx) = state
         .supervisor_sessions
         .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
         .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+        .map_err(|e| {
+            // Preserve the original code: a sessionless topology returns
+            // FailedPrecondition (terminal), which the CLI must not retry as it
+            // would a transient Unavailable.
+            Status::new(
+                e.code(),
+                format!("supervisor relay failed: {}", e.message()),
+            )
+        })?;
 
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;

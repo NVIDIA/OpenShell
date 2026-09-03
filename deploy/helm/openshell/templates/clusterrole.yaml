@@ -147,3 +147,63 @@ rules:
       - update
   {{- end }}
   {{- end }}
+  {{- if and (ne $workspaceMode "shared") (or (eq (.Values.supervisor.topology | default "combined") "proxy-pod") .Values.supervisor.proxyPod.retainCompanionRbac) }}
+  # Proxy-pod topology creates a supervisor Deployment, Service, CA Secret, and
+  # NetworkPolicy pair per sandbox in the sandbox's namespace. In managed and
+  # operator modes that namespace is per-workspace, so these permissions must be
+  # cluster-scoped; shared mode grants the same access through the namespaced
+  # Role instead. Companions are owner-referenced to the Sandbox CR and removed
+  # by garbage collection when it is deleted, so no `delete` verbs are granted —
+  # a compromised gateway must not be able to delete cluster resources. `get`
+  # supports crash-recovery reconciliation and, on deployments, readiness and
+  # the ServiceAccount-bootstrap owner-chain check. `patch` on deployments scales
+  # the supervisor on stop/start. The gateway never reads Secret contents, so
+  # Secrets get `create` only (no cluster-wide Secret read). Note: `list`/`watch`
+  # on deployments are intentionally NOT granted cluster-wide — the supervisor
+  # Deployment readiness watch is enabled only in shared (single-namespace) mode
+  # via the namespaced Role; managed/operator modes fold supervisor readiness in
+  # through get/list and the periodic reconcile to avoid cluster-wide Deployment
+  # enumeration.
+  - apiGroups:
+      - apps
+    resources:
+      - deployments
+    verbs:
+      - create
+      - get
+      - patch
+  - apiGroups:
+      - apps
+    resources:
+      - replicasets
+    verbs:
+      - get
+  - apiGroups:
+      - ""
+    resources:
+      - services
+    verbs:
+      - create
+      - get
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - create
+  # The agent egress NetworkPolicy (the workload's egress fence) has no owner
+  # reference so it can outlive the workload pod during deletion; the gateway
+  # manages its lifecycle directly. `delete` tears it down after the pod is gone,
+  # and `list` lets reconciliation reap fences orphaned by a gateway crash.
+  # Owner-referenced NetworkPolicies (supervisor ingress) are garbage-collected
+  # with the Sandbox CR.
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - networkpolicies
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+  {{- end }}

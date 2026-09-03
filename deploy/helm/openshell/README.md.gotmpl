@@ -40,13 +40,17 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <vers
 
 ## Install on OpenShift
 
-See the full [OpenShift install guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) for details. Quick start:
+See the full [OpenShift install guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) for details. The SCC the sandbox service account needs depends on the supervisor topology.
+
+### combined (default) or sidecar
+
+These topologies enforce network policy inside the sandbox pod and require the `privileged` SCC on the sandbox service account:
 
 ```shell
 # Precreate the openshell namespace so we can create the SCC cluster role
 oc create ns openshell
 
-# Sandboxes are deployed into the openshell namespace and use the openshell-sandbox service account
+# Sandboxes use the openshell-sandbox service account
 oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell
 
 # Deploy openshell with overrides to allow SCC assignment of fsGroup and runAsUser for the gateway
@@ -54,6 +58,21 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <vers
   --set server.disableTls=true \
   --set podSecurityContext.fsGroup=null \
   --set securityContext.runAsUser=null
+```
+
+### proxy-pod
+
+Network enforcement moves to a separate supervisor pod, so sandbox pods run non-root with `drop: ALL` and need no elevated privileges. The built-in `nonroot-v2` SCC is sufficient — do not grant `privileged`. Let the chart bind `nonroot-v2` via `sandboxServiceAccount.openshift.nonrootSCC=true` (requires the default `workspaceMode=shared`); no manual `oc adm policy` step for the sandbox service account is needed:
+
+```shell
+oc create ns openshell
+
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> -n openshell \
+  --set server.disableTls=true \
+  --set podSecurityContext.fsGroup=null \
+  --set securityContext.runAsUser=null \
+  --set supervisor.topology=proxy-pod \
+  --set sandboxServiceAccount.openshift.nonrootSCC=true
 ```
 
 ## Available versions

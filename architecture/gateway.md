@@ -240,10 +240,28 @@ to the selected compute driver's `AuthenticateSandbox` RPC. A capable driver is
 trusted to return the authenticated sandbox ID, while the gateway still requires
 a matching durable sandbox record before minting a JWT. The Kubernetes driver
 uses its own named configuration to run TokenReview and verify the live pod and
-controlling Sandbox CR. The bootstrap path accepts
+controlling Sandbox CR: agent pods must be directly controlled by the `Sandbox`
+CR, while proxy-pod supervisor pods may be controlled through the Kubernetes
+`Pod -> ReplicaSet -> Deployment -> Sandbox` chain. The bootstrap path accepts
 both `agents.x-k8s.io/v1beta1` ownerReferences from newer Agent Sandbox
 controllers and `agents.x-k8s.io/v1alpha1` ownerReferences from existing
-deployments. Supervisors renew gateway JWTs in memory before expiry only while
+deployments. The proxy-pod gateway Role follows least privilege: the supervisor
+Deployment, Service, CA Secret, and supervisor-ingress NetworkPolicy are
+owner-referenced to the Sandbox CR and garbage-collected with it, so the gateway
+holds no `delete` on them (Deployment create/get/patch, Service
+create/get, Secret create only, plus get on the ReplicaSet for the owner-chain
+check). In shared (single-namespace) mode the namespaced Role also grants
+Deployment `list`/`watch`, backing a supervisor Deployment watch that pushes a
+refreshed sandbox status within seconds of a supervisor availability change;
+managed and operator modes deliberately omit those verbs to avoid cluster-wide
+Deployment enumeration, folding readiness in through get/list instead. A periodic
+reconcile (alongside the one at watch establishment) corrects supervisor replica
+drift and reaps orphaned fences without waiting for the watch to drop. The agent
+egress NetworkPolicy — the workload's egress fence — carries
+no owner reference so it can outlive the workload pod during deletion; the gateway
+manages its lifecycle directly and holds create/get/delete/list on NetworkPolicies
+for ordered teardown and orphan reaping.
+Supervisors renew gateway JWTs in memory before expiry only while
 the sandbox record still exists. Older tokens are not server-revoked; shared
 deployments bound replay exposure with short `gateway_jwt.ttl_secs` lifetimes.
 The config default is

@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+suite: OpenShift sandbox SCC grant
+templates:
+  - templates/sandbox-scc.yaml
+tests:
+  - it: renders nothing by default so non-OpenShift installs never reference OpenShift APIs
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: grants use of the built-in nonroot-v2 SCC when enabled
+    set:
+      sandboxServiceAccount.openshift.nonrootSCC: true
+    documentIndex: 0
+    asserts:
+      - isKind:
+          of: ClusterRole
+      - equal:
+          path: rules[0].resourceNames[0]
+          value: nonroot-v2
+      - equal:
+          path: rules[0].verbs[0]
+          value: use
+
+  - it: binds the SCC grant to the sandbox ServiceAccount
+    set:
+      sandboxServiceAccount.openshift.nonrootSCC: true
+    documentIndex: 1
+    asserts:
+      - isKind:
+          of: ClusterRoleBinding
+      - equal:
+          path: subjects[0].kind
+          value: ServiceAccount
+      - equal:
+          path: subjects[0].name
+          value: RELEASE-NAME-openshell-sandbox
+
+  - it: creates no SecurityContextConstraints object of its own
+    set:
+      sandboxServiceAccount.openshift.nonrootSCC: true
+    asserts:
+      - hasDocuments:
+          count: 2

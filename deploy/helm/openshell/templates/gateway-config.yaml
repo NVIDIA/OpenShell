@@ -219,6 +219,47 @@ data:
     proxy_uid                    = {{ .Values.supervisor.sidecar.proxyUid | default 1337 }}
     process_binary_aware_network_policy = {{ .Values.supervisor.sidecar.processBinaryAwareNetworkPolicy }}
 
+    [openshell.drivers.kubernetes.proxy_pod]
+    proxy_uid                    = {{ .Values.supervisor.proxyPod.proxyUid | default 1337 }}
+    affinity                     = {{ .Values.supervisor.proxyPod.affinity | default "disabled" | quote }}
+    retain_companion_management  = {{ .Values.supervisor.proxyPod.retainCompanionRbac | default false }}
+    {{- range .Values.supervisor.proxyPod.dnsPeers }}
+
+    [[openshell.drivers.kubernetes.proxy_pod.dns_peers]]
+    {{- with .namespaceLabels }}
+    {{- $pairs := list }}{{ range $k, $v := . }}{{ $pairs = append $pairs (printf "%q = %q" $k $v) }}{{ end }}
+    namespace_labels = { {{ join ", " $pairs }} }
+    {{- end }}
+    {{- with .podLabels }}
+    {{- $pairs := list }}{{ range $k, $v := . }}{{ $pairs = append $pairs (printf "%q = %q" $k $v) }}{{ end }}
+    pod_labels = { {{ join ", " $pairs }} }
+    {{- end }}
+    port = {{ .port | default 53 }}
+    {{- end }}
+    {{- if .Values.supervisor.proxyPod.gatewayPeers }}
+    {{- range .Values.supervisor.proxyPod.gatewayPeers }}
+
+    [[openshell.drivers.kubernetes.proxy_pod.gateway_peers]]
+    {{- with .namespaceLabels }}
+    {{- $pairs := list }}{{ range $k, $v := . }}{{ $pairs = append $pairs (printf "%q = %q" $k $v) }}{{ end }}
+    namespace_labels = { {{ join ", " $pairs }} }
+    {{- end }}
+    {{- with .podLabels }}
+    {{- $pairs := list }}{{ range $k, $v := . }}{{ $pairs = append $pairs (printf "%q = %q" $k $v) }}{{ end }}
+    pod_labels = { {{ join ", " $pairs }} }
+    {{- end }}
+    port = {{ .port | default $.Values.service.port }}
+    {{- end }}
+    {{- else }}
+
+    # Default: permit the in-pod process supervisor to reach this gateway's own
+    # pods on the service port. Override with supervisor.proxyPod.gatewayPeers.
+    [[openshell.drivers.kubernetes.proxy_pod.gateway_peers]]
+    namespace_labels = { "kubernetes.io/metadata.name" = {{ .Release.Namespace | quote }} }
+    pod_labels = { "app.kubernetes.io/name" = {{ include "openshell.name" . | quote }}, "app.kubernetes.io/instance" = {{ .Release.Name | quote }} }
+    port = {{ .Values.service.port }}
+    {{- end }}
+
     {{- if not $credentialDrivers }}
 
     [openshell.gateway.credential_storage]

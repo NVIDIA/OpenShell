@@ -32,6 +32,7 @@ e2e-kubernetes = ["e2e"]
 e2e-kubernetes-credential-drivers = ["e2e-kubernetes"]
 e2e-kubernetes-workspace-managed = ["e2e-kubernetes"]
 e2e-kubernetes-workspace-operator = ["e2e-kubernetes"]
+e2e-kubernetes-proxy-pod = ["e2e-kubernetes"]
 e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
 e2e-oidc-pkce = []
@@ -127,6 +128,11 @@ required-features = ["e2e-kubernetes"]
 name = "kubernetes_corporate_proxy"
 path = "tests/kubernetes_corporate_proxy.rs"
 required-features = ["e2e-kubernetes"]
+
+[[test]]
+name = "proxy_pod"
+path = "tests/proxy_pod.rs"
+required-features = ["e2e-kubernetes-proxy-pod"]
 
 [[test]]
 name = "credential_drivers"

@@ -193,6 +193,18 @@ impl ServiceRouteError {
         )
     }
 
+    /// The sandbox's topology has no in-sandbox supervisor session to relay
+    /// through (e.g. proxy-pod), so HTTP service routing is not available. A
+    /// terminal condition, mirroring the `FailedPrecondition` the exec/forward
+    /// gRPC paths return for the same topologies.
+    const fn no_supervisor_session() -> Self {
+        Self::new(
+            StatusCode::PRECONDITION_FAILED,
+            "Sandbox topology has no in-sandbox supervisor; HTTP service routing is unavailable",
+            "no supervisor session",
+        )
+    }
+
     const fn invalid_request() -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
@@ -287,6 +299,27 @@ async fn proxy_to_endpoint(
     };
     if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         let err = ServiceRouteError::sandbox_not_ready();
+        emit_service_http_failure(
+            &state,
+            &req,
+            &sandbox_name,
+            &service_name,
+            Some(&endpoint),
+            &err,
+        );
+        return Err(err);
+    }
+    // A sessionless topology (e.g. proxy-pod) has no in-sandbox supervisor to
+    // relay through. Reject from the durable status here — on every replica, not
+    // just the reconciler leader that populates the in-memory sessionless set —
+    // so an HA follower returns immediately instead of waiting out the relay-open
+    // timeout. Mirrors the guard the exec/interactive/forward gRPC paths apply.
+    if sandbox
+        .status
+        .as_ref()
+        .is_some_and(crate::compute::sandbox_status_is_sessionless)
+    {
+        let err = ServiceRouteError::no_supervisor_session();
         emit_service_http_failure(
             &state,
             &req,
@@ -1068,6 +1101,14 @@ mod tests {
             response.headers()[header::CONTENT_TYPE],
             "text/plain; charset=utf-8"
         );
+    }
+
+    #[test]
+    fn sessionless_route_error_is_terminal_precondition_failed() {
+        // A sessionless topology must return a terminal 4xx (like the exec/forward
+        // FailedPrecondition), not a retryable 5xx that a client would keep hitting.
+        let response = ServiceRouteError::no_supervisor_session().into_response();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
     }
 
     #[test]

@@ -138,3 +138,24 @@ impl From<ComputeDriverError> for tonic::Status {
         }
     }
 }
+
+/// Stable marker embedded in the gateway's rejection of relay-backed RPCs for
+/// sandboxes whose topology has no in-sandbox process supervisor.
+///
+/// SSH, `exec`, port forwarding, and file transfer all travel over the
+/// supervisor session, which such a topology never opens. The CLI matches on
+/// this marker to explain the situation rather than surfacing a raw gRPC
+/// error, so callers must keep the two in sync. It is deliberately a distinct
+/// token rather than prose so rewording the message cannot break detection.
+pub const NO_SUPERVISOR_SESSION_MARKER: &str = "openshell:no-supervisor-session";
+
+/// Full message returned for relay-backed RPCs against such a sandbox.
+#[must_use]
+pub fn no_supervisor_session_message() -> String {
+    format!(
+        "this sandbox's topology runs no supervisor inside the sandbox, so SSH, exec, port \
+         forwarding, and file transfer are unavailable. Policy-enforced network egress is \
+         unaffected. Use the `combined`, `sidecar`, or `cni-sidecar` topology when interactive \
+         sessions are required. [{NO_SUPERVISOR_SESSION_MARKER}]"
+    )
+}
