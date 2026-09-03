@@ -402,15 +402,7 @@ See `CI.md` for the contributor workflow, labels, and maintainer merge-queue wor
 
 ## Docs Site
 
-Published docs live in `docs/`. Navigation lives in `docs/index.yml`. Fern site
-configuration, components, theme assets, and publish settings live in `fern/`.
-
-Use `mise run docs` for strict validation and `mise run docs:serve` for local
-preview. PR previews are produced by `.github/workflows/branch-docs.yml` when
-Fern credentials are available. Production docs publish from the release tag
-workflow.
-
-Versioned site snapshots live on the generated `docs-website` branch. Maintainers use `.github/workflows/sync-docs.yml` to refresh or remove snapshots while preserving the others. The generated branch records each managed snapshot's source commit and release version. Release Dev updates `dev` only when its development version is not older than the current snapshot, and it owns the shared Fern configuration, components, theme assets, and CSS. A stable Release Tag run creates an immutable `vX.Y.Z` snapshot and updates `latest` only when the release is not older than the current Latest version. Releases starting with v0.1.0 receive Fern's Stable availability status. Both release workflows wait for their other publication jobs, then call the docs workflow once. The workflow queues and serializes the branch update and one production publish attempt under the `docs-website` concurrency group. `.github/workflows/publish-docs-website.yml` remains available for explicit preview or production publishing of the generated branch.
+Published docs live in `docs/`, and Fern site configuration lives in `fern/`. See [fern/README.md](../fern/README.md) for the source layout, local development commands, version model, and publishing workflows.
 
 ## Validation Expectations
 
