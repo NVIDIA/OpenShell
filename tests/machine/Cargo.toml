@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "machine"
+version = "0.0.1"
+authors = ["Simon Scatton <sscatton@nvidia.com>"]
+license = "Apache-2.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { version = "1.0", default-features = false, features = ["std", "backtrace"] }
+clap = { version = "4.6.6", default-features = false, features = ["color", "derive", "help", "std", "usage"] }
+directories = { version = "6.0.0", default-features = false }
+hex = { version = "0.4", default-features = false, features = ["std", "alloc", "serde"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+serde-saphyr = { version = "1.2", default-features = false, features = ["deserialize"] }
+sha2 = { version = "0.11.0", default-features = false }
+thiserror = { version = "2.0", default-features = false, features = ["std"] }
+tokio = { version = "1.53.1", default-features = false, features = ["fs", "io-util", "rt-multi-thread"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["ansi", "fmt"] }
+url = { version = "2.5", default-features = false }
+
+[workspace]
+
+[lints.rust]
+warnings = "deny"
+future-incompatible = { level = "deny", priority = -1 }
+rust-2024-compatibility = { level = "deny", priority = -1 }
+unsafe-code = "forbid"
+unused = { level = "deny", priority = -1 }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+cargo-common-metadata = "allow"
+exhaustive-enums = "deny"
+expect-used = "deny"
+# TODO: Remove once ICU4X publishes its migration from syn 2 to syn 3.
+multiple-crate-versions = "allow"
+unwrap-used = "deny"
