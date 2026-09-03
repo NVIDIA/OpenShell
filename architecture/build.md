@@ -288,7 +288,7 @@ the release tag.
 
 ## CI and E2E
 
-Required checks run on GitHub Actions. Workflows that use NVIDIA self-hosted runners trigger from copy-pr-bot mirror branches, so trusted PRs are mirrored into `pull-request/<N>` branches before those workflows run. `main` also uses GitHub merge queue so the final queued integration commit is validated before it merges.
+Required checks run on GitHub Actions. Pull-request workflows that use NVIDIA self-hosted runners trigger from copy-pr-bot mirror branches, so trusted PRs are mirrored into `pull-request/<N>` branches before those workflows run. `main` also uses GitHub merge queue so the final queued integration commit is validated before it merges.
 
 The high-level CI model:
 
@@ -307,16 +307,19 @@ synthetic activity from contributing to product usage metrics.
 Static security checks are deliberately outside the mirror-branch path. They run
 directly on GitHub-hosted runners and none of them consume NVIDIA self-hosted
 capacity. The change-oriented ones receive no secrets, so they also cover fork
-pull requests; Codex Security release qualification is the exception because it
-needs a scoped API key. That key routes Codex Security's model calls to
-NVIDIA-hosted inference; the job itself still runs on a GitHub-hosted runner and
-uses no NVIDIA self-hosted runner. Scanner jobs request `security-events: write`
-and upload SARIF to Code Scanning directly on every event they run on, including
-fork and Dependabot pull requests, which Code Scanning permits for
+pull requests. Codex Security release qualification is the exception: it needs a
+scoped API key, which routes its model calls to NVIDIA-hosted inference while
+the job itself stays GitHub-hosted. That placement is load-bearing rather than
+incidental: on the repository self-hosted runner the scan agent executes no
+shell commands at all, so its preflight never scopes the diff and it seals no
+draft. Scanner jobs request `security-events: write` and upload SARIF to Code
+Scanning directly on every event they run on, including fork and Dependabot
+pull requests, which Code Scanning permits for
 `pull_request` runs despite their read-only `GITHUB_TOKEN`. No privileged
-intermediate workflow relays those uploads. Report retention differs by scanner:
-Actionlint, Zizmor, and CodeQL keep their reports as workflow artifacts, and
-Codex Security keeps no raw report.
+intermediate workflow relays those uploads. Manually dispatched Codex Security
+runs are the one opt-in exception, described below. Report retention differs by
+scanner: Actionlint, Zizmor, and CodeQL keep their reports as workflow artifacts,
+and Codex Security keeps no raw report.
 Triggers differ by workflow: `.github/workflows/workflow-security.yml` runs on
 `pull_request`, `merge_group`, `main`, and a weekly schedule;
 `.github/workflows/dependency-review.yml` runs on `pull_request` and
@@ -361,11 +364,23 @@ a pull request or merge group.
   calls go to NVIDIA-hosted inference at `https://inference-api.nvidia.com/v1`,
   declared as a custom Codex provider named `nvidia` that uses the Responses
   wire API with WebSockets disabled. The scan runs `openai/openai/gpt-5.6-sol`
-  at `medium` reasoning effort. The `CODEX_SECURITY_API_KEY` secret holds the
+  at `medium` reasoning effort, with the multi-agent runtime capped at eight
+  concurrent threads through
+  `features.multi_agent_v2.max_concurrent_threads_per_session`. The
+  `CODEX_SECURITY_API_KEY` secret holds the
   NVIDIA key and is exposed to the scan step alone, as `OPENAI_API_KEY` so the
   CLI selects API-key auth and as `NVIDIA_INFERENCE_API_KEY`, the provider
-  `env_key` read by the Codex child process.
-  `tasks/scripts/codex-security-release-range.mjs` resolves the scan range: the
+  `env_key` read by the Codex child process. `CODEX_SECURITY_STATE_DIR` and
+  `SCAN_DIR` are suffixed with `github.run_id` and `github.run_attempt` and
+  created mode `700`, so no scanner state or result set from a previous run or
+  retry attempt is reused even on a runner with a reusable temp directory.
+  `tasks/scripts/codex_security_range.py` resolves the scan range, reusing the
+  tag parsers in `tasks/scripts/release.py` so both stay on one definition of a
+  release tag while requiring the `v` prefix that a release workflow needs. The
+  job stages both files out of the workspace from the workflow's own revision
+  and runs the resolver by absolute path, because a scanned candidate predates
+  them and a revision under scan must not choose its own scan range. The range
+  itself is resolved against the checked-out candidate: the
   candidate must be a `vX.Y.Z-pre.N` tag that is an ancestor of `origin/main`,
   and the base is the newest stable `vX.Y.Z` tag merged into the candidate that
   is strictly older than the release train `vX.Y.Z` the candidate targets. A
@@ -374,12 +389,38 @@ a pull request or merge group.
   stable-to-candidate diff, so later candidates re-cover earlier ones. SARIF is
   uploaded against `refs/heads/main` at the candidate commit under the
   train-scoped category `codex-security/vX.Y.Z`, which makes each candidate's
-  analysis replace the previous one for that train. Codex Security 0.1.24 cannot
-  apply `--max-cost` to a slash-qualified model identifier, so the run has no
-  CLI-enforced cost ceiling. Spend is bounded instead by the 120-minute job
-  timeout, a single repository-wide concurrency group that serializes
+  analysis replace the previous one for that train. Automatic pre-release tag
+  pushes and `workflow_call` runs always upload. `workflow_dispatch` runs still
+  perform the scan and the SARIF export, but skip the Code Scanning upload
+  unless the caller sets the `upload_sarif` input, so manual diagnostics do not
+  overwrite a train's published analysis by default. Codex Security 0.1.24
+  cannot apply `--max-cost` to a slash-qualified model identifier, so the run
+  has no CLI-enforced cost ceiling. Spend is bounded instead by the 120-minute
+  job timeout, a single repository-wide concurrency group that serializes
   qualification so starting a newer candidate cancels an in-flight one, and
   NVIDIA account-side controls. No raw report is retained.
+- The job clears `kernel.apparmor_restrict_unprivileged_userns` before
+  installing the scanner. Codex confines model-run commands with bubblewrap,
+  which needs unprivileged user namespaces; Ubuntu 24.04 restricts those through
+  AppArmor, so bubblewrap fails to configure the sandbox network namespace
+  (`bwrap: loopback: Failed RTM_NEWADDR`) and the agent executes no commands at
+  all. The failure is silent: the agent retries its shell tool, gives up, and
+  seals no draft, while the scanner only reports a missing or incomplete draft.
+  Lifting a kernel restriction on the runner is what allows the sandbox that
+  confines the agent to start, and the runner is ephemeral and GitHub-hosted.
+- The scan sets `approval_policy="never"`. Codex Security keeps
+  `approvals_reviewer="auto_review"` unconditionally, and that reviewer runs on
+  its own model rather than the configured one. Because the workflow declares a
+  single provider that serves only `openai/openai/gpt-5.6-sol`, any approval
+  request reaches a model the endpoint does not serve, so the agent never gets a
+  shell command approved and seals no draft. The scan stays confined by its
+  `workspace-write` sandbox with network access disabled and by the scanner's
+  own permission profile, which grants read access to the filesystem root and
+  write access only to the workspace roots.
+- A scan that cannot execute commands reports only a missing or incomplete
+  draft, so diagnosing one means reading the scanner's session rollouts under
+  `CODEX_SECURITY_STATE_DIR`, where every shell command the agent ran is
+  recorded. No command at all is the signal that the sandbox failed to start.
 
 Findings never fail these checks; scanner and build failures do. A scanner that
 cannot run, a CodeQL analyzer that does not complete, an unexpected Dependency
