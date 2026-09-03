@@ -27,6 +27,10 @@ REQUIRED_STEP_5_IDS = {
     "portable-lifecycle-podman",
     "portable-lifecycle-vm",
 }
+REQUIRED_STEP_6_IDS = {
+    "gateway-tls-client-auth-policy",
+    "gateway-wide-process-options",
+}
 ALLOWED_STATUSES = {
     "pass",
     "intentional_change",
@@ -97,10 +101,10 @@ def test_step_5_covers_every_in_tree_compute_driver() -> None:
     }
 
 
-def test_pass_results_pin_executed_commits_and_evidence() -> None:
+def test_executed_results_pin_commits_and_evidence() -> None:
     manifest = load_toml(RESULTS_PATH)
     for result in manifest["result"]:
-        if result["status"] != "pass":
+        if result["status"] not in {"pass", "intentional_change"}:
             continue
 
         assert set(result) >= PASS_FIELDS, result["id"]
@@ -118,6 +122,17 @@ def test_pass_results_pin_executed_commits_and_evidence() -> None:
             cwd=REPO_ROOT,
             check=True,
         )
+
+
+def test_step_6_records_gateway_option_and_tls_dispositions() -> None:
+    results = [
+        result for result in load_toml(RESULTS_PATH)["result"] if result["step"] == 6
+    ]
+
+    assert {result["id"] for result in results} == REQUIRED_STEP_6_IDS
+    statuses = {result["id"]: result["status"] for result in results}
+    assert statuses["gateway-wide-process-options"] == "pass"
+    assert statuses["gateway-tls-client-auth-policy"] == "intentional_change"
 
 
 def test_platform_blocked_results_name_owner_lane_and_blocker() -> None:
