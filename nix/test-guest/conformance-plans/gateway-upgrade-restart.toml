@@ -11,6 +11,9 @@ timeout_secs = 60
 scenario = "smoke"
 
 [[runs]]
+scenario = "sandbox-lifecycle"
+
+[[runs]]
 scenario = "sandbox-continuity"
 workload_expectation = "reconciled"
 
