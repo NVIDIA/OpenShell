@@ -176,10 +176,16 @@ message HttpResponsePreflight {
   // whole-body input/replacement and each stream replacement. Stream inputs use
   // at most half this limit.
   uint64 max_payload_bytes = 7;
-  // Modes computed once from the original response head. HEADERS_ONLY is always
-  // present and is the only mode for bodyless, partial, encoded, or no-transform
-  // responses. Oversized or open-ended responses omit WHOLE_BODY_BYTES.
-  // Selecting an unlisted mode fails according to on_error.
+  // Modes derived independently for this stage. OpenShell first determines
+  // response-shape eligibility from the original final response head, then
+  // applies this stage's effective max_payload_bytes. Different stages may
+  // receive different lists. HEADERS_ONLY is always present and is the only
+  // mode for bodyless, partial, encoded, or no-transform responses. For an
+  // otherwise eligible response, a known body larger than this stage's limit
+  // omits WHOLE_BODY_BYTES. An eligible unknown-length response may select
+  // WHOLE_BODY_BYTES and later fail with whole_body_over_capacity according to
+  // this stage's on_error. Selecting an unlisted mode fails according to
+  // on_error.
   repeated HttpResponseBodyMode permitted_body_modes = 8;
   // Allows STREAM_BYTES replacements to defer bytes across units. Set only for
   // fail-closed stages; fail-open stages cannot defer.
