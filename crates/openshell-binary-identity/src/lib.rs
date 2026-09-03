@@ -9,7 +9,9 @@
 //! collects its process ancestry. Backends bind the returned identity to the
 //! intercepted connection before constructing a `MediatedConnection`.
 
-use openshell_isolation_interface::contract::{BinaryIdentity, ResolveError, Sha256Digest};
+#[cfg(target_os = "linux")]
+use openshell_isolation_interface::contract::Sha256Digest;
+use openshell_isolation_interface::contract::{BinaryIdentity, ResolveError};
 
 /// Resolves executable identity from a Linux procfs process identifier.
 ///
@@ -63,7 +65,13 @@ impl ProcfsIdentityResolver {
 
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (self, pid);
+            match self.ancestry_scope {
+                AncestryScope::PidNamespace => {}
+                AncestryScope::ProcessTree(ancestor_root) => {
+                    let _ = ancestor_root;
+                }
+            }
+            let _ = pid;
             Err(ResolveError::Failed(
                 "procfs binary identity is only available on Linux".to_string(),
             ))
