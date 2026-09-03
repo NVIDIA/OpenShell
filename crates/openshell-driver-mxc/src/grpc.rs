@@ -35,15 +35,6 @@ impl ComputeDriverService {
 
 #[tonic::async_trait]
 impl ComputeDriver for ComputeDriverService {
-    async fn authenticate_sandbox(
-        &self,
-        _request: Request<AuthenticateSandboxRequest>,
-    ) -> Result<Response<AuthenticateSandboxResponse>, Status> {
-        Err(Status::unimplemented(
-            "MXC driver does not authenticate sandbox credentials",
-        ))
-    }
-
     async fn get_capabilities(
         &self,
         _request: Request<GetCapabilitiesRequest>,
