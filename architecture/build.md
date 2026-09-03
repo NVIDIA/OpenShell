@@ -257,11 +257,14 @@ and retain that provenance with the local entry; mutable tags are used only
 for explicit publication.
 
 CLI conformance runs after target provisioning. Action-free scenarios operate
-only through the configured OpenShell CLI. A versioned conformance plan may add
-an ordered sequence of target-supplied host-side actions, such as a gateway
-restart, while the scenario remains responsible for black-box sandbox
-continuity checks. The plan exposes opaque executable paths and timeouts rather
-than driver or package-manager configuration; target setup owns those details.
+only through the configured OpenShell CLI. A scenario may be a named
+collection of internal leaf scenarios. Collections are selected and reported
+as one scenario while their runner owns cleanup for every child. A versioned
+conformance plan may add an ordered sequence of target-supplied host-side
+actions, such as a gateway restart, while the scenario remains responsible for
+black-box sandbox continuity checks. The plan exposes opaque executable paths
+and timeouts rather than driver or package-manager configuration; target setup
+owns those details.
 
 ## Python Wheel Packaging
 
