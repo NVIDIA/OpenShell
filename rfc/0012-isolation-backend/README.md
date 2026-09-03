@@ -307,10 +307,10 @@ This RFC supersedes RFC 0001's fixed in-sandbox supervisor placement and its ass
 Every failure carries a machine-readable kind for supervisor status mapping:
 
 ```rust
-enum BackendErrorKind { Invalid, Denied, Unavailable, Failed, Terminated }
+enum BackendErrorKind { Invalid, Denied, Unavailable, Unsupported, Failed, Terminated }
 ```
 
-`Invalid` covers descriptor, version, and backend mismatches; `Denied` covers authenticated attachment rejection; `Unavailable` covers transient inability to serve an operation; `Failed` covers other backend faults; and `Terminated` reports boundary or workload termination, or an operation against an inactive boundary. An error never advances the lifecycle or authorizes an operation, and backend selection never falls back.
+`Invalid` covers descriptor, version, and backend mismatches; `Denied` covers authenticated attachment rejection; `Unavailable` covers transient inability to serve an operation; `Unsupported` identifies an optional operation the selected backend does not implement; `Failed` covers other backend faults; and `Terminated` reports boundary or workload termination, or an operation against an inactive boundary. An error never advances the lifecycle or authorizes an operation, and backend selection never falls back.
 
 A backend may retry backend-private work within one `attach` call. The supervisor calls `attach` at most once per provisioned topology. If it does not return `Bound`, the topology is reclaimed rather than reused.
 
