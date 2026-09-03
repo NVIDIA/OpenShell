@@ -95,3 +95,39 @@ evidence = [
   "Schema v2 now rejects the unsupported file field while preserving the established derived policy: CA without OIDC requires a client certificate, while CA with OIDC permits bearer-only clients and validates certificates that are presented.",
   "Focused preparation tests cover both derived branches, and TLS integration tests pass required-certificate, optional-certificate, valid-CA, wrong-CA, and multiplexed HTTP/gRPC handshakes.",
 ]
+
+[[result]]
+id = "docker-driver-option-parity"
+step = 7
+capability = "Docker image, callback, pull-policy, resource, security, provider, and mount options"
+driver = "docker"
+status = "platform_blocked"
+owner = "OpenShell Linux Docker CI lane"
+lane = "linux-x86_64-docker-with-apparmor-sub-lane"
+blocker = "The validation host has neither a Docker CLI nor a Docker daemon, and the Docker driver deliberately rejects the available Libpod socket. A dedicated Docker lane must run paired lifecycle and inspect-based resource, label, mount, callback, and pull-policy checks; candidate-only AppArmor, authenticated proxy, and SPIFFE checks must run on qualifying daemons."
+
+[[result]]
+id = "podman-driver-option-parity"
+step = 7
+capability = "Podman image, callback, pull-policy, resource, mount, bootstrap, SSH, and health options"
+driver = "podman"
+status = "intentional_change"
+validated_baseline_commit = "74960ebfaeec4673885089ed995fad902459749f"
+validated_candidate_commit = "e09070d4ba0b30f0ac278fbb9938c1520ecff696"
+lane = "local-linux-x86_64-rootless-podman-5.8.2"
+evidence = [
+  "Fresh binaries from both recorded commits ran the same candidate-owned oracle against isolated schema-v1 and schema-v2 gateway processes, state, PKI, sockets, networks, and container stores.",
+  "Both variants selected the same immutable sandbox image, mapped their schema-specific pull-policy spelling to Podman missing, applied 750m CPU and 384Mi memory limits, preserved managed labels, mounted read-only bind and tmpfs configuration, injected sandbox-token and guest-TLS bootstrap files, used the renamed SSH socket, became healthy at the configured seven-second interval, and completed callback exec.",
+  "The normalized results were identical except for pids_limit: the frozen baseline accepted 31 but sent Docker's ignored PidsLimit field and received Podman's 2048 default, while the candidate sent OCI resource_limits.pids.limit and applied 31.",
+  "comparison.json recorded baseline_success=true, candidate_success=true, parity=false, classification=intentional_change, intentional_change_id=podman-pid-limit-restored, and accepted=true.",
+]
+
+[[result]]
+id = "podman-qualified-security-option-parity"
+step = 7
+capability = "Podman AppArmor, authenticated proxy, SPIFFE, and rootful user-namespace options"
+driver = "podman"
+status = "platform_blocked"
+owner = "OpenShell Podman security matrix"
+lane = "linux-podman-apparmor-proxy-spiffe-rootful-userns"
+blocker = "The available daemon is rootless and reports AppArmor disabled, and this local run has no authenticated proxy or SPIFFE Workload API fixture. A qualifying rootful matrix must validate those environment-dependent options live; deterministic driver tests remain coverage, not parity evidence."

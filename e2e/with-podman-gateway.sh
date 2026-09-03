@@ -102,6 +102,7 @@ GATEWAY_BIN=""
 CLI_BIN=""
 GATEWAY_PID=""
 GATEWAY_LOG="${WORKDIR}/gateway.log"
+export OPENSHELL_E2E_GATEWAY_LOG="${GATEWAY_LOG}"
 GATEWAY_PID_FILE="${WORKDIR}/gateway.pid"
 GATEWAY_ARGS_FILE="${WORKDIR}/gateway.args"
 DRIVER_BIN=""
@@ -375,6 +376,9 @@ fi
 # Validate the generated configuration dialect before creating runtime resources.
 CONFIG_SCHEMA_VERSION="$(e2e_podman_config_schema_version)"
 
+# Validate the opt-in profile before building images or allocating runtime resources.
+e2e_podman_option_profile >/dev/null
+
 # Preflight for managed Podman gateway mode.
 if ! command -v podman >/dev/null 2>&1; then
   echo "ERROR: podman CLI is required to run Podman-backed e2e tests" >&2
@@ -461,6 +465,9 @@ e2e_write_podman_gateway_config \
   "${OPENSHELL_PODMAN_SOCKET:-}" \
   "${OIDC_MODE}" \
   "${OPENSHELL_OIDC_ISSUER:-}"
+if [ -n "${OPENSHELL_PARITY_GATEWAY_CONFIG_CAPTURE:-}" ]; then
+  cp "${GATEWAY_CONFIG}" "${OPENSHELL_PARITY_GATEWAY_CONFIG_CAPTURE}"
+fi
 
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   OPENSHELL_COMPUTE_DRIVER_SOCKET="${DRIVER_SOCKET}" \

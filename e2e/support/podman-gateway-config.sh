@@ -25,6 +25,22 @@ e2e_podman_toml_string() {
   printf '"%s"' "${value}"
 }
 
+# Return the explicitly selected behavioral profile. Keep the default empty so
+# ordinary smoke coverage continues to exercise the minimal configuration.
+e2e_podman_option_profile() {
+  case "${OPENSHELL_E2E_PODMAN_OPTION_PROFILE:-}" in
+    "") printf '%s\n' "" ;;
+    podman-options) printf '%s\n' "podman-options" ;;
+    *)
+      echo "ERROR: unsupported OPENSHELL_E2E_PODMAN_OPTION_PROFILE: ${OPENSHELL_E2E_PODMAN_OPTION_PROFILE}" >&2
+      return 2
+      ;;
+  esac
+}
+
+# Frozen baseline 74960ebfaeec4673885089ed995fad902459749f does not accept
+# Podman app_armor_profile, so it is deliberately not part of this paired profile.
+
 # Write the minimally configured Podman e2e gateway TOML. The schema-v1
 # branch deliberately uses the frozen-main contract: list driver selection,
 # driver-local guest TLS, the old "missing" pull-policy spelling, and zero to
@@ -48,7 +64,12 @@ e2e_write_podman_gateway_config() {
   local podman_socket=${15}
   local oidc_mode=${16}
   local oidc_issuer=${17}
-  local configured_with_tls
+  local configured_with_tls option_profile
+
+  case "${OPENSHELL_E2E_PODMAN_OPTION_PROFILE:-}" in
+    ""|podman-options) option_profile="${OPENSHELL_E2E_PODMAN_OPTION_PROFILE:-}" ;;
+    *) echo "ERROR: unsupported OPENSHELL_E2E_PODMAN_OPTION_PROFILE: ${OPENSHELL_E2E_PODMAN_OPTION_PROFILE}" >&2; return 2 ;;
+  esac
 
   case "${schema_version}" in
     1)
@@ -69,8 +90,15 @@ e2e_write_podman_gateway_config() {
           printf 'gateway_port = %s\n' "${gateway_port}"
           printf 'default_image = %s\n' "$(e2e_podman_toml_string "${sandbox_image}")"
           printf 'image_pull_policy = "missing"\n'
-          # In schema v1, zero explicitly disables Podman health checks.
-          printf 'health_check_interval_secs = 0\n'
+          if [ "${option_profile}" = "podman-options" ]; then
+            printf 'sandbox_pids_limit = 31\n'
+            printf 'health_check_interval_secs = 7\n'
+
+            printf 'sandbox_ssh_socket_path = "/run/openshell/parity-ssh.sock"\n'
+          else
+            # In schema v1, zero explicitly disables Podman health checks.
+            printf 'health_check_interval_secs = 0\n'
+          fi
           printf 'stop_timeout_secs = %s\n' "${stop_timeout_secs}"
           printf 'supervisor_image = %s\n' "$(e2e_podman_toml_string "${supervisor_image}")"
           printf 'guest_tls_ca = %s\n' "$(e2e_podman_toml_string "${pki_dir}/ca.crt")"
@@ -88,6 +116,9 @@ e2e_write_podman_gateway_config() {
       ;;
     2)
       cp "${root}/deploy/rpm/gateway.toml.default" "${output}"
+      if [ "${option_profile}" = "podman-options" ]; then
+        sed -i 's/^health_check_interval_secs = .*/health_check_interval_secs = 7/' "${output}"
+      fi
       # The v2 template opens the Podman table. Insert gateway-owned TLS
       # before it rather than reopening [openshell.gateway] later.
       configured_with_tls="${output}.tls"
@@ -108,6 +139,10 @@ e2e_write_podman_gateway_config() {
           printf 'gateway_port = %s\n' "${gateway_port}"
           printf 'default_image = %s\n' "$(e2e_podman_toml_string "${sandbox_image}")"
           printf 'image_pull_policy = "if_not_present"\n'
+          if [ "${option_profile}" = "podman-options" ]; then
+            printf 'sandbox_pids_limit = 31\n'
+            printf 'ssh_socket_path = "/run/openshell/parity-ssh.sock"\n'
+          fi
           printf 'stop_timeout_secs = %s\n' "${stop_timeout_secs}"
           printf 'supervisor_image = %s\n' "$(e2e_podman_toml_string "${supervisor_image}")"
           printf 'enable_bind_mounts = true\n'
