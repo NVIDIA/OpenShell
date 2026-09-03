@@ -41,6 +41,7 @@ jobs:
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -65,6 +66,7 @@ jobs:
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -84,6 +86,7 @@ jobs:
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     defaults:
       run:
         shell: nix develop .#devShells.x86_64-linux.default -c bash -euo pipefail {0}
@@ -117,6 +120,7 @@ jobs:
           - runner: macos-15-xlarge
             system: aarch64-darwin
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     defaults:
       run:
         shell: nix develop .#devShells.${{ matrix.system }}.default -c bash -euo pipefail {0}
@@ -200,6 +204,7 @@ jobs:
       matrix:
         runner: [linux-amd64-cpu8, linux-arm64-cpu8]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -231,6 +236,7 @@ jobs:
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -250,6 +256,7 @@ jobs:
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -269,6 +276,7 @@ jobs:
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
