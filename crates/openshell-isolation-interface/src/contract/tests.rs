@@ -673,6 +673,13 @@ async fn missing_digest_is_none_never_empty() {
     assert!(identity.binary_digest.is_none());
 }
 
+#[test]
+fn sha256_digest_rejects_signed_hex_chunks() {
+    let signed = format!("+0{}", "00".repeat(31));
+    assert!(signed.parse::<Sha256Digest>().is_err());
+    assert!("00".repeat(32).parse::<Sha256Digest>().is_ok());
+}
+
 #[tokio::test]
 async fn unresolved_identity_travels_with_the_connection_and_fails_closed() {
     // Attribution failure does not tear down the source: the connection is
@@ -706,7 +713,7 @@ fn error_kinds_map_to_supervisor_status_classes() {
     );
     assert_eq!(
         BackendError::Unsupported("x".into()).kind(),
-        BackendErrorKind::Unavailable
+        BackendErrorKind::Unsupported
     );
     assert_eq!(
         BackendError::Attach("x".into()).kind(),
