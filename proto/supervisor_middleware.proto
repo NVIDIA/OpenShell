@@ -263,13 +263,13 @@ enum HttpResponseBodyMode {
   // Inspect only the response head.
   HTTP_RESPONSE_BODY_MODE_HEADERS_ONLY = 1;
   // Buffer the normalized body as one final unit before committing the head.
-  // Input and replacement must fit max_payload_bytes. Capacity and deadline
-  // failures use whole_body_over_capacity and whole_body_accumulation_timeout.
+  // Input and replacement must fit max_payload_bytes. Capacity failures use
+  // whole_body_over_capacity and follow this stage's on_error.
   HTTP_RESPONSE_BODY_MODE_WHOLE_BODY_BYTES = 2;
   // Receive normalized units ending with end_of_stream. Each input is at most
   // min(64 KiB, floor(max_payload_bytes / 2)), and each replacement must fit
-  // max_payload_bytes. The full body may exceed the limit and has no
-  // accumulation deadline.
+  // max_payload_bytes. The full body may exceed the limit. STREAM_BYTES has no
+  // total response-lifetime deadline.
   HTTP_RESPONSE_BODY_MODE_STREAM_BYTES = 3;
 }
 
