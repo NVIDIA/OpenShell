@@ -126,26 +126,30 @@ message HttpHeader {
 }
 
 // One ordered response event. A stream starts with preflight, may continue with
-// body units, and may end with one best-effort session_end.
+// body units and trailers, and may end with one best-effort session_end.
 message HttpResponseEvent {
   oneof event {
     // Initial response head and request context.
     HttpResponsePreflight preflight = 1;
     // Next normalized body unit.
     HttpResponseBodyUnit body = 2;
+    // Normalized trailers after the final body result.
+    HttpResponseTrailers trailers = 4;
     // Optional terminal notification.
     MiddlewareSessionEnd session_end = 3;
   }
 }
 
-// Each preflight and body event requires one ordered result. session_end has no
-// result.
+// Each preflight, body, and trailers event requires one ordered result.
+// session_end has no result.
 message HttpResponseEventResult {
   oneof result {
     // Result for preflight.
     HttpResponsePreflightResult preflight_result = 1;
     // Result for the next body unit.
     HttpResponseBodyResult body_result = 2;
+    // Result for response trailers.
+    HttpResponseTrailersResult trailers_result = 3;
   }
 }
 
@@ -314,6 +318,37 @@ message HttpResponseBodyTransform {
     // Normalized replacement bytes.
     bytes data = 1;
   }
+}
+
+// The current normalized response trailers in wire order. Repeated names stay
+// as separate fields. A stage that completes WHOLE_BODY_BYTES or STREAM_BYTES
+// receives exactly one trailers event after its final body result, including
+// when this set is empty. SKIP, HEADERS_ONLY, semantically bodyless responses,
+// and stages ended by block, failure, or skip_remaining receive no trailers.
+message HttpResponseTrailers {
+  repeated HttpHeader headers = 1;
+}
+
+// Applies ordered trailer mutations atomically. An empty mutation list
+// preserves the current trailers. A write may target only a case-insensitive
+// name present in the trailers event; V1 cannot create a trailer name. Removal
+// of an absent name is a no-op. Credential, routing, framing, coding, range,
+// hop-by-hop, and connection-nominated fields are protected. A violating result
+// is a middleware failure handled according to on_error.
+message HttpResponseTrailersResult {
+  // At most 64 operations, 32 KiB of validated name/value data, and 64 KiB
+  // encoded are accepted.
+  repeated HeaderMutation trailer_mutations = 1;
+  // Service diagnostic, never sent to the sandbox or security logs. Maximum
+  // 4 KiB.
+  string reason = 2;
+  // Optional audit code using preflight reason_code format. Never sent to the
+  // sandbox.
+  string reason_code = 3;
+  // Up to 32 audit-safe findings, each limited to 4 KiB encoded.
+  repeated Finding findings = 4;
+  // Non-secret diagnostic metadata, limited to 64 entries and 32 KiB.
+  map<string, string> metadata = 5;
 }
 
 // Stable reason OpenShell ended a middleware stage stream.
