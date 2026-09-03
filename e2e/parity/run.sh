@@ -23,12 +23,13 @@ RUN_DIR=""
 
 usage() {
   cat >&2 <<EOF
-Usage: e2e/parity/run.sh --driver podman [--scenario smoke|podman-options] [--baseline-worktree PATH] [--results-dir PATH]
+Usage: e2e/parity/run.sh --driver podman [--scenario smoke|external-driver|podman-options] [--baseline-worktree PATH] [--results-dir PATH]
 
 The default baseline is the immutable baseline_commit in ${MANIFEST}.
 Overrides:
   OPENSHELL_PARITY_BASELINE_{GATEWAY,CLI,CONFORMANCE}_BIN
   OPENSHELL_PARITY_CANDIDATE_{GATEWAY,CLI,CONFORMANCE}_BIN
+  OPENSHELL_PARITY_{BASELINE,CANDIDATE}_EXTERNAL_DRIVER_BIN
   OPENSHELL_PARITY_{BASELINE,CANDIDATE}_CARGO_TARGET_DIR
 EOF
 }
@@ -62,6 +63,7 @@ done
 
 case "${SCENARIO}" in
   smoke) COMMAND_CLASS="conformance_smoke" ;;
+  external-driver) COMMAND_CLASS="external_driver_conformance_smoke" ;;
   podman-options) COMMAND_CLASS="podman_options" ;;
   *) echo "ERROR: unsupported parity scenario: ${SCENARIO}." >&2; exit 2 ;;
 esac
@@ -142,9 +144,12 @@ require_executable() {
 build_variant() {
   local variant=$1 source_root=$2 target_dir=$3 gateway_override=$4 cli_override=$5 conformance_override=$6
   local gateway_var=$7 cli_var=$8 conformance_var=$9
-  local gateway cli conformance jobs=()
+  local gateway cli conformance jobs=() gateway_features=()
 
   if [ -n "${CARGO_BUILD_JOBS:-}" ]; then jobs=(-j "${CARGO_BUILD_JOBS}"); fi
+  if [ "${SCENARIO}" = external-driver ]; then
+    gateway_features=(--no-default-features --features telemetry)
+  fi
   target_dir="${target_dir:-${ROOT}/target/parity/${variant}}"
   case "${target_dir}" in /*) ;; *) target_dir="${ROOT}/${target_dir}" ;; esac
   gateway="${gateway_override:-${target_dir}/debug/openshell-gateway}"
@@ -153,7 +158,7 @@ build_variant() {
 
   if [ -z "${gateway_override}" ]; then
     echo "Building ${variant} gateway in ${target_dir}..."
-    (cd "${source_root}" && CARGO_TARGET_DIR="${target_dir}" cargo build "${jobs[@]}" -p openshell-gateway --bin openshell-gateway)
+    (cd "${source_root}" && CARGO_TARGET_DIR="${target_dir}" cargo build "${jobs[@]}" -p openshell-gateway --bin openshell-gateway "${gateway_features[@]}")
   fi
   if [ -z "${cli_override}" ]; then
     echo "Building ${variant} CLI in ${target_dir}..."
@@ -175,6 +180,37 @@ BASELINE_GATEWAY="" BASELINE_CLI="" BASELINE_CONFORMANCE=""
 CANDIDATE_GATEWAY="" CANDIDATE_CLI="" CANDIDATE_CONFORMANCE=""
 build_variant baseline "${BASELINE_WORKTREE}" "${OPENSHELL_PARITY_BASELINE_CARGO_TARGET_DIR:-}" "${OPENSHELL_PARITY_BASELINE_GATEWAY_BIN:-}" "${OPENSHELL_PARITY_BASELINE_CLI_BIN:-}" "${OPENSHELL_PARITY_BASELINE_CONFORMANCE_BIN:-}" BASELINE_GATEWAY BASELINE_CLI BASELINE_CONFORMANCE
 build_variant candidate "${ROOT}" "${OPENSHELL_PARITY_CANDIDATE_CARGO_TARGET_DIR:-}" "${OPENSHELL_PARITY_CANDIDATE_GATEWAY_BIN:-}" "${OPENSHELL_PARITY_CANDIDATE_CLI_BIN:-}" "${OPENSHELL_PARITY_CANDIDATE_CONFORMANCE_BIN:-}" CANDIDATE_GATEWAY CANDIDATE_CLI CANDIDATE_CONFORMANCE
+
+build_external_driver() {
+  local variant=$1 source_root=$2 target_dir=$3 override=$4 output_var=$5
+  local binary
+  if [ "${SCENARIO}" != external-driver ]; then
+    printf -v "${output_var}" '%s' ""
+    return
+  fi
+  target_dir="${target_dir:-${ROOT}/target/parity/${variant}}"
+  case "${target_dir}" in /*) ;; *) target_dir="${ROOT}/${target_dir}" ;; esac
+  binary="${override:-${target_dir}/debug/openshell-driver-podman}"
+  if [ -z "${override}" ]; then
+    echo "Building ${variant} external Podman driver in ${target_dir}..."
+    (cd "${source_root}" && CARGO_TARGET_DIR="${target_dir}" cargo build -p openshell-driver-podman --bin openshell-driver-podman)
+  fi
+  require_executable "${variant} external Podman driver" "${binary}"
+  printf -v "${output_var}" '%s' "${binary}"
+}
+
+BASELINE_EXTERNAL_DRIVER="" CANDIDATE_EXTERNAL_DRIVER=""
+build_external_driver baseline "${BASELINE_WORKTREE}" "${OPENSHELL_PARITY_BASELINE_CARGO_TARGET_DIR:-}" "${OPENSHELL_PARITY_BASELINE_EXTERNAL_DRIVER_BIN:-}" BASELINE_EXTERNAL_DRIVER
+build_external_driver candidate "${ROOT}" "${OPENSHELL_PARITY_CANDIDATE_CARGO_TARGET_DIR:-}" "${OPENSHELL_PARITY_CANDIDATE_EXTERNAL_DRIVER_BIN:-}" CANDIDATE_EXTERNAL_DRIVER
+if [ "${SCENARIO}" = external-driver ]; then
+  baseline_external_realpath="$(realpath "${BASELINE_EXTERNAL_DRIVER}")"
+  candidate_external_realpath="$(realpath "${CANDIDATE_EXTERNAL_DRIVER}")"
+  if [ "${baseline_external_realpath}" = "${candidate_external_realpath}" ] \
+    || [ "${BASELINE_EXTERNAL_DRIVER}" -ef "${CANDIDATE_EXTERNAL_DRIVER}" ]; then
+    echo "ERROR: external-driver parity requires distinct baseline and candidate driver artifacts." >&2
+    exit 2
+  fi
+fi
 require_executable "Podman parity wrapper" "${WRAPPER}"
 if [ "${SCENARIO}" = "podman-options" ] && [ ! -f "${PODMAN_OPTIONS_ORACLE}" ]; then
   echo "ERROR: Podman options oracle does not exist: ${PODMAN_OPTIONS_ORACLE}" >&2
@@ -182,11 +218,15 @@ if [ "${SCENARIO}" = "podman-options" ] && [ ! -f "${PODMAN_OPTIONS_ORACLE}" ]; 
 fi
 
 write_result() {
-  local variant=$1 source_sha=$2 schema=$3 status=$4
-  local normalized_result=""
+  local variant=$1 source_sha=$2 schema=$3 status=$4 external_driver=$5
+  local normalized_result="" external_driver_digest="" gateway_profile="in-tree"
+  if [ -n "${external_driver}" ]; then
+    external_driver_digest=",\"external_driver_sha256\":\"$(sha256sum "${external_driver}" | cut -d' ' -f1)\""
+    gateway_profile="driver-free"
+  fi
   if [ "${SCENARIO}" = "podman-options" ]; then normalized_result=",\"normalized_result\":\"${variant}.normalized.json\""; fi
   cat >"${RESULTS_DIR}/${variant}.json" <<EOF
-{"variant":"${variant}","source_sha":"${source_sha}","schema_version":${schema},"driver":"${DRIVER}","scenario":"${SCENARIO}","command_class":"${COMMAND_CLASS}"${normalized_result},"success":${status}}
+{"variant":"${variant}","source_sha":"${source_sha}","schema_version":${schema},"driver":"${DRIVER}","scenario":"${SCENARIO}","command_class":"${COMMAND_CLASS}","gateway_profile":"${gateway_profile}"${normalized_result}${external_driver_digest},"success":${status}}
 EOF
 }
 
@@ -227,7 +267,7 @@ EOF
 }
 
 run_variant() {
-  local variant=$1 source_sha=$2 schema=$3 gateway=$4 cli=$5 conformance=$6 result_status
+  local variant=$1 source_sha=$2 schema=$3 gateway=$4 cli=$5 conformance=$6 external_driver=$7 result_status
   local variant_home="${RUN_DIR}/${variant}"
   mkdir -p "${variant_home}/config" "${variant_home}/state" "${variant_home}/cache" "${variant_home}/data"
   echo "==> schema parity ${variant} (schema v${schema}, ${DRIVER}, ${SCENARIO})"
@@ -239,9 +279,12 @@ run_variant() {
   else
     command=("${conformance}" run --openshell-bin "${cli}" --output json)
   fi
-  if env \
+  if env -u OPENSHELL_GATEWAY_ENDPOINT -u OPENSHELL_GATEWAY_CONFIG \
+    -u OPENSHELL_COMPUTE_DRIVER -u OPENSHELL_COMPUTE_DRIVER_SOCKET -u OPENSHELL_DRIVERS \
     OPENSHELL_PARITY_VARIANT="${variant}" \
     OPENSHELL_E2E_CONFIG_SCHEMA_VERSION="${schema}" \
+    OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER="$([ "${SCENARIO}" = external-driver ] && printf 1 || printf 0)" \
+    OPENSHELL_EXTERNAL_DRIVER_BIN="${external_driver}" \
     OPENSHELL_E2E_PODMAN_OPTION_PROFILE="${option_profile}" \
     OPENSHELL_PARITY_ORACLE_RESULT="${RESULTS_DIR}/${variant}.normalized.json" \
     OPENSHELL_PARITY_GATEWAY_CONFIG_CAPTURE="${RESULTS_DIR}/${variant}.gateway.toml" \
@@ -259,16 +302,16 @@ run_variant() {
   else
     result_status=false
   fi
-  write_result "${variant}" "${source_sha}" "${schema}" "${result_status}"
+  write_result "${variant}" "${source_sha}" "${schema}" "${result_status}" "${external_driver}"
   [ "${result_status}" = true ]
 }
 
 baseline_exit=0
 candidate_exit=0
-run_variant baseline "${BASELINE_SHA}" 1 "${BASELINE_GATEWAY}" "${BASELINE_CLI}" "${BASELINE_CONFORMANCE}" || baseline_exit=$?
+run_variant baseline "${BASELINE_SHA}" 1 "${BASELINE_GATEWAY}" "${BASELINE_CLI}" "${BASELINE_CONFORMANCE}" "${BASELINE_EXTERNAL_DRIVER}" || baseline_exit=$?
 # Do not short-circuit: a candidate result is useful even when the frozen
 # baseline failed, and two equal failures must never constitute parity.
-run_variant candidate "${CANDIDATE_SHA}" 2 "${CANDIDATE_GATEWAY}" "${CANDIDATE_CLI}" "${CANDIDATE_CONFORMANCE}" || candidate_exit=$?
+run_variant candidate "${CANDIDATE_SHA}" 2 "${CANDIDATE_GATEWAY}" "${CANDIDATE_CLI}" "${CANDIDATE_CONFORMANCE}" "${CANDIDATE_EXTERNAL_DRIVER}" || candidate_exit=$?
 
 baseline_success=$([ "${baseline_exit}" -eq 0 ] && printf true || printf false)
 candidate_success=$([ "${candidate_exit}" -eq 0 ] && printf true || printf false)

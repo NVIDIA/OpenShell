@@ -74,7 +74,10 @@ mkdir -p "${WORKDIR}/bin"
 cat >"${WORKDIR}/bin/fake-wrapper" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$OPENSHELL_PARITY_VARIANT" "$OPENSHELL_E2E_CONFIG_SCHEMA_VERSION" "$OPENSHELL_GATEWAY_BIN" "$OPENSHELL_BIN" "$OPENSHELL_CONFORMANCE_BIN" "$MISE_TRUSTED_CONFIG_PATHS" "${OPENSHELL_E2E_PODMAN_OPTION_PROFILE:-}" "${OPENSHELL_PARITY_ORACLE_RESULT:-}" >>"$OPENSHELL_PARITY_TEST_CALLS"
+for variable in OPENSHELL_GATEWAY_ENDPOINT OPENSHELL_GATEWAY_CONFIG OPENSHELL_COMPUTE_DRIVER OPENSHELL_COMPUTE_DRIVER_SOCKET OPENSHELL_DRIVERS; do
+  [ -z "${!variable:-}" ] || exit 23
+done
+printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$OPENSHELL_PARITY_VARIANT" "$OPENSHELL_E2E_CONFIG_SCHEMA_VERSION" "$OPENSHELL_GATEWAY_BIN" "$OPENSHELL_BIN" "$OPENSHELL_CONFORMANCE_BIN" "$MISE_TRUSTED_CONFIG_PATHS" "${OPENSHELL_E2E_PODMAN_OPTION_PROFILE:-}" "${OPENSHELL_PARITY_ORACLE_RESULT:-}" "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-}" "${OPENSHELL_EXTERNAL_DRIVER_BIN:-}" >>"$OPENSHELL_PARITY_TEST_CALLS"
 mkdir -p "$XDG_DATA_HOME/containers/storage"
 if [ "${OPENSHELL_E2E_PODMAN_OPTION_PROFILE:-}" = podman-options ]; then
   case "${OPENSHELL_PARITY_VARIANT}" in baseline) pids=2048 ;; candidate) pids=31 ;; esac
@@ -102,7 +105,7 @@ if [ "${OPENSHELL_PARITY_FAIL_VARIANT:-}" = "${OPENSHELL_PARITY_VARIANT:-}" ] ||
 fi
 printf '{"untrusted":"raw output is intentionally not normalized"}\n'
 EOF
-for artifact in baseline-gateway baseline-cli candidate-gateway candidate-cli; do
+for artifact in baseline-gateway baseline-cli candidate-gateway candidate-cli baseline-driver candidate-driver; do
   cat >"${WORKDIR}/bin/${artifact}" <<'EOF'
 #!/usr/bin/env bash
 exit 0
@@ -122,6 +125,8 @@ run_harness() {
   OPENSHELL_PARITY_CANDIDATE_GATEWAY_BIN="${WORKDIR}/bin/candidate-gateway" \
   OPENSHELL_PARITY_CANDIDATE_CLI_BIN="${WORKDIR}/bin/candidate-cli" \
   OPENSHELL_PARITY_CANDIDATE_CONFORMANCE_BIN="${WORKDIR}/bin/fake-conformance" \
+  OPENSHELL_PARITY_BASELINE_EXTERNAL_DRIVER_BIN="${WORKDIR}/bin/baseline-driver" \
+  OPENSHELL_PARITY_CANDIDATE_EXTERNAL_DRIVER_BIN="${OPENSHELL_PARITY_TEST_CANDIDATE_DRIVER_OVERRIDE:-${WORKDIR}/bin/candidate-driver}" \
   OPENSHELL_PARITY_RESULTS_DIR="${WORKDIR}/results" \
   OPENSHELL_PARITY_TEST_CALLS="${WORKDIR}/calls" \
   OPENSHELL_PARITY_TEST_PODMAN_CALLS="${WORKDIR}/podman-calls" \
@@ -129,7 +134,12 @@ run_harness() {
   bash "${ROOT}/e2e/parity/run.sh" --driver podman "$@"
 }
 
-run_harness
+OPENSHELL_GATEWAY_ENDPOINT=http://127.0.0.1:9 \
+OPENSHELL_GATEWAY_CONFIG=/tmp/untrusted.toml \
+OPENSHELL_COMPUTE_DRIVER=wrong \
+OPENSHELL_COMPUTE_DRIVER_SOCKET=/tmp/untrusted.sock \
+OPENSHELL_DRIVERS=wrong \
+  run_harness
 assert_contains "${WORKDIR}/calls" "baseline|1|${WORKDIR}/bin/baseline-gateway|${WORKDIR}/bin/baseline-cli|${WORKDIR}/bin/fake-conformance"
 assert_contains "${WORKDIR}/calls" "candidate|2|${WORKDIR}/bin/candidate-gateway|${WORKDIR}/bin/candidate-cli|${WORKDIR}/bin/fake-conformance"
 assert_contains "${WORKDIR}/calls" "|${ROOT}"
@@ -145,6 +155,23 @@ assert_not_contains "${WORKDIR}/results/baseline.json" 'raw output'
 assert_contains "${WORKDIR}/results/baseline.log" 'raw output is intentionally not normalized'
 assert_contains "${WORKDIR}/podman-calls" 'unshare rm -rf -- '
 assert_contains "${WORKDIR}/podman-calls" 'openshell-parity-run.'
+
+run_harness --scenario external-driver
+assert_contains "${WORKDIR}/calls" "|1|${WORKDIR}/bin/baseline-driver"
+assert_contains "${WORKDIR}/calls" "|1|${WORKDIR}/bin/candidate-driver"
+assert_contains "${WORKDIR}/results/baseline.json" '"scenario":"external-driver"'
+assert_contains "${WORKDIR}/results/baseline.json" '"command_class":"external_driver_conformance_smoke"'
+assert_contains "${WORKDIR}/results/baseline.json" '"gateway_profile":"driver-free"'
+assert_contains "${WORKDIR}/results/baseline.json" '"external_driver_sha256"'
+assert_contains "${WORKDIR}/results/comparison.json" '"classification":"pass"'
+
+set +e
+OPENSHELL_PARITY_TEST_CANDIDATE_DRIVER_OVERRIDE="${WORKDIR}/bin/baseline-driver" \
+  run_harness --scenario external-driver >"${WORKDIR}/same-driver.out" 2>&1
+status=$?
+set -e
+assert_status "${status}" 2
+assert_contains "${WORKDIR}/same-driver.out" 'requires distinct baseline and candidate driver artifacts'
 
 run_harness --scenario podman-options
 assert_contains "${WORKDIR}/calls" "baseline|1|${WORKDIR}/bin/baseline-gateway|${WORKDIR}/bin/baseline-cli|${WORKDIR}/bin/fake-conformance|${ROOT}|podman-options"
@@ -188,7 +215,7 @@ assert_status "${status}" 1
 assert_contains "${WORKDIR}/results/baseline.json" '"success":false'
 assert_contains "${WORKDIR}/results/candidate.json" '"success":false'
 assert_contains "${WORKDIR}/results/comparison.json" '"parity":false'
-[ "$(wc -l <"${WORKDIR}/calls")" -eq 10 ] || fail 'candidate did not run after baseline failure'
+[ "$(wc -l <"${WORKDIR}/calls")" -eq 12 ] || fail 'candidate did not run after baseline failure'
 
 set +e
 bash "${ROOT}/e2e/parity/run.sh" --driver docker >"${WORKDIR}/driver.out" 2>&1
