@@ -1,0 +1,8 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+openshell_snap_package: /var/lib/openshell-conformance/candidate/openshell.snap
+openshell_snap_user: openshell
+openshell_snap_gateway_service: snap.openshell.gateway.service
+openshell_snap_ready_retries: 30

@@ -1,0 +1,82 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Gather facts for OpenShell Snap installation
+  become: true
+  ansible.builtin.setup:
+
+- name: Validate OpenShell Snap installation support
+  become: true
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.distribution == "Ubuntu"
+    fail_msg: >-
+      OpenShell Snap installation is currently supported only on Ubuntu test guests,
+      not {{ ansible_facts.distribution }}.
+
+- name: Verify the candidate OpenShell Snap is present
+  become: true
+  ansible.builtin.stat:
+    path: "{{ openshell_snap_package }}"
+  register: openshell_snap_package_stat
+
+- name: Assert the candidate OpenShell Snap is present
+  become: true
+  ansible.builtin.assert:
+    that: openshell_snap_package_stat.stat.exists
+    fail_msg: "Candidate OpenShell Snap is missing: {{ openshell_snap_package }}"
+
+- name: Remove any previously installed OpenShell Snap
+  become: true
+  ansible.builtin.command:
+    cmd: snap remove --purge openshell
+  changed_when: true
+  failed_when: false
+
+- name: Remove OpenShell Snap user state
+  become: true
+  ansible.builtin.file:
+    path: "/home/{{ openshell_snap_user }}/snap/openshell"
+    state: absent
+
+- name: Install candidate OpenShell Snap
+  become: true
+  ansible.builtin.command:
+    cmd: "snap install {{ openshell_snap_package }} --dangerous"
+
+- name: Connect OpenShell Snap interfaces
+  block:
+    - ansible.builtin.include_tasks: interfaces.yml
+  rescue:
+    - name: Gather OpenShell Snap gateway service status
+      become: true
+      ansible.builtin.command:
+        cmd: >-
+          systemctl status {{ openshell_snap_gateway_service }} --no-pager
+      register: openshell_snap_gateway_service_status
+      changed_when: false
+      failed_when: false
+
+    - name: Gather OpenShell Snap gateway journal
+      become: true
+      ansible.builtin.command:
+        cmd: >-
+          journalctl --no-pager -u {{ openshell_snap_gateway_service }} -n 200
+      register: openshell_snap_gateway_journal
+      changed_when: false
+      failed_when: false
+
+    - name: Report failed OpenShell Snap interface connection
+      ansible.builtin.debug:
+        msg:
+          interface_connection_error: "{{ ansible_failed_result }}"
+          gateway_service_status: "{{ openshell_snap_gateway_service_status.stdout }}"
+          gateway_journal: "{{ openshell_snap_gateway_journal.stdout }}"
+
+    - name: Fail after collecting OpenShell Snap diagnostics
+      ansible.builtin.fail:
+        msg: "OpenShell Snap interface connection failed; see diagnostics above."
+
+- name: Register OpenShell Snap gateway
+  ansible.builtin.import_tasks: register.yml
