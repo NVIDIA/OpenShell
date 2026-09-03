@@ -35,18 +35,28 @@ jobs:
         if: github.ref != 'refs/heads/main'
         uses: ./.github/actions/pr-gate
 
-  pr-check-x64:
-    name: PR lint and test (x64)
+  pr-check:
+    name: PR lint and test (${{ matrix.arch }})
     needs: pr_metadata
     if: >-
       needs.pr_metadata.outputs.should_run == 'true' &&
       github.ref != 'refs/heads/main' &&
       github.event_name != 'workflow_dispatch'
-    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2025
+            rust_target: x86_64-pc-windows-msvc
+          - arch: arm64
+            runner: windows-11-arm
+            rust_target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
     env:
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
       SCCACHE_GHA_ENABLED: "true"
-      SCCACHE_GHA_VERSION: windows-msvc-x64-prebuilt-z3-v2
+      SCCACHE_GHA_VERSION: windows-msvc-${{ matrix.arch }}-prebuilt-z3-v2
       SCCACHE_CLIENT_SIDE: "1"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
     steps:
@@ -60,7 +70,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: "1.95.0"
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ matrix.rust_target }}
           components: clippy
       - name: Install cargo-nextest
         run: mise install --locked github:nextest-rs/nextest
@@ -72,31 +82,39 @@ jobs:
           RUSTC_WRAPPER: ""
         with:
           # Keep the prebuilt-Z3 experiment isolated from earlier target caches.
-          shared-key: windows-msvc-x64-prebuilt-z3-v1
+          shared-key: windows-msvc-${{ matrix.arch }}-prebuilt-z3-v1
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
       - name: Lint Windows-supported crates
-        # rust:lint enters the native MSVC environment and excludes only the
-        # runtime packages that Windows does not support.
-        run: mise run --skip-tools rust:lint
+        run: mise run --skip-tools windows:lint:${{ matrix.arch }}
       - name: Test
-        run: mise run --skip-tools test:rust
+        run: mise run --skip-tools windows:test:${{ matrix.arch }}
       - name: sccache stats
         if: always()
         run: sccache --show-stats
 
-  cache-seed-x64:
-    name: Seed cache (x64)
+  cache-seed:
+    name: Seed cache (${{ matrix.arch }})
     needs: pr_metadata
     if: >-
       needs.pr_metadata.outputs.should_run == 'true' &&
       (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
-    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2025
+            rust_target: x86_64-pc-windows-msvc
+          - arch: arm64
+            runner: windows-11-arm
+            rust_target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
     env:
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
       SCCACHE_GHA_ENABLED: "true"
-      SCCACHE_GHA_VERSION: windows-msvc-x64-prebuilt-z3-v2
+      SCCACHE_GHA_VERSION: windows-msvc-${{ matrix.arch }}-prebuilt-z3-v2
       SCCACHE_CLIENT_SIDE: "1"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
     steps:
@@ -110,7 +128,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: "1.95.0"
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ matrix.rust_target }}
           components: clippy
       - name: Install cargo-nextest
         run: mise install --locked github:nextest-rs/nextest
@@ -119,28 +137,38 @@ jobs:
         env:
           RUSTC_WRAPPER: ""
         with:
-          shared-key: windows-msvc-x64-prebuilt-z3-v1
+          shared-key: windows-msvc-${{ matrix.arch }}-prebuilt-z3-v1
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
       - name: Lint Windows-supported crates
         # Keep the seed workload identical to the pull-request workload so its
         # target and compiler caches are reusable by subsequent pull requests.
-        run: mise run --skip-tools rust:lint
+        run: mise run --skip-tools windows:lint:${{ matrix.arch }}
       - name: Test
-        run: mise run --skip-tools test:rust
+        run: mise run --skip-tools windows:test:${{ matrix.arch }}
       - name: sccache stats
         if: always()
         run: sccache --show-stats
 
-  build-x64:
-    name: Build binaries (x64)
-    needs: cache-seed-x64
-    runs-on: windows-2025
+  build:
+    name: Build binaries (${{ matrix.arch }})
+    needs: cache-seed
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2025
+            rust_target: x86_64-pc-windows-msvc
+          - arch: arm64
+            runner: windows-11-arm
+            rust_target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
     env:
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
       SCCACHE_GHA_ENABLED: "true"
-      SCCACHE_GHA_VERSION: windows-msvc-x64-prebuilt-z3-v2
+      SCCACHE_GHA_VERSION: windows-msvc-${{ matrix.arch }}-prebuilt-z3-v2
       SCCACHE_CLIENT_SIDE: "1"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
     steps:
@@ -154,18 +182,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: "1.95.0"
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ matrix.rust_target }}
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         env:
           RUSTC_WRAPPER: ""
         with:
-          shared-key: windows-msvc-x64-prebuilt-z3-v1
+          shared-key: windows-msvc-${{ matrix.arch }}-prebuilt-z3-v1
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
       - name: Build release binaries
-        run: mise run --skip-tools windows:build:x64
+        run: mise run --skip-tools windows:build:${{ matrix.arch }}
       - name: sccache stats
         if: always()
         run: sccache --show-stats

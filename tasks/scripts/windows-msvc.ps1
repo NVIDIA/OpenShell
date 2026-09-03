@@ -503,6 +503,10 @@ function Invoke-Lint([string] $RustTarget) {
         -RustTarget $RustTarget `
         -CargoArgs "cargo clippy --manifest-path e2e/rust/Cargo.toml --all-targets --no-deps --target $RustTarget -- $WindowsClippyLintArgs" `
         -LogName "lint-$RustTarget-e2e.log"
+    Invoke-VsCargo `
+        -RustTarget $RustTarget `
+        -CargoArgs "cargo check --manifest-path examples/governance-interceptor/Cargo.toml --all-targets --target $RustTarget" `
+        -LogName "lint-$RustTarget-governance-interceptor.log"
 }
 
 function Invoke-Build([string] $RustTarget) {

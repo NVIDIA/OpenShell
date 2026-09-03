@@ -73,10 +73,12 @@ Windows validation is exposed through `tasks/windows.toml`:
 |---|---|
 | `windows:check:x64` | Check the x64 MSVC gateway/CLI build graph. |
 | `windows:check:arm64` | Check the ARM64 MSVC gateway/CLI build graph. |
+| `windows:lint:x64` | Run Clippy over the Windows-supported workspace for x64 MSVC. |
+| `windows:lint:arm64` | Run Clippy over the Windows-supported workspace for ARM64 MSVC. |
 | `windows:build:x64` | Build release x64 `openshell-gateway.exe` and `openshell.exe`. |
 | `windows:build:arm64` | Build release ARM64 `openshell-gateway.exe` and `openshell.exe`. |
-| `windows:test:x64` | Run native x64 workspace tests, including MXC mapper and lifecycle tests, while excluding unsupported Windows packages as top-level test targets. |
-| `windows:test:arm64` | Run native ARM64 workspace tests with the same package exclusions. |
+| `windows:test:x64` | Run native x64 workspace tests with the nextest CI profile and server test support, while excluding unsupported Windows packages as top-level test targets. |
+| `windows:test:arm64` | Run the same suite natively on ARM64. |
 | `windows:test:unsupported:x64` | Run focused gateway-composition tests for unsupported driver contracts. |
 | `windows:test:unsupported:arm64` | Run the same focused contracts natively on ARM64. |
 | `windows:ci` | Run check, build, test, unsupported-contract tests, and artifact reporting. |
@@ -141,35 +143,32 @@ break ARM64 crypto dependency builds.
 
 ## CI Shape
 
-The x64 GitHub Actions jobs run on `windows-2025`. Pull-request mirrors and
-merge queues execute:
+The x64 GitHub Actions jobs run on `windows-2025`; native ARM64 jobs run on
+`windows-11-arm`. Pull-request mirrors and merge queues execute the matching
+architecture-specific tasks:
 
 ```powershell
-mise run --skip-tools rust:lint
-mise run --skip-tools test:rust
+mise run --skip-tools windows:lint:<x64|arm64>
+mise run --skip-tools windows:test:<x64|arm64>
 ```
 
 Pushes to `main` and manual dispatches first seed the shared caches with those
 same lint and test commands. After the seed succeeds, a separate job executes:
 
 ```powershell
-mise run --skip-tools windows:build:x64
+mise run --skip-tools windows:build:<x64|arm64>
 ```
 
 The server test-support suite includes the unsupported-driver contract test, so
 CI does not run the focused test task a second time. The focused task remains
 available for local diagnosis.
 
-The hosted workflow uses an x64-specific cache namespace and does not cache
-Cargo-installed binaries.
+The hosted workflow uses architecture-specific cache namespaces and does not
+cache Cargo-installed binaries.
 
-The local aggregate `windows:ci` task cross-builds ARM64 on an x64 host. The
-GitHub x64 job runs only the x64 tasks, and native ARM64 tests remain exclusive
-to an ARM64 runner.
-
-GitHub Actions currently runs only x64. ARM64 remains available through the
-local `windows:*:arm64` tasks and requires a separate native workflow when the
-project is ready to enable hosted ARM64 validation.
+The local aggregate `windows:ci` task can still cross-build ARM64 on an x64
+host. Hosted tests use architecture-matched runners, so ARM64 test results are
+native rather than emulated coverage.
 
 ## Validation Contract
 
