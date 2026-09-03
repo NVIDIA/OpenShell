@@ -239,13 +239,40 @@ pub async fn run_cli_with_compute_drivers(compute_drivers: ComputeDriverRegistry
     }
 }
 
-fn reject_legacy_driver_selector_env() -> Result<()> {
-    if std::env::var_os("OPENSHELL_DRIVERS").is_some() {
+fn resolve_legacy_driver_selector_env(args: &mut RunArgs) -> Result<bool> {
+    let Some(raw) = std::env::var_os("OPENSHELL_DRIVERS") else {
+        return Ok(false);
+    };
+    let raw = raw.into_string().map_err(|_| {
+        miette::miette!(
+            "OPENSHELL_DRIVERS contains an invalid compute driver name; expected ASCII letters, digits, '-' or '_'"
+        )
+    })?;
+    let values = raw.split(',').map(str::trim).collect::<Vec<_>>();
+    if values.len() != 1 || values[0].is_empty() {
         return Err(miette::miette!(
-            "OPENSHELL_DRIVERS is no longer supported; use OPENSHELL_COMPUTE_DRIVER with exactly one driver name"
+            "OPENSHELL_DRIVERS must contain exactly one non-empty compute driver name; comma-delimited lists are not supported"
         ));
     }
-    Ok(())
+    let legacy = openshell_core::config::normalize_compute_driver_name(values[0]).map_err(|_| {
+        miette::miette!(
+            "OPENSHELL_DRIVERS contains an invalid compute driver name; expected ASCII letters, digits, '-' or '_'"
+        )
+    })?;
+
+    if let Some(canonical) = args.compute_driver.as_deref() {
+        let canonical = openshell_core::config::normalize_compute_driver_name(canonical)
+            .map_err(|error| miette::miette!("{error}"))?;
+        if canonical != legacy {
+            return Err(miette::miette!(
+                "OPENSHELL_DRIVERS conflicts with the canonical compute-driver selection; remove OPENSHELL_DRIVERS"
+            ));
+        }
+    } else {
+        args.compute_driver = Some(legacy);
+    }
+
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -258,8 +285,6 @@ fn prepare_server_config_with_drivers(
     matches: &ArgMatches,
     compute_drivers: &ComputeDriverRegistry,
 ) -> Result<ServerStartupConfig> {
-    reject_legacy_driver_selector_env()?;
-
     // Load TOML when explicitly requested, or from the default XDG location
     // when that file exists. Missing default config is not an error: runtime
     // defaults and OPENSHELL_* env vars are enough for package-managed starts.
@@ -272,7 +297,8 @@ fn prepare_server_config_with_drivers(
     if let Some(file) = file.as_ref() {
         merge_file_into_args(args, &file.openshell.gateway, matches);
     }
-    normalize_compute_driver_socket_args(args, matches)?;
+    let legacy_compute_driver_env_seen = resolve_legacy_driver_selector_env(args)?;
+    normalize_compute_driver_socket_args(args)?;
     let compute_driver = compute_drivers
         .select(args.compute_driver.as_deref())
         .map_err(|error| miette::miette!("{error}"))?;
@@ -508,6 +534,7 @@ fn prepare_server_config_with_drivers(
         config_file: file,
         guest_tls,
         compute_driver,
+        legacy_compute_driver_env_seen,
     })
 }
 
@@ -539,6 +566,10 @@ async fn run_from_args(
         compute_driver_tracing,
         gateway_resource,
     );
+
+    if prepared.legacy_compute_driver_env_seen {
+        warn!("OPENSHELL_DRIVERS is deprecated; migrate to OPENSHELL_COMPUTE_DRIVER");
+    }
 
     let has_client_ca = prepared
         .config
@@ -806,7 +837,7 @@ fn validate_grpc_rate_limit_args(requests: Option<u64>, window_seconds: Option<u
     Ok(())
 }
 
-fn normalize_compute_driver_socket_args(args: &mut RunArgs, matches: &ArgMatches) -> Result<()> {
+fn normalize_compute_driver_socket_args(args: &mut RunArgs) -> Result<()> {
     let Some(socket) = args.compute_driver_socket.as_ref() else {
         return Ok(());
     };
@@ -815,7 +846,7 @@ fn normalize_compute_driver_socket_args(args: &mut RunArgs, matches: &ArgMatches
             "--compute-driver-socket must not be an empty path"
         ));
     }
-    if arg_defaulted(matches, "compute_driver") {
+    if args.compute_driver.is_none() {
         return Err(miette::miette!(
             "--compute-driver-socket requires --compute-driver <name> or OPENSHELL_COMPUTE_DRIVER=<name>"
         ));
@@ -858,7 +889,7 @@ fn resolve_mtls_auth_enabled(
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, command, reject_legacy_driver_selector_env};
+    use super::{Cli, command};
     use crate::TEST_ENV_LOCK as ENV_LOCK;
     use clap::Parser;
     use std::net::{IpAddr, Ipv4Addr};
@@ -1140,17 +1171,120 @@ mod tests {
     }
 
     #[test]
-    fn legacy_compute_driver_environment_is_rejected_even_when_empty() {
+    fn legacy_compute_driver_environment_accepts_one_normalized_name() {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for value in ["docker", ""] {
-            let guard = EnvVarGuard::set("OPENSHELL_DRIVERS", value);
-            let error = super::reject_legacy_driver_selector_env()
-                .expect_err("legacy environment selector must be rejected");
-            assert!(error.to_string().contains("OPENSHELL_COMPUTE_DRIVER"));
-            drop(guard);
+        let _canonical = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER");
+        let _legacy = EnvVarGuard::set("OPENSHELL_DRIVERS", "  PodMan  ");
+        let (mut args, _) = parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+
+        assert!(super::resolve_legacy_driver_selector_env(&mut args).unwrap());
+        assert_eq!(args.compute_driver.as_deref(), Some("podman"));
+    }
+
+    #[test]
+    fn legacy_compute_driver_environment_flows_through_server_preparation() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
+        let _config_path = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+        let _canonical = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER");
+        let _legacy = EnvVarGuard::set("OPENSHELL_DRIVERS", "podman");
+        let (mut args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--disable-tls",
+        ]);
+        let registry = test_registry("podman", true, true);
+
+        let prepared =
+            super::prepare_server_config_with_drivers(&mut args, &matches, &registry).unwrap();
+
+        assert_eq!(prepared.compute_driver.name(), "podman");
+        assert!(prepared.legacy_compute_driver_env_seen);
+    }
+
+    #[test]
+    fn legacy_compute_driver_environment_rejects_empty_plural_and_invalid_values() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _canonical = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER");
+
+        for value in ["", " ", ",", "podman,", ",podman", "podman,docker"] {
+            let legacy = EnvVarGuard::set("OPENSHELL_DRIVERS", value);
+            let (mut args, _) =
+                parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+            let error = super::resolve_legacy_driver_selector_env(&mut args)
+                .expect_err("empty and plural legacy selectors must be rejected");
+            assert!(error.to_string().contains("exactly one non-empty"));
+            drop(legacy);
         }
+
+        let _legacy = EnvVarGuard::set("OPENSHELL_DRIVERS", "podman/path");
+        let (mut args, _) = parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        let error = super::resolve_legacy_driver_selector_env(&mut args)
+            .expect_err("invalid legacy selector must be rejected");
+        assert!(error.to_string().contains("invalid compute driver name"));
+        assert!(!error.to_string().contains("podman/path"));
+    }
+
+    #[test]
+    fn legacy_compute_driver_environment_allows_equal_canonical_and_rejects_conflict() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _canonical = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER");
+        let _legacy = EnvVarGuard::set("OPENSHELL_DRIVERS", "PODMAN");
+
+        let (mut equal, _) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver",
+            "podman",
+        ]);
+        assert!(super::resolve_legacy_driver_selector_env(&mut equal).unwrap());
+        assert_eq!(equal.compute_driver.as_deref(), Some("podman"));
+
+        let (mut conflict, _) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver",
+            "docker",
+        ]);
+        let error = super::resolve_legacy_driver_selector_env(&mut conflict)
+            .expect_err("different canonical and legacy selectors must conflict");
+        assert!(error.to_string().contains("conflicts"));
+        assert!(!error.to_string().contains("podman"));
+        assert!(!error.to_string().contains("docker"));
+    }
+
+    #[test]
+    fn legacy_compute_driver_environment_supports_remote_driver_socket() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _canonical = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER");
+        let _legacy = EnvVarGuard::set("OPENSHELL_DRIVERS", "kyma");
+        let _socket = EnvVarGuard::set(
+            "OPENSHELL_COMPUTE_DRIVER_SOCKET",
+            "/run/openshell/kyma.sock",
+        );
+        let (mut args, _) = parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+
+        assert!(super::resolve_legacy_driver_selector_env(&mut args).unwrap());
+        super::normalize_compute_driver_socket_args(&mut args).unwrap();
+        assert_eq!(args.compute_driver.as_deref(), Some("kyma"));
+        assert_eq!(
+            args.compute_driver_socket.as_deref(),
+            Some(std::path::Path::new("/run/openshell/kyma.sock"))
+        );
     }
 
     #[test]
@@ -1299,20 +1433,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_legacy_drivers_environment_variable() {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for value in ["docker", ""] {
-            let _guard = EnvVarGuard::set("OPENSHELL_DRIVERS", value);
-            let error = reject_legacy_driver_selector_env()
-                .expect_err("legacy OPENSHELL_DRIVERS must be rejected when present");
-            assert!(error.to_string().contains("OPENSHELL_DRIVERS"));
-            assert!(error.to_string().contains("OPENSHELL_COMPUTE_DRIVER"));
-        }
-    }
-
-    #[test]
     fn default_config_path_is_loaded_only_when_present() {
         let _lock = ENV_LOCK
             .lock()
@@ -1407,6 +1527,46 @@ mod tests {
         assert_eq!(args.tls_key, Some(tls.path().join("server/tls.key")));
         assert_eq!(args.tls_client_ca, Some(tls.path().join("ca.crt")));
         assert_eq!(local_tls.client_cert, tls.path().join("client/tls.crt"));
+    }
+
+    #[test]
+    fn tls_client_certificate_requirement_is_derived_from_ca_and_oidc() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
+        let _config_path = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+        let _legacy = EnvVarGuard::remove("OPENSHELL_DRIVERS");
+        let registry = test_registry("shared", false, false);
+
+        for (oidc_issuer, expected) in [(None, true), (Some("https://idp.example.com"), false)] {
+            let mut startup_args = vec![
+                "openshell-gateway",
+                "--db-url",
+                "sqlite::memory:",
+                "--compute-driver",
+                "shared",
+                "--tls-cert",
+                "/tls/server.crt",
+                "--tls-key",
+                "/tls/server.key",
+                "--tls-client-ca",
+                "/tls/ca.crt",
+            ];
+            if let Some(issuer) = oidc_issuer {
+                startup_args.extend(["--oidc-issuer", issuer]);
+            }
+            let (mut args, matches) = parse_with_args(&startup_args);
+            let prepared =
+                super::prepare_server_config_with_drivers(&mut args, &matches, &registry).unwrap();
+
+            assert_eq!(
+                prepared.config.tls.as_ref().unwrap().require_client_auth,
+                expected,
+                "oidc issuer: {oidc_issuer:?}"
+            );
+        }
     }
 
     #[test]
@@ -1659,6 +1819,28 @@ compute_driver = "podman"
     }
 
     #[test]
+    fn legacy_compute_driver_environment_conflicts_with_file_selection() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _canonical = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER");
+        let _legacy = EnvVarGuard::set("OPENSHELL_DRIVERS", "docker");
+        let file = config_file_from_toml(
+            r#"
+[openshell.gateway]
+compute_driver = "podman"
+"#,
+        );
+        let (mut args, matches) =
+            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+
+        let error = super::resolve_legacy_driver_selector_env(&mut args)
+            .expect_err("different file and legacy selectors must conflict");
+        assert!(error.to_string().contains("conflicts"));
+    }
+
+    #[test]
     fn file_oidc_block_populates_oidc_args() {
         let _lock = ENV_LOCK
             .lock()
@@ -1826,7 +2008,7 @@ ssh_session_ttl_secs = 1234
         let _g1 = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER_SOCKET");
         let _g2 = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER");
 
-        let (mut args, matches) = parse_with_args(&[
+        let (mut args, _) = parse_with_args(&[
             "openshell-gateway",
             "--db-url",
             "sqlite::memory:",
@@ -1835,7 +2017,7 @@ ssh_session_ttl_secs = 1234
             "--compute-driver-socket",
             "/run/openshell/kyma.sock",
         ]);
-        super::normalize_compute_driver_socket_args(&mut args, &matches).unwrap();
+        super::normalize_compute_driver_socket_args(&mut args).unwrap();
         assert_eq!(
             args.compute_driver_socket.as_deref(),
             Some(std::path::Path::new("/run/openshell/kyma.sock"))
@@ -1851,14 +2033,14 @@ ssh_session_ttl_secs = 1234
         let _g1 = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER_SOCKET");
         let _g2 = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER");
 
-        let (mut args, matches) = parse_with_args(&[
+        let (mut args, _) = parse_with_args(&[
             "openshell-gateway",
             "--db-url",
             "sqlite::memory:",
             "--compute-driver-socket",
             "/run/openshell/kyma.sock",
         ]);
-        let err = super::normalize_compute_driver_socket_args(&mut args, &matches).unwrap_err();
+        let err = super::normalize_compute_driver_socket_args(&mut args).unwrap_err();
 
         assert!(
             err.to_string().contains("requires --compute-driver <name>"),
@@ -1874,7 +2056,7 @@ ssh_session_ttl_secs = 1234
         let _g1 = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER_SOCKET");
         let _g2 = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER");
 
-        let (mut args, matches) = parse_with_args(&[
+        let (mut args, _) = parse_with_args(&[
             "openshell-gateway",
             "--db-url",
             "sqlite::memory:",
@@ -1883,7 +2065,7 @@ ssh_session_ttl_secs = 1234
             "--compute-driver-socket",
             "/run/openshell/extension.sock",
         ]);
-        super::normalize_compute_driver_socket_args(&mut args, &matches).unwrap();
+        super::normalize_compute_driver_socket_args(&mut args).unwrap();
         assert_eq!(args.compute_driver.as_deref(), Some("docker"));
     }
 
@@ -1895,7 +2077,7 @@ ssh_session_ttl_secs = 1234
         let _g1 = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER_SOCKET");
         let _g2 = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER");
 
-        let (mut args, matches) = parse_with_args(&[
+        let (mut args, _) = parse_with_args(&[
             "openshell-gateway",
             "--db-url",
             "sqlite::memory:",
@@ -1904,7 +2086,7 @@ ssh_session_ttl_secs = 1234
             "--compute-driver-socket",
             "/run/openshell/vm.sock",
         ]);
-        super::normalize_compute_driver_socket_args(&mut args, &matches).unwrap();
+        super::normalize_compute_driver_socket_args(&mut args).unwrap();
         assert_eq!(args.compute_driver.as_deref(), Some("vm"));
     }
 
@@ -1919,9 +2101,8 @@ ssh_session_ttl_secs = 1234
         );
         let _g2 = EnvVarGuard::set("OPENSHELL_COMPUTE_DRIVER", "kyma");
 
-        let (mut args, matches) =
-            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
-        super::normalize_compute_driver_socket_args(&mut args, &matches).unwrap();
+        let (mut args, _) = parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        super::normalize_compute_driver_socket_args(&mut args).unwrap();
         assert_eq!(
             args.compute_driver_socket.as_deref(),
             Some(std::path::Path::new("/var/run/openshell/kyma.sock"))

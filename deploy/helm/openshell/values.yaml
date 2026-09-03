@@ -255,8 +255,9 @@ server:
   # Override only when sandboxes must reach the gateway via a different
   # hostname (e.g. an external ingress or a host alias).
   grpcEndpoint: ""
-  # TLS configuration for the server. The server always terminates mTLS
-  # directly and requires client certificates.
+  # The gateway terminates TLS directly. Its client CA authenticates sandbox
+  # callbacks; OIDC-enabled listeners permit bearer-only user clients while
+  # still validating any client certificate they present.
   # -- Host gateway IP for sandbox pod hostAliases. When set, sandbox pods get
   # hostAliases entries mapping host.docker.internal and host.openshell.internal
   # to this IP, allowing them to reach services running on the Docker host.

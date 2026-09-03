@@ -72,7 +72,11 @@ future version. To migrate an existing file:
 1. Set `[openshell] version = 2`.
 2. Replace `compute_drivers = ["<name>"]` with the scalar
    `compute_driver = "<name>"`. Replace `--drivers` and `OPENSHELL_DRIVERS`
-   with `--compute-driver` and `OPENSHELL_COMPUTE_DRIVER`.
+   with `--compute-driver` and `OPENSHELL_COMPUTE_DRIVER`. Package upgrades
+   temporarily accept one non-empty `OPENSHELL_DRIVERS` value as a deprecated
+   environment-only alias when it agrees with any canonical selection.
+   Comma-delimited, invalid, or conflicting legacy values fail startup. The
+   removed `--driver` and `--drivers` flags remain unsupported.
 3. Move every compute-driver option into `[openshell.drivers.<name>]`. Schema
    version 2 does not inherit driver defaults from `[openshell.gateway]`.
    Keep only `guest_tls_ca`, `guest_tls_cert`, and `guest_tls_key` at gateway
@@ -98,9 +102,10 @@ future version. To migrate an existing file:
    state retains its recorded or recoverable identity, including legacy 10001;
    the driver does not assign 10001 to an overlay without supporting state.
 
-Unknown fields and non-table `[openshell.drivers.<name>]` values fail startup.
-This strict validation prevents misspelled or misplaced security-sensitive
-settings from being silently ignored.
+Every `[openshell.drivers.<name>]` entry must be a TOML table. The gateway
+validates driver-specific fields when it selects and constructs that driver;
+it does not deserialize unselected driver tables. Unknown or misplaced fields
+in the selected table fail startup instead of being silently ignored.
 
 ## Full Example
 
@@ -183,7 +188,6 @@ timeout = "500ms"
 cert_path             = "/etc/openshell/certs/gateway.pem"
 key_path              = "/etc/openshell/certs/gateway-key.pem"
 client_ca_path        = "/etc/openshell/certs/client-ca.pem"
-require_client_auth   = false
 # Optional: SNI-based dual certificate for external (e.g. ACME) TLS.
 # external_cert_path    = "/etc/openshell/certs/external.pem"
 # external_key_path     = "/etc/openshell/certs/external-key.pem"
@@ -255,7 +259,9 @@ namespace = "openshell"
 allow_reference_namespace = false
 ```
 
-Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to authenticate CLI callers from verified client certificates. Kubernetes deployments must leave this unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
+Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to map a verified client certificate to a CLI user identity. This application-layer identity switch does not control the TLS handshake. When `client_ca_path` is set without OIDC, the listener requires a valid client certificate. When OIDC is configured, bearer-only clients may connect; the listener still validates any client certificate they present against the configured CA. Kubernetes deployments must leave `mtls_auth.enabled` unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
+
+The client-certificate handshake policy is derived and has no `require_client_auth` TOML field. This preserves bearer-only OIDC clients and prevents a file setting from silently weakening CA-only gateways.
 
 `[openshell.gateway.tls]` supports optional SNI-based dual-certificate mode for deployments that need separate internal and external server certificates. Set `external_cert_path` and `external_key_path` to point at the external (e.g. ACME/publicly-trusted) certificate and key. List the hostnames that should be served with the external certificate in `external_server_names`. Connections whose TLS SNI hostname matches one of those names receive the external certificate; all other connections (including those with no SNI) receive the primary internal certificate from `cert_path`/`key_path`. Both fields must be set together — providing only one is a configuration error. On Kubernetes with the Helm chart, the external certificate is managed automatically when `certManager.serverIssuerRef.name` is set; the chart populates these fields from the cert-manager-issued external server certificate.
 

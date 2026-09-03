@@ -249,6 +249,7 @@ pub(crate) struct ServerStartupConfig {
     pub config_file: Option<config_file::ConfigFile>,
     pub guest_tls: Option<compute::driver_config::GuestTlsPaths>,
     pub compute_driver: ComputeDriverSelection,
+    pub legacy_compute_driver_env_seen: bool,
 }
 
 /// Server state shared across handlers.
@@ -449,6 +450,7 @@ pub(crate) async fn run_server(
         config_file,
         guest_tls,
         compute_driver,
+        legacy_compute_driver_env_seen: _,
     } = startup;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
