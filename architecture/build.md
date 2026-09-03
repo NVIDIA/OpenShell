@@ -263,6 +263,19 @@ restart, while the scenario remains responsible for black-box sandbox
 continuity checks. The plan exposes opaque executable paths and timeouts rather
 than driver or package-manager configuration; target setup owns those details.
 
+The conformance workflow also validates a branch-built Snap in an Ubuntu QEMU
+guest. It composes snapd and Docker Snap, then runs the generic Ansible
+`openshell-snap-package-bootstrap-workaround` provisioner runs the copied,
+prebuilt gateway binary in the guest to generate the package-owned PKI and
+sandbox JWT bundle before the candidate Snap is installed. The temporary
+workaround isolates the missing Snap package bootstrap, which should eventually
+create the bundle itself. The temporary role writes the generated JWT paths and
+local unauthenticated-user setting to the Snap's `gateway.toml`.
+`openshell-snap` then installs the candidate and
+connects its interfaces, registers the local gateway, and waits for
+`openshell status`. The guest command runs CLI smoke conformance against the
+Snap-installed client.
+
 ## Python Wheel Packaging
 
 The generated protobuf/gRPC stubs under `python/openshell/_proto/` are gitignored
