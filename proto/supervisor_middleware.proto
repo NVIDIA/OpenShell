@@ -36,8 +36,9 @@ service SupervisorMiddleware {
 // HttpResponsePreReturn evaluates one response for one middleware stage before
 // OpenShell returns it to the sandbox.
 service HttpResponsePreReturn {
-  // Evaluate starts with preflight, followed by selected body units. It may end
-  // with one best-effort session_end.
+  // Evaluate starts with preflight and may continue with selected body units
+  // and trailers. A body unit marked end_of_stream ends body inspection, not
+  // the event stream. Trailers and one best-effort session_end may follow.
   rpc Evaluate(stream HttpResponseEvent)
       returns (stream HttpResponseEventResult);
 }
@@ -126,7 +127,8 @@ message HttpHeader {
 }
 
 // One ordered response event. A stream starts with preflight, may continue with
-// body units and trailers, and may end with one best-effort session_end.
+// body units ending in end_of_stream, may then include trailers, and may end
+// with one best-effort session_end.
 message HttpResponseEvent {
   oneof event {
     // Initial response head and request context.
@@ -274,16 +276,18 @@ message HttpResponseBodyUnit {
   // Contiguous and stage-local, starting at 1.
   uint64 sequence = 1;
   oneof payload {
-    // Bytes without transfer framing. WHOLE_BODY_BYTES represents an empty body
-    // with present empty data. STREAM_BYTES units are at most the smaller of
-    // 64 KiB and half max_payload_bytes, and may be shorter to preserve flushing.
+    // Bytes without transfer framing. A body-capable response with no body bytes
+    // has present empty data in sequence 1. STREAM_BYTES units are at most the
+    // smaller of 64 KiB and half max_payload_bytes, and may be shorter to
+    // preserve flushing.
     bytes data = 2;
   }
-  // Marks the final unit. A completed inspection receives exactly one, including
-  // an empty sequence-1 unit for an empty body. OpenShell does not read ahead,
-  // so it may send an empty final unit after the last data unit. The final unit
-  // requires a result containing any deferred bytes. Interrupted streams may
-  // end with session_end instead.
+  // Marks the final body unit. Every normally completed body inspection receives
+  // exactly one. For a body-capable response with no body bytes, this is the
+  // empty sequence-1 unit. OpenShell does not read ahead, so it may send an empty
+  // final unit after the last nonempty unit. The matching result must flush all
+  // deferred bytes. Trailers and session_end may follow. A stage ended by
+  // skip_remaining, block, or failure receives no later final unit.
   bool end_of_stream = 3;
 }
 
