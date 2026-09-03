@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use reqwest::Client;
 use sha2::{Digest, Sha256, digest::Output};
@@ -51,10 +51,16 @@ impl CasFetcher {
 
     pub fn schedule(&mut self, url: Url, expected_sha256: Output<Sha256>) {
         let client = self.client.clone();
-        let downloads_dir = self.downloads_dir.clone();
+        let target = self.downloads_dir.join(hex::encode(expected_sha256));
 
-        self.tasks
-            .spawn(async move { fetch(&client, &downloads_dir, url, expected_sha256).await });
+        self.tasks.spawn(async move {
+            if fs::try_exists(&target).await? {
+                info!(path = %target.display(), "download already exists");
+                return Ok(target);
+            }
+
+            fetch(&client, target, url, expected_sha256).await
+        });
     }
 
     pub async fn finish(mut self) -> Result<(), Error> {
@@ -73,13 +79,12 @@ impl CasFetcher {
 
 async fn fetch(
     client: &Client,
-    downloads_dir: &Path,
+    target: PathBuf,
     url: Url,
     expected_sha256: Output<Sha256>,
 ) -> Result<PathBuf, Error> {
     let digest = hex::encode(expected_sha256);
-    let target = downloads_dir.join(&digest);
-    let partial = downloads_dir.join(format!("{digest}.part"));
+    let partial = target.with_file_name(format!("{digest}.part"));
 
     info!(url = %url, "downloading");
 
