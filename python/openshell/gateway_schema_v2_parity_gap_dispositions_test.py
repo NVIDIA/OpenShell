@@ -57,6 +57,7 @@ ALLOWED_DISPOSITIONS = {
     "must_fix_before_release_gate",
     "must_fix_or_remove_claim",
     "no_action",
+    "resolved",
 }
 
 
@@ -121,7 +122,7 @@ def test_non_findings_do_not_require_product_changes() -> None:
             assert gap["disposition"] == "no_action"
 
 
-def test_security_sensitive_tls_gap_requires_fix_or_removed_claim() -> None:
+def test_security_sensitive_tls_gap_records_reviewed_resolution() -> None:
     tls_gap = next(
         gap
         for gap in load_ledger()["gaps"]
@@ -129,8 +130,21 @@ def test_security_sensitive_tls_gap_requires_fix_or_removed_claim() -> None:
     )
 
     assert tls_gap["parity_relation"] == "preexisting_inaccessible_option"
-    assert tls_gap["disposition"] == "must_fix_or_remove_claim"
-    assert "security review" in tls_gap["resolution"]
+    assert tls_gap["disposition"] == "resolved"
+    assert "Security review" in tls_gap["resolution"]
+    assert "rejects require_client_auth" in tls_gap["candidate_behavior"]
+
+
+def test_step_6_gap_dispositions_are_resolved() -> None:
+    step_6_gaps = [gap for gap in load_ledger()["gaps"] if gap["owner_step"] == 6]
+
+    assert {gap["id"] for gap in step_6_gaps} == {
+        "legacy-environment-selector-upgrade",
+        "tls-require-client-auth-ignored",
+        "unselected-driver-validation-claim",
+    }
+    assert all(gap["severity"] == "none" for gap in step_6_gaps)
+    assert all(gap["disposition"] == "resolved" for gap in step_6_gaps)
 
 
 def test_legacy_environment_resolution_preserves_singular_semantics() -> None:
@@ -141,5 +155,5 @@ def test_legacy_environment_resolution_preserves_singular_semantics() -> None:
     )
 
     assert "one non-empty OPENSHELL_DRIVERS value" in legacy_gap["resolution"]
-    assert "reject multiple values" in legacy_gap["resolution"]
+    assert "rejects multiple values" in legacy_gap["resolution"]
     assert "conflicting canonical and legacy values" in legacy_gap["resolution"]
