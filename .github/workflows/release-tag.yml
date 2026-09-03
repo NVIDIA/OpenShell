@@ -665,15 +665,17 @@ jobs:
 
   publish-fern-docs:
     name: Sync and Publish Fern Docs
-    needs: [compute-versions, release]
+    needs: [compute-versions, release, publish-sdk-typescript, release-helm, trigger-wheel-publish]
     if: needs.compute-versions.outputs.is_prerelease != 'true'
     permissions:
       contents: write
     uses: ./.github/workflows/sync-docs.yml
     with:
       operation: sync
-      channel: latest
+      channel: stable
       source_ref: ${{ needs.compute-versions.outputs.source_sha }}
+      release_version: ${{ needs.compute-versions.outputs.semver }}
+      version_slug: v${{ needs.compute-versions.outputs.semver }}
       display_name: Latest (v${{ needs.compute-versions.outputs.semver }})
       publish: true
     secrets: inherit

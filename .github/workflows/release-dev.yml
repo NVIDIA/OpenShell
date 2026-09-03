@@ -635,7 +635,7 @@ jobs:
 
   publish-fern-docs:
     name: Sync and Publish Fern Docs
-    needs: [compute-versions, release-dev]
+    needs: [compute-versions, release-dev, release-helm, trigger-wheel-publish]
     permissions:
       contents: write
     uses: ./.github/workflows/sync-docs.yml
@@ -643,6 +643,7 @@ jobs:
       operation: sync
       channel: dev
       source_ref: ${{ github.sha }}
+      release_version: ${{ needs.compute-versions.outputs.docs_version }}
       display_name: Dev (v${{ needs.compute-versions.outputs.docs_version }})
       availability: beta
       publish: true
