@@ -22,8 +22,14 @@ pub struct TracingLogBus {
 
 #[derive(Debug)]
 struct Inner {
-    per_id: HashMap<String, broadcast::Sender<SandboxStreamEvent>>,
-    tails: HashMap<String, VecDeque<SandboxStreamEvent>>,
+    per_id: HashMap<String, PerSandbox>,
+}
+
+#[derive(Debug)]
+struct PerSandbox {
+    sender: broadcast::Sender<SandboxStreamEvent>,
+    tail: VecDeque<(u64, SandboxStreamEvent)>,
+    next_seq: u64,
 }
 
 impl Default for TracingLogBus {
@@ -37,8 +43,7 @@ impl TracingLogBus {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner {
-                per_id: HashMap::new(),
-                tails: HashMap::new(),
+                per_id: HashMap::<String, PerSandbox>::new(),
             })),
             platform_event_bus: PlatformEventBus::new(),
         }
@@ -58,8 +63,15 @@ impl TracingLogBus {
             .entry(sandbox_id.to_string())
             .or_insert_with(|| {
                 let (tx, _rx) = broadcast::channel(1024);
-                tx
+                PerSandbox {
+                    sender: tx,
+                    tail: VecDeque::new(),
+                    // Seq starts at 1 so the proto default resume_after_cursor
+                    // (0) means "from the beginning" without skipping event 1.
+                    next_seq: 1,
+                }
             })
+            .sender
             .clone()
     }
 
@@ -74,19 +86,25 @@ impl TracingLogBus {
     pub fn remove(&self, sandbox_id: &str) {
         let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
         inner.per_id.remove(sandbox_id);
-        inner.tails.remove(sandbox_id);
     }
 
     pub fn tail(&self, sandbox_id: &str, max: usize) -> Vec<SandboxStreamEvent> {
         let inner = self.inner.lock().expect("tracing bus lock poisoned");
         inner
-            .tails
+            .per_id
             .get(sandbox_id)
-            .map(|d| d.iter().rev().take(max).cloned().collect::<Vec<_>>())
+            .map(|d| {
+                d.tail
+                    .iter()
+                    .rev()
+                    .take(max)
+                    .map(|(_seq, event)| event.clone())
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default()
             .into_iter()
             .rev()
-            .collect()
+            .collect::<Vec<SandboxStreamEvent>>()
     }
 
     /// Publish a log line from an external source (e.g., sandbox push).
@@ -111,10 +129,15 @@ impl TracingLogBus {
         let _ = tx.send(event.clone());
 
         let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
-        let deque = inner.tails.entry(sandbox_id.to_string()).or_default();
-        deque.push_back(event);
-        while deque.len() > tail_cap {
-            deque.pop_front();
+        let per_sandbox = inner
+            .per_id
+            .get_mut(sandbox_id)
+            .expect("sender_for inserted the entry above");
+        let seq = per_sandbox.next_seq;
+        per_sandbox.next_seq += 1;
+        per_sandbox.tail.push_back((seq, event));
+        while per_sandbox.tail.len() > tail_cap {
+            per_sandbox.tail.pop_front();
         }
     }
 }
