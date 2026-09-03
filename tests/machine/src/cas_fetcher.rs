@@ -83,8 +83,7 @@ async fn fetch(
     url: Url,
     expected_sha256: Output<Sha256>,
 ) -> Result<PathBuf, Error> {
-    let digest = hex::encode(expected_sha256);
-    let partial = target.with_file_name(format!("{digest}.part"));
+    let partial = target.with_extension("part");
 
     info!(url = %url, "downloading");
 
@@ -104,7 +103,7 @@ async fn fetch(
     if actual_sha256 != expected_sha256 {
         return Err(Error::Sha256Mismatch {
             url: url.into(),
-            expected: digest,
+            expected: hex::encode(expected_sha256),
             actual: hex::encode(actual_sha256),
         });
     }
