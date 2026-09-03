@@ -217,6 +217,15 @@ podman logs <container> --tail=200
 openshell status
 ```
 
+On macOS, confirm the gateway is using the live Podman Machine socket rather
+than the legacy `~/.local/share/containers/podman/machine/podman.sock` path:
+
+```bash
+podman machine inspect --format '{{.ConnectionInfo.PodmanSocket.Path}}'
+export OPENSHELL_PODMAN_SOCKET="$(podman machine inspect --format '{{.ConnectionInfo.PodmanSocket.Path}}')"
+podman info --url "unix://${OPENSHELL_PODMAN_SOCKET}"
+```
+
 Common findings:
 
 - Podman socket unavailable: start or expose the user socket.
