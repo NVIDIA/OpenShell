@@ -256,11 +256,24 @@ pulls and explicit publication. OCI pulls require a trusted manifest digest
   and retain that provenance with the local entry; mutable tags are used only
   for explicit publication.
 
-The conformance workflow also builds a branch Snap for an Ubuntu QEMU guest.
-The guest installs snapd and Docker Snap, installs the unsigned candidate,
-connects its required interfaces, registers the local gateway, and verifies
-`openshell status`. Sandbox smoke conformance remains separate from this
-package-installation check.
+CLI conformance runs after target provisioning. Action-free scenarios operate
+only through the configured OpenShell CLI. A versioned conformance plan may add
+an ordered sequence of target-supplied host-side actions, such as a gateway
+restart, while the scenario remains responsible for black-box sandbox
+continuity checks. The plan exposes opaque executable paths and timeouts rather
+than driver or package-manager configuration; target setup owns those details.
+
+The conformance workflow also validates a branch-built Snap in an Ubuntu QEMU
+guest. It composes snapd and Docker Snap, then copies a prebuilt gateway binary
+that activates an internal bootstrap step in the generic Ansible
+`openshell-snap` provisioner. After purging any previous installation, the role
+uses the binary to generate the package-owned PKI and sandbox JWT bundle before
+installing the candidate. This temporary step isolates the missing Snap package
+bootstrap, which should eventually create the bundle itself. The role writes
+the generated JWT paths and local unauthenticated-user setting to the Snap's
+`gateway.toml`, connects the required interfaces, registers the local gateway,
+and waits for `openshell status`. The guest command runs CLI smoke conformance
+against the Snap-installed client.
 
 ## Python Wheel Packaging
 

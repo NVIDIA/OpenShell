@@ -5,3 +5,10 @@
 openshell_snap_package: /var/lib/openshell-conformance/candidate/openshell.snap
 openshell_snap_gateway_service: snap.openshell.gateway.service
 openshell_snap_ready_retries: 30
+
+# Temporary package workaround. Copying a prebuilt gateway to this path enables
+# PKI and sandbox JWT bootstrap before the candidate Snap is installed.
+openshell_snap_package_bootstrap_gateway_bin: /var/lib/openshell-conformance/workarounds/openshell-gateway
+openshell_snap_gateway_state_dir: /var/snap/openshell/common
+openshell_snap_gateway_tls_dir: "{{ openshell_snap_gateway_state_dir }}/tls"
+openshell_snap_gateway_config: "{{ openshell_snap_gateway_state_dir }}/gateway.toml"
