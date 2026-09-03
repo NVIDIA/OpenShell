@@ -53,7 +53,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
@@ -1912,8 +1912,14 @@ pub(super) async fn handle_watch_sandbox(
                                     }
                                 }
                             }
-                            Err(err) => {
-                                let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                // Lag is recoverable: surface a warning and keep streaming.
+                                if tx.send(Ok(crate::sandbox_watch::lag_warning_event(n))).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                let _ = tx.send(Err(Status::cancelled("stream closed"))).await;
                                 return;
                             }
                         }
@@ -1938,8 +1944,14 @@ pub(super) async fn handle_watch_sandbox(
                                     return;
                                 }
                             }
-                            Err(err) => {
-                                let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                // Lag is recoverable: surface a warning and keep streaming.
+                                if tx.send(Ok(crate::sandbox_watch::lag_warning_event(n))).await.is_err() {
+                                    return;
+                                }
+                            },
+                            Err(broadcast::error::RecvError::Closed) => {
+                                let _ = tx.send(Err(Status::cancelled("stream closed"))).await;
                                 return;
                             }
                         }
@@ -1956,8 +1968,14 @@ pub(super) async fn handle_watch_sandbox(
                                     return;
                                 }
                             }
-                            Err(err) => {
-                                let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                // Lag is recoverable: surface a warning and keep streaming.
+                                if tx.send(Ok(crate::sandbox_watch::lag_warning_event(n))).await.is_err() {
+                                    return;
+                                }
+                            },
+                            Err(broadcast::error::RecvError::Closed) => {
+                                let _ = tx.send(Err(Status::cancelled("stream closed"))).await;
                                 return;
                             }
                         }
