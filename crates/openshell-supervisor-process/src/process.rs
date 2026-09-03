@@ -901,17 +901,18 @@ impl ProcessHandle {
         }
 
         #[cfg(target_os = "linux")]
-        let mut child = spawn_command_with_supervisor_identity_namespace(cmd)
-            .into_diagnostic()
-            .wrap_err("failed to spawn sandbox entrypoint process")?;
+        let mut child = managed_children::spawn_registered(
+            || spawn_command_with_supervisor_identity_namespace(cmd),
+            Child::id,
+        )
+        .into_diagnostic()
+        .wrap_err("failed to spawn sandbox entrypoint process")?;
         #[cfg(not(target_os = "linux"))]
         let mut child = cmd
             .spawn()
             .into_diagnostic()
             .wrap_err("failed to spawn sandbox entrypoint process")?;
         let pid = child.id().unwrap_or(0);
-        managed_children::register(pid);
-
         let io = if let Some(master) = pty_master {
             ProcessIo::Pty(master)
         } else {
@@ -1055,8 +1056,6 @@ impl ProcessHandle {
 
         let mut child = cmd.spawn().into_diagnostic()?;
         let pid = child.id().unwrap_or(0);
-        #[cfg(target_os = "linux")]
-        managed_children::register(pid);
 
         debug!(pid, program, "Process spawned");
 
