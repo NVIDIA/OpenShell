@@ -546,8 +546,8 @@ mod tests {
         executor.runtime.deactivate();
         let result = executor
             .exec(ExecSpec {
-                program: "/bin/true".to_string(),
-                args: vec![],
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "exit 0".to_string()],
                 env: vec![],
                 workdir: None,
                 pty: false,
