@@ -40,6 +40,15 @@ New limits should follow these rules:
   query parameters, or external free-form diagnostics.
 - Test time bounds with simulated time and test shared budgets under saturation.
 
+## Gateway Sandbox Resources
+
+Gateway-owned sandbox resources also carry admission limits before they can
+produce supervisor work. Reusable workload templates are capped at 1000 per
+workspace. Template payloads reuse sandbox spec validation for environment
+entry count and size, image and resource field sizes, driver-config serialized
+size, and GPU count. Template names use the same DNS-style resource-name rules
+as other named gateway resources.
+
 ## Middleware
 
 Middleware limits are process-wide per sandbox. Registry replacement preserves

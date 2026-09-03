@@ -51,6 +51,15 @@ impl ComputeDriver for ComputeDriverService {
         Ok(Response::new(self.backend.capabilities()))
     }
 
+    async fn authenticate_sandbox(
+        &self,
+        _request: Request<AuthenticateSandboxRequest>,
+    ) -> Result<Response<AuthenticateSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "mxc does not authenticate sandbox credentials",
+        ))
+    }
+
     async fn get_gateway_listener_requirements(
         &self,
         _request: Request<GetGatewayListenerRequirementsRequest>,

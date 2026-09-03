@@ -71,6 +71,19 @@ Create the name of the service account assigned to sandbox pods
 {{- end }}
 
 {{/*
+Whether this chart owns workspace-scoped resources. Missing legacy values
+default to enabled so upgrades with --reuse-values preserve the old topology.
+*/}}
+{{- define "openshell.workspaceResourcesEnabled" -}}
+{{- $workspaceResources := .Values.workspaceResources | default dict -}}
+{{- $enabled := true -}}
+{{- if hasKey $workspaceResources "enabled" -}}
+{{- $enabled = get $workspaceResources "enabled" -}}
+{{- end -}}
+{{- if $enabled -}}true{{- end -}}
+{{- end }}
+
+{{/*
 Gateway image reference. Uses image.tag when set; falls back to .Chart.AppVersion
 so a released chart automatically pulls the matching image without extra overrides.
 */}}

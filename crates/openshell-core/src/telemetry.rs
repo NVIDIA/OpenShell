@@ -145,6 +145,7 @@ impl PolicyDecisionOperation {
 pub enum SandboxTemplateSource {
     Default,
     Image,
+    WorkloadTemplate,
     Undefined,
 }
 
@@ -154,6 +155,7 @@ impl SandboxTemplateSource {
         match self {
             Self::Default => "default",
             Self::Image => "image",
+            Self::WorkloadTemplate => "workload_template",
             Self::Undefined => "undefined",
         }
     }

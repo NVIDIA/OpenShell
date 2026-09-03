@@ -258,6 +258,16 @@ template resource limits. Docker and Podman apply them as runtime limits.
 Kubernetes mirrors each limit into the matching request. VM accepts the fields
 but currently ignores them.
 
+Reusable sandbox workload templates are resolved before the compute-driver
+boundary. Drivers do not receive a separate template resource; the gateway
+lowers the selected `SandboxWorkloadTemplate` into the existing sandbox spec
+and validates that spec before calling `ValidateSandboxCreate` or
+`CreateSandbox`. Template CPU and memory become the same typed resource limits
+described above. Template GPU settings become `ResourceRequirements`, preserving
+the driver's default GPU assignment when the count is omitted. Template
+`driver_config` remains a driver-keyed envelope until the compute layer selects
+the active driver block and forwards only that block to the driver.
+
 Docker and Podman also accept per-sandbox driver-config mounts for existing
 runtime-managed named volumes and tmpfs mounts. Podman additionally accepts
 image mounts through its image-volume API. User-supplied bind and volume mounts
@@ -282,6 +292,17 @@ Kubernetes deployments may set an AppArmor profile on sandbox agent containers
 through the driver configuration. The Helm chart defaults sandbox agents to
 `Unconfined` so runtime/default AppArmor profiles do not block supervisor
 network namespace setup on AppArmor-enabled nodes.
+
+The Kubernetes deployment packaging has two ownership boundaries. The gateway
+chart owns the gateway workload, configuration, Services, PKI, and
+cluster-scoped gateway resources. It can retain the legacy combined behavior,
+or omit workspace resources. The workspace chart is installed into a
+pre-provisioned sandbox namespace and owns only the sandbox ServiceAccount,
+namespaced RBAC, and sandbox ingress NetworkPolicy. Its RoleBinding names the
+gateway ServiceAccount and namespace explicitly, so the two releases have
+disjoint lifecycle ownership. A shared-mode gateway can target one external
+namespace, while operator mode maps workspace names to multiple
+platform-provisioned namespaces.
 
 Resource requirements enter the driver layer through `SandboxSpec.resource_requirements`. This includes a set of GPU requirements, where a user
 can request a specific number of GPUs or the driver-specific default behaviour.

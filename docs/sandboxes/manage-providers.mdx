@@ -122,6 +122,16 @@ read-only. The target ID must match the profile ID in the file. Update accepts
 one file at a time and rejects stale resource versions. Updated profile policy
 applies to all provider instances of that type on the next sandbox config sync.
 
+Delete one or more custom provider profiles by ID:
+
+```shell
+openshell provider profile delete custom-api custom-alt
+```
+
+When a multi-profile delete fails for one entry, the CLI reports that profile's
+failure and continues with the remaining IDs. The command exits with an error
+after it attempts every requested deletion if any entry failed.
+
 <Warning>
 Static credentials require a built-in or imported provider profile. Profiles
 normally define at least one endpoint. An endpointless profile requires an
@@ -276,6 +286,16 @@ Delete a provider:
 ```shell
 openshell provider delete my-claude
 ```
+
+Delete multiple providers by listing their names in one command:
+
+```shell
+openshell provider delete my-claude my-github
+```
+
+When a multi-provider delete fails for one entry, the CLI reports that
+provider's failure and continues with the remaining names. The command exits
+with an error after it attempts every requested deletion if any entry failed.
 
 ## Attach Providers to Sandboxes
 

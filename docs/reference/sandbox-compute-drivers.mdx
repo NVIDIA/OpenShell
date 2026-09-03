@@ -360,6 +360,18 @@ The VM driver creates nftables rules on the host for each sandbox VM's TAP netwo
 
 On hosts with restrictive firewalls (e.g. firewalld), the host firewall may additionally block VM traffic that the driver's rules accept. If VM sandboxes cannot reach the network, verify that the host firewall allows forwarding and input for `vmtap-*` interfaces. See the [VM driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-vm/README.md#host-side-nftables-rules) for details.
 
+### Corporate Proxy Egress
+
+For proxy-required networks, the VM driver accepts the same corporate egress proxy keys as the Podman driver: `https_proxy`, `no_proxy`, `proxy_auth_file`, `proxy_auth_allow_insecure`, `proxy_connect_by_hostname`, and `proxy_ca_bundle`. The in-guest supervisor chains policy-approved TLS tunnels through the proxy with HTTP CONNECT instead of dialing destinations directly.
+
+The settings reach the guest supervisor on its command line through a per-sandbox argument file the driver writes into the overlay upperdir on every launch, so a sandbox cannot select, alter, or disable the proxy from inside the guest — including through image `ENV`, the sandbox environment, or files baked into the image at the paths the driver uses.
+
+A proxy on the corporate network needs no special address and works on every VM sandbox. The guest's callback to the gateway never traverses the proxy.
+
+A proxy on the gateway host itself works only for libkrun-backed (non-GPU) sandboxes, whose egress leaves through gvproxy: configure `https_proxy = "http://host.openshell.internal:<port>"` rather than a `127.0.0.1` URL, because gvproxy NATs that alias to the host's `127.0.0.1`. GPU sandboxes use the QEMU/TAP backend, where `host.openshell.internal` resolves to the TAP host address and the driver's [host firewall rules](#host-firewall) allow the guest to reach only the gateway port on the host. The driver rejects a gateway-host proxy URL when a sandbox launches on QEMU instead of letting every CONNECT time out, so give GPU sandboxes a proxy address routable from the guest's masqueraded egress.
+
+Because a microVM has no bind mounts or container secrets, the driver stages the credential (root-only) and the CA bundle into the per-sandbox overlay disk and removes them with the sandbox. See the [Gateway Configuration File](./gateway-config) reference for the full contract, including the cleartext-credential acknowledgement and the validated-IP CONNECT behavior.
+
 ## Kubernetes Driver
 
 Kubernetes-backed sandboxes run as pods in the configured sandbox namespace. Use Kubernetes for shared clusters, remote compute, GPU scheduling, and operator-managed environments.

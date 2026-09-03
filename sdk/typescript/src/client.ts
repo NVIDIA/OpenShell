@@ -17,12 +17,13 @@ import type { MessageInitShape } from '@bufbuild/protobuf';
 import { type CallOptions, type Client, createClient, type Transport } from '@connectrpc/connect';
 import { errorCode, fromConnect, SdkError } from './errors.js';
 import type { Provider } from './gen/datamodel_pb.js';
-import type { Sandbox, UpdateConfigResponse } from './gen/openshell_pb.js';
+import type { Sandbox, SandboxWorkloadTemplate, UpdateConfigResponse } from './gen/openshell_pb.js';
 import {
   type ExecSandboxInputSchema,
   OpenShell,
   SandboxPhase,
   type SandboxSpecSchema,
+  type SandboxWorkloadTemplateSchema,
   ServiceStatus,
   type TcpForwardFrameSchema,
 } from './gen/openshell_pb.js';
@@ -31,9 +32,16 @@ import { PolicySource, type SandboxPolicySchema, SettingScope, type SettingValue
 import { validateSshResponse } from './ssh-validate.js';
 import { buildTransport, type ConnectOptions } from './transport.js';
 
-// The policy and setting value shapes are the generated protobuf messages;
-// re-export them rather than re-curating a parallel surface. Callers round-trip
-// `getConfig().policy` back into `setPolicy`, and build `SettingValue`s inline.
+// Generated protobuf message shapes that callers need to populate or round-trip
+// directly. Re-export these rather than re-curating parallel surfaces.
+export type {
+  SandboxResources,
+  SandboxServiceLevel,
+  SandboxStartup,
+  SandboxWorkloadConfig,
+  SandboxWorkloadTemplate,
+  SandboxWorkloadTemplateSpec,
+} from './gen/openshell_pb.js';
 export type { SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
 export type { ConnectOptions };
 export { errorCode };
@@ -78,6 +86,8 @@ export interface Health {
 
 export interface SandboxSpec {
   name?: string;
+  /** Workspace scope. Omit or use an empty string for the gateway default workspace. */
+  workspace?: string;
   image?: string;
   labels?: Record<string, string>;
   environment?: Record<string, string>;
@@ -103,24 +113,74 @@ export interface SandboxSpec {
   rawSpec?: MessageInitShape<typeof SandboxSpecSchema>;
 }
 
+export interface SandboxFromTemplateSpec {
+  name?: string;
+  /** Workspace scope. Omit or use an empty string for the gateway default workspace. */
+  workspace?: string;
+  templateName: string;
+  labels?: Record<string, string>;
+  providers?: string[];
+  /** Exact canonical command. Empty selects the gateway scratch shell. */
+  command?: string[];
+  /** Allocate a retained pseudo-terminal for the canonical command. */
+  tty?: boolean;
+  /**
+   * Create-time sandbox policy (the safety boundary). The named workload
+   * template supplies runtime workload fields.
+   */
+  policy?: MessageInitShape<typeof SandboxPolicySchema>;
+}
+
 export interface SandboxRef {
   id: string;
   name: string;
+  workspace: string;
   phase: SandboxPhaseName;
   labels: Record<string, string>;
   /** u64 rendered as a string — JS numbers can't hold it safely. */
   resourceVersion: string;
   mainProcessInstanceId?: string;
   exitCode?: number;
+  createdFromWorkloadTemplate?: SandboxWorkloadTemplateProvenance;
+}
+
+export interface SandboxWorkloadTemplateProvenance {
+  name: string;
+  resourceVersion: string;
 }
 
 export interface ListOptions {
   limit?: number;
   offset?: number;
   labelSelector?: string;
+  /** Workspace scope. Omit or use an empty string for the gateway default workspace. */
+  workspace?: string;
+  /** List across all workspaces. Requires platform admin permission. */
+  allWorkspaces?: boolean;
 }
 
-export interface ExecOptions {
+export interface SandboxWorkspaceOptions {
+  /** Workspace scope. Omit or use an empty string for the gateway default workspace. */
+  workspace?: string;
+}
+
+export type SandboxCallOptions = CallOptions & SandboxWorkspaceOptions;
+
+export interface SandboxTemplateWorkspaceOptions {
+  /** Workspace scope. Omit or use an empty string for the gateway default workspace. */
+  workspace?: string;
+}
+
+export interface SandboxTemplateListOptions extends SandboxTemplateWorkspaceOptions {
+  limit?: number;
+  offset?: number;
+  /** Optional label selector in key=value comma-separated form. */
+  labelSelector?: string;
+  /** List templates across all workspaces. Requires platform admin permission. */
+  allWorkspaces?: boolean;
+}
+
+export interface ExecOptions extends SandboxWorkspaceOptions {
   workdir?: string;
   environment?: Record<string, string>;
   timeoutSecs?: number;
@@ -158,7 +218,7 @@ export interface ExecExitEvent {
 /** An exec stream item: a stdout/stderr chunk or the terminal exit event. */
 export type ExecStreamEvent = ExecStreamChunk | ExecExitEvent;
 
-export interface ExecInteractiveOptions {
+export interface ExecInteractiveOptions extends SandboxWorkspaceOptions {
   workdir?: string;
   environment?: Record<string, string>;
   timeoutSecs?: number;
@@ -190,12 +250,12 @@ export interface ExecInteractiveSession {
 }
 
 /** Cancellation for the poll-based wait helpers. */
-export interface WaitOptions {
+export interface WaitOptions extends SandboxWorkspaceOptions {
   /** Abort the wait (and the in-flight poll RPC) early. */
   signal?: AbortSignal;
 }
 
-export interface ForwardOptions {
+export interface ForwardOptions extends SandboxWorkspaceOptions {
   /** Loopback TCP port inside the sandbox to dial. */
   targetPort: number;
   /** Target host inside the sandbox (loopback only). Default 127.0.0.1. */
@@ -248,7 +308,7 @@ export interface ProviderChange {
   changed: boolean;
 }
 
-export interface ProviderChangeOptions {
+export interface ProviderChangeOptions extends SandboxWorkspaceOptions {
   /** Pin the sandbox resource version for optimistic concurrency (u64 as string). */
   expectedResourceVersion?: string;
 }
@@ -274,7 +334,7 @@ export interface SandboxConfig {
   providerEnvRevision: string;
 }
 
-export interface SetPolicyOptions {
+export interface SetPolicyOptions extends SandboxWorkspaceOptions {
   /** Pin the sandbox resource version for optimistic concurrency (u64 as string). */
   expectedResourceVersion?: string;
   /** Poll getConfig until the applied policy hash is observed. */
@@ -346,12 +406,24 @@ function sandboxRef(sandbox: Sandbox | undefined): SandboxRef {
   return {
     id: meta.id,
     name: meta.name,
+    workspace: meta.workspace,
     phase: phaseName(sandbox.status?.phase ?? SandboxPhase.UNSPECIFIED),
     labels: meta?.labels ?? {},
     resourceVersion: (meta?.resourceVersion ?? 0n).toString(),
     mainProcessInstanceId: sandbox.status?.mainProcessInstanceId || undefined,
     exitCode: sandbox.status?.exitCode,
+    createdFromWorkloadTemplate: sandbox.createdFromWorkloadTemplate
+      ? {
+          name: sandbox.createdFromWorkloadTemplate.name,
+          resourceVersion: sandbox.createdFromWorkloadTemplate.resourceVersion,
+        }
+      : undefined,
   };
+}
+
+function sandboxTemplate(template: SandboxWorkloadTemplate | undefined): SandboxWorkloadTemplate {
+  if (!template) throw new SdkError('invalid_config', 'sandbox template missing from gateway response');
+  return template;
 }
 
 function providerRef(provider: Provider): ProviderRef {
@@ -418,6 +490,16 @@ function versionPin(value: string | undefined): bigint {
 }
 
 const FORWARD_CHUNK = 64 * 1024;
+
+function workspaceOption(options?: SandboxWorkspaceOptions | null): string {
+  return options?.workspace ?? '';
+}
+
+function requestCallOptions(options?: SandboxCallOptions | null): CallOptions | undefined {
+  if (!options) return undefined;
+  const { workspace: _workspace, ...callOptions } = options;
+  return callOptions;
+}
 
 // Build CallOptions that bound one poll RPC by the remaining wall-clock budget
 // and honor caller cancellation, so a stalled RPC cannot outlive the deadline.
@@ -536,6 +618,85 @@ export class Pushable<T> implements AsyncIterable<T> {
   }
 }
 
+// ---- sandbox template client ----------------------------------------------
+
+// Reusable sandbox workload template lifecycle. Templates intentionally return
+// generated proto messages because the resource owns portable workload fields
+// plus driver-specific config that should not be lossy in the curated layer.
+export class SandboxTemplateClient {
+  private readonly grpc: Client<typeof OpenShell>;
+
+  readonly raw: Client<typeof OpenShell>;
+  readonly transport: Transport;
+
+  constructor(transport: Transport, grpc = createClient(OpenShell, transport)) {
+    this.transport = transport;
+    this.grpc = grpc;
+    this.raw = this.grpc;
+  }
+
+  static async connect(options: ConnectOptions): Promise<SandboxTemplateClient> {
+    return new SandboxTemplateClient(buildTransport(options));
+  }
+
+  async create(
+    template: MessageInitShape<typeof SandboxWorkloadTemplateSchema>,
+    options?: SandboxTemplateWorkspaceOptions | null,
+  ): Promise<SandboxWorkloadTemplate> {
+    try {
+      const resp = await this.grpc.createSandboxTemplate({
+        template,
+        workspace: options?.workspace ?? '',
+      });
+      return sandboxTemplate(resp.template);
+    } catch (e) {
+      throw e instanceof SdkError ? e : fromConnect(e);
+    }
+  }
+
+  async get(name: string, options?: SandboxTemplateWorkspaceOptions | null): Promise<SandboxWorkloadTemplate> {
+    if (name.trim() === '') throw new SdkError('invalid_config', 'template name is required');
+    try {
+      const resp = await this.grpc.getSandboxTemplate({
+        name,
+        workspace: options?.workspace ?? '',
+      });
+      return sandboxTemplate(resp.template);
+    } catch (e) {
+      throw e instanceof SdkError ? e : fromConnect(e);
+    }
+  }
+
+  async list(options?: SandboxTemplateListOptions | null): Promise<SandboxWorkloadTemplate[]> {
+    try {
+      const allWorkspaces = options?.allWorkspaces ?? false;
+      const resp = await this.grpc.listSandboxTemplates({
+        limit: options?.limit ?? 0,
+        offset: options?.offset ?? 0,
+        workspace: allWorkspaces ? '' : (options?.workspace ?? ''),
+        allWorkspaces,
+        labelSelector: options?.labelSelector ?? '',
+      });
+      return resp.templates;
+    } catch (e) {
+      throw fromConnect(e);
+    }
+  }
+
+  async delete(name: string, options?: SandboxTemplateWorkspaceOptions | null): Promise<boolean> {
+    if (name.trim() === '') throw new SdkError('invalid_config', 'template name is required');
+    try {
+      const resp = await this.grpc.deleteSandboxTemplate({
+        name,
+        workspace: options?.workspace ?? '',
+      });
+      return resp.deleted;
+    } catch (e) {
+      throw fromConnect(e);
+    }
+  }
+}
+
 // ---- sandbox client --------------------------------------------------------
 
 // Sandbox lifecycle + exec. Usable standalone via `SandboxClient.connect()`,
@@ -590,6 +751,7 @@ export class SandboxClient {
       const resp = await this.grpc.createSandbox({
         name: spec.name ?? '',
         labels: spec.labels ?? {},
+        workspace: spec.workspace ?? '',
         spec: specInit,
       });
       return sandboxRef(resp.sandbox);
@@ -598,9 +760,33 @@ export class SandboxClient {
     }
   }
 
-  async get(name: string, callOptions?: CallOptions): Promise<SandboxRef> {
+  async createFromTemplate(spec: SandboxFromTemplateSpec): Promise<SandboxRef> {
+    if (spec.templateName.trim() === '') throw new SdkError('invalid_config', 'templateName is required');
     try {
-      const resp = await this.grpc.getSandbox({ name }, callOptions);
+      const resp = await this.grpc.createSandbox({
+        name: spec.name ?? '',
+        labels: spec.labels ?? {},
+        workspace: spec.workspace ?? '',
+        spec: {
+          providers: spec.providers ?? [],
+          command: spec.command ?? [],
+          tty: spec.tty ?? false,
+          policy: spec.policy,
+        },
+        workloadTemplateName: spec.templateName,
+      });
+      return sandboxRef(resp.sandbox);
+    } catch (e) {
+      throw fromConnect(e);
+    }
+  }
+
+  async get(name: string, options?: SandboxCallOptions | null): Promise<SandboxRef> {
+    try {
+      const resp = await this.grpc.getSandbox(
+        { name, workspace: workspaceOption(options) },
+        requestCallOptions(options),
+      );
       return sandboxRef(resp.sandbox);
     } catch (e) {
       throw fromConnect(e);
@@ -609,10 +795,13 @@ export class SandboxClient {
 
   async list(options?: ListOptions | null): Promise<SandboxRef[]> {
     try {
+      const allWorkspaces = options?.allWorkspaces ?? false;
       const resp = await this.grpc.listSandboxes({
         limit: options?.limit ?? 0,
         offset: options?.offset ?? 0,
         labelSelector: options?.labelSelector ?? '',
+        workspace: allWorkspaces ? '' : (options?.workspace ?? ''),
+        allWorkspaces,
       });
       return resp.sandboxes.map((s) => sandboxRef(s));
     } catch (e) {
@@ -620,9 +809,9 @@ export class SandboxClient {
     }
   }
 
-  async delete(name: string): Promise<boolean> {
+  async delete(name: string, options?: SandboxWorkspaceOptions | null): Promise<boolean> {
     try {
-      const resp = await this.grpc.deleteSandbox({ name });
+      const resp = await this.grpc.deleteSandbox({ name, workspace: workspaceOption(options) });
       return resp.deleted;
     } catch (e) {
       throw fromConnect(e);
@@ -641,7 +830,10 @@ export class SandboxClient {
       if (Date.now() >= deadline) throw new SdkError('connect', `timed out waiting for sandbox '${name}'`);
       let ref: SandboxRef;
       try {
-        ref = await this.get(name, deadlineOptions(deadline - Date.now(), signal));
+        ref = await this.get(name, {
+          ...deadlineOptions(deadline - Date.now(), signal),
+          workspace: options?.workspace,
+        });
       } catch (e) {
         throw mapWaitError(e, name, deadline, signal);
       }
@@ -664,7 +856,7 @@ export class SandboxClient {
       if (signal?.aborted) throw new SdkError('connect', `wait for sandbox '${name}' aborted`);
       if (Date.now() >= deadline) throw new SdkError('connect', `timed out waiting for sandbox '${name}' to delete`);
       try {
-        await this.get(name, deadlineOptions(deadline - Date.now(), signal));
+        await this.get(name, { ...deadlineOptions(deadline - Date.now(), signal), workspace: options?.workspace });
       } catch (e) {
         if (e instanceof SdkError && e.code === 'not_found') return;
         throw mapWaitError(e, name, deadline, signal);
@@ -687,7 +879,10 @@ export class SandboxClient {
   ): AsyncGenerator<ExecStreamEvent, void, void> {
     try {
       // Resolve the sandbox id first, exactly like the gateway client.
-      const sandbox = await this.get(name, options?.signal ? { signal: options.signal } : undefined);
+      const sandbox = await this.get(name, {
+        workspace: options?.workspace,
+        ...(options?.signal ? { signal: options.signal } : {}),
+      });
       const stream = this.grpc.execSandbox(
         {
           sandboxId: sandbox.id,
@@ -761,7 +956,9 @@ export class SandboxClient {
   ): Promise<ExecInteractiveSession> {
     let sandboxId: string;
     try {
-      sandboxId = (await this.get(name, options?.signal ? { signal: options.signal } : undefined)).id;
+      sandboxId = (
+        await this.get(name, { workspace: options?.workspace, ...(options?.signal ? { signal: options.signal } : {}) })
+      ).id;
     } catch (e) {
       throw e instanceof SdkError ? e : fromConnect(e);
     }
@@ -880,7 +1077,7 @@ export class SandboxClient {
 
     let sandboxId: string;
     try {
-      const ref = await this.get(name, opts.signal ? { signal: opts.signal } : undefined);
+      const ref = await this.get(name, { workspace: opts.workspace, ...(opts.signal ? { signal: opts.signal } : {}) });
       if (ref.phase !== 'ready') {
         throw new SdkError('connect', `sandbox '${name}' is not ready (phase: ${ref.phase})`);
       }
@@ -1061,9 +1258,9 @@ export class SandboxClient {
 
   // Mint a short-lived SSH session token for the sandbox — the input side of
   // ssh-config / ProxyCommand and forwardTcp authorization.
-  async createSshSession(name: string): Promise<SshSession> {
+  async createSshSession(name: string, options?: SandboxWorkspaceOptions | null): Promise<SshSession> {
     try {
-      const sandbox = await this.get(name);
+      const sandbox = await this.get(name, options);
       const resp = await this.grpc.createSshSession({ sandboxId: sandbox.id });
       // Reject any response outside the proto trust-boundary contract before
       // handing these values to the caller (they feed OpenSSH ProxyCommand).
@@ -1101,6 +1298,7 @@ export class SandboxClient {
         sandboxName: name,
         providerName: provider,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
+        workspace: workspaceOption(options),
       });
       return { sandbox: sandboxRef(resp.sandbox), changed: resp.attached };
     } catch (e) {
@@ -1118,6 +1316,7 @@ export class SandboxClient {
         sandboxName: name,
         providerName: provider,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
+        workspace: workspaceOption(options),
       });
       return { sandbox: sandboxRef(resp.sandbox), changed: resp.detached };
     } catch (e) {
@@ -1125,19 +1324,19 @@ export class SandboxClient {
     }
   }
 
-  async listProviders(name: string): Promise<ProviderRef[]> {
+  async listProviders(name: string, options?: SandboxWorkspaceOptions | null): Promise<ProviderRef[]> {
     try {
-      const resp = await this.grpc.listSandboxProviders({ sandboxName: name });
+      const resp = await this.grpc.listSandboxProviders({ sandboxName: name, workspace: workspaceOption(options) });
       return resp.providers.map((p) => providerRef(p));
     } catch (e) {
       throw fromConnect(e);
     }
   }
 
-  async getConfig(name: string, callOptions?: CallOptions): Promise<SandboxConfig> {
+  async getConfig(name: string, options?: SandboxCallOptions | null): Promise<SandboxConfig> {
     try {
-      const sandbox = await this.get(name, callOptions);
-      const resp = await this.grpc.getSandboxConfig({ sandboxId: sandbox.id }, callOptions);
+      const sandbox = await this.get(name, options);
+      const resp = await this.grpc.getSandboxConfig({ sandboxId: sandbox.id }, requestCallOptions(options));
       return sandboxConfig(resp);
     } catch (e) {
       throw e instanceof SdkError ? e : fromConnect(e);
@@ -1159,9 +1358,11 @@ export class SandboxClient {
         policy,
         global: false,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
+        workspace: workspaceOption(options),
       });
       const result = updateConfigResult(resp);
-      if (options?.wait) await this.waitForPolicyHash(name, result.policyHash, options.waitTimeoutSecs);
+      if (options?.wait)
+        await this.waitForPolicyHash(name, result.policyHash, options.waitTimeoutSecs, options.workspace);
       return result;
     } catch (e) {
       throw e instanceof SdkError ? e : fromConnect(e);
@@ -1174,6 +1375,7 @@ export class SandboxClient {
     name: string,
     key: string,
     value: MessageInitShape<typeof SettingValueSchema>,
+    options?: SandboxWorkspaceOptions | null,
   ): Promise<UpdateConfigResult> {
     try {
       const resp = await this.grpc.updateConfig({
@@ -1181,6 +1383,7 @@ export class SandboxClient {
         settingKey: key,
         settingValue: value,
         global: false,
+        workspace: workspaceOption(options),
       });
       return updateConfigResult(resp);
     } catch (e) {
@@ -1191,13 +1394,18 @@ export class SandboxClient {
   // Poll getConfig until the applied policy hash is observed. Each poll RPC is
   // bounded by the remaining deadline (deadlineOptions), so a stalled getConfig
   // cannot make the returned promise outlive timeoutSecs.
-  private async waitForPolicyHash(name: string, policyHash: string, timeoutSecs = 60): Promise<void> {
+  private async waitForPolicyHash(
+    name: string,
+    policyHash: string,
+    timeoutSecs = 60,
+    workspace?: string,
+  ): Promise<void> {
     const deadline = Date.now() + timeoutSecs * 1000;
     let delay = 100;
     for (;;) {
       let config: SandboxConfig;
       try {
-        config = await this.getConfig(name, deadlineOptions(deadline - Date.now()));
+        config = await this.getConfig(name, { ...deadlineOptions(deadline - Date.now()), workspace });
       } catch (e) {
         if (Date.now() >= deadline) {
           throw new SdkError('connect', `timed out waiting for policy '${policyHash}' on sandbox '${name}'`);
@@ -1219,6 +1427,8 @@ export class SandboxClient {
 export class OpenShellClient {
   /** Sandbox lifecycle + exec: create/get/list/delete, waitReady/waitDeleted, exec. */
   readonly sandbox: SandboxClient;
+  /** Reusable sandbox workload template lifecycle. */
+  readonly sandboxTemplates: SandboxTemplateClient;
 
   /**
    * Advanced escape hatch: a generated client for every gateway RPC, including
@@ -1238,6 +1448,7 @@ export class OpenShellClient {
     this.grpc = createClient(OpenShell, transport);
     this.raw = this.grpc;
     this.sandbox = new SandboxClient(transport, this.grpc);
+    this.sandboxTemplates = new SandboxTemplateClient(transport, this.grpc);
   }
 
   /**

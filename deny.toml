@@ -21,9 +21,6 @@ ignore = [
     { id = "RUSTSEC-2026-0204", reason = "crossbeam-epoch pointer deref — transitive via metrics/quanta" },
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin attack — transitive via spiffe, no direct exposure" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained — transitive via older kube/hyper" },
-    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki URI name constraints — transitive via older rustls" },
-    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki wildcard name constraints — transitive via older rustls" },
-    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL parsing panic — transitive via older rustls" },
     { id = "RUSTSEC-2025-0068", reason = "serde_yml unsound+unmaintained — direct dep, no maintained alternative yet" },
 ]
 

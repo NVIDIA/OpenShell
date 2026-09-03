@@ -102,6 +102,14 @@ sandboxServiceAccount:
   # -- Existing service account name for sandbox pods when sandboxServiceAccount.create is false.
   name: ""
 
+# Namespace-scoped resources needed to run sandboxes. Disable this when the
+# gateway and workspace prerequisites are managed as separate Helm releases
+# using the openshell-workspace chart.
+workspaceResources:
+  # -- Create the sandbox ServiceAccount, Role, RoleBinding, and NetworkPolicy
+  # from this chart. Disable for a gateway-only release.
+  enabled: true
+
 # -- Extra annotations to add to the gateway pod.
 podAnnotations: {}
 # -- Extra labels to add to the gateway pod.

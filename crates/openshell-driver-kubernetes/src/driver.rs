@@ -1428,10 +1428,10 @@ impl KubernetesComputeDriver {
 
     #[allow(clippy::similar_names)]
     #[tracing::instrument(
-        name = "kubernetes.create_sandbox",
+        name = "kubernetes.provision",
         skip(self, sandbox),
         fields(
-            otel.name = "kubernetes.create_sandbox",
+            otel.name = "kubernetes.provision",
             otel.status_code = tracing::field::Empty,
             sandbox.id = %sandbox.id,
             sandbox.name = %sandbox.name,
@@ -4945,12 +4945,13 @@ mod tests {
         use tracing::instrument::WithSubscriber as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let _tracing_lock = crate::otel_tracing::test_lock().await;
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
         let exporter = InMemorySpanExporterBuilder::new().build();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber = tracing_subscriber::registry().with(crate::otel_tracing::layer(&provider));
+        let subscriber =
+            tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider));
         let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
 
         driver
@@ -4963,7 +4964,7 @@ mod tests {
         let spans = exporter.get_finished_spans().unwrap();
         let span = spans
             .iter()
-            .find(|span| span.name == "kubernetes.create_sandbox")
+            .find(|span| span.name == "kubernetes.provision")
             .expect("create operation span");
         assert!(matches!(
             span.status,
@@ -4977,15 +4978,16 @@ mod tests {
         use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let _tracing_lock = crate::otel_tracing::test_lock().await;
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
         let exporter = InMemorySpanExporterBuilder::new().build();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter)
             .build();
-        let subscriber = tracing_subscriber::registry().with(crate::otel_tracing::layer(&provider));
+        let subscriber =
+            tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider));
 
         let annotations = tracing::subscriber::with_default(subscriber, || {
-            let span = tracing::info_span!("kubernetes.create_sandbox");
+            let span = tracing::info_span!("kubernetes.provision");
             let _entered = span.enter();
             let mut annotations = BTreeMap::new();
             add_trace_context_annotation(&mut annotations);

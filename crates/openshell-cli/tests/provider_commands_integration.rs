@@ -51,9 +51,11 @@ struct ProviderState {
     provider_update_requests: Arc<Mutex<Vec<Provider>>>,
     deny_provider_reads: Arc<AtomicBool>,
     delete_provider_requests: Arc<Mutex<Vec<String>>>,
+    delete_provider_profile_requests: Arc<Mutex<Vec<String>>>,
     fail_configure_refresh_message: Arc<Mutex<Option<String>>>,
     fail_rotate_refresh_message: Arc<Mutex<Option<String>>>,
     fail_delete_provider_message: Arc<Mutex<Option<String>>>,
+    fail_delete_provider_profile_message: Arc<Mutex<Option<String>>>,
     sandbox_providers: Arc<Mutex<HashMap<String, Vec<String>>>>,
     sandbox_provider_requests: Arc<Mutex<Vec<SandboxProviderRequestLog>>>,
     global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
@@ -183,6 +185,7 @@ impl OpenShell for TestOpenShell {
                 }),
                 spec: None,
                 status: None,
+                ..Sandbox::default()
             }),
         }))
     }
@@ -193,6 +196,8 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<ListSandboxesResponse>, Status> {
         Ok(Response::new(ListSandboxesResponse::default()))
     }
+
+    unimplemented_sandbox_template_rpcs!();
 
     async fn list_sandbox_providers(
         &self,
@@ -888,6 +893,20 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<openshell_core::proto::DeleteProviderProfileRequest>,
     ) -> Result<Response<openshell_core::proto::DeleteProviderProfileResponse>, Status> {
         let id = request.into_inner().id;
+        self.state
+            .delete_provider_profile_requests
+            .lock()
+            .await
+            .push(id.clone());
+        let delete_failure = self
+            .state
+            .fail_delete_provider_profile_message
+            .lock()
+            .await
+            .take();
+        if let Some(message) = delete_failure {
+            return Err(Status::internal(message));
+        }
         let deleted = self.state.profiles.lock().await.remove(&id).is_some();
         Ok(Response::new(
             openshell_core::proto::DeleteProviderProfileResponse { deleted },
@@ -1199,6 +1218,115 @@ async fn install_test_profile(ts: &TestServer, id: &str, credential_key: &str) {
             }],
             ..Default::default()
         },
+    );
+}
+
+/// A readable provider must carry its stored type and profile workspace into
+/// the update request. Policy interceptors evaluate the request before the
+/// gateway merges it with stored state, so an update that omits them cannot be
+/// authorized against the profile that owns the provider.
+///
+/// The stored `profile_workspace` is forwarded verbatim rather than recomputed
+/// from the request workspace. The gateway treats it as immutable, so deriving
+/// it here would look like a change and be rejected.
+#[tokio::test]
+async fn provider_update_preserves_stored_type_and_profile_workspace_when_readable() {
+    let ts = run_server().await;
+
+    run::provider_create(
+        &ts.endpoint,
+        "my-claude",
+        "claude",
+        false,
+        &["API_KEY=abc".to_string()],
+        false,
+        &[],
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    run::provider_update(run::ProviderUpdateOptions {
+        server: &ts.endpoint,
+        name: "my-claude",
+        from_existing: false,
+        from_oidc_token: false,
+        credentials: &["API_KEY=rotated".to_string()],
+        config: &[],
+        credential_expires_at: &[],
+        workspace: "default",
+        tls: &ts.tls,
+    })
+    .await
+    .expect("provider update");
+
+    let requests = ts.state.provider_update_requests.lock().await;
+    let request = requests.last().expect("provider update request");
+    // `claude` normalizes to the canonical `claude-code` at creation, so the
+    // update carries the stored type rather than the alias the caller typed.
+    assert_eq!(request.r#type, "claude-code");
+    // Forwarded verbatim rather than recomputed. The gateway treats
+    // profile_workspace as immutable, so any substitution here would look like
+    // a change and be rejected.
+    let stored = ts.state.providers.lock().await;
+    let stored = stored.get("my-claude").expect("stored provider");
+    assert_eq!(request.profile_workspace, stored.profile_workspace);
+}
+
+#[tokio::test]
+async fn provider_delete_continues_after_entry_failure() {
+    let ts = run_server().await;
+    *ts.state.fail_delete_provider_message.lock().await =
+        Some("simulated provider delete failure".to_string());
+
+    let err = run::provider_delete(
+        &ts.endpoint,
+        &["failing-provider".to_string(), "later-provider".to_string()],
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect_err("provider delete should report aggregate failure");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("failed to delete 1 provider: failing-provider"),
+        "unexpected error: {msg}"
+    );
+    assert_eq!(
+        ts.state.delete_provider_requests.lock().await.clone(),
+        vec!["failing-provider".to_string(), "later-provider".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn provider_profile_delete_continues_after_entry_failure() {
+    let ts = run_server().await;
+    *ts.state.fail_delete_provider_profile_message.lock().await =
+        Some("simulated provider profile delete failure".to_string());
+
+    let err = run::provider_profile_delete(
+        &ts.endpoint,
+        &["failing-profile".to_string(), "later-profile".to_string()],
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect_err("provider profile delete should report aggregate failure");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("failed to delete 1 provider profile: failing-profile"),
+        "unexpected error: {msg}"
+    );
+    assert_eq!(
+        ts.state
+            .delete_provider_profile_requests
+            .lock()
+            .await
+            .clone(),
+        vec!["failing-profile".to_string(), "later-profile".to_string()]
     );
 }
 

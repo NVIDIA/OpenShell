@@ -37,26 +37,28 @@ use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AttachSandboxProviderRequest,
     ClearDraftChunksRequest, ConfigureProviderRefreshRequest, CreateProviderRequest,
-    CreateSandboxRequest, CreateSshSessionRequest, DeleteInferenceRouteRequest,
-    DeleteProviderProfileRequest, DeleteProviderRefreshRequest, DeleteProviderRequest,
-    DeleteSandboxRequest, DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest,
-    ExposeServiceRequest, GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
-    GetGatewayConfigRequest, GetInferenceRouteRequest, GetProviderProfileRequest,
-    GetProviderRefreshStatusRequest, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest,
-    GetSandboxRequest, GetServiceRequest, GpuResourceRequirements, ImportProviderProfilesRequest,
-    LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
+    CreateSandboxRequest, CreateSandboxTemplateRequest, CreateSshSessionRequest,
+    DeleteInferenceRouteRequest, DeleteProviderProfileRequest, DeleteProviderRefreshRequest,
+    DeleteProviderRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
+    DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest, ExposeServiceRequest,
+    GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
+    GetInferenceRouteRequest, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
+    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetSandboxTemplateRequest, GetServiceRequest,
+    GpuResourceRequirements, ImportProviderProfilesRequest, LintProviderProfilesRequest,
+    ListProviderProfilesRequest, ListProvidersRequest, ListSandboxPoliciesRequest,
+    ListSandboxProvidersRequest, ListSandboxTemplatesRequest, ListSandboxesRequest,
     ListServicesRequest, PolicySource, PolicyStatus, Provider,
     ProviderCredentialRefreshRecoveryAction, ProviderCredentialRefreshStatus,
     ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantType, ProviderProfile,
     ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
     ResourceRequirements, RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox,
-    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceEndpointResponse,
-    SetInferenceRouteRequest, SettingScope, StartSandboxRequest, StopSandboxRequest,
-    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
-    UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
-    tcp_forward_init,
+    SandboxPhase, SandboxPolicy, SandboxResources, SandboxServiceLevel, SandboxSpec,
+    SandboxStartup, SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate,
+    SandboxWorkloadTemplateSpec, ServiceEndpointResponse, SetInferenceRouteRequest, SettingScope,
+    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest,
+    exec_sandbox_event, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -116,6 +118,20 @@ impl ProgressOutput {
 
     fn is_plain(&self) -> bool {
         matches!(self, Self::Plain)
+    }
+}
+
+fn aggregate_delete_failures(resource: &str, failures: &[String]) -> Result<()> {
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(miette!(
+            "failed to delete {} {}{}: {}",
+            failures.len(),
+            resource,
+            if failures.len() == 1 { "" } else { "s" },
+            failures.join(", ")
+        ))
     }
 }
 
@@ -386,6 +402,7 @@ async fn finalize_sandbox_create_session(
 #[derive(Debug)]
 pub struct SandboxCreateConfig<'a> {
     pub name: Option<&'a str>,
+    pub template: Option<&'a str>,
     pub from: Option<&'a str>,
     pub uploads: &'a [(String, Option<String>, bool)],
     pub keep: bool,
@@ -411,6 +428,7 @@ impl Default for SandboxCreateConfig<'_> {
     fn default() -> Self {
         Self {
             name: None,
+            template: None,
             from: None,
             uploads: &[],
             keep: false,
@@ -444,6 +462,7 @@ pub async fn sandbox_create(
 ) -> Result<i32> {
     let SandboxCreateConfig {
         name,
+        template,
         from,
         uploads,
         keep,
@@ -497,23 +516,42 @@ pub async fn sandbox_create(
     let effective_server = server.to_string();
     let effective_tls = tls.clone();
 
+    if template.is_some()
+        && (from.is_some()
+            || gpu_requirements.is_some()
+            || cpu.is_some()
+            || memory.is_some()
+            || driver_config_json.is_some()
+            || !environment.is_empty())
+    {
+        return Err(miette::miette!(
+            "--template cannot be combined with inline workload flags"
+        ));
+    }
+
     // Resolve the --from flag into a container image reference, building from
-    // a Dockerfile first if necessary.
-    let image: Option<String> = match from {
-        Some(val) => {
-            let resolved = resolve_from(val)?;
-            match resolved {
-                ResolvedSource::Image(img) => Some(img),
-                ResolvedSource::Dockerfile {
-                    dockerfile,
-                    context,
-                } => {
-                    let tag = build_from_dockerfile(&dockerfile, &context, gateway_name).await?;
-                    Some(tag)
+    // a Dockerfile first if necessary. Template creates resolve workload shape
+    // on the gateway and skip local image handling.
+    let image: Option<String> = if template.is_some() {
+        None
+    } else {
+        match from {
+            Some(val) => {
+                let resolved = resolve_from(val)?;
+                match resolved {
+                    ResolvedSource::Image(img) => Some(img),
+                    ResolvedSource::Dockerfile {
+                        dockerfile,
+                        context,
+                    } => {
+                        let tag =
+                            build_from_dockerfile(&dockerfile, &context, gateway_name).await?;
+                        Some(tag)
+                    }
                 }
             }
+            None => None,
         }
-        None => None,
     };
     let inferred_types: Vec<String> = inferred_provider_type(command).into_iter().collect();
     let configured_providers = ensure_required_providers(
@@ -526,12 +564,21 @@ pub async fn sandbox_create(
     .await?;
 
     let policy = load_sandbox_policy(policy)?;
-    let resource_limits = build_sandbox_resource_limits(cpu, memory)?;
-    let driver_config = driver_config_json
-        .map(parse_driver_config_json)
-        .transpose()?;
+    let resource_limits = if template.is_none() {
+        build_sandbox_resource_limits(cpu, memory)?
+    } else {
+        None
+    };
+    let driver_config = if template.is_none() {
+        driver_config_json
+            .map(parse_driver_config_json)
+            .transpose()?
+    } else {
+        None
+    };
 
-    let template = if image.is_some() || resource_limits.is_some() || driver_config.is_some() {
+    let inline_template = if image.is_some() || resource_limits.is_some() || driver_config.is_some()
+    {
         Some(SandboxTemplate {
             image: image.unwrap_or_default(),
             resources: resource_limits,
@@ -568,10 +615,14 @@ pub async fn sandbox_create(
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
             resource_requirements,
-            environment,
+            environment: if template.is_none() {
+                environment
+            } else {
+                HashMap::new()
+            },
             policy,
             providers: configured_providers,
-            template,
+            template: inline_template,
             command: main_command,
             tty: main_terminal,
             ..SandboxSpec::default()
@@ -581,6 +632,7 @@ pub async fn sandbox_create(
         annotations,
         workspace: workspace.to_string(),
         await_main_process_attachment,
+        workload_template_name: template.unwrap_or_default().to_string(),
     };
 
     let response = match client.create_sandbox(request).await {
@@ -1427,6 +1479,15 @@ pub async fn sandbox_get(
         }
     }
 
+    if let Some(provenance) = &sandbox.created_from_workload_template {
+        println!(
+            "  {} {}@{}",
+            "Workload template:".dimmed(),
+            provenance.name,
+            provenance.resource_version
+        );
+    }
+
     let policy_from_global = config.policy_source == PolicySource::Global as i32;
     println!(
         "  {} {}",
@@ -2212,6 +2273,16 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         || serde_json::json!({}),
         |m| serde_json::json!(m.annotations),
     );
+    let created_from_workload_template =
+        sandbox
+            .created_from_workload_template
+            .as_ref()
+            .map(|provenance| {
+                serde_json::json!({
+                    "name": provenance.name,
+                    "resource_version": provenance.resource_version,
+                })
+            });
     serde_json::json!({
         "id": sandbox.object_id(),
         "name": sandbox.object_name(),
@@ -2223,6 +2294,7 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "phase": phase_name(sandbox.phase()),
         "current_policy_version": sandbox.current_policy_version(),
         "exit_code": sandbox.status.as_ref().and_then(|status| status.exit_code),
+        "created_from_workload_template": created_from_workload_template,
     })
 }
 
@@ -2482,6 +2554,583 @@ fn format_provider_attachment_table(providers: &[Provider], color: bool) -> Stri
     output
 }
 
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+pub async fn sandbox_template_create(
+    server: &str,
+    name: &str,
+    image: Option<&str>,
+    cpu: Option<&str>,
+    memory: Option<&str>,
+    gpu_requirements: Option<GpuResourceRequirements>,
+    driver_config_json: Option<&str>,
+    ready_within: Option<&str>,
+    max_burst: Option<u32>,
+    labels: HashMap<String, String>,
+    annotations: HashMap<String, String>,
+    environment: HashMap<String, String>,
+    output: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let resources = if cpu.is_some() || memory.is_some() || gpu_requirements.is_some() {
+        Some(SandboxResources {
+            cpu: cpu
+                .map(validate_cpu_quantity)
+                .transpose()?
+                .unwrap_or_default(),
+            memory: memory
+                .map(validate_memory_quantity)
+                .transpose()?
+                .unwrap_or_default(),
+            gpu: gpu_requirements,
+        })
+    } else {
+        None
+    };
+    let driver_config = driver_config_json
+        .map(parse_driver_config_json)
+        .transpose()?;
+    let desired_service_level = build_template_service_level(ready_within, max_burst)?;
+
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .create_sandbox_template(CreateSandboxTemplateRequest {
+            template: Some(SandboxWorkloadTemplate {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: name.to_string(),
+                    created_at_ms: 0,
+                    labels,
+                    resource_version: 0,
+                    annotations,
+                    workspace: String::new(),
+                    deletion_timestamp_ms: 0,
+                }),
+                spec: Some(SandboxWorkloadTemplateSpec {
+                    workload: Some(SandboxWorkloadConfig {
+                        image: image.unwrap_or_default().to_string(),
+                        environment,
+                        resources,
+                    }),
+                    driver_config,
+                    desired_service_level,
+                }),
+            }),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+
+    let template = response
+        .into_inner()
+        .template
+        .ok_or_else(|| miette!("sandbox template missing from response"))?;
+    if crate::output::print_output_single(output, &template, sandbox_template_to_json)? {
+        return Ok(());
+    }
+    println!(
+        "{} Created sandbox template {}",
+        "✓".green().bold(),
+        template.object_name().bold()
+    );
+    Ok(())
+}
+
+fn build_template_service_level(
+    ready_within: Option<&str>,
+    max_burst: Option<u32>,
+) -> Result<Option<SandboxServiceLevel>> {
+    if ready_within.is_none() && max_burst.is_none() {
+        return Ok(None);
+    }
+    let ready_within = ready_within
+        .map(parse_duration_to_ms)
+        .transpose()?
+        .map(|ms| {
+            if ms <= 0 {
+                Err(miette!("--ready-within must be greater than zero"))
+            } else {
+                Ok(duration_ms_to_proto(ms))
+            }
+        })
+        .transpose()?;
+    Ok(Some(SandboxServiceLevel {
+        startup: Some(SandboxStartup {
+            ready_within,
+            max_burst: max_burst.unwrap_or_default(),
+        }),
+    }))
+}
+
+fn duration_ms_to_proto(ms: i64) -> prost_types::Duration {
+    prost_types::Duration {
+        seconds: ms / 1_000,
+        nanos: i32::try_from((ms % 1_000) * 1_000_000)
+            .expect("duration millisecond remainder fits in protobuf nanos"),
+    }
+}
+
+pub async fn sandbox_template_get(
+    server: &str,
+    name: &str,
+    output: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .get_sandbox_template(GetSandboxTemplateRequest {
+            name: name.to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+    let template = response
+        .into_inner()
+        .template
+        .ok_or_else(|| miette!("sandbox template missing from response"))?;
+
+    if crate::output::print_output_single(output, &template, sandbox_template_to_json)? {
+        return Ok(());
+    }
+
+    print_sandbox_template_detail(&template);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn sandbox_template_list(
+    server: &str,
+    limit: u32,
+    offset: u32,
+    label_selector: Option<&str>,
+    names_only: bool,
+    output: &str,
+    workspace: &str,
+    all_workspaces: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .list_sandbox_templates(ListSandboxTemplatesRequest {
+            limit,
+            offset,
+            workspace: if all_workspaces {
+                String::new()
+            } else {
+                workspace.to_string()
+            },
+            all_workspaces,
+            label_selector: label_selector.unwrap_or_default().to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+    let templates = response.into_inner().templates;
+
+    if crate::output::print_output_collection(output, &templates, sandbox_template_to_json)? {
+        return Ok(());
+    }
+
+    if templates.is_empty() {
+        if !names_only {
+            println!("No sandbox templates found.");
+        }
+        return Ok(());
+    }
+
+    if names_only {
+        for template in &templates {
+            if all_workspaces {
+                println!("{}/{}", template.object_workspace(), template.object_name());
+            } else {
+                println!("{}", template.object_name());
+            }
+        }
+        return Ok(());
+    }
+
+    print_sandbox_template_table(&templates, all_workspaces);
+    Ok(())
+}
+
+pub async fn sandbox_template_delete(
+    server: &str,
+    names: &[String],
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    for name in names {
+        let response = client
+            .delete_sandbox_template(DeleteSandboxTemplateRequest {
+                name: name.clone(),
+                workspace: workspace.to_string(),
+            })
+            .await
+            .into_diagnostic()?;
+        if response.into_inner().deleted {
+            println!("{} Deleted sandbox template {name}", "✓".green().bold());
+        } else {
+            println!("Sandbox template {name} not found.");
+        }
+    }
+    Ok(())
+}
+
+fn sandbox_template_to_json(template: &SandboxWorkloadTemplate) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("id".to_string(), serde_json::json!(template.object_id()));
+    obj.insert(
+        "name".to_string(),
+        serde_json::json!(template.object_name()),
+    );
+    obj.insert(
+        "workspace".to_string(),
+        serde_json::json!(template.object_workspace()),
+    );
+
+    if let Some(metadata) = &template.metadata {
+        if metadata.resource_version != 0 {
+            obj.insert(
+                "resource_version".to_string(),
+                serde_json::json!(metadata.resource_version),
+            );
+        }
+        if metadata.created_at_ms != 0 {
+            obj.insert(
+                "created_at".to_string(),
+                serde_json::json!(format_epoch_ms(metadata.created_at_ms)),
+            );
+        }
+        if !metadata.labels.is_empty() {
+            obj.insert("labels".to_string(), serde_json::json!(metadata.labels));
+        }
+        if !metadata.annotations.is_empty() {
+            obj.insert(
+                "annotations".to_string(),
+                serde_json::json!(metadata.annotations),
+            );
+        }
+    }
+
+    if let Some(spec) = &template.spec {
+        if let Some(workload) = &spec.workload {
+            obj.insert("image".to_string(), serde_json::json!(workload.image));
+            if !workload.environment.is_empty() {
+                obj.insert(
+                    "environment".to_string(),
+                    serde_json::json!(workload.environment),
+                );
+            }
+            if let Some(resources) = &workload.resources {
+                let mut resources_json = serde_json::Map::new();
+                if !resources.cpu.is_empty() {
+                    resources_json.insert("cpu".to_string(), serde_json::json!(resources.cpu));
+                }
+                if !resources.memory.is_empty() {
+                    resources_json
+                        .insert("memory".to_string(), serde_json::json!(resources.memory));
+                }
+                if let Some(gpu) = &resources.gpu {
+                    let value = gpu
+                        .count
+                        .map_or_else(|| serde_json::json!("default"), serde_json::Value::from);
+                    resources_json.insert("gpu".to_string(), value);
+                }
+                if !resources_json.is_empty() {
+                    obj.insert(
+                        "resources".to_string(),
+                        serde_json::Value::Object(resources_json),
+                    );
+                }
+            }
+        }
+        if let Some(driver_config) = &spec.driver_config {
+            obj.insert(
+                "driver_config".to_string(),
+                openshell_core::proto_struct::struct_to_json_value(driver_config),
+            );
+        }
+        if let Some(service_level) = &spec.desired_service_level
+            && let Some(startup) = &service_level.startup
+        {
+            let mut startup_json = serde_json::Map::new();
+            if let Some(ready_within) = &startup.ready_within {
+                startup_json.insert(
+                    "ready_within_ms".to_string(),
+                    serde_json::json!(duration_to_ms(ready_within)),
+                );
+            }
+            if startup.max_burst != 0 {
+                startup_json.insert(
+                    "max_burst".to_string(),
+                    serde_json::json!(startup.max_burst),
+                );
+            }
+            if !startup_json.is_empty() {
+                obj.insert(
+                    "startup".to_string(),
+                    serde_json::Value::Object(startup_json),
+                );
+            }
+        }
+    }
+
+    serde_json::Value::Object(obj)
+}
+
+fn print_sandbox_template_detail(template: &SandboxWorkloadTemplate) {
+    println!("{}", "Sandbox template:".cyan().bold());
+    println!();
+    println!("  {} {}", "Name:".dimmed(), template.object_name());
+    println!(
+        "  {} {}",
+        "Workspace:".dimmed(),
+        template.object_workspace()
+    );
+    if let Some(metadata) = &template.metadata {
+        println!("  {} {}", "Id:".dimmed(), metadata.id);
+        println!(
+            "  {} {}",
+            "Resource version:".dimmed(),
+            metadata.resource_version
+        );
+        if metadata.created_at_ms != 0 {
+            println!(
+                "  {} {}",
+                "Created:".dimmed(),
+                format_epoch_ms(metadata.created_at_ms)
+            );
+        }
+        let labels = labels_display(&metadata.labels);
+        println!(
+            "  {} {}",
+            "Labels:".dimmed(),
+            non_empty_or(&labels, "<none>")
+        );
+    }
+    if let Some(spec) = &template.spec
+        && let Some(workload) = &spec.workload
+    {
+        println!(
+            "  {} {}",
+            "Image:".dimmed(),
+            non_empty_or(&workload.image, "<default>")
+        );
+        println!(
+            "  {} {}",
+            "Environment:".dimmed(),
+            workload.environment.len()
+        );
+        if let Some(resources) = &workload.resources {
+            println!(
+                "  {} {}",
+                "CPU:".dimmed(),
+                non_empty_or(&resources.cpu, "<default>")
+            );
+            println!(
+                "  {} {}",
+                "Memory:".dimmed(),
+                non_empty_or(&resources.memory, "<default>")
+            );
+            println!(
+                "  {} {}",
+                "GPU:".dimmed(),
+                template_resources_gpu_display(resources).unwrap_or_else(|| "<none>".to_string())
+            );
+        }
+    }
+    if let Some(startup) = template_startup(template) {
+        println!(
+            "  {} {}",
+            "Ready within:".dimmed(),
+            startup
+                .ready_within
+                .as_ref()
+                .map_or_else(|| "<default>".to_string(), duration_display)
+        );
+        println!(
+            "  {} {}",
+            "Max burst:".dimmed(),
+            if startup.max_burst == 0 {
+                "<default>".to_string()
+            } else {
+                startup.max_burst.to_string()
+            }
+        );
+    }
+}
+
+fn print_sandbox_template_table(templates: &[SandboxWorkloadTemplate], show_workspace: bool) {
+    let name_width = templates
+        .iter()
+        .map(|template| template.object_name().len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let workspace_width = if show_workspace {
+        templates
+            .iter()
+            .map(|template| template.object_workspace().len())
+            .max()
+            .unwrap_or(9)
+            .max(9)
+    } else {
+        0
+    };
+    let image_width = templates
+        .iter()
+        .map(|template| template_image(template).len())
+        .max()
+        .unwrap_or(5)
+        .clamp(5, 48);
+
+    if show_workspace {
+        println!(
+            "{:<workspace_width$}  {:<name_width$}  {:<image_width$}  {:<10}  {:<10}  {:<5}  {:<12}  {:<5}  {}",
+            "WORKSPACE".bold(),
+            "NAME".bold(),
+            "IMAGE".bold(),
+            "CPU".bold(),
+            "MEMORY".bold(),
+            "GPU".bold(),
+            "READY".bold(),
+            "BURST".bold(),
+            "LABELS".bold(),
+        );
+    } else {
+        println!(
+            "{:<name_width$}  {:<image_width$}  {:<10}  {:<10}  {:<5}  {:<12}  {:<5}  {}",
+            "NAME".bold(),
+            "IMAGE".bold(),
+            "CPU".bold(),
+            "MEMORY".bold(),
+            "GPU".bold(),
+            "READY".bold(),
+            "BURST".bold(),
+            "LABELS".bold(),
+        );
+    }
+
+    for template in templates {
+        let resources = template_resources(template);
+        let cpu = resources
+            .map(|resources| resources.cpu.as_str())
+            .filter(|cpu| !cpu.is_empty())
+            .unwrap_or("-");
+        let memory = resources
+            .map(|resources| resources.memory.as_str())
+            .filter(|memory| !memory.is_empty())
+            .unwrap_or("-");
+        let gpu = resources
+            .and_then(template_resources_gpu_display)
+            .unwrap_or_else(|| "-".to_string());
+        let image = truncate_status_field(&template_image(template), image_width);
+        let startup = template_startup(template);
+        let ready = startup
+            .and_then(|startup| startup.ready_within.as_ref())
+            .map_or_else(|| "-".to_string(), duration_display);
+        let burst = startup
+            .map(|startup| startup.max_burst)
+            .filter(|burst| *burst != 0)
+            .map_or_else(|| "-".to_string(), |burst| burst.to_string());
+        let labels = template
+            .metadata
+            .as_ref()
+            .map_or_else(String::new, |metadata| labels_display(&metadata.labels));
+
+        if show_workspace {
+            println!(
+                "{:<workspace_width$}  {:<name_width$}  {:<image_width$}  {:<10}  {:<10}  {:<5}  {:<12}  {:<5}  {}",
+                template.object_workspace(),
+                template.object_name(),
+                image,
+                cpu,
+                memory,
+                gpu,
+                ready,
+                burst,
+                labels,
+            );
+        } else {
+            println!(
+                "{:<name_width$}  {:<image_width$}  {:<10}  {:<10}  {:<5}  {:<12}  {:<5}  {}",
+                template.object_name(),
+                image,
+                cpu,
+                memory,
+                gpu,
+                ready,
+                burst,
+                labels,
+            );
+        }
+    }
+}
+
+fn template_image(template: &SandboxWorkloadTemplate) -> String {
+    template
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.workload.as_ref())
+        .map_or_else(
+            || "<default>".to_string(),
+            |workload| non_empty_or(&workload.image, "<default>").to_string(),
+        )
+}
+
+fn template_resources(template: &SandboxWorkloadTemplate) -> Option<&SandboxResources> {
+    template
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.workload.as_ref())
+        .and_then(|workload| workload.resources.as_ref())
+}
+
+fn template_resources_gpu_display(resources: &SandboxResources) -> Option<String> {
+    if let Some(gpu) = &resources.gpu {
+        return Some(
+            gpu.count
+                .map_or_else(|| "default".to_string(), |count| count.to_string()),
+        );
+    }
+    None
+}
+
+fn template_startup(template: &SandboxWorkloadTemplate) -> Option<&SandboxStartup> {
+    template
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.desired_service_level.as_ref())
+        .and_then(|service_level| service_level.startup.as_ref())
+}
+
+fn duration_to_ms(duration: &prost_types::Duration) -> i64 {
+    duration.seconds.saturating_mul(1_000) + i64::from(duration.nanos / 1_000_000)
+}
+
+fn duration_display(duration: &prost_types::Duration) -> String {
+    let total_ms = duration_to_ms(duration);
+    if total_ms % 3_600_000 == 0 {
+        format!("{}h", total_ms / 3_600_000)
+    } else if total_ms % 60_000 == 0 {
+        format!("{}m", total_ms / 60_000)
+    } else if total_ms % 1_000 == 0 {
+        format!("{}s", total_ms / 1_000)
+    } else {
+        format!("{total_ms}ms")
+    }
+}
+
+fn labels_display(labels: &HashMap<String, String>) -> String {
+    let mut pairs = labels
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
+    pairs.sort();
+    pairs.join(", ")
+}
+
 /// Delete a sandbox by name, or all sandboxes when `all` is true.
 pub async fn sandbox_delete(
     server: &str,
@@ -2518,6 +3167,7 @@ pub async fn sandbox_delete(
         names.to_vec()
     };
 
+    let mut failures = Vec::new();
     for name in &names_to_delete {
         // Stop any background port forwards for this sandbox before deleting.
         if let Ok(stopped) = stop_forwards_for_sandbox(name) {
@@ -2542,7 +3192,14 @@ pub async fn sandbox_delete(
                 println!("{} Sandbox {name} already deleted", "✓".green().bold());
                 continue;
             }
-            Err(status) => return Err(status).into_diagnostic(),
+            Err(status) => {
+                eprintln!(
+                    "{} Failed to delete sandbox {name}: {status}",
+                    "!".red().bold()
+                );
+                failures.push(name.clone());
+                continue;
+            }
         };
 
         let deleted = response.into_inner().deleted;
@@ -2554,7 +3211,7 @@ pub async fn sandbox_delete(
         }
     }
 
-    Ok(())
+    aggregate_delete_failures("sandbox", &failures)
 }
 
 /// Stop a sandbox while retaining its persistent workspace.
@@ -4423,22 +5080,32 @@ pub async fn provider_profile_delete(
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
+    let mut failures = Vec::new();
     for id in ids {
-        let response = client
+        let response = match client
             .delete_provider_profile(DeleteProviderProfileRequest {
                 id: id.clone(),
                 workspace: workspace.to_string(),
             })
             .await
-            .into_diagnostic()?
-            .into_inner();
+        {
+            Ok(response) => response.into_inner(),
+            Err(status) => {
+                eprintln!(
+                    "{} Failed to delete provider profile {id}: {status}",
+                    "!".red().bold()
+                );
+                failures.push(id.clone());
+                continue;
+            }
+        };
         if response.deleted {
             println!("{} Deleted provider profile {id}", "✓".green().bold());
         } else {
             println!("{} Provider profile {id} not found", "!".yellow());
         }
     }
-    Ok(())
+    aggregate_delete_failures("provider profile", &failures)
 }
 
 pub async fn provider_refresh_status(
@@ -4962,17 +5629,39 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
     }
 
     let mut client = grpc_client(server, tls).await?;
+
+    // Look up the stored provider so the update can carry its type and profile
+    // workspace. Policy interceptors evaluate the request before the gateway
+    // merges it with stored state, so an update that omits them cannot be
+    // authorized against the profile that owns the provider.
+    //
+    // The read is best-effort. A caller holding `provider:write` without
+    // `provider:read` must still be able to rotate credentials, so a denied
+    // read keeps the previous behavior of sending empty metadata rather than
+    // failing the update. `--from-existing` and `--from-oidc-token` need the
+    // stored type, so they surface the error instead.
+    let existing = match client
+        .get_provider(GetProviderRequest {
+            name: name.to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await
+    {
+        Ok(response) => response.into_inner().provider,
+        Err(status)
+            if status.code() == Code::PermissionDenied && !from_existing && !from_oidc_token =>
+        {
+            None
+        }
+        Err(status) => return Err(status).into_diagnostic(),
+    };
+
+    if existing.is_none() && (from_existing || from_oidc_token) {
+        return Err(miette::miette!("provider '{name}' not found"));
+    }
+
     let oidc_profile = if from_oidc_token {
-        let existing = client
-            .get_provider(GetProviderRequest {
-                name: name.to_string(),
-                workspace: workspace.to_string(),
-            })
-            .await
-            .into_diagnostic()?
-            .into_inner()
-            .provider
-            .ok_or_else(|| miette::miette!("provider '{name}' not found"))?;
+        let existing = existing.as_ref().expect("checked above");
         Some(
             fetch_provider_profile(&mut client, &existing.r#type, &existing.profile_workspace)
                 .await?,
@@ -4991,25 +5680,11 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
     credential_expires_at_ms.extend(oidc_credential_expires_at_ms);
 
     if from_existing {
-        // Fetch the existing provider to discover its type for credential lookup.
-        let existing = client
-            .get_provider(GetProviderRequest {
-                name: name.to_string(),
-                workspace: workspace.to_string(),
-            })
-            .await
-            .into_diagnostic()?
-            .into_inner()
-            .provider
-            .ok_or_else(|| miette::miette!("provider '{name}' not found"))?;
-
-        let provider_type = existing.r#type;
-        let discovered = discover_existing_provider_data(
-            &mut client,
-            &provider_type,
-            &existing.profile_workspace,
-        )
-        .await?;
+        let stored = existing.as_ref().expect("checked above");
+        let provider_type = stored.r#type.clone();
+        let discovered =
+            discover_existing_provider_data(&mut client, &provider_type, &stored.profile_workspace)
+                .await?;
         let Some(discovered) = discovered else {
             return Err(miette::miette!(
                 "no existing local credentials/config found for provider type '{provider_type}'"
@@ -5037,11 +5712,17 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
                     workspace: workspace.to_string(),
                     deletion_timestamp_ms: 0,
                 }),
-                r#type: String::new(),
+                r#type: existing
+                    .as_ref()
+                    .map(|provider| provider.r#type.clone())
+                    .unwrap_or_default(),
                 credentials: credential_map,
                 config: config_map,
                 credential_expires_at_ms: HashMap::new(),
-                profile_workspace: String::new(),
+                profile_workspace: existing
+                    .as_ref()
+                    .map(|provider| provider.profile_workspace.clone())
+                    .unwrap_or_default(),
                 credential_handles: HashMap::new(),
             }),
             credential_expires_at_ms,
@@ -5070,21 +5751,32 @@ pub async fn provider_delete(
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
+    let mut failures = Vec::new();
     for name in names {
-        let response = client
+        let response = match client
             .delete_provider(DeleteProviderRequest {
                 name: name.clone(),
                 workspace: workspace.to_string(),
             })
             .await
-            .into_diagnostic()?;
+        {
+            Ok(response) => response,
+            Err(status) => {
+                eprintln!(
+                    "{} Failed to delete provider {name}: {status}",
+                    "!".red().bold()
+                );
+                failures.push(name.clone());
+                continue;
+            }
+        };
         if response.into_inner().deleted {
             println!("{} Deleted provider {name}", "✓".green().bold());
         } else {
             println!("{} Provider {name} not found", "!".yellow());
         }
     }
-    Ok(())
+    aggregate_delete_failures("provider", &failures)
 }
 
 // ---------------------------------------------------------------------------
@@ -7632,8 +8324,10 @@ mod tests {
         ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
         ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
         ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
-        SandboxPolicyRevision, SandboxStatus, ServiceEndpoint, ServiceEndpointResponse,
-        WorkspaceMember, WorkspaceRole, datamodel::v1::ObjectMeta,
+        SandboxPolicyRevision, SandboxResources, SandboxStatus, SandboxWorkloadConfig,
+        SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec,
+        ServiceEndpoint, ServiceEndpointResponse, WorkspaceMember, WorkspaceRole,
+        datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -9097,6 +9791,74 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_template_to_json_includes_metadata_labels_and_annotations() {
+        let template = SandboxWorkloadTemplate {
+            metadata: Some(ObjectMeta {
+                id: "template-123".to_string(),
+                name: "gpu-kata".to_string(),
+                labels: std::collections::HashMap::from([(
+                    "team".to_string(),
+                    "runtime".to_string(),
+                )]),
+                annotations: std::collections::HashMap::from([(
+                    "owner".to_string(),
+                    "platform".to_string(),
+                )]),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let json = super::sandbox_template_to_json(&template);
+
+        assert_eq!(json["labels"]["team"], "runtime");
+        assert_eq!(json["annotations"]["owner"], "platform");
+    }
+
+    #[test]
+    fn sandbox_template_to_json_formats_default_gpu_like_display_output() {
+        let template = SandboxWorkloadTemplate {
+            spec: Some(SandboxWorkloadTemplateSpec {
+                workload: Some(SandboxWorkloadConfig {
+                    resources: Some(SandboxResources {
+                        gpu: Some(GpuResourceRequirements { count: None }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let json = super::sandbox_template_to_json(&template);
+
+        assert_eq!(json["resources"]["gpu"], "default");
+    }
+
+    #[test]
+    fn sandbox_template_to_json_preserves_explicit_gpu_count_as_number() {
+        let template = SandboxWorkloadTemplate {
+            spec: Some(SandboxWorkloadTemplateSpec {
+                workload: Some(SandboxWorkloadConfig {
+                    resources: Some(SandboxResources {
+                        gpu: Some(GpuResourceRequirements { count: Some(2) }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let json = super::sandbox_template_to_json(&template);
+
+        assert_eq!(json["resources"]["gpu"], 2);
+    }
+
+    #[test]
     fn provider_to_json_omits_zero_metadata_fields() {
         let metadata = ObjectMeta {
             id: "prov-123".to_string(),
@@ -9194,6 +9956,10 @@ mod tests {
                 created_at_ms: 1_609_459_200_000,
                 ..Default::default()
             }),
+            created_from_workload_template: Some(SandboxWorkloadTemplateProvenance {
+                name: "gpu-kata".to_string(),
+                resource_version: "7".to_string(),
+            }),
             ..Default::default()
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
@@ -9213,6 +9979,11 @@ mod tests {
         assert_eq!(json["policy_source"], "global");
         assert_eq!(json["revision"], 3);
         assert!(json["policy"].is_null());
+        assert_eq!(json["created_from_workload_template"]["name"], "gpu-kata");
+        assert_eq!(
+            json["created_from_workload_template"]["resource_version"],
+            "7"
+        );
     }
 
     #[test]

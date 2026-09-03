@@ -1,6 +1,8 @@
 ---
 name: tui-development
 description: Guide for developing the OpenShell TUI — a ratatui-based terminal UI for the OpenShell platform. Covers architecture, navigation, data fetching, theming, UX conventions, and development workflow. Trigger keywords - term, TUI, terminal UI, ratatui, openshell-tui, tui development, tui feature, tui bug.
+metadata:
+  internal: true
 ---
 
 # OpenShell TUI Development Guide
@@ -53,7 +55,7 @@ Gateway (discovered via openshell_bootstrap::list_gateways())
 The **title bar** always reflects this hierarchy, reading left-to-right from general to specific:
 
 ```
- OpenShell │ Current Gateway: <name> [source] (<status>) │ Workspace: <name|all> │ <screen/context>
+ OpenShell v<version> │ Current Gateway: <name> [source] (<status>) │ Workspace: <name|all> │ <screen/context>
 ```
 
 ## 3. Navigation & Screen Architecture
@@ -142,8 +144,8 @@ Every frame renders four vertical regions:
 
 ### Title bar examples
 
-- Dashboard: ` >_ OpenShell  ALPHA  | Current Gateway: openshell [local] (Healthy) | Workspace: default | Dashboard`
-- Sandbox detail: ` >_ OpenShell  ALPHA  | Current Gateway: openshell [local] (Healthy) | Workspace: team-a | Sandbox: my-sandbox`
+- Dashboard: ` >_ OpenShell v<version> | Current Gateway: openshell [local] (Healthy) | Workspace: default | Dashboard`
+- Sandbox detail: ` >_ OpenShell v<version> | Current Gateway: openshell [local] (Healthy) | Workspace: team-a | Sandbox: my-sandbox`
 
 ### Adding a new screen
 
@@ -384,7 +386,7 @@ All actions are accessible via keyboard shortcuts displayed in the nav bar. The 
 `[Tab] Switch Panel  [Enter] Select  [j/k] Navigate  │  [:] Command  [q] Quit`
 
 **Dashboard (Providers focus):**
-`[Tab] Switch Panel  [h/l] Switch Tab  [j/k] Navigate  [Enter] Detail  [c] Create  [u] Update  [d] Delete  │  [:] Command  [q] Quit`
+`[Tab] Switch Panel  [h/l] Switch Tab  [j/k] Navigate  [Enter] Detail  [c] Create  [u] Update  [d] Delete  [w] Workspace  │  [:] Command  [q] Quit`
 
 **Dashboard (Global Settings focus):**
 `[Tab] Switch Panel  [h/l] Switch Tab  [j/k] Navigate  [Enter] Edit  [d] Delete  │  [:] Command  [q] Quit`
@@ -535,7 +537,7 @@ On launch, before the event loop starts:
 
 ### Workspace switching lifecycle
 
-1. User presses `[w]` on the sandboxes panel → `cycle_workspace()` advances through discovered workspace names, then "all"
+1. User presses `[w]` on the providers or sandboxes panel → `cycle_workspace()` advances through discovered workspace names, then "all"
 2. `pending_workspace_refresh = true` is set, cursor indices are reset
 3. Event loop calls `refresh_providers()` and `refresh_sandboxes()` with the new workspace scope
 

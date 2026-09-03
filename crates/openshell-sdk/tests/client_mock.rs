@@ -12,7 +12,8 @@ use openshell_core::proto;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_sdk::{
     AuthConfig, ClientConfig, ExecOptions, ListOptions, OpenShellClient, Refresh, RefreshError,
-    RefreshedToken, SandboxPhase, SandboxSpec, ServiceStatus as SdkServiceStatus,
+    RefreshedToken, SandboxPhase, SandboxSpec, SandboxTemplateCreateSpec,
+    SandboxTemplateListOptions, ServiceStatus as SdkServiceStatus,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,6 +30,10 @@ struct MockState {
     last_get_name: Mutex<Option<String>>,
     last_get_workspace: Mutex<Option<String>>,
     last_create: Mutex<Option<proto::CreateSandboxRequest>>,
+    last_template_create: Mutex<Option<proto::CreateSandboxTemplateRequest>>,
+    last_template_get: Mutex<Option<proto::GetSandboxTemplateRequest>>,
+    last_template_list: Mutex<Option<proto::ListSandboxTemplatesRequest>>,
+    last_template_delete: Mutex<Option<proto::DeleteSandboxTemplateRequest>>,
     last_delete_name: Mutex<Option<String>>,
     last_delete_workspace: Mutex<Option<String>>,
     last_stop: Mutex<Option<proto::StopSandboxRequest>>,
@@ -61,6 +66,11 @@ fn sandbox_with_phase_ws(
     phase: proto::SandboxPhase,
     workspace: &str,
 ) -> proto::Sandbox {
+    let created_from_workload_template =
+        (name == "from-template").then(|| proto::SandboxWorkloadTemplateProvenance {
+            name: "python".to_string(),
+            resource_version: "7".to_string(),
+        });
     proto::Sandbox {
         metadata: Some(proto::datamodel::v1::ObjectMeta {
             id: format!("id-{name}"),
@@ -77,6 +87,7 @@ fn sandbox_with_phase_ws(
             phase: phase.into(),
             ..Default::default()
         }),
+        created_from_workload_template,
     }
 }
 
@@ -94,6 +105,34 @@ fn workspace_proto(name: &str, phase: proto::datamodel::v1::WorkspacePhase) -> p
         }),
         status: Some(proto::datamodel::v1::WorkspaceStatus {
             phase: phase.into(),
+        }),
+    }
+}
+
+fn workload_template_proto(name: &str, workspace: &str) -> proto::SandboxWorkloadTemplate {
+    proto::SandboxWorkloadTemplate {
+        metadata: Some(proto::datamodel::v1::ObjectMeta {
+            id: format!("template-{workspace}-{name}"),
+            name: name.to_string(),
+            created_at_ms: 1_000_000,
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            resource_version: 1,
+            deletion_timestamp_ms: 0,
+            workspace: workspace.to_string(),
+        }),
+        spec: Some(proto::SandboxWorkloadTemplateSpec {
+            workload: Some(proto::SandboxWorkloadConfig {
+                image: format!("ghcr.io/test/{name}:latest"),
+                environment: HashMap::new(),
+                resources: Some(proto::SandboxResources {
+                    cpu: "1".to_string(),
+                    memory: "512Mi".to_string(),
+                    ..proto::SandboxResources::default()
+                }),
+            }),
+            driver_config: None,
+            desired_service_level: None,
         }),
     }
 }
@@ -174,6 +213,62 @@ impl OpenShell for TestOpenShell {
         *self.state.last_create.lock().await = Some(req);
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox_with_phase(&name, proto::SandboxPhase::Provisioning)),
+        }))
+    }
+
+    async fn create_sandbox_template(
+        &self,
+        request: tonic::Request<proto::CreateSandboxTemplateRequest>,
+    ) -> Result<Response<proto::SandboxTemplateResponse>, Status> {
+        let request = request.into_inner();
+        let template = request
+            .template
+            .clone()
+            .ok_or_else(|| Status::invalid_argument("missing template"))?;
+        *self.state.last_template_create.lock().await = Some(request);
+        Ok(Response::new(proto::SandboxTemplateResponse {
+            template: Some(template),
+        }))
+    }
+
+    async fn get_sandbox_template(
+        &self,
+        request: tonic::Request<proto::GetSandboxTemplateRequest>,
+    ) -> Result<Response<proto::SandboxTemplateResponse>, Status> {
+        let request = request.into_inner();
+        let workspace = if request.workspace.is_empty() {
+            "default"
+        } else {
+            &request.workspace
+        };
+        let template = workload_template_proto(&request.name, workspace);
+        *self.state.last_template_get.lock().await = Some(request);
+        Ok(Response::new(proto::SandboxTemplateResponse {
+            template: Some(template),
+        }))
+    }
+
+    async fn list_sandbox_templates(
+        &self,
+        request: tonic::Request<proto::ListSandboxTemplatesRequest>,
+    ) -> Result<Response<proto::ListSandboxTemplatesResponse>, Status> {
+        let request = request.into_inner();
+        *self.state.last_template_list.lock().await = Some(request);
+        Ok(Response::new(proto::ListSandboxTemplatesResponse {
+            templates: vec![
+                workload_template_proto("python", "default"),
+                workload_template_proto("cuda", "gpu"),
+            ],
+        }))
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        request: tonic::Request<proto::DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<proto::DeleteSandboxTemplateResponse>, Status> {
+        *self.state.last_template_delete.lock().await = Some(request.into_inner());
+        Ok(Response::new(proto::DeleteSandboxTemplateResponse {
+            deleted: true,
         }))
     }
 
@@ -818,6 +913,92 @@ async fn create_sandbox_passes_spec_through() {
 }
 
 #[tokio::test]
+async fn create_sandbox_from_template_passes_template_name() {
+    let state = Arc::new(MockState::default());
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let sandbox = client
+        .create_sandbox_from_template(SandboxTemplateCreateSpec {
+            name: Some("from-template".to_string()),
+            template_name: "python".to_string(),
+            providers: vec!["openai".to_string()],
+            command: vec!["python".to_string(), "-m".to_string(), "agent".to_string()],
+            tty: false,
+            policy: Some(proto::SandboxPolicy {
+                version: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(sandbox.name, "from-template");
+
+    let observed = state.last_create.lock().await.clone().unwrap();
+    assert_eq!(observed.name, "from-template");
+    assert_eq!(observed.workload_template_name, "python");
+    let observed_spec = observed.spec.unwrap();
+    assert_eq!(observed_spec.providers, vec!["openai".to_string()]);
+    assert_eq!(observed_spec.command, vec!["python", "-m", "agent"]);
+    assert!(!observed_spec.tty);
+    assert_eq!(observed_spec.policy.unwrap().version, 1);
+}
+
+#[tokio::test]
+async fn sandbox_template_crud_uses_default_workspace() {
+    let state = Arc::new(MockState::default());
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let created = client
+        .create_sandbox_template(workload_template_proto("python", ""))
+        .await
+        .unwrap();
+    assert_eq!(created.metadata.as_ref().unwrap().name, "python");
+
+    let observed_create = state.last_template_create.lock().await.clone().unwrap();
+    assert!(observed_create.workspace.is_empty());
+    assert_eq!(
+        observed_create
+            .template
+            .as_ref()
+            .and_then(|template| template.metadata.as_ref())
+            .unwrap()
+            .name,
+        "python"
+    );
+
+    let fetched = client.get_sandbox_template("python").await.unwrap();
+    assert_eq!(fetched.metadata.as_ref().unwrap().name, "python");
+    let observed_get = state.last_template_get.lock().await.clone().unwrap();
+    assert_eq!(observed_get.name, "python");
+    assert!(observed_get.workspace.is_empty());
+
+    let listed = client
+        .list_sandbox_templates(SandboxTemplateListOptions {
+            limit: 10,
+            offset: 2,
+            label_selector: String::new(),
+            all_workspaces: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 2);
+    let observed_list = state.last_template_list.lock().await.clone().unwrap();
+    assert_eq!(observed_list.limit, 10);
+    assert_eq!(observed_list.offset, 2);
+    assert!(observed_list.workspace.is_empty());
+    assert!(observed_list.all_workspaces);
+
+    let deleted = client.delete_sandbox_template("python").await.unwrap();
+    assert!(deleted);
+    let observed_delete = state.last_template_delete.lock().await.clone().unwrap();
+    assert_eq!(observed_delete.name, "python");
+    assert!(observed_delete.workspace.is_empty());
+}
+
+#[tokio::test]
 async fn get_sandbox_sends_name_and_maps_phase() {
     let state = Arc::new(MockState {
         phase_sequence: vec![proto::SandboxPhase::Ready],
@@ -833,6 +1014,21 @@ async fn get_sandbox_sends_name_and_maps_phase() {
 
     let observed = state.last_get_name.lock().await.clone();
     assert_eq!(observed.as_deref(), Some("my-box"));
+}
+
+#[tokio::test]
+async fn get_sandbox_preserves_workload_template_provenance() {
+    let state = Arc::new(MockState::default());
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let sandbox = client.get_sandbox("from-template").await.unwrap();
+
+    let provenance = sandbox
+        .created_from_workload_template
+        .expect("template provenance");
+    assert_eq!(provenance.name, "python");
+    assert_eq!(provenance.resource_version, "7");
 }
 
 #[tokio::test]
@@ -1138,6 +1334,33 @@ async fn workspace_scoped_create_passes_workspace() {
 }
 
 #[tokio::test]
+async fn workspace_scoped_create_from_template_passes_workspace() {
+    let state = Arc::new(MockState::default());
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let sandbox = client
+        .workspace("staging")
+        .create_sandbox_from_template(SandboxTemplateCreateSpec {
+            name: Some("from-template".to_string()),
+            template_name: "python".to_string(),
+            policy: Some(proto::SandboxPolicy {
+                version: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(sandbox.name, "from-template");
+
+    let observed = state.last_create.lock().await.clone().unwrap();
+    assert_eq!(observed.workspace, "staging");
+    assert_eq!(observed.workload_template_name, "python");
+    assert_eq!(observed.spec.unwrap().policy.unwrap().version, 2);
+}
+
+#[tokio::test]
 async fn workspace_scoped_get_passes_workspace() {
     let state = Arc::new(MockState {
         phase_sequence: vec![proto::SandboxPhase::Ready],
@@ -1167,6 +1390,50 @@ async fn workspace_scoped_list_passes_workspace() {
     let observed = state.last_list_request.lock().await.clone().unwrap();
     assert_eq!(observed.workspace, "dev");
     assert!(!observed.all_workspaces);
+}
+
+#[tokio::test]
+async fn workspace_scoped_sandbox_template_crud_passes_workspace() {
+    let state = Arc::new(MockState::default());
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+    let ws = client.workspace("staging");
+
+    ws.create_sandbox_template(workload_template_proto("python", "staging"))
+        .await
+        .unwrap();
+    let observed_create = state.last_template_create.lock().await.clone().unwrap();
+    assert_eq!(observed_create.workspace, "staging");
+
+    ws.get_sandbox_template("python").await.unwrap();
+    let observed_get = state.last_template_get.lock().await.clone().unwrap();
+    assert_eq!(observed_get.name, "python");
+    assert_eq!(observed_get.workspace, "staging");
+
+    let listed = ws
+        .list_sandbox_templates(SandboxTemplateListOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 2);
+    let observed_list = state.last_template_list.lock().await.clone().unwrap();
+    assert_eq!(observed_list.workspace, "staging");
+    assert!(!observed_list.all_workspaces);
+
+    ws.list_sandbox_templates(SandboxTemplateListOptions {
+        all_workspaces: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let observed_all = state.last_template_list.lock().await.clone().unwrap();
+    assert!(observed_all.workspace.is_empty());
+    assert!(observed_all.all_workspaces);
+
+    let deleted = ws.delete_sandbox_template("python").await.unwrap();
+    assert!(deleted);
+    let observed_delete = state.last_template_delete.lock().await.clone().unwrap();
+    assert_eq!(observed_delete.name, "python");
+    assert_eq!(observed_delete.workspace, "staging");
 }
 
 #[tokio::test]

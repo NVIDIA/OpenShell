@@ -12,16 +12,18 @@ Usage:
   nix run .#test-guest -- --distro DISTRO [OPTIONS] [-- COMMAND...]
 
 Options:
-  --distro NAME       Base distro: ubuntu, centos, fedora, or rocky
-  --with NAME         Apply a configuration; repeatable (docker, podman, selinux, snapd)
+  --distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
+  --with NAME         Apply a configuration; repeatable (docker, podman-rootless, selinux, snapd)
+  --provision NAME    Apply a post-artifact system provisioner; repeatable
   --install PATH      Install a .deb or .rpm package; repeatable
-  --copy SRC:DEST     Copy a regular file to an absolute guest path, preserving
-                      its host mode; repeatable
+  --copy SRC:DEST[:MODE]
+                      Copy a regular file to an absolute guest path, using MODE
+                      when provided, otherwise preserving its host mode; repeatable
   --ssh-port PORT     Use a specific loopback SSH forwarding port
   --forward-port HOST_PORT:GUEST_PORT
                       Forward a loopback host port to a guest port; repeatable
   --keep              Keep the disposable disk and logs after shutdown
-  --list              List distros and configurations
+  --list              List distros, configurations, and provisioners
   -h, --help          Show this help
 
 With no COMMAND, the runner opens an interactive SSH session.
@@ -31,6 +33,7 @@ EOF
 if [ "${OPENSHELL_TEST_GUEST_RUNTIME:-}" != 1 ] ||
 	[ ! -d "${OPENSHELL_TEST_GUEST_DISTROS:-}" ] ||
 	[ ! -d "${OPENSHELL_TEST_GUEST_CONFIGURATIONS:-}" ] ||
+	[ ! -d "${OPENSHELL_TEST_GUEST_PROVISIONERS:-}" ] ||
 	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_LIB:-}" ] ||
 	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_RUNNER:-}" ]; then
 	echo "run this script through 'nix run .#test-guest -- ...'" >&2
@@ -48,12 +51,13 @@ preserved_file_mode() {
 	local source_path=$1
 	local source_mode
 
-	if [ "$(uname -s)" = Darwin ]; then
-		if ! source_mode=$(stat -f '%Lp' "${source_path}"); then
-			echo "could not determine mode for --copy source: ${source_path}" >&2
-			return 1
-		fi
-	elif ! source_mode=$(stat -c '%a' "${source_path}"); then
+	# Nix supplies GNU coreutils on macOS, so choose the supported stat format
+	# by probing rather than relying on the host kernel name.
+	if source_mode=$(stat -c '%a' "${source_path}" 2>/dev/null); then
+		:
+	elif source_mode=$(stat -f '%Lp' "${source_path}" 2>/dev/null); then
+		:
+	else
 		echo "could not determine mode for --copy source: ${source_path}" >&2
 		return 1
 	fi
@@ -69,6 +73,7 @@ requested_ssh_port=
 keep=0
 list=0
 configurations=()
+provisions=()
 packages=()
 copies=()
 forward_ports=()
@@ -84,6 +89,11 @@ while [ "$#" -gt 0 ]; do
 	--with)
 		require_value "$@"
 		configurations+=("$2")
+		shift 2
+		;;
+	--provision)
+		require_value "$@"
+		provisions+=("$2")
 		shift 2
 		;;
 	--install)
@@ -141,7 +151,14 @@ if [ "${list}" -eq 1 ]; then
 	done
 	echo "Configurations:"
 	for entry in "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}"/*; do
+		[ -f "${entry}" ] || continue
 		printf '  %s\n' "${entry##*/}"
+	done
+	echo "Provisions:"
+	for entry in "${OPENSHELL_TEST_GUEST_PROVISIONERS}"/*; do
+		if [ -d "${entry}" ]; then
+			printf '  %s\n' "${entry##*/}"
+		fi
 	done
 	exit 0
 fi
@@ -160,10 +177,17 @@ fi
 # shellcheck disable=SC1090
 . "${OPENSHELL_TEST_GUEST_DISTROS}/${distro}"
 
-for item in "${configurations[@]}"; do
-	if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
-		[ ! -r "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}/${item}" ]; then
+	for item in "${configurations[@]}"; do
+		if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
+		[ ! -f "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}/${item}" ]; then
 		echo "unknown configuration: ${item:-<empty>}" >&2
+		exit 2
+	fi
+done
+for item in "${provisions[@]}"; do
+	if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
+		[ ! -d "${OPENSHELL_TEST_GUEST_PROVISIONERS}/${item}" ]; then
+		echo "unknown provisioner: ${item:-<empty>}" >&2
 		exit 2
 	fi
 done
@@ -245,13 +269,16 @@ packages=("${resolved_packages[@]}")
 resolved_copies=()
 for copy_spec in "${copies[@]}"; do
 	source_path=${copy_spec%%:*}
-	destination=${copy_spec#*:}
 	if [ "${source_path}" = "${copy_spec}" ] ||
 		! source_path=$(realpath -- "${source_path}") ||
 		[ ! -f "${source_path}" ]; then
 		echo "invalid --copy source: ${copy_spec}" >&2
 		exit 2
 	fi
+	copy_remainder=${copy_spec#*:}
+	destination=${copy_remainder%%:*}
+	mode_spec=${copy_remainder#"${destination}"}
+	mode_spec=${mode_spec#:}
 	case "${destination}" in
 	/*)
 		if [[ ${destination} == *"/../"* ]] || [[ ${destination} == */.. ]]; then
@@ -268,7 +295,12 @@ for copy_spec in "${copies[@]}"; do
 		exit 2
 		;;
 	esac
-	resolved_copies+=("${source_path}:${destination}")
+	if [ -n "${mode_spec}" ]; then
+		mode=${mode_spec}
+	else
+		mode=$(preserved_file_mode "${source_path}") || exit 2
+	fi
+	resolved_copies+=("${source_path}:${destination}:${mode}")
 done
 copies=("${resolved_copies[@]}")
 
@@ -585,6 +617,7 @@ host_key_checking = False
 inventory = ${ansible_inventory}
 interpreter_python = /usr/bin/python3
 retry_files_enabled = False
+roles_path = ${OPENSHELL_TEST_GUEST_PROVISIONERS}
 
 [ssh_connection]
 ssh_args = -F /dev/null -o IdentitiesOnly=yes -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null
@@ -638,8 +671,9 @@ if [ "${#packages[@]}" -gt 0 ] || [ "${#copies[@]}" -gt 0 ]; then
 	artifact_index=0
 	for copy_spec in "${copies[@]}"; do
 		source_path=${copy_spec%%:*}
-		destination=${copy_spec#*:}
-		mode=$(preserved_file_mode "${source_path}") || exit 2
+		copy_remainder=${copy_spec#*:}
+		destination=${copy_remainder%%:*}
+		mode=${copy_remainder#*:}
 		remote_path=${artifact_staging_dir}/copy-${artifact_index}
 		echo "==> Copying artifact: ${destination}"
 		scp -q "${scp_args[@]}" \
@@ -654,6 +688,25 @@ if [ "${#packages[@]}" -gt 0 ] || [ "${#copies[@]}" -gt 0 ]; then
 	ssh "${ssh_args[@]}" openshell@127.0.0.1 \
 		"rm -rf -- '${artifact_staging_dir}'"
 	report_timing "artifact transfer" "${phase_started_at}"
+fi
+
+if [ "${#provisions[@]}" -gt 0 ]; then
+	phase_started_at=${SECONDS}
+	provision_playbook=${run_dir}/provisioners.yml
+	{
+		echo "---"
+		echo "- name: Apply requested system provisioners"
+		echo "  hosts: test_vm"
+		echo "  gather_facts: false"
+		echo "  roles:"
+		for item in "${provisions[@]}"; do
+			echo "    - ${item}"
+		done
+	} >"${provision_playbook}"
+	echo "==> Applying provisioners: ${provisions[*]}"
+	ANSIBLE_CONFIG="${ansible_config}" ANSIBLE_NOCOLOR=1 \
+		ansible-playbook "${provision_playbook}"
+	report_timing "system provisioning" "${phase_started_at}"
 fi
 
 # Configuration may change the test user's groups. Close the SSH control

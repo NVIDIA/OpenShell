@@ -357,6 +357,67 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, 1)
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_if_workspace_count_below(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+        max_count: u64,
+    ) -> PersistenceResult<Option<WriteResult>> {
+        let now_ms = current_time_ms();
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_db_error(&e))?;
+
+        let row: (i64,) = sqlx::query_as(
+            r#"
+SELECT COUNT(*) FROM "objects"
+WHERE "object_type" = ?1 AND "workspace" = ?2
+"#,
+        )
+        .bind(object_type)
+        .bind(workspace)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        let count = u64::try_from(row.0).unwrap_or(0);
+        if count >= max_count {
+            tx.commit().await.map_err(|e| map_db_error(&e))?;
+            return Ok(None);
+        }
+
+        sqlx::query(
+            r#"
+INSERT INTO "objects" ("object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 1)
+"#,
+        )
+        .bind(object_type)
+        .bind(id)
+        .bind(name)
+        .bind(workspace)
+        .bind(payload)
+        .bind(now_ms)
+        .bind(labels.unwrap_or("{}"))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+
+        Ok(Some(WriteResult {
+            resource_version: 1,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        }))
+    }
+
     pub async fn get(
         &self,
         object_type: &str,

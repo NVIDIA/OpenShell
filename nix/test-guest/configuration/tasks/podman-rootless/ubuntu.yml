@@ -1,0 +1,29 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Install Ubuntu rootless Podman prerequisites
+  ansible.builtin.apt:
+    name:
+      - apparmor
+      - fuse-overlayfs
+      - passt
+      - uidmap
+    state: present
+
+- name: Allow pasta to receive Podman stop signals
+  ansible.builtin.lineinfile:
+    path: /etc/apparmor.d/usr.bin.pasta
+    insertafter: "^  include <abstractions/pasta>$"
+    line: "  signal (receive) peer=podman,"
+    state: present
+  register: pasta_apparmor_profile
+
+- name: Reload pasta AppArmor profile
+  ansible.builtin.command:
+    argv:
+      - apparmor_parser
+      - --replace
+      - /etc/apparmor.d/usr.bin.pasta
+  when: pasta_apparmor_profile.changed
+  changed_when: pasta_apparmor_profile.changed

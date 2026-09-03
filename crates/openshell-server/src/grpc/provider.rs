@@ -11365,6 +11365,7 @@ mod tests {
                 ..SandboxSpec::default()
             }),
             status: None,
+            ..Sandbox::default()
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
         store.put_message(&sandbox).await.unwrap();
@@ -11401,6 +11402,7 @@ mod tests {
             }),
             spec: Some(SandboxSpec::default()),
             status: None,
+            ..Sandbox::default()
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
         store.put_message(&sandbox).await.unwrap();

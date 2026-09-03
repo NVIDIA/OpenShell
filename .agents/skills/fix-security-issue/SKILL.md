@@ -1,6 +1,8 @@
 ---
 name: fix-security-issue
 description: Implement a fix for a reviewed security issue. Takes a directly requested issue number or scans for issues labeled `topic:security` and `agent:implementation-requested`. Reads the security review from the issue comments and implements the remediation plan. Trigger keywords - fix security issue, remediate security, implement security fix, patch vulnerability.
+metadata:
+  internal: true
 ---
 
 # Fix Security Issue

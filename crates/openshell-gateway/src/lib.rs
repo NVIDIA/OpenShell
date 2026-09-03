@@ -116,7 +116,7 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
             registration
                 .with_telemetry_category(TelemetryComputeDriver::anonymous_category("kubernetes"))
                 .without_mtls_user_auth()
-                .with_tracing_setup(kubernetes_tracing_setup)
+                .with_in_process_tracing(openshell_driver_kubernetes::otel_tracing::TRACING)
                 .with_inherited_config_keys(&[
                     "namespace",
                     "default_image",
@@ -138,7 +138,7 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
             registration
                 .with_telemetry_category(TelemetryComputeDriver::anonymous_category("podman"))
                 .with_local_singleplayer()
-                .with_tracing_setup(podman_tracing_setup)
+                .with_in_process_tracing(openshell_driver_podman::otel_tracing::TRACING)
                 .with_inherited_config_keys(&[
                     "default_image",
                     "supervisor_image",
@@ -158,7 +158,7 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
             registration
                 .with_telemetry_category(TelemetryComputeDriver::anonymous_category("docker"))
                 .with_local_singleplayer()
-                .with_tracing_setup(docker_tracing_setup)
+                .with_in_process_tracing(openshell_driver_docker::otel_tracing::TRACING)
                 .with_inherited_config_keys(&[
                     "sandbox_namespace",
                     "default_image",
@@ -185,84 +185,6 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
             .install(registration.expect("first-party driver name is valid"))
             .expect("first-party driver names are unique");
     }
-}
-
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-fn kubernetes_tracing_setup(
-    otlp_endpoint: Option<&str>,
-    gateway_name: Option<&str>,
-) -> openshell_server::ComputeDriverTracingSetup {
-    let (provider, error) =
-        openshell_driver_kubernetes::otel_tracing::provider_for(otlp_endpoint, gateway_name);
-    let layer = provider.as_ref().map(|provider| {
-        let layer: openshell_server::ComputeDriverTracingLayer = Box::new(
-            openshell_driver_kubernetes::otel_tracing::in_process_layer(provider),
-        );
-        layer
-    });
-    let shutdown = provider.map(|provider| {
-        let shutdown: openshell_server::ComputeDriverTracingShutdown =
-            Box::new(move || provider.shutdown().map_err(|error| error.to_string()));
-        shutdown
-    });
-    openshell_server::ComputeDriverTracingSetup::new(
-        layer,
-        shutdown,
-        error.map(|error| error.to_string()),
-        Some(openshell_driver_kubernetes::otel_tracing::IN_PROCESS_TARGET_PREFIX),
-    )
-}
-
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-fn podman_tracing_setup(
-    otlp_endpoint: Option<&str>,
-    gateway_name: Option<&str>,
-) -> openshell_server::ComputeDriverTracingSetup {
-    let (provider, error) =
-        openshell_driver_podman::otel_tracing::provider_for(otlp_endpoint, gateway_name);
-    let layer = provider.as_ref().map(|provider| {
-        let layer: openshell_server::ComputeDriverTracingLayer = Box::new(
-            openshell_driver_podman::otel_tracing::in_process_layer(provider),
-        );
-        layer
-    });
-    let shutdown = provider.map(|provider| {
-        let shutdown: openshell_server::ComputeDriverTracingShutdown =
-            Box::new(move || provider.shutdown().map_err(|error| error.to_string()));
-        shutdown
-    });
-    openshell_server::ComputeDriverTracingSetup::new(
-        layer,
-        shutdown,
-        error.map(|error| error.to_string()),
-        Some(openshell_driver_podman::otel_tracing::IN_PROCESS_TARGET_PREFIX),
-    )
-}
-
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-fn docker_tracing_setup(
-    otlp_endpoint: Option<&str>,
-    gateway_name: Option<&str>,
-) -> openshell_server::ComputeDriverTracingSetup {
-    let (provider, error) =
-        openshell_driver_docker::otel_tracing::provider_for(otlp_endpoint, gateway_name);
-    let layer = provider.as_ref().map(|provider| {
-        let layer: openshell_server::ComputeDriverTracingLayer = Box::new(
-            openshell_driver_docker::otel_tracing::in_process_layer(provider),
-        );
-        layer
-    });
-    let shutdown = provider.map(|provider| {
-        let shutdown: openshell_server::ComputeDriverTracingShutdown =
-            Box::new(move || provider.shutdown().map_err(|error| error.to_string()));
-        shutdown
-    });
-    openshell_server::ComputeDriverTracingSetup::new(
-        layer,
-        shutdown,
-        error.map(|error| error.to_string()),
-        Some(openshell_driver_docker::otel_tracing::IN_PROCESS_TARGET_PREFIX),
-    )
 }
 
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]

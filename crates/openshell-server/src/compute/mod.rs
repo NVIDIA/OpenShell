@@ -35,7 +35,7 @@ use openshell_core::proto::compute::v1::{
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
-    SandboxTemplate, ServiceEndpoint, SshSession,
+    SandboxTemplate, SandboxWorkloadTemplate, ServiceEndpoint, SshSession,
 };
 use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{ObjectLabels, ObjectWorkspace};
@@ -75,7 +75,9 @@ mod traced_driver {
     use tonic::Status;
     use tracing::Instrument as _;
 
-    use super::SharedComputeDriver;
+    use super::{DriverWatchStream, SharedComputeDriver};
+
+    type TracedWatchStream = openshell_otel::TracedGrpcStream<DriverWatchStream>;
 
     #[derive(Clone)]
     pub(super) struct TracedDriver {
@@ -88,44 +90,82 @@ mod traced_driver {
             Self { inner, name }
         }
 
+        fn span(
+            &self,
+            rpc: openshell_otel::ComputeDriverRpc,
+            sandbox_id: Option<&str>,
+        ) -> tracing::Span {
+            let span = tracing::info_span!(
+                "driver",
+                otel.name = rpc.operation,
+                otel.kind = "client",
+                otel.status_code = tracing::field::Empty,
+                driver.name = %self.name,
+                sandbox.id = tracing::field::Empty,
+                rpc.system.name = "grpc",
+                rpc.method = rpc.operation,
+                rpc.response.status_code = tracing::field::Empty,
+                error.type = tracing::field::Empty,
+            );
+            if let Some(sandbox_id) = sandbox_id {
+                span.record("sandbox.id", sandbox_id);
+            }
+            span
+        }
+
         /// Run one call across the driver boundary inside its span.
         ///
         /// Takes a closure rather than a future so the call cannot be built
         /// without going through here.
         pub(super) async fn call<T, Fut>(
             &self,
-            operation: &'static str,
+            rpc: openshell_otel::ComputeDriverRpc,
             sandbox_id: Option<&str>,
             call: impl FnOnce(SharedComputeDriver) -> Fut,
         ) -> Result<T, Status>
         where
             Fut: Future<Output = Result<T, Status>>,
         {
-            let span = tracing::info_span!(
-                "driver",
-                otel.name = operation,
-                otel.kind = "client",
-                otel.status_code = tracing::field::Empty,
-                driver.name = %self.name,
-                sandbox.id = tracing::field::Empty,
-                grpc.code = tracing::field::Empty,
-            );
-            if let Some(sandbox_id) = sandbox_id {
-                span.record("sandbox.id", sandbox_id);
-            }
+            let span = self.span(rpc, sandbox_id);
 
             let future = call(self.inner.clone());
             async {
                 let result = future.await;
-                if let Err(status) = &result {
-                    let current = tracing::Span::current();
-                    crate::otel_tracing::mark_error(&current);
-                    current.record("grpc.code", status.code() as i32);
+                let current = tracing::Span::current();
+                match &result {
+                    Ok(_) => {
+                        openshell_otel::record_grpc_status(&current, tonic::Code::Ok);
+                    }
+                    Err(status) => {
+                        openshell_otel::record_grpc_status(&current, status.code());
+                    }
                 }
                 result
             }
             .instrument(span)
             .await
+        }
+
+        /// Open a driver watch while keeping the client span alive with the stream.
+        pub(super) async fn watch(&self) -> Result<tonic::Response<DriverWatchStream>, Status> {
+            let span = self.span(openshell_otel::rpc::WATCH_SANDBOXES, None);
+            let result = self
+                .inner
+                .clone()
+                .watch_sandboxes(tonic::Request::new(super::WatchSandboxesRequest {}))
+                .instrument(span.clone())
+                .await;
+            match result {
+                Ok(response) => {
+                    let (metadata, inner, extensions) = response.into_parts();
+                    let stream: DriverWatchStream = Box::pin(TracedWatchStream::new(inner, span));
+                    Ok(tonic::Response::from_parts(metadata, stream, extensions))
+                }
+                Err(status) => {
+                    openshell_otel::record_grpc_status(&span, status.code());
+                    Err(status)
+                }
+            }
         }
     }
 }
@@ -763,9 +803,11 @@ impl ComputeRuntime {
             credential: credential.to_string(),
         };
         self.driver
-            .call("driver.authenticate_sandbox", None, |driver| async move {
-                driver.authenticate_sandbox(Request::new(request)).await
-            })
+            .call(
+                openshell_otel::rpc::AUTHENTICATE_SANDBOX,
+                None,
+                |driver| async move { driver.authenticate_sandbox(Request::new(request)).await },
+            )
             .await
             .map(|response| response.into_inner().sandbox_id)
     }
@@ -793,11 +835,15 @@ impl ComputeRuntime {
         let workspace = workspace.to_string();
         match self
             .driver
-            .call("driver.ensure_workspace", None, |driver| async move {
-                driver
-                    .ensure_workspace(Request::new(EnsureWorkspaceRequest { workspace }))
-                    .await
-            })
+            .call(
+                openshell_otel::rpc::ENSURE_WORKSPACE,
+                None,
+                |driver| async move {
+                    driver
+                        .ensure_workspace(Request::new(EnsureWorkspaceRequest { workspace }))
+                        .await
+                },
+            )
             .await
         {
             Ok(_) => Ok(()),
@@ -810,11 +856,15 @@ impl ComputeRuntime {
         let workspace = workspace.to_string();
         match self
             .driver
-            .call("driver.delete_workspace", None, |driver| async move {
-                driver
-                    .delete_workspace(Request::new(DeleteWorkspaceRequest { workspace }))
-                    .await
-            })
+            .call(
+                openshell_otel::rpc::DELETE_WORKSPACE,
+                None,
+                |driver| async move {
+                    driver
+                        .delete_workspace(Request::new(DeleteWorkspaceRequest { workspace }))
+                        .await
+                },
+            )
             .await
         {
             Ok(_) => Ok(()),
@@ -828,7 +878,7 @@ impl ComputeRuntime {
             .map_err(|status| *status)?;
         self.driver
             .call(
-                "driver.validate_sandbox_create",
+                openshell_otel::rpc::VALIDATE_SANDBOX_CREATE,
                 Some(sandbox.object_id()),
                 |driver| async move {
                     driver
@@ -901,7 +951,7 @@ impl ComputeRuntime {
         match self
             .driver
             .call(
-                "driver.create_sandbox",
+                openshell_otel::rpc::CREATE_SANDBOX,
                 Some(sandbox.object_id()),
                 |driver| async move {
                     driver
@@ -1050,18 +1100,22 @@ impl ComputeRuntime {
     ) -> Result<Sandbox, Status> {
         let result = self
             .driver
-            .call("driver.stop_sandbox", Some(&sandbox_id), |driver| {
-                let sandbox_id = sandbox_id.clone();
-                let sandbox_name = sandbox_name.clone();
-                async move {
-                    driver
-                        .stop_sandbox(Request::new(StopSandboxRequest {
-                            sandbox_id,
-                            sandbox_name,
-                        }))
-                        .await
-                }
-            })
+            .call(
+                openshell_otel::rpc::STOP_SANDBOX,
+                Some(&sandbox_id),
+                |driver| {
+                    let sandbox_id = sandbox_id.clone();
+                    let sandbox_name = sandbox_name.clone();
+                    async move {
+                        driver
+                            .stop_sandbox(Request::new(StopSandboxRequest {
+                                sandbox_id,
+                                sandbox_name,
+                            }))
+                            .await
+                    }
+                },
+            )
             .await;
 
         match result {
@@ -1210,18 +1264,22 @@ impl ComputeRuntime {
     ) -> Result<Sandbox, Status> {
         let result = self
             .driver
-            .call("driver.start_sandbox", Some(&sandbox_id), |driver| {
-                let sandbox_id = sandbox_id.clone();
-                let sandbox_name = sandbox_name.clone();
-                async move {
-                    driver
-                        .start_sandbox(Request::new(StartSandboxRequest {
-                            sandbox_id,
-                            sandbox_name,
-                        }))
-                        .await
-                }
-            })
+            .call(
+                openshell_otel::rpc::START_SANDBOX,
+                Some(&sandbox_id),
+                |driver| {
+                    let sandbox_id = sandbox_id.clone();
+                    let sandbox_name = sandbox_name.clone();
+                    async move {
+                        driver
+                            .start_sandbox(Request::new(StartSandboxRequest {
+                                sandbox_id,
+                                sandbox_name,
+                            }))
+                            .await
+                    }
+                },
+            )
             .await;
 
         match result {
@@ -1505,7 +1563,7 @@ impl ComputeRuntime {
         let result = self
             .driver
             .call(
-                "driver.delete_sandbox",
+                openshell_otel::rpc::DELETE_SANDBOX,
                 Some(transition.deleting.object_id()),
                 |driver| {
                     let sandbox_id = transition.deleting.object_id().to_string();
@@ -2067,18 +2125,22 @@ impl ComputeRuntime {
                 let sandbox_name = sandbox.object_name().to_string();
                 match self
                     .driver
-                    .call("driver.stop_sandbox", Some(&sandbox_id), |driver| {
-                        let sandbox_id = sandbox_id.clone();
-                        let sandbox_name = sandbox_name.clone();
-                        async move {
-                            driver
-                                .stop_sandbox(Request::new(StopSandboxRequest {
-                                    sandbox_id,
-                                    sandbox_name,
-                                }))
-                                .await
-                        }
-                    })
+                    .call(
+                        openshell_otel::rpc::STOP_SANDBOX,
+                        Some(&sandbox_id),
+                        |driver| {
+                            let sandbox_id = sandbox_id.clone();
+                            let sandbox_name = sandbox_name.clone();
+                            async move {
+                                driver
+                                    .stop_sandbox(Request::new(StopSandboxRequest {
+                                        sandbox_id,
+                                        sandbox_name,
+                                    }))
+                                    .await
+                            }
+                        },
+                    )
                     .await
                 {
                     Ok(_) => {
@@ -2175,18 +2237,22 @@ impl ComputeRuntime {
             let sandbox_name = sandbox.object_name().to_string();
             match self
                 .driver
-                .call("driver.start_sandbox", Some(&sandbox_id), |driver| {
-                    let sandbox_id = sandbox_id.clone();
-                    let sandbox_name = sandbox_name.clone();
-                    async move {
-                        driver
-                            .start_sandbox(Request::new(StartSandboxRequest {
-                                sandbox_id,
-                                sandbox_name,
-                            }))
-                            .await
-                    }
-                })
+                .call(
+                    openshell_otel::rpc::START_SANDBOX,
+                    Some(&sandbox_id),
+                    |driver| {
+                        let sandbox_id = sandbox_id.clone();
+                        let sandbox_name = sandbox_name.clone();
+                        async move {
+                            driver
+                                .start_sandbox(Request::new(StartSandboxRequest {
+                                    sandbox_id,
+                                    sandbox_name,
+                                }))
+                                .await
+                        }
+                    },
+                )
                 .await
             {
                 Ok(_) => {
@@ -2300,7 +2366,7 @@ impl ComputeRuntime {
                     match self
                         .driver
                         .call(
-                            "driver.stop_sandbox",
+                            openshell_otel::rpc::STOP_SANDBOX,
                             Some(&sandbox_id),
                             |driver| async move {
                                 driver
@@ -2347,7 +2413,7 @@ impl ComputeRuntime {
                     if let Err(err) = self
                         .driver
                         .call(
-                            "driver.start_sandbox",
+                            openshell_otel::rpc::START_SANDBOX,
                             Some(&sandbox_id),
                             |driver| async move {
                                 driver
@@ -2569,17 +2635,7 @@ impl ComputeRuntime {
 
     async fn watch_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
-            // Spans the stream open, not its lifetime: the future resolves
-            // once the driver accepts the watch.
-            let mut stream = match self
-                .driver
-                .call("driver.watch_sandboxes", None, |driver| async move {
-                    driver
-                        .watch_sandboxes(Request::new(WatchSandboxesRequest {}))
-                        .await
-                })
-                .await
-            {
+            let mut stream = match self.driver.watch().await {
                 Ok(response) => response.into_inner(),
                 Err(err) => {
                     warn!(error = %err, "Compute driver watch stream failed to start");
@@ -2649,11 +2705,15 @@ impl ComputeRuntime {
         let sweep_started_at_ms = openshell_core::time::now_ms();
         let backend_sandboxes = self
             .driver
-            .call("driver.list_sandboxes", None, |driver| async move {
-                driver
-                    .list_sandboxes(Request::new(ListSandboxesRequest {}))
-                    .await
-            })
+            .call(
+                openshell_otel::rpc::LIST_SANDBOXES,
+                None,
+                |driver| async move {
+                    driver
+                        .list_sandboxes(Request::new(ListSandboxesRequest {}))
+                        .await
+                },
+            )
             .await
             .map_err(|e| e.to_string())
             .inspect_err(|_| crate::otel_tracing::mark_error(&tracing::Span::current()))?
@@ -2742,7 +2802,7 @@ impl ComputeRuntime {
         match event.payload {
             Some(watch_sandboxes_event::Payload::Sandbox(sandbox)) => {
                 if let Some(sandbox) = sandbox.sandbox {
-                    self.apply_sandbox_update(sandbox).await?;
+                    Box::pin(self.apply_sandbox_update(sandbox)).await?;
                 }
             }
             Some(watch_sandboxes_event::Payload::Deleted(deleted)) => {
@@ -2767,13 +2827,67 @@ impl ComputeRuntime {
         Ok(())
     }
 
-    async fn apply_sandbox_update(&self, incoming: DriverSandbox) -> Result<(), String> {
-        let _guard = self.sync_lock.lock().await;
-        let existing = self
+    async fn apply_sandbox_update(&self, mut incoming: DriverSandbox) -> Result<(), String> {
+        let guard = self.sync_lock.lock().await;
+        let mut existing = self
             .store
             .get(Sandbox::object_type(), &incoming.id)
             .await
             .map_err(|e| e.to_string())?;
+        let existing_sandbox = existing.as_ref().map(decode_sandbox_record).transpose()?;
+        let existing_phase = existing_sandbox
+            .as_ref()
+            .map_or(SandboxPhase::Unknown, |sandbox| {
+                SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown)
+            });
+
+        if !driver_snapshot_reports_terminal_container_exit(&incoming)
+            || existing_phase != SandboxPhase::Starting
+        {
+            return self.apply_sandbox_update_locked(incoming, existing).await;
+        }
+
+        // A terminal snapshot can already be queued when StartSandbox moves
+        // the durable phase to Starting. Release the global watch lock, wait
+        // for that lifecycle operation, and then reread both the driver and
+        // store before applying the terminal observation. Taking the
+        // per-sandbox gate only for this ambiguous phase avoids delaying
+        // unrelated watch events behind slow lifecycle operations.
+        let existing_name = existing_sandbox.as_ref().map_or_else(
+            || incoming.name.clone(),
+            |sandbox| sandbox.object_name().to_string(),
+        );
+        drop(guard);
+        let _lifecycle_guard = self.lifecycle_gates.lock_for(&incoming.id).await;
+        let observed = self.get_driver_sandbox(&incoming.id, &existing_name).await;
+        let _guard = self.sync_lock.lock().await;
+        existing = self
+            .store
+            .get(Sandbox::object_type(), &incoming.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let current_phase = existing
+            .as_ref()
+            .map(decode_sandbox_record)
+            .transpose()?
+            .map_or(SandboxPhase::Unknown, |sandbox| {
+                SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown)
+            });
+
+        match observed {
+            Ok(Some(live)) if live.id == incoming.id && live.status.is_some() => incoming = live,
+            Ok(Some(_) | None) | Err(_)
+                if matches!(current_phase, SandboxPhase::Starting | SandboxPhase::Ready) =>
+            {
+                warn!(
+                    sandbox_id = %incoming.id,
+                    "Could not validate terminal driver snapshot; retaining current sandbox state"
+                );
+                return Ok(());
+            }
+            Ok(Some(_) | None) | Err(_) => {}
+        }
+
         self.apply_sandbox_update_locked(incoming, existing).await
     }
 
@@ -3227,18 +3341,22 @@ impl ComputeRuntime {
     async fn call_driver_delete_sandbox(&self, sandbox_id: &str, sandbox_name: &str) {
         let result = self
             .driver
-            .call("driver.delete_sandbox", Some(sandbox_id), |driver| {
-                let sandbox_id = sandbox_id.to_string();
-                let sandbox_name = sandbox_name.to_string();
-                async move {
-                    driver
-                        .delete_sandbox(Request::new(DeleteSandboxRequest {
-                            sandbox_id,
-                            sandbox_name,
-                        }))
-                        .await
-                }
-            })
+            .call(
+                openshell_otel::rpc::DELETE_SANDBOX,
+                Some(sandbox_id),
+                |driver| {
+                    let sandbox_id = sandbox_id.to_string();
+                    let sandbox_name = sandbox_name.to_string();
+                    async move {
+                        driver
+                            .delete_sandbox(Request::new(DeleteSandboxRequest {
+                                sandbox_id,
+                                sandbox_name,
+                            }))
+                            .await
+                    }
+                },
+            )
             .await;
 
         if let Err(status) = result {
@@ -3562,18 +3680,22 @@ impl ComputeRuntime {
     ) -> Result<Option<DriverSandbox>, String> {
         match self
             .driver
-            .call("driver.get_sandbox", Some(sandbox_id), |driver| {
-                let sandbox_id = sandbox_id.to_string();
-                let sandbox_name = sandbox_name.to_string();
-                async move {
-                    driver
-                        .get_sandbox(Request::new(GetSandboxRequest {
-                            sandbox_id,
-                            sandbox_name,
-                        }))
-                        .await
-                }
-            })
+            .call(
+                openshell_otel::rpc::GET_SANDBOX,
+                Some(sandbox_id),
+                |driver| {
+                    let sandbox_id = sandbox_id.to_string();
+                    let sandbox_name = sandbox_name.to_string();
+                    async move {
+                        driver
+                            .get_sandbox(Request::new(GetSandboxRequest {
+                                sandbox_id,
+                                sandbox_name,
+                            }))
+                            .await
+                    }
+                },
+            )
             .await
         {
             Ok(response) => {
@@ -3974,6 +4096,12 @@ impl ObjectType for Sandbox {
     }
 }
 
+impl ObjectType for SandboxWorkloadTemplate {
+    fn object_type() -> &'static str {
+        "sandbox_workload_template"
+    }
+}
+
 fn compute_error_from_status(status: Status) -> ComputeError {
     match status.code() {
         Code::AlreadyExists => ComputeError::AlreadyExists,
@@ -4154,6 +4282,18 @@ fn driver_snapshot_confirms_stopped(incoming: &DriverSandbox) -> bool {
                 && matches!(
                     condition.reason.to_ascii_lowercase().as_str(),
                     "containerexited" | "containerstopped"
+                )
+        })
+    })
+}
+
+fn driver_snapshot_reports_terminal_container_exit(incoming: &DriverSandbox) -> bool {
+    incoming.status.as_ref().is_some_and(|status| {
+        status.conditions.iter().any(|condition| {
+            condition.status.eq_ignore_ascii_case("false")
+                && matches!(
+                    condition.reason.to_ascii_lowercase().as_str(),
+                    "containerexited" | "containerstopped" | "containerruntimerestart"
                 )
         })
     })
@@ -6394,7 +6534,11 @@ mod tests {
         .instrument(tracing::info_span!("request"))
         .await;
 
-        let driver_span = traced.span_with("driver.create_sandbox", "sandbox.id", "sb-trace");
+        let driver_span = traced.span_with(
+            "openshell.compute.v1.ComputeDriver/CreateSandbox",
+            "sandbox.id",
+            "sb-trace",
+        );
         test_exporter::assert_has_parent(&driver_span);
         assert_eq!(
             test_exporter::attribute(&driver_span, "driver.name").as_deref(),
@@ -6404,6 +6548,18 @@ mod tests {
         assert_eq!(
             test_exporter::attribute(&driver_span, "sandbox.id").as_deref(),
             Some("sb-trace"),
+        );
+        assert_eq!(
+            test_exporter::attribute(&driver_span, "rpc.method").as_deref(),
+            Some("openshell.compute.v1.ComputeDriver/CreateSandbox"),
+        );
+        assert!(
+            test_exporter::attribute(&driver_span, "rpc.service").is_none(),
+            "the current RPC semantic conventions integrate the service into rpc.method"
+        );
+        assert_eq!(
+            test_exporter::attribute(&driver_span, "rpc.response.status_code").as_deref(),
+            Some("OK"),
         );
         assert_eq!(
             driver_span.span_kind,
@@ -6417,6 +6573,39 @@ mod tests {
             ),
             "a successful driver call is not marked an error, got {:?}",
             driver_span.status
+        );
+    }
+
+    #[tokio::test]
+    async fn driver_watch_client_span_lives_until_the_stream_completes() {
+        use futures::StreamExt as _;
+
+        use crate::otel_tracing::test_exporter;
+
+        let traced = test_exporter::install_traced();
+        let driver = TracedDriver::new(Arc::new(TestDriver::default()), "test-driver".to_string());
+        let response = driver.watch().await.expect("watch opens");
+        assert!(
+            traced
+                .finished_spans()
+                .iter()
+                .all(|span| span.name != "openshell.compute.v1.ComputeDriver/WatchSandboxes"),
+            "the client span must remain open while the response stream is alive"
+        );
+
+        let mut stream = response.into_inner();
+        assert!(stream.next().await.is_none());
+        drop(stream);
+
+        let spans = traced.finished_spans();
+        let span = spans
+            .iter()
+            .find(|span| span.name == "openshell.compute.v1.ComputeDriver/WatchSandboxes")
+            .expect("watch client span should finish with the stream");
+        assert_eq!(span.span_kind, opentelemetry::trace::SpanKind::Client);
+        assert_eq!(
+            test_exporter::attribute(span, "rpc.response.status_code").as_deref(),
+            Some("OK"),
         );
     }
 
@@ -6551,7 +6740,11 @@ mod tests {
         .instrument(tracing::info_span!("request"))
         .await;
 
-        let driver_span = traced.span_with("driver.create_sandbox", "sandbox.id", "sb-fail");
+        let driver_span = traced.span_with(
+            "openshell.compute.v1.ComputeDriver/CreateSandbox",
+            "sandbox.id",
+            "sb-fail",
+        );
 
         assert!(
             matches!(
@@ -6562,8 +6755,8 @@ mod tests {
             driver_span.status
         );
         assert_eq!(
-            test_exporter::attribute(&driver_span, "grpc.code").as_deref(),
-            Some("14"),
+            test_exporter::attribute(&driver_span, "rpc.response.status_code").as_deref(),
+            Some("UNAVAILABLE"),
             "the gRPC code names the cause without reading the message"
         );
     }
@@ -7145,6 +7338,105 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.phase(), SandboxPhase::Starting as i32);
+    }
+
+    #[tokio::test]
+    async fn stale_container_exit_queued_before_start_cannot_regress_restart() {
+        for reason in [
+            "ContainerExited",
+            "ContainerStopped",
+            "ContainerRuntimeRestart",
+        ] {
+            let driver = ControlledDriver::new();
+            driver.block_start();
+            let sandbox =
+                sandbox_record("sb-start-race", "sandbox-start-race", SandboxPhase::Stopped);
+            driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+                ready_driver_sandbox(sandbox.object_id(), sandbox.object_name()),
+            )));
+            let runtime = test_runtime(driver.clone()).await;
+            runtime.store.put_message(&sandbox).await.unwrap();
+
+            let start_runtime = runtime.clone();
+            let sandbox_name = sandbox.object_name().to_string();
+            let start =
+                tokio::spawn(
+                    async move { start_runtime.start_sandbox("default", &sandbox_name).await },
+                );
+            tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())
+                .await
+                .expect("start did not reach the driver");
+
+            let mut stale_exit = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+            stale_exit.status = Some(make_driver_status(make_driver_condition(
+                reason,
+                "container stopped before restart",
+            )));
+            let update_runtime = runtime.clone();
+            let mut update =
+                tokio::spawn(async move { update_runtime.apply_sandbox_update(stale_exit).await });
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut update)
+                    .await
+                    .is_err(),
+                "{reason} watch update must wait for the active start operation"
+            );
+
+            driver.release_start();
+            start.await.unwrap().unwrap();
+            update.await.unwrap().unwrap();
+
+            let stored = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored.phase(),
+                SandboxPhase::Starting as i32,
+                "{reason} must not regress the restarted sandbox"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn live_container_exit_during_start_still_transitions_to_error() {
+        for reason in [
+            "ContainerExited",
+            "ContainerStopped",
+            "ContainerRuntimeRestart",
+        ] {
+            let driver = ControlledDriver::new();
+            let sandbox = sandbox_record(
+                "sb-start-exited",
+                "sandbox-start-exited",
+                SandboxPhase::Starting,
+            );
+            let mut exited = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+            exited.status = Some(make_driver_status(make_driver_condition(
+                reason,
+                "restarted container exited",
+            )));
+            driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(exited.clone())));
+            let runtime = test_runtime(driver).await;
+            runtime.store.put_message(&sandbox).await.unwrap();
+
+            runtime.apply_sandbox_update(exited).await.unwrap();
+
+            let stored = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored.phase(),
+                SandboxPhase::Error as i32,
+                "current {reason} snapshot must remain terminal"
+            );
+        }
     }
 
     #[tokio::test]
@@ -9464,7 +9756,7 @@ mod tests {
             .iter()
             .find(|root| {
                 spans.iter().any(|span| {
-                    span.name == "driver.list_sandboxes"
+                    span.name == "openshell.compute.v1.ComputeDriver/ListSandboxes"
                         && span.span_context.trace_id() == root.span_context.trace_id()
                 }) && spans.iter().any(|span| {
                     span.name.starts_with("store.")
@@ -9477,7 +9769,7 @@ mod tests {
         let driver_span = spans
             .iter()
             .find(|span| {
-                span.name == "driver.list_sandboxes"
+                span.name == "openshell.compute.v1.ComputeDriver/ListSandboxes"
                     && span.span_context.trace_id() == root.span_context.trace_id()
             })
             .expect("the sweep records its driver call");

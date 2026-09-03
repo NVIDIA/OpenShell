@@ -1,0 +1,36 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# PROTOTYPE: Configure rootless Podman in a disposable test guest.
+
+- name: Configure rootless Podman
+  hosts: test_vm
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Validate rootless Podman support
+      ansible.builtin.assert:
+        that:
+          - >-
+            ansible_facts.distribution == "Fedora" or
+            (ansible_facts.distribution == "Ubuntu" and
+             ansible_facts.distribution_version is version("26.04", ">="))
+        fail_msg: >-
+          Rootless Podman requires Fedora or Ubuntu 26.04 or newer, not
+          {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}.
+
+    - name: Install common Podman prerequisites
+      ansible.builtin.import_tasks: tasks/podman-common.yml
+
+    - name: Configure rootless Podman on Ubuntu
+      ansible.builtin.import_tasks: tasks/podman-rootless/ubuntu.yml
+      when: ansible_facts.distribution == "Ubuntu"
+
+    - name: Configure rootless Podman on Fedora
+      ansible.builtin.import_tasks: tasks/podman-rootless/fedora.yml
+      when: ansible_facts.distribution == "Fedora"
+
+    - name: Configure shared rootless Podman settings
+      ansible.builtin.import_tasks: tasks/podman-rootless/shared.yml

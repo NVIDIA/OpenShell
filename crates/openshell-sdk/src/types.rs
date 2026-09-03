@@ -117,6 +117,60 @@ pub struct SandboxSpec {
     pub tty: bool,
 }
 
+/// Caller intent for creating a sandbox from a named workload template.
+#[derive(Clone, Debug, Default)]
+pub struct SandboxTemplateCreateSpec {
+    /// Optional user-supplied sandbox name. When empty the server generates one.
+    pub name: Option<String>,
+    /// Workspace-scoped template name to resolve at creation time.
+    pub template_name: String,
+    /// Labels attached to the sandbox.
+    pub labels: HashMap<String, String>,
+    /// Provider names to attach.
+    pub providers: Vec<String>,
+    /// Exact canonical command. Empty selects the gateway's scratch login shell.
+    pub command: Vec<String>,
+    /// Allocate a retained pseudo-terminal for the canonical command.
+    pub tty: bool,
+    /// Create-time sandbox policy. The named workload template supplies runtime
+    /// workload fields; policy remains part of the sandbox's governance spec.
+    pub policy: Option<proto::SandboxPolicy>,
+}
+
+/// Reusable sandbox workload template resource.
+///
+/// This is a raw proto alias because template specs intentionally expose the
+/// full portable workload shape plus driver-owned config.
+pub type SandboxWorkloadTemplate = proto::SandboxWorkloadTemplate;
+
+/// Desired reusable workload shape for a [`SandboxWorkloadTemplate`].
+pub type SandboxWorkloadTemplateSpec = proto::SandboxWorkloadTemplateSpec;
+
+/// Portable sandbox workload configuration for template-backed sandboxes.
+pub type SandboxWorkloadConfig = proto::SandboxWorkloadConfig;
+
+/// Portable resource requirements for template-backed sandboxes.
+pub type SandboxResources = proto::SandboxResources;
+
+/// Desired service level for sandboxes created from a template.
+pub type SandboxServiceLevel = proto::SandboxServiceLevel;
+
+/// Startup service-level settings for template-backed sandboxes.
+pub type SandboxStartup = proto::SandboxStartup;
+
+/// Options for listing reusable sandbox templates.
+#[derive(Clone, Debug, Default)]
+pub struct SandboxTemplateListOptions {
+    /// Maximum templates to return. `0` defers to the server default.
+    pub limit: u32,
+    /// Offset into the result list.
+    pub offset: u32,
+    /// Optional label selector in `key=value,key2=value2` form.
+    pub label_selector: String,
+    /// List templates across all workspaces.
+    pub all_workspaces: bool,
+}
+
 /// Reference to a sandbox owned by the gateway.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -128,12 +182,28 @@ pub struct SandboxRef {
     pub labels: HashMap<String, String>,
     pub resource_version: u64,
     pub exit_code: Option<i32>,
+    pub created_from_workload_template: Option<SandboxWorkloadTemplateProvenance>,
+}
+
+/// Reusable workload template revision used to create a sandbox.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct SandboxWorkloadTemplateProvenance {
+    pub name: String,
+    pub resource_version: String,
 }
 
 impl SandboxRef {
     pub(crate) fn from_proto(sandbox: proto::Sandbox) -> Self {
         let phase = sandbox.phase().into();
         let exit_code = sandbox.status.as_ref().and_then(|status| status.exit_code);
+        let created_from_workload_template =
+            sandbox
+                .created_from_workload_template
+                .map(|p| SandboxWorkloadTemplateProvenance {
+                    name: p.name,
+                    resource_version: p.resource_version,
+                });
         let meta = sandbox.metadata.unwrap_or_default();
         Self {
             id: meta.id,
@@ -143,6 +213,7 @@ impl SandboxRef {
             labels: meta.labels,
             resource_version: meta.resource_version,
             exit_code,
+            created_from_workload_template,
         }
     }
 }

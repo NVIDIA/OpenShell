@@ -48,7 +48,7 @@ hide = true
 
 ["test:codex-security-release-range"]
 description = "Test Codex Security release-range resolution"
-run = "node --test tasks/scripts/codex-security-release-range.test.mjs"
+run = "uv run --no-project --with pytest pytest -o \"python_files=*_test.py\" tasks/scripts/codex_security_range_test.py"
 hide = true
 
 [e2e]
