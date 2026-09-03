@@ -40,6 +40,7 @@ REQUIRED_CHANGE_IDS = {
     "middleware-payload-name-normalized",
     "package-default-only-auto-migration",
     "podman-health-zero-sentinel-removed",
+    "podman-pid-limit-restored",
     "podman-ssh-socket-rename",
     "sandbox-pid-zero-sentinel-removed",
     "schema-version-cutover",
@@ -48,6 +49,7 @@ REQUIRED_CHANGE_IDS = {
     "vm-sandbox-identity-selection",
 }
 ALLOWED_CATEGORIES = {
+    "bug_fix",
     "cardinality",
     "default_behavior",
     "migration_policy",
