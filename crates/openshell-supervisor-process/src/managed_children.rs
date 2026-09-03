@@ -78,6 +78,8 @@ mod tests {
     use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
     use nix::unistd::Pid;
     use std::process::Command;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn spawned_child_is_registered_before_returning() {
@@ -91,6 +93,51 @@ mod tests {
 
         assert!(result.is_none());
         assert!(!reaped);
+        unregister(pid);
+    }
+
+    #[test]
+    fn reaper_cannot_steal_child_while_registration_is_in_progress() {
+        // Keep `spawn` paused after its logical child exists but before it
+        // returns the PID. This is the exact window that previously let the
+        // orphan reaper consume a fast child's status.
+        let pid = 1_000_002_u32;
+        let (spawn_entered_tx, spawn_entered_rx) = mpsc::channel();
+        let (complete_spawn_tx, complete_spawn_rx) = mpsc::channel();
+        let (reap_attempted_tx, reap_attempted_rx) = mpsc::channel();
+        let (reap_result_tx, reap_result_rx) = mpsc::channel();
+
+        let spawn = std::thread::spawn(move || {
+            spawn_registered(
+                || {
+                    spawn_entered_tx.send(()).unwrap();
+                    complete_spawn_rx.recv().unwrap();
+                    Ok::<_, ()>(pid)
+                },
+                |child| Some(*child),
+            )
+            .unwrap();
+        });
+        spawn_entered_rx.recv().unwrap();
+
+        let reaper = std::thread::spawn(move || {
+            reap_attempted_tx.send(()).unwrap();
+            let result = reap_if_unmanaged(i32::try_from(pid).unwrap(), || "reaped");
+            reap_result_tx.send(result).unwrap();
+        });
+        reap_attempted_rx.recv().unwrap();
+
+        assert!(
+            reap_result_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "the reaper must wait until the child is registered"
+        );
+
+        complete_spawn_tx.send(()).unwrap();
+        spawn.join().unwrap();
+        assert_eq!(reap_result_rx.recv().unwrap(), None);
+        reaper.join().unwrap();
         unregister(pid);
     }
 
