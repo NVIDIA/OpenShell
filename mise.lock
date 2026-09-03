@@ -156,6 +156,12 @@ url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9
 url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/501885637"
 provenance = "github-attestations"
 
+[tools."github:nextest-rs/nextest"."platforms.windows-arm64"]
+checksum = "sha256:58c1637ba2396e6c556aa0092f9aa4388695594b8ddda5a4b8b39212574678ce"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.143/cargo-nextest-0.9.143-aarch64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/501886128"
+provenance = "github-attestations"
+
 [tools."github:nextest-rs/nextest"."platforms.windows-x64"]
 checksum = "sha256:c670ba18e8731fd2eff33a47af33a0fa53d1afa6d0678344e82dc6f8fc7344ac"
 url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.143/cargo-nextest-0.9.143-x86_64-pc-windows-msvc.zip"
