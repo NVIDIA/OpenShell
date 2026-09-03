@@ -68,6 +68,35 @@ The connection flow:
 5. When mTLS user authentication is enabled, the gateway maps the verified certificate subject to a user principal.
 6. The gateway authorizes the gRPC method.
 
+### Inspect the API with grpcurl
+
+The primary gateway listener serves the gRPC reflection v1 protocol. Reflection
+does not require application authentication, but the listener's TLS and client
+certificate requirements still apply.
+
+For a local plaintext development gateway:
+
+```shell
+grpcurl -plaintext localhost:18080 list
+grpcurl -plaintext localhost:18080 describe openshell.v1.OpenShell
+grpcurl -plaintext -d '{}' localhost:18080 openshell.v1.OpenShell/Health
+```
+
+For an mTLS gateway, use the bundle associated with the gateway:
+
+```shell
+grpcurl \
+  -cacert ~/.config/openshell/gateways/<name>/mtls/ca.crt \
+  -cert ~/.config/openshell/gateways/<name>/mtls/tls.crt \
+  -key ~/.config/openshell/gateways/<name>/mtls/tls.key \
+  <gateway-host>:<gateway-port> list
+```
+
+Reflection advertises only `openshell.v1.OpenShell` and
+`openshell.inference.v1.Inference`. It does not advertise internal driver,
+interceptor, or middleware services. Callback-only compute-driver listeners do
+not serve reflection.
+
 ### OIDC
 
 Gateways can validate OpenID Connect access tokens on gRPC requests. Configure OIDC when you want users, operators, or automation to authenticate with an identity provider such as Keycloak, Entra ID, or Okta.

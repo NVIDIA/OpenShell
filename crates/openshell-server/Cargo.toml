@@ -39,6 +39,7 @@ nix = { workspace = true }
 
 # gRPC
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
+tonic-reflection = { workspace = true }
 prost = { workspace = true }
 prost-reflect = { workspace = true }
 prost-types = { workspace = true }

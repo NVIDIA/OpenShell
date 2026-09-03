@@ -180,6 +180,24 @@ Docker-backed GPU sandboxes auto-select CDI when available and otherwise fall ba
 
 See the [full documentation](https://docs.nvidia.com/openshell/latest) for command guides, tutorials, and reference material.
 
+### Test the gRPC API with grpcurl
+
+The gateway serves the gRPC reflection v1 protocol. After starting a local
+plaintext gateway, use `grpcurl` without checking out or supplying the proto
+files:
+
+```shell
+grpcurl -plaintext localhost:18080 list
+grpcurl -plaintext localhost:18080 describe openshell.v1.OpenShell
+grpcurl -plaintext -d '{}' localhost:18080 openshell.v1.OpenShell/Health
+```
+
+The service list contains the public `openshell.v1.OpenShell` and
+`openshell.inference.v1.Inference` APIs. Reflection does not advertise the
+gateway's internal compute-driver, credential-driver, interceptor, or
+middleware services. For a TLS gateway, omit `-plaintext` and supply the CA and
+client certificate options required by the deployment.
+
 ## Terminal UI
 
 OpenShell includes a real-time terminal dashboard for monitoring gateways, sandboxes, and providers — inspired by [k9s](https://k9scli.io/).

@@ -30,7 +30,8 @@ use tracing::{debug, info, warn};
 /// These are structural bypasses for gRPC infrastructure that doesn't map to a
 /// single RPC method. Per-method bypasses (e.g. `Health`) are declared at the
 /// handler with `auth_mode: "unauthenticated"` in the proto annotation.
-const UNAUTHENTICATED_PREFIXES: &[&str] = &["/grpc.reflection.", "/grpc.health."];
+const UNAUTHENTICATED_PREFIXES: &[&str] =
+    &[crate::multiplex::REFLECTION_PATH_PREFIX, "/grpc.health."];
 
 /// Returns `true` if the method needs no authentication at all.
 pub fn is_unauthenticated_method(path: &str) -> bool {
@@ -407,10 +408,13 @@ mod tests {
     #[test]
     fn reflection_is_unauthenticated() {
         assert!(is_unauthenticated_method(
+            "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo"
+        ));
+        assert!(!is_unauthenticated_method(
             "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo"
         ));
-        assert!(is_unauthenticated_method(
-            "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo"
+        assert!(!is_unauthenticated_method(
+            "/grpc.reflection.v2.ServerReflection/ServerReflectionInfo"
         ));
     }
 

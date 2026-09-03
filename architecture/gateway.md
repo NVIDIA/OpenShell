@@ -74,6 +74,12 @@ Docker and Podman drivers. Operator-granted listener capabilities for external
 drivers are tracked in
 [#2539](https://github.com/NVIDIA/OpenShell/issues/2539).
 
+The primary listener serves the gRPC reflection v1 protocol without application
+authentication. It advertises only the public `openshell.v1.OpenShell` and
+`openshell.inference.v1.Inference` services. TLS and client-certificate
+requirements still apply at the transport layer. Callback-only listeners reject
+reflection before authentication.
+
 Operators can configure a gateway-wide gRPC request rate limit. The limit is
 applied only to gRPC API traffic after protocol multiplexing; health, metrics,
 and local sandbox-service HTTP routes are not rate limited by this control.
