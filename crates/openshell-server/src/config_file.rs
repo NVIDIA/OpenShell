@@ -28,7 +28,7 @@ use base64::Engine as _;
 use openshell_core::proto::SupervisorMiddlewareService;
 use openshell_core::{
     GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
-    GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig, TlsConfig,
+    GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -148,7 +148,7 @@ pub struct GatewayFileSection {
 
     // ── Nested tables ────────────────────────────────────────────────────
     #[serde(default)]
-    pub tls: Option<TlsConfig>,
+    pub tls: Option<GatewayTlsFileConfig>,
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
     #[serde(default)]
@@ -171,6 +171,27 @@ pub struct GatewayFileSection {
     // rejected in [`load`].
     #[serde(default)]
     pub database_url: Option<String>,
+}
+
+/// Gateway listener TLS fields accepted in `gateway.toml`.
+///
+/// Client-certificate handshake policy is derived from the presence of a
+/// client CA and OIDC configuration. It is intentionally not operator-settable
+/// in TOML because changing it can either weaken CA-only gateways or require a
+/// second credential from OIDC clients.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayTlsFileConfig {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    #[serde(default)]
+    pub client_ca_path: Option<PathBuf>,
+    #[serde(default)]
+    pub external_cert_path: Option<PathBuf>,
+    #[serde(default)]
+    pub external_key_path: Option<PathBuf>,
+    #[serde(default)]
+    pub external_server_names: Vec<String>,
 }
 
 /// `[openshell.gateway.otlp]` section.
@@ -922,6 +943,21 @@ nonsense = true
         let tmp = write_tmp(toml);
         let err = load(tmp.path()).expect_err("unknown field must be rejected");
         assert!(matches!(err, ConfigFileError::Parse { .. }));
+    }
+
+    #[test]
+    fn rejects_operator_selected_tls_client_auth_policy() {
+        let toml = r#"
+[openshell.gateway.tls]
+cert_path = "/tls/server.crt"
+key_path = "/tls/server.key"
+client_ca_path = "/tls/ca.crt"
+require_client_auth = false
+"#;
+        let tmp = write_tmp(toml);
+        let error = load(tmp.path()).expect_err("derived TLS client-auth policy must be rejected");
+        assert!(matches!(error, ConfigFileError::Parse { .. }));
+        assert!(error.to_string().contains("require_client_auth"));
     }
 
     #[test]
