@@ -63,3 +63,35 @@ status = "platform_blocked"
 owner = "OpenShell Windows MXC CI lane"
 lane = "windows-x64-and-windows-arm64-mxc"
 blocker = "The validation host is Linux and cannot execute the Windows MXC runtime. Step 13 must assign native Windows validation."
+
+[[result]]
+id = "gateway-wide-process-options"
+step = 6
+capability = "Gateway listeners, configuration precedence, persistence, and legacy singleton selector"
+driver = "gateway"
+status = "pass"
+validated_baseline_commit = "74960ebfaeec4673885089ed995fad902459749f"
+validated_candidate_commit = "e6aac1aa7c624c5df43535ab4fbe2bc6f9697dea"
+lane = "local-linux-x86_64-rootless-podman-5.8.2"
+evidence = [
+  "Fresh binaries from both recorded commits started against isolated schema-v1 and schema-v2 files, SQLite databases, ports, state directories, and a rootless Podman socket.",
+  "Both variants exposed primary, health, and metrics listeners; the CLI primary port beat conflicting environment and file values, and --health-port 0 disabled the file-configured auxiliary listener.",
+  "Both variants created and reopened the same isolated SQLite database, rejected database_url in TOML, identified the rejected field, and did not disclose its secret-bearing value.",
+  "Both variants accepted one legacy OPENSHELL_DRIVERS=podman selector when no canonical selector was present; the candidate emitted its deprecation warning without logging the value.",
+  "Normalized comparison recorded baseline_success=true, candidate_success=true, and parity=true.",
+]
+
+[[result]]
+id = "gateway-tls-client-auth-policy"
+step = 6
+capability = "Gateway TLS client-certificate handshake policy"
+driver = "gateway"
+status = "intentional_change"
+validated_baseline_commit = "74960ebfaeec4673885089ed995fad902459749f"
+validated_candidate_commit = "e6aac1aa7c624c5df43535ab4fbe2bc6f9697dea"
+lane = "local-linux-x86_64-deterministic-tls"
+evidence = [
+  "Security review confirmed that origin/main accepted require_client_auth in TOML but ignored it and instead derived runtime policy from client CA and OIDC presence.",
+  "Schema v2 now rejects the unsupported file field while preserving the established derived policy: CA without OIDC requires a client certificate, while CA with OIDC permits bearer-only clients and validates certificates that are presented.",
+  "Focused preparation tests cover both derived branches, and TLS integration tests pass required-certificate, optional-certificate, valid-CA, wrong-CA, and multiplexed HTTP/gRPC handshakes.",
+]

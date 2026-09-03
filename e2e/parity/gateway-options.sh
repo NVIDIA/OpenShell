@@ -171,6 +171,29 @@ run_variant() {
   fi
   stop_gateway "${pid}"
 
+  echo "==> ${variant}: legacy singleton environment selector"
+  local legacy_config="${dir}/legacy-selector.toml"
+  grep -v '^compute_driver' "${config}" >"${legacy_config}"
+  : >"${log}"
+  env -u OPENSHELL_COMPUTE_DRIVER \
+    XDG_CONFIG_HOME="${dir}/config" \
+    XDG_STATE_HOME="${dir}/state" \
+    OPENSHELL_PODMAN_SOCKET="${PODMAN_SOCKET}" \
+    OPENSHELL_DRIVERS=podman \
+      "${gateway}" \
+        --config "${legacy_config}" \
+        --db-url "sqlite:${db}?mode=rwc" \
+        --port "${second_primary}" >"${log}" 2>&1 &
+  pid=$!
+  PIDS=("${pid}")
+  wait_for_url "${pid}" "http://127.0.0.1:${health_port}/healthz" "${log}" \
+    || fail "${variant} did not accept the legacy singleton selector"
+  if [ "${variant}" = candidate ]; then
+    grep -F 'OPENSHELL_DRIVERS is deprecated' "${log}" >/dev/null \
+      || fail "candidate did not emit the legacy selector deprecation warning"
+  fi
+  stop_gateway "${pid}"
+
   echo "==> ${variant}: database URL in TOML is rejected without value disclosure"
   local invalid="${dir}/invalid.toml" secret="parity-secret-${variant}"
   awk -v secret="${secret}" '
@@ -188,7 +211,7 @@ run_variant() {
   fi
 
   cat >"${RESULTS_DIR}/gateway-options-${variant}.json" <<EOF
-{"variant":"${variant}","source_sha":"${sha}","schema_version":${schema},"listeners":true,"precedence":true,"sqlite_reopen":true,"database_toml_rejected_without_disclosure":true,"success":true}
+{"variant":"${variant}","source_sha":"${sha}","schema_version":${schema},"listeners":true,"precedence":true,"sqlite_reopen":true,"legacy_singleton_selector":true,"database_toml_rejected_without_disclosure":true,"success":true}
 EOF
 }
 
