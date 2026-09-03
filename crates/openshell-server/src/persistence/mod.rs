@@ -6,7 +6,7 @@
 mod postgres;
 mod sqlite;
 
-pub use openshell_core::proto::{
+pub use crate::storage_proto::{
     StoredDraftChunk as DraftChunkRecord, StoredPolicyRevision as PolicyRecord,
 };
 
@@ -162,8 +162,9 @@ pub trait ObjectType {
     fn object_type() -> &'static str;
 }
 
-// Import object metadata accessor traits from openshell-core
-// (implementations for all proto types are in openshell-core::metadata)
+// Import object metadata accessor traits from openshell-core. Implementations
+// for public resource types live there; private storage types implement them
+// in crate::storage_proto.
 pub use openshell_core::{
     GetResourceVersion, ObjectId, ObjectLabels, ObjectName, ObjectWorkspace, SetResourceVersion,
 };

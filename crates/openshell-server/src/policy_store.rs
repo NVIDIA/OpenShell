@@ -4,10 +4,8 @@
 use crate::persistence::{
     DraftChunkRecord, PersistenceError, PersistenceResult, PolicyRecord, SetResourceVersion, Store,
 };
-use openshell_core::proto::{
-    DraftChunkPayload, NetworkPolicyRule, PolicyRevisionPayload, Sandbox,
-    SandboxPolicy as ProtoSandboxPolicy,
-};
+use crate::storage_proto::{DraftChunkPayload, PolicyRevisionPayload};
+use openshell_core::proto::{NetworkPolicyRule, Sandbox, SandboxPolicy as ProtoSandboxPolicy};
 use prost::Message;
 use std::collections::HashMap;
 

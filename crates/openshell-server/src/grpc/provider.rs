@@ -14,12 +14,13 @@ use crate::provider_profile_sources::{
     EffectiveProviderProfileCatalog, ProviderProfileSources, profile_response_payload,
     profile_storage_payload, stored_profile_resource_version,
 };
+use crate::storage_proto::{StoredProviderCredentialRefreshState, StoredProviderProfile};
 use openshell_core::metadata::ObjectWorkspace;
 use openshell_core::proto::{
     CredentialHandle, Provider, ProviderCredentialRefreshStrategy,
     ProviderCredentialTokenGrantAudienceOverride, ProviderCredentialTokenGrantType,
     ProviderProfile, ProviderProfileCredential, Sandbox, StaticCredentialBinding,
-    StaticCredentialEndpointBinding, StoredProviderCredentialRefreshState,
+    StaticCredentialEndpointBinding,
 };
 use openshell_core::telemetry::{
     LifecycleOperation, ProviderProfile as TelemetryProviderProfile, TelemetryOutcome,
@@ -2335,8 +2336,7 @@ use openshell_core::proto::{
     ListProviderProfilesResponse, ListProvidersRequest, ListProvidersResponse,
     ProviderProfileDiagnostic, ProviderProfileImportItem, ProviderProfileResponse,
     ProviderResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
-    StoredProviderProfile, UpdateProviderProfilesRequest, UpdateProviderProfilesResponse,
-    UpdateProviderRequest,
+    UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
 };
 use openshell_core::spiffe::{
     JwtSvidParseError, SpiffeJwtClaims, parse_unverified_jwt_svid_claims,
@@ -4934,8 +4934,7 @@ mod tests {
         ProviderCredentialTokenGrantAudienceOverride, ProviderCredentialTokenGrantSubjectToken,
         ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileCategory,
         ProviderProfileCredential, ProviderProfileImportItem, RotateProviderCredentialRequest,
-        Sandbox, SandboxPolicy, SandboxSpec, StoredProviderProfile, UpdateProviderProfilesRequest,
-        UpdateProviderRequest,
+        Sandbox, SandboxPolicy, SandboxSpec, UpdateProviderProfilesRequest, UpdateProviderRequest,
     };
     use openshell_core::{ObjectId, ObjectName};
     use tonic::{Code, Request};

@@ -15,8 +15,7 @@ use openshell_core::proto::{
     GetWorkspaceResponse, InferenceRoute, ListWorkspaceMembersRequest,
     ListWorkspaceMembersResponse, ListWorkspacesRequest, ListWorkspacesResponse, Provider,
     RemoveWorkspaceMemberRequest, RemoveWorkspaceMemberResponse, Sandbox, SandboxWorkloadTemplate,
-    ServiceEndpoint, SshSession, StoredProviderCredentialRefreshState, StoredProviderProfile,
-    Workspace, WorkspaceMember, WorkspaceRole,
+    ServiceEndpoint, SshSession, Workspace, WorkspaceMember, WorkspaceRole,
 };
 use prost::Message;
 use tonic::{Request, Response, Status};
@@ -28,6 +27,7 @@ use crate::persistence::{
     DRAFT_CHUNK_OBJECT_TYPE, ObjectLabels, ObjectType, POLICY_OBJECT_TYPE, WriteCondition,
     current_time_ms,
 };
+use crate::storage_proto::{StoredProviderCredentialRefreshState, StoredProviderProfile};
 use std::collections::HashMap;
 
 use super::{MAX_PAGE_SIZE, clamp_limit};
