@@ -101,6 +101,37 @@ jobs:
       checkout-ref: ${{ github.sha }}
     secrets: inherit
 
+  build-sandbox:
+    needs: version
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      package: openshell-sandbox
+      binary: openshell-sandbox
+      triple: x86_64-unknown-linux-musl
+      runner: linux-amd64-cpu8
+      dev-shell: .#devShells.x86_64-linux.musl
+      cargo-version: ${{ needs.version.outputs.cargo }}
+      checkout-ref: ${{ github.sha }}
+    secrets: inherit
+
+  build-snap:
+    needs: [build-cli, build-gateway, build-sandbox]
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/build-snap.yml
+    with:
+      checkout-ref: ${{ github.sha }}
+      arch: amd64
+      runner: linux-amd64-cpu8
+      artifact-layout: raw
+      cli-artifact-name: openshell-x86_64-unknown-linux-musl
+      gateway-artifact-name: openshell-gateway-x86_64-unknown-linux-gnu
+      supervisor-artifact-name: openshell-sandbox-x86_64-unknown-linux-musl
+
   build-rpm:
     needs: [version, build-cli, build-gateway]
     permissions:
@@ -181,3 +212,76 @@ jobs:
             --provision gateway-rootless-podman \
             --provision openshell-rpm-gateway-upgrade \
             -- /tmp/openshell-conformance run --plan /tmp/conformance-plan.toml
+
+  ubuntu-snap:
+    name: Ubuntu Snap with Docker Snap
+    needs: [build-conformance, build-gateway, build-snap]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Enable KVM access
+        run: |
+          set -euo pipefail
+          if [[ ! -c /dev/kvm ]]; then
+            echo "::error::The runner did not expose /dev/kvm"
+            exit 1
+          fi
+          sudo chmod 0666 /dev/kvm
+          exec 3<>/dev/kvm
+          exec 3>&-
+
+      - uses: ./.github/actions/setup-nix
+
+      - name: Download Snap artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: snap-linux-amd64
+          path: snap-input
+
+      - name: Download conformance CLI
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-conformance-x86_64-unknown-linux-musl
+          path: conformance-input
+
+      - name: Download gateway binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-gateway-x86_64-unknown-linux-gnu
+          path: gateway-input
+
+      - name: Install Snap and run smoke conformance
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x conformance-input/openshell-conformance
+          chmod +x gateway-input/openshell-gateway
+          shopt -s nullglob
+          snaps=(snap-input/*.snap)
+          if [[ ${#snaps[@]} -ne 1 ]]; then
+            echo "expected one Snap artifact" >&2
+            printf 'Snap artifacts:\n' >&2
+            printf '  %s\n' snap-input/* >&2
+            exit 1
+          fi
+
+          OPENSHELL_TEST_GUEST_CACHE_DISABLE=1 nix run .#test-guest -- \
+            --distro ubuntu-24-04 \
+            --with snapd \
+            --with docker-snap \
+            --copy "${snaps[0]}:/var/lib/openshell-conformance/candidate/openshell.snap" \
+            --copy "conformance-input/openshell-conformance:/var/lib/openshell-conformance/candidate/openshell-conformance" \
+            --copy "gateway-input/openshell-gateway:/var/lib/openshell-conformance/workarounds/openshell-gateway" \
+            --provision openshell-snap-package-bootstrap-workaround \
+            --provision openshell-snap \
+            -- bash -ec '
+              /var/lib/openshell-conformance/candidate/openshell-conformance \
+                run smoke --openshell-bin /snap/bin/openshell
+            '
