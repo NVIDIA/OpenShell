@@ -16,12 +16,16 @@
 /// Preferred interactive shell when the image provides it.
 pub const BASH: &str = "/bin/bash";
 
+/// Preferred interactive shell on `usr`-merged images where `/bin` is not a
+/// top-level directory.
+pub const USR_BASH: &str = "/usr/bin/bash";
+
 /// POSIX shell. Guaranteed on virtually every image, including Alpine/`BusyBox`.
 /// Used as the ultimate fallback.
 pub const POSIX_SH: &str = "/bin/sh";
 
 /// Shell paths tried, in preference order, by [`detect_login_shell`].
-pub const SHELL_CANDIDATES: &[&str] = &[BASH, "/usr/bin/bash", POSIX_SH];
+pub const SHELL_CANDIDATES: &[&str] = &[BASH, USR_BASH, POSIX_SH];
 
 /// Return `true` if `path` is a regular, executable file in the current root
 /// filesystem.
@@ -46,17 +50,17 @@ pub fn is_executable(path: &str) -> bool {
 
 /// Resolve a login shell that exists in the current root filesystem.
 ///
-/// Resolution order: `$SHELL` (when set and executable), then
-/// [`SHELL_CANDIDATES`], falling back to [`POSIX_SH`]. Because this inspects
-/// the filesystem, call it from the supervisor (inside the sandbox), never on
-/// the gateway.
+/// Tries [`SHELL_CANDIDATES`] in order and falls back to [`POSIX_SH`]. Because
+/// this inspects the filesystem, call it from the supervisor (inside the
+/// sandbox), never on the gateway.
+///
+/// `$SHELL` is intentionally not consulted: it is image/user-controlled, the
+/// result is later invoked with `-lc`, and an executable that is not a
+/// compatible shell (e.g. `SHELL=/bin/false`) would pass the executable check
+/// yet break command execution. Resolving only from known shell paths avoids
+/// that footgun.
 #[must_use]
 pub fn detect_login_shell() -> String {
-    if let Ok(shell) = std::env::var("SHELL")
-        && is_executable(&shell)
-    {
-        return shell;
-    }
     SHELL_CANDIDATES
         .iter()
         .find(|candidate| is_executable(candidate))
