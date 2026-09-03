@@ -60,6 +60,9 @@ func TestSandboxFromProto(t *testing.T) {
 			},
 			Command: []string{"/opt/agent", "--serve"},
 			Tty:     false,
+			DisruptionProtection: &pb.DisruptionProtectionRequest{
+				Duration: durationpb.New(4 * time.Hour),
+			},
 		},
 		CreatedFromWorkloadTemplate: &pb.SandboxWorkloadTemplateProvenance{
 			Name:            "gpu-kata",
@@ -111,6 +114,8 @@ func TestSandboxFromProto(t *testing.T) {
 	assert.Equal(t, uint32(2), *s.Spec.GPUCount)
 	assert.Equal(t, []string{"/opt/agent", "--serve"}, s.Spec.Command)
 	assert.False(t, s.Spec.TTY)
+	require.NotNil(t, s.Spec.DisruptionProtectionDuration)
+	assert.Equal(t, 4*time.Hour, *s.Spec.DisruptionProtectionDuration)
 
 	// Template
 	require.NotNil(t, s.Spec.Template)
@@ -257,6 +262,7 @@ func TestSandboxToProto(t *testing.T) {
 	userNS := true
 	gpuCount := uint32(4)
 	delTime := time.UnixMilli(1700000060000).UTC()
+	disruptionProtection := 2 * time.Hour
 	s := &v1.Sandbox{
 		ID:                "sb-1",
 		Name:              "my-sandbox",
@@ -278,10 +284,11 @@ func TestSandboxToProto(t *testing.T) {
 				Environment:      map[string]string{"E": "V"},
 				UserNamespaces:   &userNS,
 			},
-			Providers: []string{"prov-a"},
-			GPUCount:  &gpuCount,
-			Command:   []string{"/opt/agent", "--serve"},
-			TTY:       false,
+			Providers:                    []string{"prov-a"},
+			GPUCount:                     &gpuCount,
+			Command:                      []string{"/opt/agent", "--serve"},
+			TTY:                          false,
+			DisruptionProtectionDuration: &disruptionProtection,
 		},
 	}
 
@@ -308,6 +315,8 @@ func TestSandboxToProto(t *testing.T) {
 	require.NotNil(t, p.Spec.ResourceRequirements)
 	require.NotNil(t, p.Spec.ResourceRequirements.Gpu)
 	assert.Equal(t, uint32(4), p.Spec.ResourceRequirements.Gpu.GetCount())
+	require.NotNil(t, p.Spec.DisruptionProtection)
+	assert.Equal(t, 2*time.Hour, p.Spec.DisruptionProtection.Duration.AsDuration())
 
 	require.NotNil(t, p.Spec.Template)
 	assert.Equal(t, "img:v1", p.Spec.Template.Image)

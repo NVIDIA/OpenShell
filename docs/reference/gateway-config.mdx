@@ -574,6 +574,17 @@ proxy_uid                      = 1337
 # inspection capabilities, and enforce endpoint/L7 policy without matching
 # policy.binaries.
 process_binary_aware_network_policy = true
+
+[openshell.drivers.kubernetes.disruption_protection]
+# Disabled by default. Enabling this permits, but does not automatically add,
+# per-sandbox PodDisruptionBudgets. New requests are rejected while disabled;
+# previously accepted PDBs remain until their deadlines but are not repaired.
+enabled      = false
+# Maximum duration accepted from the first-class Sandbox API request. This is a
+# fail-closed expiration target: if every gateway is unavailable at the
+# deadline, the PDB remains until reconciliation resumes or an operator removes
+# it.
+max_duration = "24h"
 ```
 
 In managed workspace mode, the Kubernetes driver copies each explicitly named
@@ -588,6 +599,10 @@ into the gateway pod and sets `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`.
 The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the
 SPIFFE Workload API, so this validation path does not require gateway access to
 the SPIRE OIDC discovery endpoint or its TLS CA.
+
+Custom non-Helm deployments that enable this feature must grant the gateway
+service account `create`, `delete`, `get`, `list`, and `patch` on `policy/v1`
+PodDisruptionBudgets in the sandbox namespace.
 
 ### Docker
 

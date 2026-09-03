@@ -219,6 +219,10 @@ data:
     proxy_uid                    = {{ .Values.supervisor.sidecar.proxyUid | default 1337 }}
     process_binary_aware_network_policy = {{ .Values.supervisor.sidecar.processBinaryAwareNetworkPolicy }}
 
+    [openshell.drivers.kubernetes.disruption_protection]
+    enabled                      = {{ .Values.server.disruptionProtection.enabled }}
+    max_duration                 = {{ .Values.server.disruptionProtection.maxDuration | quote }}
+
     {{- if not $credentialDrivers }}
 
     [openshell.gateway.credential_storage]

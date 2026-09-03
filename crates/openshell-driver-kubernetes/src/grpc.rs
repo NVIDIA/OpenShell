@@ -209,14 +209,16 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         _request: Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
-        self.trace_rpc("driver.list_sandboxes", "list_sandboxes", async {
-            let sandboxes = self
-                .driver
-                .list_sandboxes()
-                .await
-                .map_err(Status::internal)?;
-            Ok(Response::new(ListSandboxesResponse { sandboxes }))
-        })
+        Box::pin(
+            self.trace_rpc("driver.list_sandboxes", "list_sandboxes", async {
+                let sandboxes = self
+                    .driver
+                    .list_sandboxes()
+                    .await
+                    .map_err(Status::internal)?;
+                Ok(Response::new(ListSandboxesResponse { sandboxes }))
+            }),
+        )
         .await
     }
 
@@ -224,17 +226,19 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<CreateSandboxResponse>, Status> {
-        self.trace_rpc("driver.create_sandbox", "create_sandbox", async {
-            let sandbox = request
-                .into_inner()
-                .sandbox
-                .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-            self.driver
-                .create_sandbox(&sandbox)
-                .await
-                .map_err(|e| Status::from(openshell_core::ComputeDriverError::from(e)))?;
-            Ok(Response::new(CreateSandboxResponse {}))
-        })
+        Box::pin(
+            self.trace_rpc("driver.create_sandbox", "create_sandbox", async {
+                let sandbox = request
+                    .into_inner()
+                    .sandbox
+                    .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
+                self.driver
+                    .create_sandbox(&sandbox)
+                    .await
+                    .map_err(|e| Status::from(openshell_core::ComputeDriverError::from(e)))?;
+                Ok(Response::new(CreateSandboxResponse {}))
+            }),
+        )
         .await
     }
 

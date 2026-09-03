@@ -509,14 +509,12 @@ impl PodmanComputeDriver {
 
     /// Report driver capabilities.
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, ComputeDriverError> {
-        Ok(GetCapabilitiesResponse {
-            driver_name: "podman".to_string(),
-            driver_version: openshell_core::VERSION.to_string(),
-            default_image: self.config.default_image.clone(),
-            gateway_manages_lifecycle: true,
-            supports_sandbox_authentication: false,
-            driver_reports_runtime_readiness: false,
-        })
+        Ok(openshell_core::driver_utils::build_capabilities_response(
+            "podman",
+            openshell_core::VERSION,
+            &self.config.default_image,
+            true,
+        ))
     }
 
     /// Report the gateway exposure needed by Podman's standard local callback aliases.
@@ -625,10 +623,17 @@ impl PodmanComputeDriver {
         &self,
         sandbox: &'a DriverSandbox,
     ) -> Result<ValidatedPodmanSandbox<'a>, ComputeDriverError> {
-        let gpu_requirements = sandbox
-            .spec
+        let spec = sandbox.spec.as_ref().ok_or_else(|| {
+            ComputeDriverError::InvalidArgument("sandbox.spec is required".into())
+        })?;
+        if spec.disruption_protection.is_some() {
+            return Err(ComputeDriverError::Precondition(
+                "podman sandboxes do not support disruption protection".into(),
+            ));
+        }
+        let gpu_requirements = spec
+            .resource_requirements
             .as_ref()
-            .and_then(|spec| spec.resource_requirements.as_ref())
             .and_then(|requirements| driver_gpu_requirements(Some(requirements)));
         let driver_config = PodmanSandboxDriverConfig::from_sandbox(sandbox)?;
         Self::validate_gpu_request(gpu_requirements, &driver_config)?;
@@ -2889,7 +2894,7 @@ mod tests {
             name: name.to_string(),
             namespace: String::new(),
             workspace: String::new(),
-            spec: None,
+            spec: Some(DriverSandboxSpec::default()),
             status: None,
         }
     }

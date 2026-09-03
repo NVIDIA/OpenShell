@@ -115,6 +115,11 @@ pub struct SandboxSpec {
     pub command: Vec<String>,
     /// Allocate a retained pseudo-terminal for the canonical command.
     pub tty: bool,
+    /// Requested protection from voluntary platform disruption.
+    ///
+    /// The gateway rejects this when the selected driver does not support the
+    /// capability or the duration exceeds the administrator-configured limit.
+    pub disruption_protection: Option<Duration>,
 }
 
 /// Caller intent for creating a sandbox from a named workload template.

@@ -24,11 +24,12 @@ use openshell_core::proto::{
     DeleteSandboxRequest, DeleteSandboxResponse, DeleteSandboxTemplateRequest,
     DeleteSandboxTemplateResponse, DeleteServiceRequest, DeleteServiceResponse,
     DeleteWorkspaceRequest, DeleteWorkspaceResponse, DetachSandboxProviderRequest,
-    DetachSandboxProviderResponse, EditDraftChunkRequest, EditDraftChunkResponse,
-    ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
-    ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest, FinalizeMainProcessExitRequest,
-    FinalizeMainProcessExitResponse, GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse,
-    GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
+    DetachSandboxProviderResponse, DisruptionProtectionCapability, EditDraftChunkRequest,
+    EditDraftChunkResponse, ExchangeProviderSubjectTokenRequest,
+    ExchangeProviderSubjectTokenResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
+    ExposeServiceRequest, FinalizeMainProcessExitRequest, FinalizeMainProcessExitResponse,
+    GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse, GetDraftHistoryRequest,
+    GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetGatewayInfoRequest,
     GetGatewayInfoResponse, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
     GetProviderRefreshStatusResponse, GetProviderRequest, GetSandboxConfigRequest,
@@ -258,6 +259,13 @@ impl OpenShell for OpenShellService {
                 capabilities: Some(ComputeDriverCapabilities {
                     driver_name: driver.driver_name.clone(),
                     driver_version: driver.driver_version.clone(),
+                    disruption_protection: driver.disruption_protection.as_ref().map(
+                        |capability| DisruptionProtectionCapability {
+                            support: capability.support,
+                            enabled: capability.enabled,
+                            max_duration: capability.max_duration,
+                        },
+                    ),
                 }),
             })
             .collect();

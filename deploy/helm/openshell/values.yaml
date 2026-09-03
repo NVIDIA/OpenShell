@@ -240,6 +240,16 @@ server:
   # StorageClass. Set this on clusters with no default StorageClass, otherwise
   # the workspace PVC stays Pending and the sandbox never starts.
   workspaceStorageClass: ""
+  # PodDisruptionBudget support with a fail-closed expiration target for
+  # Kubernetes sandboxes. This is disabled by default; an individual sandbox
+  # must also request a duration through the Sandbox API before OpenShell
+  # creates a PDB.
+  disruptionProtection:
+    # -- Allow new sandbox disruption-protection requests. Turning this off
+    # retains existing PDBs until their deadlines but disables their repair.
+    enabled: false
+    # -- Maximum accepted sandbox protection duration. Supports s, m, and h.
+    maxDuration: "24h"
   # -- Default Kubernetes runtimeClassName for sandbox pods.
   # Applied when a CreateSandbox request does not specify one.
   # Empty (default) = omit the field, using the cluster's default RuntimeClass.

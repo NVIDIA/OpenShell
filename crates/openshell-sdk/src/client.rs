@@ -153,7 +153,7 @@ impl OpenShellClient {
 
     /// Create a new sandbox from a curated [`SandboxSpec`].
     pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<SandboxRef> {
-        let request = create_sandbox_request(spec);
+        let request = create_sandbox_request(spec)?;
         let response = self
             .unary(|mut grpc| {
                 let request = request.clone();
@@ -635,7 +635,7 @@ impl WorkspaceScopedClient {
 
     /// Create a new sandbox in this workspace.
     pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<SandboxRef> {
-        let mut request = create_sandbox_request(spec);
+        let mut request = create_sandbox_request(spec)?;
         request.workspace = self.workspace.clone();
         let response = self
             .client
@@ -974,7 +974,7 @@ fn store_bearer(slot: &BearerSlot, token: &str) -> Result<()> {
     Ok(())
 }
 
-fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
+fn create_sandbox_request(spec: SandboxSpec) -> Result<proto::CreateSandboxRequest> {
     let SandboxSpec {
         name,
         image,
@@ -984,6 +984,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         gpu,
         command,
         tty,
+        disruption_protection,
     } = spec;
     let template = image.map(|image| proto::SandboxTemplate {
         image,
@@ -992,7 +993,21 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
     let resource_requirements = gpu.then_some(proto::ResourceRequirements {
         gpu: Some(proto::GpuResourceRequirements { count: None }),
     });
-    proto::CreateSandboxRequest {
+    let disruption_protection = disruption_protection
+        .map(|duration| -> Result<_> {
+            let seconds = i64::try_from(duration.as_secs()).map_err(|_| {
+                SdkError::invalid_config("disruption protection duration is too large")
+            })?;
+            Ok(proto::DisruptionProtectionRequest {
+                duration: Some(prost_types::Duration {
+                    seconds,
+                    nanos: i32::try_from(duration.subsec_nanos())
+                        .expect("subsecond nanoseconds fit in i32"),
+                }),
+            })
+        })
+        .transpose()?;
+    Ok(proto::CreateSandboxRequest {
         spec: Some(proto::SandboxSpec {
             environment,
             template,
@@ -1000,6 +1015,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
             resource_requirements,
             command,
             tty,
+            disruption_protection,
             ..proto::SandboxSpec::default()
         }),
         name: name.unwrap_or_default(),
@@ -1008,7 +1024,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         workspace: String::new(),
         await_main_process_attachment: false,
         workload_template_name: String::new(),
-    }
+    })
 }
 
 fn create_sandbox_from_template_request(
@@ -1224,7 +1240,8 @@ mod tests {
             command: vec!["/opt/agent binary".into(), "--serve exactly".into()],
             tty: false,
             ..SandboxSpec::default()
-        });
+        })
+        .expect("canonical main process should produce a valid request");
 
         let spec = request.spec.expect("sandbox spec should be present");
         assert_eq!(spec.command, ["/opt/agent binary", "--serve exactly"]);
