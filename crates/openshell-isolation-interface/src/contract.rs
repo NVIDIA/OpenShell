@@ -87,6 +87,8 @@ pub enum BackendErrorKind {
     Denied,
     /// Transient inability to serve an operation.
     Unavailable,
+    /// The selected backend does not implement the requested optional operation.
+    Unsupported,
     /// Attachment, confirmation, start, or runtime operation failure.
     Failed,
     /// Abnormal boundary/workload loss, or an operation against an inactive
@@ -101,7 +103,8 @@ impl BackendError {
         match self {
             Self::Descriptor(_) | Self::NotRegistered(_) => BackendErrorKind::Invalid,
             Self::Denied(_) => BackendErrorKind::Denied,
-            Self::Unavailable(_) | Self::Unsupported(_) => BackendErrorKind::Unavailable,
+            Self::Unavailable(_) => BackendErrorKind::Unavailable,
+            Self::Unsupported(_) => BackendErrorKind::Unsupported,
             Self::Attach(_) | Self::Confirm(_) | Self::Process(_) => BackendErrorKind::Failed,
             Self::Terminated(_) => BackendErrorKind::Terminated,
         }
@@ -587,7 +590,7 @@ impl FromStr for Sha256Digest {
     type Err = ResolveError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.len() != 64 || !value.is_ascii() {
+        if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(ResolveError::Failed(
                 "SHA-256 digest must contain 64 hexadecimal characters".to_string(),
             ));
