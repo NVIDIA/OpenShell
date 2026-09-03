@@ -1347,10 +1347,10 @@ impl VmDriver {
     }
 
     #[tracing::instrument(
-        name = "vm.delete",
+        name = "vm.teardown",
         skip(self),
         fields(
-            otel.name = "vm.delete",
+            otel.name = "vm.teardown",
             otel.status_code = tracing::field::Empty,
             sandbox.id = %sandbox_id,
             sandbox.name = %sandbox_name,
@@ -6301,7 +6301,7 @@ mod tests {
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .layer(crate::otel_tracing::compute_driver_rpc_layer())
+                .layer(openshell_otel::compute_driver_rpc_layer())
                 .add_service(ComputeDriverServer::new(driver))
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(listener),
@@ -6338,7 +6338,7 @@ mod tests {
         let spans = traced.exporter.get_finished_spans().unwrap();
         let rpc_spans = spans
             .iter()
-            .filter(|span| span.name == "driver.get_capabilities")
+            .filter(|span| span.name == "openshell.compute.v1.ComputeDriver/GetCapabilities")
             .collect::<Vec<_>>();
         assert_eq!(
             rpc_spans.len(),
@@ -6419,14 +6419,14 @@ mod tests {
 
         let spans = traced.exporter.get_finished_spans().unwrap();
         let expected = [
-            "driver.get_capabilities",
-            "driver.validate_sandbox_create",
-            "driver.create_sandbox",
-            "driver.get_sandbox",
-            "driver.list_sandboxes",
-            "driver.stop_sandbox",
-            "driver.delete_sandbox",
-            "driver.watch_sandboxes",
+            "openshell.compute.v1.ComputeDriver/GetCapabilities",
+            "openshell.compute.v1.ComputeDriver/ValidateSandboxCreate",
+            "openshell.compute.v1.ComputeDriver/CreateSandbox",
+            "openshell.compute.v1.ComputeDriver/GetSandbox",
+            "openshell.compute.v1.ComputeDriver/ListSandboxes",
+            "openshell.compute.v1.ComputeDriver/StopSandbox",
+            "openshell.compute.v1.ComputeDriver/DeleteSandbox",
+            "openshell.compute.v1.ComputeDriver/WatchSandboxes",
         ];
         for name in expected {
             let span = spans
@@ -6437,10 +6437,10 @@ mod tests {
             assert_has_parent(span);
         }
         for name in [
-            "driver.validate_sandbox_create",
-            "driver.create_sandbox",
-            "driver.get_sandbox",
-            "driver.stop_sandbox",
+            "openshell.compute.v1.ComputeDriver/ValidateSandboxCreate",
+            "openshell.compute.v1.ComputeDriver/CreateSandbox",
+            "openshell.compute.v1.ComputeDriver/GetSandbox",
+            "openshell.compute.v1.ComputeDriver/StopSandbox",
         ] {
             let span = spans.iter().find(|span| span.name == name).unwrap();
             assert!(
@@ -6451,12 +6451,12 @@ mod tests {
         }
         let delete_rpc = spans
             .iter()
-            .find(|span| span.name == "driver.delete_sandbox")
+            .find(|span| span.name == "openshell.compute.v1.ComputeDriver/DeleteSandbox")
             .expect("delete RPC span");
         let cleanup = spans
             .iter()
             .find(|span| {
-                span.name == "vm.delete"
+                span.name == "vm.teardown"
                     && span.span_context.trace_id() == delete_rpc.span_context.trace_id()
             })
             .expect("delete cleanup span");
@@ -6625,7 +6625,7 @@ mod tests {
     async fn background_provisioning_does_not_extend_the_rpc_span_lifetime() {
         let traced = TestTracing::new();
         let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
-        let rpc = tracing::info_span!("driver.create_sandbox");
+        let rpc = tracing::info_span!("openshell.compute.v1.ComputeDriver/CreateSandbox");
         let entered = rpc.enter();
         let provisioning =
             provisioning_span(&rpc.context(), "sb-lifetime", "invalid image reference");
@@ -6638,7 +6638,7 @@ mod tests {
                 .get_finished_spans()
                 .unwrap()
                 .iter()
-                .any(|span| span.name == "driver.create_sandbox"),
+                .any(|span| span.name == "openshell.compute.v1.ComputeDriver/CreateSandbox"),
             "the RPC span should finish while background provisioning is still active"
         );
         drop(provisioning);
@@ -6769,7 +6769,7 @@ mod tests {
         let spans = traced.exporter.get_finished_spans().unwrap();
         let deletion = spans
             .iter()
-            .find(|span| span.name == "vm.delete")
+            .find(|span| span.name == "vm.teardown")
             .expect("delete span");
         assert!(
             matches!(deletion.status, opentelemetry::trace::Status::Error { .. }),

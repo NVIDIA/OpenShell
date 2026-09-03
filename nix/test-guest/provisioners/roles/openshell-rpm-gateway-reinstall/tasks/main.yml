@@ -1,0 +1,70 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Require RPM gateway provisioner dependencies
+  ansible.builtin.assert:
+    that:
+      - openshell_install_source | default('') == 'rpm'
+      - openshell_cli_bin is defined
+      - openshell_gateway_service is defined
+      - openshell_gateway_runtime | default('') == 'rootless-podman'
+    fail_msg: >-
+      openshell-rpm-gateway-reinstall requires openshell-rpm and a configured
+      gateway runtime.
+
+- name: Verify candidate RPMs for reinstall
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ openshell_rpm_reinstall_cli }}"
+    - "{{ openshell_rpm_reinstall_gateway }}"
+  register: openshell_rpm_reinstall_candidates
+
+- name: Require copied candidate RPMs
+  ansible.builtin.assert:
+    that: item.stat.exists
+    fail_msg: "missing candidate RPM: {{ item.item }}"
+  loop: "{{ openshell_rpm_reinstall_candidates.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Create the target reinstall command directory
+  ansible.builtin.file:
+    path: "{{ openshell_rpm_reinstall_command | dirname }}"
+    state: directory
+    mode: "0700"
+
+- name: Install the target RPM reinstall command
+  ansible.builtin.copy:
+    dest: "{{ openshell_rpm_reinstall_command }}"
+    mode: "0700"
+    content: |
+      #!/usr/bin/env bash
+      set -Eeuo pipefail
+
+      latest_transaction() {
+        sudo dnf history list --reverse --quiet | awk 'NR == 1 { print $1 }'
+      }
+
+      before_transaction="$(latest_transaction)"
+      sudo dnf reinstall -y --nogpgcheck {{ openshell_rpm_reinstall_cli }} {{ openshell_rpm_reinstall_gateway }}
+      after_transaction="$(latest_transaction)"
+      if [ -z "${after_transaction}" ] || [ "${after_transaction}" = "${before_transaction}" ]; then
+        echo "RPM reinstall did not create a DNF transaction" >&2
+        exit 1
+      fi
+      transaction_info="$(sudo dnf history info "${after_transaction}")"
+      grep -Eq 'Reinstall[[:space:]]+openshell-' <<<"${transaction_info}"
+      grep -Eq 'Reinstall[[:space:]]+openshell-gateway-' <<<"${transaction_info}"
+      rpm -V openshell openshell-gateway
+      systemctl --user daemon-reload
+      systemctl --user restart {{ openshell_gateway_service }}
+      for _ in $(seq 1 60); do
+        if {{ openshell_cli_bin }} status >/dev/null 2>&1; then
+          exit 0
+        fi
+        sleep 1
+      done
+      systemctl --user status {{ openshell_gateway_service }} --no-pager >&2 || true
+      exit 1

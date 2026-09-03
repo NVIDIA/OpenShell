@@ -756,9 +756,22 @@ identity and configured compute driver.
 
 The gateway forwards OTLP configuration, its configured gateway name, and W3C
 trace context to managed external drivers. Built-in drivers use dedicated
-in-process providers that preserve the same RPC trace boundary. Each driver
+in-process providers that preserve the same RPC trace boundary. A shared
+compute-driver tracing descriptor derives provider layers and standalone
+installation from each driver's service identity, and routes both the shared
+RPC boundary target and that driver's crate target prefix. A shared RPC tracer
+owns unary and streaming boundary outcomes. Each driver
 exports to the configured collector under its own service name and carries the
-gateway name as a resource attribute.
+gateway name and configured compute driver as resource attributes.
+Compute-driver client and server spans share the fully qualified protobuf
+operation name, such as `openshell.compute.v1.ComputeDriver/CreateSandbox`,
+in both the span name and `rpc.method`; the current RPC semantic conventions
+integrate the service into that fully qualified method and do not emit
+`rpc.service`. `service.name` and span kind distinguish the two sides.
+Backend-prefixed spans describe implementation work beneath that boundary.
+Streaming `WatchSandboxes` spans remain open for the stream lifetime on both
+sides. A terminal stream status records its outcome;
+consumer teardown without a terminal status leaves the span status unset.
 
 Two invariants shape the failure behavior. Telemetry is diagnostic, so no OTLP
 failure stops the gateway from serving: a malformed endpoint is logged at

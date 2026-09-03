@@ -154,42 +154,30 @@ jobs:
           name: openshell-conformance-x86_64-unknown-linux-musl
           path: conformance-input
 
-      - name: Install RPMs and check status
+      - name: Run RPM gateway continuity conformance
         shell: bash
         run: |
           set -euo pipefail
           chmod +x conformance-input/openshell-conformance
-          guest_script="$RUNNER_TEMP/conformance.sh"
-          cat > "$guest_script" <<'EOF'
-          set -euo pipefail
-
-          on_exit() {
-            rc=$?
-            trap - EXIT
-            if [ "$rc" -ne 0 ]; then
-              systemctl --user status openshell-gateway --no-pager || true
-              journalctl --user -u openshell-gateway --no-pager -n 200 || true
-              podman info || true
-              podman ps --all || true
-              getenforce || true
-            fi
-            exit "$rc"
-          }
-          trap on_exit EXIT
-
-          mkdir -p "$HOME/.config/openshell"
-          echo 'OPENSHELL_TELEMETRY_ENABLED=false' > "$HOME/.config/openshell/gateway.env"
-          systemctl --user enable --now openshell-gateway
-          openshell gateway add --local https://127.0.0.1:17670 --name openshell
-          /tmp/openshell-conformance run smoke
-          EOF
+          shopt -s nullglob
+          candidate_cli_package=(rpm-input/openshell-[0-9]*.rpm)
+          candidate_gateway_package=(rpm-input/openshell-gateway-[0-9]*.rpm)
+          if [[ ${#candidate_cli_package[@]} -ne 1 || ${#candidate_gateway_package[@]} -ne 1 ]]; then
+            echo "expected one candidate CLI and gateway RPM" >&2
+            printf 'RPM artifacts:\n' >&2
+            printf '  %s\n' rpm-input/* >&2
+            exit 1
+          fi
 
           OPENSHELL_TEST_GUEST_CACHE_DISABLE=1 nix run .#test-guest -- \
             --distro fedora \
             --with podman-rootless \
             --with selinux \
-            --install rpm-input/openshell-[0-9]*.rpm \
-            --install rpm-input/openshell-gateway-[0-9]*.rpm \
-            --copy "$guest_script:/tmp/conformance.sh" \
+            --copy "${candidate_cli_package[0]}:/var/lib/openshell-conformance/candidate/openshell.rpm" \
+            --copy "${candidate_gateway_package[0]}:/var/lib/openshell-conformance/candidate/openshell-gateway.rpm" \
             --copy conformance-input/openshell-conformance:/tmp/openshell-conformance \
-            -- bash /tmp/conformance.sh
+            --copy nix/test-guest/conformance-plans/gateway-upgrade-restart.toml:/tmp/conformance-plan.toml \
+            --provision openshell-rpm-latest-release \
+            --provision gateway-rootless-podman \
+            --provision openshell-rpm-gateway-upgrade \
+            -- /tmp/openshell-conformance run --plan /tmp/conformance-plan.toml

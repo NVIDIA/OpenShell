@@ -513,11 +513,9 @@ async fn run_from_args(
         Some(prepared.config.name.as_str()),
         Some(prepared.compute_driver.name()),
     );
-    let compute_driver_tracing = compute_drivers.tracing_setup(
+    let compute_driver_tracing = compute_drivers.in_process_tracing(
         &prepared.compute_driver,
         &prepared.config.compute_driver_endpoints,
-        otlp_config.map(|config| config.endpoint.as_str()),
-        Some(prepared.config.name.as_str()),
     );
     let (tracing_handle, setup_error) = crate::tracing_setup::install(
         EnvFilter::try_from_default_env()

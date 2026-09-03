@@ -14,55 +14,21 @@ use openshell_core::proto::compute::v1::{
     ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
     WatchSandboxesRequest, compute_driver_server::ComputeDriver,
 };
-use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll};
 use tonic::{Request, Response, Status};
-use tracing::Instrument as _;
 
 use crate::PodmanComputeDriver;
 
 type ComputeDriverWatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send + 'static>>;
 
-struct TracedWatchStream {
-    inner: ComputeDriverWatchStream,
-    span: tracing::Span,
-}
-
-impl TracedWatchStream {
-    fn new(inner: ComputeDriverWatchStream, span: tracing::Span) -> Self {
-        Self { inner, span }
-    }
-}
-
-impl Stream for TracedWatchStream {
-    type Item = Result<WatchSandboxesEvent, Status>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let span = self.span.clone();
-        let _entered = span.enter();
-        let result = self.inner.as_mut().poll_next(cx);
-        match &result {
-            Poll::Ready(Some(Err(status))) => {
-                openshell_otel::mark_error(&self.span);
-                self.span
-                    .record("rpc.grpc.status_code", status.code() as i32);
-            }
-            Poll::Ready(None) => {
-                self.span
-                    .record("rpc.grpc.status_code", tonic::Code::Ok as i32);
-            }
-            Poll::Pending | Poll::Ready(Some(Ok(_))) => {}
-        }
-        result
-    }
-}
+#[cfg(test)]
+type TracedWatchStream = openshell_otel::TracedGrpcStream<ComputeDriverWatchStream>;
 
 #[derive(Debug, Clone)]
 pub struct ComputeDriverService {
     driver: PodmanComputeDriver,
-    trace_in_process_rpc: bool,
+    rpc_tracer: openshell_otel::InProcessRpcTracer,
 }
 
 impl ComputeDriverService {
@@ -70,7 +36,7 @@ impl ComputeDriverService {
     pub fn new(driver: PodmanComputeDriver) -> Self {
         Self {
             driver,
-            trace_in_process_rpc: false,
+            rpc_tracer: openshell_otel::InProcessRpcTracer::disabled(),
         }
     }
 
@@ -78,50 +44,8 @@ impl ComputeDriverService {
     pub fn new_in_process(driver: PodmanComputeDriver) -> Self {
         Self {
             driver,
-            trace_in_process_rpc: true,
+            rpc_tracer: openshell_otel::InProcessRpcTracer::enabled(),
         }
-    }
-
-    fn in_process_rpc_span(
-        &self,
-        operation: &'static str,
-        method: &'static str,
-    ) -> Option<tracing::Span> {
-        self.trace_in_process_rpc.then(|| {
-            tracing::info_span!(
-                target: "openshell_driver_podman::otel_tracing",
-                "driver_rpc",
-                otel.name = operation,
-                otel.kind = "server",
-                otel.status_code = tracing::field::Empty,
-                rpc.system = "grpc",
-                rpc.service = "openshell.compute.v1.ComputeDriver",
-                rpc.method = method,
-                rpc.grpc.status_code = tracing::field::Empty,
-            )
-        })
-    }
-
-    async fn trace_rpc<T>(
-        &self,
-        operation: &'static str,
-        method: &'static str,
-        future: impl Future<Output = Result<T, Status>>,
-    ) -> Result<T, Status> {
-        let Some(span) = self.in_process_rpc_span(operation, method) else {
-            return future.await;
-        };
-        let result = future.instrument(span.clone()).await;
-        match &result {
-            Ok(_) => {
-                span.record("rpc.grpc.status_code", tonic::Code::Ok as i32);
-            }
-            Err(status) => {
-                openshell_otel::mark_error(&span);
-                span.record("rpc.grpc.status_code", status.code() as i32);
-            }
-        }
-        result
     }
 }
 
@@ -132,51 +56,54 @@ impl ComputeDriver for ComputeDriverService {
         _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
     ) -> Result<Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>, Status>
     {
-        Err(Status::unimplemented(
-            "podman does not authenticate sandbox credentials",
-        ))
+        self.rpc_tracer
+            .trace(openshell_otel::rpc::AUTHENTICATE_SANDBOX, async {
+                Err(Status::unimplemented(
+                    "podman does not authenticate sandbox credentials",
+                ))
+            })
+            .await
     }
 
     async fn get_capabilities(
         &self,
         _request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
-        self.trace_rpc("driver.get_capabilities", "get_capabilities", async {
-            self.driver
-                .capabilities()
-                .map(Response::new)
-                .map_err(Status::from)
-        })
-        .await
+        self.rpc_tracer
+            .trace(openshell_otel::rpc::GET_CAPABILITIES, async {
+                self.driver
+                    .capabilities()
+                    .map(Response::new)
+                    .map_err(Status::from)
+            })
+            .await
     }
 
     async fn get_gateway_listener_requirements(
         &self,
         _request: Request<GetGatewayListenerRequirementsRequest>,
     ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
-        self.trace_rpc(
-            "driver.get_gateway_listener_requirements",
-            "get_gateway_listener_requirements",
-            async {
-                Ok(Response::new(GetGatewayListenerRequirementsResponse {
-                    requirements: self
-                        .driver
-                        .gateway_listener_requirements()
-                        .map_err(Status::from)?,
-                }))
-            },
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::GET_GATEWAY_LISTENER_REQUIREMENTS,
+                async {
+                    Ok(Response::new(GetGatewayListenerRequirementsResponse {
+                        requirements: self
+                            .driver
+                            .gateway_listener_requirements()
+                            .map_err(Status::from)?,
+                    }))
+                },
+            )
+            .await
     }
 
     async fn validate_sandbox_create(
         &self,
         request: Request<ValidateSandboxCreateRequest>,
     ) -> Result<Response<ValidateSandboxCreateResponse>, Status> {
-        self.trace_rpc(
-            "driver.validate_sandbox_create",
-            "validate_sandbox_create",
-            async {
+        self.rpc_tracer
+            .trace(openshell_otel::rpc::VALIDATE_SANDBOX_CREATE, async {
                 let sandbox = request
                     .into_inner()
                     .sandbox
@@ -186,115 +113,120 @@ impl ComputeDriver for ComputeDriverService {
                     .await
                     .map_err(Status::from)?;
                 Ok(Response::new(ValidateSandboxCreateResponse {}))
-            },
-        )
-        .await
+            })
+            .await
     }
 
     async fn get_sandbox(
         &self,
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<GetSandboxResponse>, Status> {
-        self.trace_rpc("driver.get_sandbox", "get_sandbox", async {
-            let request = request.into_inner();
-            if request.sandbox_id.is_empty() {
-                return Err(Status::invalid_argument("sandbox_id is required"));
-            }
-            let sandbox = self
-                .driver
-                .get_sandbox(&request.sandbox_id)
-                .await
-                .map_err(Status::from)?
-                .ok_or_else(|| Status::not_found("sandbox not found"))?;
-            Ok(Response::new(GetSandboxResponse {
-                sandbox: Some(sandbox),
-            }))
-        })
-        .await
+        self.rpc_tracer
+            .trace(openshell_otel::rpc::GET_SANDBOX, async {
+                let request = request.into_inner();
+                if request.sandbox_id.is_empty() {
+                    return Err(Status::invalid_argument("sandbox_id is required"));
+                }
+                let sandbox = self
+                    .driver
+                    .get_sandbox(&request.sandbox_id)
+                    .await
+                    .map_err(Status::from)?
+                    .ok_or_else(|| Status::not_found("sandbox not found"))?;
+                Ok(Response::new(GetSandboxResponse {
+                    sandbox: Some(sandbox),
+                }))
+            })
+            .await
     }
 
     async fn list_sandboxes(
         &self,
         _request: Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
-        self.trace_rpc("driver.list_sandboxes", "list_sandboxes", async {
-            let sandboxes = self.driver.list_sandboxes().await.map_err(Status::from)?;
-            Ok(Response::new(ListSandboxesResponse { sandboxes }))
-        })
-        .await
+        self.rpc_tracer
+            .trace(openshell_otel::rpc::LIST_SANDBOXES, async {
+                let sandboxes = self.driver.list_sandboxes().await.map_err(Status::from)?;
+                Ok(Response::new(ListSandboxesResponse { sandboxes }))
+            })
+            .await
     }
 
     async fn create_sandbox(
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<CreateSandboxResponse>, Status> {
-        self.trace_rpc("driver.create_sandbox", "create_sandbox", async {
-            let sandbox = request
-                .into_inner()
-                .sandbox
-                .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-            self.driver
-                .create_sandbox(&sandbox)
-                .await
-                .map_err(Status::from)?;
-            Ok(Response::new(CreateSandboxResponse {}))
-        })
-        .await
+        self.rpc_tracer
+            .trace(openshell_otel::rpc::CREATE_SANDBOX, async {
+                let sandbox = request
+                    .into_inner()
+                    .sandbox
+                    .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
+                self.driver
+                    .create_sandbox(&sandbox)
+                    .await
+                    .map_err(Status::from)?;
+                Ok(Response::new(CreateSandboxResponse {}))
+            })
+            .await
     }
 
     async fn stop_sandbox(
         &self,
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
-        self.trace_rpc("driver.stop_sandbox", "stop_sandbox", async {
-            let request = request.into_inner();
-            if request.sandbox_id.is_empty() {
-                return Err(Status::invalid_argument("sandbox_id is required"));
-            }
-            self.driver
-                .stop_sandbox(&request.sandbox_id)
-                .await
-                .map_err(Status::from)?;
-            Ok(Response::new(StopSandboxResponse {}))
-        })
-        .await
+        self.rpc_tracer
+            .trace(openshell_otel::rpc::STOP_SANDBOX, async {
+                let request = request.into_inner();
+                if request.sandbox_id.is_empty() {
+                    return Err(Status::invalid_argument("sandbox_id is required"));
+                }
+                self.driver
+                    .stop_sandbox(&request.sandbox_id)
+                    .await
+                    .map_err(Status::from)?;
+                Ok(Response::new(StopSandboxResponse {}))
+            })
+            .await
     }
 
     async fn start_sandbox(
         &self,
         request: Request<StartSandboxRequest>,
     ) -> Result<Response<StartSandboxResponse>, Status> {
-        self.trace_rpc("driver.start_sandbox", "start_sandbox", async {
-            let request = request.into_inner();
-            if request.sandbox_id.is_empty() {
-                return Err(Status::invalid_argument("sandbox_id is required"));
-            }
-            self.driver
-                .start_sandbox(&request.sandbox_id)
-                .await
-                .map_err(Status::from)?;
-            Ok(Response::new(StartSandboxResponse {}))
-        })
-        .await
+        self.rpc_tracer
+            .trace(openshell_otel::rpc::START_SANDBOX, async {
+                let request = request.into_inner();
+                if request.sandbox_id.is_empty() {
+                    return Err(Status::invalid_argument("sandbox_id is required"));
+                }
+                self.driver
+                    .start_sandbox(&request.sandbox_id)
+                    .await
+                    .map_err(Status::from)?;
+                Ok(Response::new(StartSandboxResponse {}))
+            })
+            .await
     }
 
     async fn delete_sandbox(
         &self,
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
-        self.trace_rpc("driver.delete_sandbox", "delete_sandbox", async {
-            let request = request.into_inner();
-            if request.sandbox_id.is_empty() {
-                return Err(Status::invalid_argument("sandbox_id is required"));
-            }
-            let deleted = self
-                .driver
-                .delete_sandbox(&request.sandbox_id)
-                .await
-                .map_err(Status::from)?;
-            Ok(Response::new(DeleteSandboxResponse { deleted }))
-        })
-        .await
+        self.rpc_tracer
+            .trace(openshell_otel::rpc::DELETE_SANDBOX, async {
+                let request = request.into_inner();
+                if request.sandbox_id.is_empty() {
+                    return Err(Status::invalid_argument("sandbox_id is required"));
+                }
+                let deleted = self
+                    .driver
+                    .delete_sandbox(&request.sandbox_id)
+                    .await
+                    .map_err(Status::from)?;
+                Ok(Response::new(DeleteSandboxResponse { deleted }))
+            })
+            .await
     }
 
     type WatchSandboxesStream = ComputeDriverWatchStream;
@@ -308,40 +240,32 @@ impl ComputeDriver for ComputeDriverService {
             let stream = stream.map(|item| item.map_err(|err| Status::internal(err.to_string())));
             Ok::<ComputeDriverWatchStream, Status>(Box::pin(stream))
         };
-        let Some(span) = self.in_process_rpc_span("driver.watch_sandboxes", "watch_sandboxes")
-        else {
-            return create_stream.await.map(Response::new);
-        };
-        match create_stream.instrument(span.clone()).await {
-            Ok(stream) => Ok(Response::new(Box::pin(TracedWatchStream::new(
-                stream, span,
-            )))),
-            Err(status) => {
-                openshell_otel::mark_error(&span);
-                span.record("rpc.grpc.status_code", status.code() as i32);
-                Err(status)
-            }
-        }
+        self.rpc_tracer
+            .trace_stream(openshell_otel::rpc::WATCH_SANDBOXES, create_stream)
+            .await
+            .map(Response::new)
     }
 
     async fn ensure_workspace(
         &self,
         _request: Request<EnsureWorkspaceRequest>,
     ) -> Result<Response<EnsureWorkspaceResponse>, Status> {
-        self.trace_rpc("driver.ensure_workspace", "ensure_workspace", async {
-            Ok(Response::new(EnsureWorkspaceResponse {}))
-        })
-        .await
+        self.rpc_tracer
+            .trace(openshell_otel::rpc::ENSURE_WORKSPACE, async {
+                Ok(Response::new(EnsureWorkspaceResponse {}))
+            })
+            .await
     }
 
     async fn delete_workspace(
         &self,
         _request: Request<DeleteWorkspaceRequest>,
     ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
-        self.trace_rpc("driver.delete_workspace", "delete_workspace", async {
-            Ok(Response::new(DeleteWorkspaceResponse {}))
-        })
-        .await
+        self.rpc_tracer
+            .trace(openshell_otel::rpc::DELETE_WORKSPACE, async {
+                Ok(Response::new(DeleteWorkspaceResponse {}))
+            })
+            .await
     }
 }
 
@@ -386,7 +310,7 @@ mod tests {
         ));
         let server = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .layer(crate::otel_tracing::compute_driver_rpc_layer())
+                .layer(openshell_otel::compute_driver_rpc_layer())
                 .add_service(ComputeDriverServer::new(service))
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(listener),
@@ -429,7 +353,7 @@ mod tests {
         use tracing::{Instrument as _, instrument::WithSubscriber as _};
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let _tracing_lock = crate::otel_tracing::test_lock().await;
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
         let gateway_exporter = InMemorySpanExporterBuilder::new().build();
         let gateway_provider = SdkTracerProvider::builder()
             .with_simple_exporter(gateway_exporter.clone())
@@ -439,18 +363,18 @@ mod tests {
             .with_simple_exporter(driver_exporter.clone())
             .build();
         let subscriber = tracing_subscriber::registry()
-            .with(openshell_otel::layer_excluding_target_prefix(
+            .with(openshell_otel::layer_excluding_target_prefixes(
                 &gateway_provider,
                 "gateway-test",
-                Some(crate::otel_tracing::IN_PROCESS_TARGET_PREFIX),
+                crate::otel_tracing::TRACING.in_process_targets(),
             ))
-            .with(crate::otel_tracing::in_process_layer(&driver_provider));
+            .with(crate::otel_tracing::TRACING.in_process_layer(&driver_provider));
         let service = ComputeDriverService::new_in_process(PodmanComputeDriver::for_tests(
             PodmanComputeConfig::default(),
         ));
 
         async {
-            let gateway_span = tracing::info_span!(target: "openshell_server::compute", "driver", otel.name = "driver.get_capabilities", otel.kind = "client");
+            let gateway_span = tracing::info_span!(target: "openshell_server::compute", "driver", otel.name = "openshell.compute.v1.ComputeDriver/GetCapabilities", otel.kind = "client");
             ComputeDriver::get_capabilities(&service, Request::new(GetCapabilitiesRequest {}))
                 .instrument(gateway_span)
                 .await
@@ -465,11 +389,11 @@ mod tests {
         let driver_spans = driver_exporter.get_finished_spans().unwrap();
         let client = gateway_spans
             .iter()
-            .find(|span| span.name == "driver.get_capabilities")
+            .find(|span| span.name == "openshell.compute.v1.ComputeDriver/GetCapabilities")
             .unwrap();
         let server = driver_spans
             .iter()
-            .find(|span| span.name == "driver.get_capabilities")
+            .find(|span| span.name == "openshell.compute.v1.ComputeDriver/GetCapabilities")
             .expect("in-process server span");
         assert_eq!(
             server.span_context.trace_id(),
@@ -478,8 +402,20 @@ mod tests {
         assert_eq!(server.parent_span_id, client.span_context.span_id());
         assert_eq!(server.span_kind, opentelemetry::trace::SpanKind::Server);
         assert!(server.attributes.iter().any(|attribute| {
-            attribute.key.as_str() == "rpc.grpc.status_code"
-                && attribute.value.to_string() == (tonic::Code::Ok as i32).to_string()
+            attribute.key.as_str() == "rpc.method"
+                && attribute.value.to_string()
+                    == "openshell.compute.v1.ComputeDriver/GetCapabilities"
+        }));
+        assert!(
+            server
+                .attributes
+                .iter()
+                .all(|attribute| attribute.key.as_str() != "rpc.service"),
+            "the current RPC semantic conventions integrate the service into rpc.method"
+        );
+        assert!(server.attributes.iter().any(|attribute| {
+            attribute.key.as_str() == "rpc.response.status_code"
+                && attribute.value.to_string() == "OK"
         }));
         gateway_provider.shutdown().unwrap();
         driver_provider.shutdown().unwrap();
@@ -490,13 +426,13 @@ mod tests {
         use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let _tracing_lock = crate::otel_tracing::test_lock().await;
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
         let exporter = InMemorySpanExporterBuilder::new().build();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
         let dispatch = tracing::Dispatch::new(
-            tracing_subscriber::registry().with(crate::otel_tracing::layer(&provider)),
+            tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider)),
         );
         let _dispatch = tracing::dispatcher::set_default(&dispatch);
         let (mut client, shutdown, server) = standalone_traced_client().await;
@@ -523,7 +459,7 @@ mod tests {
         let spans = exporter.get_finished_spans().unwrap();
         let capabilities = spans
             .iter()
-            .filter(|span| span.name == "driver.get_capabilities")
+            .filter(|span| span.name == "openshell.compute.v1.ComputeDriver/GetCapabilities")
             .collect::<Vec<_>>();
         assert_eq!(capabilities.len(), 1, "exactly one RPC span is expected");
         assert_eq!(
@@ -539,21 +475,21 @@ mod tests {
             opentelemetry::trace::SpanKind::Server
         );
         assert!(capabilities[0].attributes.iter().any(|attribute| {
-            attribute.key.as_str() == "rpc.grpc.status_code"
-                && attribute.value.to_string() == (tonic::Code::Ok as i32).to_string()
+            attribute.key.as_str() == "rpc.response.status_code"
+                && attribute.value.to_string() == "OK"
         }));
 
         let failed = spans
             .iter()
-            .find(|span| span.name == "driver.validate_sandbox_create")
+            .find(|span| span.name == "openshell.compute.v1.ComputeDriver/ValidateSandboxCreate")
             .expect("failed RPC span should be exported");
         assert!(matches!(
             failed.status,
             opentelemetry::trace::Status::Error { .. }
         ));
         assert!(failed.attributes.iter().any(|attribute| {
-            attribute.key.as_str() == "rpc.grpc.status_code"
-                && attribute.value.to_string() == (tonic::Code::InvalidArgument as i32).to_string()
+            attribute.key.as_str() == "rpc.response.status_code"
+                && attribute.value.to_string() == "INVALID_ARGUMENT"
         }));
         provider.shutdown().unwrap();
     }
@@ -564,22 +500,22 @@ mod tests {
         use tracing::instrument::WithSubscriber as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let _tracing_lock = crate::otel_tracing::test_lock().await;
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
         let exporter = InMemorySpanExporterBuilder::new().build();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber =
-            tracing_subscriber::registry().with(crate::otel_tracing::in_process_layer(&provider));
+        let subscriber = tracing_subscriber::registry()
+            .with(crate::otel_tracing::TRACING.in_process_layer(&provider));
 
         async {
             let span = tracing::info_span!(
-                target: "openshell_driver_podman::otel_tracing",
+                target: crate::otel_tracing::TRACING.in_process_target(),
                 "driver_rpc",
-                otel.name = "driver.watch_sandboxes",
+                otel.name = "openshell.compute.v1.ComputeDriver/WatchSandboxes",
                 otel.kind = "server",
                 otel.status_code = tracing::field::Empty,
-                rpc.grpc.status_code = tracing::field::Empty,
+                rpc.response.status_code = tracing::field::Empty,
             );
             let inner: ComputeDriverWatchStream = Box::pin(futures::stream::iter([Err(
                 Status::internal("watch failed"),
@@ -605,7 +541,7 @@ mod tests {
         let spans = exporter.get_finished_spans().unwrap();
         let span = spans
             .iter()
-            .find(|span| span.name == "driver.watch_sandboxes")
+            .find(|span| span.name == "openshell.compute.v1.ComputeDriver/WatchSandboxes")
             .expect("watch server span should be exported when the stream ends");
         assert!(matches!(
             span.status,
@@ -620,22 +556,22 @@ mod tests {
         use tracing::instrument::WithSubscriber as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let _tracing_lock = crate::otel_tracing::test_lock().await;
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
         let exporter = InMemorySpanExporterBuilder::new().build();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber =
-            tracing_subscriber::registry().with(crate::otel_tracing::in_process_layer(&provider));
+        let subscriber = tracing_subscriber::registry()
+            .with(crate::otel_tracing::TRACING.in_process_layer(&provider));
 
         async {
             let span = tracing::info_span!(
-                target: "openshell_driver_podman::otel_tracing",
+                target: crate::otel_tracing::TRACING.in_process_target(),
                 "driver_rpc",
-                otel.name = "driver.watch_sandboxes",
+                otel.name = "openshell.compute.v1.ComputeDriver/WatchSandboxes",
                 otel.kind = "server",
                 otel.status_code = tracing::field::Empty,
-                rpc.grpc.status_code = tracing::field::Empty,
+                rpc.response.status_code = tracing::field::Empty,
             );
             let inner: ComputeDriverWatchStream = Box::pin(futures::stream::empty());
             let mut stream = TracedWatchStream::new(inner, span);
@@ -650,12 +586,59 @@ mod tests {
         let spans = exporter.get_finished_spans().unwrap();
         let span = spans
             .iter()
-            .find(|span| span.name == "driver.watch_sandboxes")
+            .find(|span| span.name == "openshell.compute.v1.ComputeDriver/WatchSandboxes")
             .expect("watch server span should be exported when the stream completes");
         assert!(span.attributes.iter().any(|attribute| {
-            attribute.key.as_str() == "rpc.grpc.status_code"
-                && attribute.value.to_string() == (tonic::Code::Ok as i32).to_string()
+            attribute.key.as_str() == "rpc.response.status_code"
+                && attribute.value.to_string() == "OK"
         }));
+        provider.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn in_process_stream_leaves_status_unset_when_dropped() {
+        use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
+        let exporter = InMemorySpanExporterBuilder::new().build();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(crate::otel_tracing::TRACING.in_process_layer(&provider));
+
+        async {
+            let span = tracing::info_span!(
+                target: crate::otel_tracing::TRACING.in_process_target(),
+                "driver_rpc",
+                otel.name = "openshell.compute.v1.ComputeDriver/WatchSandboxes",
+                otel.kind = "server",
+                otel.status_code = tracing::field::Empty,
+                rpc.response.status_code = tracing::field::Empty,
+                error.type = tracing::field::Empty,
+            );
+            let inner: ComputeDriverWatchStream = Box::pin(futures::stream::pending());
+            let stream = TracedWatchStream::new(inner, span);
+
+            drop(stream);
+        }
+        .with_subscriber(subscriber)
+        .await;
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let span = spans
+            .iter()
+            .find(|span| span.name == "openshell.compute.v1.ComputeDriver/WatchSandboxes")
+            .expect("watch server span should be exported when the stream is dropped");
+        assert!(matches!(span.status, opentelemetry::trace::Status::Unset));
+        assert!(
+            span.attributes
+                .iter()
+                .all(|attribute| attribute.key.as_str() != "rpc.response.status_code")
+        );
         provider.shutdown().unwrap();
     }
 

@@ -1,0 +1,32 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Verify copied development artifacts
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ openshell_development_cli_bin }}"
+    - "{{ openshell_development_gateway_bin }}"
+    - "{{ openshell_development_sandbox_archive }}"
+  register: openshell_development_artifacts
+
+- name: Require copied development artifacts
+  ansible.builtin.assert:
+    that: item.stat.exists
+    fail_msg: "missing required development artifact: {{ item.item }}"
+  loop: "{{ openshell_development_artifacts.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Publish development OpenShell installation
+  ansible.builtin.set_fact:
+    openshell_install_source: development
+    openshell_cli_bin: "{{ openshell_development_cli_bin }}"
+    openshell_gateway_bin: "{{ openshell_development_gateway_bin }}"
+    openshell_gateway_service: "{{ openshell_development_gateway_service }}"
+    openshell_gateway_endpoint: "{{ openshell_development_gateway_endpoint }}"
+    openshell_gateway_state_root: "{{ openshell_development_state_root }}"
+    openshell_supervisor_source: archive
+    openshell_supervisor_archive: "{{ openshell_development_sandbox_archive }}"
+    openshell_supervisor_image: "{{ openshell_development_supervisor_image }}"
