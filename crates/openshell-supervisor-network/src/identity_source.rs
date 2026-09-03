@@ -21,6 +21,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
+#[cfg(target_os = "linux")]
 use openshell_binary_identity::ProcfsIdentityResolver as SharedProcfsIdentityResolver;
 use openshell_isolation_interface::contract::{BinaryIdentity, ResolveError};
 
