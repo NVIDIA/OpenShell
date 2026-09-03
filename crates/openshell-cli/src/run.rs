@@ -593,11 +593,11 @@ pub async fn sandbox_create(
 
     let main_terminal = tty_override
         .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
-    let main_command = if command.is_empty() {
-        vec!["/bin/bash".to_string(), "-l".to_string()]
-    } else {
-        command.to_vec()
-    };
+    // Forward the command as-is. When empty, the gateway persists it empty and
+    // the supervisor resolves the default login shell against the sandbox image
+    // (bash when present, otherwise /bin/sh on minimal images like Alpine).
+    // Baking a shell here would force a shell the image may not ship.
+    let main_command = command.to_vec();
     let persist = sandbox_should_persist(keep, forward.as_ref());
     let create_detaches = detach
         || (persist

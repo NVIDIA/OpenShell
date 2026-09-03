@@ -661,42 +661,30 @@ fn main() -> Result<()> {
         // drivers otherwise provide a versioned JSON transport so argument
         // boundaries are never reconstructed with shell parsing.
         let workdir = args.workdir.clone();
-        let (command, interactive, await_main_process_attachment, is_default_command) =
-            if !args.command.is_empty() {
-                (args.command, args.interactive, false, false)
-            } else if let Ok(json) = std::env::var(openshell_core::sandbox_env::MAIN_PROCESS_SPEC) {
-                let config = openshell_core::sandbox_env::MainProcessConfig::decode(&json)
-                    .map_err(|error| miette::miette!("{error}"))?;
-                // The driver bakes the built-in default (`scratch`) into the spec
-                // when the user supplies no command. Detect that case so the
-                // default shell can be resolved against the sandbox image below.
-                let is_default =
-                    config == openshell_core::sandbox_env::MainProcessConfig::scratch();
-                (
-                    config.command,
-                    config.tty,
-                    config.await_main_process_attachment,
-                    is_default,
-                )
-            } else {
-                let config = openshell_core::sandbox_env::MainProcessConfig::scratch();
-                (
-                    config.command,
-                    config.tty,
-                    config.await_main_process_attachment,
-                    true,
-                )
-            };
-
-        // The built-in default command is a login shell (`/bin/bash -l`), but
-        // minimal images (e.g. Alpine) don't ship bash. Only the default is
-        // remapped — an explicit user command is never rewritten. This runs in
-        // the supervisor, so it resolves against the sandbox image's filesystem.
-        let command = if is_default_command {
-            resolve_default_shell_command(command)
+        let (command, interactive, await_main_process_attachment) = if !args.command.is_empty() {
+            (args.command, args.interactive, false)
+        } else if let Ok(json) = std::env::var(openshell_core::sandbox_env::MAIN_PROCESS_SPEC) {
+            let config = openshell_core::sandbox_env::MainProcessConfig::decode(&json)
+                .map_err(|error| miette::miette!("{error}"))?;
+            (
+                config.command,
+                config.tty,
+                config.await_main_process_attachment,
+            )
         } else {
-            command
+            let config = openshell_core::sandbox_env::MainProcessConfig::scratch();
+            (
+                config.command,
+                config.tty,
+                config.await_main_process_attachment,
+            )
         };
+
+        // An omitted command (the gateway leaves the default empty rather than
+        // baking a shell it cannot verify) is resolved to a login shell here, in
+        // the supervisor, so it matches the sandbox image: bash when present,
+        // otherwise /bin/sh (e.g. Alpine). An explicit command is used verbatim.
+        let command = resolve_default_command(command);
 
         info!(command = ?command, "Starting sandbox");
         // Note: "Starting sandbox" stays as plain info!() since the OCSF context
@@ -738,26 +726,18 @@ fn main() -> Result<()> {
     std::process::exit(exit_code);
 }
 
-/// Remap the built-in default shell command to a shell that exists in the
-/// sandbox image. The default program (`/bin/bash`) is absent on minimal images
-/// such as Alpine; falling back to a detected login shell lets the sandbox
-/// start instead of failing with an opaque `No such file or directory`. Only the
-/// built-in default is remapped — explicit user commands never reach this path.
-fn resolve_default_shell_command(mut command: Vec<String>) -> Vec<String> {
-    let Some(program) = command.first().cloned() else {
-        return command;
-    };
-    if openshell_core::shell::is_executable(&program) {
+/// Resolve an omitted canonical command to a login shell that exists in this
+/// sandbox image. Empty means "use the default": the gateway leaves an omitted
+/// command empty rather than persisting a shell it cannot verify, so the
+/// supervisor picks one here against the real sandbox filesystem (bash when
+/// present, otherwise `/bin/sh`). An explicit command is returned unchanged.
+fn resolve_default_command(command: Vec<String>) -> Vec<String> {
+    if !command.is_empty() {
         return command;
     }
     let shell = openshell_core::shell::detect_login_shell();
-    warn!(
-        missing = %program,
-        fallback = %shell,
-        "default shell not found in sandbox image; falling back to a detected shell"
-    );
-    command[0] = shell;
-    command
+    info!(shell = %shell, "no command specified; resolved default login shell");
+    vec![shell, "-l".to_string()]
 }
 
 #[cfg(test)]

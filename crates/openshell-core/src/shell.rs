@@ -74,9 +74,12 @@ pub fn detect_login_shell() -> String {
 mod tests {
     use super::*;
 
+    // These assume a Unix root filesystem (`/bin/sh`, POSIX permission bits) and
+    // are skipped on the Windows workspace lane where openshell-core also builds.
+    #[cfg(unix)]
     #[test]
     fn posix_sh_exists_on_test_host() {
-        // /bin/sh is present on all supported CI hosts (Linux and macOS).
+        // /bin/sh is present on all supported Unix CI hosts (Linux and macOS).
         assert!(is_executable(POSIX_SH));
     }
 
@@ -85,12 +88,14 @@ mod tests {
         assert!(!is_executable("/nonexistent/definitely/not/here"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn non_file_is_not_executable() {
         // A directory is not an executable shell.
         assert!(!is_executable("/"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn detect_returns_an_executable_shell() {
         let shell = detect_login_shell();
