@@ -25,7 +25,7 @@ use tokio::time::sleep;
 use self::executor::{CliExecutionError, CliExecutor, ProcessCli};
 
 pub use plan::{ConformancePlan, HostAction, PlanDiagnostics, PlanRun, WorkloadExpectation};
-pub use scenarios::{SANDBOX_CONTINUITY_SCENARIO, SMOKE_SCENARIO};
+pub use scenarios::{SANDBOX_CONTINUITY_SCENARIO, SANDBOX_LIFECYCLE_SCENARIO, SMOKE_SCENARIO};
 
 pub type ScenarioFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
@@ -115,7 +115,11 @@ fn default_validate_plan_run(plan_run: &PlanRun) -> Result<(), String> {
     Ok(())
 }
 
-const SCENARIOS: &[&dyn Scenario] = &[SMOKE_SCENARIO, SANDBOX_CONTINUITY_SCENARIO];
+const SCENARIOS: &[&dyn Scenario] = &[
+    SMOKE_SCENARIO,
+    SANDBOX_LIFECYCLE_SCENARIO,
+    SANDBOX_CONTINUITY_SCENARIO,
+];
 
 /// Returns every scenario compiled into this distribution.
 pub fn scenarios() -> &'static [&'static dyn Scenario] {
