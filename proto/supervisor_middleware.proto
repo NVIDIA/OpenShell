@@ -143,7 +143,7 @@ message HttpResponseEvent {
 message HttpResponseEventResult {
   oneof result {
     // Result for preflight.
-    HttpResponsePreflightDecision preflight_decision = 1;
+    HttpResponsePreflightResult preflight_result = 1;
     // Result for the next body unit.
     HttpResponseBodyResult body_result = 2;
   }
@@ -183,7 +183,7 @@ message HttpResponsePreflight {
 }
 
 // Selects skip, inspect, or block. Diagnostic fields apply to every action.
-message HttpResponsePreflightDecision {
+message HttpResponsePreflightResult {
   oneof action {
     // Deliver unchanged without invoking on_error.
     HttpResponsePreflightSkip skip = 1;
