@@ -1,5 +1,9 @@
-# Broad ownership — core team reviews everything
-* @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+# Broad ownership — disabled. This rule matched every pull request and
+# requested review from the whole codeowners team plus three individuals,
+# notifying all of them regardless of what the change touched. Reviewers
+# opt in manually until area/topic labeling and per-area maintainer
+# rosters replace it with targeted routing. Do not restore as-is.
+# * @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 
 # Vouch list — maintainers only (bot commits bypass, but manual edits need review)
 .github/VOUCHED.td @NVIDIA/openshell-codeowners
