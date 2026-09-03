@@ -312,9 +312,9 @@ status = "not_run"
 [[capabilities]]
 id = "vm-launch-and-resource-configuration"
 topics = ["vm"]
-origin_main_access_paths = ["[openshell.gateway].{default_image,guest_tls_ca,guest_tls_cert,guest_tls_key} inherited by VM", "[openshell.drivers.vm].{openshell_endpoint,state_dir,driver_dir,default_image,bootstrap_image,krun_log_level,vcpus,mem_mib,overlay_disk_mib,sandbox_uid,sandbox_gid}"]
-schema_v2_access_paths = ["[openshell.drivers.vm].{grpc_endpoint,state_dir,driver_dir,default_image,bootstrap_image,krun_log_level,vcpus,mem_mib,overlay_disk_mib,sandbox_uid,sandbox_gid}", "[openshell.gateway].{guest_tls_ca,guest_tls_cert,guest_tls_key}"]
-behavioral_oracle = "The gateway finds and launches the VM driver from driver_dir, forwards the renamed callback endpoint, and launches a guest with the selected state, images, resources, and identity."
+origin_main_access_paths = ["[openshell.gateway].{default_image,guest_tls_ca,guest_tls_cert,guest_tls_key} inherited by VM", "[openshell.drivers.vm].{grpc_endpoint,state_dir,driver_dir,default_image,bootstrap_image,krun_log_level,vcpus,mem_mib,overlay_disk_mib,sandbox_uid,sandbox_gid}", "standalone openshell-driver-vm --openshell-endpoint / OPENSHELL_GRPC_ENDPOINT"]
+schema_v2_access_paths = ["[openshell.drivers.vm].{grpc_endpoint,state_dir,driver_dir,default_image,bootstrap_image,krun_log_level,vcpus,mem_mib,overlay_disk_mib,sandbox_uid,sandbox_gid}", "[openshell.gateway].{guest_tls_ca,guest_tls_cert,guest_tls_key}", "standalone openshell-driver-vm --grpc-endpoint / OPENSHELL_GRPC_ENDPOINT"]
+behavioral_oracle = "The gateway finds and launches the VM driver from driver_dir, forwards the TOML grpc_endpoint through the schema-appropriate standalone-driver flag, and launches a guest with the selected state, images, resources, and identity."
 required_environment = "Linux libkrun/KVM host, VM driver binary, and OCI image"
 test_lane = "e2e-vm"
 status = "not_run"

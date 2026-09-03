@@ -157,3 +157,23 @@ status = "platform_blocked"
 owner = "OpenShell Kubernetes qualified option matrix"
 lane = "kubernetes-managed-operator-sidecar-proxy-spire-userns-apparmor-kata-gpu"
 blocker = "The disposable core lane executed shared, combined, init-container, runc, and Unconfined values but did not execute the infrastructure-qualified alternatives. Assigned lanes must run paired managed/operator namespace discovery, sidecar network enforcement, authenticated proxy, SPIRE CSI, hostUsers=false, AppArmor RuntimeDefault/Localhost, image-volume, Kata RuntimeClass, and NVIDIA device-plugin GPU probes."
+
+[[result]]
+id = "vm-launch-and-resource-configuration"
+step = 9
+capability = "VM launch, callback, persistent state, images, resources, and guest identity"
+driver = "vm"
+status = "platform_blocked"
+owner = "OpenShell Linux VM CI lane"
+lane = "linux-x86_64-kvm-libkrun"
+blocker = "This host has no prepared VM runtime bundle and no frozen-baseline or candidate openshell-driver-vm executable linked to a runnable libkrun environment. Both source trees passed their deterministic VM library suites, but only a paired KVM/libkrun lane can prove Ready, exec, restart recovery, overlay persistence, resource sizing, callback equivalence, and deletion."
+
+[[result]]
+id = "vm-guest-security-and-spiffe"
+step = 9
+capability = "VM guest token containment, TLS, owner state, proxy credentials, and SPIFFE opt-in"
+driver = "vm"
+status = "platform_blocked"
+owner = "OpenShell Linux VM security CI lane"
+lane = "linux-x86_64-kvm-libkrun-proxy-spiffe"
+blocker = "The guest JWT mode and visibility, private owner-marker and sandbox-state persistence, callback recovery, TLS key permissions, proxy credential containment, and guest-reachable SPIFFE TCP behavior require a booted VM. The assigned lane must add authenticated-proxy and Workload API TCP fixtures to the paired libkrun/KVM run."

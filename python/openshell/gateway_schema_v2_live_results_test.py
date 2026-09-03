@@ -40,6 +40,10 @@ REQUIRED_STEP_8_IDS = {
     "kubernetes-core-option-parity",
     "kubernetes-qualified-option-parity",
 }
+REQUIRED_STEP_9_IDS = {
+    "vm-guest-security-and-spiffe",
+    "vm-launch-and-resource-configuration",
+}
 ALLOWED_STATUSES = {
     "pass",
     "intentional_change",
@@ -165,6 +169,16 @@ def test_step_8_records_kubernetes_option_dispositions() -> None:
     statuses = {result["id"]: result["status"] for result in results}
     assert statuses["kubernetes-core-option-parity"] == "pass"
     assert statuses["kubernetes-qualified-option-parity"] == "platform_blocked"
+
+
+def test_step_9_records_vm_runtime_dispositions() -> None:
+    results = [
+        result for result in load_toml(RESULTS_PATH)["result"] if result["step"] == 9
+    ]
+
+    assert {result["id"] for result in results} == REQUIRED_STEP_9_IDS
+    assert all(result["status"] == "platform_blocked" for result in results)
+    assert all(result["driver"] == "vm" for result in results)
 
 
 def test_platform_blocked_results_name_owner_lane_and_blocker() -> None:

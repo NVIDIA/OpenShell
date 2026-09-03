@@ -72,9 +72,9 @@ validation_capability_ids = ["podman-runtime-security-and-health"]
 [[intentional_changes]]
 id = "vm-grpc-endpoint-rename"
 category = "rename"
-origin_main_contract = "The VM driver callback override is named openshell_endpoint."
-schema_v2_contract = "The VM driver callback override is named grpc_endpoint."
-migration = "Rename [openshell.drivers.vm].openshell_endpoint and the standalone flag to grpc_endpoint and --grpc-endpoint."
+origin_main_contract = "The VM gateway TOML callback override is grpc_endpoint, while the spawned standalone driver uses the internal field openshell_endpoint and flag --openshell-endpoint; OPENSHELL_GRPC_ENDPOINT is the environment override."
+schema_v2_contract = "The VM gateway TOML callback override remains grpc_endpoint, and the spawned standalone driver now uses the same internal field name plus --grpc-endpoint; OPENSHELL_GRPC_ENDPOINT is unchanged."
+migration = "No gateway TOML key changes. Operators invoking openshell-driver-vm directly must replace --openshell-endpoint with --grpc-endpoint."
 rationale = "All compute drivers use the same name for the gateway gRPC callback endpoint."
 parity_disposition = "intentional_change"
 validation_capability_ids = ["vm-launch-and-resource-configuration", "external-compute-driver-socket"]
