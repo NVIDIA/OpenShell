@@ -1,0 +1,18 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Connect Docker Snap interface
+  become: true
+  ansible.builtin.command:
+    cmd: snap connect openshell:docker docker:docker-daemon
+
+- name: Connect log-observe interface
+  become: true
+  ansible.builtin.command:
+    cmd: snap connect openshell:log-observe
+
+- name: Connect system-observe interface
+  become: true
+  ansible.builtin.command:
+    cmd: snap connect openshell:system-observe
