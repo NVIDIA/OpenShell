@@ -12,6 +12,7 @@ import subprocess
 from unittest.mock import patch
 
 from sdk_sync import (
+    _run_cmd,
     generate_issue_body,
     manage_issue,
 )
@@ -127,6 +128,46 @@ class TestGenerateIssueBody:
 
 
 class TestManageIssue:
+    @patch("sdk_sync.subprocess.run")
+    def test_command_timeout_uses_default_and_becomes_runtime_error(self, mock_run):
+        mock_run.side_effect = subprocess.TimeoutExpired(["gh", "issue", "list"], 60)
+
+        try:
+            _run_cmd(["gh", "issue", "list"])
+            raise AssertionError("expected timeout error")
+        except RuntimeError as error:
+            assert str(error) == ("Command timed out after 60 seconds: gh issue list")
+        assert mock_run.call_args.kwargs["timeout"] == 60
+
+    @patch("sdk_sync._ensure_label")
+    def test_command_timeout_returns_structured_error(self, mock_label):
+        mock_label.side_effect = RuntimeError(
+            "Command timed out after 60 seconds: gh label view"
+        )
+
+        drift = {"sdk": "go", "synced": False, "files": [], "summary": "drifted"}
+        result = manage_issue(drift, None, "go", "org/repo", "sdk:go:sync")
+
+        assert result["action"] == "error"
+        assert "timed out after 60 seconds" in result["reason"]
+
+    @patch("sdk_sync._find_open_issue")
+    @patch("sdk_sync._ensure_label")
+    def test_label_creation_failure_stops_issue_management(self, mock_label, mock_find):
+        mock_label.side_effect = RuntimeError(
+            "Failed to create label 'sdk:go:sync': permission denied"
+        )
+
+        drift = {"sdk": "go", "synced": False, "files": [], "summary": "drifted"}
+        result = manage_issue(drift, None, "go", "org/repo", "sdk:go:sync")
+
+        assert result == {
+            "issue_url": "",
+            "action": "error",
+            "reason": "Failed to create label 'sdk:go:sync': permission denied",
+        }
+        mock_find.assert_not_called()
+
     @patch("sdk_sync._find_open_issue")
     @patch("sdk_sync._ensure_label")
     @patch("sdk_sync._run_cmd")

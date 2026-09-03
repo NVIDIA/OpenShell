@@ -87,13 +87,17 @@ fi
 LOG_FILE=$(mktemp)
 trap 'rm -f "$LOG_FILE"' EXIT
 
-if mise run sdk:ts:proto > "$LOG_FILE" 2>&1 && mise run sdk:ts:typecheck >> "$LOG_FILE" 2>&1; then
-  jq -n -c '{sdk:"typescript", synced:true, files:[], summary:"all files synced"}'
-  exit 0
-else
+if ! mise run sdk:ts:proto > "$LOG_FILE" 2>&1; then
+  jq -n -c '{sdk:"typescript", synced:false, files:[], summary:"proto generation failed"}'
+  exit 1
+fi
+
+if ! mise run sdk:ts:typecheck >> "$LOG_FILE" 2>&1; then
   jq -n -c '{sdk:"typescript", synced:false, files:[], summary:"typecheck failed after proto regeneration"}'
   exit 1
 fi
+
+jq -n -c '{sdk:"typescript", synced:true, files:[], summary:"all files synced"}'
 """
 hide = true
 

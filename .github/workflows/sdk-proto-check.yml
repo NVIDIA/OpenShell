@@ -26,22 +26,29 @@ jobs:
   pr_metadata:
     name: Resolve PR metadata
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
       pull-requests: read
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
+      matrix: ${{ steps.config.outputs.matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - id: gate
         uses: ./.github/actions/pr-gate
 
+      - id: config
+        name: Load SDK configuration
+        run: echo "matrix=$(jq -c '.include' tasks/sdk-sync-config.json)" >> "$GITHUB_OUTPUT"
+
   sdk_proto_drift:
     name: Proto Drift (${{ matrix.sdk.name }})
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 15
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -50,11 +57,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sdk:
-          - name: go
-            drift_task: "go:proto:drift"
-          - name: typescript
-            drift_task: "sdk:ts:proto:drift"
+        sdk: ${{ fromJSON(needs.pr_metadata.outputs.matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -66,12 +69,13 @@ jobs:
         run: |
           REPORT=$(mise run ${{ matrix.sdk.drift_task }} 2>"$RUNNER_TEMP/drift_stderr.log") || true
 
-          if echo "$REPORT" | jq -e '.synced' >/dev/null 2>&1; then
+          if echo "$REPORT" | jq -e 'has("synced") and (.synced | type == "boolean")' >/dev/null 2>&1; then
             SYNCED=$(echo "$REPORT" | jq -r '.synced')
+            DELIMITER="REPORT_EOF_$(openssl rand -hex 16)"
             {
-              echo "report<<REPORT_EOF"
+              echo "report<<$DELIMITER"
               echo "$REPORT"
-              echo "REPORT_EOF"
+              echo "$DELIMITER"
             } >> "$GITHUB_OUTPUT"
             echo "synced=$SYNCED" >> "$GITHUB_OUTPUT"
           else
