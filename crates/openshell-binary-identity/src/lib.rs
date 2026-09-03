@@ -84,23 +84,24 @@ fn resolve_linux_process(
     pid: u32,
     ancestor_root: Option<u32>,
 ) -> Result<BinaryIdentity, ResolveError> {
-    let binary_path = executable_path(pid)?;
-    let binary_digest = Some(hash_live_executable(pid)?);
-    let ancestor_processes = collect_ancestor_processes(pid, ancestor_root);
+    let (snapshot, mut executable) = open_process_snapshot(pid)?;
+    let binary_path = snapshot.binary_path.clone();
+    let binary_digest = Some(hash_executable(pid, &mut executable)?);
+    let ancestor_processes = collect_ancestor_processes(&snapshot, ancestor_root);
     let ancestors = ancestor_processes
         .iter()
-        .filter_map(|(_, path)| path.clone())
+        .map(|snapshot| snapshot.binary_path.clone())
         .collect::<Vec<_>>();
 
     let mut excluded_paths = ancestors.clone();
     excluded_paths.push(binary_path.clone());
-    let cmdline_paths = std::iter::once(pid)
+    let cmdline_paths = cmdline_absolute_paths(&snapshot.cmdline)
+        .into_iter()
         .chain(
             ancestor_processes
                 .iter()
-                .map(|(ancestor_pid, _)| *ancestor_pid),
+                .flat_map(|snapshot| cmdline_absolute_paths(&snapshot.cmdline)),
         )
-        .flat_map(cmdline_absolute_paths)
         .filter(|path| !excluded_paths.contains(path))
         .fold(Vec::new(), |mut paths, path| {
             if !paths.contains(&path) {
@@ -109,12 +110,110 @@ fn resolve_linux_process(
             paths
         });
 
+    validate_process_snapshot(pid, &snapshot)?;
+    for ancestor in &ancestor_processes {
+        validate_process_snapshot(ancestor.pid, ancestor)?;
+    }
+
     Ok(BinaryIdentity {
         binary_path,
         binary_digest,
         ancestors,
         cmdline_paths,
     })
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+struct ProcessSnapshot {
+    pid: u32,
+    parent_pid: u32,
+    binary_path: std::path::PathBuf,
+    executable_device: u64,
+    executable_inode: u64,
+    start_time: u64,
+    cmdline: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+fn open_process_snapshot(pid: u32) -> Result<(ProcessSnapshot, std::fs::File), ResolveError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let path = format!("/proc/{pid}/exe");
+    let binary_path = executable_path(pid)?;
+    let executable = std::fs::File::open(&path)
+        .map_err(|error| ResolveError::Failed(format!("open {path}: {error}")))?;
+    let metadata = executable
+        .metadata()
+        .map_err(|error| ResolveError::Failed(format!("stat {path}: {error}")))?;
+    let (parent_pid, start_time) = process_stat(pid)?;
+    let snapshot = ProcessSnapshot {
+        pid,
+        parent_pid,
+        binary_path,
+        executable_device: metadata.dev(),
+        executable_inode: metadata.ino(),
+        start_time,
+        cmdline: read_process_cmdline(pid)?,
+    };
+    validate_process_snapshot(pid, &snapshot)?;
+    Ok((snapshot, executable))
+}
+
+#[cfg(target_os = "linux")]
+fn validate_process_snapshot(pid: u32, expected: &ProcessSnapshot) -> Result<(), ResolveError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let path = format!("/proc/{pid}/exe");
+    let metadata = std::fs::metadata(&path)
+        .map_err(|error| ResolveError::Failed(format!("stat {path}: {error}")))?;
+    let (parent_pid, start_time) = process_stat(pid)?;
+    let current = ProcessSnapshot {
+        pid,
+        parent_pid,
+        binary_path: executable_path(pid)?,
+        executable_device: metadata.dev(),
+        executable_inode: metadata.ino(),
+        start_time,
+        cmdline: read_process_cmdline(pid)?,
+    };
+    if &current == expected {
+        Ok(())
+    } else {
+        Err(ResolveError::Failed(format!(
+            "process {pid} changed while its executable identity was collected"
+        )))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_stat(pid: u32) -> Result<(u32, u64), ResolveError> {
+    let path = format!("/proc/{pid}/stat");
+    let stat = std::fs::read_to_string(&path)
+        .map_err(|error| ResolveError::Failed(format!("read {path}: {error}")))?;
+    let fields = stat
+        .rsplit_once(") ")
+        .map(|(_, fields)| fields)
+        .ok_or_else(|| ResolveError::Failed(format!("parse {path}: missing command field")))?;
+    let mut fields = fields.split_whitespace();
+    let _state = fields.next();
+    let parent_pid = fields
+        .next()
+        .ok_or_else(|| ResolveError::Failed(format!("parse {path}: missing parent PID")))?
+        .parse()
+        .map_err(|error| ResolveError::Failed(format!("parse {path} parent PID: {error}")))?;
+    let start_time = fields
+        .nth(17)
+        .ok_or_else(|| ResolveError::Failed(format!("parse {path}: missing start time")))?
+        .parse()
+        .map_err(|error| ResolveError::Failed(format!("parse {path} start time: {error}")))?;
+    Ok((parent_pid, start_time))
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_cmdline(pid: u32) -> Result<Vec<u8>, ResolveError> {
+    let path = format!("/proc/{pid}/cmdline");
+    std::fs::read(&path).map_err(|error| ResolveError::Failed(format!("read {path}: {error}")))
 }
 
 #[cfg(target_os = "linux")]
@@ -141,13 +240,11 @@ fn executable_path(pid: u32) -> Result<std::path::PathBuf, ResolveError> {
 }
 
 #[cfg(target_os = "linux")]
-fn hash_live_executable(pid: u32) -> Result<Sha256Digest, ResolveError> {
+fn hash_executable(pid: u32, executable: &mut std::fs::File) -> Result<Sha256Digest, ResolveError> {
     use sha2::{Digest as _, Sha256};
     use std::io::Read as _;
 
     let path = format!("/proc/{pid}/exe");
-    let mut executable = std::fs::File::open(&path)
-        .map_err(|error| ResolveError::Failed(format!("open {path}: {error}")))?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 8 * 1024];
     loop {
@@ -164,22 +261,25 @@ fn hash_live_executable(pid: u32) -> Result<Sha256Digest, ResolveError> {
 
 #[cfg(target_os = "linux")]
 fn collect_ancestor_processes(
-    pid: u32,
+    process: &ProcessSnapshot,
     ancestor_root: Option<u32>,
-) -> Vec<(u32, Option<std::path::PathBuf>)> {
+) -> Vec<ProcessSnapshot> {
     const MAX_DEPTH: usize = 64;
 
-    if ancestor_root == Some(pid) {
+    if ancestor_root == Some(process.pid) {
         return Vec::new();
     }
 
     let mut ancestors = Vec::new();
-    let mut current = pid;
+    let mut parent = process.parent_pid;
     for _ in 0..MAX_DEPTH {
-        let Some(parent) = parent_pid(current).filter(|parent| *parent > 0 && *parent != current)
-        else {
+        if parent == 0
+            || ancestors
+                .iter()
+                .any(|current: &ProcessSnapshot| current.pid == parent)
+        {
             break;
-        };
+        }
 
         // PID 1 is host or guest init rather than workload ancestry unless it
         // is the explicitly supplied process-tree root.
@@ -187,11 +287,15 @@ fn collect_ancestor_processes(
             break;
         }
 
-        ancestors.push((parent, executable_path(parent).ok()));
+        let Ok((snapshot, _executable)) = open_process_snapshot(parent) else {
+            break;
+        };
+        let next_parent = snapshot.parent_pid;
+        ancestors.push(snapshot);
         if ancestor_root == Some(parent) || parent == 1 {
             break;
         }
-        current = parent;
+        parent = next_parent;
     }
     ancestors
 }
@@ -236,9 +340,8 @@ fn namespace_pid(pid: u32) -> Option<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn cmdline_absolute_paths(pid: u32) -> Vec<std::path::PathBuf> {
-    std::fs::read(format!("/proc/{pid}/cmdline"))
-        .unwrap_or_default()
+fn cmdline_absolute_paths(cmdline: &[u8]) -> Vec<std::path::PathBuf> {
+    cmdline
         .split(|byte| *byte == 0)
         .filter(|argument| argument.first() == Some(&b'/'))
         .map(|argument| std::path::PathBuf::from(String::from_utf8_lossy(argument).into_owned()))
