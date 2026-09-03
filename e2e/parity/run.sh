@@ -14,6 +14,7 @@ DRIVER=""
 BASELINE_WORKTREE="${OPENSHELL_PARITY_BASELINE_WORKTREE:-}"
 RESULTS_DIR="${OPENSHELL_PARITY_RESULTS_DIR:-}"
 WRAPPER="${OPENSHELL_PARITY_PODMAN_WRAPPER:-${ROOT}/e2e/with-podman-gateway.sh}"
+PODMAN_BIN="${OPENSHELL_PARITY_PODMAN_BIN:-podman}"
 TEMP_WORKTREE=""
 RUN_DIR=""
 
@@ -75,7 +76,15 @@ cleanup() {
     git -C "${ROOT}" worktree remove --force "${TEMP_WORKTREE}" >/dev/null 2>&1 || true
   fi
   if [ -n "${RUN_DIR}" ]; then
-    rm -rf "${RUN_DIR}" || true
+    # Rootless Podman overlay files can be owned by subordinate UIDs. Remove an
+    # isolated container store from Podman's user namespace before falling back
+    # to ordinary cleanup for runs that never reached the container runtime.
+    if { [ -d "${RUN_DIR}/baseline/data/containers/storage" ] \
+      || [ -d "${RUN_DIR}/candidate/data/containers/storage" ]; } \
+      && command -v "${PODMAN_BIN}" >/dev/null 2>&1; then
+      "${PODMAN_BIN}" unshare rm -rf -- "${RUN_DIR}" >/dev/null 2>&1 || true
+    fi
+    rm -rf "${RUN_DIR}" >/dev/null 2>&1 || true
   fi
   exit "${status}"
 }
@@ -182,6 +191,7 @@ run_variant() {
     OPENSHELL_GATEWAY_BIN="${gateway}" \
     OPENSHELL_BIN="${cli}" \
     OPENSHELL_CONFORMANCE_BIN="${conformance}" \
+    MISE_TRUSTED_CONFIG_PATHS="${MISE_TRUSTED_CONFIG_PATHS:-${ROOT}}" \
     XDG_CONFIG_HOME="${variant_home}/config" \
     XDG_STATE_HOME="${variant_home}/state" \
     XDG_CACHE_HOME="${variant_home}/cache" \
