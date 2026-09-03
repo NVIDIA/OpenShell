@@ -38,9 +38,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{
     AsyncRead as TokioAsyncRead, AsyncReadExt, AsyncWrite as TokioAsyncWrite, AsyncWriteExt,
 };
-use tokio::net::TcpListener;
-#[cfg(any(target_os = "linux", test))]
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
