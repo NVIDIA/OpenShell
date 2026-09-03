@@ -131,3 +131,29 @@ status = "platform_blocked"
 owner = "OpenShell Podman security matrix"
 lane = "linux-podman-apparmor-proxy-spiffe-rootful-userns"
 blocker = "The available daemon is rootless and reports AppArmor disabled, and this local run has no authenticated proxy or SPIFFE Workload API fixture. A qualifying rootful matrix must validate those environment-dependent options live; deterministic driver tests remain coverage, not parity evidence."
+
+[[result]]
+id = "kubernetes-core-option-parity"
+step = 8
+capability = "Kubernetes shared workspace, images, placement, bootstrap, security projection, resources, and combined supervisor options"
+driver = "kubernetes"
+status = "pass"
+validated_baseline_commit = "74960ebfaeec4673885089ed995fad902459749f"
+validated_candidate_commit = "0f08b5822e4da98c9ced3d4b0f2bf4f30dae28fd"
+lane = "kind-v1.36.1-rootless-podman-host-gateway"
+evidence = [
+  "Fresh candidate gateway and CLI binaries were built from the recorded candidate commit and bound by SHA-256, with the frozen baseline binary, in the retained artifact manifest.",
+  "Both host gateway variants used isolated schema-v1/schema-v2 files, SQLite stores, JWT keys, ports, namespaces, ServiceAccounts, Secrets, and resource names against a guarded disposable kind cluster.",
+  "Both variants reached Ready through authenticated callback, completed exact-marker exec, and produced matching Sandbox, Pod, and PVC semantics for images and pull policies, pull Secret, ServiceAccount, TLS and token projections, host aliases, SSH endpoint, runc placement, AppArmor request, UID/GID, CPU/memory, shared storage, managed metadata, and deletion.",
+  "comparison.json recorded baseline_success=true, candidate_success=true, parity=true, classification=pass, and accepted=true; private keys and all per-run Kubernetes fixtures were removed.",
+]
+
+[[result]]
+id = "kubernetes-qualified-option-parity"
+step = 8
+capability = "Kubernetes managed/operator workspaces, sidecar enforcement, proxy, SPIFFE, user namespaces, AppArmor enforcement, confidential runtimes, and GPUs"
+driver = "kubernetes"
+status = "platform_blocked"
+owner = "OpenShell Kubernetes qualified option matrix"
+lane = "kubernetes-managed-operator-sidecar-proxy-spire-userns-apparmor-kata-gpu"
+blocker = "The disposable core lane executed shared, combined, init-container, runc, and Unconfined values but did not execute the infrastructure-qualified alternatives. Assigned lanes must run paired managed/operator namespace discovery, sidecar network enforcement, authenticated proxy, SPIRE CSI, hostUsers=false, AppArmor RuntimeDefault/Localhost, image-volume, Kata RuntimeClass, and NVIDIA device-plugin GPU probes."

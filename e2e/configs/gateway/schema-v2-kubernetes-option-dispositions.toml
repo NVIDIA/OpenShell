@@ -1,0 +1,152 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Step 8 records field-level Kubernetes evidence separately from the broader
+# capability manifest. A core pass means both frozen schema v1 and schema v2
+# successfully produced and executed the same observed Kubernetes resources.
+# A platform-blocked field or value still requires its assigned qualifying lane.
+manifest_version = 1
+baseline_commit = "74960ebfaeec4673885089ed995fad902459749f"
+validated_candidate_commit = "0f08b5822e4da98c9ced3d4b0f2bf4f30dae28fd"
+core_comparison = "e2e/configs/gateway/schema-v2-kubernetes-core-comparison.json"
+
+[[coverage]]
+id = "shared-combined-core"
+status = "pass"
+lane = "kind-v1.36.1-rootless-podman-host-gateway"
+fields = [
+  "namespace",
+  "default_image",
+  "image_pull_policy",
+  "image_pull_secrets",
+  "service_account_name",
+  "supervisor_image",
+  "supervisor_image_pull_policy",
+  "grpc_endpoint",
+  "ssh_socket_path",
+  "client_tls_secret_name",
+  "host_gateway_ip",
+  "sa_token_ttl_secs",
+  "workspace_mode",
+  "gateway_id",
+  "workspace_default_storage_size",
+  "workspace_storage_class",
+  "default_runtime_class_name",
+  "supervisor_sideload_method",
+  "topology",
+  "app_armor_profile",
+  "sandbox_uid",
+  "sandbox_gid",
+]
+evidence = [
+  "Both variants reached Ready through ServiceAccount-token exchange and gateway-minted JWT authentication, then completed callback exec.",
+  "The API oracle matched images, Kubernetes pull-policy spelling, pull Secret, ServiceAccount, callback and SSH environment, client TLS mount, host aliases, 600-second token projection, runc RuntimeClass, Unconfined AppArmor request, UID/GID environment, CPU/memory, managed metadata, Bound 64Mi standard PVC, and deletion.",
+  "The normalized baseline and candidate results are byte-identical; comparison.json records both successes, parity=true, classification=pass, and accepted=true.",
+]
+
+[[coverage]]
+id = "operator-namespace-discovery"
+status = "platform_blocked"
+owner = "OpenShell Kubernetes workspace-mode CI"
+lane = "managed-and-operator-workspace-matrix"
+fields = ["operator_namespace_label", "operator_namespace_file"]
+requirement = "Run paired managed and operator workspace lifecycles with isolated namespace RBAC, label discovery, allowlist hot reload, positive placement, and negative rejection probes."
+
+[[coverage]]
+id = "managed-ssh-ingress"
+status = "platform_blocked"
+owner = "OpenShell Kubernetes network-policy CI"
+lane = "managed-workspace-network-policy"
+fields = [
+  "managed_ssh_ingress.enabled",
+  "managed_ssh_ingress.gateway_namespace",
+  "managed_ssh_ingress.gateway_pod_selector",
+]
+requirement = "Run paired managed-workspace creation and inspect the generated NetworkPolicy while proving the configured gateway selector can connect and a nonmatching pod cannot."
+
+[[coverage]]
+id = "sidecar-topology"
+status = "platform_blocked"
+owner = "OpenShell Kubernetes sidecar CI"
+lane = "kubernetes-sidecar-network-enforcement"
+fields = ["sidecar.proxy_uid", "sidecar.process_binary_aware_network_policy"]
+requirement = "Run paired sidecar topology with relaxed and process-aware policy profiles and verify pod security context, proxy UID, network init, and enforcement behavior."
+
+[[coverage]]
+id = "authenticated-upstream-proxy"
+status = "platform_blocked"
+owner = "OpenShell Kubernetes proxy CI"
+lane = "kubernetes-authenticated-connect-proxy"
+fields = [
+  "https_proxy",
+  "no_proxy",
+  "proxy_auth_secret_name",
+  "proxy_auth_secret_key",
+  "proxy_auth_allow_insecure",
+  "proxy_connect_by_hostname",
+]
+requirement = "Provide an authenticated HTTP CONNECT proxy and Secret, then run paired allow, deny, no-proxy, credential, insecure-opt-in, and hostname-resolution probes."
+
+[[coverage]]
+id = "spiffe-workload-api"
+status = "platform_blocked"
+owner = "OpenShell SPIRE Kubernetes CI"
+lane = "kubernetes-spire-csi"
+fields = ["provider_spiffe_workload_api_socket_path"]
+requirement = "Provide SPIRE and its CSI driver, then run paired gateway and sandbox JWT-SVID acquisition from the allowed Workload API socket path and reject a disallowed path."
+
+[[coverage]]
+id = "user-namespace-isolation"
+status = "platform_blocked"
+owner = "OpenShell Kubernetes userns CI"
+lane = "kubernetes-userns-supported-runtime"
+fields = ["enable_user_namespaces"]
+requirement = "Run paired hostUsers=false lifecycle and host-ID mapping probes on a node whose kernel, kubelet, and runtime support Kubernetes user namespaces."
+
+[[qualified_value]]
+id = "managed-and-operator-workspace-values"
+field = "workspace_mode"
+status = "platform_blocked"
+owner = "OpenShell Kubernetes workspace-mode CI"
+lane = "managed-and-operator-workspace-matrix"
+requirement = "The local core pass exercised shared mode; managed namespace creation and operator placement/rejection remain assigned live checks."
+
+[[qualified_value]]
+id = "image-volume-sideload"
+field = "supervisor_sideload_method"
+status = "platform_blocked"
+owner = "OpenShell Kubernetes version matrix"
+lane = "kubernetes-image-volume"
+requirement = "The local core pass exercised init-container; run paired image-volume lifecycle on a cluster with the ImageVolume feature enabled."
+
+[[qualified_value]]
+id = "sidecar-topology-value"
+field = "topology"
+status = "platform_blocked"
+owner = "OpenShell Kubernetes sidecar CI"
+lane = "kubernetes-sidecar-network-enforcement"
+requirement = "The local core pass exercised combined topology; sidecar requires its enforcement fixture and positive/negative network probes."
+
+[[qualified_value]]
+id = "apparmor-enforcement"
+field = "app_armor_profile"
+status = "platform_blocked"
+owner = "OpenShell Kubernetes AppArmor CI"
+lane = "kubernetes-apparmor-runtime-default-localhost"
+requirement = "The local core pass proved Unconfined API projection; an AppArmor-enabled node with an installed localhost profile must prove RuntimeDefault and Localhost enforcement."
+
+[[qualified_value]]
+id = "runtime-class-isolation"
+field = "default_runtime_class_name"
+status = "platform_blocked"
+owner = "OpenShell Kubernetes confidential-runtime CI"
+lane = "kubernetes-kata-runtimeclass"
+requirement = "The local core pass proved runc RuntimeClass placement; a configured Kata or equivalent runtime must prove isolation-specific lifecycle behavior."
+
+[[qualified_value]]
+id = "gpu-resource-combinations"
+field = "create-request.resources.gpu"
+status = "platform_blocked"
+owner = "OpenShell Kubernetes GPU CI"
+lane = "kubernetes-nvidia-device-plugin"
+requirement = "Provide NVIDIA GPU nodes and the device plugin, then run paired GPU count/resource-name combinations and verify scheduling, limits, execution, and cleanup."
