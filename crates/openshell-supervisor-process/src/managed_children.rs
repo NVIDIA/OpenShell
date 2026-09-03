@@ -206,7 +206,7 @@ mod tests {
     use super::{ManagedChild, reap_if_unmanaged};
     use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
     use nix::unistd::Pid;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use std::sync::mpsc;
     use std::time::Duration;
     use tokio::process::Command as TokioCommand;
@@ -325,11 +325,16 @@ mod tests {
     #[tokio::test]
     async fn tokio_try_wait_retains_then_releases_management() {
         let mut child = ManagedChild::spawn(
-            || TokioCommand::new("sh").args(["-c", "sleep 0.2"]).spawn(),
+            || {
+                let mut command = TokioCommand::new("sh");
+                command.args(["-c", "read -r _"]).stdin(Stdio::piped());
+                command.spawn()
+            },
             |child| child.id(),
         )
         .expect("spawn managed Tokio child");
         let pid = i32::try_from(child.id().unwrap()).unwrap();
+        let stdin = child.take_stdin().expect("stdin must be piped");
 
         assert!(child.try_wait().expect("observe Tokio child").is_none());
         assert_eq!(
@@ -338,6 +343,7 @@ mod tests {
             "a running child must remain managed"
         );
 
+        drop(stdin);
         child.wait().await.expect("wait for Tokio child");
         assert_eq!(
             reap_if_unmanaged(pid, || "reaped"),
