@@ -340,8 +340,15 @@ struct SecretMount {
 struct ResourceLimits {
     cpu: CpuLimits,
     memory: MemoryLimits,
-    #[serde(rename = "PidsLimit", skip_serializing_if = "Option::is_none")]
-    pids_limit: Option<i64>,
+    // Podman's libpod API consumes the OCI LinuxResources shape. A Docker-style
+    // scalar PidsLimit is silently ignored and leaves the runtime default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pids: Option<PidsLimits>,
+}
+
+#[derive(Serialize)]
+struct PidsLimits {
+    limit: i64,
 }
 
 #[derive(Serialize)]
@@ -658,7 +665,9 @@ fn build_resource_limits(sandbox: &DriverSandbox, config: &PodmanComputeConfig) 
             period: DEFAULT_CPU_PERIOD,
         },
         memory: MemoryLimits { limit: mem_bytes },
-        pids_limit: config.sandbox_pids_limit.map(std::num::NonZeroI64::get),
+        pids: config
+            .sandbox_pids_limit
+            .map(|limit| PidsLimits { limit: limit.get() }),
     }
 }
 
@@ -1555,7 +1564,7 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_applies_cpu_and_memory_limits() {
+    fn container_spec_applies_resource_limits() {
         use openshell_core::proto::compute::v1::{
             DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
         };
@@ -1584,7 +1593,10 @@ mod tests {
             spec["resource_limits"]["memory"]["limit"].as_u64(),
             Some(2 * 1024 * 1024 * 1024)
         );
-        assert_eq!(spec["resource_limits"]["PidsLimit"].as_i64(), Some(2048));
+        assert_eq!(
+            spec["resource_limits"]["pids"]["limit"].as_i64(),
+            Some(2048)
+        );
     }
 
     #[test]
@@ -1594,7 +1606,7 @@ mod tests {
         config.sandbox_pids_limit = None;
         let spec = build_container_spec(&sandbox, &config);
 
-        assert!(spec["resource_limits"].get("PidsLimit").is_none());
+        assert!(spec["resource_limits"].get("pids").is_none());
     }
 
     #[test]

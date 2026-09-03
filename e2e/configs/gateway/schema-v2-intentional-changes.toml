@@ -110,6 +110,16 @@ parity_disposition = "intentional_change"
 validation_capability_ids = ["docker-security-and-provider-configuration", "podman-runtime-security-and-health"]
 
 [[intentional_changes]]
+id = "podman-pid-limit-restored"
+category = "bug_fix"
+origin_main_contract = "Podman accepts a positive sandbox_pids_limit, but serializes it with Docker's PidsLimit shape; libpod ignores that field and applies its default limit of 2048."
+schema_v2_contract = "Podman serializes a positive sandbox_pids_limit as OCI resource_limits.pids.limit, and the configured value is applied to the container."
+migration = "No configuration migration is required; existing positive values begin taking effect after upgrading."
+rationale = "Schema-v2 live validation exposed that the frozen baseline accepted this security control without enforcing it at runtime. Preserving that defect would make configuration parity unsafe."
+parity_disposition = "intentional_change"
+validation_capability_ids = ["podman-runtime-security-and-health"]
+
+[[intentional_changes]]
 id = "podman-health-zero-sentinel-removed"
 category = "sentinel_removal"
 origin_main_contract = "Podman health_check_interval_secs = 0 disables health checks."
