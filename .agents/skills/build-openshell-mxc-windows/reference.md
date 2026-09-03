@@ -9,7 +9,7 @@ maintaining the existing build-only Windows MSVC lane.
 |---|---|
 | `tasks/windows.toml` | Mise task definitions for `windows:*`. |
 | `tasks/scripts/windows-msvc.ps1` | Visual Studio environment discovery, rustup target setup, Cargo invocation, logs, artifact report. |
-| `.github/workflows/windows-msvc.yml` | PR/merge-queue lint for the Windows-supported workspace and e2e crates plus x64 tests; main/manual runs seed the same caches before x64 binary builds. ARM64 remains local-only until it gets a native workflow. |
+| `.github/workflows/windows-msvc.yml` | PR/merge-queue lint and test plus main/manual cache seeding and dependent binary builds on native x64 and ARM64 runners. |
 | `architecture/windows-msvc-build.md` | Human-readable design contract. |
 
 ## Commands

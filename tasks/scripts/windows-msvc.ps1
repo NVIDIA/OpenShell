@@ -648,7 +648,7 @@ switch ($Action) {
         foreach ($rustTarget in $targets) {
             Invoke-Build $rustTarget
         }
-        Invoke-Test "x86_64-pc-windows-msvc"
+        Invoke-PreCommitTest "x86_64-pc-windows-msvc"
         Invoke-UnsupportedContractTests "x86_64-pc-windows-msvc"
         Show-Artifacts $targets
     }
