@@ -10,22 +10,24 @@ on:
         required: true
         type: string
       upload-channel:
-        required: true
+        required: false
         type: string
+        default: ""
         description: "Snap Store channel to upload to (e.g., latest/edge, latest/candidate, latest/stable)"
       github-environment:
-        required: true
+        required: false
         type: string
+        default: ""
         description: "GitHub deployment environment for approval gates (e.g., latest/edge, latest/stable)"
       publish:
         required: false
         type: boolean
-        default: true
+        default: false
         description: "Whether to upload the built snap to the Snap Store"
 
     secrets:
       publish-credentials:
-        required: true
+        required: false
         description: "Snap Store credentials (SNAPCRAFT_STORE_CREDENTIALS)"
 
 permissions:
@@ -49,7 +51,7 @@ jobs:
             runner: linux-arm64-cpu8
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
-    environment: ${{ inputs.github-environment }}
+    environment: ${{ inputs.publish && inputs.github-environment || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
