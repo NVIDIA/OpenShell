@@ -211,11 +211,27 @@ message HttpResponsePreflightResult {
 // Ends this stage successfully without body inspection.
 message HttpResponsePreflightSkip {}
 
-// Blocks delivery as a successful decision regardless of on_error. Preflight
-// and WHOLE_BODY_BYTES blocks replace the uncommitted response with a platform
-// error. STREAM_BYTES blocks abort delivery after any sent prefix. The upstream
-// request is not undone. A block wins over other actions and failures, stops
-// later evaluation, and ends opened stages with MIDDLEWARE_DENIAL.
+// Blocks delivery as a successful decision regardless of on_error. OpenShell
+// evaluates results in policy order. Once it accepts a valid block, it stops
+// later middleware evaluation and ends every still-writable opened stage with
+// MIDDLEWARE_DENIAL. A failure handled earlier may already have stopped
+// evaluation, so a later block does not override it. An invalid block result
+// is a middleware failure handled according to on_error. The upstream request
+// has already run; blocking its response does not reject or roll back that
+// request.
+//
+// Before response commitment, including at preflight and during
+// WHOLE_BODY_BYTES, OpenShell replaces the upstream response with the canonical
+// 403 Forbidden middleware-denial response. Its JSON body has
+// error = "middleware_denied" and includes a validated reason_code when the
+// result supplies one. OpenShell never returns the free-form reason or writes it
+// to security logs. For HEAD, OpenShell sends the canonical response headers
+// and Content-Length but no body. It closes the downstream connection after the
+// denial response.
+//
+// After response commitment, including during STREAM_BYTES, OpenShell aborts
+// downstream delivery. It does not inject an error body, a terminating chunk,
+// or an error trailer. OpenShell does not reuse the upstream connection.
 message HttpResponseBlockDelivery {}
 
 // Selects body inspection and response-header mutations.
@@ -284,8 +300,9 @@ message HttpResponseBodyResult {
   // Service diagnostic, never sent to the sandbox or security logs. Maximum
   // 4 KiB.
   string reason = 4;
-  // Optional audit code using preflight reason_code format. Never sent to the
-  // sandbox.
+  // Optional audit code using preflight reason_code format. When OpenShell
+  // accepts block_delivery before response commitment, it includes this code
+  // in the canonical denial response. It is never returned after commitment.
   string reason_code = 5;
   // Up to 32 audit-safe findings, each limited to 4 KiB encoded.
   repeated Finding findings = 6;
