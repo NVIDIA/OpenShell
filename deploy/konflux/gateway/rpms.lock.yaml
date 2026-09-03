@@ -648,13 +648,13 @@ arches:
     name: groff-base
     evr: 1.22.4-10.el9
     sourcerpm: groff-1.22.4-10.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/g/gzip-1.12-1.el9.aarch64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/g/gzip-1.12-2.el9_8.aarch64.rpm
     repoid: ubi-9-baseos-rpms
-    size: 169809
-    checksum: sha256:45710df49b439ddc4a2848fd3877367761b574234ae28b6be46f1cf54f3fcdca
+    size: 171305
+    checksum: sha256:efafc848fdaa3a8e5e77baddc07abc7d800dc973efd44ecf492bc64dca4fabe6
     name: gzip
-    evr: 1.12-1.el9
-    sourcerpm: gzip-1.12-1.el9.src.rpm
+    evr: 1.12-2.el9_8
+    sourcerpm: gzip-1.12-2.el9_8.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/i/info-6.7-15.el9.aarch64.rpm
     repoid: ubi-9-baseos-rpms
     size: 230301
@@ -949,20 +949,20 @@ arches:
     name: libsmartcols
     evr: 2.37.4-25.el9
     sourcerpm: util-linux-2.37.4-25.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/l/libssh-0.10.4-18.el9.aarch64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/l/libssh-0.10.4-19.el9_8.aarch64.rpm
     repoid: ubi-9-baseos-rpms
-    size: 222382
-    checksum: sha256:6d529b3f31dee553349277c9f72da4f14ae54a2d48d10aa3088b45fbe90f99c2
+    size: 223114
+    checksum: sha256:80f3962d3eb780ca6d6d4f8c6841b003a907d758ad8ad1c3d785e9cf327672f6
     name: libssh
-    evr: 0.10.4-18.el9
-    sourcerpm: libssh-0.10.4-18.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/l/libssh-config-0.10.4-18.el9.noarch.rpm
+    evr: 0.10.4-19.el9_8
+    sourcerpm: libssh-0.10.4-19.el9_8.src.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/l/libssh-config-0.10.4-19.el9_8.noarch.rpm
     repoid: ubi-9-baseos-rpms
-    size: 14685
-    checksum: sha256:ab353cbff2269677fc7364bfcddb8e11537ea83361a0ad642e60eac87ed67fbb
+    size: 14764
+    checksum: sha256:ce06b99793b9e5abc50a58ebc3ef11037f2efbdb5f819a25f8de4994613194d4
     name: libssh-config
-    evr: 0.10.4-18.el9
-    sourcerpm: libssh-0.10.4-18.el9.src.rpm
+    evr: 0.10.4-19.el9_8
+    sourcerpm: libssh-0.10.4-19.el9_8.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/l/libstdc++-11.5.0-14.el9.aarch64.rpm
     repoid: ubi-9-baseos-rpms
     size: 723913
@@ -1012,13 +1012,13 @@ arches:
     name: libxcrypt
     evr: 4.4.18-3.el9
     sourcerpm: libxcrypt-4.4.18-3.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/l/libxml2-2.9.13-14.el9_8.2.aarch64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/l/libxml2-2.9.13-14.el9_8.4.aarch64.rpm
     repoid: ubi-9-baseos-rpms
-    size: 754623
-    checksum: sha256:e78f201e1cbab2bbce30991a1618f3b79d8afc9ef8bb9bf41046e314c5f30f0e
+    size: 754646
+    checksum: sha256:10417dde519f111c6248fae0eb6fb9889efd3e68c575caced652823d7ef4f169
     name: libxml2
-    evr: 2.9.13-14.el9_8.2
-    sourcerpm: libxml2-2.9.13-14.el9_8.2.src.rpm
+    evr: 2.9.13-14.el9_8.4
+    sourcerpm: libxml2-2.9.13-14.el9_8.4.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/baseos/os/Packages/l/libzstd-1.5.5-1.el9.aarch64.rpm
     repoid: ubi-9-baseos-rpms
     size: 283159
@@ -2017,13 +2017,13 @@ arches:
     name: groff-base
     evr: 1.22.4-10.el9
     sourcerpm: groff-1.22.4-10.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/g/gzip-1.12-1.el9.x86_64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/g/gzip-1.12-2.el9_8.x86_64.rpm
     repoid: ubi-9-baseos-rpms
-    size: 171206
-    checksum: sha256:c8b3e0414d55b1eedb0185a564ac6cb2368bee2fd5f995447d045f6a714488ac
+    size: 172571
+    checksum: sha256:a87bdcce45011f232758c01bd99c564b5f6b549d391646cc573a132d22604b85
     name: gzip
-    evr: 1.12-1.el9
-    sourcerpm: gzip-1.12-1.el9.src.rpm
+    evr: 1.12-2.el9_8
+    sourcerpm: gzip-1.12-2.el9_8.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/i/info-6.7-15.el9.x86_64.rpm
     repoid: ubi-9-baseos-rpms
     size: 233806
@@ -2318,20 +2318,20 @@ arches:
     name: libsmartcols
     evr: 2.37.4-25.el9
     sourcerpm: util-linux-2.37.4-25.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/l/libssh-0.10.4-18.el9.x86_64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/l/libssh-0.10.4-19.el9_8.x86_64.rpm
     repoid: ubi-9-baseos-rpms
-    size: 225119
-    checksum: sha256:4a3ec8a0cc0d4f693a876c522d3e4bc2296180b9ec05f958f6a0aa8658702458
+    size: 225821
+    checksum: sha256:10d0ecb7cef182f8d11eb4bc772943a60c48b8171f602ffd83bb79b9edf5eb44
     name: libssh
-    evr: 0.10.4-18.el9
-    sourcerpm: libssh-0.10.4-18.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/l/libssh-config-0.10.4-18.el9.noarch.rpm
+    evr: 0.10.4-19.el9_8
+    sourcerpm: libssh-0.10.4-19.el9_8.src.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/l/libssh-config-0.10.4-19.el9_8.noarch.rpm
     repoid: ubi-9-baseos-rpms
-    size: 14685
-    checksum: sha256:ab353cbff2269677fc7364bfcddb8e11537ea83361a0ad642e60eac87ed67fbb
+    size: 14764
+    checksum: sha256:ce06b99793b9e5abc50a58ebc3ef11037f2efbdb5f819a25f8de4994613194d4
     name: libssh-config
-    evr: 0.10.4-18.el9
-    sourcerpm: libssh-0.10.4-18.el9.src.rpm
+    evr: 0.10.4-19.el9_8
+    sourcerpm: libssh-0.10.4-19.el9_8.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/l/libstdc++-11.5.0-14.el9.x86_64.rpm
     repoid: ubi-9-baseos-rpms
     size: 763021
@@ -2381,13 +2381,13 @@ arches:
     name: libxcrypt
     evr: 4.4.18-3.el9
     sourcerpm: libxcrypt-4.4.18-3.el9.src.rpm
-  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/l/libxml2-2.9.13-14.el9_8.2.x86_64.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/l/libxml2-2.9.13-14.el9_8.4.x86_64.rpm
     repoid: ubi-9-baseos-rpms
-    size: 772164
-    checksum: sha256:8bc57807fd307c504dd53a1d047215abb9892130943d29023765d2acd9af09a4
+    size: 772646
+    checksum: sha256:3b2b7f705584d2aa9dc1a110ef1b00dbefb3305285877a24a24605fcb9567eb0
     name: libxml2
-    evr: 2.9.13-14.el9_8.2
-    sourcerpm: libxml2-2.9.13-14.el9_8.2.src.rpm
+    evr: 2.9.13-14.el9_8.4
+    sourcerpm: libxml2-2.9.13-14.el9_8.4.src.rpm
   - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/baseos/os/Packages/l/libzstd-1.5.5-1.el9.x86_64.rpm
     repoid: ubi-9-baseos-rpms
     size: 304135
