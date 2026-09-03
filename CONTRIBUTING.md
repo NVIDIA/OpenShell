@@ -333,12 +333,10 @@ For x86-64 Windows MSVC builds, use one of these Z3 paths:
   is set.
 - Bundled Z3: pass `--features bundled-z3` so `z3-sys` builds Z3 from source.
 
-Both Windows paths still require `libclang.dll` for `bindgen`. If LLVM is not on
-the default search path, set `LIBCLANG_PATH` to the directory containing
-`libclang.dll`.
+`openshell-prover` itself has no `bindgen`/`libclang` dependency, so building
+just this crate does not require `LIBCLANG_PATH`:
 
 ```powershell
-$env:LIBCLANG_PATH='C:\Program Files\Microsoft Visual Studio\2022\<Edition>\VC\Tools\Llvm\x64\bin'
 cargo build -p openshell-prover --target x86_64-pc-windows-msvc --features bundled-z3
 ```
 
@@ -346,7 +344,10 @@ cargo build -p openshell-prover --target x86_64-pc-windows-msvc --features bundl
 
 To build the full set of Windows binaries, including `openshell-gateway.exe`
 and `openshell.exe`, use the `windows:build:x64` mise task instead of a
-single-crate `cargo build`. It builds Z3 from source (bundled) by default:
+single-crate `cargo build`. It builds Z3 from source (bundled) by default. A
+full build also compiles crates that use `bindgen` (e.g. the MXC driver on
+Windows), so it requires `libclang.dll`; if LLVM is not on the default search
+path, set `LIBCLANG_PATH` to the directory containing `libclang.dll`:
 
 ```powershell
 $env:LIBCLANG_PATH='C:\Program Files\Microsoft Visual Studio\2022\<Edition>\VC\Tools\Llvm\x64\bin'
