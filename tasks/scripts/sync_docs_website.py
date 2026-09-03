@@ -16,7 +16,6 @@ import argparse
 import re
 import shutil
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -50,6 +49,7 @@ def parse_args() -> argparse.Namespace:
         "--channel", required=True, choices=["dev", "latest", "stable", "version"]
     )
     parser.add_argument("--source-ref", default="")
+    parser.add_argument("--source-sha", default="")
     parser.add_argument("--release-version", default="")
     parser.add_argument("--version-slug", default="")
     parser.add_argument("--display-name", default="")
@@ -120,19 +120,11 @@ def ensure_existing(path: Path, label: str) -> None:
         raise FileNotFoundError(f"{label} does not exist: {path}")
 
 
-def reset_directory(src: Path, dst: Path, *, preserve_components: bool) -> None:
+def reset_directory(src: Path, dst: Path) -> None:
     ensure_existing(src, "source directory")
-    preserved_components: Path | None = None
-    if preserve_components and (dst / "_components").is_dir():
-        preserved_components = Path(tempfile.mkdtemp()) / "_components"
-        shutil.copytree(dst / "_components", preserved_components)
     if dst.exists():
         shutil.rmtree(dst)
     shutil.copytree(src, dst)
-    if preserved_components is not None:
-        if (dst / "_components").exists():
-            shutil.rmtree(dst / "_components")
-        shutil.copytree(preserved_components, dst / "_components")
 
 
 def merge_directory(src: Path, dst: Path, *, overwrite: bool) -> None:
@@ -190,10 +182,19 @@ def read_snapshot_metadata(path: Path) -> dict[str, dict[str, str]]:
             raise ValueError(f"invalid snapshot metadata in {path}")
         snapshot = cast("YamlMapping", raw_snapshot)
         source_ref = snapshot.get("source-ref")
+        source_sha = snapshot.get("source-sha", "")
         version = snapshot.get("version")
-        if not isinstance(source_ref, str) or not isinstance(version, str):
+        if (
+            not isinstance(source_ref, str)
+            or not isinstance(source_sha, str)
+            or not isinstance(version, str)
+        ):
             raise ValueError(f"invalid snapshot metadata for {raw_slug} in {path}")
-        snapshots[raw_slug] = {"source-ref": source_ref, "version": version}
+        snapshots[raw_slug] = {
+            "source-ref": source_ref,
+            "source-sha": source_sha,
+            "version": version,
+        }
     return snapshots
 
 
@@ -214,6 +215,7 @@ def seed_mutable_snapshot_metadata(
         if match is not None:
             snapshots[slug] = {
                 "source-ref": "",
+                "source-sha": "",
                 "version": str(parse_release_version(match.group(1))),
             }
         return
@@ -223,14 +225,14 @@ def ensure_immutable_snapshot(
     snapshots: dict[str, dict[str, str]],
     target_fern: Path,
     slug: str,
-    source_ref: str,
+    source_sha: str,
 ) -> None:
     existing = snapshots.get(slug)
     if existing is not None:
-        if existing["source-ref"] != source_ref:
+        if existing["source-sha"] != source_sha:
             raise ValueError(
                 f"immutable snapshot {slug} already points to "
-                f"{existing['source-ref']}, not {source_ref}"
+                f"{existing['source-sha']}, not {source_sha}"
             )
         return
     if (target_fern / f"pages-{slug}").exists():
@@ -242,7 +244,7 @@ def ensure_immutable_snapshot(
 def ensure_monotonic_snapshot(
     snapshots: dict[str, dict[str, str]],
     slug: str,
-    source_ref: str,
+    source_sha: str,
     release_version: str,
     *,
     allow_rollback: bool,
@@ -257,13 +259,13 @@ def ensure_monotonic_snapshot(
         return False
     if (
         incoming_version == existing_version
-        and bool(existing["source-ref"])
-        and existing["source-ref"] != source_ref
+        and bool(existing["source-sha"])
+        and existing["source-sha"] != source_sha
         and not allow_rollback
     ):
         raise ValueError(
             f"snapshot {slug} version {release_version} already points to "
-            f"{existing['source-ref']}, not {source_ref}"
+            f"{existing['source-sha']}, not {source_sha}"
         )
     return True
 
@@ -396,11 +398,7 @@ def write_snapshot(
     refresh_shared: bool,
 ) -> None:
     pages_dir = f"pages-{entry.slug}"
-    reset_directory(
-        source_docs,
-        target_fern / pages_dir,
-        preserve_components=not refresh_shared,
-    )
+    reset_directory(source_docs, target_fern / pages_dir)
     if refresh_shared:
         merge_directory(source_fern / "assets", target_fern / "assets", overwrite=True)
         merge_directory(
@@ -449,6 +447,9 @@ def sync_docs(args: argparse.Namespace) -> None:
     source_ref = clean_input(args.source_ref)
     if not source_ref:
         raise ValueError("--source-ref is required when --operation=sync")
+    source_sha = clean_input(getattr(args, "source_sha", ""))
+    if not source_sha:
+        raise ValueError("--source-sha is required when --operation=sync")
     release_version = clean_input(getattr(args, "release_version", ""))
     version_slug = clean_input(args.version_slug)
     display_override = clean_input(args.display_name)
@@ -469,7 +470,7 @@ def sync_docs(args: argparse.Namespace) -> None:
         expected_slug = f"v{parsed_version}"
         if slug != expected_slug:
             raise ValueError(f"stable version slug must be {expected_slug}, got {slug}")
-        ensure_immutable_snapshot(snapshots, target_fern, slug, source_ref)
+        ensure_immutable_snapshot(snapshots, target_fern, slug, source_sha)
         stable_availability = availability or default_stable_availability(
             release_version
         )
@@ -487,6 +488,7 @@ def sync_docs(args: argparse.Namespace) -> None:
         )
         snapshots[slug] = {
             "source-ref": source_ref,
+            "source-sha": source_sha,
             "version": str(parsed_version),
         }
 
@@ -494,7 +496,7 @@ def sync_docs(args: argparse.Namespace) -> None:
         if ensure_monotonic_snapshot(
             snapshots,
             "latest",
-            source_ref,
+            source_sha,
             release_version,
             allow_rollback=bool(getattr(args, "allow_rollback", False)),
         ):
@@ -512,6 +514,7 @@ def sync_docs(args: argparse.Namespace) -> None:
             )
             snapshots["latest"] = {
                 "source-ref": source_ref,
+                "source-sha": source_sha,
                 "version": str(parsed_version),
             }
         write_snapshot_metadata(metadata_path, snapshots)
@@ -523,7 +526,7 @@ def sync_docs(args: argparse.Namespace) -> None:
         if not ensure_monotonic_snapshot(
             snapshots,
             slug,
-            source_ref,
+            source_sha,
             release_version,
             allow_rollback=bool(getattr(args, "allow_rollback", False)),
         ):
@@ -533,7 +536,7 @@ def sync_docs(args: argparse.Namespace) -> None:
             )
             return
     else:
-        ensure_immutable_snapshot(snapshots, target_fern, slug, source_ref)
+        ensure_immutable_snapshot(snapshots, target_fern, slug, source_sha)
         release_version = release_version or slug.removeprefix("v")
 
     write_snapshot(
@@ -550,6 +553,7 @@ def sync_docs(args: argparse.Namespace) -> None:
     )
     snapshots[slug] = {
         "source-ref": source_ref,
+        "source-sha": source_sha,
         "version": release_version,
     }
     write_snapshot_metadata(metadata_path, snapshots)

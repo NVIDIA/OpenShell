@@ -103,6 +103,9 @@ def test_sync_workflow_serializes_sync_and_publish() -> None:
     publish_step = next(step for step in steps if step["name"] == "Publish Fern docs")
     assert publish_step["if"] == "${{ inputs.publish }}"
     assert publish_step["working-directory"] == "docs-website/fern"
+    update_step = next(step for step in steps if step["name"] == "Update docs snapshot")
+    assert "git -C source rev-parse HEAD" in update_step["run"]
+    assert '--source-sha "$SOURCE_SHA"' in update_step["run"]
 
 
 def test_resolve_slug_channels() -> None:
@@ -239,6 +242,7 @@ def test_sync_docs_creates_snapshot(tmp_path: Path) -> None:
             docs_website_root=website,
             channel="dev",
             source_ref="main",
+            source_sha="dev-sha",
             release_version="0.0.117.dev56",
             version_slug="",
             display_name="",
@@ -290,6 +294,7 @@ def test_sync_docs_preserves_other_version_availability(tmp_path: Path) -> None:
             docs_website_root=website,
             channel="dev",
             source_ref="main",
+            source_sha="dev-sha",
             release_version="0.0.117.dev56",
             version_slug="",
             display_name="Dev (v0.0.117.dev56)",
@@ -327,7 +332,8 @@ def test_stable_sync_creates_immutable_version_and_promotes_latest(
             source_root=source,
             docs_website_root=website,
             channel="stable",
-            source_ref="new-sha",
+            source_ref="v0.2.0",
+            source_sha="new-sha",
             release_version="0.2.0",
             version_slug="v0.2.0",
             display_name="",
@@ -345,9 +351,14 @@ def test_stable_sync_creates_immutable_version_and_promotes_latest(
     assert versions[0]["availability"] == "stable"
     assert versions[1]["availability"] == "stable"
     snapshots = read_yaml(fern / sdw.SNAPSHOT_METADATA_FILE)["snapshots"]
-    assert snapshots["latest"] == {"source-ref": "new-sha", "version": "0.2.0"}
+    assert snapshots["latest"] == {
+        "source-ref": "v0.2.0",
+        "source-sha": "new-sha",
+        "version": "0.2.0",
+    }
     assert snapshots["v0.2.0"] == {
-        "source-ref": "new-sha",
+        "source-ref": "v0.2.0",
+        "source-sha": "new-sha",
         "version": "0.2.0",
     }
 
@@ -362,7 +373,7 @@ def test_n_minus_one_sync_does_not_move_latest_backwards(tmp_path: Path) -> None
     (maintenance / "docs" / "intro.mdx").write_text("# Maintenance\n", encoding="utf-8")
     _make_docs_website_tree(website)
 
-    for source, source_ref, version in (
+    for source, source_sha, version in (
         (current, "current-sha", "0.3.1"),
         (maintenance, "maintenance-sha", "0.2.7"),
     ):
@@ -371,7 +382,8 @@ def test_n_minus_one_sync_does_not_move_latest_backwards(tmp_path: Path) -> None
                 source_root=source,
                 docs_website_root=website,
                 channel="stable",
-                source_ref=source_ref,
+                source_ref=f"v{version}",
+                source_sha=source_sha,
                 release_version=version,
                 version_slug=f"v{version}",
                 display_name="",
@@ -389,7 +401,8 @@ def test_n_minus_one_sync_does_not_move_latest_backwards(tmp_path: Path) -> None
     ) == "# Maintenance\n"
     snapshots = read_yaml(fern / sdw.SNAPSHOT_METADATA_FILE)["snapshots"]
     assert snapshots["latest"] == {
-        "source-ref": "current-sha",
+        "source-ref": "v0.3.1",
+        "source-sha": "current-sha",
         "version": "0.3.1",
     }
 
@@ -426,7 +439,8 @@ def test_stable_sync_preserves_newer_legacy_latest_without_metadata(
             source_root=source,
             docs_website_root=website,
             channel="stable",
-            source_ref="maintenance-sha",
+            source_ref="v0.2.7",
+            source_sha="maintenance-sha",
             release_version="0.2.7",
             version_slug="v0.2.7",
             display_name="",
@@ -439,7 +453,11 @@ def test_stable_sync_preserves_newer_legacy_latest_without_metadata(
         encoding="utf-8"
     ) == "# Existing latest\n"
     snapshots = read_yaml(fern / sdw.SNAPSHOT_METADATA_FILE)["snapshots"]
-    assert snapshots["latest"] == {"source-ref": "", "version": "0.3.1"}
+    assert snapshots["latest"] == {
+        "source-ref": "",
+        "source-sha": "",
+        "version": "0.3.1",
+    }
 
 
 def test_dev_sync_rejects_stale_or_conflicting_updates(tmp_path: Path) -> None:
@@ -452,13 +470,14 @@ def test_dev_sync_rejects_stale_or_conflicting_updates(tmp_path: Path) -> None:
     (stale / "docs" / "intro.mdx").write_text("# Stale\n", encoding="utf-8")
     _make_docs_website_tree(website)
 
-    def sync(source: Path, source_ref: str, version: str) -> None:
+    def sync(source: Path, source_sha: str, version: str) -> None:
         sdw.sync_docs(
             Namespace(
                 source_root=source,
                 docs_website_root=website,
                 channel="dev",
-                source_ref=source_ref,
+                source_ref="main",
+                source_sha=source_sha,
                 release_version=version,
                 version_slug="",
                 display_name=f"Dev (v{version})",
@@ -485,7 +504,8 @@ def test_immutable_snapshot_cannot_change_source(tmp_path: Path) -> None:
         source_root=source,
         docs_website_root=website,
         channel="stable",
-        source_ref="release-sha",
+        source_ref="main",
+        source_sha="release-sha",
         release_version="0.2.0",
         version_slug="v0.2.0",
         display_name="",
@@ -494,7 +514,7 @@ def test_immutable_snapshot_cannot_change_source(tmp_path: Path) -> None:
     )
     sdw.sync_docs(args)
 
-    args.source_ref = "different-sha"
+    args.source_sha = "different-sha"
     with pytest.raises(ValueError, match=r"immutable snapshot v0\.2\.0"):
         sdw.sync_docs(args)
 
@@ -518,7 +538,8 @@ def test_only_dev_refreshes_shared_fern_files(tmp_path: Path) -> None:
             source_root=dev,
             docs_website_root=website,
             channel="dev",
-            source_ref="dev-sha",
+            source_ref="main",
+            source_sha="dev-sha",
             release_version="0.2.1.dev1",
             version_slug="",
             display_name="Dev (v0.2.1.dev1)",
@@ -531,7 +552,8 @@ def test_only_dev_refreshes_shared_fern_files(tmp_path: Path) -> None:
             source_root=release,
             docs_website_root=website,
             channel="stable",
-            source_ref="release-sha",
+            source_ref="v0.2.0",
+            source_sha="release-sha",
             release_version="0.2.0",
             version_slug="v0.2.0",
             display_name="",
@@ -556,6 +578,7 @@ def test_remove_docs_drops_snapshot(tmp_path: Path) -> None:
         docs_website_root=website,
         channel="version",
         source_ref="v0.0.36",
+        source_sha="release-sha",
         version_slug="v0.0.36",
         display_name="",
         availability="deprecated",
@@ -583,3 +606,74 @@ def test_remove_docs_drops_snapshot(tmp_path: Path) -> None:
     assert not (fern / "versions" / "v0.0.36.yml").exists()
     docs_yml = read_yaml(fern / "docs.yml")
     assert [entry["slug"] for entry in docs_yml["versions"]] == []
+
+
+@pytest.mark.parametrize("channel", ["stable", "version"])
+def test_immutable_snapshot_uses_resolved_commit_identity(
+    tmp_path: Path, channel: str
+) -> None:
+    source = tmp_path / "source"
+    website = tmp_path / "docs-website"
+    _make_source_tree(source)
+    _make_docs_website_tree(website)
+    args = Namespace(
+        source_root=source,
+        docs_website_root=website,
+        channel=channel,
+        source_ref="main",
+        source_sha="first-sha",
+        release_version="0.2.0" if channel == "stable" else "",
+        version_slug="v0.2.0",
+        display_name="",
+        availability="",
+        allow_rollback=False,
+    )
+    sdw.sync_docs(args)
+
+    (source / "docs" / "intro.mdx").write_text("# Changed\n", encoding="utf-8")
+    args.source_sha = "second-sha"
+
+    with pytest.raises(ValueError, match=r"immutable snapshot v0\.2\.0"):
+        sdw.sync_docs(args)
+    assert (website / "fern" / "pages-v0.2.0" / "intro.mdx").read_text(
+        encoding="utf-8"
+    ) == "# Intro\n"
+
+
+def test_stable_promotion_replaces_latest_page_components(tmp_path: Path) -> None:
+    old = tmp_path / "old"
+    new = tmp_path / "new"
+    website = tmp_path / "docs-website"
+    _make_source_tree(old)
+    _make_source_tree(new)
+    (old / "docs" / "_components").mkdir()
+    (old / "docs" / "_components" / "Widget.tsx").write_text(
+        "export const Widget = 'old';\n", encoding="utf-8"
+    )
+    (new / "docs" / "_components").mkdir()
+    (new / "docs" / "_components" / "Widget.tsx").write_text(
+        "export const Widget = 'new';\n", encoding="utf-8"
+    )
+    _make_docs_website_tree(website)
+
+    for source, source_sha, version in (
+        (old, "old-sha", "1.0.0"),
+        (new, "new-sha", "1.1.0"),
+    ):
+        sdw.sync_docs(
+            Namespace(
+                source_root=source,
+                docs_website_root=website,
+                channel="stable",
+                source_ref=f"v{version}",
+                source_sha=source_sha,
+                release_version=version,
+                version_slug=f"v{version}",
+                display_name="",
+                availability="",
+                allow_rollback=False,
+            )
+        )
+
+    widget = website / "fern" / "pages-latest" / "_components" / "Widget.tsx"
+    assert widget.read_text(encoding="utf-8") == "export const Widget = 'new';\n"

@@ -179,6 +179,10 @@ jobs:
           AVAILABILITY: ${{ inputs.availability }}
           ALLOW_ROLLBACK: ${{ inputs.allow_rollback }}
         run: |
+          SOURCE_SHA=""
+          if [[ "$OPERATION" == "sync" ]]; then
+            SOURCE_SHA=$(git -C source rev-parse HEAD)
+          fi
           rollback_args=()
           if [[ "$ALLOW_ROLLBACK" == "true" ]]; then
             rollback_args+=(--allow-rollback)
@@ -189,6 +193,7 @@ jobs:
             --docs-website-root docs-website \
             --channel "$CHANNEL" \
             --source-ref "$SOURCE_REF" \
+            --source-sha "$SOURCE_SHA" \
             --release-version "$RELEASE_VERSION" \
             --version-slug "$VERSION_SLUG" \
             --display-name "$DISPLAY_NAME" \
