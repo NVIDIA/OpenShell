@@ -1,0 +1,22 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+openshell_binaries_candidate_staging_dir: /var/lib/openshell-test-guest/artifacts
+openshell_binaries_candidate_cli_artifact: "{{ openshell_binaries_candidate_staging_dir }}/openshell"
+openshell_binaries_candidate_gateway_artifact: "{{ openshell_binaries_candidate_staging_dir }}/openshell-gateway"
+openshell_binaries_candidate_sandbox_artifact: "{{ openshell_binaries_candidate_staging_dir }}/openshell-sandbox.tar"
+openshell_binaries_candidate_cli_bin: /usr/local/bin/openshell
+openshell_binaries_candidate_gateway_bin: /usr/local/bin/openshell-gateway
+openshell_binaries_candidate_sandbox_archive: /usr/local/lib/openshell-sandbox.tar
+openshell_binaries_candidate_apply_command: /home/openshell/.local/bin/openshell-test-guest-binaries-apply-candidate
+openshell_binaries_candidate_artifacts:
+  - source: "{{ openshell_binaries_candidate_cli_artifact }}"
+    destination: "{{ openshell_binaries_candidate_cli_bin }}"
+    mode: "0755"
+  - source: "{{ openshell_binaries_candidate_gateway_artifact }}"
+    destination: "{{ openshell_binaries_candidate_gateway_bin }}"
+    mode: "0755"
+  - source: "{{ openshell_binaries_candidate_sandbox_artifact }}"
+    destination: "{{ openshell_binaries_candidate_sandbox_archive }}"
+    mode: "0644"

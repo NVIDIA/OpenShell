@@ -1,0 +1,32 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Verify installed candidate binaries
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ openshell_binaries_contract_cli_bin }}"
+    - "{{ openshell_binaries_contract_gateway_bin }}"
+    - "{{ openshell_binaries_contract_sandbox_archive }}"
+  register: openshell_binaries_contract_artifacts
+
+- name: Require installed candidate binaries
+  ansible.builtin.assert:
+    that: item.stat.exists
+    fail_msg: "missing required candidate binary: {{ item.item }}"
+  loop: "{{ openshell_binaries_contract_artifacts.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Publish candidate binary OpenShell installation
+  ansible.builtin.set_fact:
+    openshell_install_source: binaries
+    openshell_cli_bin: "{{ openshell_binaries_contract_cli_bin }}"
+    openshell_gateway_bin: "{{ openshell_binaries_contract_gateway_bin }}"
+    openshell_gateway_service: "{{ openshell_binaries_contract_gateway_service }}"
+    openshell_gateway_endpoint: "{{ openshell_binaries_contract_gateway_endpoint }}"
+    openshell_gateway_state_root: "{{ openshell_binaries_contract_state_root }}"
+    openshell_supervisor_source: archive
+    openshell_supervisor_archive: "{{ openshell_binaries_contract_sandbox_archive }}"
+    openshell_supervisor_image: "{{ openshell_binaries_contract_supervisor_image }}"

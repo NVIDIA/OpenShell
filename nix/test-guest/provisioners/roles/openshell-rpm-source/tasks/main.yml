@@ -1,0 +1,64 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Require an RPM source definition
+  ansible.builtin.assert:
+    that:
+      - openshell_rpm_source_name | length > 0
+      - openshell_rpm_source_cli_package | length > 0
+      - openshell_rpm_source_gateway_package | length > 0
+
+- name: Verify RPM source packages
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+  loop: "{{ openshell_rpm_source_packages }}"
+  register: openshell_rpm_source_package_stats
+
+- name: Require RPM source packages
+  ansible.builtin.assert:
+    that: item.stat.exists
+    fail_msg: "missing {{ openshell_rpm_source_name }} RPM: {{ item.item.path }}"
+  loop: "{{ openshell_rpm_source_package_stats.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+
+- name: Create the RPM source command directory
+  ansible.builtin.file:
+    path: "{{ openshell_rpm_source_command_dir }}"
+    state: directory
+    mode: "0700"
+
+- name: Install the RPM source apply command
+  ansible.builtin.copy:
+    dest: "{{ openshell_rpm_source_apply_command }}"
+    mode: "0700"
+    content: |
+      #!/usr/bin/env bash
+      set -Eeuo pipefail
+      case "${1:-}" in
+        "")
+          sudo dnf install -y --allowerasing --nogpgcheck {{ openshell_rpm_source_cli_package | quote }} {{ openshell_rpm_source_gateway_package | quote }}
+          ;;
+        --force)
+          sudo dnf reinstall -y --nogpgcheck {{ openshell_rpm_source_cli_package | quote }} {{ openshell_rpm_source_gateway_package | quote }}
+          ;;
+        *)
+          echo "usage: $0 [--force]" >&2
+          exit 2
+          ;;
+      esac
+
+- name: Determine whether this is the initial OpenShell source
+  ansible.builtin.set_fact:
+    openshell_rpm_source_is_initial: "{{ openshell_install_source is not defined }}"
+
+- name: Install the first RPM source as the initial OpenShell state
+  ansible.builtin.command:
+    cmd: "{{ openshell_rpm_source_apply_command }}"
+  when: openshell_rpm_source_is_initial
+
+- name: Publish the initial RPM OpenShell contract
+  ansible.builtin.include_role:
+    name: openshell-rpm-contract
+  when: openshell_rpm_source_is_initial

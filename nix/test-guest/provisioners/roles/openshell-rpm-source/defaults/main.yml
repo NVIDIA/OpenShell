@@ -1,0 +1,15 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+openshell_rpm_source_name: ""
+openshell_rpm_source_cli_package: ""
+openshell_rpm_source_gateway_package: ""
+openshell_rpm_source_command_dir: /home/openshell/.local/bin
+openshell_rpm_source_apply_command: >-
+  {{ openshell_rpm_source_command_dir }}/openshell-test-guest-rpm-apply-{{ openshell_rpm_source_name }}
+openshell_rpm_source_packages:
+  - name: openshell
+    path: "{{ openshell_rpm_source_cli_package }}"
+  - name: openshell-gateway
+    path: "{{ openshell_rpm_source_gateway_package }}"

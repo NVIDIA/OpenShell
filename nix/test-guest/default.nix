@@ -40,12 +40,13 @@ let
   ];
 
   provisionerRoles = [
-    "openshell-development"
-    "openshell-rpm"
-    "openshell-rpm-latest-release"
+    "openshell-candidate-binaries-source"
+    "openshell-binaries-contract"
+    "openshell-candidate-rpm-source"
+    "openshell-rpm-contract"
+    "openshell-latest-release-rpm-source"
+    "openshell-rpm-source"
     "gateway-podman"
-    "openshell-rpm-gateway-reinstall"
-    "openshell-rpm-gateway-upgrade"
   ];
 
   mkDistroProfile =
