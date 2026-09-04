@@ -6,6 +6,7 @@
 //! This module intentionally contains mechanisms, not sandbox orchestration.
 //! The in-workload sandbox owns lifecycle, policy, and failure handling.
 
+pub mod child_seccomp;
 pub mod landlock;
 pub mod proc_fd;
 pub mod seccomp_notify;
