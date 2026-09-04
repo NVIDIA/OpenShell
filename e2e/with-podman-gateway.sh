@@ -469,6 +469,18 @@ e2e_write_podman_gateway_config \
 if [ -n "${OPENSHELL_PARITY_GATEWAY_CONFIG_CAPTURE:-}" ]; then
   cp "${GATEWAY_CONFIG}" "${OPENSHELL_PARITY_GATEWAY_CONFIG_CAPTURE}"
 fi
+if [ -n "${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE:-}" ]; then
+  driver_transport=in_tree
+  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+    driver_transport=remote_uds
+  fi
+  printf '{"schema_version":%s,"external_compute_driver":%s,"compute_driver_transport":"%s","external_driver_pull_policy":"%s"}\n' \
+    "${CONFIG_SCHEMA_VERSION}" \
+    "$([ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ] && printf true || printf false)" \
+    "${driver_transport}" \
+    "${EXTERNAL_DRIVER_PULL_POLICY}" \
+    >"${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE}"
+fi
 
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   OPENSHELL_COMPUTE_DRIVER_SOCKET="${DRIVER_SOCKET}" \
