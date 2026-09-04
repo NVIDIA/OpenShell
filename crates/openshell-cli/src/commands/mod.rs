@@ -3,4 +3,7 @@
 
 pub mod common;
 pub mod gateway;
+pub mod inference;
 pub mod provider;
+pub mod service;
+pub mod settings;
