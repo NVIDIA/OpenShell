@@ -7,15 +7,15 @@ on:
   workflow_call:
     inputs:
       operation:
-        description: "Whether to sync or remove a docs snapshot"
+        description: "Whether to register or remove a docs version"
         required: true
         type: string
       channel:
-        description: "Docs channel to update or remove"
+        description: "Docs version channel to update or remove"
         required: true
         type: string
       source_ref:
-        description: "Source commit SHA, branch, or tag to snapshot when operation=sync"
+        description: "Source commit SHA, branch, or tag to register when operation=sync"
         required: false
         type: string
       release_version:
@@ -50,7 +50,7 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: "Whether to sync or remove a docs snapshot"
+        description: "Whether to register or remove a docs version"
         required: true
         default: sync
         type: choice
@@ -58,7 +58,7 @@ on:
           - sync
           - remove
       channel:
-        description: "Docs channel to update or remove"
+        description: "Docs version channel to update or remove"
         required: true
         type: choice
         options:
@@ -67,7 +67,7 @@ on:
           - stable
           - version
       source_ref:
-        description: "Source commit SHA, branch, or tag to snapshot when operation=sync"
+        description: "Source commit SHA, branch, or tag to register when operation=sync"
         required: false
         type: string
       release_version:
@@ -166,7 +166,7 @@ jobs:
           version: "0.10.12"
           python-version: "3.13"
 
-      - name: Update docs snapshot
+      - name: Update docs version manifest
         # Inputs flow in as quoted env vars to avoid shell injection; see the
         # Validate inputs step above.
         env:

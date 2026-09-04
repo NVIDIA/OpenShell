@@ -7,8 +7,12 @@ on:
       - "fern/**"
       - "mise.toml"
       - "tasks/docs.toml"
+      - "tasks/scripts/sync_docs_website.py"
+      - "tasks/scripts/sync_docs_website_test.py"
       - ".github/workflows/branch-docs.yml"
       - ".github/workflows/release-tag.yml"
+      - ".github/workflows/release-dev.yml"
+      - ".github/workflows/sync-docs.yml"
 
 permissions:
   contents: read
@@ -20,6 +24,38 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Checkout docs website branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: docs-website
+          fetch-depth: 0
+          path: docs-website
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          version: "0.10.12"
+          python-version: "3.13"
+
+      - name: Stage version manifest for preview
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          uv run tasks/scripts/sync_docs_website.py \
+            --operation sync \
+            --source-root . \
+            --docs-website-root docs-website \
+            --channel dev \
+            --source-ref "$SOURCE_SHA" \
+            --source-sha "$SOURCE_SHA" \
+            --release-version 0.0.0.dev0 \
+            --display-name "Dev (PR #${PR_NUMBER})" \
+            --availability beta \
+            --allow-rollback
 
       - name: Check Fern preview availability
         id: fern-preview
@@ -39,12 +75,13 @@ jobs:
           node-version: "24"
 
       - name: Install Fern CLI
+        working-directory: ./docs-website
         run: |
           FERN_VERSION=$(node -p "require('./fern/fern.config.json').version")
           npm install -g "fern-api@${FERN_VERSION}"
 
       - name: Validate docs
-        working-directory: ./fern
+        working-directory: ./docs-website/fern
         run: fern check
 
       - name: Generate preview URL
@@ -53,7 +90,7 @@ jobs:
         env:
           FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
           PREVIEW_ID: pr-${{ github.event.pull_request.number }}
-        working-directory: ./fern
+        working-directory: ./docs-website/fern
         run: |
           OUTPUT=$(fern generate --docs --preview --id "$PREVIEW_ID" 2>&1)
           echo "$OUTPUT"

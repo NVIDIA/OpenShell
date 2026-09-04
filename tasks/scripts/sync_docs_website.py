@@ -34,13 +34,14 @@ YamlMapping = dict[str, object]
 class VersionEntry:
     slug: str
     display_name: str
-    path: str
+    ref: str | None = None
+    path: str | None = None
     availability: str | None = None
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Sync or remove docs snapshots in the docs-website branch."
+        description="Update the git-ref version manifest on the docs-website branch."
     )
     parser.add_argument("--operation", choices=["sync", "remove"], default="sync")
     parser.add_argument("--source-root", type=Path)
@@ -127,24 +128,6 @@ def reset_directory(src: Path, dst: Path) -> None:
     shutil.copytree(src, dst)
 
 
-def merge_directory(src: Path, dst: Path, *, overwrite: bool) -> None:
-    if not src.exists():
-        return
-    if overwrite:
-        shutil.copytree(src, dst, dirs_exist_ok=True)
-        return
-    for copied in src.rglob("*"):
-        relative = copied.relative_to(src)
-        target = dst / relative
-        if copied.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
-            continue
-        if target.exists():
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(copied, target)
-
-
 def copy_if_exists(src: Path, dst: Path) -> None:
     if src.exists():
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -202,131 +185,43 @@ def write_snapshot_metadata(path: Path, snapshots: dict[str, dict[str, str]]) ->
     write_yaml(path, {"snapshots": snapshots})
 
 
-def seed_mutable_snapshot_metadata(
-    snapshots: dict[str, dict[str, str]], docs_yml: Path, slug: str
-) -> None:
-    if slug in snapshots:
-        return
-    data = read_yaml(docs_yml)
-    for entry in parse_versions(data.get("versions")):
-        if entry.slug != slug:
-            continue
-        match = DISPLAY_VERSION_RE.search(entry.display_name)
-        if match is not None:
-            snapshots[slug] = {
-                "source-ref": "",
-                "source-sha": "",
-                "version": str(parse_release_version(match.group(1))),
-            }
-        return
-
-
-def ensure_immutable_snapshot(
-    snapshots: dict[str, dict[str, str]],
-    target_fern: Path,
-    slug: str,
-    source_sha: str,
-) -> None:
-    existing = snapshots.get(slug)
-    if existing is not None:
-        if existing["source-sha"] != source_sha:
-            raise ValueError(
-                f"immutable snapshot {slug} already points to "
-                f"{existing['source-sha']}, not {source_sha}"
-            )
-        return
-    if (target_fern / f"pages-{slug}").exists():
-        raise ValueError(
-            f"immutable snapshot {slug} already exists without source metadata"
-        )
-
-
-def ensure_monotonic_snapshot(
-    snapshots: dict[str, dict[str, str]],
-    slug: str,
-    source_sha: str,
-    release_version: str,
-    *,
-    allow_rollback: bool,
-) -> bool:
-    existing = snapshots.get(slug)
-    if existing is None:
-        return True
-
-    incoming_version = parse_release_version(release_version)
-    existing_version = parse_release_version(existing["version"])
-    if incoming_version < existing_version and not allow_rollback:
-        return False
-    if (
-        incoming_version == existing_version
-        and bool(existing["source-sha"])
-        and existing["source-sha"] != source_sha
-        and not allow_rollback
-    ):
-        raise ValueError(
-            f"snapshot {slug} version {release_version} already points to "
-            f"{existing['source-sha']}, not {source_sha}"
-        )
-    return True
-
-
-def prefix_path(value: object, pages_dir: str) -> object:
-    if not isinstance(value, str):
-        return value
-    if value.startswith(("../", "/", "http://", "https://")):
-        return value
-    return f"../{pages_dir}/{value}"
-
-
-def prefix_navigation_paths(value: object, pages_dir: str) -> object:
-    if isinstance(value, dict):
-        mapping = cast("YamlMapping", value)
-        for key in ("path", "folder"):
-            if key in mapping:
-                mapping[key] = prefix_path(mapping[key], pages_dir)
-        for child in mapping.values():
-            prefix_navigation_paths(child, pages_dir)
-    elif isinstance(value, list):
-        for child in cast("list[object]", value):
-            prefix_navigation_paths(child, pages_dir)
-    return value
-
-
-def version_navigation(source_index: Path, pages_dir: str) -> YamlMapping:
-    data = read_yaml(source_index)
-    prefix_navigation_paths(data, pages_dir)
-    return data
-
-
 def parse_versions(raw_versions: object) -> list[VersionEntry]:
     if raw_versions is None:
         return []
     if not isinstance(raw_versions, list):
         raise ValueError("docs.yml versions must be a list")
+
     entries: list[VersionEntry] = []
     for raw in cast("list[object]", raw_versions):
         if not isinstance(raw, dict):
-            continue
+            raise ValueError("docs.yml version entries must be mappings")
         entry = cast("YamlMapping", raw)
         slug = entry.get("slug")
         display_name = entry.get("display-name")
+        ref = entry.get("ref")
         path = entry.get("path")
         availability = entry.get("availability")
-        if (
-            isinstance(slug, str)
-            and isinstance(display_name, str)
-            and isinstance(path, str)
-        ):
-            entries.append(
-                VersionEntry(
-                    slug=slug,
-                    display_name=display_name,
-                    path=path,
-                    availability=availability
-                    if isinstance(availability, str)
-                    else None,
-                )
+        if not isinstance(slug, str) or not isinstance(display_name, str):
+            raise ValueError("docs.yml version entries require slug and display-name")
+        if (ref is None) == (path is None):
+            raise ValueError(
+                f"docs.yml version {slug} must set exactly one of ref or path"
             )
+        if ref is not None and not isinstance(ref, str):
+            raise ValueError(f"docs.yml version {slug} ref must be a string")
+        if path is not None and not isinstance(path, str):
+            raise ValueError(f"docs.yml version {slug} path must be a string")
+        if availability is not None and not isinstance(availability, str):
+            raise ValueError(f"docs.yml version {slug} availability must be a string")
+        entries.append(
+            VersionEntry(
+                slug=slug,
+                display_name=display_name,
+                ref=cast("str | None", ref),
+                path=cast("str | None", path),
+                availability=cast("str | None", availability),
+            )
+        )
     return entries
 
 
@@ -352,81 +247,174 @@ def ordered_entries(
 def render_versions(entries: list[VersionEntry]) -> list[dict[str, str]]:
     rendered: list[dict[str, str]] = []
     for entry in entries:
-        item = {
-            "display-name": entry.display_name,
-            "path": entry.path,
-            "slug": entry.slug,
-        }
+        item = {"display-name": entry.display_name}
+        if entry.ref is not None:
+            item["ref"] = entry.ref
+        elif entry.path is not None:
+            item["path"] = entry.path
+        else:
+            raise ValueError(f"version {entry.slug} has no content source")
+        item["slug"] = entry.slug
         if entry.availability is not None:
             item["availability"] = entry.availability
         rendered.append(item)
     return rendered
 
 
-def component_dirs(fern_dir: Path) -> list[str]:
-    dirs: list[str] = []
-    preferred = ["pages-latest", "pages-dev"]
-    all_page_dirs = sorted(
-        path.name for path in fern_dir.glob("pages-*") if path.is_dir()
-    )
-    for name in preferred + all_page_dirs:
-        path = fern_dir / name / "_components"
-        component = f"./{name}/_components"
-        if path.is_dir() and component not in dirs:
-            dirs.append(component)
-    dirs.append("./components")
-    return dirs
+def infer_legacy_ref(entry: VersionEntry) -> str | None:
+    if entry.ref is not None:
+        return entry.ref
+    if entry.slug == "latest":
+        match = DISPLAY_VERSION_RE.search(entry.display_name)
+        return f"v{match.group(1)}" if match is not None else None
+    if entry.slug.startswith("v"):
+        try:
+            parse_release_version(entry.slug)
+        except ValueError:
+            return None
+        return entry.slug
+    return None
 
 
-def update_docs_yml(docs_yml: Path, updated: VersionEntry, fern_dir: Path) -> None:
-    data = read_yaml(docs_yml)
-    data["experimental"] = {
-        "mdx-components": component_dirs(fern_dir),
-    }
-    data["versions"] = render_versions(
-        ordered_entries(parse_versions(data.get("versions")), updated)
-    )
-    write_yaml(docs_yml, data)
-
-
-def write_snapshot(
-    source_docs: Path,
-    source_fern: Path,
-    target_fern: Path,
-    entry: VersionEntry,
-    *,
-    refresh_shared: bool,
-) -> None:
-    pages_dir = f"pages-{entry.slug}"
-    reset_directory(source_docs, target_fern / pages_dir)
-    if refresh_shared:
-        merge_directory(source_fern / "assets", target_fern / "assets", overwrite=True)
-        merge_directory(
-            source_fern / "components", target_fern / "components", overwrite=True
-        )
-        copy_if_exists(source_fern / "main.css", target_fern / "main.css")
-        copy_if_exists(
-            source_fern / "fern.config.json", target_fern / "fern.config.json"
-        )
-
+def remove_local_snapshot(target_fern: Path, slug: str) -> None:
+    pages_dir = target_fern / f"pages-{slug}"
+    if pages_dir.exists():
+        shutil.rmtree(pages_dir)
+    version_file = target_fern / "versions" / f"{slug}.yml"
+    if version_file.exists():
+        version_file.unlink()
     versions_dir = target_fern / "versions"
-    versions_dir.mkdir(parents=True, exist_ok=True)
-    write_yaml(
-        versions_dir / f"{entry.slug}.yml",
-        version_navigation(source_docs / "index.yml", pages_dir),
+    if versions_dir.is_dir() and not any(versions_dir.iterdir()):
+        versions_dir.rmdir()
+
+
+def migrate_legacy_entries(
+    entries: list[VersionEntry], target_fern: Path
+) -> list[VersionEntry]:
+    migrated: list[VersionEntry] = []
+    for entry in entries:
+        inferred_ref = infer_legacy_ref(entry)
+        if entry.path is None or inferred_ref is None:
+            migrated.append(entry)
+            continue
+        migrated.append(
+            VersionEntry(
+                slug=entry.slug,
+                display_name=entry.display_name,
+                ref=inferred_ref,
+                availability=entry.availability,
+            )
+        )
+        remove_local_snapshot(target_fern, entry.slug)
+    return migrated
+
+
+def seed_snapshot_metadata(
+    snapshots: dict[str, dict[str, str]], entries: list[VersionEntry]
+) -> None:
+    for entry in entries:
+        if entry.slug in snapshots:
+            continue
+        match = DISPLAY_VERSION_RE.search(entry.display_name)
+        if match is None:
+            continue
+        snapshots[entry.slug] = {
+            "source-ref": infer_legacy_ref(entry) or "",
+            "source-sha": "",
+            "version": str(parse_release_version(match.group(1))),
+        }
+
+
+def ensure_immutable_version(
+    snapshots: dict[str, dict[str, str]],
+    entries: list[VersionEntry],
+    slug: str,
+    source_ref: str,
+    source_sha: str,
+) -> None:
+    existing = snapshots.get(slug)
+    if existing is not None:
+        existing_sha = existing["source-sha"]
+        if existing_sha and existing_sha != source_sha:
+            raise ValueError(
+                f"immutable version {slug} already points to {existing_sha}, not {source_sha}"
+            )
+        existing_ref = existing["source-ref"]
+        if existing_ref and existing_ref != source_ref:
+            raise ValueError(
+                f"immutable version {slug} already uses ref {existing_ref}, not {source_ref}"
+            )
+
+    existing_entry = next((entry for entry in entries if entry.slug == slug), None)
+    if existing_entry is not None:
+        existing_ref = infer_legacy_ref(existing_entry)
+        if existing_ref != source_ref:
+            raise ValueError(
+                f"immutable version {slug} already uses ref {existing_ref}, not {source_ref}"
+            )
+
+
+def ensure_monotonic_snapshot(
+    snapshots: dict[str, dict[str, str]],
+    slug: str,
+    source_sha: str,
+    release_version: str,
+    *,
+    allow_rollback: bool,
+) -> bool:
+    existing = snapshots.get(slug)
+    if existing is None:
+        return True
+
+    incoming_version = parse_release_version(release_version)
+    existing_version = parse_release_version(existing["version"])
+    if incoming_version < existing_version and not allow_rollback:
+        return False
+    if (
+        incoming_version == existing_version
+        and bool(existing["source-sha"])
+        and existing["source-sha"] != source_sha
+        and not allow_rollback
+    ):
+        raise ValueError(
+            f"version {slug} {release_version} already points to "
+            f"{existing['source-sha']}, not {source_sha}"
+        )
+    return True
+
+
+def normalize_manifest_components(data: YamlMapping) -> None:
+    raw_experimental = data.get("experimental")
+    experimental = (
+        cast("YamlMapping", raw_experimental)
+        if isinstance(raw_experimental, dict)
+        else {}
     )
-    update_docs_yml(target_fern / "docs.yml", entry, target_fern)
+    experimental["mdx-components"] = ["./components"]
+    data["experimental"] = experimental
 
 
-def remove_docs_yml_entry(docs_yml: Path, slug: str, fern_dir: Path) -> None:
-    data = read_yaml(docs_yml)
-    entries = [
-        entry for entry in parse_versions(data.get("versions")) if entry.slug != slug
-    ]
-    data["experimental"] = {
-        "mdx-components": component_dirs(fern_dir),
-    }
+def refresh_shared_fern(
+    source_fern: Path, target_fern: Path, entries: list[VersionEntry]
+) -> None:
+    data = read_yaml(source_fern / "docs.yml")
     data["versions"] = render_versions(entries)
+    normalize_manifest_components(data)
+    write_yaml(target_fern / "docs.yml", data)
+
+    for directory in ("assets", "components"):
+        source_dir = source_fern / directory
+        if source_dir.exists():
+            reset_directory(source_dir, target_fern / directory)
+    copy_if_exists(source_fern / "main.css", target_fern / "main.css")
+    copy_if_exists(source_fern / "fern.config.json", target_fern / "fern.config.json")
+
+
+def write_manifest(target_fern: Path, entries: list[VersionEntry]) -> None:
+    docs_yml = target_fern / "docs.yml"
+    data = read_yaml(docs_yml)
+    data["versions"] = render_versions(entries)
+    normalize_manifest_components(data)
     write_yaml(docs_yml, data)
 
 
@@ -435,158 +423,156 @@ def sync_docs(args: argparse.Namespace) -> None:
         raise ValueError("--source-root is required when --operation=sync")
     source_root = args.source_root.resolve()
     docs_root = args.docs_website_root.resolve()
-    source_docs = source_root / "docs"
     source_fern = source_root / "fern"
     target_fern = docs_root / "fern"
 
-    ensure_existing(source_docs, "source docs")
-    ensure_existing(source_fern, "source fern config")
-    ensure_existing(target_fern, "docs website fern directory")
+    ensure_existing(source_fern / "docs.yml", "source Fern docs config")
+    ensure_existing(target_fern / "docs.yml", "docs website Fern docs config")
 
     channel = clean_input(args.channel)
     source_ref = clean_input(args.source_ref)
-    if not source_ref:
-        raise ValueError("--source-ref is required when --operation=sync")
     source_sha = clean_input(getattr(args, "source_sha", ""))
-    if not source_sha:
-        raise ValueError("--source-sha is required when --operation=sync")
     release_version = clean_input(getattr(args, "release_version", ""))
     version_slug = clean_input(args.version_slug)
     display_override = clean_input(args.display_name)
     availability_override = clean_input(args.availability)
+    allow_rollback = bool(getattr(args, "allow_rollback", False))
+
+    if not source_ref:
+        raise ValueError("--source-ref is required when --operation=sync")
+    if not source_sha:
+        raise ValueError("--source-sha is required when --operation=sync")
     if channel in {"dev", "latest", "stable"} and not release_version:
         raise ValueError(
             "--release-version is required for dev, latest, and stable channels"
         )
+
     slug = resolve_slug(channel, version_slug)
     display_name = resolve_display_name(channel, slug, source_ref, display_override)
     availability = resolve_availability(channel, availability_override)
-    metadata_path = target_fern / SNAPSHOT_METADATA_FILE
-    snapshots = read_snapshot_metadata(metadata_path)
     docs_yml = target_fern / "docs.yml"
+    metadata_path = target_fern / SNAPSHOT_METADATA_FILE
+    entries = parse_versions(read_yaml(docs_yml).get("versions"))
+    snapshots = read_snapshot_metadata(metadata_path)
+    seed_snapshot_metadata(snapshots, entries)
+
+    if channel in {"dev", "latest"} and not ensure_monotonic_snapshot(
+        snapshots,
+        slug,
+        source_sha,
+        release_version,
+        allow_rollback=allow_rollback,
+    ):
+        print(
+            f"Skipped stale {slug} docs {release_version}; "
+            f"current version is {snapshots[slug]['version']}"
+        )
+        return
+
+    entries = migrate_legacy_entries(entries, target_fern)
 
     if channel == "stable":
         parsed_version = parse_release_version(release_version)
         expected_slug = f"v{parsed_version}"
         if slug != expected_slug:
             raise ValueError(f"stable version slug must be {expected_slug}, got {slug}")
-        ensure_immutable_snapshot(snapshots, target_fern, slug, source_sha)
+        if source_ref != slug:
+            raise ValueError(f"stable source ref must be tag {slug}, got {source_ref}")
+        ensure_immutable_version(snapshots, entries, slug, source_ref, source_sha)
         stable_availability = availability or default_stable_availability(
             release_version
         )
-        write_snapshot(
-            source_docs,
-            source_fern,
-            target_fern,
+        entries = ordered_entries(
+            entries,
             VersionEntry(
                 slug=slug,
                 display_name=slug,
-                path=f"./versions/{slug}.yml",
+                ref=source_ref,
                 availability=stable_availability,
             ),
-            refresh_shared=False,
         )
         snapshots[slug] = {
             "source-ref": source_ref,
             "source-sha": source_sha,
             "version": str(parsed_version),
         }
+        remove_local_snapshot(target_fern, slug)
 
-        seed_mutable_snapshot_metadata(snapshots, docs_yml, "latest")
         if ensure_monotonic_snapshot(
             snapshots,
             "latest",
             source_sha,
             release_version,
-            allow_rollback=bool(getattr(args, "allow_rollback", False)),
+            allow_rollback=allow_rollback,
         ):
-            write_snapshot(
-                source_docs,
-                source_fern,
-                target_fern,
+            entries = ordered_entries(
+                entries,
                 VersionEntry(
                     slug="latest",
                     display_name=display_override or f"Latest ({slug})",
-                    path="./versions/latest.yml",
+                    ref=source_ref,
                     availability=stable_availability,
                 ),
-                refresh_shared=False,
             )
             snapshots["latest"] = {
                 "source-ref": source_ref,
                 "source-sha": source_sha,
                 "version": str(parsed_version),
             }
+            remove_local_snapshot(target_fern, "latest")
+        write_manifest(target_fern, entries)
         write_snapshot_metadata(metadata_path, snapshots)
-        print(f"Synced immutable {slug} docs from {source_ref}")
+        print(f"Registered immutable {slug} docs from {source_ref}")
         return
 
-    if channel in {"dev", "latest"}:
-        seed_mutable_snapshot_metadata(snapshots, docs_yml, slug)
-        if not ensure_monotonic_snapshot(
-            snapshots,
-            slug,
-            source_sha,
-            release_version,
-            allow_rollback=bool(getattr(args, "allow_rollback", False)),
-        ):
-            print(
-                f"Skipped stale {slug} docs {release_version}; "
-                f"current version is {snapshots[slug]['version']}"
-            )
-            return
-    else:
-        ensure_immutable_snapshot(snapshots, target_fern, slug, source_sha)
+    if channel == "version":
+        ensure_immutable_version(snapshots, entries, slug, source_ref, source_sha)
         release_version = release_version or slug.removeprefix("v")
 
-    write_snapshot(
-        source_docs,
-        source_fern,
-        target_fern,
+    content_ref = source_sha
+    entries = ordered_entries(
+        entries,
         VersionEntry(
             slug=slug,
             display_name=display_name,
-            path=f"./versions/{slug}.yml",
+            ref=content_ref,
             availability=availability,
         ),
-        refresh_shared=channel == "dev",
     )
     snapshots[slug] = {
         "source-ref": source_ref,
         "source-sha": source_sha,
         "version": release_version,
     }
-    write_snapshot_metadata(metadata_path, snapshots)
+    remove_local_snapshot(target_fern, slug)
 
-    print(f"Synced {channel} docs from {source_ref} to fern/pages-{slug}")
+    if channel == "dev":
+        refresh_shared_fern(source_fern, target_fern, entries)
+    else:
+        write_manifest(target_fern, entries)
+    write_snapshot_metadata(metadata_path, snapshots)
+    print(f"Registered {channel} docs from {content_ref}")
 
 
 def remove_docs(args: argparse.Namespace) -> None:
     docs_root = args.docs_website_root.resolve()
     target_fern = docs_root / "fern"
+    docs_yml = target_fern / "docs.yml"
+    ensure_existing(docs_yml, "docs website Fern docs config")
 
-    ensure_existing(target_fern, "docs website fern directory")
+    slug = resolve_slug(clean_input(args.channel), clean_input(args.version_slug))
+    entries = migrate_legacy_entries(
+        parse_versions(read_yaml(docs_yml).get("versions")), target_fern
+    )
+    entries = [entry for entry in entries if entry.slug != slug]
+    remove_local_snapshot(target_fern, slug)
+    write_manifest(target_fern, entries)
 
-    channel = clean_input(args.channel)
-    version_slug = clean_input(args.version_slug)
-    slug = resolve_slug(channel, version_slug)
-
-    pages_dir = target_fern / f"pages-{slug}"
-    if pages_dir.exists():
-        shutil.rmtree(pages_dir)
-
-    version_file = target_fern / "versions" / f"{slug}.yml"
-    if version_file.exists():
-        version_file.unlink()
-
-    remove_docs_yml_entry(target_fern / "docs.yml", slug, target_fern)
     metadata_path = target_fern / SNAPSHOT_METADATA_FILE
     snapshots = read_snapshot_metadata(metadata_path)
-    if slug in snapshots:
-        del snapshots[slug]
-        write_snapshot_metadata(metadata_path, snapshots)
-
-    print(f"Removed {slug} docs from docs website branch")
+    snapshots.pop(slug, None)
+    write_snapshot_metadata(metadata_path, snapshots)
+    print(f"Removed {slug} docs from the version manifest")
 
 
 def main() -> None:
