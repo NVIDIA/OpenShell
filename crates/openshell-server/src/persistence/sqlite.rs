@@ -23,6 +23,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
+
+#[cfg(test)]
+pub(super) fn embedded_migration_sql(version: i64) -> Option<&'static str> {
+    SQLITE_MIGRATOR
+        .iter()
+        .find(|migration| migration.version == version)
+        .map(|migration| migration.sql.as_ref())
+}
 static IN_MEMORY_DB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};

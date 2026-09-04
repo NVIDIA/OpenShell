@@ -108,7 +108,7 @@ bash examples/sandbox-policy-quickstart/demo.sh
 OpenShell isolates each sandbox in its own container with policy-enforced egress routing. A lightweight gateway coordinates sandbox lifecycle, and every outbound connection is intercepted by the policy engine, which does one of three things:
 
 - **Allows** — the destination and binary match a policy block.
-- **Routes for inference** — strips caller credentials, injects backend credentials, and forwards to the managed model.
+- **Binds credentials to endpoints** — injects provider credentials only after policy admits a request to a profile-authorized endpoint.
 - **Denies** — blocks the request and logs it.
 
 | Component          | Role                                                                                         |
@@ -116,7 +116,7 @@ OpenShell isolates each sandbox in its own container with policy-enforced egress
 | **Gateway**        | Control-plane API that coordinates sandbox lifecycle and acts as the auth boundary.          |
 | **Sandbox**        | Isolated runtime with container supervision and policy-enforced egress routing.              |
 | **Policy Engine**  | Enforces filesystem, network, and process constraints from application layer down to kernel. |
-| **Privacy Router** | Privacy-aware LLM routing that keeps sensitive context on sandbox compute.                   |
+| **Provider Access** | Profile-defined endpoints, binary policy, and endpoint-bound credential injection for model APIs and other services. |
 
 OpenShell runs a gateway control plane that manages sandbox lifecycle through a configured compute driver. Supported compute platforms include Docker, Podman, MicroVM, and Kubernetes.
 
@@ -129,13 +129,15 @@ OpenShell applies defense in depth across four policy domains:
 | Filesystem | Prevents reads/writes outside allowed paths.        | Locked at sandbox creation. |
 | Network    | Blocks unauthorized outbound connections.           | Hot-reloadable at runtime.  |
 | Process    | Blocks privilege escalation and dangerous syscalls. | Locked at sandbox creation. |
-| Inference  | Reroutes model API calls to controlled backends.    | Hot-reloadable at runtime.  |
+| Providers  | Grants endpoint-bound credentials and network access. | Hot-reloadable at runtime. |
 
-Policies are declarative YAML files. Static sections (filesystem, process) are locked at creation; dynamic sections (network, inference) can be hot-reloaded on a running sandbox with `openshell policy set`.
+Policies are declarative YAML files. Static sections (filesystem, process) are locked at creation; network policy and provider attachments can be updated on a running sandbox.
 
 ## Providers
 
 Agents need credentials — API keys, tokens, service accounts. OpenShell manages these as **providers**: named credential bundles that are injected into sandboxes at creation. The CLI auto-discovers credentials for recognized agents (Claude, Codex, OpenCode, Copilot) from your shell environment, or you can create providers explicitly with `openshell provider create`. Credentials never leak into the sandbox filesystem; they are injected as environment variables at runtime.
+
+Inference access uses the same provider workflow. Attach an inference-capable provider to a sandbox, call the provider's native endpoint, and select the model in the client. Provider profiles contribute the endpoint policy and bind credential placeholders to the authorized destination.
 
 ## GPU Support (Experimental)
 
@@ -159,8 +161,8 @@ Docker-backed GPU sandboxes auto-select CDI when available and otherwise fall ba
 | [OpenCode](https://opencode.ai/)                              | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `OPENAI_API_KEY` or `OPENROUTER_API_KEY`. |
 | [Codex](https://developers.openai.com/codex)                  | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `OPENAI_API_KEY`.                         |
 | [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `GITHUB_TOKEN` or `COPILOT_GITHUB_TOKEN`. |
-| [OpenClaw](https://openclaw.ai/)                 | [NemoClaw](https://github.com/NVIDIA/NemoClaw)                                   | Run OpenClaw more securely inside NVIDIA OpenShell with managed inference using NemoClaw.       |
-| [Hermes Agent](https://github.com/NousResearch/hermes-agent)   | [NemoClaw](https://github.com/NVIDIA/NemoClaw)                                   | Run Hermes Agent more securely inside NVIDIA OpenShell with managed inference using NemoClaw.   |
+| [OpenClaw](https://openclaw.ai/)                 | [NemoClaw](https://github.com/NVIDIA/NemoClaw)                                   | Run OpenClaw more securely inside NVIDIA OpenShell with the NemoClaw blueprint.       |
+| [Hermes Agent](https://github.com/NousResearch/hermes-agent)   | [NemoClaw](https://github.com/NVIDIA/NemoClaw)                                   | Run Hermes Agent more securely inside NVIDIA OpenShell with the NemoClaw blueprint.   |
 | [Ollama](https://ollama.com/)                                 | [Community](https://github.com/NVIDIA/OpenShell-Community)                       | Launch with `openshell sandbox create --from ollama`.                         |
 | [Pi](https://pi.dev/)                                 | [Community](https://github.com/NVIDIA/OpenShell-Community)                       | Launch with `openshell sandbox create --from pi`.                         |
 
@@ -172,9 +174,9 @@ Docker-backed GPU sandboxes auto-select CDI when available and otherwise fall ba
 | `openshell sandbox connect [name]`                         | SSH into a running sandbox.                     |
 | `openshell sandbox list`                                   | List all sandboxes.                             |
 | `openshell provider create --type [type] --from-existing`  | Create a credential provider from env vars.     |
+| `openshell sandbox provider attach <sandbox> <provider>`   | Attach a provider to a running sandbox.         |
 | `openshell policy set <name> --policy file.yaml`           | Apply or update a policy on a running sandbox.  |
 | `openshell policy get <name>`                              | Show the active policy.                         |
-| `openshell inference set --provider <p> --model <m>`       | Configure the `inference.local` endpoint.       |
 | `openshell logs [name] --tail`                             | Stream sandbox logs.                            |
 | `openshell term`                                           | Launch the real-time terminal UI for debugging. |
 

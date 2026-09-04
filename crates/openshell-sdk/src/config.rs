@@ -56,8 +56,7 @@ impl AuthConfig {
 
 /// Configuration for opening a gRPC channel to an `OpenShell` gateway.
 ///
-/// Consumed by `openshell_sdk::transport::grpc_client` and the
-/// inference-client equivalent. One `ClientConfig` per logical connection;
+/// Consumed by `openshell_sdk::transport::grpc_client`. One `ClientConfig` per logical connection;
 /// callers that want connection pooling cache the resulting `tonic::Channel`.
 //
 // NOTE:

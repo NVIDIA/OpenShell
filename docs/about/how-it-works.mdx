@@ -4,14 +4,14 @@
 title: "How OpenShell Works"
 sidebar-title: "How It Works"
 description: "Understand the OpenShell architecture, runtime boundaries, gateways, sandboxes, and ecosystem integration points."
-keywords: "Generative AI, Cybersecurity, AI Agents, Architecture, Gateway, Sandbox, Inference Routing"
+keywords: "Generative AI, Cybersecurity, AI Agents, Architecture, Gateway, Sandbox, Providers"
 position: 2
 ---
 
 OpenShell is built around three stable runtime components: the **CLI**, the **Gateway**, and the **Supervisor**.
 
 The CLI, SDK, and TUI provide user-facing access. The gateway is the
-control plane: it owns API access, state, policy and settings delivery, provider and inference configuration, and relay coordination. The supervisor runs inside every sandbox workload and is the local security boundary. It launches the agent as a restricted child process and enforces policy where process identity, filesystem access, network egress, and
+control plane: it owns API access, state, policy and settings delivery, provider configuration, and relay coordination. The supervisor runs inside every sandbox workload and is the local security boundary. It launches the agent as a restricted child process and enforces policy where process identity, filesystem access, network egress, and
 runtime credentials are visible.
 
 Infrastructure-specific work sits behind integration boundaries. Compute,
@@ -46,7 +46,6 @@ flowchart TB
         AGENT["Restricted agent process"]
         PROXY["Policy proxy"]
         POLICY["OPA policy engine"]
-        ROUTER["Inference router"]
     end
 
     CLI -->|"gRPC / HTTP"| GW
@@ -64,8 +63,7 @@ flowchart TB
     AGENT -->|"ordinary egress"| PROXY
     PROXY -->|"evaluate"| POLICY
     PROXY -->|"allowed traffic"| EXT["External services"]
-    PROXY -->|"inference.local"| ROUTER
-    ROUTER -->|"managed inference"| MODEL["Inference backends"]
+    PROXY -->|"profile-authorized traffic"| MODEL["Model providers"]
 ```
 
 ## Deployment Models
@@ -92,11 +90,11 @@ device plugins without changing the gateway and sandbox contract.
 | [Gateways](/sandboxes/manage-gateways) | Authenticated control plane that owns API access, durable state, sandbox lifecycle, settings delivery, authorization, and relay coordination. |
 | [Providers](/sandboxes/manage-providers) | Credential and provider records that map logical agent needs to platform or user-managed secrets without exposing raw credentials to the agent process. |
 | [Policies](/sandboxes/policies) | Declarative controls for filesystem access, process identity, network egress, L7 rules, credential injection, and runtime policy updates. |
-| [Inference Routing](/sandboxes/inference-routing) | Managed `https://inference.local` path that routes model traffic to configured backends while keeping provider credentials outside the sandbox. |
+| [Provider-backed Inference](/sandboxes/inference-routing) | Per-sandbox provider attachment, native model endpoints, and endpoint-bound credential injection. |
 
 ## Gateways and Sandboxes
 
-The gateway and sandbox split control-plane authority from runtime enforcement. The gateway owns durable platform state: sandboxes, policy revisions, runtime settings, provider records, inference configuration, session records, and authorization decisions. A sandbox owns the local execution boundary: process identity, filesystem access, network egress, credential injection, local logs, and the agent child process.
+The gateway and sandbox split control-plane authority from runtime enforcement. The gateway owns durable platform state: sandboxes, policy revisions, runtime settings, provider records, session records, and authorization decisions. A sandbox owns the local execution boundary: process identity, filesystem access, network egress, credential injection, local logs, and the agent child process.
 
 The relationship is supervisor initiated. Each sandbox supervisor connects outbound to a known gateway endpoint, authenticates as a sandbox workload, and keeps a live session open for control traffic and relays. This avoids requiring every compute driver to solve gateway-to-sandbox reachability through pod IPs, bridge networks, port mappings, NAT traversal, or custom tunnels.
 
@@ -114,18 +112,18 @@ then launches the agent under the active policy.
 | Filesystem | Applies filesystem policy before the agent starts so undeclared paths are inaccessible and declared paths are read-only or read-write as configured. |
 | Network | Routes ordinary egress through the policy proxy so destination, port, binary identity, and L7 request rules can be evaluated before traffic leaves the sandbox. |
 | Credentials | Receives credential material from the gateway and injects it only through configured policy paths or request-time proxy rules. |
-| Inference | Intercepts `https://inference.local` and forwards model traffic through the configured inference route instead of exposing provider credentials to the agent. |
+| Provider access | Enforces profile-derived policy and substitutes provider credential placeholders only at profile-authorized endpoints. |
 | Observability | Emits local security and lifecycle logs, pushes sandbox logs to the gateway, and keeps relay endpoints available for connect, exec, and file transfer operations. |
 
 Static controls such as filesystem and process isolation are established at
 sandbox start and require sandbox recreation to change. Dynamic controls such as
-network policy, credential delivery, and inference routing can refresh over the
+network policy and credential delivery can refresh over the
 live gateway-supervisor session.
 
 ## Ecosystem Integration
 
 OpenShell integrates with infrastructure ecosystems instead of replacing them. Runtimes, schedulers, secret stores, identity providers, workload identity systems, image pipelines, storage, and GPU or device exposure remain owned by the platforms that provide them.
 
-The gateway owns OpenShell control-plane semantics: sandbox state, lifecycle ordering, policy and settings resolution, credential mapping, authorization, inference configuration, and relay coordination. Drivers translate those semantics into platform-native operations.
+The gateway owns OpenShell control-plane semantics: sandbox state, lifecycle ordering, policy and settings resolution, credential mapping, authorization, and relay coordination. Drivers translate those semantics into platform-native operations.
 
-The supervisor owns OpenShell sandbox semantics. Filesystem policy, process privilege reduction, network proxying, inference interception, credential injection, security logging, and gateway relay behavior stay consistent across Docker, Podman, Kubernetes, VM-backed sandboxes, and future integrations.
+The supervisor owns OpenShell sandbox semantics. Filesystem policy, process privilege reduction, network proxying, provider credential injection, security logging, and gateway relay behavior stay consistent across Docker, Podman, Kubernetes, VM-backed sandboxes, and future integrations.

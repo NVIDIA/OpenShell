@@ -23,7 +23,6 @@ openshell-otel = { path = "../openshell-otel" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-prover = { path = "../openshell-prover" }
 openshell-providers = { path = "../openshell-providers" }
-openshell-router = { path = "../openshell-router" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 

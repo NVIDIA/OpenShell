@@ -25,8 +25,6 @@ import httpx
 
 from ._proto import (
     datamodel_pb2,
-    inference_pb2,
-    inference_pb2_grpc,
     openshell_pb2,
     openshell_pb2_grpc,
 )
@@ -1202,74 +1200,6 @@ class SandboxTemplateClient:
             timeout=self._timeout,
         )
         return bool(response.deleted)
-
-
-@dataclass(frozen=True)
-class InferenceRouteConfig:
-    provider_name: str
-    model_id: str
-    version: int
-
-
-class InferenceRouteClient:
-    """gRPC client for workspace-scoped inference route configuration."""
-
-    def __init__(self, channel: grpc.Channel, *, timeout: float = 30.0) -> None:
-        self._stub = inference_pb2_grpc.InferenceStub(channel)
-        self._timeout = timeout
-
-    @classmethod
-    def from_sandbox_client(cls, client: SandboxClient) -> InferenceRouteClient:
-        return cls(client._channel, timeout=client._timeout)
-
-    def set_route(
-        self,
-        *,
-        workspace: str,
-        provider_name: str,
-        model_id: str,
-        no_verify: bool = False,
-    ) -> InferenceRouteConfig:
-        response = self._stub.SetInferenceRoute(
-            inference_pb2.SetInferenceRouteRequest(
-                workspace=workspace,
-                provider_name=provider_name,
-                model_id=model_id,
-                no_verify=no_verify,
-            ),
-            timeout=self._timeout,
-        )
-        return InferenceRouteConfig(
-            provider_name=response.provider_name,
-            model_id=response.model_id,
-            version=response.version,
-        )
-
-    def get_route(self, *, workspace: str) -> InferenceRouteConfig:
-        response = self._stub.GetInferenceRoute(
-            inference_pb2.GetInferenceRouteRequest(workspace=workspace),
-            timeout=self._timeout,
-        )
-        return InferenceRouteConfig(
-            provider_name=response.provider_name,
-            model_id=response.model_id,
-            version=response.version,
-        )
-
-    def delete_route(
-        self,
-        *,
-        workspace: str,
-        route_name: str = "",
-    ) -> bool:
-        response = self._stub.DeleteInferenceRoute(
-            inference_pb2.DeleteInferenceRouteRequest(
-                workspace=workspace,
-                route_name=route_name,
-            ),
-            timeout=self._timeout,
-        )
-        return response.deleted
 
 
 @dataclass(frozen=True)

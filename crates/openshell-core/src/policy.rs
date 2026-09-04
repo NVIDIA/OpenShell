@@ -101,7 +101,7 @@ impl TryFrom<ProtoSandboxPolicy> for SandboxPolicy {
 
     fn try_from(proto: ProtoSandboxPolicy) -> Result<Self, Self::Error> {
         // In cluster mode we always run with proxy networking so all egress
-        // can be evaluated by OPA and `inference.local` is always addressable.
+        // can be evaluated by OPA.
         let network = NetworkPolicy {
             mode: NetworkMode::Proxy,
             proxy: Some(ProxyPolicy { http_addr: None }),

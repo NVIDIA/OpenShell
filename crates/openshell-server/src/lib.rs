@@ -23,7 +23,6 @@ mod defaults;
 mod gateway_listener;
 mod grpc;
 mod http;
-mod inference;
 mod middleware;
 mod multiplex;
 mod otel_tracing;
