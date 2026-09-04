@@ -251,24 +251,6 @@
       }
     },
     {
-      "name": "inference:read",
-      "description": "Read inference resources",
-      "protocol": "openid-connect",
-      "attributes": {
-        "include.in.token.scope": "true",
-        "display.on.consent.screen": "true"
-      }
-    },
-    {
-      "name": "inference:write",
-      "description": "Write inference resources",
-      "protocol": "openid-connect",
-      "attributes": {
-        "include.in.token.scope": "true",
-        "display.on.consent.screen": "true"
-      }
-    },
-    {
       "name": "workspace:read",
       "description": "Read workspace resources",
       "protocol": "openid-connect",
@@ -328,7 +310,7 @@
         }
       ],
       "defaultClientScopes": ["openid", "profile", "email", "roles", "web-origins", "acr"],
-      "optionalClientScopes": ["sandbox:read", "sandbox:write", "provider:read", "provider:write", "config:read", "config:write", "inference:read", "inference:write", "workspace:read", "workspace:write", "openshell:all"]
+      "optionalClientScopes": ["sandbox:read", "sandbox:write", "provider:read", "provider:write", "config:read", "config:write", "workspace:read", "workspace:write", "openshell:all"]
     },
     {
       "clientId": "openshell-ci",

@@ -199,7 +199,7 @@ fn snake_to_pascal(ident: &str) -> String {
 /// Name of the per-service const emitted alongside the impl block. The
 /// service module is what disambiguates between services — every impl
 /// lives in its own module (`crate::grpc::AUTH_METADATA`,
-/// `crate::inference::AUTH_METADATA`), so a fixed name reads more
+/// another service's `AUTH_METADATA`), so a fixed name reads more
 /// naturally than `OPENSHELL_AUTH_METADATA` / `INFERENCE_AUTH_METADATA`.
 const AUTH_METADATA_CONST: &str = "AUTH_METADATA";
 

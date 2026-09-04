@@ -19,7 +19,7 @@ openshell - CLI for managing OpenShell sandboxes, gateway registrations, and pro
 **openshell** is the command-line interface for OpenShell, a platform
 providing safe, sandboxed runtimes for autonomous AI agents. It manages
 gateway registrations, sandbox lifecycle, credential providers,
-network policies, and inference routing.
+network policies, and provider attachments.
 
 The CLI communicates with a gateway server over gRPC. The gateway can
 run as a package-managed systemd user service, a Helm deployment, a
@@ -114,16 +114,12 @@ development task, or behind a cloud reverse proxy.
 **provider delete** *NAME*
 :   Delete a provider.
 
-## Inference Routing
+**sandbox provider attach** *SANDBOX* *PROVIDER*
+:   Attach a provider to a running sandbox. New processes receive its
+    endpoint-bound credential placeholders and provider-derived policy.
 
-**inference set** **--provider** *NAME* **--model** *MODEL*
-:   Configure inference routing.
-
-**inference get**
-:   Show current inference configuration.
-
-**inference update** \[**--model** *MODEL*\]
-:   Update inference configuration.
+**sandbox provider detach** *SANDBOX* *PROVIDER*
+:   Revoke a provider attachment from a running sandbox.
 
 ## Other
 

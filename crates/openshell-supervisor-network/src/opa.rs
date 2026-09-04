@@ -5730,7 +5730,7 @@ process:
     // network_action tests
     // ========================================================================
 
-    const INFERENCE_TEST_DATA: &str = r#"
+    const PROVIDER_ENDPOINT_TEST_DATA: &str = r#"
 network_policies:
   claude_code:
     name: claude_code
@@ -5755,7 +5755,7 @@ process:
   run_as_group: sandbox
 "#;
 
-    const NO_INFERENCE_TEST_DATA: &str = r#"
+    const OTHER_ENDPOINT_TEST_DATA: &str = r#"
 network_policies:
   gitlab:
     name: gitlab
@@ -5774,19 +5774,19 @@ process:
   run_as_group: sandbox
 "#;
 
-    fn inference_engine() -> OpaEngine {
-        OpaEngine::from_strings(TEST_POLICY, INFERENCE_TEST_DATA)
-            .expect("Failed to load inference test data")
+    fn provider_endpoint_engine() -> OpaEngine {
+        OpaEngine::from_strings(TEST_POLICY, PROVIDER_ENDPOINT_TEST_DATA)
+            .expect("Failed to load provider endpoint test data")
     }
 
-    fn no_inference_engine() -> OpaEngine {
-        OpaEngine::from_strings(TEST_POLICY, NO_INFERENCE_TEST_DATA)
-            .expect("Failed to load no-inference test data")
+    fn other_endpoint_engine() -> OpaEngine {
+        OpaEngine::from_strings(TEST_POLICY, OTHER_ENDPOINT_TEST_DATA)
+            .expect("Failed to load alternate endpoint test data")
     }
 
     #[test]
     fn explicitly_allowed_endpoint_binary_returns_allow() {
-        let engine = inference_engine();
+        let engine = provider_endpoint_engine();
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
             port: 443,
@@ -5808,7 +5808,7 @@ process:
     fn relaxed_binary_identity_allows_declared_endpoint_without_binary_match() {
         let engine = OpaEngine::from_strings_with_binary_identity_required(
             TEST_POLICY,
-            INFERENCE_TEST_DATA,
+            PROVIDER_ENDPOINT_TEST_DATA,
             false,
         )
         .expect("Failed to load relaxed binary identity test data");
@@ -5846,7 +5846,7 @@ process:
 
     #[test]
     fn unknown_endpoint_returns_deny() {
-        let engine = inference_engine();
+        let engine = provider_endpoint_engine();
         let input = NetworkInput {
             host: "api.openai.com".into(),
             port: 443,
@@ -5863,8 +5863,8 @@ process:
     }
 
     #[test]
-    fn unknown_endpoint_without_inference_returns_deny() {
-        let engine = no_inference_engine();
+    fn unknown_endpoint_with_other_policy_returns_deny() {
+        let engine = other_endpoint_engine();
         let input = NetworkInput {
             host: "api.openai.com".into(),
             port: 443,
@@ -5884,7 +5884,7 @@ process:
     fn endpoint_in_policy_binary_not_allowed_returns_deny() {
         // api.anthropic.com is declared but python3 is not in the binary list.
         // With binary allow/deny, this is denied.
-        let engine = inference_engine();
+        let engine = provider_endpoint_engine();
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
             port: 443,
@@ -5901,8 +5901,8 @@ process:
     }
 
     #[test]
-    fn endpoint_in_policy_binary_not_allowed_without_inference_returns_deny() {
-        let engine = no_inference_engine();
+    fn endpoint_in_policy_binary_not_allowed_with_other_policy_returns_deny() {
+        let engine = other_endpoint_engine();
         let input = NetworkInput {
             host: "gitlab.com".into(),
             port: 443,

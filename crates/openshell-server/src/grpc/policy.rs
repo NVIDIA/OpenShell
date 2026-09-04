@@ -2808,11 +2808,6 @@ async fn provider_policy_context_with_catalog(
             continue;
         };
 
-        if !super::provider::provider_profile_endpoints_are_active(&profile, &provider) {
-            endpointless_provider_names.insert(name.clone());
-            continue;
-        }
-
         let rule_name = openshell_policy::provider_rule_name(provider.object_name());
         let mut rule = profile.network_policy_rule(&rule_name);
         if rule.endpoints.is_empty() {
@@ -8547,36 +8542,6 @@ mod tests {
             git_transport.deny_rules.is_empty(),
             "composed git transport should block push via its narrow allow set, not deny rules"
         );
-    }
-
-    #[tokio::test]
-    async fn provider_policy_layers_skip_public_vendor_endpoints_for_alternate_upstreams() {
-        let store = test_store().await;
-        let mut openai = test_provider("alternate-openai", "openai");
-        openai.config.insert(
-            "OPENAI_BASE_URL".to_string(),
-            "https://api.example.com/v1".to_string(),
-        );
-        let mut anthropic = test_provider("alternate-anthropic", "anthropic");
-        anthropic.config.insert(
-            "ANTHROPIC_BASE_URL".to_string(),
-            "https://api.example.com/v1".to_string(),
-        );
-        store.put_message(&openai).await.unwrap();
-        store.put_message(&anthropic).await.unwrap();
-
-        let layers = profile_provider_policy_layers(
-            &store,
-            "default",
-            &[
-                "alternate-openai".to_string(),
-                "alternate-anthropic".to_string(),
-            ],
-        )
-        .await
-        .unwrap();
-
-        assert!(layers.is_empty());
     }
 
     #[tokio::test]

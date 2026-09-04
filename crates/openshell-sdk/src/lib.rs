@@ -9,8 +9,8 @@
 //!   health, sandbox CRUD, reusable sandbox templates, readiness/deletion
 //!   waits, and non-streaming exec.
 //! - [`raw`] — direct access to the generated tonic clients for RPCs the
-//!   curated surface doesn't yet cover (inference, providers, policy, logs,
-//!   settings, SSH, forwarding).
+//!   curated surface doesn't yet cover (providers, policy, logs, settings,
+//!   SSH, forwarding).
 //!
 //! Owns the gRPC transport stack — channel construction, TLS material
 //! handling, request interceptors, OIDC token refresh, and the Cloudflare

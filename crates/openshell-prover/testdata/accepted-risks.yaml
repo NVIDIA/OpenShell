@@ -1,7 +1,0 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
-accepted_risks:
-  - query: inference_relay
-    reason: "Demo environment — inference.local not configured."
-    accepted_by: demo
