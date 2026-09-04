@@ -15,6 +15,7 @@ depends = [
   "test:packaging-assets",
   "test:codex-security-release-range",
   "test:docs-website",
+  "test:core-approval",
 ]
 
 ["test:docs-website"]
@@ -49,6 +50,11 @@ hide = true
 ["test:codex-security-release-range"]
 description = "Test Codex Security release-range resolution"
 run = "uv run --no-project --with pytest pytest -o \"python_files=*_test.py\" tasks/scripts/codex_security_range_test.py"
+hide = true
+
+["test:core-approval"]
+description = "Test the maintainer approval gate helper"
+run = "uv run --no-project --with pytest pytest -o \"python_files=*_test.py\" tasks/scripts/core_approval_test.py"
 hide = true
 
 [e2e]
