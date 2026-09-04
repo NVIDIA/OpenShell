@@ -111,6 +111,10 @@ pub struct VmComputeConfig {
     #[serde(flatten)]
     pub upstream_proxy: UpstreamProxyConfig,
 
+    /// Path on the gateway host to a PEM CA bundle trusted for the corporate
+    /// proxy and for server certificates re-signed by a TLS-intercepting proxy.
+    pub proxy_ca_bundle: Option<PathBuf>,
+
     /// Explicit guest-reachable SPIFFE Workload API TCP listener. VM guests
     /// cannot receive a host UNIX socket, so this requires acknowledgement.
     pub provider_spiffe_workload_api_tcp_endpoint: Option<String>,
@@ -152,6 +156,21 @@ impl VmComputeConfig {
         4096
     }
 
+    fn validate_proxy_config(&self) -> Result<()> {
+        self.upstream_proxy.validate().map_err(Error::config)?;
+        if let Some(path) = self.proxy_ca_bundle.as_ref() {
+            if path.as_os_str().is_empty() {
+                return Err(Error::config("proxy_ca_bundle must not be empty when set"));
+            }
+            if self.upstream_proxy.https_proxy.is_none() {
+                return Err(Error::config(
+                    "proxy_ca_bundle is set but no https_proxy is configured",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     #[must_use]
     fn default_driver_search_dirs(home: Option<PathBuf>) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
@@ -183,6 +202,7 @@ impl Default for VmComputeConfig {
             guest_tls_cert: None,
             guest_tls_key: None,
             upstream_proxy: UpstreamProxyConfig::default(),
+            proxy_ca_bundle: None,
             provider_spiffe_workload_api_tcp_endpoint: None,
             provider_spiffe_allow_guest_tcp: false,
         }
@@ -483,7 +503,7 @@ pub async fn spawn(
     }
 
     validate_vm_sandbox_identity(vm_config)?;
-    vm_config.upstream_proxy.validate().map_err(Error::config)?;
+    vm_config.validate_proxy_config()?;
     if let Some(endpoint) = vm_config
         .provider_spiffe_workload_api_tcp_endpoint
         .as_deref()
@@ -599,6 +619,9 @@ fn append_vm_proxy_and_spiffe_args(command: &mut Command, config: &VmComputeConf
     }
     if proxy.proxy_connect_by_hostname == Some(true) {
         command.arg("--upstream-proxy-connect-by-hostname");
+    }
+    if let Some(path) = config.proxy_ca_bundle.as_ref() {
+        command.arg("--upstream-proxy-ca-bundle").arg(path);
     }
     if let Some(endpoint) = config.provider_spiffe_workload_api_tcp_endpoint.as_ref() {
         command
@@ -745,13 +768,14 @@ mod tests {
         append_vm_proxy_and_spiffe_args(
             &mut command,
             &VmComputeConfig {
-                upstream_proxy: openshell_core::UpstreamProxyConfig {
+                upstream_proxy: UpstreamProxyConfig {
                     https_proxy: Some("http://proxy.corp.com:8080".to_string()),
                     no_proxy: Some("10.0.0.0/8".to_string()),
                     proxy_auth_file: Some(PathBuf::from("/etc/openshell/secrets/proxy-auth")),
                     proxy_auth_allow_insecure: Some(true),
                     proxy_connect_by_hostname: Some(true),
                 },
+                proxy_ca_bundle: Some(PathBuf::from("/etc/openshell/tls/proxy-ca.pem")),
                 provider_spiffe_workload_api_tcp_endpoint: Some("tcp:192.0.2.10:8081".to_string()),
                 provider_spiffe_allow_guest_tcp: true,
                 ..VmComputeConfig::default()
@@ -774,6 +798,8 @@ mod tests {
                 "/etc/openshell/secrets/proxy-auth",
                 "--upstream-proxy-auth-allow-insecure",
                 "--upstream-proxy-connect-by-hostname",
+                "--upstream-proxy-ca-bundle",
+                "/etc/openshell/tls/proxy-ca.pem",
                 "--provider-spiffe-workload-api-tcp-endpoint",
                 "tcp:192.0.2.10:8081",
                 "--provider-spiffe-allow-guest-tcp",
@@ -790,7 +816,7 @@ mod tests {
 
     #[test]
     fn invalid_corporate_proxy_config_is_rejected_before_the_driver_starts() {
-        let err = openshell_core::UpstreamProxyConfig {
+        let err = UpstreamProxyConfig {
             https_proxy: Some("socks5://proxy.corp.com:1080".to_string()),
             ..Default::default()
         }
@@ -798,11 +824,21 @@ mod tests {
         .expect_err("only http:// and https:// proxies are supported");
         assert!(err.contains("https_proxy"), "{err}");
 
-        openshell_core::UpstreamProxyConfig {
-            https_proxy: Some("http://proxy.corp.com:8080".to_string()),
+        VmComputeConfig {
+            proxy_ca_bundle: Some(PathBuf::from("/etc/openshell/tls/proxy-ca.pem")),
             ..Default::default()
         }
-        .validate()
+        .validate_proxy_config()
+        .expect_err("a CA bundle without a proxy URL must fail closed");
+
+        VmComputeConfig {
+            upstream_proxy: UpstreamProxyConfig {
+                https_proxy: Some("http://proxy.corp.com:8080".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .validate_proxy_config()
         .expect("a lone proxy URL is a complete configuration");
     }
 

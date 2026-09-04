@@ -566,9 +566,7 @@ impl DockerComputeDriver {
             docker_config.grpc_endpoint = gateway_callback_endpoint(
                 GatewayCallbackTopology::Docker,
                 gateway_port,
-                docker_config.guest_tls_ca.is_some()
-                    || docker_config.guest_tls_cert.is_some()
-                    || docker_config.guest_tls_key.is_some(),
+                docker_guest_tls_configured(&docker_config),
             );
         }
         let grpc_endpoint = docker_container_openshell_endpoint(
@@ -4106,6 +4104,12 @@ fn canonicalize_existing_file(path: &Path, description: &str) -> CoreResult<Path
             path.display()
         ))
     })
+}
+
+fn docker_guest_tls_configured(docker_config: &DockerComputeConfig) -> bool {
+    docker_config.guest_tls_ca.is_some()
+        || docker_config.guest_tls_cert.is_some()
+        || docker_config.guest_tls_key.is_some()
 }
 
 pub(crate) fn docker_guest_tls_paths(

@@ -158,6 +158,7 @@ Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, 
 | `proxy_auth_file` | unset | Gateway-host path to a validated `user:pass` credential file. Staged root-only into the per-sandbox overlay and removed with the sandbox; credentials never enter logs or process arguments. |
 | `proxy_auth_allow_insecure` | unset | Required with `proxy_auth_file` against an `http://` proxy: acknowledges that Basic auth is cleartext on the connection to the proxy. |
 | `proxy_connect_by_hostname` | unset | Send hostnames rather than validated IPs in CONNECT. Last resort for proxies whose ACLs reject IP CONNECT targets. |
+| `proxy_ca_bundle` | unset | Gateway-host PEM CA bundle trusted for the corporate proxy and TLS-intercepted server certificates. The driver validates it and stages it at a fixed non-secret guest path in the protected overlay. Requires `https_proxy`. |
 | `provider_spiffe_workload_api_tcp_endpoint` | unset | Explicit guest-reachable `tcp:IP:port` SPIFFE Workload API listener for provider token exchange. It requires `provider_spiffe_allow_guest_tcp = true`; a host UNIX socket is never silently exposed to a VM guest. |
 
 The proxy settings are operator-owned and deployment-level: they are not accepted through `template.driver_config.vm`, and they reach the supervisor through a protected per-sandbox argument file the driver writes into the overlay upperdir on every launch, so a sandbox image cannot forge or shadow them. Every present-but-invalid value is fatal at gateway or sandbox startup rather than degrading to a direct dial.

@@ -172,6 +172,8 @@ const GUEST_INIT_DROPIN_MANIFEST: &str =
 /// Guest path of the root-only corporate proxy credential staged by the driver.
 const GUEST_UPSTREAM_PROXY_AUTH_PATH: &str =
     openshell_core::container_paths::VM_GUEST_UPSTREAM_PROXY_AUTH_PATH;
+/// Guest path of the corporate proxy CA bundle staged by the driver.
+const GUEST_PROXY_CA_PATH: &str = openshell_core::container_paths::VM_GUEST_PROXY_CA_PATH;
 /// Guest path of the driver-authored supervisor argument list.
 ///
 /// The counterpart of [`GUEST_INIT_DROPIN_MANIFEST`] for the supervisor's own
@@ -258,6 +260,9 @@ pub struct VmDriverConfig {
     /// Corporate forward proxy settings delivered to the guest init script.
     #[serde(flatten)]
     pub upstream_proxy: UpstreamProxyConfig,
+    /// Gateway-host PEM CA bundle staged into the guest overlay for the
+    /// corporate proxy and TLS-intercepted server certificates.
+    pub proxy_ca_bundle: Option<PathBuf>,
     /// Guest-reachable SPIFFE Workload API TCP endpoint. A VM cannot safely
     /// project a host UNIX socket; this must be a deliberately exposed TCP
     /// listener and requires `provider_spiffe_allow_guest_tcp`.
@@ -323,6 +328,10 @@ impl std::fmt::Debug for VmDriverConfig {
                 &self.upstream_proxy.proxy_connect_by_hostname,
             )
             .field(
+                "proxy_ca_bundle_configured",
+                &self.proxy_ca_bundle.is_some(),
+            )
+            .field(
                 "provider_spiffe_workload_api_tcp_endpoint_configured",
                 &self.provider_spiffe_workload_api_tcp_endpoint.is_some(),
             )
@@ -355,6 +364,7 @@ impl Default for VmDriverConfig {
             guest_tls_cert: None,
             guest_tls_key: None,
             upstream_proxy: UpstreamProxyConfig::default(),
+            proxy_ca_bundle: None,
             provider_spiffe_workload_api_tcp_endpoint: None,
             provider_spiffe_allow_guest_tcp: false,
             gpu_enabled: false,
@@ -379,6 +389,14 @@ impl VmDriverConfig {
 
     pub fn validate_runtime_security_config(&self) -> Result<(), String> {
         self.upstream_proxy.validate()?;
+        if let Some(path) = self.proxy_ca_bundle.as_ref() {
+            if path.as_os_str().is_empty() {
+                return Err("proxy_ca_bundle must not be empty when set".to_string());
+            }
+            if self.upstream_proxy.https_proxy.is_none() {
+                return Err("proxy_ca_bundle is set but no https_proxy is configured".to_string());
+            }
+        }
         if let Some(endpoint) = self.provider_spiffe_workload_api_tcp_endpoint.as_deref() {
             openshell_core::driver_utils::validate_guest_spiffe_tcp_endpoint(
                 endpoint,
@@ -4940,33 +4958,6 @@ fn build_guest_environment(
             GUEST_TLS_KEY_PATH.to_string(),
         );
     }
-    if let Some(url) = config.upstream_proxy.https_proxy.as_ref() {
-        environment.insert("OPENSHELL_VM_UPSTREAM_PROXY".to_string(), url.clone());
-    }
-    if let Some(no_proxy) = config.upstream_proxy.no_proxy.as_ref() {
-        environment.insert(
-            "OPENSHELL_VM_UPSTREAM_NO_PROXY".to_string(),
-            no_proxy.clone(),
-        );
-    }
-    if config.upstream_proxy.proxy_auth_file.is_some() {
-        environment.insert(
-            "OPENSHELL_VM_UPSTREAM_PROXY_AUTH_FILE".to_string(),
-            GUEST_UPSTREAM_PROXY_AUTH_PATH.to_string(),
-        );
-    }
-    if config.upstream_proxy.proxy_auth_allow_insecure == Some(true) {
-        environment.insert(
-            "OPENSHELL_VM_UPSTREAM_PROXY_AUTH_ALLOW_INSECURE".to_string(),
-            "true".to_string(),
-        );
-    }
-    if config.upstream_proxy.proxy_connect_by_hostname == Some(true) {
-        environment.insert(
-            "OPENSHELL_VM_UPSTREAM_PROXY_CONNECT_BY_HOSTNAME".to_string(),
-            "true".to_string(),
-        );
-    }
     if let Some(endpoint) = config.provider_spiffe_workload_api_tcp_endpoint.as_ref() {
         environment.insert(
             openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET.to_string(),
@@ -5824,6 +5815,11 @@ fn upstream_proxy_cli_args(config: &VmDriverConfig) -> Vec<String> {
     if config.upstream_proxy.proxy_connect_by_hostname == Some(true) {
         args.push("--upstream-proxy-connect-by-hostname".to_string());
     }
+    if config.proxy_ca_bundle.is_some() {
+        args.push("--upstream-proxy-ca-bundle".to_string());
+        // The guest path, never the gateway-host path the operator configured.
+        args.push(GUEST_PROXY_CA_PATH.to_string());
+    }
     args
 }
 
@@ -5866,7 +5862,10 @@ async fn read_sandbox_proxy_credential(path: &Path) -> Result<String, Status> {
     let path_owned = path.to_path_buf();
     let display_path = path.display().to_string();
     let raw = tokio::task::spawn_blocking(move || {
-        openshell_core::driver_utils::read_upstream_proxy_credential_file(&path_owned)
+        let path = path_owned
+            .to_str()
+            .ok_or_else(|| "proxy_auth_file path is not valid UTF-8".to_string())?;
+        openshell_core::driver_utils::read_upstream_proxy_credential_file(path)
     })
     .await
     .map_err(|err| Status::internal(format!("proxy_auth_file read task failed: {err}")))?
@@ -5878,11 +5877,37 @@ async fn read_sandbox_proxy_credential(path: &Path) -> Result<String, Status> {
     Ok(credential.to_string())
 }
 
+/// Read and validate the corporate proxy CA bundle from the gateway host.
+///
+/// The validation rejects symlinks and non-regular files, bounds the read,
+/// requires PEM certificate markers, and never includes file contents in an
+/// error.
+async fn read_sandbox_proxy_ca_bundle(path: &Path) -> Result<Vec<u8>, Status> {
+    let path_owned = path.to_path_buf();
+    let display_path = path.display().to_string();
+    tokio::task::spawn_blocking(move || {
+        let path = path_owned
+            .to_str()
+            .ok_or_else(|| "proxy_ca_bundle path is not valid UTF-8".to_string())?;
+        openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(path, "proxy_ca_bundle")
+            .map(String::into_bytes)
+    })
+    .await
+    .map_err(|err| Status::internal(format!("proxy_ca_bundle read task failed: {err}")))?
+    .map_err(|err| {
+        Status::invalid_argument(format!(
+            "proxy_ca_bundle '{display_path}' could not be read: {err}"
+        ))
+    })
+}
+
 /// Stage the corporate upstream-proxy configuration into the guest overlay.
 ///
-/// Writes two files into the overlay upperdir the driver owns:
+/// Writes three files into the overlay upperdir the driver owns:
 ///
 /// * the credential at [`GUEST_UPSTREAM_PROXY_AUTH_PATH`], mode `0600`;
+/// * the CA bundle at [`GUEST_PROXY_CA_PATH`], mode `0644` (a CA certificate
+///   is not secret);
 /// * the supervisor argument list at [`GUEST_SUPERVISOR_ARGS_PATH`], mode
 ///   `0644`.
 ///
@@ -5916,6 +5941,16 @@ async fn inject_guest_upstream_proxy(
         .map_err(|err| Status::internal(format!("write VM guest proxy credential: {err}")))?;
     set_rootfs_image_file_mode(overlay_disk, &credential_path, 0o600)
         .map_err(|err| Status::internal(format!("set VM guest proxy credential mode: {err}")))?;
+
+    let ca_bundle = match config.proxy_ca_bundle.as_deref() {
+        Some(path) => read_sandbox_proxy_ca_bundle(path).await?,
+        None => Vec::new(),
+    };
+    let ca_path = overlay_upper_path(GUEST_PROXY_CA_PATH);
+    write_rootfs_image_file(overlay_disk, &ca_path, &ca_bundle)
+        .map_err(|err| Status::internal(format!("write VM guest proxy CA bundle: {err}")))?;
+    set_rootfs_image_file_mode(overlay_disk, &ca_path, 0o644)
+        .map_err(|err| Status::internal(format!("set VM guest proxy CA bundle mode: {err}")))?;
 
     let args = upstream_proxy_cli_args(config);
     validate_guest_supervisor_args(&args).map_err(Status::failed_precondition)?;
@@ -8804,7 +8839,7 @@ mod tests {
     }
 
     #[test]
-    fn build_guest_environment_projects_operator_proxy_and_spiffe_endpoint() {
+    fn build_guest_environment_projects_spiffe_endpoint_without_operator_proxy() {
         let config = VmDriverConfig {
             upstream_proxy: UpstreamProxyConfig {
                 https_proxy: Some("https://proxy.example:8443".to_string()),
@@ -8823,18 +8858,13 @@ mod tests {
             ..Default::default()
         };
         let env = build_guest_environment(&sandbox, &config, None);
-        assert!(
-            env.contains(&"OPENSHELL_VM_UPSTREAM_PROXY=https://proxy.example:8443".to_string())
-        );
-        assert!(env.contains(&"OPENSHELL_VM_UPSTREAM_NO_PROXY=.svc".to_string()));
-        assert!(env.contains(&"OPENSHELL_VM_UPSTREAM_PROXY_CONNECT_BY_HOSTNAME=true".to_string()));
-        assert!(env.contains(&format!(
-            "OPENSHELL_VM_UPSTREAM_PROXY_AUTH_FILE={GUEST_UPSTREAM_PROXY_AUTH_PATH}"
-        )));
         assert!(env.contains(
             &"OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET=tcp:192.0.2.10:8081".to_string()
         ));
-        assert!(!env.iter().any(|value| value.contains("user:pass")));
+        assert!(
+            !env.iter().any(|value| value.contains("UPSTREAM_PROXY")),
+            "operator proxy settings must use protected guest argument staging: {env:?}"
+        );
     }
 
     #[test]
@@ -9837,7 +9867,11 @@ mod tests {
         // credential removable with the sandbox (remove_sandbox_state_dir
         // deletes the whole directory) and unforgeable by the guest image
         // (the upperdir shadows the read-only image layer).
-        for guest_path in [GUEST_UPSTREAM_PROXY_AUTH_PATH, GUEST_SUPERVISOR_ARGS_PATH] {
+        for guest_path in [
+            GUEST_UPSTREAM_PROXY_AUTH_PATH,
+            GUEST_PROXY_CA_PATH,
+            GUEST_SUPERVISOR_ARGS_PATH,
+        ] {
             assert!(
                 guest_path.starts_with("/opt/openshell/"),
                 "{guest_path} must be under the reserved guest control root"
@@ -9860,19 +9894,25 @@ mod tests {
 
     #[test]
     fn upstream_proxy_args_pass_guest_paths_not_host_paths() {
-        let config = proxy_config(
+        let mut config = proxy_config(
             Some("http://proxy.corp.test:3128"),
             Some("/etc/openshell/secrets/proxy-auth"),
         );
+        config.proxy_ca_bundle = Some(PathBuf::from("/etc/openshell/tls/corp-ca.pem"));
         let args = upstream_proxy_cli_args(&config);
 
-        // The credential lives at a fixed guest path; the gateway-host path
-        // the operator configured must never reach the guest argv.
+        // The credential and CA live at fixed guest paths; the gateway-host
+        // paths the operator configured must never reach the guest argv.
         let auth = args
             .iter()
             .position(|arg| arg == "--upstream-proxy-auth-file")
             .map(|i| args[i + 1].as_str());
         assert_eq!(auth, Some(GUEST_UPSTREAM_PROXY_AUTH_PATH));
+        let ca = args
+            .iter()
+            .position(|arg| arg == "--upstream-proxy-ca-bundle")
+            .map(|i| args[i + 1].as_str());
+        assert_eq!(ca, Some(GUEST_PROXY_CA_PATH));
         assert!(
             !args
                 .iter()
@@ -9959,6 +9999,15 @@ mod tests {
         config
             .validate_runtime_security_config()
             .expect("a lone proxy URL is a complete configuration");
+
+        let config = VmDriverConfig {
+            proxy_ca_bundle: Some(PathBuf::from("/etc/openshell/tls/corp-ca.pem")),
+            ..Default::default()
+        };
+        let err = config
+            .validate_runtime_security_config()
+            .expect_err("a CA bundle without a proxy URL must fail closed");
+        assert!(err.contains("proxy_ca_bundle"), "{err}");
     }
 
     #[test]
@@ -10079,7 +10128,7 @@ mod tests {
 
         std::fs::write(&path, "proxyuser:proxypass\n").unwrap();
         assert_eq!(
-            read_sandbox_proxy_credential(path.to_str().unwrap())
+            read_sandbox_proxy_credential(&path)
                 .await
                 .expect("a well-formed credential is accepted"),
             "proxyuser:proxypass"
@@ -10087,7 +10136,7 @@ mod tests {
 
         // Rejected here rather than inside every sandbox's supervisor.
         std::fs::write(&path, "no-separator\n").unwrap();
-        let err = read_sandbox_proxy_credential(path.to_str().unwrap())
+        let err = read_sandbox_proxy_credential(&path)
             .await
             .expect_err("a malformed credential must fail closed");
         assert_eq!(err.code(), Code::InvalidArgument);

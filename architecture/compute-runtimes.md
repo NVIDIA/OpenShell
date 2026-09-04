@@ -300,7 +300,11 @@ explicitly. The Helm chart independently uses `Unconfined` for Kubernetes.
 Corporate proxy settings are driver-owned supervisor inputs. Docker, Podman,
 and VM propagate `https_proxy`, `no_proxy`, an optional root-only auth file,
 and the explicit cleartext-Basic-auth acknowledgement without allowing
-workload environment to override them. Local containers project provider SPIFFE
+workload environment to override them. Podman and VM can also project an
+operator CA bundle for an HTTPS or TLS-intercepting proxy. The VM driver validates and
+stages its credential and CA bundle under fixed guest paths, then forwards
+those paths through the protected supervisor argument file rather than the
+guest environment. Local containers project provider SPIFFE
 through a dedicated host UNIX-socket parent mount. A VM cannot safely expose
 that host socket: it accepts only a separately operated, concrete TCP listener
 when `provider_spiffe_allow_guest_tcp = true` explicitly acknowledges guest

@@ -928,11 +928,14 @@ overlay_disk_mib = 4096
 # address routable from the guest's masqueraded egress.
 #
 # Because a microVM has no bind mounts or container secrets, the driver stages
-# the credential into the per-sandbox overlay disk, root-only inside the guest,
-# and removes it with the sandbox. The credential is therefore at rest in that
-# overlay image on the gateway host — the same delivery the per-sandbox gateway
-# token already uses, and a difference from the Podman secret model worth noting
-# when choosing where to keep proxy credentials.
+# the credential and optional CA bundle into the per-sandbox overlay disk and
+# removes them with the sandbox. The credential is root-only; the non-secret CA
+# bundle is mode 0644. Both are referenced from the protected supervisor
+# argument file by fixed guest paths, never their gateway-host paths. The
+# credential is therefore at rest in that overlay image on the gateway host —
+# the same delivery the per-sandbox gateway token already uses, and a difference
+# from the Podman secret model worth noting when choosing where to keep proxy
+# credentials.
 # https_proxy               = "http://host.openshell.internal:8080"
 # no_proxy                  = "10.0.0.0/8,.internal.example"
 # proxy_auth_file           = "/etc/openshell/secrets/proxy-auth"
@@ -940,6 +943,9 @@ overlay_disk_mib = 4096
 # proxy_auth_allow_insecure = true
 # Last resort for hostname-filtering proxy ACLs; see the Podman section above.
 # proxy_connect_by_hostname = true
+# Gateway-host PEM bundle trusted for an https:// proxy and for server
+# certificates re-signed by a TLS-intercepting proxy. Requires https_proxy.
+# proxy_ca_bundle           = "/etc/openshell/tls/proxy-ca.pem"
 # VM guests cannot mount a host Workload API Unix socket. Configure only a
 # separately operated guest-reachable TCP listener and explicitly acknowledge
 # the exposure; host-only sockets are never exposed automatically.

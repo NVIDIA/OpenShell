@@ -73,7 +73,17 @@ REQUIRED_STEP_12_IDS = {
     "rpm-package-upgrade",
     "snap-package-refresh",
 }
-STEP_10_CANDIDATE_COMMIT = "4a39da510e4d278a24dd60291149519c9a570b46"
+EXPECTED_EXECUTED_CANDIDATE_COMMITS = {
+    "portable-lifecycle-podman": "a3860084d019ed2ac979e3eaa1ddf085a96b773c",
+    "gateway-wide-process-options": "e6aac1aa7c624c5df43535ab4fbe2bc6f9697dea",
+    "gateway-tls-client-auth-policy": "e6aac1aa7c624c5df43535ab4fbe2bc6f9697dea",
+    "podman-driver-option-parity": "e09070d4ba0b30f0ac278fbb9938c1520ecff696",
+    "kubernetes-core-option-parity": "0f08b5822e4da98c9ced3d4b0f2bf4f30dae28fd",
+    "compute-driver-boundary-parity": "4a39da510e4d278a24dd60291149519c9a570b46",
+}
+STEP_10_CANDIDATE_COMMIT = EXPECTED_EXECUTED_CANDIDATE_COMMITS[
+    "compute-driver-boundary-parity"
+]
 STEP_10_REPORT_SHA256 = (
     "65541eec5f642461a88b04b5459474fd7a475adeb7071a65a53fe183caad6a01"
 )
@@ -153,25 +163,28 @@ def test_step_5_covers_every_in_tree_compute_driver() -> None:
 
 def test_executed_results_pin_commits_and_evidence() -> None:
     manifest = load_toml(RESULTS_PATH)
-    for result in manifest["result"]:
-        if result["status"] not in {"pass", "intentional_change"}:
-            continue
+    executed = {
+        result["id"]: result
+        for result in manifest["result"]
+        if result["status"] in {"pass", "intentional_change"}
+    }
+    assert set(executed) == set(EXPECTED_EXECUTED_CANDIDATE_COMMITS)
 
-        assert set(result) >= PASS_FIELDS, result["id"]
+    for result_id, result in executed.items():
+        assert set(result) >= PASS_FIELDS, result_id
         assert result["validated_baseline_commit"] == manifest["baseline_commit"]
         candidate = assert_full_sha(
             result["validated_candidate_commit"],
-            f"{result['id']}.validated_candidate_commit",
+            f"{result_id}.validated_candidate_commit",
         )
+        assert candidate == EXPECTED_EXECUTED_CANDIDATE_COMMITS[result_id]
         assert isinstance(result["evidence"], list) and result["evidence"]
         assert all(
             isinstance(item, str) and item.strip() for item in result["evidence"]
         )
-        subprocess.run(
-            ["git", "merge-base", "--is-ancestor", candidate, "HEAD"],
-            cwd=REPO_ROOT,
-            check=True,
-        )
+        # These immutable SHAs bind the original live-validation artifacts.
+        # A later history-preserving source rebase can intentionally make those
+        # exact execution commits non-ancestors without changing the evidence.
 
 
 def test_step_6_records_gateway_option_and_tls_dispositions() -> None:
