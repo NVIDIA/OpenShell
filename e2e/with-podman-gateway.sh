@@ -319,6 +319,17 @@ ensure_podman_supervisor_image() {
   if [ -n "${OPENSHELL_E2E_SUPERVISOR_BIN:-}" ]; then
     local dockerfile=${OPENSHELL_E2E_SUPERVISOR_DOCKERFILE:-${ROOT}/deploy/docker/Dockerfile.supervisor}
     local context="${WORKDIR}/supervisor-image" arch
+    case "${image}" in
+      *:dev|*:latest)
+        echo "ERROR: supplied supervisor binaries require a unique versioned image tag, not ${image}." >&2
+        exit 2
+        ;;
+      *:*) ;;
+      *)
+        echo "ERROR: supplied supervisor binaries require an explicit versioned image tag: ${image}." >&2
+        exit 2
+        ;;
+    esac
     case "$(uname -m)" in
       x86_64|amd64) arch=amd64 ;;
       aarch64|arm64) arch=arm64 ;;
@@ -436,16 +447,21 @@ SUPERVISOR_IMAGE="$(resolve_podman_supervisor_image)"
 ensure_podman_supervisor_image "${SUPERVISOR_IMAGE}"
 SUPERVISOR_IMAGE_ID="$(podman_cmd image inspect --format '{{.Id}}' "${SUPERVISOR_IMAGE}")"
 SUPERVISOR_IMAGE_ID="${SUPERVISOR_IMAGE_ID#sha256:}"
-SUPERVISOR_RUNTIME_IMAGE="$(podman_cmd image inspect --format '{{index .RepoDigests 0}}' "${SUPERVISOR_IMAGE}")"
+SUPERVISOR_IMAGE_DIGEST="$(podman_cmd image inspect --format '{{.Digest}}' "${SUPERVISOR_IMAGE}")"
 if ! [[ "${SUPERVISOR_IMAGE_ID}" =~ ^[0-9a-f]{64}$ ]]; then
   echo "ERROR: could not resolve immutable supervisor image ID for ${SUPERVISOR_IMAGE}." >&2
   exit 2
 fi
-if ! [[ "${SUPERVISOR_RUNTIME_IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]]; then
-  echo "ERROR: could not resolve digest-pinned supervisor image reference for ${SUPERVISOR_IMAGE}." >&2
+if ! [[ "${SUPERVISOR_IMAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  echo "ERROR: could not resolve supervisor image digest for ${SUPERVISOR_IMAGE}." >&2
   exit 2
 fi
-echo "Using Podman supervisor image: ${SUPERVISOR_RUNTIME_IMAGE} (ID ${SUPERVISOR_IMAGE_ID})"
+# Locally built RepoDigest references make Podman's pull API contact a registry
+# even when the corresponding image is present. The per-variant tag is unique
+# to this exact source SHA and lives in an isolated store; its resolved ID and
+# manifest digest attest the image that the driver consumes with policy=missing.
+SUPERVISOR_RUNTIME_IMAGE="${SUPERVISOR_IMAGE}"
+echo "Using Podman supervisor image: ${SUPERVISOR_RUNTIME_IMAGE} (ID ${SUPERVISOR_IMAGE_ID}, digest ${SUPERVISOR_IMAGE_DIGEST})"
 
 DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 SANDBOX_IMAGE="${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
@@ -518,13 +534,14 @@ if [ -n "${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE:-}" ]; then
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     driver_transport=remote_uds
   fi
-  printf '{"schema_version":%s,"external_compute_driver":%s,"compute_driver_transport":"%s","external_driver_pull_policy":"%s","supervisor_image":"%s","supervisor_image_id":"%s","supervisor_runtime_image":"%s"}\n' \
+  printf '{"schema_version":%s,"external_compute_driver":%s,"compute_driver_transport":"%s","external_driver_pull_policy":"%s","supervisor_image":"%s","supervisor_image_id":"%s","supervisor_image_digest":"%s","supervisor_runtime_image":"%s"}\n' \
     "${CONFIG_SCHEMA_VERSION}" \
     "$([ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ] && printf true || printf false)" \
     "${driver_transport}" \
     "${EXTERNAL_DRIVER_PULL_POLICY}" \
     "${SUPERVISOR_IMAGE}" \
     "${SUPERVISOR_IMAGE_ID}" \
+    "${SUPERVISOR_IMAGE_DIGEST}" \
     "${SUPERVISOR_RUNTIME_IMAGE}" \
     >"${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE}"
 fi

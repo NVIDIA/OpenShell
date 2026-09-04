@@ -89,9 +89,9 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = 1 ]; then
   transport=remote_uds
   external=true
 fi
-printf '{"schema_version":%s,"external_compute_driver":%s,"compute_driver_transport":"%s","external_driver_pull_policy":"%s","supervisor_image":"%s","supervisor_image_id":"%064d","supervisor_runtime_image":"localhost/openshell/supervisor@sha256:%064d"}\n' \
+printf '{"schema_version":%s,"external_compute_driver":%s,"compute_driver_transport":"%s","external_driver_pull_policy":"%s","supervisor_image":"%s","supervisor_image_id":"%064d","supervisor_image_digest":"sha256:%064d","supervisor_runtime_image":"%s"}\n' \
   "${OPENSHELL_E2E_CONFIG_SCHEMA_VERSION}" "${external}" "${transport}" "${pull_policy}" \
-  "${OPENSHELL_SUPERVISOR_IMAGE}" 0 0 \
+  "${OPENSHELL_SUPERVISOR_IMAGE}" 0 0 "${OPENSHELL_SUPERVISOR_IMAGE}" \
   >"${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE}"
 if [ "${OPENSHELL_PARITY_TEST_MUTATE_ARTIFACT:-}" = "${OPENSHELL_PARITY_VARIANT}" ]; then
   replacement="${OPENSHELL_GATEWAY_BIN}.replacement"
@@ -194,7 +194,8 @@ assert_contains "${WORKDIR}/results/baseline.json" '"gateway_origin":"supplied_o
 assert_contains "${WORKDIR}/results/baseline.json" '"external_driver_origin":"supplied_override"'
 assert_contains "${WORKDIR}/results/baseline.launch.json" '"compute_driver_transport":"remote_uds"'
 assert_contains "${WORKDIR}/results/baseline.launch.json" '"external_driver_pull_policy":"missing"'
-assert_contains "${WORKDIR}/results/baseline.launch.json" '"supervisor_runtime_image":"localhost/openshell/supervisor@sha256:'
+assert_contains "${WORKDIR}/results/baseline.launch.json" '"supervisor_image_digest":"sha256:'
+assert_contains "${WORKDIR}/results/baseline.launch.json" '"supervisor_runtime_image":"openshell/supervisor:parity-baseline-'
 assert_contains "${WORKDIR}/results/candidate.launch.json" '"external_driver_pull_policy":"if_not_present"'
 assert_contains "${WORKDIR}/results/baseline.json" '"gateway_sha256"'
 assert_contains "${WORKDIR}/results/baseline.json" '"cli_sha256"'
