@@ -845,6 +845,8 @@ guest_tls_key    = "/var/lib/openshell/guest-tls/client-key.pem"
 # request-scoped subdirectory per staging slot and removes it after use.
 # rootfs_tar_staging_dir = "/var/lib/openshell/vm/rootfs-tar-staging"
 # Largest rootfs tar archive the driver accepts, in bytes. Defaults to 10 GiB.
+# Gzip archives are decompressed while staging, and the limit also bounds the
+# expanded tar.
 # rootfs_tar_max_bytes = 10737418240
 ```
 

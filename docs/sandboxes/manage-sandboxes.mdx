@@ -182,9 +182,14 @@ the gateway host's filesystem, the two must share a filesystem and run as the
 same user. Gateways using the Docker, Podman, or Kubernetes drivers reject
 rootfs tar sources.
 
+Gzip-compressed archives (`.tar.gz`, `.tgz`) are decompressed while the gateway
+stages them, so the sandbox sees the same filesystem either way. Compression is
+detected from the archive contents, not the file name.
+
 The gateway caps archive size (10 GiB by default, configurable with the VM
 driver's `rootfs_tar_max_bytes`), and reclaims an unused staging slot after 30
-minutes.
+minutes. The cap applies to the expanded archive too: a compressed source that
+decompresses past the limit is rejected.
 
 ## Reuse Workload Templates
 

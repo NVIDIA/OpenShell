@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use flate2::read::MultiGzDecoder;
 use std::fs;
 use std::fs::File;
 #[cfg(test)]
 use std::io::BufWriter;
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,6 +14,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const SUPERVISOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-sandbox.zst"));
 const UMOCI: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/umoci.zst"));
 const ROOTFS_VARIANT_MARKER: &str = ".openshell-rootfs-variant";
+/// Leading bytes of a gzip stream, used to recognize `.tar.gz`/`.tgz` input
+/// without trusting the file name.
+pub const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 const SANDBOX_GUEST_INIT_PATH: &str = "/srv/openshell-vm-sandbox-init.sh";
 const SANDBOX_SUPERVISOR_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
 const SANDBOX_UMOCI_PATH: &str = openshell_core::container_paths::VM_UMOCI_PATH;
@@ -44,6 +48,12 @@ pub fn prepare_sandbox_rootfs_from_image_root(
     Ok(())
 }
 
+/// Extract a rootfs tarball, transparently decompressing gzip archives.
+///
+/// Compression is detected from the magic bytes rather than the file name:
+/// `--from` accepts `.tar.gz` and `.tgz`, but nothing guarantees a caller's
+/// extension matches the bytes, and the archives this crate stages internally
+/// carry no extension at all.
 pub fn extract_rootfs_archive_to(archive_path: &Path, dest: &Path) -> Result<(), String> {
     if dest.exists() {
         fs::remove_dir_all(dest)
@@ -53,8 +63,20 @@ pub fn extract_rootfs_archive_to(archive_path: &Path, dest: &Path) -> Result<(),
     fs::create_dir_all(dest).map_err(|e| format!("create rootfs dir {}: {e}", dest.display()))?;
     let file =
         File::open(archive_path).map_err(|e| format!("open {}: {e}", archive_path.display()))?;
-    let mut archive = tar::Archive::new(file);
-    archive
+    let mut reader = BufReader::new(file);
+    let compressed = reader
+        .fill_buf()
+        .map_err(|e| format!("read {}: {e}", archive_path.display()))?
+        .starts_with(&GZIP_MAGIC);
+    if compressed {
+        unpack_tar_reader(MultiGzDecoder::new(reader), dest)
+    } else {
+        unpack_tar_reader(reader, dest)
+    }
+}
+
+fn unpack_tar_reader(reader: impl Read, dest: &Path) -> Result<(), String> {
+    tar::Archive::new(reader)
         .unpack(dest)
         .map_err(|e| format!("extract rootfs tarball into {}: {e}", dest.display()))
 }
@@ -1026,6 +1048,36 @@ mod tests {
         assert_eq!(
             fs::read_to_string(rootfs.join("sandbox/app.py")).expect("read app"),
             "print('hello')\n"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `--from` accepts `.tar.gz` and `.tgz`, so extraction must recognize a
+    /// gzip stream instead of handing compressed bytes to the tar reader.
+    #[test]
+    fn extract_rootfs_archive_accepts_gzip_archives() {
+        let dir = unique_temp_dir();
+        let rootfs = dir.join("rootfs");
+        let extracted = dir.join("extracted");
+        let archive = dir.join("rootfs.tar");
+        let gz_archive = dir.join("rootfs.tar.gz");
+
+        fs::create_dir_all(rootfs.join("etc")).expect("create etc");
+        fs::write(rootfs.join("etc/marker.txt"), "gzip-rootfs\n").expect("write marker");
+        create_rootfs_archive_from_dir(&rootfs, &archive).expect("archive rootfs");
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(&fs::read(&archive).expect("read archive"))
+            .expect("gzip archive");
+        fs::write(&gz_archive, encoder.finish().expect("finish gzip")).expect("write gzip archive");
+
+        extract_rootfs_archive_to(&gz_archive, &extracted).expect("extract gzip rootfs");
+
+        assert_eq!(
+            fs::read_to_string(extracted.join("etc/marker.txt")).expect("read extracted marker"),
+            "gzip-rootfs\n"
         );
 
         let _ = fs::remove_dir_all(&dir);
