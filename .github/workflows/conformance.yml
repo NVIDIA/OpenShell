@@ -4,7 +4,16 @@
 name: Conformance
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      target_arch:
+        description: "Architecture for package artifacts"
+        required: false
+        default: amd64
+        type: choice
+        options:
+          - amd64
+          - arm64
 
 permissions: {}
 
@@ -25,6 +34,55 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: gate
         uses: ./.github/actions/pr-gate
+
+  target:
+    name: Resolve target architecture
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      arch: ${{ steps.target.outputs.arch }}
+      build_runner: ${{ steps.target.outputs.build_runner }}
+      test_runner: ${{ steps.target.outputs.test_runner }}
+      rpm_arch: ${{ steps.target.outputs.rpm_arch }}
+      musl_triple: ${{ steps.target.outputs.musl_triple }}
+      gnu_triple: ${{ steps.target.outputs.gnu_triple }}
+      musl_dev_shell: ${{ steps.target.outputs.musl_dev_shell }}
+      gnu_dev_shell: ${{ steps.target.outputs.gnu_dev_shell }}
+      gateway_interpreter: ${{ steps.target.outputs.gateway_interpreter }}
+    steps:
+      - id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ inputs.target_arch }}" in
+            amd64)
+              cat >> "$GITHUB_OUTPUT" <<'EOF'
+          arch=amd64
+          build_runner=linux-amd64-cpu8
+          test_runner=ubuntu-24.04
+          rpm_arch=x86_64
+          musl_triple=x86_64-unknown-linux-musl
+          gnu_triple=x86_64-unknown-linux-gnu
+          musl_dev_shell=.#devShells.x86_64-linux.musl
+          gnu_dev_shell=.#devShells.x86_64-linux.glibc-2-28
+          gateway_interpreter=/lib64/ld-linux-x86-64.so.2
+          EOF
+              ;;
+            arm64)
+              cat >> "$GITHUB_OUTPUT" <<'EOF'
+          arch=arm64
+          build_runner=linux-arm64-cpu8
+          test_runner=ubuntu-24.04-arm
+          rpm_arch=aarch64
+          musl_triple=aarch64-unknown-linux-musl
+          gnu_triple=aarch64-unknown-linux-gnu
+          musl_dev_shell=.#devShells.aarch64-linux.musl
+          gnu_dev_shell=.#devShells.aarch64-linux.glibc-2-28
+          gateway_interpreter=/lib/ld-linux-aarch64.so.1
+          EOF
+              ;;
+          esac
 
   version:
     needs: pr_metadata
@@ -55,69 +113,69 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   build-cli:
-    needs: version
+    needs: [version, target]
     permissions:
       contents: read
     uses: ./.github/workflows/build-binaries.yml
     with:
       package: openshell-cli
       binary: openshell
-      triple: x86_64-unknown-linux-musl
-      runner: linux-amd64-cpu8
-      dev-shell: .#devShells.x86_64-linux.musl
+      triple: ${{ needs.target.outputs.musl_triple }}
+      runner: ${{ needs.target.outputs.build_runner }}
+      dev-shell: ${{ needs.target.outputs.musl_dev_shell }}
       cargo-version: ${{ needs.version.outputs.cargo }}
       checkout-ref: ${{ github.sha }}
     secrets: inherit
 
   build-conformance:
-    needs: version
+    needs: [version, target]
     permissions:
       contents: read
     uses: ./.github/workflows/build-binaries.yml
     with:
       package: openshell-conformance-cli
       binary: openshell-conformance
-      triple: x86_64-unknown-linux-musl
-      runner: linux-amd64-cpu8
-      dev-shell: .#devShells.x86_64-linux.musl
+      triple: ${{ needs.target.outputs.musl_triple }}
+      runner: ${{ needs.target.outputs.build_runner }}
+      dev-shell: ${{ needs.target.outputs.musl_dev_shell }}
       cargo-version: ${{ needs.version.outputs.cargo }}
       checkout-ref: ${{ github.sha }}
     secrets: inherit
 
   build-gateway:
-    needs: version
+    needs: [version, target]
     permissions:
       contents: read
     uses: ./.github/workflows/build-binaries.yml
     with:
       package: openshell-gateway
       binary: openshell-gateway
-      triple: x86_64-unknown-linux-gnu
-      runner: linux-amd64-cpu8
-      dev-shell: .#devShells.x86_64-linux.glibc-2-28
+      triple: ${{ needs.target.outputs.gnu_triple }}
+      runner: ${{ needs.target.outputs.build_runner }}
+      dev-shell: ${{ needs.target.outputs.gnu_dev_shell }}
       cargo-version: ${{ needs.version.outputs.cargo }}
       image-tag: dev
-      interpreter: /lib64/ld-linux-x86-64.so.2
+      interpreter: ${{ needs.target.outputs.gateway_interpreter }}
       checkout-ref: ${{ github.sha }}
     secrets: inherit
 
   build-sandbox:
-    needs: version
+    needs: [version, target]
     permissions:
       contents: read
     uses: ./.github/workflows/build-binaries.yml
     with:
       package: openshell-sandbox
       binary: openshell-sandbox
-      triple: x86_64-unknown-linux-musl
-      runner: linux-amd64-cpu8
-      dev-shell: .#devShells.x86_64-linux.musl
+      triple: ${{ needs.target.outputs.musl_triple }}
+      runner: ${{ needs.target.outputs.build_runner }}
+      dev-shell: ${{ needs.target.outputs.musl_dev_shell }}
       cargo-version: ${{ needs.version.outputs.cargo }}
       checkout-ref: ${{ github.sha }}
     secrets: inherit
 
   build-snap:
-    needs: [build-cli, build-gateway, build-sandbox]
+    needs: [build-cli, build-gateway, build-sandbox, target]
     permissions:
       actions: read
       contents: read
@@ -125,31 +183,31 @@ jobs:
     uses: ./.github/workflows/build-snap.yml
     with:
       checkout-ref: ${{ github.sha }}
-      arch: amd64
-      runner: linux-amd64-cpu8
-      cli-artifact-name: openshell-x86_64-unknown-linux-musl
-      gateway-artifact-name: openshell-gateway-x86_64-unknown-linux-gnu
-      supervisor-artifact-name: openshell-sandbox-x86_64-unknown-linux-musl
+      arch: ${{ needs.target.outputs.arch }}
+      runner: ${{ needs.target.outputs.build_runner }}
+      cli-artifact-name: openshell-${{ needs.target.outputs.musl_triple }}
+      gateway-artifact-name: openshell-gateway-${{ needs.target.outputs.gnu_triple }}
+      supervisor-artifact-name: openshell-sandbox-${{ needs.target.outputs.musl_triple }}
 
   build-rpm:
-    needs: [version, build-cli, build-gateway]
+    needs: [version, build-cli, build-gateway, target]
     permissions:
       contents: read
     uses: ./.github/workflows/build-rpm.yml
     with:
       checkout-ref: ${{ github.sha }}
-      arch: x86_64
-      runner: linux-amd64-cpu8
-      cli-target: x86_64-unknown-linux-musl
-      gateway-target: x86_64-unknown-linux-gnu
+      arch: ${{ needs.target.outputs.rpm_arch }}
+      runner: ${{ needs.target.outputs.build_runner }}
+      cli-target: ${{ needs.target.outputs.musl_triple }}
+      gateway-target: ${{ needs.target.outputs.gnu_triple }}
       cargo-version: ${{ needs.version.outputs.cargo }}
       rpm-version: ${{ needs.version.outputs.rpm_version }}
       rpm-release: ${{ needs.version.outputs.rpm_release }}
 
   fedora:
     name: Fedora with Rootless Podman
-    needs: [build-conformance, build-rpm]
-    runs-on: ubuntu-24.04
+    needs: [build-conformance, build-rpm, target]
+    runs-on: ${{ needs.target.outputs.test_runner }}
     timeout-minutes: 45
     permissions:
       actions: read
@@ -175,13 +233,13 @@ jobs:
       - name: Download RPM artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: rpm-linux-x86_64
+          name: rpm-linux-${{ needs.target.outputs.rpm_arch }}
           path: rpm-input
 
       - name: Download conformance CLI
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: openshell-conformance-x86_64-unknown-linux-musl
+          name: openshell-conformance-${{ needs.target.outputs.musl_triple }}
           path: conformance-input
 
       - name: Run RPM gateway continuity conformance
@@ -213,9 +271,9 @@ jobs:
             -- /tmp/openshell-conformance run --plan /tmp/conformance-plan.toml
 
   ubuntu-snap:
-    name: Ubuntu Snap with Docker Snap
-    needs: build-snap
-    runs-on: ubuntu-24.04
+    name: Ubuntu Snap with Docker Snap (${{ needs.target.outputs.arch }})
+    needs: [build-snap, target]
+    runs-on: ${{ needs.target.outputs.test_runner }}
     timeout-minutes: 45
     permissions:
       actions: read
@@ -241,7 +299,7 @@ jobs:
       - name: Download Snap artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: snap-linux-amd64
+          name: snap-linux-${{ needs.target.outputs.arch }}
           path: snap-input
 
       - name: Install Snap and verify gateway status
