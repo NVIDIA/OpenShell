@@ -7999,7 +7999,7 @@ network_policies:
         old_sessions
             .pop()
             .expect("old-generation session")
-            .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
             .await;
         let admitted = current_runner
             .preflight_websocket(

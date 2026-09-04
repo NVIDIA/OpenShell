@@ -97,7 +97,8 @@ pub enum WebSocketAssemblyAdmissionOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WebSocketTerminationCause {
-    PeerDisconnect,
+    DownstreamDisconnect,
+    UpstreamDisconnect,
     PolicyReload,
     CapacityExhausted,
     MiddlewareDenial,
@@ -111,7 +112,7 @@ enum WebSocketTerminationCause {
 impl WebSocketTerminationCause {
     fn close_code(self) -> Option<u16> {
         match self {
-            Self::PeerDisconnect => None,
+            Self::DownstreamDisconnect | Self::UpstreamDisconnect => None,
             Self::PolicyReload => Some(1012),
             Self::CapacityExhausted => Some(1013),
             Self::MiddlewareDenial | Self::MiddlewareFailure | Self::PolicyDenial => Some(1008),
@@ -121,21 +122,24 @@ impl WebSocketTerminationCause {
         }
     }
 
-    fn session_end_reason(self) -> openshell_core::proto::WebSocketSessionEndReason {
+    fn session_end_reason(self) -> openshell_core::proto::MiddlewareSessionEndReason {
         match self {
-            Self::PeerDisconnect => {
-                openshell_core::proto::WebSocketSessionEndReason::PeerDisconnect
+            Self::DownstreamDisconnect => {
+                openshell_core::proto::MiddlewareSessionEndReason::DownstreamDisconnect
             }
-            Self::PolicyReload => openshell_core::proto::WebSocketSessionEndReason::PolicyReload,
+            Self::UpstreamDisconnect => {
+                openshell_core::proto::MiddlewareSessionEndReason::UpstreamDisconnect
+            }
+            Self::PolicyReload => openshell_core::proto::MiddlewareSessionEndReason::PolicyReload,
             Self::MiddlewareDenial => {
-                openshell_core::proto::WebSocketSessionEndReason::MiddlewareDenial
+                openshell_core::proto::MiddlewareSessionEndReason::MiddlewareDenial
             }
-            Self::PolicyDenial => openshell_core::proto::WebSocketSessionEndReason::PolicyDenial,
+            Self::PolicyDenial => openshell_core::proto::MiddlewareSessionEndReason::PolicyDenial,
             Self::CapacityExhausted | Self::MiddlewareFailure => {
-                openshell_core::proto::WebSocketSessionEndReason::MiddlewareFailure
+                openshell_core::proto::MiddlewareSessionEndReason::MiddlewareFailure
             }
             Self::InvalidUtf8 | Self::ProtocolError | Self::MessageTooBig => {
-                openshell_core::proto::WebSocketSessionEndReason::ProtocolError
+                openshell_core::proto::MiddlewareSessionEndReason::ProtocolError
             }
         }
     }
@@ -189,7 +193,8 @@ enum AssemblyTimeoutKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrameErrorKind {
-    PeerDisconnect,
+    DownstreamDisconnect,
+    UpstreamDisconnect,
     Protocol(FrameFailureClass),
     InvalidUtf8,
     MessageTooBig,
@@ -209,17 +214,24 @@ impl std::fmt::Display for FrameError {
 }
 
 impl FrameError {
-    fn peer_io(context: &str, error: std::io::Error) -> Self {
+    fn client_io(error: std::io::Error) -> Self {
         Self {
-            kind: FrameErrorKind::PeerDisconnect,
-            error: miette!("{context}: {error}"),
+            kind: FrameErrorKind::DownstreamDisconnect,
+            error: miette!("websocket client read failed: {error}"),
         }
     }
 
-    fn peer_disconnect(error: miette::Report) -> Self {
+    fn client_disconnect(error: miette::Report) -> Self {
         Self {
-            kind: FrameErrorKind::PeerDisconnect,
+            kind: FrameErrorKind::DownstreamDisconnect,
             error,
+        }
+    }
+
+    fn upstream_io(context: &str, error: std::io::Error) -> Self {
+        Self {
+            kind: FrameErrorKind::UpstreamDisconnect,
+            error: miette!("{context}: {error}"),
         }
     }
 
@@ -263,7 +275,12 @@ impl FrameError {
 impl From<FrameError> for WebSocketTermination {
     fn from(frame_error: FrameError) -> Self {
         let (cause, failure_class) = match frame_error.kind {
-            FrameErrorKind::PeerDisconnect => (WebSocketTerminationCause::PeerDisconnect, None),
+            FrameErrorKind::DownstreamDisconnect => {
+                (WebSocketTerminationCause::DownstreamDisconnect, None)
+            }
+            FrameErrorKind::UpstreamDisconnect => {
+                (WebSocketTerminationCause::UpstreamDisconnect, None)
+            }
             FrameErrorKind::Protocol(failure_class) => (
                 WebSocketTerminationCause::ProtocolError,
                 Some(failure_class),
@@ -381,7 +398,7 @@ impl TextMessageAssembly {
                 Err(FrameError::assembly_timeout(AssemblyTimeoutKind::Idle))
             }
             result = reader.read(buffer) => {
-                result.map_err(|error| FrameError::peer_io("websocket client read failed", error))
+                result.map_err(FrameError::client_io)
             },
         }
     }
@@ -395,7 +412,7 @@ impl TextMessageAssembly {
         while filled < buffer.len() {
             let read = self.read_some(reader, &mut buffer[filled..]).await?;
             if read == 0 {
-                return Err(FrameError::peer_disconnect(miette!(
+                return Err(FrameError::client_disconnect(miette!(
                     "websocket payload ended before declared length"
                 )));
             }
@@ -524,22 +541,35 @@ where
         &mut options,
     );
     let server_to_client = async {
-        tokio::io::copy(&mut upstream_read, &mut client_write)
-            .await
-            .map_err(|error| {
+        let mut buf = vec![0u8; COPY_BUF_SIZE];
+        loop {
+            let read = upstream_read.read(&mut buf).await.map_err(|error| {
                 terminate(
-                    WebSocketTerminationCause::PeerDisconnect,
-                    miette!("websocket upstream relay ended: {error}"),
+                    WebSocketTerminationCause::UpstreamDisconnect,
+                    miette!("websocket upstream read failed: {error}"),
                 )
             })?;
-        client_write.flush().await.map_err(|error| {
-            terminate(
-                WebSocketTerminationCause::PeerDisconnect,
-                miette!("websocket client relay ended: {error}"),
-            )
-        })?;
+            if read == 0 {
+                break;
+            }
+            client_write
+                .write_all(&buf[..read])
+                .await
+                .map_err(|error| {
+                    terminate(
+                        WebSocketTerminationCause::DownstreamDisconnect,
+                        miette!("websocket client write failed: {error}"),
+                    )
+                })?;
+            client_write.flush().await.map_err(|error| {
+                terminate(
+                    WebSocketTerminationCause::DownstreamDisconnect,
+                    miette!("websocket client flush failed: {error}"),
+                )
+            })?;
+        }
         Ok::<_, WebSocketTermination>(
-            openshell_core::proto::WebSocketSessionEndReason::PeerDisconnect,
+            openshell_core::proto::MiddlewareSessionEndReason::UpstreamDisconnect,
         )
     };
 
@@ -619,7 +649,7 @@ async fn relay_client_to_server<R, W>(
     host: &str,
     port: u16,
     options: &mut RelayOptions<'_>,
-) -> WebSocketRelayResult<openshell_core::proto::WebSocketSessionEndReason>
+) -> WebSocketRelayResult<openshell_core::proto::MiddlewareSessionEndReason>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -637,9 +667,9 @@ where
         else {
             let _ = writer.shutdown().await;
             return Ok(if close_seen {
-                openshell_core::proto::WebSocketSessionEndReason::NormalClose
+                openshell_core::proto::MiddlewareSessionEndReason::Normal
             } else {
-                openshell_core::proto::WebSocketSessionEndReason::PeerDisconnect
+                openshell_core::proto::MiddlewareSessionEndReason::DownstreamDisconnect
             });
         };
 
@@ -886,7 +916,7 @@ async fn read_exact_for_assembly<R: AsyncRead + Unpin>(
             .read_exact(buffer)
             .await
             .map(|_| ())
-            .map_err(|error| FrameError::peer_io("websocket client read failed", error)),
+            .map_err(FrameError::client_io),
     }
 }
 
@@ -897,10 +927,7 @@ async fn read_frame_header<R: AsyncRead + Unpin>(
     let mut first = [0u8; 1];
     let first_read = match assembly {
         Some(assembly) => assembly.read_some(reader, &mut first).await,
-        None => reader
-            .read(&mut first)
-            .await
-            .map_err(|error| FrameError::peer_io("websocket client read failed", error)),
+        None => reader.read(&mut first).await.map_err(FrameError::client_io),
     };
     let first = match first_read {
         Ok(0) => return Ok(None),
@@ -1600,15 +1627,15 @@ where
     writer
         .write_all(&frame.raw_header)
         .await
-        .map_err(|error| FrameError::peer_io("websocket upstream write failed", error))?;
+        .map_err(|error| FrameError::upstream_io("websocket upstream write failed", error))?;
     writer
         .write_all(&raw_payload)
         .await
-        .map_err(|error| FrameError::peer_io("websocket upstream write failed", error))?;
+        .map_err(|error| FrameError::upstream_io("websocket upstream write failed", error))?;
     writer
         .flush()
         .await
-        .map_err(|error| FrameError::peer_io("websocket upstream flush failed", error))?;
+        .map_err(|error| FrameError::upstream_io("websocket upstream flush failed", error))?;
     Ok(())
 }
 
@@ -1654,7 +1681,7 @@ where
     writer
         .write_all(&frame.raw_header)
         .await
-        .map_err(|error| FrameError::peer_io("websocket upstream write failed", error))?;
+        .map_err(|error| FrameError::upstream_io("websocket upstream write failed", error))?;
     let mut remaining = frame.payload_len;
     let mut buf = [0u8; COPY_BUF_SIZE];
     while remaining > 0 {
@@ -1664,22 +1691,22 @@ where
         let n = reader
             .read(&mut buf[..to_read])
             .await
-            .map_err(|error| FrameError::peer_io("websocket client read failed", error))?;
+            .map_err(FrameError::client_io)?;
         if n == 0 {
-            return Err(FrameError::peer_disconnect(miette!(
+            return Err(FrameError::client_disconnect(miette!(
                 "websocket payload ended before declared length"
             )));
         }
         writer
             .write_all(&buf[..n])
             .await
-            .map_err(|error| FrameError::peer_io("websocket upstream write failed", error))?;
+            .map_err(|error| FrameError::upstream_io("websocket upstream write failed", error))?;
         remaining -= n as u64;
     }
     writer
         .flush()
         .await
-        .map_err(|error| FrameError::peer_io("websocket upstream flush failed", error))?;
+        .map_err(|error| FrameError::upstream_io("websocket upstream flush failed", error))?;
     Ok(())
 }
 
@@ -1762,19 +1789,19 @@ async fn write_text_frame_guarded<W: AsyncWrite + Unpin>(
     tokio::time::timeout(TEXT_MESSAGE_FORWARD_TOTAL_TIMEOUT, async {
         writer.write_all(header).await.map_err(|error| {
             terminate(
-                WebSocketTerminationCause::PeerDisconnect,
+                WebSocketTerminationCause::UpstreamDisconnect,
                 miette!("websocket upstream write failed: {error}"),
             )
         })?;
         writer.write_all(payload).await.map_err(|error| {
             terminate(
-                WebSocketTerminationCause::PeerDisconnect,
+                WebSocketTerminationCause::UpstreamDisconnect,
                 miette!("websocket upstream write failed: {error}"),
             )
         })?;
         writer.flush().await.map_err(|error| {
             terminate(
-                WebSocketTerminationCause::PeerDisconnect,
+                WebSocketTerminationCause::UpstreamDisconnect,
                 miette!("websocket upstream flush failed: {error}"),
             )
         })
@@ -1782,7 +1809,7 @@ async fn write_text_frame_guarded<W: AsyncWrite + Unpin>(
     .await
     .map_err(|_| {
         terminate(
-            WebSocketTerminationCause::PeerDisconnect,
+            WebSocketTerminationCause::UpstreamDisconnect,
             miette!("websocket upstream forwarding total timeout"),
         )
     })??;
@@ -2216,7 +2243,7 @@ network_policies:
 
     #[test]
     fn termination_causes_map_to_protocol_close_codes_and_session_reasons() {
-        use openshell_core::proto::WebSocketSessionEndReason as EndReason;
+        use openshell_core::proto::MiddlewareSessionEndReason as EndReason;
 
         assert_eq!(
             WebSocketTerminationCause::InvalidUtf8.close_code(),
@@ -2238,7 +2265,14 @@ network_policies:
             WebSocketTerminationCause::PolicyReload.close_code(),
             Some(1012)
         );
-        assert_eq!(WebSocketTerminationCause::PeerDisconnect.close_code(), None);
+        assert_eq!(
+            WebSocketTerminationCause::DownstreamDisconnect.close_code(),
+            None
+        );
+        assert_eq!(
+            WebSocketTerminationCause::UpstreamDisconnect.close_code(),
+            None
+        );
 
         assert_eq!(
             WebSocketTerminationCause::InvalidUtf8.session_end_reason(),
@@ -2259,6 +2293,14 @@ network_policies:
         assert_eq!(
             WebSocketTerminationCause::PolicyReload.session_end_reason(),
             EndReason::PolicyReload
+        );
+        assert_eq!(
+            WebSocketTerminationCause::DownstreamDisconnect.session_end_reason(),
+            EndReason::DownstreamDisconnect
+        );
+        assert_eq!(
+            WebSocketTerminationCause::UpstreamDisconnect.session_end_reason(),
+            EndReason::UpstreamDisconnect
         );
     }
 
@@ -2603,7 +2645,7 @@ network_policies:
             .await
             .expect("join forwarding")
             .expect_err("non-reading upstream must time out");
-        assert_eq!(error.cause, WebSocketTerminationCause::PeerDisconnect);
+        assert_eq!(error.cause, WebSocketTerminationCause::UpstreamDisconnect);
         assert!(
             error
                 .error
@@ -3486,7 +3528,7 @@ network_policies:
     enum ObservedWebSocketRequest {
         SessionStart,
         Message { sequence: u64, payload: String },
-        SessionEnd(openshell_core::proto::WebSocketSessionEndReason),
+        SessionEnd(openshell_core::proto::MiddlewareSessionEndReason),
     }
 
     #[derive(Clone, Default)]
@@ -3648,7 +3690,7 @@ network_policies:
                         Some(web_socket_session_event::Event::SessionEnd(end)) => {
                             if let Some(observed) = &observed
                                 && let Ok(reason) =
-                                    openshell_core::proto::WebSocketSessionEndReason::try_from(
+                                    openshell_core::proto::MiddlewareSessionEndReason::try_from(
                                         end.reason,
                                     )
                             {
@@ -3898,7 +3940,7 @@ network_policies:
         assert!(matches!(
             observed.recv().await,
             Some(ObservedWebSocketRequest::SessionEnd(
-                openshell_core::proto::WebSocketSessionEndReason::ProtocolError,
+                openshell_core::proto::MiddlewareSessionEndReason::ProtocolError,
             ))
         ));
         assert!(
@@ -4018,13 +4060,79 @@ network_policies:
         assert!(matches!(
             observed.recv().await,
             Some(ObservedWebSocketRequest::SessionEnd(
-                openshell_core::proto::WebSocketSessionEndReason::PeerDisconnect,
+                openshell_core::proto::MiddlewareSessionEndReason::DownstreamDisconnect,
             ))
         ));
 
         let _ = shutdown_tx.send(());
         server_task
             .await
+            .expect("join middleware server")
+            .expect("middleware server");
+    }
+
+    #[tokio::test]
+    async fn upstream_eof_reports_one_upstream_disconnect_while_downstream_is_open() {
+        let (mut session, mut observed, shutdown_tx, server_task) =
+            recording_middleware_session("wss").await;
+        assert!(session.start("").await.allowed);
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), observed.recv())
+                .await
+                .expect("middleware observes session start"),
+            Some(ObservedWebSocketRequest::SessionStart)
+        ));
+
+        let (client_app, mut relay_client) = tokio::io::duplex(4096);
+        let (mut relay_upstream, upstream_app) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(async move {
+            relay_with_options(
+                &mut relay_client,
+                &mut relay_upstream,
+                Vec::new(),
+                "api.openai.com",
+                443,
+                RelayOptions {
+                    policy_name: "rest-api",
+                    assembly_budget: WebSocketAssemblyBudget::default(),
+                    resolver: None,
+                    generation_guard: None,
+                    provider_credentials: None,
+                    target: "/",
+                    inspector: None,
+                    compression: WebSocketCompression::None,
+                    middleware_session: Some(session),
+                    middleware_context: None,
+                    deny_uninspected_credentials: false,
+                },
+            )
+            .await
+        });
+
+        drop(upstream_app);
+        tokio::time::timeout(std::time::Duration::from_secs(2), relay)
+            .await
+            .expect("relay finishes after upstream disconnect")
+            .expect("join relay")
+            .expect("upstream EOF ends relay normally");
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), observed.recv())
+                .await
+                .expect("middleware observes session end"),
+            Some(ObservedWebSocketRequest::SessionEnd(
+                openshell_core::proto::MiddlewareSessionEndReason::UpstreamDisconnect,
+            ))
+        ));
+        assert!(
+            observed.try_recv().is_err(),
+            "upstream EOF must produce exactly one session end"
+        );
+
+        drop(client_app);
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
+            .await
+            .expect("middleware server shuts down")
             .expect("join middleware server")
             .expect("middleware server");
     }
@@ -4056,7 +4164,7 @@ network_policies:
         assert!(matches!(
             observed.recv().await,
             Some(ObservedWebSocketRequest::SessionEnd(
-                openshell_core::proto::WebSocketSessionEndReason::MiddlewareFailure,
+                openshell_core::proto::MiddlewareSessionEndReason::MiddlewareFailure,
             ))
         ));
         assert!(
@@ -4258,7 +4366,7 @@ network_policies:
         assert!(error.to_string().contains("policy generation is stale"));
         match observed.recv().await {
             Some(ObservedWebSocketRequest::SessionEnd(
-                openshell_core::proto::WebSocketSessionEndReason::PolicyReload,
+                openshell_core::proto::MiddlewareSessionEndReason::PolicyReload,
             )) => {}
             Some(ObservedWebSocketRequest::Message { payload, .. }) => {
                 panic!("stale message leaked {} bytes to middleware", payload.len());
@@ -4383,7 +4491,7 @@ network_policies:
         }
         assert_eq!(
             end_reason,
-            Some(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+            Some(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
         );
 
         let _ = shutdown_tx.send(());
@@ -4423,7 +4531,7 @@ network_policies:
         assert!(matches!(
             observed.recv().await,
             Some(ObservedWebSocketRequest::SessionEnd(
-                openshell_core::proto::WebSocketSessionEndReason::PolicyReload
+                openshell_core::proto::MiddlewareSessionEndReason::PolicyReload
             ))
         ));
 
@@ -4527,7 +4635,7 @@ network_policies:
         assert!(matches!(
             observed.recv().await,
             Some(ObservedWebSocketRequest::SessionEnd(
-                openshell_core::proto::WebSocketSessionEndReason::PolicyReload
+                openshell_core::proto::MiddlewareSessionEndReason::PolicyReload
             ))
         ));
 
@@ -4637,7 +4745,7 @@ network_policies:
         );
         match observed.recv().await {
             Some(ObservedWebSocketRequest::SessionEnd(
-                openshell_core::proto::WebSocketSessionEndReason::PolicyDenial,
+                openshell_core::proto::MiddlewareSessionEndReason::PolicyDenial,
             )) => {}
             Some(ObservedWebSocketRequest::Message { payload, .. }) => {
                 panic!(
