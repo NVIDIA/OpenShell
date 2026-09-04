@@ -644,7 +644,7 @@ jobs:
       channel: dev
       source_ref: ${{ github.sha }}
       release_version: ${{ needs.compute-versions.outputs.docs_version }}
-      display_name: Dev (v${{ needs.compute-versions.outputs.docs_version }})
+      display_name: Dev
       availability: beta
       publish: true
     secrets: inherit

@@ -47,10 +47,8 @@ def test_release_workflows_sync_and_publish_docs_once() -> None:
         == "${{ needs.compute-versions.outputs.docs_version }}"
     )
     assert dev_job["with"]["publish"] == "true"
-    assert (
-        dev_job["with"]["display_name"]
-        == "Dev (v${{ needs.compute-versions.outputs.docs_version }})"
-    )
+    assert dev_job["with"]["display_name"] == "Dev"
+    assert dev_job["with"]["availability"] == "beta"
 
     assert tag_job["needs"] == [
         "compute-versions",
@@ -60,14 +58,15 @@ def test_release_workflows_sync_and_publish_docs_once() -> None:
         "trigger-wheel-publish",
     ]
     assert tag_job["uses"] == "./.github/workflows/sync-docs.yml"
-    assert tag_job["with"]["channel"] == "stable"
+    assert tag_job["with"]["channel"] == "latest"
     assert (
         tag_job["with"]["release_version"]
         == "${{ needs.compute-versions.outputs.semver }}"
     )
+    assert "version_slug" not in tag_job["with"]
     assert (
-        tag_job["with"]["version_slug"]
-        == "v${{ needs.compute-versions.outputs.semver }}"
+        tag_job["with"]["display_name"]
+        == "Latest (v${{ needs.compute-versions.outputs.semver }})"
     )
     assert tag_job["with"]["publish"] == "true"
     assert "is_prerelease != 'true'" in tag_job["if"]
@@ -229,7 +228,7 @@ def _make_docs_website_tree(root: Path) -> None:
     (fern / "docs.yml").write_text(yaml.safe_dump({"versions": []}), encoding="utf-8")
 
 
-def test_sync_docs_creates_snapshot(tmp_path: Path) -> None:
+def test_sync_docs_creates_planned_latest_and_dev_selector(tmp_path: Path) -> None:
     source = tmp_path / "source"
     website = tmp_path / "docs-website"
     _make_source_tree(source)
@@ -240,13 +239,27 @@ def test_sync_docs_creates_snapshot(tmp_path: Path) -> None:
             operation="sync",
             source_root=source,
             docs_website_root=website,
+            channel="latest",
+            source_ref="release-sha",
+            source_sha="release-sha",
+            release_version="0.0.116",
+            version_slug="",
+            display_name="Latest (v0.0.116)",
+            availability="",
+        )
+    )
+    sdw.sync_docs(
+        Namespace(
+            operation="sync",
+            source_root=source,
+            docs_website_root=website,
             channel="dev",
             source_ref="main",
             source_sha="dev-sha",
             release_version="0.0.117.dev56",
             version_slug="",
-            display_name="",
-            availability="",
+            display_name="Dev",
+            availability="beta",
         )
     )
 
@@ -258,10 +271,19 @@ def test_sync_docs_creates_snapshot(tmp_path: Path) -> None:
     assert version_nav["navigation"][0]["path"] == "../pages-dev/intro.mdx"
 
     docs_yml = read_yaml(fern / "docs.yml")
-    slugs = [entry["slug"] for entry in docs_yml["versions"]]
-    assert slugs == ["dev"]
-    assert docs_yml["versions"][0]["path"] == "./versions/dev.yml"
-    assert docs_yml["versions"][0]["availability"] == "beta"
+    assert docs_yml["versions"] == [
+        {
+            "display-name": "Latest (v0.0.116)",
+            "path": "./versions/latest.yml",
+            "slug": "latest",
+        },
+        {
+            "display-name": "Dev",
+            "path": "./versions/dev.yml",
+            "slug": "dev",
+            "availability": "beta",
+        },
+    ]
     assert "./components" in docs_yml["experimental"]["mdx-components"]
 
 

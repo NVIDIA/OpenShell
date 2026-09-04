@@ -39,25 +39,24 @@ The tasks read the Fern CLI version from `fern/fern.config.json`, so local check
 
 The generated `docs-website` branch contains the complete production input for Fern. Each version has an exact copy of its source commit's `docs/` tree under `fern/pages-<slug>/` and a navigation file under `fern/versions/`. `fern/.docs-snapshots.yml` records the original source ref, resolved source commit, and release version for each managed snapshot.
 
-The site uses these version types:
+The automated site uses these version types:
 
 | Version | Source | Update policy | Fern status |
 |---|---|---|---|
+| `latest` | The newest stable release. | Mutable. A maintenance release older than the current stable release cannot move it backward unless a maintainer explicitly allows a rollback. | No status before v0.1.0. |
 | `dev` | The most recent successful Release Dev run from `main`. | Mutable. Automation rejects an older version or the same version from a different commit unless a maintainer explicitly allows a rollback. | Beta. |
-| `latest` | The newest stable release. | Mutable. A maintenance release older than the current stable release cannot move it backward unless a maintainer explicitly allows a rollback. | Stable starting with v0.1.0. |
-| `vX.Y.Z` | The matching stable release tag. | Immutable. Repeating the sync is allowed only when the tag resolves to the same commit. | Stable starting with v0.1.0. |
 
 Release Dev waits for the development artifacts and Helm chart, then calls `.github/workflows/sync-docs.yml` once. The reusable workflow updates `dev`, validates the generated site, commits and pushes the branch when needed, and publishes the production site once.
 
-Release Tag follows the same sequence for a non-prerelease tag after the release artifacts, SDK package, Helm chart, and wheel publication complete. It creates the immutable `vX.Y.Z` snapshot and updates `latest` when the release is not older than the current version. One call to `.github/workflows/sync-docs.yml` performs both changes and publishes the production site once.
+Release Tag follows the same sequence for a non-prerelease tag after the release artifacts, SDK package, Helm chart, and wheel publication complete. It updates `latest` when the release is not older than the current version, then publishes the production site once.
 
 The sync and publish workflows share the `docs-website` concurrency group. This serializes writes and publication. Queued runs remain pending instead of replacing one another.
 
-The `dev` snapshot also owns the shared Fern configuration, components, assets, and CSS on `docs-website`. Stable snapshots copy their documentation and navigation but do not replace those shared files. This keeps the site configuration aligned with `main` while preserving the content captured for each release.
+The `dev` snapshot also owns the shared Fern configuration, components, assets, and CSS on `docs-website`. The `latest` snapshot copies its documentation and navigation but does not replace those shared files. This keeps the site configuration aligned with `main` while preserving the released content.
 
 ## Manual maintenance and publishing
 
-Maintainers can run `.github/workflows/sync-docs.yml` manually to add, refresh, or remove a snapshot. The workflow preserves snapshots that were not selected. Production publishing is disabled by default for a manual sync.
+Maintainers can run `.github/workflows/sync-docs.yml` manually to add, refresh, or remove a historical version snapshot. The workflow preserves snapshots that were not selected. Production publishing is disabled by default for a manual sync.
 
 `.github/workflows/publish-docs-website.yml` validates and publishes the existing `docs-website` branch without syncing content. Its default mode creates a preview. Selecting production mode publishes the live site, so use it only for an intentional production republish.
 

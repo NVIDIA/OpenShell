@@ -672,10 +672,9 @@ jobs:
     uses: ./.github/workflows/sync-docs.yml
     with:
       operation: sync
-      channel: stable
+      channel: latest
       source_ref: ${{ needs.compute-versions.outputs.source_sha }}
       release_version: ${{ needs.compute-versions.outputs.semver }}
-      version_slug: v${{ needs.compute-versions.outputs.semver }}
       display_name: Latest (v${{ needs.compute-versions.outputs.semver }})
       publish: true
     secrets: inherit
