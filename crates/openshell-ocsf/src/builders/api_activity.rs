@@ -159,9 +159,9 @@ mod tests {
             .ai_model(AiModel::new("claude-3-haiku", "anthropic"))
             .http_request(HttpRequest::new(
                 "POST",
-                Url::new("https", "inference.local", "/v1/messages", 443),
+                Url::new("https", "api.anthropic.com", "/v1/messages", 443),
             ))
-            .dst_endpoint(Endpoint::from_domain("inference.local", 443))
+            .dst_endpoint(Endpoint::from_domain("api.anthropic.com", 443))
             .unmapped("latency_ms", 701_u64)
             .unmapped("input_tokens", 12_u64)
             .message("Model call: claude-3-haiku via anthropic")

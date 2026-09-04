@@ -9,7 +9,7 @@ keywords: "Generative AI, Cybersecurity, Security, Policy, Sandbox, Landlock, Se
 position: 1
 ---
 
-OpenShell enforces sandbox security across four layers: network, filesystem, process, and inference.
+OpenShell enforces sandbox security across three layers: network, filesystem, and process.
 This page documents every configurable control, its default, what it protects, and the risk of relaxing it.
 
 For the full policy YAML schema, refer to the [Policy Schema](/reference/policy-schema).
@@ -31,7 +31,7 @@ You can update dynamic controls on a running sandbox with `openshell policy upda
 | Network | Unauthorized outbound connections and data exfiltration. | CONNECT proxy + OPA policy engine | Yes. Use `openshell policy update`, `openshell policy set`, or operator approval in the TUI. |
 | Filesystem | System binary tampering, credential theft, config manipulation. | Landlock LSM (kernel level) | No. Requires sandbox re-creation. |
 | Process | Privilege escalation, fork bombs, dangerous syscalls. | Seccomp BPF + privilege drop (`setuid`/`setgid`) | No. Requires sandbox re-creation. |
-| Inference | Credential exposure, unauthorized model access. | Proxy intercept of `inference.local` | Yes. Use `openshell inference set`. |
+| Provider credentials | Credential exposure and unauthorized service access. | Endpoint-bound placeholder resolution in the policy proxy | Yes. Update the provider or attached profile policy. |
 
 ## Network Controls
 
@@ -232,23 +232,6 @@ This ordering is intentional: named network-namespace setup still relies on priv
 5. Core-dump hardening (`RLIMIT_CORE=0`, plus `PR_SET_DUMPABLE=0` on Linux).
 6. Landlock filesystem restrictions.
 7. Runtime seccomp socket domain and syscall filters.
-
-## Inference Controls
-
-OpenShell routes all inference traffic through the gateway to isolate provider credentials from the sandbox.
-
-### Routed Inference through `inference.local`
-
-The proxy intercepts HTTPS CONNECT requests to `inference.local` and routes matching inference API requests through the sandbox-local router.
-The agent never receives the provider API key.
-
-| Aspect | Detail |
-|---|---|
-| Default | Always active. The proxy handles `inference.local` before OPA policy evaluation. The gateway injects credentials on the host side. |
-| Keep-alive isolation | If a sandbox reuses a keep-alive connection that previously carried a routed inference request for a subsequent non-inference request, the proxy denies the non-inference request with `connection not allowed by policy` and closes the connection. This prevents agents from reusing an inference-authorized connection for other destinations. |
-| What you can change | Configure inference routes with `openshell inference set`. |
-| Risk if bypassed | If an inference provider's host is added directly to `network_policies`, the agent could reach it with a stolen or hardcoded key, bypassing credential isolation. |
-| Recommendation | Do not add inference provider hosts to `network_policies`. Use OpenShell inference routing instead. |
 
 ## Gateway Security
 

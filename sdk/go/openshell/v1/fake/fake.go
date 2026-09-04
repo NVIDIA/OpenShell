@@ -35,7 +35,6 @@ type Client struct {
 	cfg            v1.ConfigInterface
 	policy         v1.PolicyInterface
 	workspaces     v1.WorkspaceInterface
-	inference      v1.InferenceInterface
 
 	closeOnce sync.Once
 	closed    bool
@@ -95,7 +94,6 @@ func NewClient(opts ...ClientOption) *Client {
 	fc.cfg = newFakeConfigClient(fc.isClosed)
 	fc.policy = newFakePolicyClient(fc.isClosed)
 	fc.workspaces = newFakeWorkspaceClient(fc.workspaceStore, fc.memberStore, fc.isClosed)
-	fc.inference = newFakeInferenceClient(fc.isClosed)
 
 	for _, opt := range opts {
 		opt(fc)
@@ -153,9 +151,6 @@ func (fc *Client) Policy() v1.PolicyInterface { return fc.policy }
 
 // Workspaces returns the workspace management sub-client.
 func (fc *Client) Workspaces() v1.WorkspaceInterface { return fc.workspaces }
-
-// Inference returns the inference route management sub-client.
-func (fc *Client) Inference() v1.InferenceInterface { return fc.inference }
 
 // Close marks the client as closed, stops all active watchers, and causes
 // subsequent sub-client calls to return Unavailable. Safe to call multiple

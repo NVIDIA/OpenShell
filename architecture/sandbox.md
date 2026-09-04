@@ -28,7 +28,7 @@ only when the set is already empty; any other outcome fails the spawn.
 2. The supervisor loads policy and runtime settings from local files or the
    gateway, depending on mode.
 3. It prepares filesystem access, process restrictions, network namespace
-   routing, trust stores, provider credential resolution, and inference routes.
+   routing, trust stores, and provider credential resolution.
 4. It launches the persisted canonical main-process argv and retains its PTY
    or pipes in the main-session multiplexer.
 5. It starts the policy proxy and local SSH server.
@@ -45,7 +45,7 @@ OpenShell uses overlapping controls rather than a single sandbox primitive:
 | Process policy | The child process runs as a non-root user with reduced privileges. |
 | Seccomp | Blocks dangerous syscalls, including raw socket paths that bypass the proxy. |
 | Network namespace | Forces ordinary agent egress through the local CONNECT proxy. |
-| Policy proxy | Evaluates destination, binary identity, TLS/L7 rules, SSRF checks, and inference interception. |
+| Policy proxy | Evaluates destination, binary identity, TLS/L7 rules, SSRF checks, and credential injection. |
 
 The supervisor may enrich baseline filesystem allowances for runtime-required
 paths, such as proxy support files or GPU device paths when a GPU is present.
@@ -214,17 +214,9 @@ security logs. See
 [Supervisor Middleware](../docs/extensibility/supervisor-middleware.mdx) for
 configuration and protocol details.
 
-`https://inference.local` is special. It bypasses OPA network policy and is
-handled by the inference interception path:
-
-1. The proxy terminates the local TLS connection with the sandbox CA.
-2. It detects known OpenAI, Anthropic, and compatible inference request shapes.
-3. It strips caller-supplied credentials and disallowed headers.
-4. It forwards through `openshell-router` using the route bundle fetched from
-   the gateway.
-
-External inference endpoints that do not use `inference.local` are treated like
-ordinary network traffic and must be allowed by policy.
+Inference providers use the ordinary policy proxy path. Attached provider
+profiles contribute their native endpoints, allowed binaries, and
+endpoint-bound credential metadata.
 
 In proxy-required networks, the supervisor chains upstream TLS tunnels through
 a corporate forward proxy with HTTP CONNECT instead of connecting directly,

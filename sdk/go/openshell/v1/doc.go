@@ -5,7 +5,7 @@
 //
 // The SDK follows the Kubernetes client-go sub-client pattern: a single Client
 // provides typed accessors for each resource domain (Sandboxes, Providers, Exec,
-// Files, Health, Services, SSH, TCP, Config, Policy, Workspaces, Inference). All operations accept a context.Context and return idiomatic
+// Files, Health, Services, SSH, TCP, Config, Policy, Workspaces). All operations accept a context.Context and return idiomatic
 // Go types. Proto-generated types never appear in the public API.
 //
 // # Quick Start
@@ -441,31 +441,4 @@
 //	    log.Fatal(err)
 //	}
 //	fmt.Printf("New settings revision: %d\n", result.SettingsRevision)
-//
-// # Inference Route Management
-//
-// Configure workspace-scoped inference routing to control how inference
-// requests are forwarded to upstream providers:
-//
-//	route, err := client.Inference().SetRoute(ctx, "my-workspace", &v1.InferenceRouteConfig{
-//	    ProviderName: "openai",
-//	    ModelID:      "gpt-4",
-//	    RouteName:    "",  // empty string = default route
-//	    TimeoutSecs:  120,
-//	})
-//	if err != nil {
-//	    log.Fatal(err)
-//	}
-//	fmt.Printf("Route v%d: %s/%s\n", route.Version, route.ProviderName, route.ModelID)
-//
-//	route, err = client.Inference().GetRoute(ctx, "my-workspace", "")
-//	if err != nil {
-//	    log.Fatal(err)
-//	}
-//	fmt.Printf("Provider: %s, Model: %s\n", route.ProviderName, route.ModelID)
-//
-//	err = client.Inference().DeleteRoute(ctx, "my-workspace", "")
-//	if err != nil {
-//	    log.Fatal(err)
-//	}
 package v1

@@ -4247,24 +4247,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "openshell-router"
-version = "0.0.0"
-dependencies = [
- "bytes",
- "openshell-core",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "serde_yml",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
- "wiremock",
-]
-
-[[package]]
 name = "openshell-sandbox"
 version = "0.0.0"
 dependencies = [
@@ -4367,7 +4349,6 @@ dependencies = [
  "openshell-policy",
  "openshell-prover",
  "openshell-providers",
- "openshell-router",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
  "opentelemetry",
@@ -4474,7 +4455,6 @@ dependencies = [
  "openshell-core",
  "openshell-ocsf",
  "openshell-policy",
- "openshell-router",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
  "prost-types",

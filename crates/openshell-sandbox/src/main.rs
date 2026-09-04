@@ -165,12 +165,6 @@ struct Args {
     #[arg(long, env = openshell_core::sandbox_env::SSH_SOCKET_PATH)]
     ssh_socket_path: Option<String>,
 
-    /// Path to YAML inference routes for standalone routing.
-    /// When set, inference routes are loaded from this file instead of
-    /// fetching a bundle from the gateway.
-    #[arg(long, env = "OPENSHELL_INFERENCE_ROUTES")]
-    inference_routes: Option<String>,
-
     /// Enable health check endpoint.
     #[arg(long)]
     health_check: bool,
@@ -717,7 +711,6 @@ fn main() -> Result<()> {
             args.ssh_socket_path,
             args.health_check,
             args.health_port,
-            args.inference_routes,
             ocsf_enabled,
             ocsf_schema_version,
             args.mode.network,
