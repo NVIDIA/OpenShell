@@ -31,8 +31,9 @@ use openshell_core::proto::compute::v1::{
     ListSandboxesRequest, ResourceCapabilities as DriverResourceCapabilities,
     ResourceRequirements as DriverSandboxResourceRequirements, StartSandboxRequest,
     StopSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
-    gateway_listener_requirement::Selector, watch_sandboxes_event,
+    WorkloadIdentityRequest, compute_driver_client::ComputeDriverClient,
+    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
+    watch_sandboxes_event,
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
@@ -3916,6 +3917,18 @@ fn driver_sandbox_spec_from_public(
         command: spec.command.clone(),
         tty: spec.tty,
         await_main_process_attachment: false,
+        workload_identity: Some(WorkloadIdentityRequest {
+            user: spec
+                .policy
+                .as_ref()
+                .and_then(|policy| policy.process.as_ref())
+                .map_or_else(String::new, |process| process.run_as_user.clone()),
+            group: spec
+                .policy
+                .as_ref()
+                .and_then(|policy| policy.process.as_ref())
+                .map_or_else(String::new, |process| process.run_as_group.clone()),
+        }),
     })
 }
 
@@ -4190,6 +4203,7 @@ fn driver_status_from_public(status: &SandboxStatus) -> DriverSandboxStatus {
             .map(driver_condition_from_public)
             .collect(),
         deleting: SandboxPhase::try_from(status.phase) == Ok(SandboxPhase::Deleting),
+        ..Default::default()
     }
 }
 
@@ -5002,6 +5016,28 @@ mod tests {
             .and_then(|requirements| requirements.gpu.as_ref())
             .expect("driver GPU requirement should be set");
         assert_eq!(gpu.count, Some(2));
+    }
+
+    #[test]
+    fn driver_sandbox_spec_carries_admitted_identity_selectors() {
+        let public = SandboxSpec {
+            policy: Some(openshell_core::proto::sandbox::v1::SandboxPolicy {
+                process: Some(openshell_core::proto::sandbox::v1::ProcessPolicy {
+                    run_as_user: "10001".to_string(),
+                    run_as_group: "10002".to_string(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let driver = driver_sandbox_spec_from_public(&public, "test-driver")
+            .expect("driver spec should map");
+        let identity = driver
+            .workload_identity
+            .expect("identity request is mandatory");
+        assert_eq!(identity.user, "10001");
+        assert_eq!(identity.group, "10002");
     }
 
     #[test]
@@ -6378,6 +6414,7 @@ mod tests {
             sandbox_fd: String::new(),
             conditions: vec![condition],
             deleting: false,
+            ..Default::default()
         }
     }
 
@@ -6401,6 +6438,7 @@ mod tests {
                     last_transition_time: String::new(),
                 }],
                 deleting: false,
+                ..Default::default()
             }),
         }
     }
@@ -8022,6 +8060,7 @@ mod tests {
                         last_transition_time: String::new(),
                     }],
                     deleting: false,
+                    ..Default::default()
                 }),
                 workspace: "default".to_string(),
             })
@@ -9628,6 +9667,7 @@ mod tests {
                 last_transition_time: String::new(),
             }],
             deleting: false,
+            ..Default::default()
         }
     }
 
@@ -9645,6 +9685,7 @@ mod tests {
                 last_transition_time: String::new(),
             }],
             deleting: true,
+            ..Default::default()
         }
     }
 
@@ -9922,6 +9963,7 @@ mod tests {
                         last_transition_time: String::new(),
                     }],
                     deleting: false,
+                    ..Default::default()
                 }),
                 workspace: "default".to_string(),
             }],
@@ -9943,6 +9985,7 @@ mod tests {
                         last_transition_time: String::new(),
                     }],
                     deleting: false,
+                    ..Default::default()
                 }),
                 workspace: "default".to_string(),
             }],
@@ -10156,6 +10199,7 @@ mod tests {
                         last_transition_time: String::new(),
                     }],
                     deleting: false,
+                    ..Default::default()
                 }),
                 workspace: "default".to_string(),
             }],
