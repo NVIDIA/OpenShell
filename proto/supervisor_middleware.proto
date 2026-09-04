@@ -175,8 +175,8 @@ message HttpResponsePreflight {
   // Validated service configuration. Limited to 64 KiB encoded.
   google.protobuf.Struct config = 6;
   // Effective minimum of platform, registration, and binding limits. Applies to
-  // whole-body input/replacement and each stream replacement. Stream inputs use
-  // at most floor(max_payload_bytes / 2).
+  // whole-body input/replacement and each stream input/replacement. Stream
+  // inputs use at most min(64 KiB, max_payload_bytes).
   uint64 max_payload_bytes = 7;
   // Modes derived independently for this stage. OpenShell first determines
   // response-shape eligibility from the original final response head, then
@@ -187,13 +187,9 @@ message HttpResponsePreflight {
   // omits WHOLE_BODY_BYTES. An eligible unknown-length response may select
   // WHOLE_BODY_BYTES and later fail with whole_body_over_capacity according to
   // this stage's on_error. STREAM_BYTES is omitted when
-  // floor(max_payload_bytes / 2) is zero. Selecting an unlisted mode fails
-  // according to on_error.
+  // max_payload_bytes is zero. Selecting an unlisted mode fails according to
+  // on_error.
   repeated HttpResponseBodyMode permitted_body_modes = 8;
-  // Allows a STREAM_BYTES stage to retain input bytes for a later replacement.
-  // True only for fail-closed stages. Fail-open stages must account for every
-  // input unit in their results and cannot retain bytes across units.
-  bool deferral_permitted = 9;
 }
 
 // Selects skip, inspect, or block. Diagnostic fields apply to every action.
@@ -269,9 +265,10 @@ enum HttpResponseBodyMode {
   // whole_body_over_capacity and follow this stage's on_error.
   HTTP_RESPONSE_BODY_MODE_WHOLE_BODY_BYTES = 2;
   // Receive normalized units ending with end_of_stream. Each input is at most
-  // min(64 KiB, floor(max_payload_bytes / 2)), and each replacement must fit
-  // max_payload_bytes. The full body may exceed the limit. STREAM_BYTES has no
-  // total response-lifetime deadline.
+  // min(64 KiB, max_payload_bytes), and each replacement must fit
+  // max_payload_bytes. Each result fully accounts for its input unit; V1 does
+  // not permit retaining input across units. The full body may exceed the
+  // limit. STREAM_BYTES has no total response-lifetime deadline.
   HTTP_RESPONSE_BODY_MODE_STREAM_BYTES = 3;
 }
 
@@ -283,25 +280,25 @@ message HttpResponseBodyUnit {
   oneof payload {
     // Bytes without transfer framing. A body-capable response with no body bytes
     // has present empty data in sequence 1. STREAM_BYTES input size is at most
-    // min(64 KiB, floor(max_payload_bytes / 2)). A unit may be shorter to
-    // preserve flushing.
+    // min(64 KiB, max_payload_bytes). A unit may be shorter to preserve
+    // flushing.
     bytes data = 2;
   }
   // Marks the final body unit. Every normally completed body inspection receives
   // exactly one. For a body-capable response with no body bytes, this is the
   // empty sequence-1 unit. OpenShell does not read ahead, so it may send an empty
-  // final unit after the last nonempty unit. The matching result must flush all
-  // retained bytes. Trailers and session_end may follow. A stage ended by
-  // skip_remaining, block, or failure receives no later final unit.
+  // final unit after the last nonempty unit. Trailers and session_end may
+  // follow. A stage ended by skip_remaining, block, or failure receives no
+  // later final unit.
   bool end_of_stream = 3;
 }
 
 // Result for one body unit. Units are processed in lockstep; V1 does not
-// support ownership transfer. Diagnostic fields apply to every action. Invalid
-// diagnostics make the entire result a middleware failure handled according to
-// on_error. OpenShell enforces input and replacement size bounds and validates
-// the event lifecycle. It cannot distinguish bytes intentionally deleted from
-// bytes retained privately by middleware.
+// support ownership transfer or cross-unit retention. Diagnostic fields apply
+// to every action. Invalid diagnostics make the entire result a middleware
+// failure handled according to on_error. OpenShell retains the current input
+// until it validates the result, so fail-open can continue from the last input
+// OpenShell still owns.
 message HttpResponseBodyResult {
   // Must match the next unit. Zero, gaps, duplicates, and regressions fail.
   uint64 sequence = 1;
@@ -335,14 +332,13 @@ message HttpResponseBodyPassThrough {}
 
 // Finalizes this unit and ends the stage. This stage receives no later body or
 // trailer events. The current and later units continue through other stages.
-// Any retained bytes must be in transform. For WHOLE_BODY_BYTES, this equals
-// its nested action.
+// For WHOLE_BODY_BYTES, this equals its nested action.
 message HttpResponseBodySkipRemaining {
   // Exactly one action for the current unit.
   oneof current {
     // Forward the current unit unchanged.
     HttpResponseBodyPassThrough pass_through = 1;
-    // Replace the current unit and flush all retained bytes.
+    // Replace the current unit.
     HttpResponseBodyTransform transform = 2;
   }
 }
@@ -350,10 +346,8 @@ message HttpResponseBodySkipRemaining {
 // Replaces the complete input unit.
 message HttpResponseBodyTransform {
   // Required replacement, limited to max_payload_bytes. Present empty data
-  // deletes the input unit. When deferral_permitted, middleware may retain at
-  // most floor(max_payload_bytes / 2) input bytes for a later replacement.
-  // Otherwise it must not retain input across units. The transform for a normal
-  // final unit or skip_remaining.transform must flush every retained byte.
+  // deletes the input unit. The replacement fully accounts for this input unit;
+  // middleware must not retain input bytes for a later unit in V1.
   oneof replacement {
     // Normalized replacement bytes.
     bytes data = 1;
