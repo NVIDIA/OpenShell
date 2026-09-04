@@ -92,11 +92,13 @@ journalctl -u openshell-gateway --no-pager --lines=200
 
 Gateway configuration requires `[openshell] version = 2`, a singular
 `compute_driver` selector, and driver-owned settings under
-`[openshell.drivers.<name>]`. The gateway rejects legacy `compute_drivers`,
-`--drivers`, and `OPENSHELL_DRIVERS` selectors rather than silently migrating
-them. Homebrew and RPM package startup migrates only exact package-generated v1
-defaults. If an upgraded package still reports an unsupported version, inspect
-the active prefix or `~/.config/openshell/gateway.toml`; an edited v1 file must
+`[openshell.drivers.<name>]`. The gateway rejects legacy `compute_drivers` and
+`--drivers` selectors rather than silently migrating them. One valid, nonempty
+`OPENSHELL_DRIVERS` value remains a deprecated environment-only alias when the
+canonical selector is absent; the gateway selects that driver with a warning.
+Empty, invalid, comma-delimited, or conflicting values fail startup. Homebrew
+and RPM package startup migrates only exact package-generated v1 defaults. If
+an upgraded package still reports an unsupported version, inspect the active prefix or `~/.config/openshell/gateway.toml`; an edited v1 file must
 follow the published schema-v2 migration steps and must not be overwritten.
 Guest TLS CA, certificate, and key paths are the exception to driver ownership:
 configure the complete bundle under `[openshell.gateway]`, and the gateway
