@@ -839,11 +839,11 @@ async fn serve_gateway_listener(
                 continue;
             }
         };
-        let listener_scope = match stream.local_addr() {
-            Ok(local_addr) => spec.scope_for_local_addr(local_addr),
+        let (accepted_local_addr, listener_scope) = match stream.local_addr() {
+            Ok(local_addr) => (local_addr, spec.scope_for_local_addr(local_addr)),
             Err(e) => {
                 debug!(error = %e, client = %addr, listen = %listen_addr, "Failed to inspect accepted local address");
-                spec.scope
+                (listen_addr, spec.scope)
             }
         };
 
@@ -852,7 +852,7 @@ async fn serve_gateway_listener(
         spawn_gateway_connection(
             stream,
             addr,
-            listen_addr,
+            accepted_local_addr,
             listener_scope,
             service.clone(),
             tls_acceptor.clone(),
@@ -1401,20 +1401,28 @@ async fn build_compute_runtime(
             };
             let instance = registration.factory.build(build_context).await?;
             match instance {
-                ComputeDriverInstance::InProcess(driver) => ComputeRuntime::from_driver(
-                    registration.name,
-                    driver,
-                    None,
-                    store,
-                    sandbox_index,
-                    sandbox_watch_bus,
-                    tracing_log_bus,
-                    supervisor_sessions,
-                )
-                .await
-                .map_err(|error| {
-                    Error::execution(format!("failed to create compute runtime: {error}"))
-                })?,
+                ComputeDriverInstance::InProcess(driver) => {
+                    let listener_bind_policy = if registration.name == "podman" {
+                        compute::GatewayListenerBindPolicy::TrustedBuiltinPodman
+                    } else {
+                        compute::GatewayListenerBindPolicy::Deny
+                    };
+                    ComputeRuntime::from_driver(
+                        registration.name,
+                        driver,
+                        None,
+                        listener_bind_policy,
+                        store,
+                        sandbox_index,
+                        sandbox_watch_bus,
+                        tracing_log_bus,
+                        supervisor_sessions,
+                    )
+                    .await
+                    .map_err(|error| {
+                        Error::execution(format!("failed to create compute runtime: {error}"))
+                    })?
+                }
                 ComputeDriverInstance::ManagedRemote(mut endpoint) => {
                     endpoint.name = registration.name;
                     ComputeRuntime::new_remote_driver(
@@ -2296,6 +2304,7 @@ mod tests {
             address,
             driver_name: "docker".to_string(),
             reason: "managed bridge".to_string(),
+            allow_delayed_bind: false,
         }
     }
 }

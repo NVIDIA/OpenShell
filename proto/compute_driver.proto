@@ -111,7 +111,8 @@ message GatewayListenerRequirement {
 
   oneof selector {
     // Concrete IP:port address requested by the driver. The port must match
-    // the gateway's configured primary listener port.
+    // the gateway's configured primary listener port. Retained for drivers
+    // that predate GatewayExactBindAddressRequirement.
     string exact_bind_address = 2;
     // Ask the gateway to bind the IPv4 address selected by its default route.
     // This matches rootless pasta's default upstream-interface selection.
@@ -119,7 +120,21 @@ message GatewayListenerRequirement {
     // Ask the gateway to ensure an IPv4 loopback listener is present. This
     // covers runtimes whose host forwarder terminates on gateway loopback.
     GatewayLoopbackInterfaceRequirement loopback_interface = 4;
+    // Concrete address with additional bind behavior requested by a trusted
+    // built-in driver.
+    GatewayExactBindAddressRequirement exact_bind = 5;
   }
+}
+
+message GatewayExactBindAddressRequirement {
+  // Concrete IP:port address requested by the driver.
+  string address = 1;
+
+  // Indicates that the address belongs to a driver-managed bridge that may
+  // not exist until the first sandbox joins it. Gateways must honor this only
+  // for a trusted built-in driver; external drivers cannot authorize a
+  // nonlocal or wildcard listener.
+  bool allow_delayed_bind = 2;
 }
 
 message GatewayDefaultRouteInterfaceRequirement {}
