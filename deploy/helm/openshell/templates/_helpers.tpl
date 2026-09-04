@@ -274,9 +274,21 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if and (eq $workloadKind "statefulset") (gt $replicaCount 1) (not (get $workload "allowMultiReplicaStatefulSet" | default false)) -}}
 {{- fail "replicaCount > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true; use workload.kind=deployment for external database-backed multi-replica gateways." -}}
 {{- end -}}
-{{- $servicePort := int .Values.service.port -}}
-{{- $healthPort := int .Values.service.healthPort -}}
-{{- $metricsPort := int (default 0 .Values.service.metricsPort) -}}
+{{- $servicePortValue := toString .Values.service.port -}}
+{{- $healthPortValue := toString .Values.service.healthPort -}}
+{{- $metricsPortValue := toString (default 0 .Values.service.metricsPort) -}}
+{{- if not (regexMatch `^-?[0-9]+$` $servicePortValue) -}}
+{{- fail "service.port must be an integer." -}}
+{{- end -}}
+{{- if not (regexMatch `^-?[0-9]+$` $healthPortValue) -}}
+{{- fail "service.healthPort must be an integer." -}}
+{{- end -}}
+{{- if not (regexMatch `^-?[0-9]+$` $metricsPortValue) -}}
+{{- fail "service.metricsPort must be an integer." -}}
+{{- end -}}
+{{- $servicePort := int $servicePortValue -}}
+{{- $healthPort := int $healthPortValue -}}
+{{- $metricsPort := int $metricsPortValue -}}
 {{- if or (lt $servicePort 1) (gt $servicePort 65535) -}}
 {{- fail "service.port must be between 1 and 65535." -}}
 {{- end -}}
