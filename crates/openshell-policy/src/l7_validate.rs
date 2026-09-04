@@ -69,6 +69,30 @@ pub fn validate_explicit_tcp_additional_fields(
     )]
 }
 
+/// Validate the security-sensitive endpoint fields whose public representation
+/// is currently a string. Empty values preserve the documented defaults.
+pub fn validate_endpoint_modes(tls: &str, enforcement: &str, access: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    if !matches!(tls, "" | "skip" | "terminate" | "passthrough") {
+        errors.push(format!(
+            "unknown tls value '{tls}' (expected skip, terminate, or passthrough)"
+        ));
+    }
+    if !matches!(enforcement, "" | "enforce" | "audit") {
+        errors.push(format!(
+            "unknown enforcement value '{enforcement}' (expected enforce or audit)"
+        ));
+    }
+    if !matches!(access, "" | "read-only" | "read-write" | "full") {
+        errors.push(format!(
+            "unknown access value '{access}' (expected read-only, read-write, or full)"
+        ));
+    }
+
+    errors
+}
+
 /// Fields extracted from an endpoint definition needed for L7 semantic
 /// validation. Both profile lint and the runtime validator construct this
 /// from their own data representation.
@@ -210,6 +234,27 @@ mod tests {
     fn valid_endpoint_produces_no_errors() {
         let errors = validate_l7_endpoint_semantics(&valid_rest_endpoint());
         assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn endpoint_modes_reject_unknown_values() {
+        let errors = validate_endpoint_modes("skp", "enforc", "read-wirte");
+
+        assert_eq!(errors.len(), 3);
+        assert!(errors[0].contains("unknown tls value 'skp'"));
+        assert!(errors[1].contains("unknown enforcement value 'enforc'"));
+        assert!(errors[2].contains("unknown access value 'read-wirte'"));
+    }
+
+    #[test]
+    fn endpoint_modes_accept_documented_values_and_defaults() {
+        for tls in ["", "skip", "terminate", "passthrough"] {
+            for enforcement in ["", "enforce", "audit"] {
+                for access in ["", "read-only", "read-write", "full"] {
+                    assert!(validate_endpoint_modes(tls, enforcement, access).is_empty());
+                }
+            }
+        }
     }
 
     #[test]

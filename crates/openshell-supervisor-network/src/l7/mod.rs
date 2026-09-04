@@ -23,7 +23,8 @@ pub(crate) mod websocket;
 
 pub use openshell_policy::L7Protocol;
 use openshell_policy::{
-    L7EndpointFields, validate_explicit_tcp_additional_fields, validate_l7_endpoint_semantics,
+    L7EndpointFields, validate_endpoint_modes, validate_explicit_tcp_additional_fields,
+    validate_l7_endpoint_semantics,
 };
 
 pub(crate) fn build_credential_endpoint_mismatch_finding(
@@ -177,9 +178,16 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let protocol_val = get_object_str(val, "protocol")?;
     let protocol = L7Protocol::parse(&protocol_val)?;
 
-    let tls = match get_object_str(val, "tls").as_deref() {
-        Some("skip") => TlsMode::Skip,
-        Some("terminate") => {
+    let tls_value = get_object_str(val, "tls").unwrap_or_default();
+    let enforcement_value = get_object_str(val, "enforcement").unwrap_or_default();
+    let access_value = get_object_str(val, "access").unwrap_or_default();
+    if !validate_endpoint_modes(&tls_value, &enforcement_value, &access_value).is_empty() {
+        return None;
+    }
+
+    let tls = match tls_value.as_str() {
+        "skip" => TlsMode::Skip,
+        "terminate" => {
             let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(openshell_ocsf::ActivityId::Other)
                 .severity(openshell_ocsf::SeverityId::Medium)
@@ -191,7 +199,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
             openshell_ocsf::ocsf_emit!(event);
             TlsMode::Auto
         }
-        Some("passthrough") => {
+        "passthrough" => {
             let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(openshell_ocsf::ActivityId::Other)
                 .severity(openshell_ocsf::SeverityId::Medium)
@@ -203,12 +211,14 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
             openshell_ocsf::ocsf_emit!(event);
             TlsMode::Auto
         }
-        _ => TlsMode::Auto,
+        "" => TlsMode::Auto,
+        _ => unreachable!("endpoint modes were validated above"),
     };
 
-    let enforcement = match get_object_str(val, "enforcement").as_deref() {
-        Some("enforce") => EnforcementMode::Enforce,
-        _ => EnforcementMode::Audit,
+    let enforcement = match enforcement_value.as_str() {
+        "enforce" => EnforcementMode::Enforce,
+        "" | "audit" => EnforcementMode::Audit,
+        _ => unreachable!("endpoint modes were validated above"),
     };
 
     let allow_encoded_slash = get_object_bool(val, "allow_encoded_slash").unwrap_or(false);
@@ -1760,6 +1770,16 @@ mod tests {
         assert_eq!(config.protocol, L7Protocol::Rest);
         assert_eq!(config.tls, TlsMode::Auto);
         assert_eq!(config.enforcement, EnforcementMode::Audit);
+    }
+
+    #[test]
+    fn parse_l7_config_rejects_unknown_enforcement() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "enforcement": "enforc", "access": "read-only", "host": "api.example.com", "port": 443}"#,
+        )
+        .unwrap();
+
+        assert!(parse_l7_config(&val).is_none());
     }
 
     #[test]
