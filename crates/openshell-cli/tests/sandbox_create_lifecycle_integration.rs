@@ -2711,6 +2711,40 @@ async fn run_rejected_oidc_refresh_server() -> String {
     issuer
 }
 
+fn write_oidc_test_credentials(
+    server: &TestServer,
+    xdg_dir: &TempDir,
+    issuer: &str,
+    expires_at: u64,
+) {
+    let gateway_dir = xdg_dir.path().join("openshell/gateways/openshell");
+    fs::write(
+        gateway_dir.join("metadata.json"),
+        serde_json::to_vec_pretty(&openshell_bootstrap::GatewayMetadata {
+            name: "openshell".to_string(),
+            gateway_endpoint: server.endpoint.clone(),
+            auth_mode: Some("oidc".to_string()),
+            oidc_issuer: Some(issuer.to_string()),
+            oidc_client_id: Some("openshell-cli".to_string()),
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        gateway_dir.join("oidc_token.json"),
+        serde_json::to_vec_pretty(&openshell_bootstrap::oidc_token::OidcTokenBundle {
+            access_token: "cached-access-token".to_string(),
+            refresh_token: Some("inactive-refresh-token".to_string()),
+            expires_at: Some(expires_at),
+            issuer: issuer.to_string(),
+            client_id: "openshell-cli".to_string(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+}
+
 /// Models the gateway's JWT-expiration leeway by using a test gateway that
 /// still accepts the stale bearer. Before the CLI failed closed, the rejected
 /// refresh was only logged and `CreateSandbox` reached this gateway anyway.
@@ -2721,32 +2755,7 @@ async fn sandbox_create_fails_before_mutation_when_expired_oidc_refresh_is_rejec
     let xdg_dir = tempfile::tempdir().unwrap();
     prepare_cli_xdg(&server, &xdg_dir);
 
-    let gateway_dir = xdg_dir.path().join("openshell/gateways/openshell");
-    fs::write(
-        gateway_dir.join("metadata.json"),
-        serde_json::to_vec_pretty(&openshell_bootstrap::GatewayMetadata {
-            name: "openshell".to_string(),
-            gateway_endpoint: server.endpoint.clone(),
-            auth_mode: Some("oidc".to_string()),
-            oidc_issuer: Some(issuer.clone()),
-            oidc_client_id: Some("openshell-cli".to_string()),
-            ..Default::default()
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    fs::write(
-        gateway_dir.join("oidc_token.json"),
-        serde_json::to_vec_pretty(&openshell_bootstrap::oidc_token::OidcTokenBundle {
-            access_token: "expired-access-token".to_string(),
-            refresh_token: Some("inactive-refresh-token".to_string()),
-            expires_at: Some(0),
-            issuer,
-            client_id: "openshell-cli".to_string(),
-        })
-        .unwrap(),
-    )
-    .unwrap();
+    write_oidc_test_credentials(&server, &xdg_dir, &issuer, 0);
 
     let result = run_cli_sandbox_create_with_xdg(
         &server,
@@ -2772,6 +2781,40 @@ async fn sandbox_create_fails_before_mutation_when_expired_oidc_refresh_is_rejec
     assert!(
         create_requests(&server).await.is_empty(),
         "CreateSandbox must not be called after OIDC refresh fails"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_continues_with_unexpired_cached_token_when_refresh_fails() {
+    let server = run_server().await;
+    let issuer = run_rejected_oidc_refresh_server().await;
+    let xdg_dir = tempfile::tempdir().unwrap();
+    prepare_cli_xdg(&server, &xdg_dir);
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 20;
+    write_oidc_test_credentials(&server, &xdg_dir, &issuer, expires_at);
+
+    let result =
+        run_cli_sandbox_create_with_xdg(&server, &xdg_dir, "uses-cached-token", &["--output=json"])
+            .await;
+
+    assert!(
+        result.status.success(),
+        "sandbox create should continue with an unexpired cached token:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("continuing with the cached token"),
+        "refresh fallback warning should be visible: {stderr}"
+    );
+    assert_eq!(
+        create_requests(&server).await.len(),
+        1,
+        "CreateSandbox should be reached with the cached token"
     );
 }
 

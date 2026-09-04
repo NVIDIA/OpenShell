@@ -209,9 +209,17 @@ fn apply_auth_with_status(tls: &mut TlsOptions, gateway_name: &str) -> Option<St
                     }
                     Err(e) => {
                         tracing::warn!("OIDC token refresh failed: {e}");
-                        Some(format!(
-                            "OIDC token refresh failed: {e}\nrun `openshell gateway login {gateway_name}`"
-                        ))
+                        if openshell_bootstrap::oidc_token::is_token_actually_expired(&bundle) {
+                            Some(format!(
+                                "OIDC token refresh failed: {e}\ncached OIDC token has expired; run `openshell gateway login {gateway_name}`"
+                            ))
+                        } else {
+                            tls.oidc_token = Some(bundle.access_token);
+                            eprintln!(
+                                "Warning: OIDC token refresh failed; continuing with the cached token: {e}"
+                            );
+                            None
+                        }
                     }
                 }
             } else {
