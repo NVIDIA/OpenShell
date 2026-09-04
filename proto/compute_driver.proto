@@ -93,6 +93,10 @@ message GetCapabilitiesResponse {
   bool driver_reports_runtime_readiness = 8;
   // Static portable resource request forms supported by this configured driver.
   ResourceCapabilities resource_capabilities = 9;
+  // Whether this configured driver instance completely enforces the current
+  // portable SandboxPolicy.ui contract. Partial support must report false so
+  // the gateway rejects every explicit UI section before provisioning.
+  bool supports_ui_policy = 10;
 }
 
 message AuthenticateSandboxRequest {

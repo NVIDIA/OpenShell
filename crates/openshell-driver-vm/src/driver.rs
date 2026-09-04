@@ -685,6 +685,7 @@ impl VmDriver {
                     count_selection_supported: self.config.gpu_enabled,
                 }),
             }),
+            supports_ui_policy: false,
         }
     }
 

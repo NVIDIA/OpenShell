@@ -603,6 +603,7 @@ impl DockerComputeDriver {
                     count_selection_supported: self.config.gpu.cdi_supported,
                 }),
             }),
+            supports_ui_policy: false,
         }
     }
 

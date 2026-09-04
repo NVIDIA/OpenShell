@@ -31,7 +31,7 @@
 #![cfg(target_os = "windows")]
 
 use base64::Engine as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 // ── Path resolution ──────────────────────────────────────────────────────────
@@ -64,10 +64,19 @@ fn wxc_path() -> Option<PathBuf> {
 /// Invoke `wxc-exec --config-base64 <cfg> --dry-run` synchronously.
 /// Returns `(exit_code, stdout, stderr)`.
 fn dry_run(wxc: &PathBuf, config: &serde_json::Value) -> (i32, String, String) {
+    dry_run_with_args(wxc, config, &[])
+}
+
+fn dry_run_with_args(
+    wxc: &PathBuf,
+    config: &serde_json::Value,
+    args: &[&str],
+) -> (i32, String, String) {
     let json = serde_json::to_string(config).expect("config serialize");
     let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
 
     let out = Command::new(wxc)
+        .args(args)
         .arg("--config-base64")
         .arg(&b64)
         .arg("--dry-run")
@@ -78,6 +87,32 @@ fn dry_run(wxc: &PathBuf, config: &serde_json::Value) -> (i32, String, String) {
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let code = out.status.code().unwrap_or(-1);
     (code, stdout, stderr)
+}
+
+fn wxc_version(wxc: &Path) -> Option<(u64, u64, u64, String)> {
+    // wxc-exec does not expose --version. Release builds carry the Cargo
+    // version in the standard Windows ProductVersion resource.
+    let path_literal = wxc.to_string_lossy().replace('\'', "''");
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command"])
+        .arg(format!(
+            "(Get-Item -LiteralPath '{path_literal}').VersionInfo.ProductVersion"
+        ))
+        .output()
+        .ok()?;
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let version = raw.split_whitespace().find_map(|token| {
+        let core = token
+            .trim_matches(|ch: char| !ch.is_ascii_digit() && ch != '.')
+            .split(['+', '-'])
+            .next()?;
+        let mut parts = core.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next()?.parse().ok()?;
+        Some((major, minor, patch))
+    })?;
+    Some((version.0, version.1, version.2, raw))
 }
 
 // ── (a) Dry-run contract tests ────────────────────────────────────────────────
@@ -114,6 +149,103 @@ fn dryrun_accepts_minimal_processcontainer_config() {
     assert_eq!(
         code, 0,
         "minimal processcontainer config rejected by --dry-run\nstdout={stdout}\nstderr={stderr}"
+    );
+}
+
+/// Every `OpenShell` clipboard direction maps to MXC's shared top-level UI
+/// contract, with graphical UI and injection carried as independent booleans.
+#[test]
+#[ignore = "requires real wxc-exec"]
+fn dryrun_accepts_processcontainer_ui_policy_matrix() {
+    let Some(wxc) = wxc_path() else {
+        eprintln!("SKIP: wxc-exec not found");
+        return;
+    };
+
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let temp_path = tempdir.path().to_string_lossy().into_owned();
+    for clipboard in ["none", "read", "write", "all"] {
+        let config = serde_json::json!({
+            "version": "0.7.0-alpha",
+            "containerId": format!("test-ui-{clipboard}"),
+            "containment": "processcontainer",
+            "process": {
+                "commandLine": "cmd /c exit 0",
+                "cwd": temp_path.clone(),
+                "timeout": 0,
+            },
+            "filesystem": {
+                "readwritePaths": [temp_path.clone()],
+            },
+            "ui": {
+                "disable": false,
+                "clipboard": clipboard,
+                "injection": true,
+            },
+        });
+
+        let (code, stdout, stderr) = dry_run(&wxc, &config);
+        assert_eq!(
+            code, 0,
+            "processcontainer UI policy clipboard={clipboard} rejected by --dry-run\nstdout={stdout}\nstderr={stderr}"
+        );
+    }
+}
+
+/// MXC 0.8 and the 0.9 development schema reject the shared top-level
+/// UI object on `isolation_session`, while omission remains accepted. Older
+/// 0.7 builds accepted and ignored the object, so `OpenShell`'s gateway-level
+/// capability check is the stable enforcement boundary across versions.
+#[test]
+#[ignore = "requires real wxc-exec"]
+fn dryrun_current_schema_rejects_isolation_session_ui() {
+    let Some(wxc) = wxc_path() else {
+        eprintln!("SKIP: wxc-exec not found");
+        return;
+    };
+    let Some((major, minor, _patch, raw_version)) = wxc_version(&wxc) else {
+        eprintln!("SKIP: could not determine wxc-exec version");
+        return;
+    };
+    if (major, minor) < (0, 8) {
+        eprintln!("SKIP: {raw_version} predates the isolation_session UI rejection contract");
+        return;
+    }
+
+    let base = serde_json::json!({
+        "phase": "provision",
+        "containment": "isolation_session",
+        "network": {
+            "defaultPolicy": "allow",
+            "allowLocalNetwork": true,
+        },
+    });
+    let (code, stdout, stderr) = dry_run_with_args(&wxc, &base, &["--experimental"]);
+    let output = format!("{stdout} {stderr}").to_ascii_lowercase();
+    if code != 0
+        && output.contains("backend_unavailable")
+        && output.contains("not available in this build")
+    {
+        eprintln!("SKIP: {raw_version} was built without isolation_session support");
+        return;
+    }
+    assert_eq!(
+        code, 0,
+        "current isolation_session schema must accept omission of UI\nversion={raw_version}\nstdout={stdout}\nstderr={stderr}"
+    );
+
+    let mut with_ui = base;
+    with_ui["ui"] = serde_json::json!({ "disable": true });
+    let (code, stdout, stderr) = dry_run_with_args(&wxc, &with_ui, &["--experimental"]);
+    assert_ne!(
+        code, 0,
+        "current isolation_session schema unexpectedly accepted UI\nversion={raw_version}\nstdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        format!("{stdout} {stderr}")
+            .to_ascii_lowercase()
+            .contains("ui"),
+        "rejection should identify UI\nversion={raw_version}\nstdout={stdout}\nstderr={stderr}"
     );
 }
 

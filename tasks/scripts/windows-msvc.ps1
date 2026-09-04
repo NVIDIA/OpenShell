@@ -6,7 +6,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("check", "lint", "build", "test", "test-precommit", "test-unsupported", "artifacts", "ci")]
+    [ValidateSet("check", "lint", "build", "test", "test-precommit", "test-unsupported", "test-mxc-real", "artifacts", "ci")]
     [string] $Action,
 
     [Parameter(Position = 1)]
@@ -68,12 +68,14 @@ $WindowsClippyPackageExcludes = $UnsupportedDriverPackageExcludes
 $WindowsClippyLintArgs = "-D warnings -A dead-code -A unused-imports -A clippy::unused-async"
 $BundledZ3WorkspaceFeatures = "--features openshell-prover/bundled-z3"
 $BundledZ3ServerFeatures = "--features openshell-server/bundled-z3,openshell-prover/bundled-z3"
+$BundledZ3GatewayFeatures = "--features bundled-z3"
 $BundledZ3Repository = "https://github.com/Z3Prover/z3.git"
 $BundledZ3SysVersion = "0.11.0"
 # This is the matching Z3 4.16.0 source revision. Update both pins together.
 $BundledZ3Revision = "ddb49568d3520e99799e364fb22f35fc67d887b1"
 $Z3WorkspaceFeatures = $BundledZ3WorkspaceFeatures
 $Z3ServerFeatures = $BundledZ3ServerFeatures
+$Z3GatewayFeatures = $BundledZ3GatewayFeatures
 
 function Get-VsInstallRoots {
     $programFiles = @(
@@ -470,6 +472,7 @@ function Configure-Z3 {
         return [pscustomobject]@{
             WorkspaceFeatures = $BundledZ3WorkspaceFeatures
             ServerFeatures = $BundledZ3ServerFeatures
+            GatewayFeatures = $BundledZ3GatewayFeatures
         }
     }
 
@@ -497,6 +500,7 @@ function Configure-Z3 {
     return [pscustomobject]@{
         WorkspaceFeatures = ""
         ServerFeatures = ""
+        GatewayFeatures = ""
     }
 }
 
@@ -643,9 +647,17 @@ function Invoke-UnsupportedContractTests([string] $RustTarget) {
     foreach ($test in $tests) {
         Invoke-VsCargo `
             -RustTarget $RustTarget `
-            -CargoArgs "cargo test -p openshell-gateway --target $RustTarget $test $Z3ServerFeatures" `
+            -CargoArgs "cargo test -p openshell-gateway --target $RustTarget $test $Z3GatewayFeatures" `
             -LogName "test-$RustTarget-unsupported-$test.log"
     }
+}
+
+function Invoke-MxcRealTests([string] $RustTarget) {
+    Assert-NativeTestTarget $RustTarget
+    Invoke-VsCargo `
+        -RustTarget $RustTarget `
+        -CargoArgs "cargo test -p openshell-driver-mxc --test wxc_exec_real --target $RustTarget -- --ignored --test-threads=1 --nocapture" `
+        -LogName "test-$RustTarget-mxc-real.log"
 }
 
 function Get-Sha256([string] $Path) {
@@ -692,16 +704,17 @@ if ($Action -eq "ci" -and (Get-HostArch) -ne "amd64") {
 }
 
 $targets = Get-SelectedTargets $Target
-if ($Action -in @("test", "test-precommit", "test-unsupported")) {
+if ($Action -in @("test", "test-precommit", "test-unsupported", "test-mxc-real")) {
     foreach ($rustTarget in $targets) {
         Assert-NativeTestTarget $rustTarget
     }
 }
 
-if ($Action -in @("check", "lint", "build", "test", "test-precommit", "test-unsupported", "ci")) {
+if ($Action -in @("check", "lint", "build", "test", "test-precommit", "test-unsupported", "test-mxc-real", "ci")) {
     $z3Features = Configure-Z3
     $Z3WorkspaceFeatures = $z3Features.WorkspaceFeatures
     $Z3ServerFeatures = $z3Features.ServerFeatures
+    $Z3GatewayFeatures = $z3Features.GatewayFeatures
     $env:LIBCLANG_PATH = Resolve-LibclangPath
     Add-PathEntry $env:LIBCLANG_PATH
     Write-Host "==> LIBCLANG_PATH=$env:LIBCLANG_PATH"
@@ -738,6 +751,11 @@ switch ($Action) {
     "test-unsupported" {
         foreach ($rustTarget in $targets) {
             Invoke-UnsupportedContractTests $rustTarget
+        }
+    }
+    "test-mxc-real" {
+        foreach ($rustTarget in $targets) {
+            Invoke-MxcRealTests $rustTarget
         }
     }
     "artifacts" {

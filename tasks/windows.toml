@@ -65,9 +65,14 @@ run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 ci all"
 
 ["windows:test:mxc-real:x64"]
-description = "Run real-wxc-exec Tier-2 integration tests (skip-safe: tests print SKIP when binary/backend absent)"
+description = "Run native x64 real-wxc-exec Tier-2 integration tests (skip-safe: tests print SKIP when binary/backend absent)"
 run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
-run_windows = "cargo test -p openshell-driver-mxc --test wxc_exec_real --target x86_64-pc-windows-msvc -- --ignored --test-threads=1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-mxc-real x86_64-pc-windows-msvc"
+
+["windows:test:mxc-real:arm64"]
+description = "Run native ARM64 real-wxc-exec Tier-2 integration tests (skip-safe: tests print SKIP when binary/backend absent)"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-mxc-real aarch64-pc-windows-msvc"
 
 ["windows:e2e:mxc"]
 description = "Run MXC Tier-3 e2e scenario runner against real wxc-exec (probe-gated; skip-safe on hosts without the binary)"

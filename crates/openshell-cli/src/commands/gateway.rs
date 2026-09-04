@@ -45,6 +45,7 @@ struct ComputeDriverInfoView {
 struct ComputeDriverCapabilitiesView {
     driver_name: String,
     driver_version: String,
+    supports_ui_policy: bool,
 }
 
 /// Show gateway status.
@@ -392,6 +393,7 @@ pub async fn gateway_info(
                     capabilities: ComputeDriverCapabilitiesView {
                         driver_name: capabilities.driver_name,
                         driver_version: capabilities.driver_version,
+                        supports_ui_policy: capabilities.supports_ui_policy,
                     },
                 }
             })
@@ -446,6 +448,15 @@ fn print_compute_driver_info(drivers: &[ComputeDriverInfoView]) {
             "Driver version:".dimmed(),
             driver.capabilities.driver_version
         );
+        println!(
+            "      {} {}",
+            "UI policy:".dimmed(),
+            if driver.capabilities.supports_ui_policy {
+                "supported"
+            } else {
+                "unsupported"
+            }
+        );
     }
 }
 
@@ -464,6 +475,7 @@ fn gateway_info_to_json(view: &GatewayInfoView) -> serde_json::Value {
                 "capabilities": {
                     "driver_name": &driver.capabilities.driver_name,
                     "driver_version": &driver.capabilities.driver_version,
+                    "supports_ui_policy": driver.capabilities.supports_ui_policy,
                 },
             }))
             .collect::<Vec<_>>(),
@@ -1822,6 +1834,7 @@ mod tests {
                 capabilities: ComputeDriverCapabilitiesView {
                     driver_name: "podman".to_string(),
                     driver_version: "0.0.75".to_string(),
+                    supports_ui_policy: false,
                 },
             }],
         };
@@ -1839,6 +1852,10 @@ mod tests {
         assert_eq!(
             json["compute_drivers"][0]["capabilities"]["driver_version"],
             "0.0.75"
+        );
+        assert_eq!(
+            json["compute_drivers"][0]["capabilities"]["supports_ui_policy"],
+            false
         );
     }
 

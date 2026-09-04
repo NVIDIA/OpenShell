@@ -748,7 +748,7 @@ An exact IP is treated as `/32` — only that specific address is permitted.
       - { path: /usr/bin/curl }
 ```
 
-The agent inserts the new entry after the last existing policy in the `network_policies` block. All other sections (`filesystem_policy`, `landlock`, `process`) are untouched.
+The agent inserts the new entry after the last existing policy in the `network_policies` block. All other sections (`filesystem_policy`, `landlock`, `process`, `ui`) are untouched.
 
 ---
 

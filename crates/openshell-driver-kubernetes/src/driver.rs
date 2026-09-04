@@ -589,6 +589,7 @@ impl KubernetesComputeDriver {
                     count_selection_supported: true,
                 }),
             }),
+            supports_ui_policy: false,
         })
     }
 

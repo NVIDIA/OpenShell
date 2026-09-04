@@ -839,6 +839,10 @@ message ComputeDriverCapabilities {
 
   // Static portable resource request forms reported by the driver.
   ResourceCapabilities resource_capabilities = 3;
+
+  // Whether the configured driver instance completely enforces the portable
+  // SandboxPolicy.ui contract.
+  bool supports_ui_policy = 4;
 }
 
 // Static portable resource request forms reported by a compute driver.

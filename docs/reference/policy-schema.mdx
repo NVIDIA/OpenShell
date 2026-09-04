@@ -19,6 +19,7 @@ version: 1
 filesystem_policy: { ... }
 landlock: { ... }
 process: { ... }
+ui: { ... }
 network_policies: { ... }
 network_middlewares: { ... }
 ```
@@ -29,6 +30,7 @@ network_middlewares: { ... }
 | `filesystem_policy` | object | No | Static | Controls which directories the agent can read and write. |
 | `landlock` | object | No | Static | Configures Landlock LSM enforcement behavior. |
 | `process` | object | No | Static | Sets the user and group the agent process runs as. |
+| `ui` | object | No | Static | Controls graphical UI, directional clipboard access, and synthetic input on compute drivers that advertise complete enforcement. |
 | `network_policies` | map | No | Dynamic | Declares which binaries can reach which network endpoints. |
 | `network_middlewares` | map | No | Dynamic | Attaches ordered middleware by destination host; each implementation's manifest selects its supported HTTP and WebSocket operations. |
 
@@ -136,6 +138,37 @@ Example:
 process:
   run_as_user: "1500"
   run_as_group: "1500"
+```
+
+## UI
+
+**Category:** Static
+
+Declares platform-neutral UI capabilities. Within an explicit section, every
+field is deny by default, so `ui: {}` grants nothing on a supporting backend.
+Omit the entire section when the workload does not need a UI surface.
+
+| Field | Type | Required | Values | Description |
+|---|---|---|---|---|
+| `allow_graphical_ui` | bool | No | `true`, `false` | Allows the workload to display graphical windows. Defaults to `false`. |
+| `clipboard` | string | No | `none`, `read`, `write`, `all` | Controls host clipboard direction from the sandbox's perspective. Defaults to `none`. |
+| `allow_input_injection` | bool | No | `true`, `false` | Allows synthetic keyboard or pointer input. Defaults to `false`. |
+
+MXC `process_container` enforces this section on Windows and advertises complete
+support through the compute-driver capability contract. OpenShell rejects any
+explicit UI section, including `{}`, with MXC `isolation_session` because
+current MXC rejects the top-level `ui` object there. Docker, Podman, Kubernetes,
+VM, and older or partial extension drivers also advertise no support, so the
+gateway rejects explicit UI policy before validation or provisioning. Omitting
+the section preserves each runtime's existing behavior.
+
+Example:
+
+```yaml showLineNumbers={false}
+ui:
+  allow_graphical_ui: true
+  clipboard: read
+  allow_input_injection: false
 ```
 
 ## Network Policies

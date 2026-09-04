@@ -264,6 +264,7 @@ impl OpenShell for OpenShellService {
                         .resource_capabilities
                         .as_ref()
                         .map(|resources| public_resource_capabilities(*resources)),
+                    supports_ui_policy: driver.supports_ui_policy,
                 }),
             })
             .collect();

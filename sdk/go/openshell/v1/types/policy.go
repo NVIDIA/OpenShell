@@ -108,7 +108,7 @@ type DraftPolicy struct {
 
 // SandboxPolicy is the top-level security policy configuration for a sandbox.
 // It contains filesystem access rules, Landlock LSM configuration, process
-// identity rules, and named network access policies.
+// identity rules, portable UI capabilities, and named network access policies.
 type SandboxPolicy struct {
 	// Version is the policy version number. The server may override this on write.
 	Version uint32
@@ -121,6 +121,9 @@ type SandboxPolicy struct {
 	// Process controls the user and group identity for sandboxed processes.
 	// Nil means no process policy is specified.
 	Process *ProcessPolicy
+	// UI controls portable graphical UI, clipboard, and input-injection capabilities.
+	// Nil means no UI policy is specified.
+	UI *UIPolicy
 	// NetworkPolicies contains named network access rules.
 	// Nil means no network policies are specified; an empty map is distinct from nil.
 	NetworkPolicies map[string]NetworkPolicyRule
@@ -172,6 +175,33 @@ type ProcessPolicy struct {
 	RunAsUser string
 	// RunAsGroup is the group name for sandboxed processes.
 	RunAsGroup string
+}
+
+// UIClipboardAccess controls host clipboard direction from the sandbox's perspective.
+type UIClipboardAccess int
+
+const (
+	// UIClipboardAccessUnspecified resolves to no clipboard access.
+	UIClipboardAccessUnspecified UIClipboardAccess = iota
+	// UIClipboardAccessNone denies clipboard reads and writes.
+	UIClipboardAccessNone
+	// UIClipboardAccessRead permits reading host clipboard contents.
+	UIClipboardAccessRead
+	// UIClipboardAccessWrite permits writing host clipboard contents.
+	UIClipboardAccessWrite
+	// UIClipboardAccessAll permits reading and writing host clipboard contents.
+	UIClipboardAccessAll
+)
+
+// UIPolicy declares platform-neutral user-interface capabilities.
+// Every zero value denies access.
+type UIPolicy struct {
+	// AllowGraphicalUI permits the workload to display graphical windows.
+	AllowGraphicalUI bool
+	// Clipboard controls host clipboard direction.
+	Clipboard UIClipboardAccess
+	// AllowInputInjection permits synthetic keyboard or pointer input.
+	AllowInputInjection bool
 }
 
 // SandboxPolicyRevision represents a versioned policy revision for a sandbox.
