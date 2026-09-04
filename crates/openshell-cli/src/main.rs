@@ -785,6 +785,12 @@ enum LogLevel {
     Error,
     Warn,
     Info,
+    /// Accepted because the gateway ranks OCSF alongside INFO, so this has
+    /// always worked as a threshold. Hidden rather than advertised: it selects
+    /// exactly the same lines as `info`, and offering two spellings for one
+    /// threshold in `--help` would suggest a distinction that does not exist.
+    #[value(hide = true)]
+    Ocsf,
     Debug,
     Trace,
 }
@@ -795,6 +801,7 @@ impl LogLevel {
             Self::Error => "error",
             Self::Warn => "warn",
             Self::Info => "info",
+            Self::Ocsf => "ocsf",
             Self::Debug => "debug",
             Self::Trace => "trace",
         }
@@ -4541,9 +4548,19 @@ mod tests {
 
     #[test]
     fn logs_level_accepts_known_values_any_case() {
-        for value in ["error", "warn", "info", "debug", "trace", "ERROR", "Warn"] {
+        for value in [
+            "error", "warn", "info", "debug", "trace", "ERROR", "Warn", "ocsf", "OCSF",
+        ] {
             Cli::try_parse_from(["openshell", "logs", "sb", "--level", value])
                 .unwrap_or_else(|err| panic!("--level {value} should parse: {err}"));
+        }
+    }
+
+    #[test]
+    fn logs_source_accepts_known_values_any_case() {
+        for value in ["gateway", "sandbox", "all", "Gateway", "SANDBOX"] {
+            Cli::try_parse_from(["openshell", "logs", "sb", "--source", value])
+                .unwrap_or_else(|err| panic!("--source {value} should parse: {err}"));
         }
     }
 
