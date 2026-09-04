@@ -44,6 +44,13 @@ data:
     metrics_bind_address  = "0.0.0.0:{{ .Values.service.metricsPort }}"
     {{- end }}
     log_level             = {{ .Values.server.logLevel | quote }}
+    {{- $dbMaxConnections := int .Values.server.dbMaxConnections }}
+    {{- if lt $dbMaxConnections 0 }}
+    {{- fail "server.dbMaxConnections must not be negative; set 0 to use the gateway default" }}
+    {{- end }}
+    {{- if gt $dbMaxConnections 0 }}
+    database_max_connections = {{ $dbMaxConnections }}
+    {{- end }}
     {{- if $credentialDrivers }}
     credential_drivers    = [{{- range $i, $driver := $credentialDrivers }}{{ if $i }}, {{ end }}{{ $driver | quote }}{{- end }}]
     {{- end }}

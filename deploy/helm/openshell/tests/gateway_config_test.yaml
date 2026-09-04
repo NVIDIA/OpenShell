@@ -391,6 +391,30 @@ tests:
       - failedTemplate:
           errorMessage: "server.grpcRateLimit.requests and server.grpcRateLimit.windowSeconds must not be negative; they map to unsigned gateway settings"
 
+  - it: omits the database pool ceiling by default so the gateway keeps its own default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'database_max_connections\s*='
+
+  - it: renders the database pool ceiling under [openshell.gateway] when set
+    template: templates/gateway-config.yaml
+    set:
+      server.dbMaxConnections: 64
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\].*?database_max_connections\s*=\s*64'
+
+  - it: fails to render when dbMaxConnections is negative
+    template: templates/statefulset.yaml
+    set:
+      server.dbMaxConnections: -1
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.dbMaxConnections must not be negative; set 0 to use the gateway default"
+
   - it: uses the configured existing sandbox service account name
     template: templates/gateway-config.yaml
     set:
