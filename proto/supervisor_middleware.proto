@@ -399,7 +399,9 @@ enum MiddlewareSessionEndReason {
   MIDDLEWARE_SESSION_END_REASON_UNSPECIFIED = 0;
   // Evaluation completed.
   MIDDLEWARE_SESSION_END_REASON_NORMAL = 1;
-  // The sandbox peer disconnected.
+  // The sandbox peer disconnected. Before the directional split, wire value 2
+  // represented either peer disconnect. Mixed deployments across that
+  // pre-0.1.0 change are unsupported.
   MIDDLEWARE_SESSION_END_REASON_DOWNSTREAM_DISCONNECT = 2;
   // A policy reload replaced the active middleware chain.
   MIDDLEWARE_SESSION_END_REASON_POLICY_RELOAD = 3;

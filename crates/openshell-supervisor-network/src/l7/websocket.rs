@@ -4072,6 +4072,72 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn upstream_eof_reports_one_upstream_disconnect_while_downstream_is_open() {
+        let (mut session, mut observed, shutdown_tx, server_task) =
+            recording_middleware_session("wss").await;
+        assert!(session.start("").await.allowed);
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), observed.recv())
+                .await
+                .expect("middleware observes session start"),
+            Some(ObservedWebSocketRequest::SessionStart)
+        ));
+
+        let (client_app, mut relay_client) = tokio::io::duplex(4096);
+        let (mut relay_upstream, upstream_app) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(async move {
+            relay_with_options(
+                &mut relay_client,
+                &mut relay_upstream,
+                Vec::new(),
+                "api.openai.com",
+                443,
+                RelayOptions {
+                    policy_name: "rest-api",
+                    assembly_budget: WebSocketAssemblyBudget::default(),
+                    resolver: None,
+                    generation_guard: None,
+                    provider_credentials: None,
+                    target: "/",
+                    inspector: None,
+                    compression: WebSocketCompression::None,
+                    middleware_session: Some(session),
+                    middleware_context: None,
+                    deny_uninspected_credentials: false,
+                },
+            )
+            .await
+        });
+
+        drop(upstream_app);
+        tokio::time::timeout(std::time::Duration::from_secs(2), relay)
+            .await
+            .expect("relay finishes after upstream disconnect")
+            .expect("join relay")
+            .expect("upstream EOF ends relay normally");
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), observed.recv())
+                .await
+                .expect("middleware observes session end"),
+            Some(ObservedWebSocketRequest::SessionEnd(
+                openshell_core::proto::MiddlewareSessionEndReason::UpstreamDisconnect,
+            ))
+        ));
+        assert!(
+            observed.try_recv().is_err(),
+            "upstream EOF must produce exactly one session end"
+        );
+
+        drop(client_app);
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
+            .await
+            .expect("middleware server shuts down")
+            .expect("join middleware server")
+            .expect("middleware server");
+    }
+
+    #[tokio::test]
     async fn denied_websocket_session_start_reports_middleware_failure_before_close() {
         let (session, mut observed, shutdown_tx, server_task) =
             recording_middleware_session("wss").await;
