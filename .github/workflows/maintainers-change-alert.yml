@@ -46,10 +46,30 @@ jobs:
 
           # Fetching file contents is reading data, not executing it. The head
           # revision is never checked out or run.
+          #
+          # A 404 means the file genuinely does not exist at that revision — a
+          # pull request that adds or deletes MAINTAINERS.md — and yields an
+          # empty side of the comparison. Every other failure is fatal: an empty
+          # file from a rate limit or a 5xx would render as "every maintainer
+          # was just added" or "nothing changed", both of which mislead the
+          # reviewer about who can merge code.
           fetch_maintainers() {
-            gh api -H "Accept: application/vnd.github.raw" \
-              "repos/$GH_REPO/contents/MAINTAINERS.md?ref=$1" > "$2" 2>/dev/null \
-              || : > "$2"
+            local ref="$1" out="$2" err
+            err="$(mktemp)"
+            if gh api -H "Accept: application/vnd.github.raw" \
+                 "repos/$GH_REPO/contents/MAINTAINERS.md?ref=$ref" > "$out" 2>"$err"; then
+              rm -f "$err"
+              return 0
+            fi
+            if grep -q 'HTTP 404' "$err"; then
+              rm -f "$err"
+              : > "$out"
+              return 0
+            fi
+            echo "::error::Could not fetch MAINTAINERS.md at $ref"
+            cat "$err" >&2
+            rm -f "$err"
+            return 1
           }
 
           fetch_maintainers "$BASE_SHA" before.md
