@@ -48,11 +48,11 @@ def parse_maintainers(markdown: str) -> set[str]:
 def latest_positions(reviews: list[dict]) -> dict[str, str]:
     """Map each reviewer's lowercased login to their most recent decisive state.
 
-    The reviews API returns reviews in ascending submission order, so a later
-    entry for the same login supersedes an earlier one.
+    Ordering comes from the review id, not from input order: a later entry
+    for the same login, by ascending review id, supersedes an earlier one.
     """
     positions: dict[str, str] = {}
-    for entry in reviews:
+    for entry in sorted(reviews, key=lambda r: r.get("id") or 0):
         state = str(entry.get("state") or "").upper()
         if state not in DECISIVE_STATES:
             continue

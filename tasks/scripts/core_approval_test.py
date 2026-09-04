@@ -74,6 +74,17 @@ def test_dismissed_review_revokes_approval() -> None:
     assert state == "failure"
 
 
+def test_out_of_order_reviews_still_respect_the_latest_position() -> None:
+    # Ordering comes from the review id, not the order the caller happened
+    # to assemble the pages in.
+    reviews = [
+        {"id": 2, "user": {"login": "purp"}, "state": "DISMISSED"},
+        {"id": 1, "user": {"login": "purp"}, "state": "APPROVED"},
+    ]
+    state, _ = ca.decide(TABLE, reviews, "contributor")
+    assert state == "failure"
+
+
 def test_changes_requested_after_approval_revokes_it() -> None:
     reviews = [review("purp", "APPROVED"), review("purp", "CHANGES_REQUESTED")]
     state, _ = ca.decide(TABLE, reviews, "contributor")
