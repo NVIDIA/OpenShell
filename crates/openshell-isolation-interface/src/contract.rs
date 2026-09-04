@@ -23,13 +23,13 @@
 //! `attach` is atomic from the caller's perspective: it establishes and binds
 //! the boundary, returns `Bound`, or fails closed. It never binds a resource
 //! already bound to an active boundary. Binary identity travels on every
-//! [`MediatedConnection`], resolved by the backend for that exact connection;
-//! an unresolved identity denies the connection and never authorizes anything.
+//! [`PendingNetworkOpen`], resolved for that exact socket and process
+//! generation; an unresolved identity denies the open.
 //!
 //! The contract is transport-neutral. Concrete topology implementations keep
 //! their placement and coordination details behind these interfaces.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -41,10 +41,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::oneshot;
 
 pub use openshell_core::policy::SandboxPolicy;
-
-/// The Isolation Backend contract version. The descriptor and the resolved
-/// backend must both equal the supervisor-supported version exactly.
-pub const INTERFACE_VERSION: u32 = 2;
 
 // ============================================================================
 // Errors
@@ -81,7 +77,7 @@ pub enum BackendError {
 /// (which operation failed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendErrorKind {
-    /// Descriptor, version, or backend mismatch.
+    /// Descriptor or backend mismatch.
     Invalid,
     /// Authenticated attachment rejection.
     Denied,
@@ -162,8 +158,6 @@ impl std::error::Error for ResolveError {}
 /// and resource lifecycle remain topology-specific.
 #[derive(Debug, Clone)]
 pub struct TopologyDescriptor {
-    /// The Isolation Backend contract version this descriptor targets.
-    pub version: u32,
     /// The backend the supervisor must instantiate.
     pub backend_name: String,
     /// Backend-specific attachment data.
@@ -191,10 +185,51 @@ impl VerifiedTopologyDescriptor {
     pub fn payload(&self) -> &[u8] {
         &self.descriptor.payload
     }
-    /// The interface version.
-    #[must_use]
-    pub fn version(&self) -> u32 {
-        self.descriptor.version
+}
+
+/// Exact non-root identity selected before the immutable workload is created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedWorkloadIdentity {
+    /// Effective and real user ID used by sandbox and all workload children.
+    pub uid: u32,
+    /// Primary group ID used by sandbox and all workload children.
+    pub gid: u32,
+    /// Sorted, unique supplementary groups inherited unchanged by children.
+    pub supplementary_gids: Vec<u32>,
+    /// Driver-defined resolution source (`policy`, `template`, or `image`).
+    pub source: String,
+    /// Digest of the immutable image/rootfs/config used for resolution.
+    pub resource_digest: String,
+}
+
+impl ResolvedWorkloadIdentity {
+    /// Validate and construct a final workload identity.
+    pub fn new(
+        uid: u32,
+        gid: u32,
+        mut supplementary_gids: Vec<u32>,
+        source: String,
+        resource_digest: String,
+    ) -> Result<Self, BackendError> {
+        if uid == 0 || gid == 0 || supplementary_gids.contains(&0) {
+            return Err(BackendError::Descriptor(
+                "workload identity must not contain UID or GID zero".to_string(),
+            ));
+        }
+        if source.trim().is_empty() || resource_digest.trim().is_empty() {
+            return Err(BackendError::Descriptor(
+                "workload identity source and resource digest are required".to_string(),
+            ));
+        }
+        supplementary_gids.sort_unstable();
+        supplementary_gids.dedup();
+        Ok(Self {
+            uid,
+            gid,
+            supplementary_gids,
+            source,
+            resource_digest,
+        })
     }
 }
 
@@ -211,6 +246,8 @@ pub struct SandboxContext {
     pub policy: SandboxPolicy,
     /// The admitted agent workload.
     pub agent: AgentSpec,
+    /// Immutable identity already applied by the driver to sandbox and agent.
+    pub identity: ResolvedWorkloadIdentity,
 }
 
 /// The agent workload to run inside the boundary.
@@ -233,24 +270,16 @@ impl BackendRegistry {
         }
     }
 
-    /// Register a backend. Rejects a duplicate name or a backend that does not
-    /// speak the supervisor-supported interface version exactly.
+    /// Register a backend. Rejects a duplicate name.
     ///
     /// # Errors
     ///
-    /// Returns [`BackendError::Descriptor`] for a duplicate `backend_name` or
-    /// an interface-version mismatch.
+    /// Returns [`BackendError::Descriptor`] for a duplicate `backend_name`.
     pub fn register(&mut self, backend: Arc<dyn IsolationBackend>) -> Result<(), BackendError> {
         let name = backend.backend_name().to_string();
         if self.backends.contains_key(&name) {
             return Err(BackendError::Descriptor(format!(
                 "duplicate backend name {name:?}"
-            )));
-        }
-        if backend.version() != INTERFACE_VERSION {
-            return Err(BackendError::Descriptor(format!(
-                "backend {name:?} targets interface version {}, supervisor speaks {INTERFACE_VERSION}",
-                backend.version()
             )));
         }
         self.backends.insert(name, backend);
@@ -260,27 +289,19 @@ impl BackendRegistry {
     /// Verify the descriptor's common envelope against the admitted backend name
     /// and resolve its backend. Fails closed and never falls back:
     ///
-    /// - the descriptor's interface version must equal [`INTERFACE_VERSION`];
     /// - the descriptor's `backend_name` must equal the admitted name;
-    /// - a backend must be registered under that name; and
-    /// - the backend's version must equal [`INTERFACE_VERSION`] exactly.
+    /// - a backend must be registered under that name.
     ///
     /// # Errors
     ///
-    /// Returns [`BackendError::Descriptor`] for a version or admission
-    /// mismatch, and [`BackendError::NotRegistered`] when no backend is
+    /// Returns [`BackendError::Descriptor`] for an admission mismatch, and
+    /// [`BackendError::NotRegistered`] when no backend is
     /// registered for the admitted name.
     pub fn resolve(
         &self,
         descriptor: TopologyDescriptor,
         admitted_backend_name: &str,
     ) -> Result<(Arc<dyn IsolationBackend>, VerifiedTopologyDescriptor), BackendError> {
-        if descriptor.version != INTERFACE_VERSION {
-            return Err(BackendError::Descriptor(format!(
-                "descriptor interface version {} unsupported (expected {INTERFACE_VERSION})",
-                descriptor.version
-            )));
-        }
         if descriptor.backend_name != admitted_backend_name {
             return Err(BackendError::Descriptor(format!(
                 "descriptor backend {:?} does not match admitted backend {admitted_backend_name:?}",
@@ -299,13 +320,6 @@ impl BackendRegistry {
                 descriptor.backend_name
             )));
         }
-        if backend.version() != INTERFACE_VERSION {
-            return Err(BackendError::Descriptor(format!(
-                "backend {:?} speaks interface version {}, supervisor requires {INTERFACE_VERSION}",
-                descriptor.backend_name,
-                backend.version()
-            )));
-        }
         Ok((backend, VerifiedTopologyDescriptor { descriptor }))
     }
 }
@@ -315,10 +329,6 @@ impl BackendRegistry {
 pub trait IsolationBackend: Send + Sync {
     /// The stable registered backend name.
     fn backend_name(&self) -> &str;
-
-    /// The Isolation Backend contract version this backend speaks. Matched
-    /// exactly against [`INTERFACE_VERSION`]; there is no capability negotiation.
-    fn version(&self) -> u32;
 
     /// Validate the opaque payload, establish any boundary-local resources,
     /// and atomically bind them to the trusted sandbox context: returns `Bound`
@@ -363,9 +373,122 @@ pub trait BoundBoundary: Send {
         None
     }
 
-    /// Confirm standing enforcement. How a backend establishes confidence is
-    /// private to that backend; confirmation fails closed.
-    async fn confirm(self: Box<Self>) -> Result<Box<dyn ReadyBoundary>, BackendError>;
+    /// Confirm standing enforcement and return measured sandbox evidence.
+    /// Confirmation fails closed and does not execute untrusted workload code.
+    async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError>;
+}
+
+/// Capability masks measured from `/proc/<pid>/status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapabilityEvidence {
+    pub inheritable: u64,
+    pub permitted: u64,
+    pub effective: u64,
+    pub bounding: u64,
+    pub ambient: u64,
+}
+
+impl CapabilityEvidence {
+    /// True only when every Linux capability set is empty.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.inheritable == 0
+            && self.permitted == 0
+            && self.effective == 0
+            && self.bounding == 0
+            && self.ambient == 0
+    }
+}
+
+/// Active seccomp notification and socket-broker evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each independently measured kernel operation is reported explicitly"
+)]
+pub struct SeccompEvidence {
+    pub new_listener: bool,
+    pub notification_round_trip: bool,
+    pub id_validation: bool,
+    pub addfd_send: bool,
+    pub retained_socket_operation: bool,
+    pub proc_fd_identity: bool,
+    pub task_memory_read: bool,
+    pub task_memory_write: bool,
+    pub cancellation: bool,
+}
+
+/// Measured sandbox-owned evidence produced before agent launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "confirmation preserves independently measured security results"
+)]
+pub struct SandboxConfirmEvidence {
+    pub generation: String,
+    pub identity: ResolvedWorkloadIdentity,
+    pub capabilities: CapabilityEvidence,
+    pub no_new_privileges: bool,
+    pub sandbox_dumpable: bool,
+    pub child_dumpable: bool,
+    pub core_limit_zero: bool,
+    pub native_architecture: String,
+    pub kernel_release: String,
+    pub seccomp: SeccompEvidence,
+    pub landlock_abi: u32,
+    pub landlock_allow_deny: bool,
+    pub udp_dns_round_trip: bool,
+    pub tcp_dns_round_trip: bool,
+    pub tcp_allow_round_trip: bool,
+    pub tcp_deny_round_trip: bool,
+    pub authenticated_supervisor: bool,
+    pub session_epoch: String,
+    pub direct_egress_blocked: bool,
+    pub resource_claims: BTreeMap<String, String>,
+}
+
+impl SandboxConfirmEvidence {
+    /// Validate the security-critical evidence required before launch.
+    pub fn validate(&self, expected: &ResolvedWorkloadIdentity) -> Result<(), BackendError> {
+        let complete = &self.identity == expected
+            && self.capabilities.is_empty()
+            && self.no_new_privileges
+            && !self.sandbox_dumpable
+            && self.child_dumpable
+            && self.core_limit_zero
+            && self.seccomp.new_listener
+            && self.seccomp.notification_round_trip
+            && self.seccomp.id_validation
+            && self.seccomp.addfd_send
+            && self.seccomp.retained_socket_operation
+            && self.seccomp.proc_fd_identity
+            && self.seccomp.task_memory_read
+            && self.seccomp.task_memory_write
+            && self.seccomp.cancellation
+            && self.landlock_abi > 0
+            && self.landlock_allow_deny
+            && self.udp_dns_round_trip
+            && self.tcp_dns_round_trip
+            && self.tcp_allow_round_trip
+            && self.tcp_deny_round_trip
+            && self.authenticated_supervisor
+            && self.direct_egress_blocked
+            && !self.generation.is_empty()
+            && !self.session_epoch.is_empty();
+        if complete {
+            Ok(())
+        } else {
+            Err(BackendError::Confirm(
+                "sandbox confirmation evidence is incomplete or mismatched".to_string(),
+            ))
+        }
+    }
+}
+
+/// Ready boundary paired with the evidence measured by `confirm`.
+pub struct ConfirmedBoundary {
+    pub boundary: Box<dyn ReadyBoundary>,
+    pub evidence: SandboxConfirmEvidence,
 }
 
 /// Ready: standing enforcement is confirmed, and the backend is prepared to
@@ -544,7 +667,7 @@ pub trait BoundaryPortForward: Send + Sync {
 // ============================================================================
 
 /// Executable identity for one accepted connection, resolved by the backend and
-/// delivered on [`MediatedConnection`] before the mediation service evaluates
+/// delivered on [`PendingNetworkOpen`] before the mediation service evaluates
 /// policy.
 ///
 /// A missing digest is `None`, never an empty value; policy that requires an
@@ -605,19 +728,45 @@ impl FromStr for Sha256Digest {
     }
 }
 
-/// A workload connection delivered to the mediation service, carrying the
-/// identity-resolution result for that connection.
+/// Immutable socket metadata supplied with a pending external TCP open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkSocketMetadata {
+    /// Kernel socket cookie captured for the exact open-file description.
+    pub socket_cookie: u64,
+    /// Whether the workload requested nonblocking operation.
+    pub nonblocking: bool,
+    /// Workload process generation that owns the open.
+    pub process_generation: u64,
+}
+
+/// Typed supervisor decision for one pending TCP open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkOpenResult {
+    /// L4 authorization and a bounded relay handler are ready. L7 policy still
+    /// applies to bytes after the local connection commits.
+    RelayReady,
+    /// The socket remains unchanged and connect returns this positive errno.
+    Denied { errno: i32 },
+}
+
+/// A staged workload TCP open delivered before its local relay is committed.
 ///
-/// An `Err` identity denies the connection and is audited; it never authorizes
-/// anything.
-pub struct MediatedConnection {
-    /// The workload connection stream.
+/// An `Err` identity must be denied and audited. The supervisor owns
+/// `result`; dropping it cancels the open without changing the workload socket.
+pub struct PendingNetworkOpen {
+    /// Staged byte stream whose workload side is committed only after
+    /// [`NetworkOpenResult::RelayReady`].
     pub stream: BoundaryDuplexStream,
     /// Executable identity, resolved by the backend for this connection.
     pub binary_identity: Result<BinaryIdentity, ResolveError>,
-    /// Original destination captured by the backend. Explicit-proxy
-    /// transports leave this absent; transparent transports must supply it.
-    pub destination: Option<SocketAddr>,
+    /// Original external destination captured from the blocked syscall.
+    pub destination: SocketAddr,
+    /// Socket and process identity bound to this request.
+    pub socket: NetworkSocketMetadata,
+    /// Policy generation under which the request was created.
+    pub policy_generation: u64,
+    /// Single-use completion channel back to the sandbox broker.
+    pub result: oneshot::Sender<NetworkOpenResult>,
 }
 
 /// A logical per-boundary stream of workload connections, consumed by the
@@ -631,8 +780,8 @@ pub struct MediatedConnection {
 /// means the source itself is unusable and fails the boundary closed.
 #[async_trait]
 pub trait NetworkMediationSource: Send + Sync {
-    /// Await the next mediated workload connection.
-    async fn accept(&self) -> Result<MediatedConnection, BackendError>;
+    /// Await the next staged workload TCP open.
+    async fn accept(&self) -> Result<PendingNetworkOpen, BackendError>;
 }
 
 /// DNS transport used by one workload exchange.
