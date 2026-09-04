@@ -1,0 +1,144 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Trivy Changes
+
+on:
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+    inputs:
+      base_sha:
+        description: Base commit SHA to compare
+        required: true
+        type: string
+      head_sha:
+        description: Candidate commit SHA to compare
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect deployment configuration changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.default.outputs.should_run || steps.changed.outputs.any_changed }}
+    steps:
+      - id: default
+        if: github.event_name != 'pull_request'
+        run: echo "should_run=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+
+      - id: changed
+        if: github.event_name == 'pull_request'
+        uses: tj-actions/changed-files@aa08304bd477b800d468db44fe10f6c61f7f7b11 # v42.1.0
+        with:
+          files: |
+            deploy/docker/**
+            deploy/helm/**
+            .trivyignore.yaml
+            flake.nix
+            flake.lock
+            tasks/scripts/trivy-scan.sh
+            .github/workflows/trivy-changes.yml
+
+  scan:
+    name: Scan changed deployment configuration
+    needs: changes
+    if: needs.changes.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BASE_REF: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || inputs.base_sha }}
+      HEAD_REF: ${{ inputs.head_sha || github.sha }}
+    defaults:
+      run:
+        shell: nix develop --command bash -euo pipefail {0}
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.HEAD_REF }}
+          persist-credentials: false
+
+      - name: Check out baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BASE_REF }}
+          path: .trivy-base
+          persist-credentials: false
+
+      - name: Set up Nix
+        uses: ./.github/actions/setup-nix
+
+      - name: Scan baseline
+        env:
+          TRIVY_SOURCE_ROOT: ${{ github.workspace }}/.trivy-base
+          TRIVY_IGNORE_FILE: ${{ github.workspace }}/.trivyignore.yaml
+          TRIVY_REPORT_DIR: ${{ runner.temp }}/trivy-base
+        run: |
+          mkdir -p "$TRIVY_REPORT_DIR"
+          "$GITHUB_WORKSPACE/tasks/scripts/trivy-scan.sh" config
+
+      - name: Scan candidate
+        env:
+          TRIVY_REPORT_DIR: ${{ runner.temp }}/trivy-head
+        run: |
+          mkdir -p "$TRIVY_REPORT_DIR"
+          tasks/scripts/trivy-scan.sh config
+
+      - name: Reject new high or critical findings
+        run: |
+          tasks/scripts/trivy-scan.sh gate-config-diff \
+            "$RUNNER_TEMP/trivy-base" "$RUNNER_TEMP/trivy-head"
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-changes-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/trivy-base
+            ${{ runner.temp }}/trivy-head
+          if-no-files-found: ignore
+          retention-days: 14
+
+  result:
+    name: OpenShell / Trivy Changes
+    needs: [changes, scan]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check scan result
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          SHOULD_RUN: ${{ needs.changes.outputs.should_run }}
+          SCAN_RESULT: ${{ needs.scan.result }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::Change detection concluded $CHANGES_RESULT."
+            exit 1
+          fi
+          if [ "$SHOULD_RUN" = "true" ] && [ "$SCAN_RESULT" != "success" ]; then
+            echo "::error::Trivy scan concluded $SCAN_RESULT."
+            exit 1
+          fi
+          if [ "$SHOULD_RUN" != "true" ]; then
+            echo "No Helm or Dockerfile changes to scan."
+          fi
