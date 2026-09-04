@@ -113,6 +113,11 @@ EOF
 done
 chmod +x "${WORKDIR}/bin/"*
 
+# shellcheck source=e2e/support/podman-gateway-config.sh
+source "${ROOT}/e2e/support/podman-gateway-config.sh"
+[ "$(e2e_podman_external_driver_pull_policy 1)" = missing ] || fail 'schema v1 external pull policy mismatch'
+[ "$(e2e_podman_external_driver_pull_policy 2)" = if_not_present ] || fail 'schema v2 external pull policy mismatch'
+
 run_harness() {
   OPENSHELL_PARITY_CAPABILITY_MANIFEST="${WORKDIR}/manifest.toml" \
   OPENSHELL_PARITY_BASELINE_WORKTREE="${ROOT}" \
@@ -162,6 +167,9 @@ assert_contains "${WORKDIR}/calls" "|1|${WORKDIR}/bin/candidate-driver"
 assert_contains "${WORKDIR}/results/baseline.json" '"scenario":"external-driver"'
 assert_contains "${WORKDIR}/results/baseline.json" '"command_class":"external_driver_conformance_smoke"'
 assert_contains "${WORKDIR}/results/baseline.json" '"gateway_profile":"driver-free"'
+assert_contains "${WORKDIR}/results/baseline.json" '"gateway_sha256"'
+assert_contains "${WORKDIR}/results/baseline.json" '"cli_sha256"'
+assert_contains "${WORKDIR}/results/baseline.json" '"conformance_sha256"'
 assert_contains "${WORKDIR}/results/baseline.json" '"external_driver_sha256"'
 assert_contains "${WORKDIR}/results/comparison.json" '"classification":"pass"'
 

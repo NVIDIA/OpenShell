@@ -18,6 +18,14 @@ e2e_podman_config_schema_version() {
   esac
 }
 
+e2e_podman_external_driver_pull_policy() {
+  case "$1" in
+    1) printf '%s\n' missing ;;
+    2) printf '%s\n' if_not_present ;;
+    *) echo "ERROR: unsupported Podman config schema version: $1" >&2; return 2 ;;
+  esac
+}
+
 e2e_podman_toml_string() {
   local value="$1"
   value="${value//\\/\\\\}"

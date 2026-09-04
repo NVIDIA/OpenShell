@@ -375,6 +375,7 @@ fi
 
 # Validate the generated configuration dialect before creating runtime resources.
 CONFIG_SCHEMA_VERSION="$(e2e_podman_config_schema_version)"
+EXTERNAL_DRIVER_PULL_POLICY="$(e2e_podman_external_driver_pull_policy "${CONFIG_SCHEMA_VERSION}")"
 
 # Validate the opt-in profile before building images or allocating runtime resources.
 e2e_podman_option_profile >/dev/null
@@ -473,7 +474,7 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   OPENSHELL_COMPUTE_DRIVER_SOCKET="${DRIVER_SOCKET}" \
   OPENSHELL_PODMAN_SOCKET="${OPENSHELL_PODMAN_SOCKET:-}" \
   OPENSHELL_SANDBOX_IMAGE="${SANDBOX_IMAGE}" \
-  OPENSHELL_SANDBOX_IMAGE_PULL_POLICY="if_not_present" \
+  OPENSHELL_SANDBOX_IMAGE_PULL_POLICY="${EXTERNAL_DRIVER_PULL_POLICY}" \
   OPENSHELL_HEALTH_CHECK_INTERVAL_SECS=10 \
   OPENSHELL_GATEWAY_PORT="${HOST_PORT}" \
   OPENSHELL_NETWORK_NAME="${PODMAN_NETWORK_NAME}" \
