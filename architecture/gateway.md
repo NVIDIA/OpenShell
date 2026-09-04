@@ -336,6 +336,10 @@ This keeps the gateway data model portable across storage backends and leaves
 room for future stores that can provide the same object, label, version, and
 scope semantics.
 
+For in-memory SQLite, the adapter retains a dedicated keepalive connection for
+the store lifetime. Operational connection replacement therefore preserves the
+shared in-memory schema and objects instead of creating an empty database.
+
 The SQLite adapter tightens the on-disk database file to mode `0o600` on every
 connect so that provider API keys, SSH session tokens, and sandbox metadata are
 not readable by other local users on shared hosts. The same restriction is

@@ -132,6 +132,58 @@ async fn sqlite_connect_runs_embedded_migrations() {
     assert!(records.is_empty());
 }
 
+#[tokio::test]
+async fn sqlite_in_memory_store_survives_pool_connection_replacement() {
+    for url in ["sqlite::memory:", "sqlite://?mode=memory"] {
+        let store = super::sqlite::SqliteStore::connect(url)
+            .await
+            .expect("connect to in-memory SQLite");
+        store.migrate().await.expect("migrate in-memory SQLite");
+        store
+            .put(
+                "sandbox",
+                "before-replacement",
+                "before-replacement",
+                "default",
+                b"before",
+                None,
+            )
+            .await
+            .expect("write before connection replacement");
+
+        super::sqlite::replace_pool_connection(&store)
+            .await
+            .expect("replace operational pool connection");
+
+        let preserved = store
+            .get("sandbox", "before-replacement")
+            .await
+            .expect("schema survives connection replacement")
+            .expect("existing object survives connection replacement");
+        assert_eq!(preserved.payload, b"before", "database URL: {url}");
+
+        store
+            .put(
+                "sandbox",
+                "after-replacement",
+                "after-replacement",
+                "default",
+                b"after",
+                None,
+            )
+            .await
+            .expect("write after connection replacement");
+        assert!(
+            store
+                .get("sandbox", "after-replacement")
+                .await
+                .expect("read after connection replacement")
+                .is_some(),
+            "database URL: {url}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn sqlite_connect_restricts_db_file_permissions() {
