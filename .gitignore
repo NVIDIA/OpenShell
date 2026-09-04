@@ -235,3 +235,12 @@ scripts/lint-mermaid/node_modules/
 
 # Bazel
 bazel-*
+
+# spex: generated/local files (only constitution is committed)
+**/.claude/
+**/.agents/
+**/.codex/
+**/.specify/**
+!**/.specify/spex.json
+!**/.specify/memory/
+!**/.specify/memory/constitution.md
