@@ -121,7 +121,8 @@ GATEWAY_PID_FILE="${WORKDIR}/gateway.pid"
 GATEWAY_ARGS_FILE="${WORKDIR}/gateway.args"
 DRIVER_BIN=""
 DRIVER_PID=""
-DRIVER_LOG="${WORKDIR}/podman-driver.log"
+DRIVER_LOG="${OPENSHELL_PARITY_EXTERNAL_DRIVER_LOG_CAPTURE:-${WORKDIR}/podman-driver.log}"
+mkdir -p "$(dirname "${DRIVER_LOG}")"
 DRIVER_SOCKET="${WORKDIR}/compute-driver.sock"
 E2E_NAMESPACE=""
 PODMAN_NETWORK_NAME=""
@@ -621,6 +622,12 @@ e2e_write_podman_gateway_config \
 if [ -n "${OPENSHELL_PARITY_GATEWAY_CONFIG_CAPTURE:-}" ]; then
   cp "${GATEWAY_CONFIG}" "${OPENSHELL_PARITY_GATEWAY_CONFIG_CAPTURE}"
 fi
+EXTERNAL_DRIVER_CALLBACK_ENDPOINT="https://host.containers.internal:${HOST_PORT}"
+EXTERNAL_DRIVER_HEALTH_CHECK_INTERVAL_SECS=10
+EXTERNAL_DRIVER_ENABLE_BIND_MOUNTS=true
+EXTERNAL_DRIVER_TLS_CA="${PKI_DIR}/ca.crt"
+EXTERNAL_DRIVER_TLS_CERT="${PKI_DIR}/client/tls.crt"
+EXTERNAL_DRIVER_TLS_KEY="${PKI_DIR}/client/tls.key"
 if [ -n "${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE:-}" ]; then
   driver_transport=in_tree
   external_driver_grpc_endpoint=null
@@ -629,12 +636,34 @@ if [ -n "${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE:-}" ]; then
   external_driver_spiffe=false
   external_driver_proxy=false
   external_driver_app_armor=false
+  external_driver_environment=null
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     driver_transport=remote_uds
-    external_driver_grpc_endpoint="\"https://host.containers.internal:${HOST_PORT}\""
+    external_driver_grpc_endpoint="\"${EXTERNAL_DRIVER_CALLBACK_ENDPOINT}\""
     external_driver_host_gateway_ip='"host-gateway"'
+    driver_tls_ca_sha256="$(sha256sum "${EXTERNAL_DRIVER_TLS_CA}" | cut -d' ' -f1)"
+    driver_tls_cert_sha256="$(sha256sum "${EXTERNAL_DRIVER_TLS_CERT}" | cut -d' ' -f1)"
+    driver_tls_key_sha256="$(sha256sum "${EXTERNAL_DRIVER_TLS_KEY}" | cut -d' ' -f1)"
+    external_driver_environment="$(printf '{\"OPENSHELL_COMPUTE_DRIVER_SOCKET\":\"%s\",\"OPENSHELL_PODMAN_SOCKET\":\"%s\",\"OPENSHELL_SANDBOX_IMAGE\":\"%s\",\"OPENSHELL_SANDBOX_IMAGE_PULL_POLICY\":\"%s\",\"OPENSHELL_HEALTH_CHECK_INTERVAL_SECS\":%s,\"OPENSHELL_GRPC_ENDPOINT\":\"%s\",\"OPENSHELL_GATEWAY_PORT\":%s,\"OPENSHELL_NETWORK_NAME\":\"%s\",\"OPENSHELL_STOP_TIMEOUT\":%s,\"OPENSHELL_SUPERVISOR_IMAGE\":\"%s\",\"OPENSHELL_PODMAN_TLS_CA\":{\"path\":\"%s\",\"sha256\":\"%s\"},\"OPENSHELL_PODMAN_TLS_CERT\":{\"path\":\"%s\",\"sha256\":\"%s\"},\"OPENSHELL_PODMAN_TLS_KEY\":{\"path\":\"%s\",\"sha256\":\"%s\"},\"OPENSHELL_ENABLE_BIND_MOUNTS\":%s}' \
+      "${DRIVER_SOCKET}" \
+      "${OPENSHELL_PODMAN_SOCKET:-}" \
+      "${SANDBOX_RUNTIME_IMAGE}" \
+      "${EXTERNAL_DRIVER_PULL_POLICY}" \
+      "${EXTERNAL_DRIVER_HEALTH_CHECK_INTERVAL_SECS}" \
+      "${EXTERNAL_DRIVER_CALLBACK_ENDPOINT}" \
+      "${HOST_PORT}" \
+      "${PODMAN_NETWORK_NAME}" \
+      "${PODMAN_STOP_TIMEOUT_SECS}" \
+      "${SUPERVISOR_RUNTIME_IMAGE}" \
+      "${EXTERNAL_DRIVER_TLS_CA}" \
+      "${driver_tls_ca_sha256}" \
+      "${EXTERNAL_DRIVER_TLS_CERT}" \
+      "${driver_tls_cert_sha256}" \
+      "${EXTERNAL_DRIVER_TLS_KEY}" \
+      "${driver_tls_key_sha256}" \
+      "${EXTERNAL_DRIVER_ENABLE_BIND_MOUNTS}")"
   fi
-  printf '{"schema_version":%s,"gateway_port":%s,"external_compute_driver":%s,"compute_driver_transport":"%s","external_driver_pull_policy":"%s","supervisor_image":"%s","supervisor_image_id":"%s","supervisor_image_digest":"%s","supervisor_runtime_image":"%s","supervisor_base_image":"%s","supervisor_base_image_id":"%s","supervisor_base_image_digest":"%s","supervisor_base_runtime_image":"%s","supervisor_package_manifest_sha256":"%s","sandbox_image_request":"%s","sandbox_image_id":"%s","sandbox_image_digest":"%s","sandbox_runtime_image":"%s","sandbox_client_image_alias":"%s","sandbox_client_image_alias_id":"%s","gateway_sha256_before_execution":"%s","cli_sha256_before_execution":"%s","conformance_sha256_before_execution":"%s","external_driver_sha256_before_execution":"%s","supervisor_sha256_before_execution":"%s","supervisor_dockerfile_sha256_before_execution":"%s","external_driver_grpc_endpoint":%s,"external_driver_host_gateway_ip":%s,"external_driver_userns":%s,"external_driver_spiffe":%s,"external_driver_proxy":%s,"external_driver_app_armor":%s}\n' \
+  printf '{"schema_version":%s,"gateway_port":%s,"external_compute_driver":%s,"compute_driver_transport":"%s","external_driver_pull_policy":"%s","supervisor_image":"%s","supervisor_image_id":"%s","supervisor_image_digest":"%s","supervisor_runtime_image":"%s","supervisor_base_image":"%s","supervisor_base_image_id":"%s","supervisor_base_image_digest":"%s","supervisor_base_runtime_image":"%s","supervisor_package_manifest_sha256":"%s","sandbox_image_request":"%s","sandbox_image_id":"%s","sandbox_image_digest":"%s","sandbox_runtime_image":"%s","sandbox_client_image_alias":"%s","sandbox_client_image_alias_id":"%s","gateway_sha256_before_execution":"%s","cli_sha256_before_execution":"%s","conformance_sha256_before_execution":"%s","external_driver_sha256_before_execution":"%s","supervisor_sha256_before_execution":"%s","supervisor_dockerfile_sha256_before_execution":"%s","cli_trace_wrapper_sha256_before_execution":"%s","external_driver_grpc_endpoint":%s,"external_driver_host_gateway_ip":%s,"external_driver_userns":%s,"external_driver_spiffe":%s,"external_driver_proxy":%s,"external_driver_app_armor":%s,"external_driver_environment":%s}\n' \
     "${CONFIG_SCHEMA_VERSION}" \
     "${HOST_PORT}" \
     "$([ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ] && printf true || printf false)" \
@@ -661,12 +690,14 @@ if [ -n "${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE:-}" ]; then
     "${OPENSHELL_E2E_EXPECTED_EXTERNAL_DRIVER_SHA256:-}" \
     "${OPENSHELL_E2E_EXPECTED_SUPERVISOR_SHA256:-}" \
     "${OPENSHELL_E2E_EXPECTED_SUPERVISOR_DOCKERFILE_SHA256:-}" \
+    "${OPENSHELL_E2E_EXPECTED_CLI_TRACE_WRAPPER_SHA256:-}" \
     "${external_driver_grpc_endpoint}" \
     "${external_driver_host_gateway_ip}" \
     "${external_driver_userns}" \
     "${external_driver_spiffe}" \
     "${external_driver_proxy}" \
     "${external_driver_app_armor}" \
+    "${external_driver_environment}" \
     >"${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE}"
 fi
 
@@ -678,16 +709,16 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   OPENSHELL_PODMAN_SOCKET="${OPENSHELL_PODMAN_SOCKET:-}" \
   OPENSHELL_SANDBOX_IMAGE="${SANDBOX_RUNTIME_IMAGE}" \
   OPENSHELL_SANDBOX_IMAGE_PULL_POLICY="${EXTERNAL_DRIVER_PULL_POLICY}" \
-  OPENSHELL_HEALTH_CHECK_INTERVAL_SECS=10 \
-  OPENSHELL_GRPC_ENDPOINT="https://host.containers.internal:${HOST_PORT}" \
+  OPENSHELL_HEALTH_CHECK_INTERVAL_SECS="${EXTERNAL_DRIVER_HEALTH_CHECK_INTERVAL_SECS}" \
+  OPENSHELL_GRPC_ENDPOINT="${EXTERNAL_DRIVER_CALLBACK_ENDPOINT}" \
   OPENSHELL_GATEWAY_PORT="${HOST_PORT}" \
   OPENSHELL_NETWORK_NAME="${PODMAN_NETWORK_NAME}" \
   OPENSHELL_STOP_TIMEOUT="${PODMAN_STOP_TIMEOUT_SECS}" \
   OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_RUNTIME_IMAGE}" \
-  OPENSHELL_PODMAN_TLS_CA="${PKI_DIR}/ca.crt" \
-  OPENSHELL_PODMAN_TLS_CERT="${PKI_DIR}/client/tls.crt" \
-  OPENSHELL_PODMAN_TLS_KEY="${PKI_DIR}/client/tls.key" \
-  OPENSHELL_ENABLE_BIND_MOUNTS=true \
+  OPENSHELL_PODMAN_TLS_CA="${EXTERNAL_DRIVER_TLS_CA}" \
+  OPENSHELL_PODMAN_TLS_CERT="${EXTERNAL_DRIVER_TLS_CERT}" \
+  OPENSHELL_PODMAN_TLS_KEY="${EXTERNAL_DRIVER_TLS_KEY}" \
+  OPENSHELL_ENABLE_BIND_MOUNTS="${EXTERNAL_DRIVER_ENABLE_BIND_MOUNTS}" \
     "${DRIVER_BIN}" >"${DRIVER_LOG}" 2>&1 &
   DRIVER_PID=$!
   e2e_wait_for_socket \

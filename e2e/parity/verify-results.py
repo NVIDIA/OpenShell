@@ -22,6 +22,7 @@ ARTIFACT_FIELDS = {
     "conformance_sha256": "conformance",
     "supervisor_sha256": "supervisor",
     "supervisor_dockerfile_sha256": "supervisor.Dockerfile",
+    "cli_trace_wrapper_sha256": "cli-trace-wrapper",
 }
 ORACLE_MARKERS = (
     "][smoke/status] completed",
@@ -156,6 +157,11 @@ def verify_variant(
         require(
             set(podman_config) == {"socket_path"},
             f"{config_path}: external gateway Podman table is not transport-only",
+        )
+        require(
+            isinstance(podman_config["socket_path"], str)
+            and Path(podman_config["socket_path"]).is_absolute(),
+            f"{config_path}: external driver socket path is not absolute",
         )
     else:
         required_runtime_fields = {
@@ -308,6 +314,7 @@ def verify_variant(
             "supervisor_dockerfile_sha256_before_execution",
             "supervisor_dockerfile_sha256",
         ),
+        ("cli_trace_wrapper_sha256_before_execution", "cli_trace_wrapper_sha256"),
     ):
         require(
             launch.get(launch_field) == result.get(result_field),
@@ -320,11 +327,11 @@ def verify_variant(
             f"{launch_path}: external driver pre-execution hash mismatch",
         )
         gateway_port = launch.get("gateway_port")
+        callback_endpoint = f"https://host.containers.internal:{gateway_port}"
         require(
             isinstance(gateway_port, int)
             and 0 < gateway_port <= 65535
-            and launch.get("external_driver_grpc_endpoint")
-            == f"https://host.containers.internal:{gateway_port}",
+            and launch.get("external_driver_grpc_endpoint") == callback_endpoint,
             f"{launch_path}: external driver callback endpoint is not isolated",
         )
         require(
@@ -334,6 +341,76 @@ def verify_variant(
             and launch.get("external_driver_proxy") is False
             and launch.get("external_driver_app_armor") is False,
             f"{launch_path}: external driver effective configuration is tainted",
+        )
+        driver_environment = launch.get("external_driver_environment")
+        expected_environment_keys = {
+            "OPENSHELL_COMPUTE_DRIVER_SOCKET",
+            "OPENSHELL_PODMAN_SOCKET",
+            "OPENSHELL_SANDBOX_IMAGE",
+            "OPENSHELL_SANDBOX_IMAGE_PULL_POLICY",
+            "OPENSHELL_HEALTH_CHECK_INTERVAL_SECS",
+            "OPENSHELL_GRPC_ENDPOINT",
+            "OPENSHELL_GATEWAY_PORT",
+            "OPENSHELL_NETWORK_NAME",
+            "OPENSHELL_STOP_TIMEOUT",
+            "OPENSHELL_SUPERVISOR_IMAGE",
+            "OPENSHELL_PODMAN_TLS_CA",
+            "OPENSHELL_PODMAN_TLS_CERT",
+            "OPENSHELL_PODMAN_TLS_KEY",
+            "OPENSHELL_ENABLE_BIND_MOUNTS",
+        }
+        require(
+            isinstance(driver_environment, dict)
+            and set(driver_environment) == expected_environment_keys,
+            f"{launch_path}: external driver allowlisted environment is incomplete",
+        )
+        require(
+            driver_environment["OPENSHELL_COMPUTE_DRIVER_SOCKET"]
+            == podman_config["socket_path"],
+            f"{launch_path}: external driver socket differs from gateway TOML",
+        )
+        podman_socket = driver_environment["OPENSHELL_PODMAN_SOCKET"]
+        require(
+            isinstance(podman_socket, str)
+            and Path(podman_socket).is_absolute()
+            and podman_socket != podman_config["socket_path"],
+            f"{launch_path}: external driver Podman socket is not isolated",
+        )
+        require(
+            driver_environment["OPENSHELL_SANDBOX_IMAGE"] == sandbox_runtime
+            and driver_environment["OPENSHELL_SANDBOX_IMAGE_PULL_POLICY"]
+            == expected_policy
+            and driver_environment["OPENSHELL_HEALTH_CHECK_INTERVAL_SECS"] == 10
+            and driver_environment["OPENSHELL_GRPC_ENDPOINT"] == callback_endpoint
+            and driver_environment["OPENSHELL_GATEWAY_PORT"] == gateway_port
+            and isinstance(driver_environment["OPENSHELL_NETWORK_NAME"], str)
+            and driver_environment["OPENSHELL_NETWORK_NAME"]
+            and isinstance(driver_environment["OPENSHELL_STOP_TIMEOUT"], int)
+            and driver_environment["OPENSHELL_STOP_TIMEOUT"] >= 0
+            and driver_environment["OPENSHELL_SUPERVISOR_IMAGE"] == runtime_image
+            and driver_environment["OPENSHELL_ENABLE_BIND_MOUNTS"] is True,
+            f"{launch_path}: external driver allowlisted runtime inputs differ",
+        )
+        tls_paths: set[str] = set()
+        for field in (
+            "OPENSHELL_PODMAN_TLS_CA",
+            "OPENSHELL_PODMAN_TLS_CERT",
+            "OPENSHELL_PODMAN_TLS_KEY",
+        ):
+            tls_input = driver_environment[field]
+            require(
+                isinstance(tls_input, dict)
+                and set(tls_input) == {"path", "sha256"}
+                and isinstance(tls_input["path"], str)
+                and Path(tls_input["path"]).is_absolute()
+                and isinstance(tls_input["sha256"], str)
+                and SHA256_RE.fullmatch(tls_input["sha256"]) is not None,
+                f"{launch_path}: invalid external driver callback TLS input {field}",
+            )
+            tls_paths.add(tls_input["path"])
+        require(
+            len(tls_paths) == 3,
+            f"{launch_path}: external driver callback TLS paths are not distinct",
         )
     else:
         require(
@@ -351,6 +428,31 @@ def verify_variant(
     require(
         '"passed": true' in raw_log,
         f"{log_path}: missing successful conformance result",
+    )
+    require(
+        re.search(
+            r"gateway preflight connected: .*authentication=authenticated(?:\n|$)",
+            raw_log,
+        )
+        is not None,
+        f"{log_path}: authenticated gateway preflight is missing",
+    )
+    run_ids = re.findall(
+        r"^CLI conformance run ID: ([a-z0-9]+)$", raw_log, re.MULTILINE
+    )
+    require(
+        len(run_ids) == 1,
+        f"{log_path}: expected exactly one conformance run ID",
+    )
+    exec_stdout_path = results_dir / f"{variant}.exec.stdout"
+    require(
+        exec_stdout_path.is_file(),
+        f"{exec_stdout_path}: retained exec stdout is missing",
+    )
+    expected_exec_stdout = f"openshell-conformance-{run_ids[0]}\n".encode()
+    require(
+        exec_stdout_path.read_bytes() == expected_exec_stdout,
+        f"{exec_stdout_path}: callback exec stdout is not the exact marker",
     )
     launch_markers = (
         runtime_image,
@@ -371,6 +473,21 @@ def verify_variant(
         f"{log_path}: launch provenance is absent from raw output",
     )
 
+    raw_evidence_hashes = {
+        result_path.name: sha256(result_path),
+        launch_path.name: sha256(launch_path),
+        log_path.name: sha256(log_path),
+        config_path.name: sha256(config_path),
+        exec_stdout_path.name: sha256(exec_stdout_path),
+    }
+    if external:
+        driver_log_path = results_dir / f"{variant}.driver.log"
+        require(
+            driver_log_path.is_file() and driver_log_path.stat().st_size > 0,
+            f"{driver_log_path}: retained external driver log is missing or empty",
+        )
+        raw_evidence_hashes[driver_log_path.name] = sha256(driver_log_path)
+
     return {
         "schema_version": schema_version,
         "source_sha": expected_sha,
@@ -385,12 +502,7 @@ def verify_variant(
         },
         "artifact_sha256": artifact_hashes,
         "launch_attestation": launch,
-        "raw_evidence_sha256": {
-            result_path.name: sha256(result_path),
-            launch_path.name: sha256(launch_path),
-            log_path.name: sha256(log_path),
-            config_path.name: sha256(config_path),
-        },
+        "raw_evidence_sha256": raw_evidence_hashes,
         "artifacts_verified": True,
         "raw_output_verified": True,
         "success": True,
@@ -450,6 +562,26 @@ def verify_topology(
             != candidate["artifact_sha256"]["external-driver"],
             "external-driver artifacts have identical content",
         )
+        baseline_env = baseline_launch["external_driver_environment"]
+        candidate_env = candidate_launch["external_driver_environment"]
+        for field, label in (
+            ("OPENSHELL_COMPUTE_DRIVER_SOCKET", "compute-driver UDS"),
+            ("OPENSHELL_PODMAN_SOCKET", "Podman API UDS"),
+            ("OPENSHELL_NETWORK_NAME", "Podman network"),
+        ):
+            require(
+                baseline_env[field] != candidate_env[field],
+                f"baseline and candidate reuse the same external {label}",
+            )
+        for field in (
+            "OPENSHELL_PODMAN_TLS_CA",
+            "OPENSHELL_PODMAN_TLS_CERT",
+            "OPENSHELL_PODMAN_TLS_KEY",
+        ):
+            require(
+                baseline_env[field]["path"] != candidate_env[field]["path"],
+                "baseline and candidate reuse the same external callback TLS path",
+            )
 
     return {
         "baseline": baseline,
@@ -495,6 +627,21 @@ def verify_four_run_provenance(
         tuples = {tuple(launch.get(field) for field in fields) for launch in variants}
         require(len(tuples) == 1, f"the four runs use different {label}")
 
+    for variant in ("baseline", "candidate"):
+        in_tree_artifacts = in_tree[variant]["artifact_sha256"]
+        external_artifacts = external_uds[variant]["artifact_sha256"]
+        for artifact in (
+            "cli",
+            "conformance",
+            "supervisor",
+            "supervisor.Dockerfile",
+            "cli-trace-wrapper",
+        ):
+            require(
+                in_tree_artifacts[artifact] == external_artifacts[artifact],
+                f"{variant} {artifact} differs across topologies",
+            )
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -530,6 +677,10 @@ def main() -> None:
         "baseline_commit": args.baseline_sha,
         "candidate_commit": args.candidate_sha,
         "lane": "local-linux-x86_64-rootless-podman-5.8.2",
+        "retained_evidence_bundles": {
+            "in_tree": args.in_tree.as_posix(),
+            "external_uds": args.external_uds.as_posix(),
+        },
         "oracle": {
             "status": True,
             "create": True,
@@ -553,6 +704,11 @@ def main() -> None:
         "verification": {
             "retained_artifact_hashes_recomputed": True,
             "raw_lifecycle_output_inspected": True,
+            "authenticated_preflight_verified": True,
+            "exact_callback_exec_stdout_verified": True,
+            "external_driver_allowlist_verified": True,
+            "external_driver_logs_retained": True,
+            "external_uds_isolation_verified": True,
             "digest_pinned_supervisor_runtime_verified": True,
             "same_immutable_sandbox_verified": True,
             "supervisor_dependency_provenance_matched": True,

@@ -52,6 +52,7 @@ def create_variant(
         "conformance": f"{variant}-conformance",
         "supervisor": f"{variant}-supervisor",
         "supervisor.Dockerfile": f"{variant}-dockerfile",
+        "cli-trace-wrapper": "shared-cli-trace-wrapper",
         "external-driver": f"{variant}-external-driver",
         "supervisor.packages.txt": "fixture-package-1.0-r0\n",
     }
@@ -79,6 +80,9 @@ def create_variant(
             "supervisor_sha256": verifier.sha256(artifact_dir / "supervisor"),
             "supervisor_dockerfile_sha256": verifier.sha256(
                 artifact_dir / "supervisor.Dockerfile"
+            ),
+            "cli_trace_wrapper_sha256": verifier.sha256(
+                artifact_dir / "cli-trace-wrapper"
             ),
             "external_driver_sha256": verifier.sha256(artifact_dir / "external-driver"),
             "success": True,
@@ -132,21 +136,57 @@ socket_path = "/tmp/{variant}.sock"
             "supervisor_dockerfile_sha256_before_execution": result[
                 "supervisor_dockerfile_sha256"
             ],
+            "cli_trace_wrapper_sha256_before_execution": result[
+                "cli_trace_wrapper_sha256"
+            ],
             "external_driver_grpc_endpoint": "https://host.containers.internal:18181",
             "external_driver_host_gateway_ip": "host-gateway",
             "external_driver_userns": None,
             "external_driver_spiffe": False,
             "external_driver_proxy": False,
             "external_driver_app_armor": False,
+            "external_driver_environment": {
+                "OPENSHELL_COMPUTE_DRIVER_SOCKET": f"/tmp/{variant}.sock",
+                "OPENSHELL_PODMAN_SOCKET": f"/tmp/{variant}-podman.sock",
+                "OPENSHELL_SANDBOX_IMAGE": "example.invalid/sandbox@" + IMAGE_DIGEST,
+                "OPENSHELL_SANDBOX_IMAGE_PULL_POLICY": policy,
+                "OPENSHELL_HEALTH_CHECK_INTERVAL_SECS": 10,
+                "OPENSHELL_GRPC_ENDPOINT": "https://host.containers.internal:18181",
+                "OPENSHELL_GATEWAY_PORT": 18181,
+                "OPENSHELL_NETWORK_NAME": f"{variant}-network",
+                "OPENSHELL_STOP_TIMEOUT": 15,
+                "OPENSHELL_SUPERVISOR_IMAGE": RUNTIME_IMAGE,
+                "OPENSHELL_PODMAN_TLS_CA": {
+                    "path": f"/tmp/{variant}-pki/ca.crt",
+                    "sha256": "8" * 64,
+                },
+                "OPENSHELL_PODMAN_TLS_CERT": {
+                    "path": f"/tmp/{variant}-pki/tls.crt",
+                    "sha256": "9" * 64,
+                },
+                "OPENSHELL_PODMAN_TLS_KEY": {
+                    "path": f"/tmp/{variant}-pki/tls.key",
+                    "sha256": "a" * 64,
+                },
+                "OPENSHELL_ENABLE_BIND_MOUNTS": True,
+            },
         },
     )
     lifecycle = "\n".join(
         f"[run fixture{marker} in 1ms: exit 0" for marker in verifier.ORACLE_MARKERS
     )
     (results_dir / f"{variant}.log").write_text(
+        f"CLI conformance run ID: fixture\n"
+        f"gateway preflight connected: gateway=fixture, authentication=authenticated\n"
         f"{lifecycle}\n{RUNTIME_IMAGE} {BASE_RUNTIME_IMAGE} example.invalid/sandbox@{IMAGE_DIGEST} example.invalid/sandbox:latest "
         f'{IMAGE_ID} {IMAGE_DIGEST} {package_hash}\n"passed": true\n',
         encoding="utf-8",
+    )
+    (results_dir / f"{variant}.exec.stdout").write_bytes(
+        b"openshell-conformance-fixture\n"
+    )
+    (results_dir / f"{variant}.driver.log").write_text(
+        "external driver fixture started\n", encoding="utf-8"
     )
 
 
@@ -218,6 +258,7 @@ def test_verifier_rejects_different_sandbox_artifacts(tmp_path: Path) -> None:
             "sandbox_client_image_alias_id": other_id,
         }
     )
+    launch["external_driver_environment"]["OPENSHELL_SANDBOX_IMAGE"] = other_runtime
     write_json(launch_path, launch)
     with (tmp_path / "candidate.log").open("a", encoding="utf-8") as log:
         log.write(f"{other_id} {other_digest} {other_runtime}\n")
@@ -247,6 +288,87 @@ def test_verifier_rejects_different_supervisor_packages(tmp_path: Path) -> None:
         )
 
 
+def test_verifier_rejects_unattested_external_driver_input(tmp_path: Path) -> None:
+    verifier = load_verifier()
+    create_external_bundle(verifier, tmp_path)
+    launch_path = tmp_path / "candidate.launch.json"
+    launch = json.loads(launch_path.read_text(encoding="utf-8"))
+    del launch["external_driver_environment"]["OPENSHELL_STOP_TIMEOUT"]
+    write_json(launch_path, launch)
+
+    with pytest.raises(ValueError, match="allowlisted environment is incomplete"):
+        verifier.verify_topology(
+            tmp_path, BASELINE_SHA, CANDIDATE_SHA, "external-driver"
+        )
+
+
+def test_verifier_binds_gateway_and_driver_uds(tmp_path: Path) -> None:
+    verifier = load_verifier()
+    create_external_bundle(verifier, tmp_path)
+    launch_path = tmp_path / "candidate.launch.json"
+    launch = json.loads(launch_path.read_text(encoding="utf-8"))
+    launch["external_driver_environment"]["OPENSHELL_COMPUTE_DRIVER_SOCKET"] = (
+        "/tmp/different.sock"
+    )
+    write_json(launch_path, launch)
+
+    with pytest.raises(ValueError, match="driver socket differs from gateway TOML"):
+        verifier.verify_topology(
+            tmp_path, BASELINE_SHA, CANDIDATE_SHA, "external-driver"
+        )
+
+
+def test_verifier_rejects_reused_external_uds(tmp_path: Path) -> None:
+    verifier = load_verifier()
+    create_external_bundle(verifier, tmp_path)
+    launch_path = tmp_path / "candidate.launch.json"
+    launch = json.loads(launch_path.read_text(encoding="utf-8"))
+    launch["external_driver_environment"]["OPENSHELL_COMPUTE_DRIVER_SOCKET"] = (
+        "/tmp/baseline.sock"
+    )
+    write_json(launch_path, launch)
+    config_path = tmp_path / "candidate.gateway.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "/tmp/candidate.sock", "/tmp/baseline.sock"
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="reuse the same external compute-driver UDS"):
+        verifier.verify_topology(
+            tmp_path, BASELINE_SHA, CANDIDATE_SHA, "external-driver"
+        )
+
+
+def test_verifier_requires_exact_exec_stdout(tmp_path: Path) -> None:
+    verifier = load_verifier()
+    create_external_bundle(verifier, tmp_path)
+    (tmp_path / "candidate.exec.stdout").write_text("wrong marker\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="stdout is not the exact marker"):
+        verifier.verify_topology(
+            tmp_path, BASELINE_SHA, CANDIDATE_SHA, "external-driver"
+        )
+
+
+def test_verifier_requires_authenticated_preflight(tmp_path: Path) -> None:
+    verifier = load_verifier()
+    create_external_bundle(verifier, tmp_path)
+    log_path = tmp_path / "candidate.log"
+    log_path.write_text(
+        log_path.read_text(encoding="utf-8").replace(
+            "authentication=authenticated", "authentication=unauthenticated"
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="authenticated gateway preflight is missing"):
+        verifier.verify_topology(
+            tmp_path, BASELINE_SHA, CANDIDATE_SHA, "external-driver"
+        )
+
+
 def test_verifier_rejects_cross_topology_sandbox_drift() -> None:
     verifier = load_verifier()
     launch = {
@@ -261,13 +383,32 @@ def test_verifier_rejects_cross_topology_sandbox_drift() -> None:
         "supervisor_base_runtime_image": BASE_RUNTIME_IMAGE,
         "supervisor_package_manifest_sha256": "7" * 64,
     }
+    shared_artifacts = {
+        "cli": "b" * 64,
+        "conformance": "c" * 64,
+        "supervisor": "d" * 64,
+        "supervisor.Dockerfile": "e" * 64,
+        "cli-trace-wrapper": "f" * 64,
+    }
     in_tree = {
-        "baseline": {"launch_attestation": dict(launch)},
-        "candidate": {"launch_attestation": dict(launch)},
+        "baseline": {
+            "launch_attestation": dict(launch),
+            "artifact_sha256": dict(shared_artifacts),
+        },
+        "candidate": {
+            "launch_attestation": dict(launch),
+            "artifact_sha256": dict(shared_artifacts),
+        },
     }
     external = {
-        "baseline": {"launch_attestation": dict(launch)},
-        "candidate": {"launch_attestation": dict(launch)},
+        "baseline": {
+            "launch_attestation": dict(launch),
+            "artifact_sha256": dict(shared_artifacts),
+        },
+        "candidate": {
+            "launch_attestation": dict(launch),
+            "artifact_sha256": dict(shared_artifacts),
+        },
     }
     external["candidate"]["launch_attestation"]["sandbox_image_id"] = "8" * 64
 

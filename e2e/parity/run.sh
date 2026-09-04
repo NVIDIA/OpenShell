@@ -314,18 +314,20 @@ stage_executable() {
   stage_artifact "$1" "$2" "$3" 0555 "$4" "$5"
 }
 
-BASELINE_GATEWAY_DIGEST="" BASELINE_CLI_DIGEST="" BASELINE_CONFORMANCE_DIGEST="" BASELINE_EXTERNAL_DRIVER_DIGEST="" BASELINE_SUPERVISOR_DIGEST="" BASELINE_SUPERVISOR_DOCKERFILE="" BASELINE_SUPERVISOR_DOCKERFILE_DIGEST=""
-CANDIDATE_GATEWAY_DIGEST="" CANDIDATE_CLI_DIGEST="" CANDIDATE_CONFORMANCE_DIGEST="" CANDIDATE_EXTERNAL_DRIVER_DIGEST="" CANDIDATE_SUPERVISOR_DIGEST="" CANDIDATE_SUPERVISOR_DOCKERFILE="" CANDIDATE_SUPERVISOR_DOCKERFILE_DIGEST=""
+BASELINE_GATEWAY_DIGEST="" BASELINE_CLI_DIGEST="" BASELINE_CONFORMANCE_DIGEST="" BASELINE_EXTERNAL_DRIVER_DIGEST="" BASELINE_SUPERVISOR_DIGEST="" BASELINE_SUPERVISOR_DOCKERFILE="" BASELINE_SUPERVISOR_DOCKERFILE_DIGEST="" BASELINE_CLI_TRACE_WRAPPER="" BASELINE_CLI_TRACE_WRAPPER_DIGEST=""
+CANDIDATE_GATEWAY_DIGEST="" CANDIDATE_CLI_DIGEST="" CANDIDATE_CONFORMANCE_DIGEST="" CANDIDATE_EXTERNAL_DRIVER_DIGEST="" CANDIDATE_SUPERVISOR_DIGEST="" CANDIDATE_SUPERVISOR_DOCKERFILE="" CANDIDATE_SUPERVISOR_DOCKERFILE_DIGEST="" CANDIDATE_CLI_TRACE_WRAPPER="" CANDIDATE_CLI_TRACE_WRAPPER_DIGEST=""
 stage_executable baseline gateway "${BASELINE_GATEWAY}" BASELINE_GATEWAY BASELINE_GATEWAY_DIGEST
 stage_executable baseline cli "${BASELINE_CLI}" BASELINE_CLI BASELINE_CLI_DIGEST
 stage_executable baseline conformance "${BASELINE_CONFORMANCE}" BASELINE_CONFORMANCE BASELINE_CONFORMANCE_DIGEST
 stage_executable baseline supervisor "${BASELINE_SUPERVISOR}" BASELINE_SUPERVISOR BASELINE_SUPERVISOR_DIGEST
 stage_artifact baseline supervisor.Dockerfile "${BASELINE_WORKTREE}/deploy/docker/Dockerfile.supervisor" 0444 BASELINE_SUPERVISOR_DOCKERFILE BASELINE_SUPERVISOR_DOCKERFILE_DIGEST
+stage_artifact baseline cli-trace-wrapper "${ROOT}/e2e/parity/trace-cli.sh" 0555 BASELINE_CLI_TRACE_WRAPPER BASELINE_CLI_TRACE_WRAPPER_DIGEST
 stage_executable candidate gateway "${CANDIDATE_GATEWAY}" CANDIDATE_GATEWAY CANDIDATE_GATEWAY_DIGEST
 stage_executable candidate cli "${CANDIDATE_CLI}" CANDIDATE_CLI CANDIDATE_CLI_DIGEST
 stage_executable candidate conformance "${CANDIDATE_CONFORMANCE}" CANDIDATE_CONFORMANCE CANDIDATE_CONFORMANCE_DIGEST
 stage_executable candidate supervisor "${CANDIDATE_SUPERVISOR}" CANDIDATE_SUPERVISOR CANDIDATE_SUPERVISOR_DIGEST
 stage_artifact candidate supervisor.Dockerfile "${CANDIDATE_WORKTREE}/deploy/docker/Dockerfile.supervisor" 0444 CANDIDATE_SUPERVISOR_DOCKERFILE CANDIDATE_SUPERVISOR_DOCKERFILE_DIGEST
+stage_artifact candidate cli-trace-wrapper "${ROOT}/e2e/parity/trace-cli.sh" 0555 CANDIDATE_CLI_TRACE_WRAPPER CANDIDATE_CLI_TRACE_WRAPPER_DIGEST
 if [ "${SCENARIO}" = external-driver ]; then
   stage_executable baseline external-driver "${BASELINE_EXTERNAL_DRIVER}" BASELINE_EXTERNAL_DRIVER BASELINE_EXTERNAL_DRIVER_DIGEST
   stage_executable candidate external-driver "${CANDIDATE_EXTERNAL_DRIVER}" CANDIDATE_EXTERNAL_DRIVER CANDIDATE_EXTERNAL_DRIVER_DIGEST
@@ -416,7 +418,7 @@ resolve_parity_supervisor_base_image
 
 write_result() {
   local variant=$1 source_sha=$2 schema=$3 status=$4
-  local gateway_digest=$5 cli_digest=$6 conformance_digest=$7 external_driver_digest_value=$8 supervisor_digest=$9 supervisor_dockerfile_digest=${10}
+  local gateway_digest=$5 cli_digest=$6 conformance_digest=$7 external_driver_digest_value=$8 supervisor_digest=$9 supervisor_dockerfile_digest=${10} cli_trace_wrapper_digest=${11}
   local normalized_result="" external_driver_digest="" gateway_profile="in-tree"
   local gateway_features=default
   local gateway_origin cli_origin conformance_origin external_driver_origin supervisor_origin
@@ -440,7 +442,7 @@ write_result() {
   fi
   if [ "${SCENARIO}" = "podman-options" ]; then normalized_result=",\"normalized_result\":\"${variant}.normalized.json\""; fi
   cat >"${RESULTS_DIR}/${variant}.json" <<EOF
-{"variant":"${variant}","source_sha":"${source_sha}","schema_version":${schema},"driver":"${DRIVER}","scenario":"${SCENARIO}","command_class":"${COMMAND_CLASS}","gateway_profile":"${gateway_profile}","gateway_cargo_features":"${gateway_features}","gateway_origin":"${gateway_origin}","cli_origin":"${cli_origin}","conformance_origin":"${conformance_origin}","external_driver_origin":"${external_driver_origin}","supervisor_origin":"${supervisor_origin}","gateway_sha256":"${gateway_digest}","cli_sha256":"${cli_digest}","conformance_sha256":"${conformance_digest}","supervisor_sha256":"${supervisor_digest}","supervisor_dockerfile_sha256":"${supervisor_dockerfile_digest}"${normalized_result}${external_driver_digest},"success":${status}}
+{"variant":"${variant}","source_sha":"${source_sha}","schema_version":${schema},"driver":"${DRIVER}","scenario":"${SCENARIO}","command_class":"${COMMAND_CLASS}","gateway_profile":"${gateway_profile}","gateway_cargo_features":"${gateway_features}","gateway_origin":"${gateway_origin}","cli_origin":"${cli_origin}","conformance_origin":"${conformance_origin}","external_driver_origin":"${external_driver_origin}","supervisor_origin":"${supervisor_origin}","gateway_sha256":"${gateway_digest}","cli_sha256":"${cli_digest}","conformance_sha256":"${conformance_digest}","supervisor_sha256":"${supervisor_digest}","supervisor_dockerfile_sha256":"${supervisor_dockerfile_digest}","cli_trace_wrapper_sha256":"${cli_trace_wrapper_digest}"${normalized_result}${external_driver_digest},"success":${status}}
 EOF
 }
 
@@ -491,7 +493,7 @@ verify_artifact_digest() {
 
 run_variant() {
   local variant=$1 source_sha=$2 schema=$3 gateway=$4 cli=$5 conformance=$6 external_driver=$7 supervisor=$8 supervisor_dockerfile=$9
-  local gateway_digest=${10} cli_digest=${11} conformance_digest=${12} external_driver_digest=${13} supervisor_digest=${14} supervisor_dockerfile_digest=${15}
+  local gateway_digest=${10} cli_digest=${11} conformance_digest=${12} external_driver_digest=${13} supervisor_digest=${14} supervisor_dockerfile_digest=${15} cli_trace_wrapper=${16} cli_trace_wrapper_digest=${17}
   local result_status variant_home="${RUN_DIR}/${variant}"
   local supervisor_image="localhost/openshell/supervisor:parity-${variant}-${source_sha:0:12}"
   mkdir -p "${variant_home}/config" "${variant_home}/state" "${variant_home}/cache" "${variant_home}/data"
@@ -502,13 +504,14 @@ run_variant() {
     option_profile="podman-options"
     command=(bash "${PODMAN_OPTIONS_ORACLE}")
   else
-    command=("${conformance}" run --openshell-bin "${cli}" --output json)
+    command=("${conformance}" run --openshell-bin "${cli_trace_wrapper}" --output json)
   fi
   verify_artifact_digest "${variant} gateway before execution" "${gateway}" "${gateway_digest}" || return 1
   verify_artifact_digest "${variant} CLI before execution" "${cli}" "${cli_digest}" || return 1
   verify_artifact_digest "${variant} conformance CLI before execution" "${conformance}" "${conformance_digest}" || return 1
   verify_artifact_digest "${variant} supervisor before execution" "${supervisor}" "${supervisor_digest}" || return 1
   verify_artifact_digest "${variant} supervisor Dockerfile before execution" "${supervisor_dockerfile}" "${supervisor_dockerfile_digest}" || return 1
+  verify_artifact_digest "${variant} CLI trace wrapper before execution" "${cli_trace_wrapper}" "${cli_trace_wrapper_digest}" || return 1
   if [ -n "${external_driver}" ]; then
     verify_artifact_digest "${variant} external driver before execution" "${external_driver}" "${external_driver_digest}" || return 1
   fi
@@ -545,6 +548,10 @@ run_variant() {
     OPENSHELL_E2E_EXPECTED_EXTERNAL_DRIVER_SHA256="${external_driver_digest}" \
     OPENSHELL_E2E_EXPECTED_SUPERVISOR_SHA256="${supervisor_digest}" \
     OPENSHELL_E2E_EXPECTED_SUPERVISOR_DOCKERFILE_SHA256="${supervisor_dockerfile_digest}" \
+    OPENSHELL_E2E_EXPECTED_CLI_TRACE_WRAPPER_SHA256="${cli_trace_wrapper_digest}" \
+    OPENSHELL_PARITY_REAL_CLI="${cli}" \
+    OPENSHELL_PARITY_EXEC_STDOUT_CAPTURE="${RESULTS_DIR}/${variant}.exec.stdout" \
+    OPENSHELL_PARITY_EXTERNAL_DRIVER_LOG_CAPTURE="${RESULTS_DIR}/${variant}.driver.log" \
     OPENSHELL_SUPERVISOR_IMAGE="${supervisor_image}" \
     OPENSHELL_E2E_PODMAN_OPTION_PROFILE="${option_profile}" \
     OPENSHELL_PARITY_ORACLE_RESULT="${RESULTS_DIR}/${variant}.normalized.json" \
@@ -574,19 +581,29 @@ run_variant() {
   verify_artifact_digest "${variant} conformance CLI" "${conformance}" "${conformance_digest}" || result_status=false
   verify_artifact_digest "${variant} supervisor" "${supervisor}" "${supervisor_digest}" || result_status=false
   verify_artifact_digest "${variant} supervisor Dockerfile" "${supervisor_dockerfile}" "${supervisor_dockerfile_digest}" || result_status=false
+  verify_artifact_digest "${variant} CLI trace wrapper" "${cli_trace_wrapper}" "${cli_trace_wrapper_digest}" || result_status=false
   if [ -n "${external_driver}" ]; then
     verify_artifact_digest "${variant} external driver" "${external_driver}" "${external_driver_digest}" || result_status=false
   fi
-  write_result "${variant}" "${source_sha}" "${schema}" "${result_status}" "${gateway_digest}" "${cli_digest}" "${conformance_digest}" "${external_driver_digest}" "${supervisor_digest}" "${supervisor_dockerfile_digest}"
+  if [ "${SCENARIO}" != podman-options ] \
+     && [ ! -s "${RESULTS_DIR}/${variant}.exec.stdout" ]; then
+    echo "ERROR: ${variant} CLI trace wrapper did not retain exec stdout." >&2
+    result_status=false
+  fi
+  if [ "${SCENARIO}" = external-driver ] && [ ! -s "${RESULTS_DIR}/${variant}.driver.log" ]; then
+    echo "ERROR: ${variant} external driver log was not retained." >&2
+    result_status=false
+  fi
+  write_result "${variant}" "${source_sha}" "${schema}" "${result_status}" "${gateway_digest}" "${cli_digest}" "${conformance_digest}" "${external_driver_digest}" "${supervisor_digest}" "${supervisor_dockerfile_digest}" "${cli_trace_wrapper_digest}"
   [ "${result_status}" = true ]
 }
 
 baseline_exit=0
 candidate_exit=0
-run_variant baseline "${BASELINE_SHA}" 1 "${BASELINE_GATEWAY}" "${BASELINE_CLI}" "${BASELINE_CONFORMANCE}" "${BASELINE_EXTERNAL_DRIVER}" "${BASELINE_SUPERVISOR}" "${BASELINE_SUPERVISOR_DOCKERFILE}" "${BASELINE_GATEWAY_DIGEST}" "${BASELINE_CLI_DIGEST}" "${BASELINE_CONFORMANCE_DIGEST}" "${BASELINE_EXTERNAL_DRIVER_DIGEST}" "${BASELINE_SUPERVISOR_DIGEST}" "${BASELINE_SUPERVISOR_DOCKERFILE_DIGEST}" || baseline_exit=$?
+run_variant baseline "${BASELINE_SHA}" 1 "${BASELINE_GATEWAY}" "${BASELINE_CLI}" "${BASELINE_CONFORMANCE}" "${BASELINE_EXTERNAL_DRIVER}" "${BASELINE_SUPERVISOR}" "${BASELINE_SUPERVISOR_DOCKERFILE}" "${BASELINE_GATEWAY_DIGEST}" "${BASELINE_CLI_DIGEST}" "${BASELINE_CONFORMANCE_DIGEST}" "${BASELINE_EXTERNAL_DRIVER_DIGEST}" "${BASELINE_SUPERVISOR_DIGEST}" "${BASELINE_SUPERVISOR_DOCKERFILE_DIGEST}" "${BASELINE_CLI_TRACE_WRAPPER}" "${BASELINE_CLI_TRACE_WRAPPER_DIGEST}" || baseline_exit=$?
 # Do not short-circuit: a candidate result is useful even when the frozen
 # baseline failed, and two equal failures must never constitute parity.
-run_variant candidate "${CANDIDATE_SHA}" 2 "${CANDIDATE_GATEWAY}" "${CANDIDATE_CLI}" "${CANDIDATE_CONFORMANCE}" "${CANDIDATE_EXTERNAL_DRIVER}" "${CANDIDATE_SUPERVISOR}" "${CANDIDATE_SUPERVISOR_DOCKERFILE}" "${CANDIDATE_GATEWAY_DIGEST}" "${CANDIDATE_CLI_DIGEST}" "${CANDIDATE_CONFORMANCE_DIGEST}" "${CANDIDATE_EXTERNAL_DRIVER_DIGEST}" "${CANDIDATE_SUPERVISOR_DIGEST}" "${CANDIDATE_SUPERVISOR_DOCKERFILE_DIGEST}" || candidate_exit=$?
+run_variant candidate "${CANDIDATE_SHA}" 2 "${CANDIDATE_GATEWAY}" "${CANDIDATE_CLI}" "${CANDIDATE_CONFORMANCE}" "${CANDIDATE_EXTERNAL_DRIVER}" "${CANDIDATE_SUPERVISOR}" "${CANDIDATE_SUPERVISOR_DOCKERFILE}" "${CANDIDATE_GATEWAY_DIGEST}" "${CANDIDATE_CLI_DIGEST}" "${CANDIDATE_CONFORMANCE_DIGEST}" "${CANDIDATE_EXTERNAL_DRIVER_DIGEST}" "${CANDIDATE_SUPERVISOR_DIGEST}" "${CANDIDATE_SUPERVISOR_DOCKERFILE_DIGEST}" "${CANDIDATE_CLI_TRACE_WRAPPER}" "${CANDIDATE_CLI_TRACE_WRAPPER_DIGEST}" || candidate_exit=$?
 
 baseline_success=$([ "${baseline_exit}" -eq 0 ] && printf true || printf false)
 candidate_success=$([ "${candidate_exit}" -eq 0 ] && printf true || printf false)
