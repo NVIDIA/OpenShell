@@ -174,7 +174,7 @@ service_name = "openshell-gateway"
 [openshell.gateway.oidc]
 issuer        = "https://idp.example.com/realms/openshell"
 audience      = "openshell-cli"
-jwks_ttl_secs = 3600
+jwks_ttl_secs = 3600 # Must be greater than zero.
 roles_claim   = "realm_access.roles"
 admin_role    = "openshell-admin"
 user_role     = "openshell-user"

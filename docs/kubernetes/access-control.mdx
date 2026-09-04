@@ -31,7 +31,7 @@ The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the SPIF
 
 ## OIDC User Authentication
 
-Set `server.oidc.issuer` to enable OIDC. The gateway validates the `Authorization: Bearer <token>` header on every request against the issuer's JWKS endpoint.
+Set `server.oidc.issuer` to enable OIDC. The gateway validates the `Authorization: Bearer <token>` header on every request against the issuer's JWKS endpoint. It accepts JWTs signed with RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, or EdDSA (Ed25519) keys published in the issuer JWKS. Okta tenants that sign access tokens with ES256 work without additional gateway configuration.
 
 ```shell
 helm upgrade openshell \
@@ -53,7 +53,7 @@ The `audience` value must match the client ID configured in your identity provid
 |---|---|---|
 | `server.oidc.issuer` | `""` | OIDC issuer URL. Empty disables OIDC. |
 | `server.oidc.audience` | `openshell-cli` | Expected `aud` claim in the JWT. |
-| `server.oidc.jwksTtl` | `3600` | JWKS key cache TTL in seconds. |
+| `server.oidc.jwksTtl` | `3600` | JWKS key cache TTL in seconds. Must be greater than zero. |
 | `server.oidc.rolesClaim` | `""` | Dot-separated path to the roles array in JWT claims. |
 | `server.oidc.adminRole` | `""` | Role name that grants admin access. |
 | `server.oidc.userRole` | `""` | Role name that grants standard user access. |

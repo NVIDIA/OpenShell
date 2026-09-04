@@ -1227,7 +1227,9 @@ fn build_environment_sets_docker_tls_paths() {
         })
         .expect("main-process transport");
     let main = openshell_core::sandbox_env::MainProcessConfig::decode(&encoded).unwrap();
-    assert_eq!(main.command, vec!["/bin/bash", "-l"]);
+    // An omitted command is forwarded empty; the supervisor resolves the default
+    // login shell against the sandbox image at startup.
+    assert!(main.command.is_empty());
     assert!(main.tty);
 }
 

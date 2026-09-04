@@ -192,7 +192,7 @@ Supported auth modes:
 | Plaintext | Local development or a trusted reverse proxy boundary. |
 | Unauthenticated local users | Trusted Kubernetes dev or fully trusted proxy deployments only. |
 | Cloudflare JWT | Edge-authenticated deployments where Cloudflare Access supplies identity. |
-| OIDC | Bearer-token auth for users, with browser or device-code PKCE and client credentials login. |
+| OIDC | Bearer-token auth for users, with browser or device-code PKCE and client credentials login. JWKS validation accepts RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, and EdDSA (Ed25519) signing keys. |
 
 The CLI persists the scopes requested during OIDC login in gateway metadata and
 reuses them when refreshing an access token. This preserves the intended API

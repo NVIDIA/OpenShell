@@ -111,7 +111,9 @@ impl std::str::FromStr for Mode {
 #[command(about = "Process sandbox and monitor", long_about = None)]
 struct Args {
     /// Command to execute in the sandbox.
-    /// Defaults to `/bin/bash -l` if neither this nor the driver specification is provided.
+    /// Defaults to a login shell if neither this nor the driver specification is
+    /// provided: `/bin/bash -l` when available, otherwise a shell detected in the
+    /// sandbox image (e.g. `/bin/sh` on Alpine).
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
 
@@ -678,6 +680,12 @@ fn main() -> Result<()> {
             )
         };
 
+        // An omitted command (the gateway leaves the default empty rather than
+        // baking a shell it cannot verify) is resolved to a login shell here, in
+        // the supervisor, so it matches the sandbox image: bash when present,
+        // otherwise /bin/sh (e.g. Alpine). An explicit command is used verbatim.
+        let command = resolve_default_command(command);
+
         info!(command = ?command, "Starting sandbox");
         // Note: "Starting sandbox" stays as plain info!() since the OCSF context
         // is not yet initialized at this point (run_sandbox hasn't been called).
@@ -716,6 +724,20 @@ fn main() -> Result<()> {
     })?;
 
     std::process::exit(exit_code);
+}
+
+/// Resolve an omitted canonical command to a login shell that exists in this
+/// sandbox image. Empty means "use the default": the gateway leaves an omitted
+/// command empty rather than persisting a shell it cannot verify, so the
+/// supervisor picks one here against the real sandbox filesystem (bash when
+/// present, otherwise `/bin/sh`). An explicit command is returned unchanged.
+fn resolve_default_command(command: Vec<String>) -> Vec<String> {
+    if !command.is_empty() {
+        return command;
+    }
+    let shell = openshell_core::shell::detect_login_shell();
+    info!(shell = %shell, "no command specified; resolved default login shell");
+    vec![shell, "-l".to_string()]
 }
 
 #[cfg(test)]
