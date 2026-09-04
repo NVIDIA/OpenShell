@@ -64,6 +64,21 @@ set -e
 assert_status "${status}" 2
 assert_contains "${WORKDIR}/wrapper-schema.out" 'must be 1 or 2'
 
+cat >"${WORKDIR}/trace-cli-fixture" <<'EOF'
+#!/usr/bin/env bash
+printf 'openshell-conformance-tracefixture\n'
+printf 'trace fixture stderr\n' >&2
+EOF
+chmod +x "${WORKDIR}/trace-cli-fixture"
+OPENSHELL_PARITY_REAL_CLI="${WORKDIR}/trace-cli-fixture" \
+OPENSHELL_PARITY_EXEC_STDOUT_CAPTURE="${WORKDIR}/trace-cli.stdout" \
+  bash "${ROOT}/e2e/parity/trace-cli.sh" sandbox exec -- echo marker \
+  >"${WORKDIR}/trace-cli.forwarded.stdout" \
+  2>"${WORKDIR}/trace-cli.forwarded.stderr"
+cmp -s "${WORKDIR}/trace-cli.stdout" "${WORKDIR}/trace-cli.forwarded.stdout" \
+  || fail 'CLI trace wrapper did not preserve exact exec stdout'
+assert_contains "${WORKDIR}/trace-cli.forwarded.stderr" 'trace fixture stderr'
+
 HEAD_SHA="$(git -C "${ROOT}" rev-parse HEAD)"
 cat >"${WORKDIR}/manifest.toml" <<EOF
 manifest_version = 1
@@ -113,6 +128,10 @@ printf '{"schema_version":%s,"external_compute_driver":%s,"compute_driver_transp
   "${OPENSHELL_SUPERVISOR_IMAGE}" 0 0 "${runtime_image}" \
   >"${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE}"
 printf 'fixture-package-1.0-r0\n' >"${OPENSHELL_PARITY_SUPERVISOR_PACKAGE_CAPTURE}"
+printf 'fixture exec stdout\n' >"${OPENSHELL_PARITY_EXEC_STDOUT_CAPTURE}"
+if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = 1 ]; then
+  printf 'fixture external driver log\n' >"${OPENSHELL_PARITY_EXTERNAL_DRIVER_LOG_CAPTURE}"
+fi
 if [ "${OPENSHELL_PARITY_TEST_MUTATE_ARTIFACT:-}" = "${OPENSHELL_PARITY_VARIANT}" ]; then
   replacement="${OPENSHELL_GATEWAY_BIN}.replacement"
   printf '#!/usr/bin/env bash\nexit 0\n# mutated\n' >"${replacement}"
