@@ -181,6 +181,19 @@ CANDIDATE_GATEWAY="" CANDIDATE_CLI="" CANDIDATE_CONFORMANCE=""
 build_variant baseline "${BASELINE_WORKTREE}" "${OPENSHELL_PARITY_BASELINE_CARGO_TARGET_DIR:-}" "${OPENSHELL_PARITY_BASELINE_GATEWAY_BIN:-}" "${OPENSHELL_PARITY_BASELINE_CLI_BIN:-}" "${OPENSHELL_PARITY_BASELINE_CONFORMANCE_BIN:-}" BASELINE_GATEWAY BASELINE_CLI BASELINE_CONFORMANCE
 build_variant candidate "${ROOT}" "${OPENSHELL_PARITY_CANDIDATE_CARGO_TARGET_DIR:-}" "${OPENSHELL_PARITY_CANDIDATE_GATEWAY_BIN:-}" "${OPENSHELL_PARITY_CANDIDATE_CLI_BIN:-}" "${OPENSHELL_PARITY_CANDIDATE_CONFORMANCE_BIN:-}" CANDIDATE_GATEWAY CANDIDATE_CLI CANDIDATE_CONFORMANCE
 
+BASELINE_GATEWAY_ORIGIN=built_by_harness
+BASELINE_CLI_ORIGIN=built_by_harness
+BASELINE_CONFORMANCE_ORIGIN=built_by_harness
+CANDIDATE_GATEWAY_ORIGIN=built_by_harness
+CANDIDATE_CLI_ORIGIN=built_by_harness
+CANDIDATE_CONFORMANCE_ORIGIN=built_by_harness
+[ -z "${OPENSHELL_PARITY_BASELINE_GATEWAY_BIN:-}" ] || BASELINE_GATEWAY_ORIGIN=supplied_override
+[ -z "${OPENSHELL_PARITY_BASELINE_CLI_BIN:-}" ] || BASELINE_CLI_ORIGIN=supplied_override
+[ -z "${OPENSHELL_PARITY_BASELINE_CONFORMANCE_BIN:-}" ] || BASELINE_CONFORMANCE_ORIGIN=supplied_override
+[ -z "${OPENSHELL_PARITY_CANDIDATE_GATEWAY_BIN:-}" ] || CANDIDATE_GATEWAY_ORIGIN=supplied_override
+[ -z "${OPENSHELL_PARITY_CANDIDATE_CLI_BIN:-}" ] || CANDIDATE_CLI_ORIGIN=supplied_override
+[ -z "${OPENSHELL_PARITY_CANDIDATE_CONFORMANCE_BIN:-}" ] || CANDIDATE_CONFORMANCE_ORIGIN=supplied_override
+
 build_external_driver() {
   local variant=$1 source_root=$2 target_dir=$3 override=$4 output_var=$5
   local binary
@@ -200,6 +213,14 @@ build_external_driver() {
 }
 
 BASELINE_EXTERNAL_DRIVER="" CANDIDATE_EXTERNAL_DRIVER=""
+BASELINE_EXTERNAL_DRIVER_ORIGIN=not_applicable
+CANDIDATE_EXTERNAL_DRIVER_ORIGIN=not_applicable
+if [ "${SCENARIO}" = external-driver ]; then
+  BASELINE_EXTERNAL_DRIVER_ORIGIN=built_by_harness
+  CANDIDATE_EXTERNAL_DRIVER_ORIGIN=built_by_harness
+  [ -z "${OPENSHELL_PARITY_BASELINE_EXTERNAL_DRIVER_BIN:-}" ] || BASELINE_EXTERNAL_DRIVER_ORIGIN=supplied_override
+  [ -z "${OPENSHELL_PARITY_CANDIDATE_EXTERNAL_DRIVER_BIN:-}" ] || CANDIDATE_EXTERNAL_DRIVER_ORIGIN=supplied_override
+fi
 build_external_driver baseline "${BASELINE_WORKTREE}" "${OPENSHELL_PARITY_BASELINE_CARGO_TARGET_DIR:-}" "${OPENSHELL_PARITY_BASELINE_EXTERNAL_DRIVER_BIN:-}" BASELINE_EXTERNAL_DRIVER
 build_external_driver candidate "${ROOT}" "${OPENSHELL_PARITY_CANDIDATE_CARGO_TARGET_DIR:-}" "${OPENSHELL_PARITY_CANDIDATE_EXTERNAL_DRIVER_BIN:-}" CANDIDATE_EXTERNAL_DRIVER
 if [ "${SCENARIO}" = external-driver ]; then
@@ -220,17 +241,30 @@ fi
 write_result() {
   local variant=$1 source_sha=$2 schema=$3 status=$4 gateway=$5 cli=$6 conformance=$7 external_driver=$8
   local normalized_result="" external_driver_digest="" gateway_profile="in-tree"
-  local gateway_digest cli_digest conformance_digest
+  local gateway_digest cli_digest conformance_digest gateway_features=default
+  local gateway_origin cli_origin conformance_origin external_driver_origin
+  if [ "${variant}" = baseline ]; then
+    gateway_origin=${BASELINE_GATEWAY_ORIGIN}
+    cli_origin=${BASELINE_CLI_ORIGIN}
+    conformance_origin=${BASELINE_CONFORMANCE_ORIGIN}
+    external_driver_origin=${BASELINE_EXTERNAL_DRIVER_ORIGIN}
+  else
+    gateway_origin=${CANDIDATE_GATEWAY_ORIGIN}
+    cli_origin=${CANDIDATE_CLI_ORIGIN}
+    conformance_origin=${CANDIDATE_CONFORMANCE_ORIGIN}
+    external_driver_origin=${CANDIDATE_EXTERNAL_DRIVER_ORIGIN}
+  fi
   gateway_digest="$(sha256sum "${gateway}" | cut -d' ' -f1)"
   cli_digest="$(sha256sum "${cli}" | cut -d' ' -f1)"
   conformance_digest="$(sha256sum "${conformance}" | cut -d' ' -f1)"
   if [ -n "${external_driver}" ]; then
     external_driver_digest=",\"external_driver_sha256\":\"$(sha256sum "${external_driver}" | cut -d' ' -f1)\""
     gateway_profile="driver-free"
+    gateway_features="--no-default-features --features telemetry"
   fi
   if [ "${SCENARIO}" = "podman-options" ]; then normalized_result=",\"normalized_result\":\"${variant}.normalized.json\""; fi
   cat >"${RESULTS_DIR}/${variant}.json" <<EOF
-{"variant":"${variant}","source_sha":"${source_sha}","schema_version":${schema},"driver":"${DRIVER}","scenario":"${SCENARIO}","command_class":"${COMMAND_CLASS}","gateway_profile":"${gateway_profile}","gateway_sha256":"${gateway_digest}","cli_sha256":"${cli_digest}","conformance_sha256":"${conformance_digest}"${normalized_result}${external_driver_digest},"success":${status}}
+{"variant":"${variant}","source_sha":"${source_sha}","schema_version":${schema},"driver":"${DRIVER}","scenario":"${SCENARIO}","command_class":"${COMMAND_CLASS}","gateway_profile":"${gateway_profile}","gateway_cargo_features":"${gateway_features}","gateway_origin":"${gateway_origin}","cli_origin":"${cli_origin}","conformance_origin":"${conformance_origin}","external_driver_origin":"${external_driver_origin}","gateway_sha256":"${gateway_digest}","cli_sha256":"${cli_digest}","conformance_sha256":"${conformance_digest}"${normalized_result}${external_driver_digest},"success":${status}}
 EOF
 }
 
@@ -292,6 +326,7 @@ run_variant() {
     OPENSHELL_E2E_PODMAN_OPTION_PROFILE="${option_profile}" \
     OPENSHELL_PARITY_ORACLE_RESULT="${RESULTS_DIR}/${variant}.normalized.json" \
     OPENSHELL_PARITY_GATEWAY_CONFIG_CAPTURE="${RESULTS_DIR}/${variant}.gateway.toml" \
+    OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE="${RESULTS_DIR}/${variant}.launch.json" \
     OPENSHELL_GATEWAY_BIN="${gateway}" \
     OPENSHELL_BIN="${cli}" \
     OPENSHELL_CONFORMANCE_BIN="${conformance}" \
@@ -304,6 +339,10 @@ run_variant() {
     2>&1 | tee "${RESULTS_DIR}/${variant}.log"; then
     result_status=true
   else
+    result_status=false
+  fi
+  if [ ! -s "${RESULTS_DIR}/${variant}.launch.json" ]; then
+    echo "ERROR: ${variant} launcher did not emit a launch manifest." >&2
     result_status=false
   fi
   write_result "${variant}" "${source_sha}" "${schema}" "${result_status}" "${gateway}" "${cli}" "${conformance}" "${external_driver}"

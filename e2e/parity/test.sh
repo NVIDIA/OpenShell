@@ -79,6 +79,19 @@ for variable in OPENSHELL_GATEWAY_ENDPOINT OPENSHELL_GATEWAY_CONFIG OPENSHELL_CO
 done
 printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$OPENSHELL_PARITY_VARIANT" "$OPENSHELL_E2E_CONFIG_SCHEMA_VERSION" "$OPENSHELL_GATEWAY_BIN" "$OPENSHELL_BIN" "$OPENSHELL_CONFORMANCE_BIN" "$MISE_TRUSTED_CONFIG_PATHS" "${OPENSHELL_E2E_PODMAN_OPTION_PROFILE:-}" "${OPENSHELL_PARITY_ORACLE_RESULT:-}" "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-}" "${OPENSHELL_EXTERNAL_DRIVER_BIN:-}" >>"$OPENSHELL_PARITY_TEST_CALLS"
 mkdir -p "$XDG_DATA_HOME/containers/storage"
+case "${OPENSHELL_E2E_CONFIG_SCHEMA_VERSION}" in
+  1) pull_policy=missing ;;
+  2) pull_policy=if_not_present ;;
+esac
+transport=in_tree
+external=false
+if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = 1 ]; then
+  transport=remote_uds
+  external=true
+fi
+printf '{"schema_version":%s,"external_compute_driver":%s,"compute_driver_transport":"%s","external_driver_pull_policy":"%s"}\n' \
+  "${OPENSHELL_E2E_CONFIG_SCHEMA_VERSION}" "${external}" "${transport}" "${pull_policy}" \
+  >"${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE}"
 if [ "${OPENSHELL_E2E_PODMAN_OPTION_PROFILE:-}" = podman-options ]; then
   case "${OPENSHELL_PARITY_VARIANT}" in baseline) pids=2048 ;; candidate) pids=31 ;; esac
   stable=true
@@ -167,6 +180,12 @@ assert_contains "${WORKDIR}/calls" "|1|${WORKDIR}/bin/candidate-driver"
 assert_contains "${WORKDIR}/results/baseline.json" '"scenario":"external-driver"'
 assert_contains "${WORKDIR}/results/baseline.json" '"command_class":"external_driver_conformance_smoke"'
 assert_contains "${WORKDIR}/results/baseline.json" '"gateway_profile":"driver-free"'
+assert_contains "${WORKDIR}/results/baseline.json" '"gateway_cargo_features":"--no-default-features --features telemetry"'
+assert_contains "${WORKDIR}/results/baseline.json" '"gateway_origin":"supplied_override"'
+assert_contains "${WORKDIR}/results/baseline.json" '"external_driver_origin":"supplied_override"'
+assert_contains "${WORKDIR}/results/baseline.launch.json" '"compute_driver_transport":"remote_uds"'
+assert_contains "${WORKDIR}/results/baseline.launch.json" '"external_driver_pull_policy":"missing"'
+assert_contains "${WORKDIR}/results/candidate.launch.json" '"external_driver_pull_policy":"if_not_present"'
 assert_contains "${WORKDIR}/results/baseline.json" '"gateway_sha256"'
 assert_contains "${WORKDIR}/results/baseline.json" '"cli_sha256"'
 assert_contains "${WORKDIR}/results/baseline.json" '"conformance_sha256"'
