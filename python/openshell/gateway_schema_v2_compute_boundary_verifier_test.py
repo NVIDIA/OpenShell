@@ -22,6 +22,7 @@ CANDIDATE_SHA = "2" * 40
 IMAGE_ID = "3" * 64
 IMAGE_DIGEST = f"sha256:{'4' * 64}"
 RUNTIME_IMAGE = f"localhost/openshell/supervisor@{IMAGE_DIGEST}"
+BASE_RUNTIME_IMAGE = f"docker.io/library/alpine@{IMAGE_DIGEST}"
 
 
 def load_verifier() -> ModuleType:
@@ -100,10 +101,12 @@ socket_path = "/tmp/{variant}.sock"
     )
     policy = "missing" if schema_version == 1 else "if_not_present"
     package_hash = verifier.sha256(artifact_dir / "supervisor.packages.txt")
+    result = json.loads((results_dir / f"{variant}.json").read_text(encoding="utf-8"))
     write_json(
         results_dir / f"{variant}.launch.json",
         {
             "schema_version": schema_version,
+            "gateway_port": 18181,
             "external_compute_driver": True,
             "compute_driver_transport": "remote_uds",
             "external_driver_pull_policy": policy,
@@ -113,18 +116,35 @@ socket_path = "/tmp/{variant}.sock"
             "supervisor_base_image": "alpine:fixture",
             "supervisor_base_image_id": IMAGE_ID,
             "supervisor_base_image_digest": IMAGE_DIGEST,
+            "supervisor_base_runtime_image": BASE_RUNTIME_IMAGE,
             "supervisor_package_manifest_sha256": package_hash,
             "sandbox_image_request": "example.invalid/sandbox@" + IMAGE_DIGEST,
             "sandbox_image_id": IMAGE_ID,
             "sandbox_image_digest": IMAGE_DIGEST,
             "sandbox_runtime_image": "example.invalid/sandbox@" + IMAGE_DIGEST,
+            "sandbox_client_image_alias": "example.invalid/sandbox:latest",
+            "sandbox_client_image_alias_id": IMAGE_ID,
+            "gateway_sha256_before_execution": result["gateway_sha256"],
+            "cli_sha256_before_execution": result["cli_sha256"],
+            "conformance_sha256_before_execution": result["conformance_sha256"],
+            "external_driver_sha256_before_execution": result["external_driver_sha256"],
+            "supervisor_sha256_before_execution": result["supervisor_sha256"],
+            "supervisor_dockerfile_sha256_before_execution": result[
+                "supervisor_dockerfile_sha256"
+            ],
+            "external_driver_grpc_endpoint": "https://host.containers.internal:18181",
+            "external_driver_host_gateway_ip": "host-gateway",
+            "external_driver_userns": None,
+            "external_driver_spiffe": False,
+            "external_driver_proxy": False,
+            "external_driver_app_armor": False,
         },
     )
     lifecycle = "\n".join(
         f"[run fixture{marker} in 1ms: exit 0" for marker in verifier.ORACLE_MARKERS
     )
     (results_dir / f"{variant}.log").write_text(
-        f"{lifecycle}\n{RUNTIME_IMAGE} example.invalid/sandbox@{IMAGE_DIGEST} "
+        f"{lifecycle}\n{RUNTIME_IMAGE} {BASE_RUNTIME_IMAGE} example.invalid/sandbox@{IMAGE_DIGEST} example.invalid/sandbox:latest "
         f'{IMAGE_ID} {IMAGE_DIGEST} {package_hash}\n"passed": true\n',
         encoding="utf-8",
     )
@@ -195,6 +215,7 @@ def test_verifier_rejects_different_sandbox_artifacts(tmp_path: Path) -> None:
             "sandbox_image_id": other_id,
             "sandbox_image_digest": other_digest,
             "sandbox_runtime_image": other_runtime,
+            "sandbox_client_image_alias_id": other_id,
         }
     )
     write_json(launch_path, launch)
@@ -224,3 +245,31 @@ def test_verifier_rejects_different_supervisor_packages(tmp_path: Path) -> None:
         verifier.verify_topology(
             tmp_path, BASELINE_SHA, CANDIDATE_SHA, "external-driver"
         )
+
+
+def test_verifier_rejects_cross_topology_sandbox_drift() -> None:
+    verifier = load_verifier()
+    launch = {
+        "sandbox_image_id": IMAGE_ID,
+        "sandbox_image_digest": IMAGE_DIGEST,
+        "sandbox_runtime_image": "example.invalid/sandbox@" + IMAGE_DIGEST,
+        "sandbox_client_image_alias": "example.invalid/sandbox:latest",
+        "sandbox_client_image_alias_id": IMAGE_ID,
+        "supervisor_base_image": "alpine:fixture",
+        "supervisor_base_image_id": IMAGE_ID,
+        "supervisor_base_image_digest": IMAGE_DIGEST,
+        "supervisor_base_runtime_image": BASE_RUNTIME_IMAGE,
+        "supervisor_package_manifest_sha256": "7" * 64,
+    }
+    in_tree = {
+        "baseline": {"launch_attestation": dict(launch)},
+        "candidate": {"launch_attestation": dict(launch)},
+    }
+    external = {
+        "baseline": {"launch_attestation": dict(launch)},
+        "candidate": {"launch_attestation": dict(launch)},
+    }
+    external["candidate"]["launch_attestation"]["sandbox_image_id"] = "8" * 64
+
+    with pytest.raises(ValueError, match="four runs use different sandbox artifact"):
+        verifier.verify_four_run_provenance(in_tree, external)

@@ -261,6 +261,16 @@ def verify_variant(
             f"{config_path}: runtime image references differ from launch evidence",
         )
 
+    base_runtime = launch.get("supervisor_base_runtime_image")
+    base_runtime_match = (
+        DIGEST_REFERENCE_RE.fullmatch(base_runtime)
+        if isinstance(base_runtime, str)
+        else None
+    )
+    require(
+        base_runtime_match is not None,
+        f"{launch_path}: supervisor base runtime image is not digest-pinned",
+    )
     for field in ("supervisor_base_image_id", "supervisor_package_manifest_sha256"):
         value = launch.get(field)
         require(
@@ -281,6 +291,56 @@ def verify_variant(
     )
     artifact_hashes["supervisor.packages.txt"] = sha256(package_path)
 
+    sandbox_alias = launch.get("sandbox_client_image_alias")
+    require(
+        isinstance(sandbox_alias, str)
+        and sandbox_alias == sandbox_runtime.rsplit("@", 1)[0] + ":latest"
+        and launch.get("sandbox_client_image_alias_id") == sandbox_id,
+        f"{launch_path}: sandbox client alias is not bound to the pinned image",
+    )
+
+    for launch_field, result_field in (
+        ("gateway_sha256_before_execution", "gateway_sha256"),
+        ("cli_sha256_before_execution", "cli_sha256"),
+        ("conformance_sha256_before_execution", "conformance_sha256"),
+        ("supervisor_sha256_before_execution", "supervisor_sha256"),
+        (
+            "supervisor_dockerfile_sha256_before_execution",
+            "supervisor_dockerfile_sha256",
+        ),
+    ):
+        require(
+            launch.get(launch_field) == result.get(result_field),
+            f"{launch_path}: {launch_field} does not bind the staged artifact",
+        )
+    if external:
+        require(
+            launch.get("external_driver_sha256_before_execution")
+            == result.get("external_driver_sha256"),
+            f"{launch_path}: external driver pre-execution hash mismatch",
+        )
+        gateway_port = launch.get("gateway_port")
+        require(
+            isinstance(gateway_port, int)
+            and 0 < gateway_port <= 65535
+            and launch.get("external_driver_grpc_endpoint")
+            == f"https://host.containers.internal:{gateway_port}",
+            f"{launch_path}: external driver callback endpoint is not isolated",
+        )
+        require(
+            launch.get("external_driver_host_gateway_ip") == "host-gateway"
+            and launch.get("external_driver_userns") is None
+            and launch.get("external_driver_spiffe") is False
+            and launch.get("external_driver_proxy") is False
+            and launch.get("external_driver_app_armor") is False,
+            f"{launch_path}: external driver effective configuration is tainted",
+        )
+    else:
+        require(
+            launch.get("external_driver_sha256_before_execution") == "",
+            f"{launch_path}: unexpected external driver hash",
+        )
+
     require(log_path.is_file(), f"{log_path}: retained raw log is missing")
     raw_log = log_path.read_text(encoding="utf-8", errors="replace")
     for marker in ORACLE_MARKERS:
@@ -299,8 +359,11 @@ def verify_variant(
         sandbox_runtime,
         sandbox_id,
         sandbox_digest,
+        sandbox_alias,
+        launch["sandbox_client_image_alias_id"],
         launch["supervisor_base_image_id"],
         base_digest,
+        base_runtime,
         launch["supervisor_package_manifest_sha256"],
     )
     require(
@@ -398,6 +461,41 @@ def verify_topology(
     }
 
 
+def verify_four_run_provenance(
+    in_tree: dict[str, Any], external_uds: dict[str, Any]
+) -> None:
+    variants = [
+        in_tree["baseline"]["launch_attestation"],
+        in_tree["candidate"]["launch_attestation"],
+        external_uds["baseline"]["launch_attestation"],
+        external_uds["candidate"]["launch_attestation"],
+    ]
+    for fields, label in (
+        (
+            (
+                "sandbox_image_id",
+                "sandbox_image_digest",
+                "sandbox_runtime_image",
+                "sandbox_client_image_alias",
+                "sandbox_client_image_alias_id",
+            ),
+            "sandbox artifact",
+        ),
+        (
+            (
+                "supervisor_base_image",
+                "supervisor_base_image_id",
+                "supervisor_base_image_digest",
+                "supervisor_base_runtime_image",
+                "supervisor_package_manifest_sha256",
+            ),
+            "supervisor dependency provenance",
+        ),
+    ):
+        tuples = {tuple(launch.get(field) for field in fields) for launch in variants}
+        require(len(tuples) == 1, f"the four runs use different {label}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline-sha", required=True)
@@ -419,6 +517,14 @@ def main() -> None:
         "invalid candidate SHA",
     )
 
+    in_tree = verify_topology(
+        args.in_tree, args.baseline_sha, args.candidate_sha, "smoke"
+    )
+    external_uds = verify_topology(
+        args.external_uds, args.baseline_sha, args.candidate_sha, "external-driver"
+    )
+    verify_four_run_provenance(in_tree, external_uds)
+
     report = {
         "manifest_version": 2,
         "baseline_commit": args.baseline_sha,
@@ -433,12 +539,8 @@ def main() -> None:
             "delete": True,
             "list_empty": True,
         },
-        "in_tree": verify_topology(
-            args.in_tree, args.baseline_sha, args.candidate_sha, "smoke"
-        ),
-        "external_uds": verify_topology(
-            args.external_uds, args.baseline_sha, args.candidate_sha, "external-driver"
-        ),
+        "in_tree": in_tree,
+        "external_uds": external_uds,
         "callback_listener": {
             "in_tree_baseline_exec": True,
             "in_tree_candidate_exec": True,
