@@ -86,9 +86,10 @@ struct MockSource<K>(PhantomData<K>);
 
 #[async_trait]
 impl<K: MockKind> NetworkMediationSource for MockSource<K> {
-    async fn accept(&self) -> Result<MediatedConnection, BackendError> {
+    async fn accept(&self) -> Result<PendingNetworkOpen, BackendError> {
         let (near, _far) = tokio::io::duplex(64);
-        Ok(MediatedConnection {
+        let (result, _result_rx) = oneshot::channel();
+        Ok(PendingNetworkOpen {
             stream: Box::new(near),
             binary_identity: Ok(BinaryIdentity {
                 binary_path: PathBuf::from("/usr/bin/agent"),
@@ -97,7 +98,14 @@ impl<K: MockKind> NetworkMediationSource for MockSource<K> {
                 ancestors: vec![],
                 cmdline_paths: vec![],
             }),
-            destination: None,
+            destination: "203.0.113.10:443".parse().unwrap(),
+            socket: NetworkSocketMetadata {
+                socket_cookie: 7,
+                nonblocking: false,
+                process_generation: 1,
+            },
+            policy_generation: 1,
+            result,
         })
     }
 }
@@ -109,12 +117,20 @@ struct UnattributedSource;
 
 #[async_trait]
 impl NetworkMediationSource for UnattributedSource {
-    async fn accept(&self) -> Result<MediatedConnection, BackendError> {
+    async fn accept(&self) -> Result<PendingNetworkOpen, BackendError> {
         let (near, _far) = tokio::io::duplex(64);
-        Ok(MediatedConnection {
+        let (result, _result_rx) = oneshot::channel();
+        Ok(PendingNetworkOpen {
             stream: Box::new(near),
             binary_identity: Err(ResolveError::Failed("hash unavailable".to_string())),
-            destination: None,
+            destination: "203.0.113.10:443".parse().unwrap(),
+            socket: NetworkSocketMetadata {
+                socket_cookie: 8,
+                nonblocking: false,
+                process_generation: 1,
+            },
+            policy_generation: 1,
+            result,
         })
     }
 }
@@ -194,8 +210,11 @@ impl<K: MockKind> BoundBoundary for MockBound<K> {
     fn network_mediation_source(&self) -> Arc<dyn NetworkMediationSource> {
         self.source.clone()
     }
-    async fn confirm(self: Box<Self>) -> Result<Box<dyn ReadyBoundary>, BackendError> {
-        Ok(Box::new(MockReady::<K> { _k: PhantomData }))
+    async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError> {
+        Ok(ConfirmedBoundary {
+            boundary: Box::new(MockReady::<K> { _k: PhantomData }),
+            evidence: confirmation_evidence(),
+        })
     }
 }
 
@@ -245,9 +264,6 @@ impl<K: MockKind> IsolationBackend for MockBackend<K> {
     fn backend_name(&self) -> &'static str {
         K::BACKEND_ID
     }
-    fn version(&self) -> u32 {
-        INTERFACE_VERSION
-    }
     async fn attach(
         &self,
         descriptor: VerifiedTopologyDescriptor,
@@ -266,26 +282,6 @@ impl<K: MockKind> IsolationBackend for MockBackend<K> {
     }
 }
 
-/// A backend that speaks the wrong contract version; registration must reject it.
-struct WrongVersionBackend;
-
-#[async_trait]
-impl IsolationBackend for WrongVersionBackend {
-    fn backend_name(&self) -> &'static str {
-        "mock-wrong-version"
-    }
-    fn version(&self) -> u32 {
-        INTERFACE_VERSION + 1
-    }
-    async fn attach(
-        &self,
-        _descriptor: VerifiedTopologyDescriptor,
-        _sandbox: SandboxContext,
-    ) -> Result<Box<dyn BoundBoundary>, BackendError> {
-        unreachable!("must never be resolved")
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------
@@ -301,7 +297,6 @@ fn registry() -> BackendRegistry {
 
 fn descriptor(backend_name: &str) -> TopologyDescriptor {
     TopologyDescriptor {
-        version: INTERFACE_VERSION,
         backend_name: backend_name.to_string(),
         payload: vec![],
     }
@@ -324,6 +319,59 @@ fn sandbox_ctx() -> SandboxContext {
             timeout_secs: 0,
             interactive: false,
         },
+        identity: workload_identity(),
+    }
+}
+
+fn workload_identity() -> ResolvedWorkloadIdentity {
+    ResolvedWorkloadIdentity::new(
+        1000,
+        1000,
+        vec![1000],
+        "policy".to_string(),
+        "sha256:test".to_string(),
+    )
+    .unwrap()
+}
+
+fn confirmation_evidence() -> SandboxConfirmEvidence {
+    SandboxConfirmEvidence {
+        generation: "generation-1".to_string(),
+        identity: workload_identity(),
+        capabilities: CapabilityEvidence {
+            inheritable: 0,
+            permitted: 0,
+            effective: 0,
+            bounding: 0,
+            ambient: 0,
+        },
+        no_new_privileges: true,
+        sandbox_dumpable: false,
+        child_dumpable: true,
+        core_limit_zero: true,
+        native_architecture: std::env::consts::ARCH.to_string(),
+        kernel_release: "test".to_string(),
+        seccomp: SeccompEvidence {
+            new_listener: true,
+            notification_round_trip: true,
+            id_validation: true,
+            addfd_send: true,
+            retained_socket_operation: true,
+            proc_fd_identity: true,
+            task_memory_read: true,
+            task_memory_write: true,
+            cancellation: true,
+        },
+        landlock_abi: 1,
+        landlock_allow_deny: true,
+        udp_dns_round_trip: true,
+        tcp_dns_round_trip: true,
+        tcp_allow_round_trip: true,
+        tcp_deny_round_trip: true,
+        authenticated_supervisor: true,
+        session_epoch: "epoch-1".to_string(),
+        direct_egress_blocked: true,
+        resource_claims: BTreeMap::new(),
     }
 }
 
@@ -340,8 +388,9 @@ async fn drive(
     // usable across the confirm/start transitions.
     let _ingress = bound.network_mediation_source();
     assert_eq!(bound.host_gateway_ip(), None);
-    let ready = bound.confirm().await?;
-    ready.start_agent().await
+    let confirmed = bound.confirm().await?;
+    confirmed.evidence.validate(&sandbox_ctx().identity)?;
+    confirmed.boundary.start_agent().await
 }
 
 // ---------------------------------------------------------------------------
@@ -369,15 +418,6 @@ fn registry_rejects_duplicate_registration() {
 }
 
 #[test]
-fn registry_rejects_wrong_backend_version() {
-    let mut reg = BackendRegistry::new();
-    let err = reg
-        .register(Arc::new(WrongVersionBackend))
-        .expect_err("wrong version must fail");
-    assert_eq!(err.kind(), BackendErrorKind::Invalid);
-}
-
-#[test]
 fn registry_rejects_unknown_backend() {
     let reg = registry();
     let err = reg
@@ -396,18 +436,6 @@ fn registry_rejects_descriptor_admission_mismatch_without_fallback() {
         .resolve(descriptor("mock-primary"), "mock-secondary")
         .map(|_| ())
         .expect_err("mismatch must fail");
-    assert!(matches!(err, BackendError::Descriptor(_)));
-}
-
-#[test]
-fn registry_rejects_unsupported_version() {
-    let reg = registry();
-    let mut d = descriptor("mock-primary");
-    d.version = INTERFACE_VERSION + 1;
-    let err = reg
-        .resolve(d, "mock-primary")
-        .map(|_| ())
-        .expect_err("bad version must fail");
     assert!(matches!(err, BackendError::Descriptor(_)));
 }
 
@@ -490,8 +518,8 @@ async fn runtime_interfaces_survive_lifecycle_consumption() {
     // Retain the source at Bound, then consume the bound state with confirm.
     // The retained Arc must remain usable afterward.
     let source = bound.network_mediation_source();
-    let ready = bound.confirm().await.expect("confirm");
-    let _running = ready.start_agent().await.expect("start");
+    let confirmed = bound.confirm().await.expect("confirm");
+    let _running = confirmed.boundary.start_agent().await.expect("start");
 
     let conn = source.accept().await.expect("accept after consumption");
     let identity = conn.binary_identity.expect("identity resolves");
@@ -640,7 +668,7 @@ async fn validated_port_forward_stream_remains_usable() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn mediated_connection_carries_identity_for_that_connection() {
+async fn pending_network_open_carries_socket_bound_identity() {
     let reg = registry();
     let (backend, verified) = reg
         .resolve(descriptor("mock-primary"), "mock-primary")
@@ -661,6 +689,8 @@ async fn mediated_connection_carries_identity_for_that_connection() {
         identity.binary_digest.expect("digest").to_string(),
         "00".repeat(32)
     );
+    assert_eq!(conn.destination, "203.0.113.10:443".parse().unwrap());
+    assert_eq!(conn.socket.socket_cookie, 7);
 }
 
 #[tokio::test]
@@ -681,12 +711,49 @@ fn sha256_digest_rejects_signed_hex_chunks() {
 }
 
 #[tokio::test]
-async fn unresolved_identity_travels_with_the_connection_and_fails_closed() {
+async fn unresolved_identity_travels_with_the_pending_open_and_fails_closed() {
     // Attribution failure does not tear down the source: the connection is
     // delivered carrying `Err`, and the mediation service denies it.
     let source = UnattributedSource;
     let conn = source.accept().await.expect("accept");
     assert!(conn.binary_identity.is_err());
+}
+
+#[test]
+fn workload_identity_rejects_root_and_normalizes_groups() {
+    assert!(
+        ResolvedWorkloadIdentity::new(0, 1000, vec![], "policy".into(), "digest".into()).is_err()
+    );
+    let identity = ResolvedWorkloadIdentity::new(
+        1000,
+        1001,
+        vec![1003, 1002, 1003],
+        "policy".into(),
+        "digest".into(),
+    )
+    .unwrap();
+    assert_eq!(identity.supplementary_gids, vec![1002, 1003]);
+}
+
+#[test]
+fn confirmation_evidence_rejects_identity_or_posture_drift() {
+    let expected = workload_identity();
+    let evidence = confirmation_evidence();
+    evidence.validate(&expected).unwrap();
+
+    let mut drifted = confirmation_evidence();
+    drifted.capabilities.effective = 1;
+    assert!(drifted.validate(&expected).is_err());
+
+    let different = ResolvedWorkloadIdentity::new(
+        1002,
+        1000,
+        vec![1000],
+        "policy".into(),
+        "sha256:test".into(),
+    )
+    .unwrap();
+    assert!(evidence.validate(&different).is_err());
 }
 
 // ---------------------------------------------------------------------------
