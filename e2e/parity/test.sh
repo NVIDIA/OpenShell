@@ -74,7 +74,12 @@ mkdir -p "${WORKDIR}/bin"
 cat >"${WORKDIR}/bin/fake-wrapper" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-for variable in OPENSHELL_GATEWAY_ENDPOINT OPENSHELL_GATEWAY_CONFIG OPENSHELL_COMPUTE_DRIVER OPENSHELL_COMPUTE_DRIVER_SOCKET OPENSHELL_DRIVERS OPENSHELL_PODMAN_SOCKET; do
+for variable in \
+  OPENSHELL_GATEWAY_ENDPOINT OPENSHELL_GATEWAY_CONFIG OPENSHELL_COMPUTE_DRIVER \
+  OPENSHELL_COMPUTE_DRIVER_SOCKET OPENSHELL_DRIVERS OPENSHELL_PODMAN_SOCKET \
+  CONTAINER_HOST CONTAINER_CONNECTION CONTAINERS_STORAGE_CONF CONTAINERS_CONF \
+  CONTAINERS_REGISTRIES_CONF CONTAINERS_REGISTRIES_CONF_DIR CONTAINERS_POLICY \
+  PODMAN_CONNECTIONS_CONF DOCKER_HOST; do
   [ -z "${!variable:-}" ] || exit 23
 done
 printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$OPENSHELL_PARITY_VARIANT" "$OPENSHELL_E2E_CONFIG_SCHEMA_VERSION" "$OPENSHELL_GATEWAY_BIN" "$OPENSHELL_BIN" "$OPENSHELL_CONFORMANCE_BIN" "$MISE_TRUSTED_CONFIG_PATHS" "${OPENSHELL_E2E_PODMAN_OPTION_PROFILE:-}" "${OPENSHELL_PARITY_ORACLE_RESULT:-}" "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-}" "${OPENSHELL_EXTERNAL_DRIVER_BIN:-}" "${OPENSHELL_E2E_SUPERVISOR_BIN:-}" >>"$OPENSHELL_PARITY_TEST_CALLS"
@@ -89,10 +94,12 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = 1 ]; then
   transport=remote_uds
   external=true
 fi
+runtime_image="localhost/openshell/supervisor@sha256:$(printf '%064d' 0)"
 printf '{"schema_version":%s,"external_compute_driver":%s,"compute_driver_transport":"%s","external_driver_pull_policy":"%s","supervisor_image":"%s","supervisor_image_id":"%064d","supervisor_image_digest":"sha256:%064d","supervisor_runtime_image":"%s"}\n' \
   "${OPENSHELL_E2E_CONFIG_SCHEMA_VERSION}" "${external}" "${transport}" "${pull_policy}" \
-  "${OPENSHELL_SUPERVISOR_IMAGE}" 0 0 "${OPENSHELL_SUPERVISOR_IMAGE}" \
+  "${OPENSHELL_SUPERVISOR_IMAGE}" 0 0 "${runtime_image}" \
   >"${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE}"
+printf 'fixture-package-1.0-r0\n' >"${OPENSHELL_PARITY_SUPERVISOR_PACKAGE_CAPTURE}"
 if [ "${OPENSHELL_PARITY_TEST_MUTATE_ARTIFACT:-}" = "${OPENSHELL_PARITY_VARIANT}" ]; then
   replacement="${OPENSHELL_GATEWAY_BIN}.replacement"
   printf '#!/usr/bin/env bash\nexit 0\n# mutated\n' >"${replacement}"
@@ -126,10 +133,7 @@ fi
 printf '{"untrusted":"raw output is intentionally not normalized"}\n'
 EOF
 for artifact in baseline-gateway baseline-cli candidate-gateway candidate-cli baseline-driver candidate-driver baseline-supervisor candidate-supervisor; do
-  cat >"${WORKDIR}/bin/${artifact}" <<'EOF'
-#!/usr/bin/env bash
-exit 0
-EOF
+  printf '#!/usr/bin/env bash\n# %s\nexit 0\n' "${artifact}" >"${WORKDIR}/bin/${artifact}"
 done
 chmod +x "${WORKDIR}/bin/"*
 
@@ -167,6 +171,15 @@ OPENSHELL_COMPUTE_DRIVER=wrong \
 OPENSHELL_COMPUTE_DRIVER_SOCKET=/tmp/untrusted.sock \
 OPENSHELL_DRIVERS=wrong \
 OPENSHELL_PODMAN_SOCKET=/tmp/untrusted-podman.sock \
+CONTAINER_HOST=tcp://untrusted.invalid:9999 \
+CONTAINER_CONNECTION=untrusted \
+CONTAINERS_STORAGE_CONF=/tmp/untrusted-storage.conf \
+CONTAINERS_CONF=/tmp/untrusted-containers.conf \
+CONTAINERS_REGISTRIES_CONF=/tmp/untrusted-registries.conf \
+CONTAINERS_REGISTRIES_CONF_DIR=/tmp/untrusted-registries.d \
+CONTAINERS_POLICY=/tmp/untrusted-policy.json \
+PODMAN_CONNECTIONS_CONF=/tmp/untrusted-connections.json \
+DOCKER_HOST=tcp://untrusted.invalid:2375 \
   run_harness
 assert_contains "${WORKDIR}/calls" "baseline|1|${WORKDIR}/results/artifacts/baseline/gateway|${WORKDIR}/results/artifacts/baseline/cli|${WORKDIR}/results/artifacts/baseline/conformance"
 assert_contains "${WORKDIR}/calls" "candidate|2|${WORKDIR}/results/artifacts/candidate/gateway|${WORKDIR}/results/artifacts/candidate/cli|${WORKDIR}/results/artifacts/candidate/conformance"
@@ -196,7 +209,7 @@ assert_contains "${WORKDIR}/results/baseline.json" '"external_driver_origin":"su
 assert_contains "${WORKDIR}/results/baseline.launch.json" '"compute_driver_transport":"remote_uds"'
 assert_contains "${WORKDIR}/results/baseline.launch.json" '"external_driver_pull_policy":"missing"'
 assert_contains "${WORKDIR}/results/baseline.launch.json" '"supervisor_image_digest":"sha256:'
-assert_contains "${WORKDIR}/results/baseline.launch.json" '"supervisor_runtime_image":"localhost/openshell/supervisor:parity-baseline-'
+assert_contains "${WORKDIR}/results/baseline.launch.json" '"supervisor_runtime_image":"localhost/openshell/supervisor@sha256:'
 assert_contains "${WORKDIR}/results/candidate.launch.json" '"external_driver_pull_policy":"if_not_present"'
 assert_contains "${WORKDIR}/results/baseline.json" '"gateway_sha256"'
 assert_contains "${WORKDIR}/results/baseline.json" '"cli_sha256"'
@@ -214,6 +227,15 @@ status=$?
 set -e
 assert_status "${status}" 2
 assert_contains "${WORKDIR}/same-driver.out" 'requires distinct baseline and candidate driver artifacts'
+
+cp "${WORKDIR}/bin/baseline-driver" "${WORKDIR}/bin/same-content-driver"
+set +e
+OPENSHELL_PARITY_TEST_CANDIDATE_DRIVER_OVERRIDE="${WORKDIR}/bin/same-content-driver" \
+  run_harness --scenario external-driver >"${WORKDIR}/same-driver-content.out" 2>&1
+status=$?
+set -e
+assert_status "${status}" 2
+assert_contains "${WORKDIR}/same-driver-content.out" 'requires different baseline and candidate driver content'
 
 run_harness --scenario podman-options
 assert_contains "${WORKDIR}/calls" "baseline|1|${WORKDIR}/results/artifacts/baseline/gateway|${WORKDIR}/results/artifacts/baseline/cli|${WORKDIR}/results/artifacts/baseline/conformance|${ROOT}|podman-options"
