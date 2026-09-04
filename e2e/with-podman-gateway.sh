@@ -85,6 +85,20 @@ podman_cmd() {
   with_podman_config podman "$@"
 }
 
+require_expected_sha256() {
+  local label=$1 path=$2 expected=$3 actual
+  [ -n "${expected}" ] || return 0
+  if [ ! -f "${path}" ]; then
+    echo "ERROR: ${label} is missing before execution: ${path}" >&2
+    exit 2
+  fi
+  actual="$(sha256sum "${path}" | cut -d' ' -f1)"
+  if [ "${actual}" != "${expected}" ]; then
+    echo "ERROR: ${label} hash changed before execution." >&2
+    exit 2
+  fi
+}
+
 WORKDIR_PARENT="${TMPDIR:-/tmp}"
 WORKDIR_PARENT="${WORKDIR_PARENT%/}"
 WORKDIR="$(mktemp -d "${WORKDIR_PARENT}/openshell-e2e-podman.XXXXXX")"
@@ -347,14 +361,33 @@ ensure_podman_supervisor_image() {
       echo "ERROR: supervisor Dockerfile not found: ${dockerfile}" >&2
       exit 2
     fi
+    require_expected_sha256 "supervisor binary" "${OPENSHELL_E2E_SUPERVISOR_BIN}" \
+      "${OPENSHELL_E2E_EXPECTED_SUPERVISOR_SHA256:-}"
+    require_expected_sha256 "supervisor Dockerfile" "${dockerfile}" \
+      "${OPENSHELL_E2E_EXPECTED_SUPERVISOR_DOCKERFILE_SHA256:-}"
     mkdir -p "${context}/deploy/docker/.build/prebuilt-binaries/${arch}"
     install -m 0555 "${OPENSHELL_E2E_SUPERVISOR_BIN}" \
       "${context}/deploy/docker/.build/prebuilt-binaries/${arch}/openshell-sandbox"
     cp "${dockerfile}" "${context}/deploy/docker/Dockerfile.supervisor"
+    local -a pull_option=()
+    if [ -n "${OPENSHELL_E2E_SUPERVISOR_BASE_RUNTIME_IMAGE:-}" ]; then
+      local dockerfile_base
+      dockerfile_base="$(awk '$1 == "FROM" { print $2; exit }' "${dockerfile}")"
+      if [ "${dockerfile_base}" != "${OPENSHELL_E2E_SUPERVISOR_BASE_IMAGE:-}" ] \
+         || ! [[ "${OPENSHELL_E2E_SUPERVISOR_BASE_RUNTIME_IMAGE}" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]]; then
+        echo "ERROR: supervisor base-image attestation does not match the Dockerfile." >&2
+        exit 2
+      fi
+      echo "Pulling pinned supervisor base image ${OPENSHELL_E2E_SUPERVISOR_BASE_RUNTIME_IMAGE}..."
+      podman_cmd pull "${OPENSHELL_E2E_SUPERVISOR_BASE_RUNTIME_IMAGE}"
+      podman_cmd tag "${OPENSHELL_E2E_SUPERVISOR_BASE_RUNTIME_IMAGE}" "${dockerfile_base}"
+      pull_option=(--pull=never)
+    fi
     echo "Building Podman supervisor image ${image} from supplied binary..."
     (
       cd "${context}"
       podman_cmd build \
+        "${pull_option[@]}" \
         --build-arg "TARGETARCH=${arch}" \
         --file deploy/docker/Dockerfile.supervisor \
         --target supervisor \
@@ -520,7 +553,19 @@ if [ "${OPENSHELL_E2E_REQUIRE_DIGEST_PINNED_SANDBOX_IMAGE:-0}" = "1" ] \
   echo "ERROR: sandbox image digest changed while resolving ${SANDBOX_IMAGE_REQUEST}." >&2
   exit 2
 fi
-echo "Using Podman sandbox image: ${SANDBOX_RUNTIME_IMAGE} (ID ${SANDBOX_IMAGE_ID}, digest ${SANDBOX_IMAGE_DIGEST})"
+SANDBOX_CLIENT_IMAGE_ALIAS=""
+SANDBOX_CLIENT_IMAGE_ALIAS_ID=""
+if [ "${OPENSHELL_E2E_REQUIRE_DIGEST_PINNED_SANDBOX_IMAGE:-0}" = "1" ]; then
+  SANDBOX_CLIENT_IMAGE_ALIAS="${SANDBOX_IMAGE_REPOSITORY}:latest"
+  podman_cmd tag "${SANDBOX_RUNTIME_IMAGE}" "${SANDBOX_CLIENT_IMAGE_ALIAS}"
+  SANDBOX_CLIENT_IMAGE_ALIAS_ID="$(podman_cmd image inspect --format '{{.Id}}' "${SANDBOX_CLIENT_IMAGE_ALIAS}")"
+  SANDBOX_CLIENT_IMAGE_ALIAS_ID="${SANDBOX_CLIENT_IMAGE_ALIAS_ID#sha256:}"
+  if [ "${SANDBOX_CLIENT_IMAGE_ALIAS_ID}" != "${SANDBOX_IMAGE_ID}" ]; then
+    echo "ERROR: sandbox client alias does not resolve to the pinned sandbox image." >&2
+    exit 2
+  fi
+fi
+echo "Using Podman sandbox image: ${SANDBOX_RUNTIME_IMAGE} (ID ${SANDBOX_IMAGE_ID}, digest ${SANDBOX_IMAGE_DIGEST}, client alias ${SANDBOX_CLIENT_IMAGE_ALIAS:-none} ID ${SANDBOX_CLIENT_IMAGE_ALIAS_ID:-none})"
 
 PKI_DIR="${WORKDIR}/pki"
 e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}" "host.containers.internal"
@@ -578,11 +623,20 @@ if [ -n "${OPENSHELL_PARITY_GATEWAY_CONFIG_CAPTURE:-}" ]; then
 fi
 if [ -n "${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE:-}" ]; then
   driver_transport=in_tree
+  external_driver_grpc_endpoint=null
+  external_driver_host_gateway_ip=null
+  external_driver_userns=null
+  external_driver_spiffe=false
+  external_driver_proxy=false
+  external_driver_app_armor=false
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     driver_transport=remote_uds
+    external_driver_grpc_endpoint="\"https://host.containers.internal:${HOST_PORT}\""
+    external_driver_host_gateway_ip='"host-gateway"'
   fi
-  printf '{"schema_version":%s,"external_compute_driver":%s,"compute_driver_transport":"%s","external_driver_pull_policy":"%s","supervisor_image":"%s","supervisor_image_id":"%s","supervisor_image_digest":"%s","supervisor_runtime_image":"%s","supervisor_base_image":"%s","supervisor_base_image_id":"%s","supervisor_base_image_digest":"%s","supervisor_package_manifest_sha256":"%s","sandbox_image_request":"%s","sandbox_image_id":"%s","sandbox_image_digest":"%s","sandbox_runtime_image":"%s"}\n' \
+  printf '{"schema_version":%s,"gateway_port":%s,"external_compute_driver":%s,"compute_driver_transport":"%s","external_driver_pull_policy":"%s","supervisor_image":"%s","supervisor_image_id":"%s","supervisor_image_digest":"%s","supervisor_runtime_image":"%s","supervisor_base_image":"%s","supervisor_base_image_id":"%s","supervisor_base_image_digest":"%s","supervisor_base_runtime_image":"%s","supervisor_package_manifest_sha256":"%s","sandbox_image_request":"%s","sandbox_image_id":"%s","sandbox_image_digest":"%s","sandbox_runtime_image":"%s","sandbox_client_image_alias":"%s","sandbox_client_image_alias_id":"%s","gateway_sha256_before_execution":"%s","cli_sha256_before_execution":"%s","conformance_sha256_before_execution":"%s","external_driver_sha256_before_execution":"%s","supervisor_sha256_before_execution":"%s","supervisor_dockerfile_sha256_before_execution":"%s","external_driver_grpc_endpoint":%s,"external_driver_host_gateway_ip":%s,"external_driver_userns":%s,"external_driver_spiffe":%s,"external_driver_proxy":%s,"external_driver_app_armor":%s}\n' \
     "${CONFIG_SCHEMA_VERSION}" \
+    "${HOST_PORT}" \
     "$([ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ] && printf true || printf false)" \
     "${driver_transport}" \
     "${EXTERNAL_DRIVER_PULL_POLICY}" \
@@ -593,20 +647,39 @@ if [ -n "${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE:-}" ]; then
     "${SUPERVISOR_BASE_IMAGE}" \
     "${SUPERVISOR_BASE_IMAGE_ID}" \
     "${SUPERVISOR_BASE_IMAGE_DIGEST}" \
+    "${OPENSHELL_E2E_SUPERVISOR_BASE_RUNTIME_IMAGE:-${SUPERVISOR_BASE_IMAGE}@${SUPERVISOR_BASE_IMAGE_DIGEST}}" \
     "${SUPERVISOR_PACKAGE_MANIFEST_SHA256}" \
     "${SANDBOX_IMAGE_REQUEST}" \
     "${SANDBOX_IMAGE_ID}" \
     "${SANDBOX_IMAGE_DIGEST}" \
     "${SANDBOX_RUNTIME_IMAGE}" \
+    "${SANDBOX_CLIENT_IMAGE_ALIAS}" \
+    "${SANDBOX_CLIENT_IMAGE_ALIAS_ID}" \
+    "${OPENSHELL_E2E_EXPECTED_GATEWAY_SHA256:-}" \
+    "${OPENSHELL_E2E_EXPECTED_CLI_SHA256:-}" \
+    "${OPENSHELL_E2E_EXPECTED_CONFORMANCE_SHA256:-}" \
+    "${OPENSHELL_E2E_EXPECTED_EXTERNAL_DRIVER_SHA256:-}" \
+    "${OPENSHELL_E2E_EXPECTED_SUPERVISOR_SHA256:-}" \
+    "${OPENSHELL_E2E_EXPECTED_SUPERVISOR_DOCKERFILE_SHA256:-}" \
+    "${external_driver_grpc_endpoint}" \
+    "${external_driver_host_gateway_ip}" \
+    "${external_driver_userns}" \
+    "${external_driver_spiffe}" \
+    "${external_driver_proxy}" \
+    "${external_driver_app_armor}" \
     >"${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE}"
 fi
 
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+  require_expected_sha256 "external compute driver" "${DRIVER_BIN}" \
+    "${OPENSHELL_E2E_EXPECTED_EXTERNAL_DRIVER_SHA256:-}"
+  env -i \
   OPENSHELL_COMPUTE_DRIVER_SOCKET="${DRIVER_SOCKET}" \
   OPENSHELL_PODMAN_SOCKET="${OPENSHELL_PODMAN_SOCKET:-}" \
   OPENSHELL_SANDBOX_IMAGE="${SANDBOX_RUNTIME_IMAGE}" \
   OPENSHELL_SANDBOX_IMAGE_PULL_POLICY="${EXTERNAL_DRIVER_PULL_POLICY}" \
   OPENSHELL_HEALTH_CHECK_INTERVAL_SECS=10 \
+  OPENSHELL_GRPC_ENDPOINT="https://host.containers.internal:${HOST_PORT}" \
   OPENSHELL_GATEWAY_PORT="${HOST_PORT}" \
   OPENSHELL_NETWORK_NAME="${PODMAN_NETWORK_NAME}" \
   OPENSHELL_STOP_TIMEOUT="${PODMAN_STOP_TIMEOUT_SECS}" \
@@ -653,6 +726,8 @@ e2e_export_gateway_restart_metadata \
   "${GATEWAY_LOG}" \
   "${GATEWAY_PID_FILE}"
 
+require_expected_sha256 "gateway binary" "${GATEWAY_BIN}" \
+  "${OPENSHELL_E2E_EXPECTED_GATEWAY_SHA256:-}"
 OPENSHELL_LOCAL_TLS_DIR="${PKI_DIR}" \
 OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_RUNTIME_IMAGE}" \
 OPENSHELL_NETWORK_NAME="${PODMAN_NETWORK_NAME}" \
@@ -704,5 +779,11 @@ if [ "${elapsed}" -ge "${timeout}" ]; then
   exit 1
 fi
 
+require_expected_sha256 "OpenShell CLI" "${CLI_BIN}" \
+  "${OPENSHELL_E2E_EXPECTED_CLI_SHA256:-}"
+if [ -n "${OPENSHELL_E2E_EXPECTED_CONFORMANCE_SHA256:-}" ]; then
+  require_expected_sha256 "conformance CLI" "${OPENSHELL_CONFORMANCE_BIN}" \
+    "${OPENSHELL_E2E_EXPECTED_CONFORMANCE_SHA256}"
+fi
 echo "Running e2e command against ${CLI_GATEWAY_ENDPOINT}: $*"
 "$@"

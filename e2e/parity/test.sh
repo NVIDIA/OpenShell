@@ -79,12 +79,22 @@ for variable in \
   OPENSHELL_COMPUTE_DRIVER_SOCKET OPENSHELL_DRIVERS OPENSHELL_PODMAN_SOCKET \
   CONTAINER_HOST CONTAINER_CONNECTION CONTAINERS_STORAGE_CONF CONTAINERS_CONF \
   CONTAINERS_REGISTRIES_CONF CONTAINERS_REGISTRIES_CONF_DIR CONTAINERS_POLICY \
-  PODMAN_CONNECTIONS_CONF DOCKER_HOST OPENSHELL_SANDBOX_IMAGE; do
+  PODMAN_CONNECTIONS_CONF DOCKER_HOST OPENSHELL_SANDBOX_IMAGE \
+  OPENSHELL_GRPC_ENDPOINT OPENSHELL_PODMAN_HOST_GATEWAY_IP OPENSHELL_PODMAN_USERNS \
+  OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET \
+  OPENSHELL_APP_ARMOR_PROFILE OPENSHELL_SANDBOX_HTTPS_PROXY OPENSHELL_SANDBOX_NO_PROXY \
+  OPENSHELL_SANDBOX_PROXY_AUTH_FILE OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE \
+  OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME OPENSHELL_SANDBOX_PROXY_CA_BUNDLE \
+  OPENSHELL_OTLP_ENDPOINT OPENSHELL_GATEWAY_NAME OPENSHELL_COMPUTE_DRIVER_BIND; do
   [ -z "${!variable:-}" ] || exit 23
 done
 expected_sandbox="ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:$(printf '%064d' 0)"
 [ "${OPENSHELL_E2E_REQUIRE_DIGEST_PINNED_SANDBOX_IMAGE:-0}" = 1 ] || exit 24
 [ "${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-}" = "${expected_sandbox}" ] || exit 25
+[ "${OPENSHELL_COMMUNITY_REGISTRY:-}" = "ghcr.io/nvidia/openshell-community/sandboxes" ] || exit 28
+expected_base="docker.io/library/alpine@sha256:$(printf '%064d' 0)"
+[ "${OPENSHELL_E2E_SUPERVISOR_BASE_IMAGE:-}" = alpine:3.22 ] || exit 26
+[ "${OPENSHELL_E2E_SUPERVISOR_BASE_RUNTIME_IMAGE:-}" = "${expected_base}" ] || exit 27
 printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$OPENSHELL_PARITY_VARIANT" "$OPENSHELL_E2E_CONFIG_SCHEMA_VERSION" "$OPENSHELL_GATEWAY_BIN" "$OPENSHELL_BIN" "$OPENSHELL_CONFORMANCE_BIN" "$MISE_TRUSTED_CONFIG_PATHS" "${OPENSHELL_E2E_PODMAN_OPTION_PROFILE:-}" "${OPENSHELL_PARITY_ORACLE_RESULT:-}" "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-}" "${OPENSHELL_EXTERNAL_DRIVER_BIN:-}" "${OPENSHELL_E2E_SUPERVISOR_BIN:-}" >>"$OPENSHELL_PARITY_TEST_CALLS"
 mkdir -p "$XDG_DATA_HOME/containers/storage"
 case "${OPENSHELL_E2E_CONFIG_SCHEMA_VERSION}" in
@@ -130,6 +140,7 @@ case "$1" in
     case "$4" in
       '{{.Id}}') printf 'sha256:%064d\n' 0 ;;
       '{{.Digest}}') printf 'sha256:%064d\n' 0 ;;
+      '{{index .RepoDigests 0}}') printf 'docker.io/library/alpine@sha256:%064d\n' 0 ;;
       *) exit 19 ;;
     esac
     ;;
@@ -197,6 +208,22 @@ CONTAINERS_POLICY=/tmp/untrusted-policy.json \
 PODMAN_CONNECTIONS_CONF=/tmp/untrusted-connections.json \
 DOCKER_HOST=tcp://untrusted.invalid:2375 \
 OPENSHELL_SANDBOX_IMAGE=untrusted.invalid/sandbox:latest \
+OPENSHELL_GRPC_ENDPOINT=http://untrusted.invalid:1 \
+OPENSHELL_PODMAN_HOST_GATEWAY_IP=192.0.2.1 \
+OPENSHELL_PODMAN_USERNS=keep-id \
+OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET=/tmp/untrusted-spiffe.sock \
+OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET=/tmp/untrusted-e2e-spiffe.sock \
+OPENSHELL_APP_ARMOR_PROFILE=Unconfined \
+OPENSHELL_SANDBOX_HTTPS_PROXY=http://untrusted.invalid:8080 \
+OPENSHELL_SANDBOX_NO_PROXY=untrusted.invalid \
+OPENSHELL_SANDBOX_PROXY_AUTH_FILE=/tmp/untrusted-proxy-auth \
+OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE=true \
+OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME=true \
+OPENSHELL_SANDBOX_PROXY_CA_BUNDLE=/tmp/untrusted-proxy-ca \
+OPENSHELL_OTLP_ENDPOINT=http://untrusted.invalid:4317 \
+OPENSHELL_GATEWAY_NAME=untrusted \
+OPENSHELL_COMPUTE_DRIVER_BIND=192.0.2.2:50061 \
+OPENSHELL_COMMUNITY_REGISTRY=untrusted.invalid/community \
   run_harness
 assert_contains "${WORKDIR}/calls" "baseline|1|${WORKDIR}/results/artifacts/baseline/gateway|${WORKDIR}/results/artifacts/baseline/cli|${WORKDIR}/results/artifacts/baseline/conformance"
 assert_contains "${WORKDIR}/calls" "candidate|2|${WORKDIR}/results/artifacts/candidate/gateway|${WORKDIR}/results/artifacts/candidate/cli|${WORKDIR}/results/artifacts/candidate/conformance"
@@ -212,6 +239,7 @@ assert_contains "${WORKDIR}/results/comparison.json" '"parity":true'
 assert_not_contains "${WORKDIR}/results/baseline.json" 'raw output'
 assert_contains "${WORKDIR}/results/baseline.log" 'raw output is intentionally not normalized'
 assert_contains "${WORKDIR}/podman-calls" 'pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest'
+assert_contains "${WORKDIR}/podman-calls" 'pull alpine:3.22'
 assert_contains "${WORKDIR}/podman-calls" 'unshare rm -rf -- '
 assert_contains "${WORKDIR}/podman-calls" 'openshell-parity-run.'
 

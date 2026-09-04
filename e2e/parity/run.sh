@@ -22,6 +22,9 @@ PODMAN_BIN="${OPENSHELL_PARITY_PODMAN_BIN:-podman}"
 DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 SANDBOX_IMAGE_REQUEST="${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}"
 PARITY_SANDBOX_RUNTIME_IMAGE=""
+PARITY_SANDBOX_COMMUNITY_REGISTRY=""
+PARITY_SUPERVISOR_BASE_IMAGE=""
+PARITY_SUPERVISOR_BASE_RUNTIME_IMAGE=""
 TEMP_WORKTREE=""
 RUN_DIR=""
 
@@ -381,10 +384,35 @@ resolve_parity_sandbox_image() {
     echo "ERROR: could not resolve one immutable parity sandbox image from ${SANDBOX_IMAGE_REQUEST}." >&2
     exit 2
   fi
+  PARITY_SANDBOX_COMMUNITY_REGISTRY="${repository%/base}"
+  if [ "${PARITY_SANDBOX_COMMUNITY_REGISTRY}" = "${repository}" ]; then
+    echo "ERROR: parity sandbox repository must end in /base for the conformance alias: ${repository}." >&2
+    exit 2
+  fi
   echo "Using one immutable parity sandbox image for both variants: ${PARITY_SANDBOX_RUNTIME_IMAGE} (ID ${image_id})"
 }
 
+resolve_parity_supervisor_base_image() {
+  local baseline_base candidate_base
+  baseline_base="$(awk '$1 == "FROM" { print $2; exit }' "${BASELINE_SUPERVISOR_DOCKERFILE}")"
+  candidate_base="$(awk '$1 == "FROM" { print $2; exit }' "${CANDIDATE_SUPERVISOR_DOCKERFILE}")"
+  if [ -z "${baseline_base}" ] || [ "${baseline_base}" != "${candidate_base}" ]; then
+    echo "ERROR: parity supervisor Dockerfiles must select the same base image." >&2
+    exit 2
+  fi
+  PARITY_SUPERVISOR_BASE_IMAGE="${baseline_base}"
+  echo "Resolving parity supervisor base image once: ${PARITY_SUPERVISOR_BASE_IMAGE}"
+  podman_in_resolver_store pull "${PARITY_SUPERVISOR_BASE_IMAGE}" >/dev/null
+  PARITY_SUPERVISOR_BASE_RUNTIME_IMAGE="$(podman_in_resolver_store image inspect --format '{{index .RepoDigests 0}}' "${PARITY_SUPERVISOR_BASE_IMAGE}")"
+  if ! [[ "${PARITY_SUPERVISOR_BASE_RUNTIME_IMAGE}" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]]; then
+    echo "ERROR: could not resolve one immutable supervisor base image from ${PARITY_SUPERVISOR_BASE_IMAGE}." >&2
+    exit 2
+  fi
+  echo "Using one immutable supervisor base image for both variants: ${PARITY_SUPERVISOR_BASE_RUNTIME_IMAGE}"
+}
+
 resolve_parity_sandbox_image
+resolve_parity_supervisor_base_image
 
 write_result() {
   local variant=$1 source_sha=$2 schema=$3 status=$4
@@ -476,6 +504,14 @@ run_variant() {
   else
     command=("${conformance}" run --openshell-bin "${cli}" --output json)
   fi
+  verify_artifact_digest "${variant} gateway before execution" "${gateway}" "${gateway_digest}" || return 1
+  verify_artifact_digest "${variant} CLI before execution" "${cli}" "${cli_digest}" || return 1
+  verify_artifact_digest "${variant} conformance CLI before execution" "${conformance}" "${conformance_digest}" || return 1
+  verify_artifact_digest "${variant} supervisor before execution" "${supervisor}" "${supervisor_digest}" || return 1
+  verify_artifact_digest "${variant} supervisor Dockerfile before execution" "${supervisor_dockerfile}" "${supervisor_dockerfile_digest}" || return 1
+  if [ -n "${external_driver}" ]; then
+    verify_artifact_digest "${variant} external driver before execution" "${external_driver}" "${external_driver_digest}" || return 1
+  fi
   if env -u OPENSHELL_GATEWAY_ENDPOINT -u OPENSHELL_GATEWAY_CONFIG \
     -u OPENSHELL_COMPUTE_DRIVER -u OPENSHELL_COMPUTE_DRIVER_SOCKET -u OPENSHELL_DRIVERS \
     -u OPENSHELL_PODMAN_SOCKET \
@@ -483,6 +519,14 @@ run_variant() {
     -u CONTAINERS_CONF -u CONTAINERS_REGISTRIES_CONF -u CONTAINERS_REGISTRIES_CONF_DIR \
     -u CONTAINERS_POLICY -u PODMAN_CONNECTIONS_CONF -u DOCKER_HOST \
     -u OPENSHELL_SANDBOX_IMAGE -u OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE \
+    -u OPENSHELL_GRPC_ENDPOINT -u OPENSHELL_PODMAN_HOST_GATEWAY_IP \
+    -u OPENSHELL_PODMAN_USERNS -u OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET \
+    -u OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET -u OPENSHELL_APP_ARMOR_PROFILE \
+    -u OPENSHELL_SANDBOX_HTTPS_PROXY -u OPENSHELL_SANDBOX_NO_PROXY \
+    -u OPENSHELL_SANDBOX_PROXY_AUTH_FILE -u OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE \
+    -u OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME -u OPENSHELL_SANDBOX_PROXY_CA_BUNDLE \
+    -u OPENSHELL_OTLP_ENDPOINT -u OPENSHELL_GATEWAY_NAME -u OPENSHELL_COMPUTE_DRIVER_BIND \
+    -u OPENSHELL_COMMUNITY_REGISTRY \
     OPENSHELL_PARITY_VARIANT="${variant}" \
     OPENSHELL_E2E_CONFIG_SCHEMA_VERSION="${schema}" \
     OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER="$([ "${SCENARIO}" = external-driver ] && printf 1 || printf 0)" \
@@ -492,6 +536,15 @@ run_variant() {
     OPENSHELL_E2E_FORCE_TEMP_PODMAN_SERVICE=1 \
     OPENSHELL_E2E_REQUIRE_DIGEST_PINNED_SANDBOX_IMAGE=1 \
     OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE="${PARITY_SANDBOX_RUNTIME_IMAGE}" \
+    OPENSHELL_COMMUNITY_REGISTRY="${PARITY_SANDBOX_COMMUNITY_REGISTRY}" \
+    OPENSHELL_E2E_SUPERVISOR_BASE_IMAGE="${PARITY_SUPERVISOR_BASE_IMAGE}" \
+    OPENSHELL_E2E_SUPERVISOR_BASE_RUNTIME_IMAGE="${PARITY_SUPERVISOR_BASE_RUNTIME_IMAGE}" \
+    OPENSHELL_E2E_EXPECTED_GATEWAY_SHA256="${gateway_digest}" \
+    OPENSHELL_E2E_EXPECTED_CLI_SHA256="${cli_digest}" \
+    OPENSHELL_E2E_EXPECTED_CONFORMANCE_SHA256="${conformance_digest}" \
+    OPENSHELL_E2E_EXPECTED_EXTERNAL_DRIVER_SHA256="${external_driver_digest}" \
+    OPENSHELL_E2E_EXPECTED_SUPERVISOR_SHA256="${supervisor_digest}" \
+    OPENSHELL_E2E_EXPECTED_SUPERVISOR_DOCKERFILE_SHA256="${supervisor_dockerfile_digest}" \
     OPENSHELL_SUPERVISOR_IMAGE="${supervisor_image}" \
     OPENSHELL_E2E_PODMAN_OPTION_PROFILE="${option_profile}" \
     OPENSHELL_PARITY_ORACLE_RESULT="${RESULTS_DIR}/${variant}.normalized.json" \
