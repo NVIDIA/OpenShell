@@ -19,6 +19,9 @@ CAPABILITY_PATH = REPO_ROOT / "e2e/configs/gateway/schema-v2-capability-parity.t
 COMPUTE_BOUNDARY_PATH = (
     REPO_ROOT / "e2e/configs/gateway/schema-v2-compute-boundary-comparison.json"
 )
+CROSS_CUTTING_DISPOSITIONS_PATH = (
+    REPO_ROOT / "e2e/configs/gateway/schema-v2-cross-cutting-dispositions.toml"
+)
 
 REQUIRED_HEADER_FIELDS = {
     "manifest_version",
@@ -51,6 +54,19 @@ REQUIRED_STEP_9_IDS = {
     "vm-launch-and-resource-configuration",
 }
 REQUIRED_STEP_10_IDS = {"compute-driver-boundary-parity"}
+REQUIRED_STEP_11_IDS = {
+    "credential-driver-backend-tables",
+    "credential-driver-selection-and-kek",
+    "gateway-interceptor-registration",
+    "gateway-minted-sandbox-jwt",
+    "inference-control-plane-configuration",
+    "mtls-user-authentication",
+    "oidc-bearer-authentication",
+    "otlp-observability",
+    "provider-profile-sources",
+    "supervisor-middleware-registration",
+    "unsafe-unauthenticated-user-mode",
+}
 STEP_10_CANDIDATE_COMMIT = "4a39da510e4d278a24dd60291149519c9a570b46"
 STEP_10_REPORT_SHA256 = (
     "65541eec5f642461a88b04b5459474fd7a475adeb7071a65a53fe183caad6a01"
@@ -333,6 +349,26 @@ def test_step_10_records_verified_compute_boundary_parity(tmp_path: Path) -> Non
             check=True,
         )
         assert reproduced.read_bytes() == COMPUTE_BOUNDARY_PATH.read_bytes()
+
+
+def test_step_11_records_cross_cutting_live_lane_dispositions() -> None:
+    results = {
+        result["id"]: result
+        for result in load_toml(RESULTS_PATH)["result"]
+        if result["step"] == 11
+    }
+    dispositions = {
+        entry["id"]: entry
+        for entry in load_toml(CROSS_CUTTING_DISPOSITIONS_PATH)["capabilities"]
+    }
+
+    assert set(results) == REQUIRED_STEP_11_IDS
+    assert set(dispositions) == REQUIRED_STEP_11_IDS
+    for result_id, result in results.items():
+        disposition = dispositions[result_id]
+        assert result["status"] == "platform_blocked"
+        for field in ("status", "owner", "lane", "blocker"):
+            assert result[field] == disposition[field]
 
 
 def test_platform_blocked_results_name_owner_lane_and_blocker() -> None:
