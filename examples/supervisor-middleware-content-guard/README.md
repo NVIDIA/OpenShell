@@ -8,14 +8,14 @@ SPDX-License-Identifier: Apache-2.0
 > [!WARNING]
 > Supervisor middleware is a research preview. Its policy and service contracts may change without compatibility guarantees. Use it only to prototype and evaluate middleware integrations.
 
-This example implements an operator-run supervisor middleware service. It scans UTF-8 HTTP request bodies and complete client-to-upstream WebSocket text messages for configured literal strings, then either replaces every match or denies the request or message. Findings report only aggregate counts and never include configured terms or inspected content.
+This example implements one operator-run service with HTTP request, HTTP response, and client WebSocket bindings. Request bodies and WebSocket text messages use the content-guard behavior. The response binding demonstrates headers-only, whole-body, and normalized streaming processing.
 
 > [!WARNING]
-> This intentionally simple implementation demonstrates the supervisor middleware service contract. It is not a complete or reliable content guard and must not be used as a security control. It handles only UTF-8 HTTP request bodies and WebSocket text messages with case-sensitive literal terms, merges overlapping literal match ranges before redaction, and does not address encodings, transformations, normalization, binary WebSocket messages, upstream-to-client messages, or adversarial inputs that a production content guard must handle.
+> This intentionally simple implementation demonstrates the supervisor middleware service contract. It is not a complete or reliable content guard and must not be used as a security control. Request and WebSocket handling supports only case-sensitive literal matches in UTF-8 text. The response paths demonstrate framing and body modes with fixed transformations; they do not implement content detection. The example does not address content encodings, application-level normalization, binary WebSocket messages, or adversarial inputs.
 
 ## Prerequisites
 
-Install `cargo`, `curl`, `jq`, and `openssl` on the host before running the smoke script.
+Install `cargo`, `curl`, `jq`, `openssl`, and Python 3 on the host before running the example.
 
 ## Run the smoke example
 
@@ -54,6 +54,7 @@ Add the service registration to your local gateway TOML:
 [[openshell.supervisor.middleware]]
 name = "content-guard-example"
 grpc_endpoint = "http://host.openshell.internal:50051"
+allow_insecure_transport = true
 max_payload_bytes = 262144
 timeout = "500ms"
 ```
@@ -84,6 +85,32 @@ curl -sS https://httpbin.org/anything \
 
 The echoed JSON body contains `[FILTERED]` instead of the configured term.
 
+## HTTP response behavior
+
+The same service advertises `HTTP_RESPONSE/PRE_RETURN`. Start the included raw HTTP upstream in another terminal:
+
+```shell
+python3 examples/supervisor-middleware-content-guard/upstream.py
+```
+
+The example policy allows these requests from the sandbox:
+
+```shell
+curl -i http://host.openshell.internal:18081/headers-only
+curl -i http://host.openshell.internal:18081/whole-body
+curl -i --raw http://host.openshell.internal:18081/stream
+```
+
+The paths exercise each response mode:
+
+| Path | Mode | Result |
+| --- | --- | --- |
+| `/headers-only` | `HEADERS_ONLY` | Adds `x-example-response-mode` and passes the body through. |
+| `/whole-body` | `WHOLE_BODY_BYTES` | Prefixes the normalized complete body with `[whole]` plus a space. |
+| `/stream` | `STREAM_BYTES` | Uppercases each normalized unit and writes the declared `x-example-body-bytes` trailer. |
+
+The upstream uses content-length, chunked, and close-delimited responses. OpenShell removes those transport boundaries before invoking middleware and repairs downstream framing after a transformation. Paths outside this table return `SKIP` with `path_not_selected`.
+
 ## WebSocket behavior
 
 For a selected WebSocket upgrade, the service accepts preflight, waits for the session-start notification, and evaluates each complete client-to-upstream text message. Redact mode returns a replacement message, while deny mode returns `content_match` and OpenShell closes the session according to middleware policy. Session-start and session-end events are notifications and do not produce results.
@@ -107,4 +134,4 @@ config:
     - prototype-secret
 ```
 
-The implementation supports `HTTP_REQUEST/PRE_CREDENTIALS` and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`, advertises a 256 KiB limit for each operation, and inherits the service-wide RPC timeout. The gateway registration's `max_payload_bytes` may set a smaller shared limit. A binding can advertise a shorter timeout, but it cannot extend the operator-configured timeout.
+The implementation supports `HTTP_REQUEST/PRE_CREDENTIALS`, `HTTP_RESPONSE/PRE_RETURN`, and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`. It advertises a 256 KiB limit for each operation and inherits the service-wide RPC timeout. The gateway registration's `max_payload_bytes` may set a smaller shared limit. A binding can advertise a shorter timeout, but it cannot extend the operator-configured timeout.

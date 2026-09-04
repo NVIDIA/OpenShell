@@ -18,6 +18,7 @@ network_middlewares:
     endpoints:
       include:
         - httpbin.org
+        - host.openshell.internal
 
 network_policies:
   httpbin:
@@ -42,5 +43,23 @@ network_policies:
           - allow:
               method: POST
               path: /anything
+    binaries:
+      - path: /usr/bin/curl
+  response-framing-demo:
+    name: Response framing demo
+    endpoints:
+      - host: host.openshell.internal
+        port: 18081
+        protocol: rest
+        rules:
+          - allow:
+              method: GET
+              path: /headers-only
+          - allow:
+              method: GET
+              path: /whole-body
+          - allow:
+              method: GET
+              path: /stream
     binaries:
       - path: /usr/bin/curl

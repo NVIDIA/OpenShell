@@ -423,7 +423,8 @@ pub(super) fn middleware_chain_body_limit(
         .max()
 }
 
-pub async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_middleware_chain_with_request_id<C: AsyncRead + AsyncWrite + Unpin + Send>(
     req: crate::l7::provider::L7Request,
     client: &mut C,
     ctx: &L7EvalContext,
@@ -431,8 +432,9 @@ pub async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
     runner: &openshell_supervisor_middleware::ChainRunner,
     generation_guard: &PolicyGenerationGuard,
     transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+    request_id: &str,
 ) -> Result<MiddlewareApplyResult> {
-    apply_middleware_chain_for_scheme(
+    apply_middleware_chain_for_scheme_with_request_id(
         req,
         client,
         ctx,
@@ -441,6 +443,7 @@ pub async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
         runner,
         generation_guard,
         transformed_body_policy,
+        request_id,
     )
     .await
 }
@@ -455,6 +458,35 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
     runner: &openshell_supervisor_middleware::ChainRunner,
     generation_guard: &PolicyGenerationGuard,
     transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+) -> Result<MiddlewareApplyResult> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    apply_middleware_chain_for_scheme_with_request_id(
+        req,
+        client,
+        ctx,
+        scheme,
+        chain,
+        runner,
+        generation_guard,
+        transformed_body_policy,
+        &request_id,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_middleware_chain_for_scheme_with_request_id<
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+>(
+    req: crate::l7::provider::L7Request,
+    client: &mut C,
+    ctx: &L7EvalContext,
+    scheme: &str,
+    chain: Vec<openshell_supervisor_middleware::ChainEntry>,
+    runner: &openshell_supervisor_middleware::ChainRunner,
+    generation_guard: &PolicyGenerationGuard,
+    transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+    request_id: &str,
 ) -> Result<MiddlewareApplyResult> {
     if chain.is_empty() {
         return Ok(MiddlewareApplyResult::Allowed(req));
@@ -479,7 +511,7 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
         // body. Apply each entry's `on_error` policy without buffering (an
         // unresolved binding is handled before the body is read) and forward
         // the original request unchanged if the chain allows.
-        let input = middleware_request_input(
+        let input = middleware_request_input_with_id(
             openshell_ocsf::ctx::ctx(),
             scheme,
             &req,
@@ -488,6 +520,7 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
             Vec::new(),
             String::new(),
             Vec::new(),
+            request_id,
         );
         let outcome = runner
             .evaluate_described_with_policy_admitted(
@@ -525,7 +558,7 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
     };
     let headers = safe_middleware_headers(&buffered.headers)?;
     let query = raw_query_from_request_headers(&buffered.headers)?;
-    let input = middleware_request_input(
+    let input = middleware_request_input_with_id(
         openshell_ocsf::ctx::ctx(),
         scheme,
         &req,
@@ -534,6 +567,7 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
         headers.connection_nominated,
         query,
         buffered.body,
+        request_id,
     );
     // The explicitly selected transformation policy either re-checks every
     // replacement or documents that this protocol's policy is body-independent.
@@ -610,7 +644,7 @@ pub async fn send_middleware_admission_exhausted_response<
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn middleware_request_input(
+fn middleware_request_input_with_id(
     sandbox: &openshell_ocsf::SandboxContext,
     scheme: &str,
     req: &crate::l7::provider::L7Request,
@@ -619,9 +653,10 @@ pub(super) fn middleware_request_input(
     connection_nominated_headers: Vec<String>,
     query: String,
     body: Vec<u8>,
+    request_id: &str,
 ) -> openshell_supervisor_middleware::HttpRequestInput {
     openshell_supervisor_middleware::HttpRequestInput {
-        request_id: uuid::Uuid::new_v4().to_string(),
+        request_id: request_id.to_string(),
         sandbox_id: sandbox.sandbox_id.clone(),
         sandbox_name: sandbox.sandbox_name.clone(),
         workspace: ctx.workspace.clone(),
@@ -635,6 +670,32 @@ pub(super) fn middleware_request_input(
         connection_nominated_headers,
         body,
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn middleware_request_input(
+    sandbox: &openshell_ocsf::SandboxContext,
+    scheme: &str,
+    req: &crate::l7::provider::L7Request,
+    ctx: &L7EvalContext,
+    headers: Vec<(String, String)>,
+    connection_nominated_headers: Vec<String>,
+    query: String,
+    body: Vec<u8>,
+) -> openshell_supervisor_middleware::HttpRequestInput {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    middleware_request_input_with_id(
+        sandbox,
+        scheme,
+        req,
+        ctx,
+        headers,
+        connection_nominated_headers,
+        query,
+        body,
+        &request_id,
+    )
 }
 
 pub(super) fn raw_query_from_request_headers(headers: &[u8]) -> Result<String> {
@@ -1116,7 +1177,7 @@ mod tests {
             body_length: crate::l7::provider::BodyLength::None,
         };
 
-        let input = super::middleware_request_input(
+        let input = super::middleware_request_input_with_id(
             &sandbox,
             "https",
             &req,
@@ -1125,11 +1186,13 @@ mod tests {
             Vec::new(),
             String::new(),
             Vec::new(),
+            "exchange-123",
         );
 
         assert_eq!(input.sandbox_name, "nightly-build");
         assert_eq!(input.sandbox_id, "sbx-123");
         assert_eq!(input.workspace, "wrks-default");
+        assert_eq!(input.request_id, "exchange-123");
     }
 
     #[tokio::test]

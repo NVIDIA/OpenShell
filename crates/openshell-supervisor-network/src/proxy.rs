@@ -1751,7 +1751,7 @@ async fn handle_tcp_connection(
     let target = parts.next().unwrap_or("");
 
     if method != "CONNECT" {
-        return handle_forward_proxy(
+        return Box::pin(handle_forward_proxy(
             method,
             target,
             &buf[..],
@@ -1768,7 +1768,7 @@ async fn handle_tcp_connection(
             dynamic_credentials,
             denial_tx.as_ref(),
             activity_tx.as_ref(),
-        )
+        ))
         .await;
     }
 
@@ -6630,7 +6630,7 @@ network_policies:
 
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            handle_forward_proxy(
+            Box::pin(handle_forward_proxy(
                 "GET",
                 &target,
                 request.as_bytes(),
@@ -6647,7 +6647,7 @@ network_policies:
                 None,
                 None,
                 None,
-            ),
+            )),
         )
         .await
         .expect("denied preflight must complete without an upstream response")
@@ -6763,7 +6763,7 @@ network_policies:
         let (mut proxy_connection, _) = proxy_listener.accept().await.unwrap();
 
         let handler = tokio::spawn(async move {
-            handle_forward_proxy(
+            Box::pin(handle_forward_proxy(
                 "GET",
                 &target,
                 request.as_bytes(),
@@ -6780,7 +6780,7 @@ network_policies:
                 None,
                 None,
                 None,
-            )
+            ))
             .await
         });
         let scenario = tokio::time::timeout(std::time::Duration::from_secs(60), async {
