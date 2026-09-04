@@ -115,8 +115,6 @@ PODMAN_NETWORK_MANAGED=0
 PODMAN_SERVICE_PID=""
 PODMAN_SERVICE_LOG="${WORKDIR}/podman-service.log"
 PODMAN_SOCKET=""
-SUPERVISOR_REGISTRY_CONTAINER=""
-SUPERVISOR_REGISTRY_PORT=""
 GPU_MODE="${OPENSHELL_E2E_PODMAN_GPU:-0}"
 OIDC_MODE="${OPENSHELL_E2E_OIDC_GATEWAY:-0}"
 OIDC_ISSUER="${OPENSHELL_E2E_OIDC_ISSUER:-}"
@@ -170,11 +168,6 @@ cleanup() {
         podman_cmd volume rm -f "openshell-sandbox-${sandbox_id}-workspace" >/dev/null 2>&1 || true
       fi
     done
-  fi
-
-  if [ -n "${SUPERVISOR_REGISTRY_CONTAINER}" ] \
-     && command -v podman >/dev/null 2>&1; then
-    podman_cmd rm -f "${SUPERVISOR_REGISTRY_CONTAINER}" >/dev/null 2>&1 || true
   fi
 
   if [ "${PODMAN_NETWORK_MANAGED}" = "1" ] \
@@ -243,17 +236,21 @@ default_podman_socket_path() {
 }
 
 ensure_podman_api_socket() {
-  if [ -n "${OPENSHELL_PODMAN_SOCKET:-}" ]; then
-    return 0
-  fi
+  if [ "${OPENSHELL_E2E_FORCE_TEMP_PODMAN_SERVICE:-0}" != 1 ]; then
+    if [ -n "${OPENSHELL_PODMAN_SOCKET:-}" ]; then
+      return 0
+    fi
 
-  local default_socket
-  default_socket="$(default_podman_socket_path || true)"
-  if [ -n "${default_socket}" ] \
-     && [ -S "${default_socket}" ] \
-     && podman_cmd --url "unix://${default_socket}" info >/dev/null 2>&1; then
-    export OPENSHELL_PODMAN_SOCKET="${default_socket}"
-    return 0
+    local default_socket
+    default_socket="$(default_podman_socket_path || true)"
+    if [ -n "${default_socket}" ] \
+       && [ -S "${default_socket}" ] \
+       && podman_cmd --url "unix://${default_socket}" info >/dev/null 2>&1; then
+      export OPENSHELL_PODMAN_SOCKET="${default_socket}"
+      return 0
+    fi
+  else
+    unset OPENSHELL_PODMAN_SOCKET
   fi
 
   # `podman system service` is a Linux-only subcommand — the macOS client
@@ -441,15 +438,6 @@ if ! podman_cmd info >/dev/null 2>&1; then
   echo "       Start it with 'podman machine start' on macOS, or the user service on Linux." >&2
   exit 2
 fi
-if [ -n "${OPENSHELL_E2E_SUPERVISOR_BIN:-}" ]; then
-  SUPERVISOR_REGISTRY_PORT="$(e2e_pick_port)"
-  cat >"${WORKDIR}/registries.conf" <<EOF
-[[registry]]
-location = "localhost:${SUPERVISOR_REGISTRY_PORT}"
-insecure = true
-EOF
-  export CONTAINERS_REGISTRIES_CONF="${WORKDIR}/registries.conf"
-fi
 ensure_podman_api_socket
 
 e2e_build_gateway_binaries "${ROOT}" TARGET_DIR GATEWAY_BIN CLI_BIN
@@ -472,33 +460,15 @@ if ! [[ "${SUPERVISOR_IMAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
   echo "ERROR: could not resolve supervisor image digest for ${SUPERVISOR_IMAGE}." >&2
   exit 2
 fi
-SUPERVISOR_RUNTIME_IMAGE="${SUPERVISOR_IMAGE}"
-if [ -n "${OPENSHELL_E2E_SUPERVISOR_BIN:-}" ]; then
-  # Podman's image-pull API contacts a registry even for a locally present
-  # image with policy=missing. Publish the exact staged image to a disposable
-  # loopback-only registry so both frozen and current drivers can resolve it
-  # without any external mutable-tag dependency.
-  SUPERVISOR_REGISTRY_CONTAINER="openshell-parity-registry-$$"
-  supervisor_registry_image="localhost:${SUPERVISOR_REGISTRY_PORT}/openshell/supervisor:${SUPERVISOR_IMAGE##*:}"
-  podman_cmd run --detach --name "${SUPERVISOR_REGISTRY_CONTAINER}" \
-    --publish "127.0.0.1:${SUPERVISOR_REGISTRY_PORT}:5000" \
-    docker.io/library/registry:2 >/dev/null
-  supervisor_registry_ready=0
-  for _ in $(seq 1 30); do
-    if curl --noproxy '*' --silent --fail \
-      "http://127.0.0.1:${SUPERVISOR_REGISTRY_PORT}/v2/" >/dev/null; then
-      supervisor_registry_ready=1
-      break
-    fi
-    sleep 1
-  done
-  if [ "${supervisor_registry_ready}" != 1 ]; then
-    echo "ERROR: disposable supervisor registry did not become ready." >&2
-    exit 2
-  fi
-  podman_cmd tag "${SUPERVISOR_IMAGE}" "${supervisor_registry_image}"
-  podman_cmd push --tls-verify=false "${supervisor_registry_image}" >/dev/null
-  SUPERVISOR_RUNTIME_IMAGE="${supervisor_registry_image}"
+# The parity harness forces a temporary Podman API service into the same
+# isolated XDG store where this image was built. Address the local image by its
+# immutable manifest digest so policy=missing cannot resolve a mutable tag or
+# contact a registry for a different artifact.
+SUPERVISOR_IMAGE_REPOSITORY="${SUPERVISOR_IMAGE%:*}"
+SUPERVISOR_RUNTIME_IMAGE="${SUPERVISOR_IMAGE_REPOSITORY}@${SUPERVISOR_IMAGE_DIGEST}"
+if ! [[ "${SUPERVISOR_RUNTIME_IMAGE}" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]]; then
+  echo "ERROR: supervisor runtime image is not digest-pinned: ${SUPERVISOR_RUNTIME_IMAGE}" >&2
+  exit 2
 fi
 echo "Using Podman supervisor image: ${SUPERVISOR_RUNTIME_IMAGE} (ID ${SUPERVISOR_IMAGE_ID}, digest ${SUPERVISOR_IMAGE_DIGEST})"
 

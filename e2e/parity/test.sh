@@ -74,7 +74,7 @@ mkdir -p "${WORKDIR}/bin"
 cat >"${WORKDIR}/bin/fake-wrapper" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-for variable in OPENSHELL_GATEWAY_ENDPOINT OPENSHELL_GATEWAY_CONFIG OPENSHELL_COMPUTE_DRIVER OPENSHELL_COMPUTE_DRIVER_SOCKET OPENSHELL_DRIVERS; do
+for variable in OPENSHELL_GATEWAY_ENDPOINT OPENSHELL_GATEWAY_CONFIG OPENSHELL_COMPUTE_DRIVER OPENSHELL_COMPUTE_DRIVER_SOCKET OPENSHELL_DRIVERS OPENSHELL_PODMAN_SOCKET; do
   [ -z "${!variable:-}" ] || exit 23
 done
 printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$OPENSHELL_PARITY_VARIANT" "$OPENSHELL_E2E_CONFIG_SCHEMA_VERSION" "$OPENSHELL_GATEWAY_BIN" "$OPENSHELL_BIN" "$OPENSHELL_CONFORMANCE_BIN" "$MISE_TRUSTED_CONFIG_PATHS" "${OPENSHELL_E2E_PODMAN_OPTION_PROFILE:-}" "${OPENSHELL_PARITY_ORACLE_RESULT:-}" "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-}" "${OPENSHELL_EXTERNAL_DRIVER_BIN:-}" "${OPENSHELL_E2E_SUPERVISOR_BIN:-}" >>"$OPENSHELL_PARITY_TEST_CALLS"
@@ -166,6 +166,7 @@ OPENSHELL_GATEWAY_CONFIG=/tmp/untrusted.toml \
 OPENSHELL_COMPUTE_DRIVER=wrong \
 OPENSHELL_COMPUTE_DRIVER_SOCKET=/tmp/untrusted.sock \
 OPENSHELL_DRIVERS=wrong \
+OPENSHELL_PODMAN_SOCKET=/tmp/untrusted-podman.sock \
   run_harness
 assert_contains "${WORKDIR}/calls" "baseline|1|${WORKDIR}/results/artifacts/baseline/gateway|${WORKDIR}/results/artifacts/baseline/cli|${WORKDIR}/results/artifacts/baseline/conformance"
 assert_contains "${WORKDIR}/calls" "candidate|2|${WORKDIR}/results/artifacts/candidate/gateway|${WORKDIR}/results/artifacts/candidate/cli|${WORKDIR}/results/artifacts/candidate/conformance"
