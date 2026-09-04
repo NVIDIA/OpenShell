@@ -166,8 +166,11 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
     ] {
         append_argument_equal_deny(&mut instructions, syscall, argument, sandbox_tgid)?;
     }
-    append_argument_equal_deny(&mut instructions, libc::SYS_kill, 0, u32::MAX)?;
-    append_argument_equal_deny(&mut instructions, libc::SYS_rt_sigqueueinfo, 0, u32::MAX)?;
+    // Negative PID arguments target process groups or every signalable
+    // process. The workload never needs that authority and must not be able
+    // to include the trusted sandbox workers in a broad signal operation.
+    append_argument_masked_deny(&mut instructions, libc::SYS_kill, 0, 1 << 31)?;
+    append_argument_masked_deny(&mut instructions, libc::SYS_rt_sigqueueinfo, 0, 1 << 31)?;
 
     for syscall in [
         libc::SYS_prlimit64,
@@ -375,6 +378,12 @@ mod tests {
             {
                 unsafe { libc::_exit(4) };
             }
+            let sandbox_group = -unsafe { libc::getpgrp() };
+            if unsafe { libc::kill(sandbox_group, 0) } != -1
+                || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
+            {
+                unsafe { libc::_exit(7) };
+            }
             if unsafe { libc::syscall(libc::SYS_prlimit64, sandbox_tgid, libc::RLIMIT_CORE, 0, 0) }
                 != -1
                 || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
@@ -392,6 +401,23 @@ mod tests {
                 || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
             {
                 unsafe { libc::_exit(6) };
+            }
+            if unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_SETOWN, sandbox_tgid) } != -1
+                || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
+            {
+                unsafe { libc::_exit(8) };
+            }
+            let mut owner = sandbox_tgid;
+            if unsafe {
+                libc::ioctl(
+                    libc::STDIN_FILENO,
+                    libc::c_ulong::from(FIOSETOWN_REQUEST),
+                    &raw mut owner,
+                )
+            } != -1
+                || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
+            {
+                unsafe { libc::_exit(9) };
             }
             unsafe { libc::_exit(0) };
         }
