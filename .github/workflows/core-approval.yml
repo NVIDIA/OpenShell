@@ -35,11 +35,11 @@ jobs:
     # job fails before the publishing step resolves the head SHA itself — a
     # checkout failure, or a transient API error. Step-level writes to
     # $GITHUB_ENV override this for later steps, so post_status clearing it
-    # still works. Empty on merge_group and workflow_dispatch, where the
-    # publishing step sets it instead.
+    # still works. Empty only on workflow_dispatch, where no SHA is known until
+    # the publishing step looks the pull request up.
     env:
       STATUS_CONTEXT: OpenShell / Core Approval
-      STATUS_SHA: ${{ github.event.pull_request.head.sha }}
+      STATUS_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
     steps:
       # Check out the default branch, never the pull request head. This job runs
       # with a write-capable token, so it must not fetch or execute contributor
