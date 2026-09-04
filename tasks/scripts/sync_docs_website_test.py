@@ -495,6 +495,47 @@ def test_dev_sync_rejects_stale_or_conflicting_updates(tmp_path: Path) -> None:
         sync(stale, "other-sha", "0.3.2.dev10")
 
 
+def test_dev_sync_allows_explicit_rollback(tmp_path: Path) -> None:
+    current = tmp_path / "current"
+    stale = tmp_path / "stale"
+    website = tmp_path / "docs-website"
+    _make_source_tree(current)
+    _make_source_tree(stale)
+    (current / "docs" / "intro.mdx").write_text("# Current\n", encoding="utf-8")
+    (stale / "docs" / "intro.mdx").write_text("# Rolled back\n", encoding="utf-8")
+    _make_docs_website_tree(website)
+
+    def sync(source: Path, source_sha: str, version: str, allow_rollback: bool) -> None:
+        sdw.sync_docs(
+            Namespace(
+                source_root=source,
+                docs_website_root=website,
+                channel="dev",
+                source_ref="main",
+                source_sha=source_sha,
+                release_version=version,
+                version_slug="",
+                display_name=f"Dev (v{version})",
+                availability="beta",
+                allow_rollback=allow_rollback,
+            )
+        )
+
+    sync(current, "current-sha", "0.3.2.dev10", False)
+    sync(stale, "rollback-sha", "0.3.2.dev9", True)
+
+    fern = website / "fern"
+    assert (fern / "pages-dev" / "intro.mdx").read_text(
+        encoding="utf-8"
+    ) == "# Rolled back\n"
+    snapshots = read_yaml(fern / sdw.SNAPSHOT_METADATA_FILE)["snapshots"]
+    assert snapshots["dev"] == {
+        "source-ref": "main",
+        "source-sha": "rollback-sha",
+        "version": "0.3.2.dev9",
+    }
+
+
 def test_immutable_snapshot_cannot_change_source(tmp_path: Path) -> None:
     source = tmp_path / "source"
     website = tmp_path / "docs-website"
