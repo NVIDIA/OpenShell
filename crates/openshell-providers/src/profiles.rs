@@ -15,7 +15,8 @@ use openshell_core::proto::{
 };
 use openshell_core::secrets::uses_reserved_revision_namespace;
 use openshell_policy::{
-    L7EndpointFields, validate_explicit_tcp_additional_fields, validate_l7_endpoint_semantics,
+    L7EndpointFields, validate_endpoint_modes, validate_explicit_tcp_additional_fields,
+    validate_l7_endpoint_semantics,
 };
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -2088,6 +2089,16 @@ pub fn validate_profile_set(
                     .unwrap_or(false),
             };
             for msg in validate_l7_endpoint_semantics(&l7_fields) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}]"),
+                    msg,
+                ));
+            }
+            for msg in
+                validate_endpoint_modes(&endpoint.tls, &endpoint.enforcement, &endpoint.access)
+            {
                 diagnostics.push(ProfileValidationDiagnostic::error(
                     source,
                     profile_id,
@@ -4877,6 +4888,35 @@ credentials:
     }
 
     // -- L7 endpoint semantic validation (shared with runtime) ----------------
+
+    #[test]
+    fn validate_rejects_unknown_security_sensitive_endpoint_values() {
+        let profile = parse_profile_yaml(
+            r"
+id: invalid-modes
+display_name: Invalid modes
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    tls: skp
+    enforcement: enforc
+    access: read-wirte
+",
+        )
+        .expect("string values should parse before semantic validation");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        let message = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(message.contains("unknown tls value 'skp'"));
+        assert!(message.contains("unknown enforcement value 'enforc'"));
+        assert!(message.contains("unknown access value 'read-wirte'"));
+    }
 
     #[test]
     fn validate_rejects_protocol_without_rules_or_access() {

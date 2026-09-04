@@ -1994,6 +1994,35 @@ mod tests {
     }
 
     #[test]
+    fn validate_policy_safety_reports_unknown_enforcement() {
+        use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
+
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "github_api".into(),
+            NetworkPolicyRule {
+                name: "github-api-readonly".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.github.com".into(),
+                    port: 443,
+                    protocol: "rest".into(),
+                    enforcement: "enforc".into(),
+                    access: "read-only".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let err = validate_policy_safety(&policy).unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("endpoint 0"));
+        assert!(err.message().contains("unknown enforcement value 'enforc'"));
+        assert!(err.message().contains("expected enforce or audit"));
+    }
+
+    #[test]
     fn validate_policy_safety_rejects_invalid_middleware_before_acceptance() {
         use openshell_core::proto::{MiddlewareEndpointSelector, NetworkMiddlewareConfig};
 
