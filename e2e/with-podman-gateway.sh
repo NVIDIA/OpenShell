@@ -316,6 +316,39 @@ resolve_podman_supervisor_image() {
 ensure_podman_supervisor_image() {
   local image=$1
 
+  if [ -n "${OPENSHELL_E2E_SUPERVISOR_BIN:-}" ]; then
+    local dockerfile=${OPENSHELL_E2E_SUPERVISOR_DOCKERFILE:-${ROOT}/deploy/docker/Dockerfile.supervisor}
+    local context="${WORKDIR}/supervisor-image" arch
+    case "$(uname -m)" in
+      x86_64|amd64) arch=amd64 ;;
+      aarch64|arm64) arch=arm64 ;;
+      *) echo "ERROR: unsupported supervisor image architecture: $(uname -m)" >&2; exit 2 ;;
+    esac
+    if [ ! -x "${OPENSHELL_E2E_SUPERVISOR_BIN}" ]; then
+      echo "ERROR: supplied supervisor binary is not executable: ${OPENSHELL_E2E_SUPERVISOR_BIN}" >&2
+      exit 2
+    fi
+    if [ ! -f "${dockerfile}" ]; then
+      echo "ERROR: supervisor Dockerfile not found: ${dockerfile}" >&2
+      exit 2
+    fi
+    mkdir -p "${context}/deploy/docker/.build/prebuilt-binaries/${arch}"
+    install -m 0555 "${OPENSHELL_E2E_SUPERVISOR_BIN}" \
+      "${context}/deploy/docker/.build/prebuilt-binaries/${arch}/openshell-sandbox"
+    cp "${dockerfile}" "${context}/deploy/docker/Dockerfile.supervisor"
+    echo "Building Podman supervisor image ${image} from supplied binary..."
+    (
+      cd "${context}"
+      podman_cmd build \
+        --build-arg "TARGETARCH=${arch}" \
+        --file deploy/docker/Dockerfile.supervisor \
+        --target supervisor \
+        --tag "${image}" \
+        .
+    )
+    return 0
+  fi
+
   if [ "${image}" = "openshell/supervisor:dev" ] \
      && [ -z "${OPENSHELL_SUPERVISOR_IMAGE:-}" ] \
      && [ -z "${CI:-}" ]; then
@@ -401,7 +434,18 @@ fi
 
 SUPERVISOR_IMAGE="$(resolve_podman_supervisor_image)"
 ensure_podman_supervisor_image "${SUPERVISOR_IMAGE}"
-echo "Using Podman supervisor image: ${SUPERVISOR_IMAGE}"
+SUPERVISOR_IMAGE_ID="$(podman_cmd image inspect --format '{{.Id}}' "${SUPERVISOR_IMAGE}")"
+SUPERVISOR_IMAGE_ID="${SUPERVISOR_IMAGE_ID#sha256:}"
+SUPERVISOR_RUNTIME_IMAGE="$(podman_cmd image inspect --format '{{index .RepoDigests 0}}' "${SUPERVISOR_IMAGE}")"
+if ! [[ "${SUPERVISOR_IMAGE_ID}" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "ERROR: could not resolve immutable supervisor image ID for ${SUPERVISOR_IMAGE}." >&2
+  exit 2
+fi
+if ! [[ "${SUPERVISOR_RUNTIME_IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]]; then
+  echo "ERROR: could not resolve digest-pinned supervisor image reference for ${SUPERVISOR_IMAGE}." >&2
+  exit 2
+fi
+echo "Using Podman supervisor image: ${SUPERVISOR_RUNTIME_IMAGE} (ID ${SUPERVISOR_IMAGE_ID})"
 
 DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 SANDBOX_IMAGE="${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
@@ -461,7 +505,7 @@ e2e_write_podman_gateway_config \
   "${HOST_PORT}" \
   "${SANDBOX_IMAGE}" \
   "${PODMAN_STOP_TIMEOUT_SECS}" \
-  "${SUPERVISOR_IMAGE}" \
+  "${SUPERVISOR_RUNTIME_IMAGE}" \
   "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET:-}" \
   "${OPENSHELL_PODMAN_SOCKET:-}" \
   "${OIDC_MODE}" \
@@ -474,11 +518,14 @@ if [ -n "${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE:-}" ]; then
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     driver_transport=remote_uds
   fi
-  printf '{"schema_version":%s,"external_compute_driver":%s,"compute_driver_transport":"%s","external_driver_pull_policy":"%s"}\n' \
+  printf '{"schema_version":%s,"external_compute_driver":%s,"compute_driver_transport":"%s","external_driver_pull_policy":"%s","supervisor_image":"%s","supervisor_image_id":"%s","supervisor_runtime_image":"%s"}\n' \
     "${CONFIG_SCHEMA_VERSION}" \
     "$([ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ] && printf true || printf false)" \
     "${driver_transport}" \
     "${EXTERNAL_DRIVER_PULL_POLICY}" \
+    "${SUPERVISOR_IMAGE}" \
+    "${SUPERVISOR_IMAGE_ID}" \
+    "${SUPERVISOR_RUNTIME_IMAGE}" \
     >"${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE}"
 fi
 
@@ -491,7 +538,7 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   OPENSHELL_GATEWAY_PORT="${HOST_PORT}" \
   OPENSHELL_NETWORK_NAME="${PODMAN_NETWORK_NAME}" \
   OPENSHELL_STOP_TIMEOUT="${PODMAN_STOP_TIMEOUT_SECS}" \
-  OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}" \
+  OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_RUNTIME_IMAGE}" \
   OPENSHELL_PODMAN_TLS_CA="${PKI_DIR}/ca.crt" \
   OPENSHELL_PODMAN_TLS_CERT="${PKI_DIR}/client/tls.crt" \
   OPENSHELL_PODMAN_TLS_KEY="${PKI_DIR}/client/tls.key" \
@@ -535,7 +582,7 @@ e2e_export_gateway_restart_metadata \
   "${GATEWAY_PID_FILE}"
 
 OPENSHELL_LOCAL_TLS_DIR="${PKI_DIR}" \
-OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}" \
+OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_RUNTIME_IMAGE}" \
 OPENSHELL_NETWORK_NAME="${PODMAN_NETWORK_NAME}" \
   "${GATEWAY_BIN}" "${GATEWAY_ARGS[@]}" >"${GATEWAY_LOG}" 2>&1 &
 GATEWAY_PID=$!
