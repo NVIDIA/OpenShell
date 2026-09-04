@@ -21,15 +21,21 @@ pub struct TracingLogBus {
     seq: SeqAllocator,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Inner {
     per_id: HashMap<String, PerSandbox>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PerSandbox {
     sender: broadcast::Sender<SandboxStreamEvent>,
     tail: VecDeque<(u64, SandboxStreamEvent)>,
+    /// Highest seq this bus has evicted from `tail`. 0 = nothing trimmed.
+    ///
+    /// Under the shared cursor space each bus's tail is non-contiguous in the
+    /// global seq (the other bus owns the missing seqs), so a resume gap can
+    /// only be judged by what *this* bus actually dropped.
+    last_trimmed_seq: u64,
 }
 
 impl PerSandbox {
@@ -38,8 +44,17 @@ impl PerSandbox {
         Self {
             sender: tx,
             tail: VecDeque::new(),
+            last_trimmed_seq: 0,
         }
     }
+}
+
+/// The requested resume cursor is older than the oldest buffered event;
+/// the events between them were trimmed and cannot be replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumeGap {
+    pub requested_after: u64,
+    pub oldest_available: u64,
 }
 
 /// Per-sandbox monotonic sequence allocator.
@@ -73,6 +88,33 @@ impl SeqAllocator {
             .expect("seq allocator lock poisoned")
             .remove(sandbox_id);
     }
+}
+
+fn tail_after_impl(
+    tail: &VecDeque<(u64, SandboxStreamEvent)>,
+    last_trimmed_seq: u64,
+    after_seq: u64,
+) -> Result<Vec<SandboxStreamEvent>, ResumeGap> {
+    // Gap iff this bus dropped an event the client still needs, i.e. the
+    // highest seq we evicted is newer than the client's position. Judged only
+    // on this bus's own evictions — the other bus owns the seqs missing here.
+    if after_seq < last_trimmed_seq {
+        return Err(ResumeGap {
+            requested_after: after_seq,
+            oldest_available: last_trimmed_seq + 1,
+        });
+    }
+
+    // Skippable events (seq <= after_seq) are the oldest, at the front, so a
+    // take-while would stop before reaching the wanted ones. Filter the whole
+    // tail instead; order is preserved and caught-up yields an empty vec.
+    let res: Vec<SandboxStreamEvent> = tail
+        .iter()
+        .filter(|(seq, _)| *seq > after_seq)
+        .map(|(_, event)| event.clone())
+        .collect();
+
+    Ok(res)
 }
 
 impl Default for TracingLogBus {
@@ -147,6 +189,18 @@ impl TracingLogBus {
             .collect::<Vec<SandboxStreamEvent>>()
     }
 
+    pub fn tail_after(
+        &self,
+        sandbox_id: &str,
+        after_seq: u64,
+    ) -> Result<Vec<SandboxStreamEvent>, ResumeGap> {
+        let inner = self.inner.lock().expect("tracing bus lock poisoned");
+        inner.per_id.get(sandbox_id).map_or_else(
+            || Ok(Vec::new()),
+            |per| tail_after_impl(&per.tail, per.last_trimmed_seq, after_seq),
+        )
+    }
+
     /// Publish a log line from an external source (e.g., sandbox push).
     ///
     /// Injects the line into the same broadcast channel and tail buffer
@@ -181,7 +235,9 @@ impl TracingLogBus {
         let _ = per.sender.send(event.clone());
         per.tail.push_back((seq, event));
         while per.tail.len() > tail_cap {
-            per.tail.pop_front();
+            if let Some((trimmed, _)) = per.tail.pop_front() {
+                per.last_trimmed_seq = trimmed;
+            }
         }
     }
 }
@@ -275,6 +331,153 @@ mod tests {
             source: "gateway".to_string(),
             fields: HashMap::new(),
         }
+    }
+
+    /// Build a stream event carrying `seq` in its cursor for assertion.
+    fn stream_event(seq: u64) -> SandboxStreamEvent {
+        SandboxStreamEvent {
+            payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
+                make_log_event("sb", &seq.to_string()),
+            )),
+            cursor: seq,
+        }
+    }
+
+    /// Build a contiguous tail with seqs `lo..=hi`.
+    fn tail_of(lo: u64, hi: u64) -> VecDeque<(u64, SandboxStreamEvent)> {
+        (lo..=hi).map(|s| (s, stream_event(s))).collect()
+    }
+
+    /// Extract cursors from a run of events, in order.
+    fn cursors(events: &[SandboxStreamEvent]) -> Vec<u64> {
+        events.iter().map(|e| e.cursor).collect()
+    }
+
+    #[test]
+    fn tail_after_impl_empty_tail_returns_empty() {
+        let tail = VecDeque::new();
+        // Nothing trimmed (last_trimmed_seq = 0): any cursor is serviceable.
+        assert_eq!(tail_after_impl(&tail, 0, 0).unwrap(), Vec::new());
+        assert_eq!(tail_after_impl(&tail, 0, 42).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn tail_after_impl_from_zero_returns_all() {
+        let tail = tail_of(1, 5);
+        let events = tail_after_impl(&tail, 0, 0).expect("serviceable");
+        assert_eq!(cursors(&events), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn tail_after_impl_mid_range_returns_newer_in_order() {
+        let tail = tail_of(1, 5);
+        let events = tail_after_impl(&tail, 0, 3).expect("serviceable");
+        assert_eq!(cursors(&events), vec![4, 5]);
+    }
+
+    #[test]
+    fn tail_after_impl_caught_up_returns_empty() {
+        let tail = tail_of(1, 5);
+        // Cursor at the newest seq: nothing newer, but not a gap.
+        assert_eq!(tail_after_impl(&tail, 0, 5).expect("ok"), Vec::new());
+    }
+
+    #[test]
+    fn tail_after_impl_future_cursor_returns_empty() {
+        let tail = tail_of(1, 5);
+        // Cursor beyond newest (client claims to have seen more than exists):
+        // still serviceable, just nothing to send.
+        assert_eq!(tail_after_impl(&tail, 0, 99).expect("ok"), Vec::new());
+    }
+
+    #[test]
+    fn tail_after_impl_boundary_at_last_trimmed_is_serviceable() {
+        // Bus trimmed up to seq 2, retains 3..=5. Client saw exactly 2, so
+        // nothing they still need was dropped.
+        let tail = tail_of(3, 5);
+        let events = tail_after_impl(&tail, 2, 2).expect("serviceable");
+        assert_eq!(cursors(&events), vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn tail_after_impl_gap_returns_err() {
+        // Bus trimmed up to seq 2, retains 3..=5. Client wants everything after
+        // 1, but seq 2 was evicted and cannot be replayed.
+        let tail = tail_of(3, 5);
+        let err = tail_after_impl(&tail, 2, 1).expect_err("gap");
+        assert_eq!(
+            err,
+            ResumeGap {
+                requested_after: 1,
+                oldest_available: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn tail_after_impl_non_contiguous_tail_no_false_gap() {
+        // Simulate the shared cursor space: this bus only owns seqs 2 and 4
+        // (the other bus owns 1 and 3), and never trimmed. Resuming from 0 must
+        // not report a gap just because seq 1 is absent here.
+        let tail: VecDeque<(u64, SandboxStreamEvent)> =
+            [(2, stream_event(2)), (4, stream_event(4))]
+                .into_iter()
+                .collect();
+        let events = tail_after_impl(&tail, 0, 0).expect("no gap");
+        assert_eq!(cursors(&events), vec![2, 4]);
+    }
+
+    #[test]
+    fn tracing_log_bus_tail_after_serviceable_and_missing() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-ta";
+        for _ in 0..3 {
+            bus.publish_external(make_log_event(sandbox_id, "line"));
+        }
+        // Cursors start at 1, so three publishes are seqs 1,2,3.
+        assert_eq!(
+            cursors(&bus.tail_after(sandbox_id, 0).unwrap()),
+            vec![1, 2, 3]
+        );
+        assert_eq!(cursors(&bus.tail_after(sandbox_id, 2).unwrap()), vec![3]);
+        // Unknown sandbox: no entry, nothing buffered, no gap.
+        assert_eq!(bus.tail_after("nope", 5).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn platform_event_bus_tail_after_serviceable() {
+        let bus = TracingLogBus::new();
+        let platform = &bus.platform_event_bus;
+        let sandbox_id = "sb-pe";
+        for _ in 0..3 {
+            platform.publish(sandbox_id, stream_event(0));
+        }
+        // Shared allocator, but only the platform bus published here, so its
+        // seqs are 1,2,3.
+        assert_eq!(
+            cursors(&platform.tail_after(sandbox_id, 0).unwrap()),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            cursors(&platform.tail_after(sandbox_id, 1).unwrap()),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn shared_allocator_interleaves_cursors_across_buses() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-mix";
+        // Interleave log and platform publishes; the shared allocator gives
+        // each a unique, increasing cursor in one merged space.
+        bus.publish_external(make_log_event(sandbox_id, "a")); // seq 1
+        bus.platform_event_bus.publish(sandbox_id, stream_event(0)); // seq 2
+        bus.publish_external(make_log_event(sandbox_id, "b")); // seq 3
+
+        let logs = cursors(&bus.tail_after(sandbox_id, 0).unwrap());
+        let events = cursors(&bus.platform_event_bus.tail_after(sandbox_id, 0).unwrap());
+        assert_eq!(logs, vec![1, 3]);
+        assert_eq!(events, vec![2]);
     }
 
     #[test]
@@ -520,7 +723,9 @@ impl PlatformEventBus {
         let _ = per.sender.send(event.clone());
         per.tail.push_back((seq, event));
         while per.tail.len() > Self::DEFAULT_TAIL {
-            per.tail.pop_front();
+            if let Some((trimmed, _)) = per.tail.pop_front() {
+                per.last_trimmed_seq = trimmed;
+            }
         }
     }
 
@@ -542,6 +747,19 @@ impl PlatformEventBus {
             .into_iter()
             .rev()
             .collect()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn tail_after(
+        &self,
+        sandbox_id: &str,
+        after_seq: u64,
+    ) -> Result<Vec<SandboxStreamEvent>, ResumeGap> {
+        let inner = self.inner.lock().expect("platform event bus lock poisoned");
+        inner.per_id.get(sandbox_id).map_or_else(
+            || Ok(Vec::new()),
+            |per| tail_after_impl(&per.tail, per.last_trimmed_seq, after_seq),
+        )
     }
 
     /// Remove the bus entry for the given sandbox id.
