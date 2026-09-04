@@ -41,7 +41,6 @@ experimental:
   mdx-components:
   - ./pages-latest/_components
   - ./pages-dev/_components
-  - ./pages-v0.0.36/_components
   - ./components
 versions:
 - display-name: Latest (v0.0.116)
@@ -51,9 +50,6 @@ versions:
   path: ./versions/dev.yml
   slug: dev
   availability: beta
-- display-name: v0.0.36
-  path: ./versions/v0.0.36.yml
-  slug: v0.0.36
 redirects:
 - source: /openshell/index.html
   destination: /openshell/latest
