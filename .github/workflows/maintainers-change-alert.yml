@@ -22,6 +22,7 @@ jobs:
     name: Comment on the approver set change
     if: github.repository_owner == 'NVIDIA'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       # Default branch only. The helper must be the reviewed version, not
       # whatever the pull request happens to contain.
@@ -80,6 +81,10 @@ jobs:
           cat body.md >> "$GITHUB_STEP_SUMMARY"
 
           # Update the existing comment rather than stacking one per push.
+          # This marker must stay identical to COMMENT_MARKER in
+          # tasks/scripts/core_approval.py, which emits it as the first line of
+          # the body. If they drift, the lookup below silently stops matching
+          # and every push stacks another comment.
           COMMENT_ID=$(gh api --paginate "repos/$GH_REPO/issues/$PR_NUMBER/comments" \
             --jq '.[] | select(.body | startswith("<!-- core-approval-maintainer-delta -->")) | .id' \
             | head -n 1)

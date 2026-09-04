@@ -31,7 +31,15 @@ jobs:
     name: Publish core approval status
     if: github.repository_owner == 'NVIDIA'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Seeded so the guard step below can still publish a red status when the
+    # job fails before the publishing step resolves the head SHA itself — a
+    # checkout failure, or a transient API error. Step-level writes to
+    # $GITHUB_ENV override this for later steps, so post_status clearing it
+    # still works. Empty on merge_group and workflow_dispatch, where the
+    # publishing step sets it instead.
+    env:
+      STATUS_CONTEXT: OpenShell / Core Approval
+      STATUS_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
       # Check out the default branch, never the pull request head. This job runs
       # with a write-capable token, so it must not fetch or execute contributor
@@ -47,6 +55,7 @@ jobs:
           persist-credentials: false
 
       - name: Publish core approval status
+        timeout-minutes: 10
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -58,7 +67,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          STATUS_CONTEXT="OpenShell / Core Approval"
           RUN_URL="https://github.com/$GH_REPO/actions/runs/$GITHUB_RUN_ID"
 
           post_status() {
@@ -120,9 +128,9 @@ jobs:
           post_status "$HEAD_SHA" "${RESULT%%$'\t'*}" "${RESULT#*$'\t'}" "$TARGET_URL"
 
       # If the step above aborted before publishing anything — a transient API
-      # failure, a timeout — the required check would otherwise sit at
-      # "Expected" forever. Publish red so the state is visible and the job can
-      # be re-run.
+      # failure, a failed checkout, the step timing out — the required check
+      # would otherwise sit at "Expected" forever. Publish red so the state is
+      # visible and the job can be re-run.
       - name: Publish a failure status if none was published
         if: failure() && env.STATUS_SHA != ''
         env:
@@ -133,8 +141,7 @@ jobs:
           set -euo pipefail
           gh api --method POST "repos/$GH_REPO/statuses/$STATUS_SHA" \
             -f "state=failure" \
-            -f "context=OpenShell / Core Approval" \
+            -f "context=$STATUS_CONTEXT" \
             -f "description=Could not evaluate maintainer approval" \
             -f "target_url=https://github.com/$GH_REPO/actions/runs/$GITHUB_RUN_ID" \
             >/dev/null
-
