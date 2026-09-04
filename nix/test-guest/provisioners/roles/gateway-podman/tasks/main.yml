@@ -1,0 +1,57 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Require an OpenShell installation
+  ansible.builtin.assert:
+    that:
+      - openshell_install_source is defined
+      - openshell_cli_bin is defined
+      - openshell_gateway_bin is defined
+      - openshell_gateway_service is defined
+      - openshell_gateway_endpoint is defined
+      - openshell_gateway_service_source in ['generated', 'package']
+      - openshell_gateway_config_source in ['generated', 'package']
+      - openshell_podman_mode in ['rootless', 'rootful']
+    fail_msg: >-
+      gateway-podman requires an earlier OpenShell installation role and a
+      rootless or rootful Podman wrapper.
+
+- name: Resolve the gateway service account
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ openshell_podman_service_user }}"
+
+- name: Publish the gateway service account
+  ansible.builtin.set_fact:
+    openshell_gateway_service_user: "{{ openshell_podman_service_user }}"
+    openshell_gateway_service_uid: "{{ ansible_facts.getent_passwd[openshell_podman_service_user][1] }}"
+    openshell_gateway_service_home: "{{ ansible_facts.getent_passwd[openshell_podman_service_user][4] }}"
+
+- name: Configure a development gateway
+  ansible.builtin.include_tasks: development-gateway.yml
+  when:
+    - openshell_gateway_service_source == 'generated'
+    - openshell_gateway_config_source == 'generated'
+
+- name: Enable the gateway service account user manager
+  ansible.builtin.command:
+    argv:
+      - loginctl
+      - enable-linger
+      - "{{ openshell_gateway_service_user }}"
+  become: true
+  changed_when: false
+
+- name: Start the gateway service account user manager
+  ansible.builtin.systemd_service:
+    name: "user@{{ openshell_gateway_service_uid }}.service"
+    state: started
+  become: true
+
+- name: Run the gateway lifecycle
+  ansible.builtin.include_tasks: lifecycle.yml
+
+- name: Publish Podman gateway runtime
+  ansible.builtin.set_fact:
+    openshell_gateway_runtime: "{{ openshell_podman_mode }}-podman"

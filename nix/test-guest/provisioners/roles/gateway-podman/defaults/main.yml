@@ -2,5 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+openshell_podman_service_user: openshell
+openshell_gateway_service_command: /home/openshell/.local/bin/openshell-test-guest-as-gateway-user
 openshell_gateway_restart_command: /home/openshell/.local/bin/openshell-test-guest-gateway-restart
 openshell_gateway_diagnostics_command: /home/openshell/.local/bin/openshell-test-guest-diagnostics

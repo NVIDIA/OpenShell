@@ -26,4 +26,6 @@
     openshell_gateway_bin: "{{ openshell_rpm_gateway_bin }}"
     openshell_gateway_service: "{{ openshell_rpm_gateway_service }}"
     openshell_gateway_endpoint: "{{ openshell_rpm_gateway_endpoint }}"
+    openshell_gateway_service_source: package
+    openshell_gateway_config_source: package
     openshell_supervisor_source: package

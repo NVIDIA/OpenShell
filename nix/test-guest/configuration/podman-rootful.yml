@@ -1,0 +1,30 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Configure rootful Podman
+  hosts: test_vm
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Install common Podman prerequisites
+      ansible.builtin.import_tasks: tasks/podman-common.yml
+
+    - name: Enable the rootful Podman API socket
+      ansible.builtin.systemd_service:
+        name: podman.socket
+        enabled: true
+        state: started
+
+    - name: Verify rootful Podman mode
+      ansible.builtin.command:
+        argv:
+          - podman
+          - --url
+          - unix:///run/podman/podman.sock
+          - info
+          - --format
+          - "{% raw %}{{.Host.Security.Rootless}}{% endraw %}"
+      changed_when: false
+      register: podman_rootless
+      failed_when: podman_rootless.stdout != "false"

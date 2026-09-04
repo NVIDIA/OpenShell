@@ -13,7 +13,7 @@ Usage:
 
 Options:
   --distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
-  --with NAME         Apply a configuration; repeatable (docker, podman-rootless, selinux, snapd)
+  --with NAME         Apply a configuration; repeatable (docker, podman-rootful, podman-rootless, selinux, snapd)
   --provision NAME    Apply a post-artifact system provisioner; repeatable
   --install PATH      Install a .deb or .rpm package; repeatable
   --copy SRC:DEST[:MODE]

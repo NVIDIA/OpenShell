@@ -5,5 +5,5 @@
 - ansible.builtin.include_role:
     name: gateway-podman
   vars:
-    openshell_podman_mode: rootless
-    openshell_podman_service_user: openshell
+    openshell_podman_mode: rootful
+    openshell_podman_service_user: root
