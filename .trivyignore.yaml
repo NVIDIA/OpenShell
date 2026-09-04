@@ -1,0 +1,62 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Trivy exceptions. Passed explicitly with --ignorefile by tasks/scripts/trivy-scan.sh,
+# because Trivy auto-loads a plain `.trivyignore` but not the YAML variant.
+#
+# An entry belongs here only when the finding is wrong: the condition it
+# reports is not true of this repository, or it is an artifact of how the scan
+# renders the chart. Nothing else qualifies. Findings that describe hardening
+# we have not done, or a risk we have accepted, stay in the report where they
+# can be seen and argued about, even when that means the gate fails.
+#
+# Always scope an entry with `paths`, naming individual files. An `id` on its
+# own disables the check everywhere, which would also hide a genuine occurrence
+# elsewhere.
+#
+# Use `**/<file>.yaml`. Paths match the location Trivy reports, which is
+# relative to the scanned target, and the same template is reported two ways:
+# `helm/openshell/templates/x.yaml` when scanning deploy/, and
+# `helm-chart-<version>.tgz:templates/x.yaml` when scanning the published chart.
+# Only a leading `**/` matches both. `*templates/x.yaml` silently stops applying
+# to the repository scan, and `**/templates/x.yaml` to the packaged one.
+#
+# `paths` is also as narrow as this file can get: for misconfigurations Trivy
+# offers no per-occurrence scoping, so a second, legitimate finding of the same
+# check in a listed file would be hidden too. Inline `#trivy:ignore:` comments
+# would fix that and do work for Dockerfiles, but Trivy 0.74 does not apply them
+# to Helm templates. Revisit when it does.
+
+misconfigurations:
+  # helm template renders without a namespace, so every workload appears to be
+  # in "default". The namespace comes from `helm install -n` and no template
+  # hardcodes one.
+  - id: KSV-0110
+    paths:
+      - "**/statefulset.yaml"
+      - "**/deployment.yaml"
+    statement: >-
+      An artifact of rendering the chart outside a cluster. The namespace is
+      supplied at install time.
+
+  # This ConfigMap stores the *name* of a key inside an external Secret
+  # (proxy_auth_secret_key = "proxy-auth"), not the credential. Scoped to the
+  # one file, because elsewhere this check is what would catch a real
+  # credential committed into a ConfigMap.
+  - id: KSV-01010
+    paths:
+      - "**/gateway-config.yaml"
+    statement: >-
+      The ConfigMap holds the name of a key in an external Secret, not a
+      credential.
+
+  # ghcr.io/nvidia/openshell is where this project publishes its own images.
+  # Trivy's default trusted-registry list cannot be extended in the version we
+  # run, so the check cannot be taught about our registry. Scoped to the two
+  # workload templates so third-party images referenced elsewhere still report.
+  - id: KSV-0125
+    paths:
+      - "**/statefulset.yaml"
+      - "**/deployment.yaml"
+    statement: >-
+      Images come from ghcr.io/nvidia/openshell, this project's own registry.

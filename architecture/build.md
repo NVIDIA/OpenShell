@@ -439,6 +439,92 @@ tags and gating stable promotion on qualification results are part of
 [RFC 0014](../rfc/0014-release-stability/release-qualification.md) and are not
 implemented yet.
 
+## Artifact Scanning
+
+Trivy runs in two places: a reusable release-artifact workflow and a
+pull-request change gate.
+
+### Release Artifacts
+
+`.github/workflows/trivy-scan.yml` is reusable and takes OCI references as
+input, so it has no knowledge of how a release is assembled and no dependency on
+release job ordering. Nix supplies both Trivy and Helm, and the jobs stay on
+GitHub-hosted runners like the other scanners.
+
+Findings are informational during the observation phase: they warn and the run
+stays green, while a scanner that cannot run still fails. The `fail-on-findings`
+input turns them into failures, which is a prerequisite for wiring the workflow
+into a release `needs:` rather than something to do at the same time.
+
+Two scopes, with deliberately different reporting semantics:
+
+- **Images.** `HIGH` and `CRITICAL` are reported, and vulnerabilities with no
+  upstream fix are ignored. Without that exclusion a base-image CVE with no
+  available patch would be permanent noise, and a gate nobody can act on once
+  findings start failing. Published tags are multi-arch indexes and Trivy
+  defaults to the runner's own platform, so each architecture is scanned
+  separately.
+- **Configuration.** The same severity threshold, but the unfixed exclusion does not
+  apply to misconfigurations. One pass over `deploy/` covers both charts, the
+  published Dockerfiles and the raw manifests. Coverage then depends on value
+  combinations: the chart defaults render 10 of the chart's 19 templates, so
+  CI value fixtures exercise conditional resources such as the high-availability
+  Deployment, Gateway API objects, OpenShift Route, and broader workspace-mode
+  ClusterRole. Each fixture is scanned on its own, and the packaged chart is
+  scanned from its published OCI reference to cover the artifact consumers
+  actually install.
+
+Trivy has no OCI artifact target, and `trivy image` rejects the Helm config media
+type, so a packaged chart has to be fetched with `helm pull` before it can be
+scanned. Trivy reports locations relative to the scanned target, so
+`tasks/scripts/trivy-scan.sh` rewrites SARIF URIs to repository-relative paths;
+without that, Code Scanning resolves alerts against files that do not exist. That
+rewrite and the profile loop are the only repository-specific logic: severity
+filtering, the pass/fail decision and the summary table all come from
+`trivy convert --exit-code`, so nothing reimplements counting.
+
+`.trivyignore.yaml` holds exceptions, and the bar for adding one is that the
+finding is wrong: the condition it reports is not true of this repository, or it
+is an artifact of how the scan renders the chart. Hardening that has not been
+done and risks that have been accepted stay in the report instead, so the
+scanner keeps describing the real posture rather than a curated one. Trivy
+auto-loads a plain `.trivyignore` but not the YAML variant, so the scripts pass
+`--ignorefile` explicitly.
+
+That bar means four checks report today: `KSV-0014`, `KSV-0041`, `KSV-0056` and
+`DS-0002`. Reports are written before findings are evaluated, so a warning or a
+failure still publishes SARIF and artifacts. Introducing the tooling and settling
+its findings are separate changes, in that order.
+
+### Pull-Request Change Gate
+
+`.github/workflows/trivy-changes.yml` gates changes rather than releases. It
+runs on `pull_request` and `merge_group`; `workflow_dispatch` takes explicit
+base and head SHAs for diagnostics. A detection job decides whether the change
+touches `deploy/docker/**`, `deploy/helm/**`, or the scanner inputs themselves
+(`.trivyignore.yaml`, `flake.nix`, `flake.lock`, `tasks/scripts/trivy-scan.sh`,
+and the workflow file).
+
+When it does, the scan job checks out both the baseline and the candidate and
+runs the candidate's `trivy-scan.sh config` over each tree with the candidate's
+`.trivyignore.yaml`, so a scanner or ignore-policy change is judged by its own
+rules on both sides. `gate-config-diff` then compares semantic finding
+identities — rule ID, target, namespace, message, and cause
+provider/service/resource — and fails only on identities absent from the
+baseline. The four findings above therefore keep reporting without blocking
+every pull request, while a newly introduced `HIGH` or `CRITICAL`
+misconfiguration fails the check. Both report sets are uploaded as workflow
+artifacts.
+
+The `result` job publishes a stable `OpenShell / Trivy Changes` status that
+succeeds when no relevant files changed, so the check can be required
+unconditionally.
+
+This gate scans Helm and Dockerfile configuration only. It builds no image, so
+it cannot detect OS or package CVEs in the image a change would produce.
+Final-image vulnerability scanning stays with the release-artifact workflow
+above.
+
 See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
 
 ## Docs Site

@@ -1,0 +1,276 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Trivy Scan
+
+# Scans the artifacts a release publishes: the final container images and the
+# deployment configuration. Callers pass OCI references, so this workflow is
+# self-contained and knows nothing about how a release is assembled.
+#
+# Findings are informational while we learn what this reports in practice: they
+# produce a warning, not a failure. A scanner that cannot run still fails, so a
+# broken scan cannot look clean. Set fail-on-findings to flip the gate on.
+
+on:
+  workflow_call:
+    inputs:
+      images:
+        description: Newline-separated image references to scan
+        required: false
+        type: string
+        default: ""
+      chart-ref:
+        description: |
+          Packaged Helm chart to scan, for example
+          oci://ghcr.io/nvidia/openshell/helm-chart:0.0.116
+        required: false
+        type: string
+        default: ""
+      severity:
+        description: Severities that fail the workflow
+        required: false
+        type: string
+        default: HIGH,CRITICAL
+      ignore-unfixed:
+        description: Ignore image vulnerabilities with no upstream fix
+        required: false
+        type: boolean
+        default: true
+      fail-on-findings:
+        description: Fail the run on findings instead of warning
+        required: false
+        type: boolean
+        default: false
+      upload-sarif:
+        description: Upload results to GitHub Code Scanning
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      CACHIX_AUTH_TOKEN:
+        description: Token used to write Nix build outputs to Cachix
+        required: false
+
+  workflow_dispatch:
+    inputs:
+      images:
+        description: Newline-separated image references to scan
+        required: false
+        type: string
+        default: ""
+      chart-ref:
+        description: Packaged Helm chart OCI reference to scan
+        required: false
+        type: string
+        default: ""
+      severity:
+        description: Severities that fail the workflow
+        required: false
+        type: string
+        default: HIGH,CRITICAL
+      ignore-unfixed:
+        description: Ignore image vulnerabilities with no upstream fix
+        required: false
+        type: boolean
+        default: true
+      fail-on-findings:
+        description: Fail the run on findings instead of warning
+        required: false
+        type: boolean
+        default: false
+      upload-sarif:
+        description: Upload results to GitHub Code Scanning
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: nix develop --command bash -euo pipefail {0}
+
+env:
+  TRIVY_SEVERITY: ${{ inputs.severity }}
+  TRIVY_REPORT_DIR: reports/trivy
+
+jobs:
+  image:
+    name: Image vulnerabilities (informational)
+    if: inputs.images != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Trivy reads ~/.docker/config.json, which `nix develop` leaves alone.
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Set up Nix
+        uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ github.event_name != 'pull_request' && secrets.CACHIX_AUTH_TOKEN || '' }}
+
+      - name: Scan images
+        id: scan
+        env:
+          IMAGES: ${{ inputs.images }}
+          TRIVY_IGNORE_UNFIXED: ${{ inputs.ignore-unfixed }}
+        run: |
+          mapfile -t refs < <(printf '%s\n' "$IMAGES" | sed '/^[[:space:]]*$/d')
+          tasks/scripts/trivy-scan.sh images "${refs[@]}"
+
+      - name: Upload SARIF to Code Scanning
+        if: ${{ !cancelled() && steps.scan.conclusion == 'success' && inputs.upload-sarif }}
+        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          sarif_file: reports/trivy
+          category: trivy-image
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-image-${{ github.run_id }}
+          path: reports/trivy
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # Separate from the scan so a tripped gate still publishes its reports.
+      - name: Report findings
+        if: ${{ !cancelled() && steps.scan.conclusion == 'success' }}
+        env:
+          FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+        run: |
+          set +e
+          tasks/scripts/trivy-scan.sh gate
+          status=$?
+          set -e
+          case "$status" in
+            0) echo "No findings at ${TRIVY_SEVERITY}." ;;
+            10)
+              if [ "$FAIL_ON_FINDINGS" = "true" ]; then
+                echo "::error::Image findings at ${TRIVY_SEVERITY}."
+                exit 1
+              fi
+              echo "::warning::Image findings at ${TRIVY_SEVERITY}; this check is informational."
+              ;;
+            *) echo "::error::Trivy could not evaluate the reports (exit $status)."; exit "$status" ;;
+          esac
+
+  config:
+    name: Configuration misconfigurations (informational)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # `helm pull` needs registry credentials only when a packaged chart is
+      # requested, but logging in unconditionally keeps the step list flat.
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Set up Nix
+        uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ github.event_name != 'pull_request' && secrets.CACHIX_AUTH_TOKEN || '' }}
+
+      - name: Scan configuration
+        id: scan
+        env:
+          CHART_REF: ${{ inputs.chart-ref }}
+        run: |
+          args=()
+          if [ -n "$CHART_REF" ]; then
+            args+=(--chart-ref "$CHART_REF")
+          fi
+          tasks/scripts/trivy-scan.sh config "${args[@]}"
+
+      - name: Upload SARIF to Code Scanning
+        if: ${{ !cancelled() && steps.scan.conclusion == 'success' && inputs.upload-sarif }}
+        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          sarif_file: reports/trivy
+          category: trivy-config
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-config-${{ github.run_id }}
+          path: reports/trivy
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Report findings
+        if: ${{ !cancelled() && steps.scan.conclusion == 'success' }}
+        env:
+          FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+        run: |
+          set +e
+          tasks/scripts/trivy-scan.sh gate
+          status=$?
+          set -e
+          case "$status" in
+            0) echo "No findings at ${TRIVY_SEVERITY}." ;;
+            10)
+              if [ "$FAIL_ON_FINDINGS" = "true" ]; then
+                echo "::error::Configuration findings at ${TRIVY_SEVERITY}."
+                exit 1
+              fi
+              echo "::warning::Configuration findings at ${TRIVY_SEVERITY}; this check is informational."
+              ;;
+            *) echo "::error::Trivy could not evaluate the reports (exit $status)."; exit "$status" ;;
+          esac
+
+  # Republishes whether the scans ran, not what they found, so a broken scanner
+  # cannot pass as healthy while findings stay informational.
+  result:
+    name: OpenShell / Trivy (informational)
+    needs: [image, config]
+    if: always()
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The image job is skipped when no references are passed, which
+      # check-job-results treats as a failure, so drop skipped jobs first.
+      - name: Drop skipped jobs
+        id: required
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          {
+            echo 'results<<EOF'
+            jq -c 'with_entries(select(.value.result != "skipped"))' <<<"$JOB_RESULTS"
+            echo EOF
+          } >>"$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/check-job-results
+        with:
+          results: ${{ steps.required.outputs.results }}
