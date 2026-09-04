@@ -12,3 +12,4 @@ pub mod proc_fd;
 pub mod seccomp_notify;
 pub mod socket_registry;
 pub mod task_memory;
+pub mod workload_launcher;

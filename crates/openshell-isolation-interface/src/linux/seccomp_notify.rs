@@ -39,6 +39,7 @@ const SECCOMP_DATA_ARGS_OFFSET: u32 = 16;
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
 const SECCOMP_ADDFD_FLAG_SEND: u32 = 1 << 1;
+const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
 
 const CONNECTED_SEND_FLAGS: u32 =
     (libc::MSG_DONTWAIT | libc::MSG_EOR | libc::MSG_MORE | libc::MSG_NOSIGNAL | libc::MSG_OOB)
@@ -181,6 +182,12 @@ pub struct NotificationListener {
 }
 
 impl NotificationListener {
+    /// Raw listener descriptor for readiness integration and diagnostics.
+    #[must_use]
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
     /// Whether the listener was installed with killable receive waits.
     #[must_use]
     pub fn wait_killable_recv(&self) -> bool {
@@ -254,6 +261,26 @@ impl NotificationListener {
         Ok(())
     }
 
+    /// Continue a verified local-kernel operation in the notifying task.
+    ///
+    /// Callers must not use this for an external INET operation or where a
+    /// mutable workload pointer is part of the authorization decision.
+    pub fn respond_continue(&self, id: u64) -> io::Result<()> {
+        self.validate_id(id)?;
+        let mut response = RawResponse {
+            id,
+            val: 0,
+            error: 0,
+            flags: SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+        };
+        ioctl_ptr(
+            self.fd.as_raw_fd(),
+            SECCOMP_IOCTL_NOTIF_SEND,
+            std::ptr::addr_of_mut!(response).cast(),
+        )?;
+        Ok(())
+    }
+
     /// Atomically inject `source` and complete the notifying syscall with the
     /// allocated target FD. The target receives `O_CLOEXEC` when requested.
     pub fn add_fd_and_send(
@@ -308,6 +335,29 @@ pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
         }
         Err(error) => Err(error),
     }
+}
+
+/// Install the capability-free workload networking listener on the calling
+/// launcher thread.
+///
+/// The filter mediates every syscall that can create, select, or materially
+/// reconfigure an INET endpoint. Connected `send()`/null-destination
+/// `sendto()` retains the audited cBPF fast path.
+pub fn install_workload_listener() -> io::Result<NotificationListener> {
+    install_listener(&[
+        libc::SYS_socket,
+        libc::SYS_connect,
+        libc::SYS_bind,
+        libc::SYS_listen,
+        libc::SYS_accept,
+        libc::SYS_accept4,
+        libc::SYS_sendto,
+        libc::SYS_sendmsg,
+        libc::SYS_sendmmsg,
+        libc::SYS_getpeername,
+        libc::SYS_getsockname,
+        libc::SYS_setsockopt,
+    ])
 }
 
 /// Run a no-capability conformance probe.
