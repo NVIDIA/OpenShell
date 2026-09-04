@@ -34,7 +34,7 @@ k8s-openapi = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
-socket2 = { workspace = true }
+socket2 = { workspace = true, features = ["all"] }
 nix = { workspace = true }
 
 # gRPC

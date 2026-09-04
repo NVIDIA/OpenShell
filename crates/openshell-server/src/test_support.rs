@@ -9,8 +9,8 @@ use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServ
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverSandbox, EnsureWorkspaceRequest,
-    EnsureWorkspaceResponse, GatewayListenerRequirement, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    EnsureWorkspaceResponse, GatewayExactBindAddressRequirement, GatewayListenerRequirement,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
     ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
     StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
@@ -142,7 +142,12 @@ impl FakeComputeDriver {
                 .gateway_listener_requirements
                 .push(GatewayListenerRequirement {
                     reason: reason.into(),
-                    selector: Some(Selector::ExactBindAddress(bind_address.into())),
+                    selector: Some(Selector::ExactBindAddress(
+                        GatewayExactBindAddressRequirement {
+                            address: bind_address.into(),
+                            allow_delayed_bind: false,
+                        },
+                    )),
                 });
         });
         self
