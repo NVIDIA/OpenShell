@@ -38,7 +38,7 @@ pub use compose::{
     is_provider_rule_name, provider_rule_name, strip_provider_rule_names,
 };
 pub use l7_validate::{
-    L7EndpointFields, L7Protocol, agent_authored_transport_rejection,
+    L7EndpointFields, L7Protocol, agent_authored_transport_rejection, validate_endpoint_modes,
     validate_explicit_tcp_additional_fields, validate_l7_endpoint_semantics,
 };
 pub use merge::{
@@ -1814,6 +1814,11 @@ fn validate_sandbox_policy_with_mcp_presence(
                     .unwrap_or(false),
             };
             let mut l7_errors = validate_l7_endpoint_semantics(&fields);
+            l7_errors.extend(validate_endpoint_modes(
+                &ep.tls,
+                &ep.enforcement,
+                &ep.access,
+            ));
             let mut explicit_tcp_fields = Vec::new();
             if !ep.enforcement.is_empty() {
                 explicit_tcp_fields.push("enforcement");
@@ -2405,6 +2410,36 @@ network_policies:
         assert_eq!(policy.version, 1);
         assert!(policy.network_policies.is_empty());
         assert!(policy.filesystem.is_none());
+    }
+
+    #[test]
+    fn validation_rejects_unknown_security_sensitive_endpoint_values() {
+        let policy = parse_sandbox_policy(
+            r"
+version: 1
+network_policies:
+  github_api:
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        tls: skp
+        enforcement: enforc
+        access: read-wirte
+",
+        )
+        .expect("the string-backed protobuf shape accepts syntactically valid YAML");
+
+        let violations = validate_sandbox_policy(&policy).expect_err("values must be rejected");
+        let message = violations
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(message.contains("unknown tls value 'skp'"));
+        assert!(message.contains("unknown enforcement value 'enforc'"));
+        assert!(message.contains("unknown access value 'read-wirte'"));
     }
 
     #[test]
