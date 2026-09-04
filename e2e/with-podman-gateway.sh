@@ -488,6 +488,11 @@ echo "Using Podman supervisor image: ${SUPERVISOR_RUNTIME_IMAGE} (ID ${SUPERVISO
 
 DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 SANDBOX_IMAGE_REQUEST="${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
+if [ "${OPENSHELL_E2E_REQUIRE_DIGEST_PINNED_SANDBOX_IMAGE:-0}" = "1" ] \
+   && ! [[ "${SANDBOX_IMAGE_REQUEST}" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]]; then
+  echo "ERROR: this e2e invocation requires a digest-pinned sandbox image: ${SANDBOX_IMAGE_REQUEST}" >&2
+  exit 2
+fi
 PODMAN_STOP_TIMEOUT_SECS="${OPENSHELL_E2E_PODMAN_STOP_TIMEOUT_SECS:-15}"
 if ! [[ "${PODMAN_STOP_TIMEOUT_SECS}" =~ ^[0-9]+$ ]]; then
   echo "ERROR: OPENSHELL_E2E_PODMAN_STOP_TIMEOUT_SECS must be a non-negative integer." >&2
@@ -508,6 +513,11 @@ SANDBOX_RUNTIME_IMAGE="${SANDBOX_IMAGE_REPOSITORY}@${SANDBOX_IMAGE_DIGEST}"
 if ! [[ "${SANDBOX_IMAGE_ID}" =~ ^[0-9a-f]{64}$ ]] \
    || ! [[ "${SANDBOX_RUNTIME_IMAGE}" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]]; then
   echo "ERROR: could not resolve an immutable sandbox image for ${SANDBOX_IMAGE_REQUEST}." >&2
+  exit 2
+fi
+if [ "${OPENSHELL_E2E_REQUIRE_DIGEST_PINNED_SANDBOX_IMAGE:-0}" = "1" ] \
+   && [ "${SANDBOX_IMAGE_REQUEST}" != "${SANDBOX_RUNTIME_IMAGE}" ]; then
+  echo "ERROR: sandbox image digest changed while resolving ${SANDBOX_IMAGE_REQUEST}." >&2
   exit 2
 fi
 echo "Using Podman sandbox image: ${SANDBOX_RUNTIME_IMAGE} (ID ${SANDBOX_IMAGE_ID}, digest ${SANDBOX_IMAGE_DIGEST})"

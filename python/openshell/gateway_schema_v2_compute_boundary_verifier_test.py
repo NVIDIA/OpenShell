@@ -114,7 +114,7 @@ socket_path = "/tmp/{variant}.sock"
             "supervisor_base_image_id": IMAGE_ID,
             "supervisor_base_image_digest": IMAGE_DIGEST,
             "supervisor_package_manifest_sha256": package_hash,
-            "sandbox_image_request": "example.invalid/sandbox:fixture",
+            "sandbox_image_request": "example.invalid/sandbox@" + IMAGE_DIGEST,
             "sandbox_image_id": IMAGE_ID,
             "sandbox_image_digest": IMAGE_DIGEST,
             "sandbox_runtime_image": "example.invalid/sandbox@" + IMAGE_DIGEST,
@@ -160,6 +160,67 @@ def test_verifier_recomputes_retained_artifact_hashes(tmp_path: Path) -> None:
         "mutated after execution", encoding="utf-8"
     )
     with pytest.raises(ValueError, match="retained artifact hash mismatch"):
+        verifier.verify_topology(
+            tmp_path, BASELINE_SHA, CANDIDATE_SHA, "external-driver"
+        )
+
+
+def test_verifier_rejects_mutable_sandbox_request(tmp_path: Path) -> None:
+    verifier = load_verifier()
+    create_external_bundle(verifier, tmp_path)
+    launch_path = tmp_path / "candidate.launch.json"
+    launch = json.loads(launch_path.read_text(encoding="utf-8"))
+    launch["sandbox_image_request"] = "example.invalid/sandbox:latest"
+    write_json(launch_path, launch)
+
+    with pytest.raises(
+        ValueError, match="request was not the resolved digest reference"
+    ):
+        verifier.verify_topology(
+            tmp_path, BASELINE_SHA, CANDIDATE_SHA, "external-driver"
+        )
+
+
+def test_verifier_rejects_different_sandbox_artifacts(tmp_path: Path) -> None:
+    verifier = load_verifier()
+    create_external_bundle(verifier, tmp_path)
+    launch_path = tmp_path / "candidate.launch.json"
+    launch = json.loads(launch_path.read_text(encoding="utf-8"))
+    other_id = "5" * 64
+    other_digest = f"sha256:{'6' * 64}"
+    other_runtime = f"example.invalid/sandbox@{other_digest}"
+    launch.update(
+        {
+            "sandbox_image_request": other_runtime,
+            "sandbox_image_id": other_id,
+            "sandbox_image_digest": other_digest,
+            "sandbox_runtime_image": other_runtime,
+        }
+    )
+    write_json(launch_path, launch)
+    with (tmp_path / "candidate.log").open("a", encoding="utf-8") as log:
+        log.write(f"{other_id} {other_digest} {other_runtime}\n")
+
+    with pytest.raises(ValueError, match="sandbox image ID differ"):
+        verifier.verify_topology(
+            tmp_path, BASELINE_SHA, CANDIDATE_SHA, "external-driver"
+        )
+
+
+def test_verifier_rejects_different_supervisor_packages(tmp_path: Path) -> None:
+    verifier = load_verifier()
+    create_external_bundle(verifier, tmp_path)
+    package_path = tmp_path / "artifacts/candidate/supervisor.packages.txt"
+    package_path.write_text("fixture-package-2.0-r0\n", encoding="utf-8")
+    package_hash = verifier.sha256(package_path)
+    launch_path = tmp_path / "candidate.launch.json"
+    launch = json.loads(launch_path.read_text(encoding="utf-8"))
+    launch["supervisor_package_manifest_sha256"] = package_hash
+    write_json(launch_path, launch)
+    with (tmp_path / "candidate.log").open("a", encoding="utf-8") as log:
+        log.write(f"{package_hash}\n")
+
+    with pytest.raises(ValueError, match="supervisor package manifest differ"):
         verifier.verify_topology(
             tmp_path, BASELINE_SHA, CANDIDATE_SHA, "external-driver"
         )

@@ -227,6 +227,7 @@ def verify_variant(
         f"{launch_path}: runtime reference digest mismatch",
     )
 
+    sandbox_request = launch.get("sandbox_image_request")
     sandbox_id = launch.get("sandbox_image_id")
     sandbox_digest = launch.get("sandbox_image_digest")
     sandbox_runtime = launch.get("sandbox_runtime_image")
@@ -248,6 +249,10 @@ def verify_variant(
         sandbox_match is not None
         and f"sha256:{sandbox_match.group(1)}" == sandbox_digest,
         f"{launch_path}: sandbox runtime image is not digest-pinned",
+    )
+    require(
+        sandbox_request == sandbox_runtime,
+        f"{launch_path}: sandbox image request was not the resolved digest reference",
     )
     if not external:
         require(
@@ -351,6 +356,21 @@ def verify_topology(
 
     baseline = verify_variant(results_dir, "baseline", baseline_sha, 1, scenario)
     candidate = verify_variant(results_dir, "candidate", candidate_sha, 2, scenario)
+    baseline_launch = baseline["launch_attestation"]
+    candidate_launch = candidate["launch_attestation"]
+    for field, label in (
+        ("sandbox_image_id", "sandbox image ID"),
+        ("sandbox_image_digest", "sandbox image digest"),
+        ("sandbox_runtime_image", "sandbox runtime image"),
+        ("supervisor_base_image", "supervisor base image"),
+        ("supervisor_base_image_id", "supervisor base-image ID"),
+        ("supervisor_base_image_digest", "supervisor base-image digest"),
+        ("supervisor_package_manifest_sha256", "supervisor package manifest"),
+    ):
+        require(
+            baseline_launch.get(field) == candidate_launch.get(field),
+            f"baseline and candidate {label} differ",
+        )
     if scenario == "external-driver":
         baseline_driver = results_dir / "artifacts/baseline/external-driver"
         candidate_driver = results_dir / "artifacts/candidate/external-driver"
@@ -432,6 +452,8 @@ def main() -> None:
             "retained_artifact_hashes_recomputed": True,
             "raw_lifecycle_output_inspected": True,
             "digest_pinned_supervisor_runtime_verified": True,
+            "same_immutable_sandbox_verified": True,
+            "supervisor_dependency_provenance_matched": True,
         },
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
