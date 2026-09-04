@@ -2723,6 +2723,7 @@ mod tests {
                 run_as_user: "sandbox".to_string(),
                 run_as_group: "sandbox".to_string(),
             }),
+            ui: None,
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         }
@@ -3820,6 +3821,7 @@ process:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            ui: None,
         };
         let engine = OpaEngine::from_proto_with_pid_and_binary_identity_required(&proto, 0, false)
             .expect("engine from relaxed proto");
@@ -4358,6 +4360,7 @@ network_policies:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            ui: None,
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -4429,6 +4432,7 @@ network_policies:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            ui: None,
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -4505,6 +4509,7 @@ network_policies:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            ui: None,
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -5990,6 +5995,7 @@ network_policies:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            ui: None,
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -6047,6 +6053,7 @@ network_policies:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            ui: None,
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -6105,6 +6112,7 @@ network_policies:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            ui: None,
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -6165,6 +6173,7 @@ network_policies:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            ui: None,
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -6224,6 +6233,7 @@ network_policies:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            ui: None,
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -7616,6 +7626,7 @@ network_policies:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            ui: None,
         };
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
         let input = NetworkInput {
@@ -7686,6 +7697,7 @@ network_policies:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            ui: None,
         };
         let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
 
@@ -7916,6 +7928,7 @@ network_policies:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            ui: None,
         };
         let engine = OpaEngine::from_proto(&proto).unwrap();
         // Port 443
@@ -8884,6 +8897,7 @@ network_policies:
             process: None,
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            ui: None,
         };
 
         let pid = std::process::id(); // accessible root, leaf paths absent
@@ -9520,6 +9534,7 @@ network_policies:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            ui: None,
         };
 
         // Build engine with our PID (symlink resolution will work via /proc/self/root/)
@@ -9595,6 +9610,7 @@ network_policies:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            ui: None,
         };
 
         // Initial load at pid=0 — no symlink expansion

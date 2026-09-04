@@ -11,7 +11,9 @@
 
 use std::net::SocketAddr;
 
-use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule, SandboxPolicy};
+use openshell_core::proto::{
+    NetworkEndpoint, NetworkPolicyRule, SandboxPolicy, UiClipboardAccess, UiPolicy,
+};
 use serde_json::{Value, json};
 
 use super::config::{
@@ -222,12 +224,10 @@ fn build_split_mxc_config(
         "process": process,
         "filesystem": filesystem,
         "network": network,
-        "ui": {
-            "disable": true,
-            "clipboard": "none",
-            "injection": false,
-        },
     });
+    if let Some(ui) = map_ui(policy.ui.as_ref(), &opts.containment, items) {
+        config["ui"] = ui;
+    }
 
     // No network hosts, so backend-specific network blocks (processContainer
     // internetClient, etc.) are not added — correct for the proxy path.
@@ -275,16 +275,87 @@ fn build_mxc_config(
         "process": process,
         "filesystem": filesystem,
         "network": network,
-        "ui": {
-            "disable": true,
-            "clipboard": "none",
-            "injection": false,
-        },
     });
+    if let Some(ui) = map_ui(policy.ui.as_ref(), &opts.containment, items) {
+        config["ui"] = ui;
+    }
 
     add_backend_specific_config(&mut config, &opts.containment, &allowed_hosts, items);
     add_static_policy_loss(policy, opts, items);
     config
+}
+
+fn map_ui(ui: Option<&UiPolicy>, containment: &str, items: &mut Vec<LossItem>) -> Option<Value> {
+    let restrictive = || {
+        json!({
+            "disable": true,
+            "clipboard": "none",
+            "injection": false,
+        })
+    };
+
+    match containment {
+        "processcontainer" | "process" => {
+            let Some(ui) = ui else {
+                // Preserve the mapper's existing deny posture for policies
+                // authored before the optional OpenShell UI section existed.
+                return Some(restrictive());
+            };
+            let clipboard = match UiClipboardAccess::try_from(ui.clipboard) {
+                Ok(UiClipboardAccess::Unspecified | UiClipboardAccess::None) => "none",
+                Ok(UiClipboardAccess::Read) => "read",
+                Ok(UiClipboardAccess::Write) => "write",
+                Ok(UiClipboardAccess::All) => "all",
+                Err(_) => {
+                    add_loss(
+                        items,
+                        "ui.clipboard",
+                        "error",
+                        &format!(
+                            "OpenShell UI clipboard policy has unknown enum value {}.",
+                            ui.clipboard
+                        ),
+                        "directional clipboard access",
+                        "MXC receives the restrictive clipboard=none fallback; sandbox creation is rejected.",
+                    );
+                    "none"
+                }
+            };
+            Some(json!({
+                "disable": !ui.allow_graphical_ui,
+                "clipboard": clipboard,
+                "injection": ui.allow_input_injection,
+            }))
+        }
+        "isolation_session" => {
+            if ui.is_some() {
+                add_loss(
+                    items,
+                    "ui",
+                    "error",
+                    "MXC isolation_session rejects every explicitly supplied top-level UI policy, including an empty or deny-only policy.",
+                    "OpenShell UI policy",
+                    "The UI block is omitted and sandbox creation is rejected before wxc-exec is invoked.",
+                );
+            }
+            None
+        }
+        _ => {
+            if ui.is_some() {
+                add_loss(
+                    items,
+                    "ui",
+                    "error",
+                    &format!(
+                        "OpenShell UI policy enforcement is not supported by the MXC `{containment}` mapping target."
+                    ),
+                    "OpenShell UI policy",
+                    "The generated config remains at the mapper's restrictive UI defaults and the caller must reject the mapping.",
+                );
+            }
+            Some(restrictive())
+        }
+    }
 }
 
 fn map_filesystem(

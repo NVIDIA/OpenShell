@@ -19,6 +19,7 @@ readiness; there is no in-sandbox supervisor or `ConnectSupervisor` relay.
 | Capability | MXC driver | Closing it requires |
 |---|---|---|
 | Filesystem policy (read-write / read-only grants) | ✅ provision-time AppContainer shares | — |
+| UI policy | `process_container` advertises complete support and maps portable graphical UI, clipboard-direction, and input-injection controls to MXC; omitted fields inside an explicit section deny. `isolation_session` advertises no support, so the gateway rejects any explicit section before provisioning. | MXC support for persistent sessions |
 | Governed egress (CONNECT proxy + OPA + L7) | Available behind `egress_proxy` on `process_container`; the driver starts a per-sandbox host CONNECT proxy, generates HTTPS MITM trust material, and injects the CA bundle into the sandbox process env | Gateway event-bus wiring follow-on |
 | Network policy | Split into MXC `network.proxy` + trimmed OpenShell policy on `process_container`; `isolation_session` still rejects network config | MXC feedback item M1 for persistent sessions |
 | Network middleware | ❌ rejected before launch because the MXC host proxy does not receive the gateway middleware registry | Gateway middleware-registry injection |
@@ -141,9 +142,19 @@ environment. The development export surface remains the
 [`policy-to-mxc`](examples/policy-to-mxc.rs) example; there is no production
 `openshell policy export-mxc` subcommand yet.
 
+The mapper normalizes filesystem paths to Windows form and does not add
+gateway-configured host paths. The policy supplied for the sandbox is the only
+source of filesystem grants. For `process_container`, the driver advertises
+`supports_ui_policy = true` and emits the top-level `ui` object shared by MXC's
+0.8 stable and 0.9 development schemas, with restrictive defaults or the exact
+requested clipboard direction, graphical UI setting, and input-injection
+setting. `isolation_session` advertises false, so the gateway rejects explicit
+UI policy before the driver RPC; the mapper also rejects it before lifecycle
+side effects as defense in depth.
+
 If governed egress is disabled, any network rule fails closed rather than launching without an enforcement path.
 
-Parity and matrix tests under [`tests/`](tests/) cover the mapper on the Windows MSVC lane. The driver performs this mapping automatically; there is no separate policy-export command or example.
+Parity and matrix tests under [`tests/`](tests/) cover the mapper on the Windows MSVC lane. The real-MXC lane also dry-runs every clipboard direction against the installed schema. The driver performs this mapping automatically; there is no separate policy-export command or example.
 
 ## Packaging the demo for the demo box
 
@@ -163,6 +174,7 @@ exits 0 rather than failing.
 | Task | What it runs | When to use |
 |---|---|---|
 | `windows:test:mxc-real:x64` | `tests/wxc_exec_real.rs` — Tier-2 invoker tests with `--ignored --test-threads=1`, including an HTTPS request through the host proxy | Pre-merge on any Windows host that has `wxc-exec`; dry-run tests always pass; enforcement tests probe-gate themselves |
+| `windows:test:mxc-real:arm64` | Native ARM64 `tests/wxc_exec_real.rs` with the same contract | Pre-merge on an ARM64 Windows host with `wxc-exec` |
 | `windows:e2e:mxc` | `examples/run-mxc-e2e.ps1` — Tier-3 scenario runner, real binary, probe-gated | Demo box / nightly; needs the gateway + CLI binaries in the script directory |
 | `windows:e2e:mxc:mock` | Same runner with `-Mock` — wiring-only, no real `wxc-exec` needed | Any Windows host (CI, dev machine); validates wiring and the network-reject scenario |
 

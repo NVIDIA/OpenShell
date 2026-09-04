@@ -11,7 +11,7 @@ Generate YAML sandbox network policies and network middleware configuration from
 
 This skill translates a user's plain-language policy intent into a valid sandbox policy. The amount of detail the user provides determines the granularity of the generated policy — from broad L4 or preset-based policies (just a host:port) up to fine-grained per-endpoint L7 rules (full API docs).
 
-The output is a `network_policies` YAML block, an optional `network_middlewares` block, and optionally a full policy file that conforms to the sandbox policy schema.
+The output is a `network_policies` YAML block, an optional `network_middlewares` block, an optional static `ui` block when explicitly requested, and optionally a full policy file that conforms to the sandbox policy schema.
 
 ## Step 1: Gather Inputs
 
@@ -168,6 +168,7 @@ Key sections to reference:
 - **Private IP Access via `allowed_ips`** — CIDR allowlist for private IP space
 - **Network Middleware** - top-level middleware configs, ordering, host selection, and failure behavior
 - **Validation Rules** — what combinations are valid/invalid
+- **UI** — static, portable capabilities and runtime support boundaries
 
 When middleware is requested, also read the published [supervisor middleware guide](https://docs.nvidia.com/openshell/latest/extensibility/supervisor-middleware.md).
 
@@ -256,6 +257,28 @@ rules:
 Use the most specific pattern that covers the intent. Prefer narrow globs over `**` when the API structure is known.
 
 ## Step 5: Generate the Policy
+
+### UI Policy
+
+Emit `ui` only when the user explicitly requests a graphical surface,
+clipboard access, or synthetic input. Choose the narrowest capability and keep
+unrequested fields omitted so they remain deny by default:
+
+```yaml
+ui:
+  allow_graphical_ui: true
+  clipboard: read # none | read | write | all
+  allow_input_injection: false
+```
+
+Treat clipboard direction from the sandbox's perspective. Warn that UI is a
+static sandbox-creation control. It is currently enforceable only by the MXC
+driver's OpenShell `process_container` backend, which emits MXC's
+`processcontainer` containment value and advertises complete support. MXC
+`isolation_session` and non-Windows drivers advertise no support, so the gateway
+rejects any explicit UI section, including `{}`, before provisioning. Omit the
+section rather than emitting deny-only UI for those drivers; omission preserves
+their existing behavior.
 
 ### Output Format
 
@@ -381,6 +404,7 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 - [ ] No fail-closed middleware selector can cover a `tls: skip` endpoint
 - [ ] Any required WebSocket control advertises `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`, and the user understands that V1 does not inspect binary messages
 - [ ] Endpoints contributed by a credentialed provider are not L4-only or `tls: skip` unless `allow_uninspected_credentials: true` explicitly records the exception
+- [ ] An explicit `ui` section targets a configured driver/backend that advertises complete UI-policy support
 
 ### Schema Warnings (log-only, but should be fixed)
 
@@ -443,7 +467,7 @@ The policy needs to go somewhere. Determine which mode applies:
 
 1. **Read the existing file** to understand current state:
    - What policies already exist under `network_policies`
-   - What the `filesystem_policy`, `landlock`, and `process` sections look like
+   - What the `filesystem_policy`, `landlock`, `process`, and `ui` sections look like
    - Whether the file uses compact (`{ host: ..., port: ... }`) or expanded YAML style
 
 2. **Check for conflicts**:
@@ -462,7 +486,7 @@ The policy needs to go somewhere. Determine which mode applies:
    - **Modifying an existing policy**: Edit the specific policy in place — add/remove endpoints, change access presets, update rules, add binaries, etc. A rule authorizes every binary it lists to reach every endpoint and port it lists, so adding one binary grants it all of that rule's endpoints, and adding one endpoint grants it to all of that rule's binaries. State the resulting pairs to the user before writing them. When the user wants a binary to reach only part of a rule's endpoints, put that binary and those endpoints in a separate rule instead of extending the existing one. An empty `binaries` list means any binary, so leaving it off widens the rule to every process.
    - **Removing a policy**: Delete the policy block if the user asks.
 
-4. **Preserve everything else**: Do not modify `filesystem_policy`, `landlock`, `process`, or other policies unless the user explicitly asks.
+4. **Preserve everything else**: Do not modify `filesystem_policy`, `landlock`, `process`, `ui`, or other policies unless the user explicitly asks.
 
 ### Mode B: Create a New Policy File
 
