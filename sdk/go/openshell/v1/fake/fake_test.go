@@ -38,7 +38,7 @@ func TestFakeClient_Sandboxes_AfterClose(t *testing.T) {
 
 	_ = fc.Close()
 
-	_, err := fc.Sandboxes().Create(ctx, "default", "test", &types.SandboxSpec{}, nil)
+	_, err := fc.Sandboxes().Create(ctx, "default", "test", types.CreateSandboxParams{})
 	require.Error(t, err)
 	assert.True(t, types.IsUnavailable(err))
 }

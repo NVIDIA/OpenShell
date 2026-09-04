@@ -12,6 +12,9 @@ import (
 // Sandbox represents a sandbox instance.
 type Sandbox = types.Sandbox
 
+// CreateSandboxParams bundles the optional parameters for creating a sandbox.
+type CreateSandboxParams = types.CreateSandboxParams
+
 // SandboxSpec holds the desired state of a sandbox.
 type SandboxSpec = types.SandboxSpec
 
@@ -53,7 +56,7 @@ var WithLogMinLevel = types.WithLogMinLevel
 
 // SandboxInterface defines lifecycle operations on sandboxes.
 type SandboxInterface interface {
-	Create(ctx context.Context, workspace, name string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
+	Create(ctx context.Context, workspace, name string, params CreateSandboxParams, opts ...CreateOptions) (*Sandbox, error)
 	Get(ctx context.Context, workspace, name string) (*Sandbox, error)
 	List(ctx context.Context, workspace string, opts ...ListOptions) ([]*Sandbox, error)
 	Stop(ctx context.Context, workspace, name string) (*Sandbox, error)

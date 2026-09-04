@@ -134,7 +134,7 @@ type mockSandboxResolver struct {
 	err       error
 }
 
-func (m *mockSandboxResolver) Create(_ context.Context, _, _ string, _ *SandboxSpec, _ map[string]string, _ ...CreateOptions) (*Sandbox, error) {
+func (m *mockSandboxResolver) Create(_ context.Context, _, _ string, _ CreateSandboxParams, _ ...CreateOptions) (*Sandbox, error) {
 	return nil, nil
 }
 

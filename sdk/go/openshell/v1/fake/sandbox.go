@@ -274,11 +274,12 @@ func newFakeSandboxClient(
 }
 
 // Create creates a new sandbox with Provisioning phase.
-func (c *fakeSandboxClient) Create(_ context.Context, workspace, name string, spec *types.SandboxSpec, labels map[string]string, opts ...types.CreateOptions) (*types.Sandbox, error) {
+func (c *fakeSandboxClient) Create(_ context.Context, workspace, name string, params types.CreateSandboxParams, opts ...types.CreateOptions) (*types.Sandbox, error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
 
+	spec := params.Spec
 	if spec == nil {
 		spec = &types.SandboxSpec{}
 	}
@@ -292,7 +293,7 @@ func (c *fakeSandboxClient) Create(_ context.Context, workspace, name string, sp
 		Name:            name,
 		Workspace:       workspace,
 		CreatedAt:       time.Now(),
-		Labels:          copyStringMap(labels),
+		Labels:          copyStringMap(params.Labels),
 		Annotations:     annotations,
 		ResourceVersion: 1,
 		Spec:            copySandboxSpec(*spec),

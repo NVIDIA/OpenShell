@@ -25,8 +25,8 @@ func newSandboxClient(conn grpc.ClientConnInterface) *sandboxClient {
 	return &sandboxClient{client: pb.NewOpenShellClient(conn)}
 }
 
-func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error) {
-	protoSpec, err := converter.SandboxSpecToProtoChecked(spec)
+func (s *sandboxClient) Create(ctx context.Context, workspace, name string, params CreateSandboxParams, opts ...CreateOptions) (*Sandbox, error) {
+	protoSpec, labels, err := converter.CreateSandboxParamsToProto(&params)
 	if err != nil {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: err.Error()}
 	}

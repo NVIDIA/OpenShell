@@ -50,9 +50,11 @@ func TestIntegration_SandboxExecSmoke(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	_, err = client.Sandboxes().Create(ctx, "default", name, &SandboxSpec{
-		Template: &SandboxTemplate{Image: image},
-	}, nil)
+	_, err = client.Sandboxes().Create(ctx, "default", name, CreateSandboxParams{
+		Spec: &SandboxSpec{
+			Template: &SandboxTemplate{Image: image},
+		},
+	})
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Minute)

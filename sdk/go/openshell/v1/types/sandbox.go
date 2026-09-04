@@ -19,6 +19,13 @@ type Sandbox struct {
 	Status            SandboxStatus
 }
 
+// CreateSandboxParams bundles the optional parameters for creating a sandbox.
+// Use a value (not pointer) so the zero value is a valid empty configuration.
+type CreateSandboxParams struct {
+	Spec   *SandboxSpec
+	Labels map[string]string
+}
+
 // SandboxSpec holds the desired state of a sandbox.
 type SandboxSpec struct {
 	LogLevel    string

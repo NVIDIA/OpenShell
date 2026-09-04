@@ -223,6 +223,19 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 	return result
 }
 
+// CreateSandboxParamsToProto converts CreateSandboxParams fields into the
+// proto spec and labels used by CreateSandboxRequest.
+func CreateSandboxParamsToProto(params *types.CreateSandboxParams) (*pb.SandboxSpec, map[string]string, error) {
+	if params == nil {
+		return nil, nil, nil
+	}
+	spec, err := SandboxSpecToProtoChecked(params.Spec)
+	if err != nil {
+		return nil, nil, err
+	}
+	return spec, CopyStringMap(params.Labels), nil
+}
+
 // SandboxSpecToProtoChecked converts an SDK SandboxSpec and reports values
 // that protobuf Struct cannot represent instead of silently dropping them.
 func SandboxSpecToProtoChecked(spec *types.SandboxSpec) (*pb.SandboxSpec, error) {

@@ -255,7 +255,7 @@ func TestSandboxCreate(t *testing.T) {
 	}
 	labels := map[string]string{"env": "dev"}
 
-	result, err := client.Create(context.Background(), "default", "my-sandbox", spec, labels)
+	result, err := client.Create(context.Background(), "default", "my-sandbox", CreateSandboxParams{Spec: spec, Labels: labels})
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -270,9 +270,11 @@ func TestSandboxCreate_RejectsUnrepresentableResourcesBeforeRPC(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	_, err := client.Create(context.Background(), "default", "bad", &SandboxSpec{
-		Template: &SandboxTemplate{Resources: map[string]any{"invalid": make(chan int)}},
-	}, nil)
+	_, err := client.Create(context.Background(), "default", "bad", CreateSandboxParams{
+		Spec: &SandboxSpec{
+			Template: &SandboxTemplate{Resources: map[string]any{"invalid": make(chan int)}},
+		},
+	})
 	require.Error(t, err)
 	assert.True(t, IsInvalidArgument(err))
 	mock.mu.Lock()
@@ -286,7 +288,7 @@ func TestSandboxCreate_AlreadyExists(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	_, err := client.Create(context.Background(), "default", "dup", &SandboxSpec{}, nil)
+	_, err := client.Create(context.Background(), "default", "dup", CreateSandboxParams{})
 
 	require.Error(t, err)
 	assert.True(t, IsAlreadyExists(err))

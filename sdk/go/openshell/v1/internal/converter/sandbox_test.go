@@ -445,5 +445,61 @@ func TestSandboxSpecToProto_Nil(t *testing.T) {
 	assert.Nil(t, p)
 }
 
+func TestCreateSandboxParamsToProto_Nil(t *testing.T) {
+	spec, labels, err := CreateSandboxParamsToProto(nil)
+	assert.NoError(t, err)
+	assert.Nil(t, spec)
+	assert.Nil(t, labels)
+}
+
+func TestCreateSandboxParamsToProto_Empty(t *testing.T) {
+	params := &v1.CreateSandboxParams{}
+	spec, labels, err := CreateSandboxParamsToProto(params)
+	assert.NoError(t, err)
+	assert.Nil(t, spec)
+	assert.Nil(t, labels)
+}
+
+func TestCreateSandboxParamsToProto_SpecOnly(t *testing.T) {
+	params := &v1.CreateSandboxParams{
+		Spec: &v1.SandboxSpec{
+			LogLevel: "debug",
+		},
+	}
+	spec, labels, err := CreateSandboxParamsToProto(params)
+	assert.NoError(t, err)
+	assert.NotNil(t, spec)
+	assert.Equal(t, "debug", spec.LogLevel)
+	assert.Nil(t, labels)
+}
+
+func TestCreateSandboxParamsToProto_LabelsOnly(t *testing.T) {
+	params := &v1.CreateSandboxParams{
+		Labels: map[string]string{"env": "test"},
+	}
+	spec, labels, err := CreateSandboxParamsToProto(params)
+	assert.NoError(t, err)
+	assert.Nil(t, spec)
+	assert.Equal(t, map[string]string{"env": "test"}, labels)
+}
+
+func TestCreateSandboxParamsToProto_FullyPopulated(t *testing.T) {
+	params := &v1.CreateSandboxParams{
+		Spec: &v1.SandboxSpec{
+			LogLevel:  "info",
+			Providers: []string{"openai"},
+			Template:  &v1.SandboxTemplate{Image: "python:3.12"},
+		},
+		Labels: map[string]string{"team": "sdk"},
+	}
+	spec, labels, err := CreateSandboxParamsToProto(params)
+	assert.NoError(t, err)
+	assert.NotNil(t, spec)
+	assert.Equal(t, "info", spec.LogLevel)
+	assert.Equal(t, []string{"openai"}, spec.Providers)
+	assert.Equal(t, "python:3.12", spec.Template.GetImage())
+	assert.Equal(t, map[string]string{"team": "sdk"}, labels)
+}
+
 // Verify proto import is used (suppress unused import warning).
 var _ = proto.Marshal

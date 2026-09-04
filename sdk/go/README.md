@@ -52,9 +52,11 @@ if err != nil {
 defer client.Close()
 
 // Create a sandbox and wait until it's ready
-sandbox, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{
-    Template: &v1.SandboxTemplate{Image: "python:3.12"},
-}, nil)
+sandbox, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", v1.CreateSandboxParams{
+    Spec: &v1.SandboxSpec{
+        Template: &v1.SandboxTemplate{Image: "python:3.12"},
+    },
+})
 if err != nil {
     log.Fatal(err)
 }
