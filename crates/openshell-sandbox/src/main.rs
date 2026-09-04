@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
 use openshell_ocsf::{OcsfJsonlLayer, OcsfShorthandLayer};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
@@ -577,7 +577,7 @@ fn main() -> Result<()> {
         .build()
         .into_diagnostic()?;
 
-    let exit_code = runtime.block_on(async move {
+    let result = runtime.block_on(async move {
         // Install rustls crypto provider before any TLS connections (including log push).
         let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -725,7 +725,21 @@ fn main() -> Result<()> {
             upstream_proxy_args,
         )
         .await
-    })?;
+    });
+
+    let exit_code = match result {
+        Ok(exit_code) => exit_code,
+        Err(error)
+            if error
+                .to_string()
+                .contains("image workspace validation failed") =>
+        {
+            error!(%error, "Image workspace validation failed");
+            eprintln!("{error:?}");
+            openshell_core::driver_utils::SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED
+        }
+        Err(error) => return Err(error),
+    };
 
     std::process::exit(exit_code);
 }

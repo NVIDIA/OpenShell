@@ -3763,16 +3763,13 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 name = "openshell-bootstrap"
 version = "0.0.0"
 dependencies = [
- "bollard",
  "bytes",
- "futures",
  "miette",
  "openshell-core",
  "rcgen",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "tar",
  "tempfile",
  "tokio",
  "tracing",

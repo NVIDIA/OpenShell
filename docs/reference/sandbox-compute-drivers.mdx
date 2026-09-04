@@ -166,7 +166,7 @@ to `0.0.0.0` solely to make sandbox callbacks reachable.
 
 [Docker](https://www.docker.com/get-started/)-backed sandboxes run as containers on the gateway host. Use Docker for local development, single-machine gateways, and hosts that already use Docker Desktop or Docker Engine.
 
-The gateway talks to the Docker daemon to create sandbox containers. Docker is also required for local image builds from directories or Dockerfiles.
+The gateway talks to the Docker daemon to create sandbox containers.
 
 Docker Desktop and compatible macOS runtimes route `host.openshell.internal`
 through an IPv4 host-gateway alias. The gateway reuses an IPv4 primary listener

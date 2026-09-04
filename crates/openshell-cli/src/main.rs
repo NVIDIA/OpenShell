@@ -1363,18 +1363,17 @@ enum SandboxCommands {
         #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs"])]
         template: Option<String>,
 
-        /// Sandbox source: a community sandbox name (e.g., `ollama`), a path
-        /// to a Dockerfile or directory containing one, a rootfs tar archive
-        /// (`.tar`, `.tar.gz`, or `.tgz`), or a full container image reference
-        /// (e.g., `myregistry.com/img:tag`).
+        /// Sandbox source: a community sandbox name (e.g., `ollama`), a rootfs
+        /// tar archive (`.tar`, `.tar.gz`, or `.tgz`), or a full container
+        /// image reference (e.g., `myregistry.com/img:tag`).
         ///
         /// Community names are resolved to
         /// `ghcr.io/nvidia/openshell-community/sandboxes/<name>:latest`
         /// (override the prefix with `OPENSHELL_COMMUNITY_REGISTRY`).
         ///
-        /// When given a Dockerfile or directory, the image is built into the
-        /// local Docker daemon before creating the sandbox. When given a
-        /// rootfs tar, it is passed directly to the VM compute driver.
+        /// To use a local Dockerfile, build and tag it with the container
+        /// engine used by your local gateway, then pass the resulting image
+        /// reference here. A rootfs tar is staged for the VM compute driver.
         #[arg(long, value_hint = ValueHint::AnyPath)]
         from: Option<String>,
 
@@ -4240,11 +4239,6 @@ mod tests {
                 "Dockerfile",
             ),
             (
-                vec!["openshell", "sandbox", "create", "--from", "Do"],
-                4,
-                "Dockerfile",
-            ),
-            (
                 vec![
                     "openshell",
                     "sandbox",
@@ -4469,20 +4463,12 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_create_and_download_use_path_value_hints() {
+    fn sandbox_download_uses_path_value_hint() {
         let cmd = Cli::command();
         let sandbox = cmd
             .get_subcommands()
             .find(|c| c.get_name() == "sandbox")
             .expect("missing sandbox subcommand");
-        let create = sandbox
-            .get_subcommands()
-            .find(|c| c.get_name() == "create")
-            .expect("missing create subcommand");
-        let from = create
-            .get_arguments()
-            .find(|arg| arg.get_id() == "from")
-            .expect("missing from argument");
         let download = sandbox
             .get_subcommands()
             .find(|c| c.get_name() == "download")
@@ -4492,7 +4478,6 @@ mod tests {
             .find(|arg| arg.get_id() == "dest")
             .expect("missing dest argument");
 
-        assert_eq!(from.get_value_hint(), ValueHint::AnyPath);
         assert_eq!(dest.get_value_hint(), ValueHint::AnyPath);
     }
 

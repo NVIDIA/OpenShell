@@ -196,13 +196,19 @@ The TUI gives you a live, keyboard-driven view of your gateway and sandboxes. Na
 
 ## Community Sandboxes and BYOC
 
-Use `--from` to create sandboxes from the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog, a local directory, or a container image:
+Use `--from` to create sandboxes from the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog or a container image:
 
 ```bash
 openshell sandbox create --from gemini             # community catalog
-openshell sandbox create --from ./my-sandbox-dir   # local Dockerfile
+docker build -t my-sandbox:latest ./my-sandbox-dir # Docker gateway
+openshell sandbox create --from my-sandbox:latest  # Docker built image
+podman build -t localhost/my-sandbox:latest ./my-sandbox-dir # Podman gateway
+openshell sandbox create --from localhost/my-sandbox:latest  # Podman built image
 openshell sandbox create --from registry.io/img:v1 # container image
 ```
+
+Build with the container engine used by your local gateway. For a remote
+gateway, push the image to a registry that the gateway can pull from.
 
 See the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog and the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for details.
 

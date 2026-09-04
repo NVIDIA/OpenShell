@@ -24,8 +24,9 @@ use futures::{Stream, StreamExt};
 use openshell_core::config::{DEFAULT_SANDBOX_PIDS_LIMIT, DEFAULT_STOP_TIMEOUT_SECS};
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
-    CONDITION_EXITED, CONDITION_RUNTIME_RESTART, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
-    LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE,
+    CONDITION_EXITED, CONDITION_RUNTIME_RESTART, CONDITION_WORKSPACE_VALIDATION_FAILED,
+    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
+    LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE, SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED,
     SUPERVISOR_IMAGE_BINARY_PATH, extract_first_tar_entry, supervisor_image_should_refresh,
     temp_extract_container_name, validate_linux_elf_binary, write_cache_binary_atomic,
 };
@@ -3496,8 +3497,10 @@ fn driver_status_from_summary(
 
 /// Refine an exited Docker sandbox's `Ready` condition from inspected state.
 ///
-/// A signal kill (exit 137/143 = SIGKILL/SIGTERM, not OOM) is the signature of
-/// a machine/daemon restart terminating a running container. Reclassify it from
+/// A workspace-validation exit is reported distinctly so users can repair the
+/// OCI working directory rather than diagnose a generic crash. A signal kill
+/// (exit 137/143 = SIGKILL/SIGTERM, not OOM) is the signature of a
+/// machine/daemon restart terminating a running container. Reclassify it from
 /// the generic terminal `ContainerExited` to the recoverable
 /// `ContainerRuntimeRestart` so gateway startup can revive it. OOM kills and
 /// ordinary application exits stay `ContainerExited` and terminal.
@@ -3505,7 +3508,7 @@ fn apply_docker_exit_classification(sandbox: &mut DriverSandbox, state: &Contain
     if state.oom_killed == Some(true) {
         return;
     }
-    let Some(code) = state.exit_code.filter(|&code| matches!(code, 137 | 143)) else {
+    let Some(code) = state.exit_code else {
         return;
     };
     let Some(condition) = sandbox
@@ -3518,8 +3521,13 @@ fn apply_docker_exit_classification(sandbox: &mut DriverSandbox, state: &Contain
     if condition.reason != CONDITION_EXITED {
         return;
     }
-    condition.reason = CONDITION_RUNTIME_RESTART.to_string();
-    condition.message = format!("Container terminated by signal (exit code {code})");
+    if code == i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED) {
+        condition.reason = CONDITION_WORKSPACE_VALIDATION_FAILED.to_string();
+        condition.message = "OCI WorkingDir is not usable by the sandbox identity".to_string();
+    } else if matches!(code, 137 | 143) {
+        condition.reason = CONDITION_RUNTIME_RESTART.to_string();
+        condition.message = format!("Container terminated by signal (exit code {code})");
+    }
 }
 
 fn container_ready_condition(
