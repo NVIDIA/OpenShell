@@ -470,19 +470,47 @@ if ! [[ "${SUPERVISOR_RUNTIME_IMAGE}" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]]; then
   echo "ERROR: supervisor runtime image is not digest-pinned: ${SUPERVISOR_RUNTIME_IMAGE}" >&2
   exit 2
 fi
-echo "Using Podman supervisor image: ${SUPERVISOR_RUNTIME_IMAGE} (ID ${SUPERVISOR_IMAGE_ID}, digest ${SUPERVISOR_IMAGE_DIGEST})"
+SUPERVISOR_BASE_IMAGE="$(awk '$1 == "FROM" { print $2; exit }' "${OPENSHELL_E2E_SUPERVISOR_DOCKERFILE:-${ROOT}/deploy/docker/Dockerfile.supervisor}")"
+SUPERVISOR_BASE_IMAGE_ID="$(podman_cmd image inspect --format '{{.Id}}' "${SUPERVISOR_BASE_IMAGE}")"
+SUPERVISOR_BASE_IMAGE_ID="${SUPERVISOR_BASE_IMAGE_ID#sha256:}"
+SUPERVISOR_BASE_IMAGE_DIGEST="$(podman_cmd image inspect --format '{{.Digest}}' "${SUPERVISOR_BASE_IMAGE}")"
+if ! [[ "${SUPERVISOR_BASE_IMAGE_ID}" =~ ^[0-9a-f]{64}$ ]] \
+   || ! [[ "${SUPERVISOR_BASE_IMAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  echo "ERROR: could not resolve supervisor base-image provenance for ${SUPERVISOR_BASE_IMAGE}." >&2
+  exit 2
+fi
+SUPERVISOR_PACKAGE_MANIFEST="${OPENSHELL_PARITY_SUPERVISOR_PACKAGE_CAPTURE:-${WORKDIR}/supervisor.packages.txt}"
+mkdir -p "$(dirname "${SUPERVISOR_PACKAGE_MANIFEST}")"
+podman_cmd run --rm --network none --entrypoint /sbin/apk \
+  "${SUPERVISOR_RUNTIME_IMAGE}" info -v | LC_ALL=C sort >"${SUPERVISOR_PACKAGE_MANIFEST}"
+SUPERVISOR_PACKAGE_MANIFEST_SHA256="$(sha256sum "${SUPERVISOR_PACKAGE_MANIFEST}" | cut -d' ' -f1)"
+echo "Using Podman supervisor image: ${SUPERVISOR_RUNTIME_IMAGE} (ID ${SUPERVISOR_IMAGE_ID}, digest ${SUPERVISOR_IMAGE_DIGEST}, base ${SUPERVISOR_BASE_IMAGE} ID ${SUPERVISOR_BASE_IMAGE_ID} digest ${SUPERVISOR_BASE_IMAGE_DIGEST}, packages ${SUPERVISOR_PACKAGE_MANIFEST_SHA256})"
 
 DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
-SANDBOX_IMAGE="${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
+SANDBOX_IMAGE_REQUEST="${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
 PODMAN_STOP_TIMEOUT_SECS="${OPENSHELL_E2E_PODMAN_STOP_TIMEOUT_SECS:-15}"
 if ! [[ "${PODMAN_STOP_TIMEOUT_SECS}" =~ ^[0-9]+$ ]]; then
   echo "ERROR: OPENSHELL_E2E_PODMAN_STOP_TIMEOUT_SECS must be a non-negative integer." >&2
   exit 2
 fi
-if ! podman_cmd image exists "${SANDBOX_IMAGE}" 2>/dev/null; then
-  echo "Pulling ${SANDBOX_IMAGE}..."
-  podman_cmd pull "${SANDBOX_IMAGE}"
+if ! podman_cmd image exists "${SANDBOX_IMAGE_REQUEST}" 2>/dev/null; then
+  echo "Pulling ${SANDBOX_IMAGE_REQUEST}..."
+  podman_cmd pull "${SANDBOX_IMAGE_REQUEST}"
 fi
+SANDBOX_IMAGE_ID="$(podman_cmd image inspect --format '{{.Id}}' "${SANDBOX_IMAGE_REQUEST}")"
+SANDBOX_IMAGE_ID="${SANDBOX_IMAGE_ID#sha256:}"
+SANDBOX_IMAGE_DIGEST="$(podman_cmd image inspect --format '{{.Digest}}' "${SANDBOX_IMAGE_REQUEST}")"
+SANDBOX_IMAGE_REPOSITORY="${SANDBOX_IMAGE_REQUEST%%@*}"
+case "${SANDBOX_IMAGE_REPOSITORY##*/}" in
+  *:*) SANDBOX_IMAGE_REPOSITORY="${SANDBOX_IMAGE_REPOSITORY%:*}" ;;
+esac
+SANDBOX_RUNTIME_IMAGE="${SANDBOX_IMAGE_REPOSITORY}@${SANDBOX_IMAGE_DIGEST}"
+if ! [[ "${SANDBOX_IMAGE_ID}" =~ ^[0-9a-f]{64}$ ]] \
+   || ! [[ "${SANDBOX_RUNTIME_IMAGE}" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]]; then
+  echo "ERROR: could not resolve an immutable sandbox image for ${SANDBOX_IMAGE_REQUEST}." >&2
+  exit 2
+fi
+echo "Using Podman sandbox image: ${SANDBOX_RUNTIME_IMAGE} (ID ${SANDBOX_IMAGE_ID}, digest ${SANDBOX_IMAGE_DIGEST})"
 
 PKI_DIR="${WORKDIR}/pki"
 e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}" "host.containers.internal"
@@ -528,7 +556,7 @@ e2e_write_podman_gateway_config \
   "${DRIVER_SOCKET}" \
   "${PODMAN_NETWORK_NAME}" \
   "${HOST_PORT}" \
-  "${SANDBOX_IMAGE}" \
+  "${SANDBOX_RUNTIME_IMAGE}" \
   "${PODMAN_STOP_TIMEOUT_SECS}" \
   "${SUPERVISOR_RUNTIME_IMAGE}" \
   "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET:-}" \
@@ -543,7 +571,7 @@ if [ -n "${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE:-}" ]; then
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     driver_transport=remote_uds
   fi
-  printf '{"schema_version":%s,"external_compute_driver":%s,"compute_driver_transport":"%s","external_driver_pull_policy":"%s","supervisor_image":"%s","supervisor_image_id":"%s","supervisor_image_digest":"%s","supervisor_runtime_image":"%s"}\n' \
+  printf '{"schema_version":%s,"external_compute_driver":%s,"compute_driver_transport":"%s","external_driver_pull_policy":"%s","supervisor_image":"%s","supervisor_image_id":"%s","supervisor_image_digest":"%s","supervisor_runtime_image":"%s","supervisor_base_image":"%s","supervisor_base_image_id":"%s","supervisor_base_image_digest":"%s","supervisor_package_manifest_sha256":"%s","sandbox_image_request":"%s","sandbox_image_id":"%s","sandbox_image_digest":"%s","sandbox_runtime_image":"%s"}\n' \
     "${CONFIG_SCHEMA_VERSION}" \
     "$([ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ] && printf true || printf false)" \
     "${driver_transport}" \
@@ -552,13 +580,21 @@ if [ -n "${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE:-}" ]; then
     "${SUPERVISOR_IMAGE_ID}" \
     "${SUPERVISOR_IMAGE_DIGEST}" \
     "${SUPERVISOR_RUNTIME_IMAGE}" \
+    "${SUPERVISOR_BASE_IMAGE}" \
+    "${SUPERVISOR_BASE_IMAGE_ID}" \
+    "${SUPERVISOR_BASE_IMAGE_DIGEST}" \
+    "${SUPERVISOR_PACKAGE_MANIFEST_SHA256}" \
+    "${SANDBOX_IMAGE_REQUEST}" \
+    "${SANDBOX_IMAGE_ID}" \
+    "${SANDBOX_IMAGE_DIGEST}" \
+    "${SANDBOX_RUNTIME_IMAGE}" \
     >"${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE}"
 fi
 
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   OPENSHELL_COMPUTE_DRIVER_SOCKET="${DRIVER_SOCKET}" \
   OPENSHELL_PODMAN_SOCKET="${OPENSHELL_PODMAN_SOCKET:-}" \
-  OPENSHELL_SANDBOX_IMAGE="${SANDBOX_IMAGE}" \
+  OPENSHELL_SANDBOX_IMAGE="${SANDBOX_RUNTIME_IMAGE}" \
   OPENSHELL_SANDBOX_IMAGE_PULL_POLICY="${EXTERNAL_DRIVER_PULL_POLICY}" \
   OPENSHELL_HEALTH_CHECK_INTERVAL_SECS=10 \
   OPENSHELL_GATEWAY_PORT="${HOST_PORT}" \

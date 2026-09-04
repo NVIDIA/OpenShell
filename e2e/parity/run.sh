@@ -322,6 +322,10 @@ stage_artifact candidate supervisor.Dockerfile "${CANDIDATE_WORKTREE}/deploy/doc
 if [ "${SCENARIO}" = external-driver ]; then
   stage_executable baseline external-driver "${BASELINE_EXTERNAL_DRIVER}" BASELINE_EXTERNAL_DRIVER BASELINE_EXTERNAL_DRIVER_DIGEST
   stage_executable candidate external-driver "${CANDIDATE_EXTERNAL_DRIVER}" CANDIDATE_EXTERNAL_DRIVER CANDIDATE_EXTERNAL_DRIVER_DIGEST
+  if [ "${BASELINE_EXTERNAL_DRIVER_DIGEST}" = "${CANDIDATE_EXTERNAL_DRIVER_DIGEST}" ]; then
+    echo "ERROR: external-driver parity requires different baseline and candidate driver content." >&2
+    exit 2
+  fi
 fi
 
 require_executable "Podman parity wrapper" "${WRAPPER}"
@@ -423,6 +427,9 @@ run_variant() {
   if env -u OPENSHELL_GATEWAY_ENDPOINT -u OPENSHELL_GATEWAY_CONFIG \
     -u OPENSHELL_COMPUTE_DRIVER -u OPENSHELL_COMPUTE_DRIVER_SOCKET -u OPENSHELL_DRIVERS \
     -u OPENSHELL_PODMAN_SOCKET \
+    -u CONTAINER_HOST -u CONTAINER_CONNECTION -u CONTAINERS_STORAGE_CONF \
+    -u CONTAINERS_CONF -u CONTAINERS_REGISTRIES_CONF -u CONTAINERS_REGISTRIES_CONF_DIR \
+    -u CONTAINERS_POLICY -u PODMAN_CONNECTIONS_CONF -u DOCKER_HOST \
     OPENSHELL_PARITY_VARIANT="${variant}" \
     OPENSHELL_E2E_CONFIG_SCHEMA_VERSION="${schema}" \
     OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER="$([ "${SCENARIO}" = external-driver ] && printf 1 || printf 0)" \
@@ -435,6 +442,7 @@ run_variant() {
     OPENSHELL_PARITY_ORACLE_RESULT="${RESULTS_DIR}/${variant}.normalized.json" \
     OPENSHELL_PARITY_GATEWAY_CONFIG_CAPTURE="${RESULTS_DIR}/${variant}.gateway.toml" \
     OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE="${RESULTS_DIR}/${variant}.launch.json" \
+    OPENSHELL_PARITY_SUPERVISOR_PACKAGE_CAPTURE="${RESULTS_DIR}/artifacts/${variant}/supervisor.packages.txt" \
     OPENSHELL_GATEWAY_BIN="${gateway}" \
     OPENSHELL_BIN="${cli}" \
     OPENSHELL_CONFORMANCE_BIN="${conformance}" \
