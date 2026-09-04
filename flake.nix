@@ -52,6 +52,8 @@
           cargo-nextest
           # Assemble Debian artifacts on macOS and Linux.
           dpkg
+          # Build and inspect ext4 images in VM driver tests.
+          e2fsprogs
           git
           # Required to find packages.
           pkg-config
