@@ -170,7 +170,7 @@ OCSF API:INFERENCE [INFO] Success claude-haiku-4-5-20251001 via https://api.anth
 
 ## SIEM Schema Version Compatibility
 
-OpenShell emits OCSF v1.7.0 events internally, but many SIEMs only support older schema versions. The `ocsf_schema_version` setting tells the JSONL layer to downgrade events before writing, stripping fields and profiles that don't exist in the target version.
+OpenShell emits OCSF v1.8.0 events internally, but many SIEMs only support older schema versions. The `ocsf_schema_version` setting tells the JSONL layer to downgrade events before writing, stripping fields and profiles that don't exist in the target version.
 
 Set the target version globally:
 
@@ -192,7 +192,7 @@ Supported target versions are `1.1` and `1.3`. When set, the JSONL layer applies
 - Removes unknown profile names from `metadata.profiles`: `ai_operation`, `container`
 - Rewrites `metadata.version` to match the target version
 
-The shorthand log output is unaffected. The internal event model stays at v1.7.0; only the serialized JSONL is transformed.
+The shorthand log output is unaffected. The internal event model stays at v1.8.0; only the serialized JSONL is transformed.
 
 When unset or empty, no downgrade is applied and events are written at the current schema version.
 

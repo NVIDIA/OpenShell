@@ -57,7 +57,7 @@ pub fn downgrade_event(event: &mut Value, target_version: &str) -> bool {
         }
     }
 
-    if modified && let Some(metadata) = obj.get_mut("metadata").and_then(Value::as_object_mut) {
+    if let Some(metadata) = obj.get_mut("metadata").and_then(Value::as_object_mut) {
         let original_version = metadata
             .get("version")
             .and_then(Value::as_str)
@@ -67,6 +67,7 @@ pub fn downgrade_event(event: &mut Value, target_version: &str) -> bool {
             "version".to_string(),
             Value::String(target_version.to_string()),
         );
+        modified = true;
 
         let unmapped = obj
             .entry("unmapped")
@@ -102,7 +103,7 @@ mod tests {
             "time": 1_234_567_890,
             "severity_id": 1,
             "metadata": {
-                "version": "1.7.0",
+                "version": crate::OCSF_VERSION,
                 "profiles": ["security_control", "network_proxy", "container", "host"]
             },
             "device": {"hostname": "sandbox-1"},
@@ -151,16 +152,16 @@ mod tests {
         downgrade_event(&mut event, "1.1.0");
 
         assert_eq!(event["metadata"]["version"], "1.1.0");
-        assert_eq!(event["unmapped"]["downgraded_from"], "1.7.0");
+        assert_eq!(event["unmapped"]["downgraded_from"], crate::OCSF_VERSION);
     }
 
     #[test]
     fn test_no_downgrade_for_current_version() {
         let mut event = test_event();
-        let modified = downgrade_event(&mut event, "1.7.0");
+        let modified = downgrade_event(&mut event, crate::OCSF_VERSION);
 
         assert!(!modified);
-        assert_eq!(event["metadata"]["version"], "1.7.0");
+        assert_eq!(event["metadata"]["version"], crate::OCSF_VERSION);
     }
 
     #[test]
@@ -203,7 +204,7 @@ mod tests {
         let mut event = serde_json::json!({
             "class_uid": 4001,
             "metadata": {
-                "version": "1.7.0",
+                "version": crate::OCSF_VERSION,
                 "profiles": ["container"]
             },
             "container": {"name": "sandbox-1"}
@@ -211,13 +212,30 @@ mod tests {
         let modified = downgrade_event(&mut event, "1.1.0");
 
         assert!(modified);
-        assert_eq!(event["unmapped"]["downgraded_from"], "1.7.0");
+        assert_eq!(event["unmapped"]["downgraded_from"], crate::OCSF_VERSION);
+    }
+
+    #[test]
+    fn test_downgrade_rewrites_version_without_strippable_fields() {
+        let mut event = serde_json::json!({
+            "class_uid": 0,
+            "metadata": {
+                "version": crate::OCSF_VERSION,
+                "profiles": ["host"]
+            }
+        });
+
+        let modified = downgrade_event(&mut event, "1.3.0");
+
+        assert!(modified);
+        assert_eq!(event["metadata"]["version"], "1.3.0");
+        assert_eq!(event["unmapped"]["downgraded_from"], crate::OCSF_VERSION);
     }
 
     #[test]
     fn test_no_downgrade_omits_breadcrumb() {
         let mut event = test_event();
-        downgrade_event(&mut event, "1.7.0");
+        downgrade_event(&mut event, crate::OCSF_VERSION);
 
         assert!(
             event
