@@ -97,6 +97,21 @@ raw relay by default. A `protocol: rest` endpoint can opt in to
 after an allowed `101` upgrade; server-to-client traffic and all other upgraded
 protocols remain raw passthrough.
 
+Supervisor middleware attaches independently of the network rule that admits
+the destination. Request and client WebSocket hooks run after policy admission
+and before credential injection. HTTP response hooks run after the upstream
+returns a final non-`1xx` head and before the sandbox receives it. Response
+middleware operates on normalized representation bytes, not transfer chunks or
+socket reads, and retains each V1 input until the stage acknowledges it. This
+lets `fail_open` preserve content. A `fail_closed` error returns a platform-owned
+502 before response commitment and aborts the stream after commitment. Generic
+response processing never handles a `101` protocol upgrade.
+
+One shared header-mutation validator applies request, response, and trailer
+authority profiles atomically. Middleware can write permitted end-to-end fields
+without a namespace prefix, while each direction protects its credentials,
+routing, framing, connection control, and semantic security fields.
+
 ## Credentialed Endpoints
 
 OpenShell keeps provider credentials on paths it can inspect or rewrite by
