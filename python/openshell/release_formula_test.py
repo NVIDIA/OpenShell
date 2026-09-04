@@ -131,13 +131,15 @@ def test_snap_wrapper_uses_optional_gateway_config_without_generating_toml() -> 
     assert 'exec "${SNAP}/bin/openshell-gateway" "$@"' in wrapper
 
 
-def test_snap_docker_connect_hook_restarts_gateway() -> None:
+def test_snap_docker_connect_hook_enables_and_starts_gateway() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     hook = repo_root / "snap/hooks/connect-plug-docker"
+    snapcraft = (repo_root / "snapcraft.yaml").read_text(encoding="utf-8")
 
     assert hook.is_file()
     assert hook.stat().st_mode & stat.S_IXUSR
-    assert 'snapctl restart "${SNAP_INSTANCE_NAME}.gateway"' in hook.read_text(
+    assert "install-mode: disable" in snapcraft
+    assert 'snapctl start --enable "${SNAP_INSTANCE_NAME}.gateway"' in hook.read_text(
         encoding="utf-8"
     )
 
