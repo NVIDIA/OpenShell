@@ -413,7 +413,21 @@ impl OpaEngine {
         entrypoint_pid: u32,
         require_binary_identity: bool,
     ) -> Result<Self> {
-        let ambiguities = openshell_policy::find_endpoint_ambiguities(proto);
+        // Protobuf cannot distinguish an omitted repeated MCP version field
+        // from an empty one. Canonicalize before any runtime consumer reads
+        // the policy so both representations select the pinned default.
+        let proto = openshell_policy::validate_and_canonicalize_sandbox_policy(proto.clone())
+            .map_err(|error| {
+                let errors = error
+                    .violations()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                miette::miette!("policy validation failed:\n{errors}")
+            })?;
+
+        let ambiguities = openshell_policy::find_endpoint_ambiguities(&proto);
         if !ambiguities.is_empty() {
             return Err(miette::miette!(
                 "network endpoint ambiguity validation failed:\n{}",
@@ -426,16 +440,7 @@ impl OpaEngine {
         }
 
         emit_binary_identity_mode(require_binary_identity, "proto");
-        if let Err(violations) = openshell_policy::validate_sandbox_policy(proto) {
-            let errors = violations
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Err(miette::miette!("policy validation failed:\n{errors}"));
-        }
-
-        let data_json_str = proto_to_opa_data_json(proto, entrypoint_pid);
+        let data_json_str = proto_to_opa_data_json(&proto, entrypoint_pid);
 
         // Parse back to Value for preprocessing, then re-serialize
         let mut data: serde_json::Value = serde_json::from_str(&data_json_str)
@@ -2262,6 +2267,31 @@ mod tests {
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         }
+    }
+
+    fn defaultable_mcp_proto(mcp: Option<McpOptions>) -> ProtoSandboxPolicy {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "mcp".to_string(),
+            NetworkPolicyRule {
+                name: "mcp".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "mcp.example.com".to_string(),
+                    port: 443,
+                    protocol: "mcp".to_string(),
+                    mcp,
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: "tools/list".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        policy
     }
 
     const POLICY_DNS_SNAPSHOT_DATA: &str = r#"
@@ -5269,6 +5299,35 @@ network_policies:
         assert!(message.contains("wildcard"));
         assert!(message.contains("exact"));
         assert!(message.contains("tls"));
+    }
+
+    #[test]
+    fn proto_load_accepts_defaultable_mcp_versions() {
+        for policy in [
+            defaultable_mcp_proto(None),
+            defaultable_mcp_proto(Some(McpOptions::default())),
+        ] {
+            OpaEngine::from_proto(&policy)
+                .expect("supervisor ingress must materialize the pinned MCP revision");
+        }
+    }
+
+    #[test]
+    fn proto_load_rejects_unsupported_mcp_versions() {
+        let policy = defaultable_mcp_proto(Some(McpOptions {
+            versions: vec!["latest".to_string()],
+            ..Default::default()
+        }));
+
+        let Err(error) = OpaEngine::from_proto(&policy) else {
+            panic!("canonicalization must not repair an unsupported MCP revision");
+        };
+        let error = error.to_string();
+        assert!(error.contains("policy validation failed"), "{error}");
+        assert!(
+            error.contains("unsupported protocol version 'latest'"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
