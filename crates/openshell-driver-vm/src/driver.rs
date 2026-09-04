@@ -18,7 +18,7 @@ use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::ContainerCreateBody;
 use bollard::query_parameters::{CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder};
-use flate2::read::GzDecoder;
+use flate2::read::{GzDecoder, MultiGzDecoder};
 use futures::{Stream, StreamExt, TryStreamExt};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
@@ -61,7 +61,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -2961,26 +2961,28 @@ impl VmDriver {
         );
         let copy_src = tar_path.to_path_buf();
         let copy_dst = rootfs_archive.clone();
-        let copied_digest =
-            match tokio::task::spawn_blocking(move || copy_file_sha256_hex(&copy_src, &copy_dst))
-                .await
-            {
-                Ok(Ok(digest)) => digest,
-                Ok(Err(err)) => {
-                    let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-                    cleanup_request_staging().await;
-                    return Err(Status::internal(format!(
-                        "failed to copy rootfs tar to staging: {err}"
-                    )));
-                }
-                Err(err) => {
-                    let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-                    cleanup_request_staging().await;
-                    return Err(Status::internal(format!(
-                        "failed to copy rootfs tar to staging: {err}"
-                    )));
-                }
-            };
+        let max_bytes = self.config.rootfs_tar_max_bytes();
+        let copied_digest = match tokio::task::spawn_blocking(move || {
+            stage_rootfs_tar_archive(&copy_src, &copy_dst, max_bytes)
+        })
+        .await
+        {
+            Ok(Ok(digest)) => digest,
+            Ok(Err(err)) => {
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                cleanup_request_staging().await;
+                return Err(Status::internal(format!(
+                    "failed to copy rootfs tar to staging: {err}"
+                )));
+            }
+            Err(err) => {
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                cleanup_request_staging().await;
+                return Err(Status::internal(format!(
+                    "failed to copy rootfs tar to staging: {err}"
+                )));
+            }
+        };
 
         // The archive changed between the hash pass and the copy: the prepared
         // disk we are about to build would not match the identity it is cached
@@ -4814,33 +4816,100 @@ fn compute_bytes_sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Copy `src` to `dst` and return the SHA-256 of the bytes actually written.
+/// Stage the caller-supplied rootfs archive at `src` into the image cache at
+/// `dst`, and return the SHA-256 of the source bytes that were read.
 ///
-/// Hashing the copy rather than re-reading the source is what lets the caller
-/// detect an archive that changed underneath it during staging: the digest
-/// describes exactly the bytes that landed in the image cache.
-fn copy_file_sha256_hex(src: &Path, dst: &Path) -> Result<String, String> {
-    let mut reader = fs::File::open(src).map_err(|err| format!("open {}: {err}", src.display()))?;
-    let mut writer =
-        fs::File::create(dst).map_err(|err| format!("create {}: {err}", dst.display()))?;
-    let mut hasher = Sha256::new();
+/// The staged file is always an uncompressed tar. `--from` accepts `.tar.gz`
+/// and `.tgz`, but the guest image-prep VM extracts the staged file with a
+/// plain `tar -xpf`, and the prepared disk is sized from that file's length,
+/// so leaving gzip bytes on disk would both depend on the guest tar
+/// auto-detecting compression and size the disk from the compressed length.
+/// Compression is detected from the magic bytes: the driver only ever sees a
+/// gateway-issued staging path, never the caller's file name.
+///
+/// Expansion is bounded by `max_bytes` — the same limit the driver applies to
+/// the archive it accepts — so a compression bomb cannot fill the host disk.
+///
+/// The digest covers the source bytes rather than the bytes written, which is
+/// what lets the caller detect an archive that changed underneath it during
+/// staging: it stays comparable with the pre-copy hash pass whether or not the
+/// source was compressed.
+fn stage_rootfs_tar_archive(src: &Path, dst: &Path, max_bytes: u64) -> Result<String, String> {
+    let file = fs::File::open(src).map_err(|err| format!("open {}: {err}", src.display()))?;
+    let mut reader = BufReader::new(file);
+    let compressed = reader
+        .fill_buf()
+        .map_err(|err| format!("read {}: {err}", src.display()))?
+        .starts_with(&crate::rootfs::GZIP_MAGIC);
+
+    let mut source = HashingReader::new(reader);
+    if compressed {
+        write_stream_to_file(MultiGzDecoder::new(&mut source), dst, max_bytes)?;
+    } else {
+        write_stream_to_file(&mut source, dst, max_bytes)?;
+    }
+
+    // A decoder stops at the end of the compressed stream, so drain whatever
+    // it left behind: the digest has to describe the whole source file for the
+    // caller's change-detection comparison to mean anything.
+    std::io::copy(&mut source, &mut std::io::sink())
+        .map_err(|err| format!("read {}: {err}", src.display()))?;
+    Ok(source.finish())
+}
+
+/// Reader adapter that digests every byte it yields.
+struct HashingReader<R> {
+    inner: R,
+    hasher: Sha256,
+}
+
+impl<R: Read> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+        }
+    }
+
+    fn finish(self) -> String {
+        format!("{:x}", self.hasher.finalize())
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.hasher.update(&buf[..read]);
+        Ok(read)
+    }
+}
+
+fn write_stream_to_file(mut reader: impl Read, dst: &Path, max_bytes: u64) -> Result<(), String> {
+    let mut writer = BufWriter::new(
+        fs::File::create(dst).map_err(|err| format!("create {}: {err}", dst.display()))?,
+    );
     let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    let mut written = 0_u64;
     loop {
         let read = reader
             .read(&mut buffer)
-            .map_err(|err| format!("read {}: {err}", src.display()))?;
+            .map_err(|err| format!("read rootfs tar: {err}"))?;
         if read == 0 {
             break;
         }
-        hasher.update(&buffer[..read]);
+        written = written.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        if written > max_bytes {
+            return Err(format!(
+                "rootfs tar expands to more than the {max_bytes} byte limit"
+            ));
+        }
         writer
             .write_all(&buffer[..read])
             .map_err(|err| format!("write {}: {err}", dst.display()))?;
     }
     writer
         .flush()
-        .map_err(|err| format!("flush {}: {err}", dst.display()))?;
-    Ok(format!("{:x}", hasher.finalize()))
+        .map_err(|err| format!("flush {}: {err}", dst.display()))
 }
 
 /// Cache identity for a rootfs tar archive, derived from its contents.
@@ -9191,8 +9260,29 @@ mod tests {
         );
     }
 
+    const TEST_STAGING_LIMIT: u64 = 10 * 1024 * 1024;
+
+    /// Build an uncompressed tar holding a single file.
+    fn tar_bytes_with_file(name: &str, contents: &[u8]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(u64::try_from(contents.len()).expect("tar entry size fits u64"));
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, name, contents)
+            .expect("append tar entry");
+        builder.into_inner().expect("finish tar")
+    }
+
+    fn gzip_bytes(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).expect("gzip payload");
+        encoder.finish().expect("finish gzip")
+    }
+
     #[test]
-    fn copy_file_sha256_hex_matches_source_digest() {
+    fn stage_rootfs_tar_archive_matches_source_digest() {
         let base = unique_temp_dir();
         std::fs::create_dir_all(&base).expect("create base dir");
         let src = base.join("src.tar");
@@ -9200,7 +9290,8 @@ mod tests {
         let payload = vec![3_u8; 200 * 1024];
         std::fs::write(&src, &payload).expect("write source");
 
-        let copied = copy_file_sha256_hex(&src, &dst).expect("copy should succeed");
+        let copied =
+            stage_rootfs_tar_archive(&src, &dst, TEST_STAGING_LIMIT).expect("copy should succeed");
 
         assert_eq!(copied, compute_file_sha256_hex(&src).expect("hash source"));
         assert_eq!(copied, compute_bytes_sha256_hex(&payload));
@@ -9212,7 +9303,7 @@ mod tests {
     /// different digest, which is what lets the caller reject it instead of
     /// caching a disk under an identity that does not describe it.
     #[test]
-    fn copy_file_sha256_hex_detects_content_change_between_passes() {
+    fn stage_rootfs_tar_archive_detects_content_change_between_passes() {
         let base = unique_temp_dir();
         std::fs::create_dir_all(&base).expect("create base dir");
         let src = base.join("src.tar");
@@ -9220,12 +9311,64 @@ mod tests {
         let first = compute_file_sha256_hex(&src).expect("hash source");
 
         std::fs::write(&src, b"replaced").expect("rewrite source");
-        let second = copy_file_sha256_hex(&src, &base.join("dst.tar")).expect("copy");
+        let second = stage_rootfs_tar_archive(&src, &base.join("dst.tar"), TEST_STAGING_LIMIT)
+            .expect("copy");
 
         assert_ne!(
             first, second,
             "a mid-staging rewrite must produce a different digest"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `--from` accepts `.tar.gz`/`.tgz`, and the guest extracts the staged
+    /// file as a plain tar, so staging has to decompress on the way in.
+    #[test]
+    fn stage_rootfs_tar_archive_decompresses_gzip_sources() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).expect("create base dir");
+        let tar = tar_bytes_with_file("etc/marker.txt", b"rootfs-tar-gzip\n");
+        let gzipped = gzip_bytes(&tar);
+        let src = base.join("src.tar.gz");
+        let dst = base.join("source-rootfs.tar");
+        std::fs::write(&src, &gzipped).expect("write source");
+
+        let digest =
+            stage_rootfs_tar_archive(&src, &dst, TEST_STAGING_LIMIT).expect("stage gzip archive");
+
+        assert_eq!(
+            digest,
+            compute_bytes_sha256_hex(&gzipped),
+            "the digest must cover the whole compressed source"
+        );
+        assert_eq!(
+            std::fs::read(&dst).expect("read staged archive"),
+            tar,
+            "the staged archive must be an uncompressed tar"
+        );
+
+        let extracted = base.join("extracted");
+        extract_rootfs_archive_to(&dst, &extracted).expect("extract staged archive");
+        assert_eq!(
+            std::fs::read_to_string(extracted.join("etc/marker.txt")).expect("read marker"),
+            "rootfs-tar-gzip\n"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The configured limit bounds what the driver writes, not just what it
+    /// accepts, so a highly compressible archive cannot fill the host disk.
+    #[test]
+    fn stage_rootfs_tar_archive_rejects_oversized_expansion() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).expect("create base dir");
+        let src = base.join("bomb.tar.gz");
+        std::fs::write(&src, gzip_bytes(&vec![0_u8; 4 * 1024 * 1024])).expect("write source");
+
+        let err = stage_rootfs_tar_archive(&src, &base.join("dst.tar"), 64 * 1024)
+            .expect_err("expansion beyond the limit must be rejected");
+
+        assert!(err.contains("65536"), "unexpected error: {err}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
