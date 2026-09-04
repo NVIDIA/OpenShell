@@ -178,6 +178,7 @@ pub enum GatewayListenerRequirement {
         address: SocketAddr,
         driver_name: String,
         reason: String,
+        allow_delayed_bind: bool,
     },
     DefaultRouteInterface {
         driver_name: String,
@@ -187,6 +188,12 @@ pub enum GatewayListenerRequirement {
         driver_name: String,
         reason: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GatewayListenerBindPolicy {
+    Deny,
+    TrustedBuiltinPodman,
 }
 
 impl GatewayListenerRequirement {
@@ -627,6 +634,7 @@ impl ComputeRuntime {
         driver_name: String,
         driver: SharedComputeDriver,
         driver_process: Option<Arc<ManagedDriverProcess>>,
+        listener_bind_policy: GatewayListenerBindPolicy,
         store: Arc<Store>,
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
@@ -682,6 +690,23 @@ impl ComputeRuntime {
                                 address,
                                 driver_name: driver_name.clone(),
                                 reason: requirement.reason,
+                                allow_delayed_bind: false,
+                            })
+                        }
+                        Selector::ExactBind(exact_bind) => {
+                            let address = exact_bind.address.parse::<SocketAddr>().map_err(|err| {
+                                ComputeError::Message(format!(
+                                    "compute driver '{driver_name}' returned invalid gateway listener address '{}': {err}",
+                                    exact_bind.address
+                                ))
+                            })?;
+                            Ok(GatewayListenerRequirement::Exact {
+                                address,
+                                driver_name: driver_name.clone(),
+                                reason: requirement.reason,
+                                allow_delayed_bind: listener_bind_policy
+                                    == GatewayListenerBindPolicy::TrustedBuiltinPodman
+                                    && exact_bind.allow_delayed_bind,
                             })
                         }
                         Selector::DefaultRouteInterface(_) => {
@@ -764,6 +789,7 @@ impl ComputeRuntime {
             endpoint.name,
             driver,
             endpoint.driver_process,
+            GatewayListenerBindPolicy::Deny,
             store,
             sandbox_index,
             sandbox_watch_bus,
@@ -10608,6 +10634,7 @@ mod tests {
             "test-driver".to_string(),
             Arc::new(TestDriver::default()),
             None,
+            GatewayListenerBindPolicy::Deny,
             store,
             SandboxIndex::new(),
             SandboxWatchBus::new(),
@@ -10795,6 +10822,7 @@ mod tests {
                 address: "172.19.0.1:17670".parse().unwrap(),
                 driver_name: "docker".to_string(),
                 reason: "external driver managed bridge".to_string(),
+                allow_delayed_bind: false,
             }]
         );
 

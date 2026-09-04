@@ -148,6 +148,24 @@ HTTP requests. A `PermissionDenied` response from an additional callback-only
 listener is expected for those requests. Do not broaden the primary listener
 to `0.0.0.0` solely to make sandbox callbacks reachable.
 
+For rootful Podman on Linux, the bridge gateway may not exist until the first
+sandbox joins. If the exact private bridge bind fails with `EADDRNOTAVAIL`,
+OpenShell binds that future address with `IP_FREEBIND`. The callback-only
+listener becomes reachable when netavark materializes the bridge. This applies
+only to the managed bridge discovered by the built-in Podman driver; rootless
+Podman, explicit `host_gateway_ip` values, and external drivers remain
+ordinary exact-bind only.
+
+If delayed exact binding also fails while the gateway is nested inside a Linux
+container, OpenShell falls back to one IPv4 wildcard socket for that gateway
+process. Loopback traffic still receives primary scope; every other IPv4
+interface receives callback-only scope. The fallback therefore exposes the
+sandbox-callable gRPC surface—not administrator, health, reflection, or HTTP
+routes—on all IPv4 interfaces in the outer container namespace. Restrict access
+to that namespace with the surrounding container network, and retain mTLS and
+sandbox JWT authentication. Gateways running directly on a host never use the
+wildcard fallback.
+
 ## Docker Driver
 
 [Docker](https://www.docker.com/get-started/)-backed sandboxes run as containers on the gateway host. Use Docker for local development, single-machine gateways, and hosts that already use Docker Desktop or Docker Engine.

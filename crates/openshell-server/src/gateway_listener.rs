@@ -4,9 +4,12 @@
 use crate::compute::GatewayListenerRequirement;
 use openshell_core::{Error, Result};
 use socket2::{Domain, Protocol, Socket, Type};
+use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Authorization scope associated with a gateway listener.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,6 +30,7 @@ pub struct GatewayListenerSpec {
     pub scope: GatewayListenerScope,
     covered_addresses: Vec<CoveredGatewayAddress>,
     provenance: Option<GatewayListenerProvenance>,
+    allows_delayed_bind: bool,
 }
 
 /// Diagnostic source of a driver-requested listener.
@@ -49,6 +53,7 @@ impl GatewayListenerSpec {
             scope,
             covered_addresses: Vec::new(),
             provenance: None,
+            allows_delayed_bind: false,
         }
     }
 
@@ -177,6 +182,13 @@ fn callback_listener_spec(
     address: SocketAddr,
     requirement: &GatewayListenerRequirement,
 ) -> GatewayListenerSpec {
+    let allows_delayed_bind = matches!(
+        requirement,
+        GatewayListenerRequirement::Exact {
+            allow_delayed_bind: true,
+            ..
+        }
+    );
     GatewayListenerSpec {
         address,
         scope: GatewayListenerScope::ComputeDriverCallback,
@@ -185,6 +197,7 @@ fn callback_listener_spec(
             driver_name: requirement.driver_name().to_string(),
             reason: requirement.reason().to_string(),
         }),
+        allows_delayed_bind,
     }
 }
 
@@ -272,9 +285,77 @@ pub async fn bind_gateway_listeners(
         ) && specs.iter().any(|candidate| {
             candidate.address.port() == spec.address.port() && candidate.address.is_ipv4()
         });
-        let listener = bind_gateway_listener(spec.address, ipv6_only)
-            .await
-            .map_err(|e| Error::transport(format!("failed to bind to {}: {e}", spec.address)))?;
+        let listener = bind_gateway_listener(spec.address, ipv6_only).await;
+        let listener = match listener {
+            Ok(listener) => listener,
+            Err(err) => {
+                let delayed_bind_eligible = podman_delayed_bind_is_eligible(spec, err.kind());
+                if delayed_bind_eligible {
+                    match bind_gateway_listener_freebind(spec.address) {
+                        Ok(listener) => {
+                            let provenance = spec
+                                .provenance
+                                .as_ref()
+                                .expect("delayed callback listener must include provenance");
+                            warn!(
+                                address = %spec.address,
+                                listener_purpose = "compute-driver-callback-delayed-bind",
+                                driver = %provenance.driver_name,
+                                reason = %provenance.reason,
+                                bind_strategy = "linux-ip-freebind",
+                                authorization_scope = "sandbox-callable-grpc-only",
+                                "Podman bridge address is not available yet; gateway bound the exact callback address for delayed activation"
+                            );
+                            listener
+                        }
+                        Err(freebind_err) => {
+                            let Some(fallback_spec) = nested_podman_wildcard_fallback_spec(
+                                &specs,
+                                spec,
+                                err.kind(),
+                                running_in_linux_container(),
+                            ) else {
+                                return Err(Error::transport(format!(
+                                    "failed to bind Podman callback address {} ({err}); delayed exact bind also failed: {freebind_err}",
+                                    spec.address
+                                )));
+                            };
+
+                            // The wildcard cannot coexist with the already-bound loopback
+                            // socket on the same port. Dropping the partial listener set is
+                            // safe because none of it has been returned to the server yet.
+                            drop(listeners);
+                            let listener = bind_gateway_listener(fallback_spec.address, false)
+                                .await
+                                .map_err(|fallback_err| {
+                                    Error::transport(format!(
+                                        "failed to bind Podman callback address {} ({err}); delayed exact bind failed ({freebind_err}); scoped wildcard fallback {} also failed: {fallback_err}",
+                                        spec.address, fallback_spec.address
+                                    ))
+                                })?;
+                            let local_addr = listener.local_addr().unwrap_or(fallback_spec.address);
+                            let fallback_spec = fallback_spec.bind_to(local_addr);
+                            warn!(
+                                address = %local_addr,
+                                unavailable_callback_address = %spec.address,
+                                listener_purpose = "nested-podman-callback-fallback",
+                                authorization_scope = "primary-on-loopback; sandbox-callable-grpc-only-on-other-ipv4-interfaces",
+                                "Podman bridge address is not available yet and delayed exact binding failed; gateway callback listener is exposed on all container IPv4 interfaces for this gateway process"
+                            );
+                            return Ok(vec![BoundGatewayListener {
+                                listener,
+                                spec: fallback_spec,
+                            }]);
+                        }
+                    }
+                } else {
+                    return Err(Error::transport(format!(
+                        "failed to bind to {}: {err}",
+                        spec.address
+                    )));
+                }
+            }
+        };
         let local_addr = listener.local_addr().unwrap_or(spec.address);
         match spec.scope {
             GatewayListenerScope::Primary => {
@@ -306,6 +387,83 @@ pub async fn bind_gateway_listeners(
         });
     }
     Ok(listeners)
+}
+
+fn nested_podman_wildcard_fallback_spec(
+    specs: &[GatewayListenerSpec],
+    failed_spec: &GatewayListenerSpec,
+    error_kind: ErrorKind,
+    running_in_container: bool,
+) -> Option<GatewayListenerSpec> {
+    if !running_in_container
+        || specs.len() != 2
+        || !podman_delayed_bind_is_eligible(failed_spec, error_kind)
+    {
+        return None;
+    }
+
+    let primary = specs
+        .iter()
+        .find(|spec| spec.scope == GatewayListenerScope::Primary)?;
+    let callback = specs.iter().find(|spec| {
+        spec.scope == GatewayListenerScope::ComputeDriverCallback && *spec == failed_spec
+    })?;
+    let callback_provenance = callback.provenance.as_ref()?;
+    let (IpAddr::V4(primary_ip), IpAddr::V4(_)) = (primary.address.ip(), callback.address.ip())
+    else {
+        return None;
+    };
+    if !primary_ip.is_loopback()
+        || primary.address.port() == 0
+        || primary.address.port() != callback.address.port()
+    {
+        return None;
+    }
+
+    Some(GatewayListenerSpec {
+        address: SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, primary.address.port())),
+        // The broader socket is callback-only by default. Only connections
+        // addressed to the original loopback endpoint retain primary scope.
+        scope: GatewayListenerScope::ComputeDriverCallback,
+        covered_addresses: vec![CoveredGatewayAddress {
+            address: primary.address,
+            scope: GatewayListenerScope::Primary,
+        }],
+        provenance: Some(callback_provenance.clone()),
+        allows_delayed_bind: true,
+    })
+}
+
+fn podman_delayed_bind_is_eligible(
+    failed_spec: &GatewayListenerSpec,
+    error_kind: ErrorKind,
+) -> bool {
+    if error_kind != ErrorKind::AddrNotAvailable
+        || failed_spec.scope != GatewayListenerScope::ComputeDriverCallback
+    {
+        return false;
+    }
+
+    let Some(callback_provenance) = failed_spec.provenance.as_ref() else {
+        return false;
+    };
+    let IpAddr::V4(callback_ip) = failed_spec.address.ip() else {
+        return false;
+    };
+
+    callback_ip.is_private()
+        && failed_spec.allows_delayed_bind
+        && callback_provenance.driver_name == "podman"
+}
+
+#[cfg(target_os = "linux")]
+fn running_in_linux_container() -> bool {
+    Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn running_in_linux_container() -> bool {
+    false
 }
 
 fn resolve_bound_covered_addresses(
@@ -356,6 +514,32 @@ async fn bind_gateway_listener(
     TcpListener::bind(address).await
 }
 
+#[cfg(target_os = "linux")]
+fn bind_gateway_listener_freebind(address: SocketAddr) -> std::io::Result<TcpListener> {
+    if !address.is_ipv4() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "delayed gateway listener binding requires an IPv4 address",
+        ));
+    }
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    socket.set_freebind_v4(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&address.into())?;
+    socket.listen(1024)?;
+    let listener: std::net::TcpListener = socket.into();
+    TcpListener::from_std(listener)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_gateway_listener_freebind(_address: SocketAddr) -> std::io::Result<TcpListener> {
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        "delayed gateway listener binding is supported only on Linux",
+    ))
+}
+
 fn listener_covers(existing: SocketAddr, requested: SocketAddr) -> bool {
     if existing == requested {
         return true;
@@ -376,9 +560,11 @@ mod tests {
     use super::{
         GatewayListenerProvenance, GatewayListenerScope, GatewayListenerSpec,
         bind_gateway_listeners, gateway_listener_specs,
-        gateway_listener_specs_with_default_route_ip,
+        gateway_listener_specs_with_default_route_ip, nested_podman_wildcard_fallback_spec,
+        podman_delayed_bind_is_eligible,
     };
     use crate::compute::GatewayListenerRequirement;
+    use std::io::ErrorKind;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::net::TcpListener;
@@ -435,6 +621,7 @@ mod tests {
                     scope: GatewayListenerScope::Primary,
                     covered_addresses: Vec::new(),
                     provenance: None,
+                    allows_delayed_bind: false,
                 },
                 GatewayListenerSpec {
                     address: callback,
@@ -444,6 +631,7 @@ mod tests {
                         driver_name: "alpha".to_string(),
                         reason: "managed bridge".to_string(),
                     }),
+                    allows_delayed_bind: false,
                 },
             ]
         );
@@ -456,6 +644,7 @@ mod tests {
             address: "172.18.0.1:8080".parse().unwrap(),
             driver_name: "external-test".to_string(),
             reason: "external bridge".to_string(),
+            allow_delayed_bind: false,
         };
 
         let specs = gateway_listener_specs(primary, &[requirement]).unwrap();
@@ -620,6 +809,59 @@ mod tests {
         assert_eq!(specs[1].scope, GatewayListenerScope::ComputeDriverCallback);
     }
 
+    #[test]
+    fn podman_delayed_bind_does_not_depend_on_primary_listener_topology() {
+        let callback: SocketAddr = "10.89.1.1:8080".parse().unwrap();
+
+        for primary in ["192.168.20.20:8080", "[::1]:8080"] {
+            let primary = primary.parse().unwrap();
+            let specs = gateway_listener_specs(primary, &[delayed_podman_requirement(callback)])
+                .expect("delayed Podman callback requirement should be valid");
+
+            assert!(podman_delayed_bind_is_eligible(
+                &specs[1],
+                ErrorKind::AddrNotAvailable,
+            ));
+        }
+    }
+
+    #[test]
+    fn nested_podman_wildcard_fallback_remains_loopback_primary_only() {
+        let callback: SocketAddr = "10.89.1.1:8080".parse().unwrap();
+
+        for primary in ["192.168.20.20:8080", "[::1]:8080"] {
+            let primary = primary.parse().unwrap();
+            let specs = gateway_listener_specs(primary, &[delayed_podman_requirement(callback)])
+                .expect("delayed Podman callback requirement should be valid");
+
+            assert!(
+                nested_podman_wildcard_fallback_spec(
+                    &specs,
+                    &specs[1],
+                    ErrorKind::AddrNotAvailable,
+                    true,
+                )
+                .is_none(),
+                "wildcard fallback should reject primary listener {primary}",
+            );
+        }
+
+        let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let specs = gateway_listener_specs(primary, &[delayed_podman_requirement(callback)])
+            .expect("delayed Podman callback requirement should be valid");
+        assert_eq!(
+            nested_podman_wildcard_fallback_spec(
+                &specs,
+                &specs[1],
+                ErrorKind::AddrNotAvailable,
+                true,
+            )
+            .expect("loopback primary should permit the nested wildcard fallback")
+            .address,
+            "0.0.0.0:8080".parse().unwrap(),
+        );
+    }
+
     #[tokio::test]
     async fn failed_bind_does_not_return_partially_bound_listeners() {
         let occupied_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -676,6 +918,7 @@ mod tests {
             address,
             driver_name: "alpha".to_string(),
             reason: "managed bridge".to_string(),
+            allow_delayed_bind: false,
         }
     }
 
@@ -684,6 +927,16 @@ mod tests {
             address,
             driver_name: "beta".to_string(),
             reason: "managed bridge".to_string(),
+            allow_delayed_bind: false,
+        }
+    }
+
+    fn delayed_podman_requirement(address: SocketAddr) -> GatewayListenerRequirement {
+        GatewayListenerRequirement::Exact {
+            address,
+            driver_name: "podman".to_string(),
+            reason: "managed bridge".to_string(),
+            allow_delayed_bind: true,
         }
     }
 
@@ -707,6 +960,7 @@ mod tests {
             scope: GatewayListenerScope::Primary,
             covered_addresses: Vec::new(),
             provenance: None,
+            allows_delayed_bind: false,
         }
     }
 
@@ -723,6 +977,7 @@ mod tests {
                 driver_name: driver_name.to_string(),
                 reason: reason.to_string(),
             }),
+            allows_delayed_bind: false,
         }
     }
 }

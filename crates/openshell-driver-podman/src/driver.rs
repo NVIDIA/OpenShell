@@ -20,13 +20,15 @@ use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
     effective_driver_gpu_count, validate_specific_gpu_device_request,
 };
-#[cfg(target_os = "linux")]
-use openshell_core::proto::compute::v1::GatewayDefaultRouteInterfaceRequirement;
 #[cfg(target_os = "macos")]
 use openshell_core::proto::compute::v1::GatewayLoopbackInterfaceRequirement;
 use openshell_core::proto::compute::v1::{
     DriverSandbox, GatewayListenerRequirement, GetCapabilitiesResponse, GpuResourceRequirements,
     gateway_listener_requirement::Selector,
+};
+#[cfg(target_os = "linux")]
+use openshell_core::proto::compute::v1::{
+    GatewayDefaultRouteInterfaceRequirement, GatewayExactBindAddressRequirement,
 };
 #[cfg(target_os = "linux")]
 use std::net::{IpAddr, SocketAddr};
@@ -586,9 +588,14 @@ impl PodmanComputeDriver {
             })?;
             Ok(vec![GatewayListenerRequirement {
                 reason: format!("Podman network '{}' host gateway", self.config.network_name),
-                selector: Some(Selector::ExactBindAddress(
-                    SocketAddr::new(gateway_ip, callback_port).to_string(),
-                )),
+                selector: Some(Selector::ExactBind(GatewayExactBindAddressRequirement {
+                    address: SocketAddr::new(gateway_ip, callback_port).to_string(),
+                    // A rootful managed bridge can be created after gateway
+                    // startup. An explicit override is operator-owned, and
+                    // rootless networking must never broaden the listener.
+                    allow_delayed_bind: !self.rootless
+                        && self.config.host_gateway_ip.trim().is_empty(),
+                })),
             }])
         }
         #[cfg(target_os = "macos")]
@@ -2179,7 +2186,10 @@ mod tests {
         assert_eq!(requirements.len(), 1);
         assert_eq!(
             requirements[0].selector,
-            Some(Selector::ExactBindAddress("10.89.1.1:17670".to_string()))
+            Some(Selector::ExactBind(GatewayExactBindAddressRequirement {
+                address: "10.89.1.1:17670".to_string(),
+                allow_delayed_bind: true,
+            }))
         );
     }
 
@@ -2199,7 +2209,10 @@ mod tests {
 
         assert_eq!(
             requirements[0].selector,
-            Some(Selector::ExactBindAddress("10.90.1.1:17670".to_string()))
+            Some(Selector::ExactBind(GatewayExactBindAddressRequirement {
+                address: "10.90.1.1:17670".to_string(),
+                allow_delayed_bind: false,
+            }))
         );
     }
 

@@ -117,10 +117,18 @@ jobs:
       rpm-release: ${{ needs.version.outputs.rpm_release }}
 
   fedora:
-    name: Fedora with Rootless Podman
+    name: Fedora with ${{ matrix.name }} Podman
     needs: [build-conformance, build-rpm]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Rootless
+            configuration: podman-rootless
+          - name: Rootful
+            configuration: podman-rootful
     permissions:
       actions: read
       contents: read
@@ -154,8 +162,10 @@ jobs:
           name: openshell-conformance-x86_64-unknown-linux-musl
           path: conformance-input
 
-      - name: Run RPM gateway continuity conformance
+      - name: Run RPM gateway conformance
         shell: bash
+        env:
+          PODMAN_CONFIGURATION: ${{ matrix.configuration }}
         run: |
           set -euo pipefail
           chmod +x conformance-input/openshell-conformance
@@ -171,13 +181,13 @@ jobs:
 
           OPENSHELL_TEST_GUEST_CACHE_DISABLE=1 nix run .#test-guest -- \
             --distro fedora \
-            --with podman-rootless \
+            --with "${PODMAN_CONFIGURATION}" \
             --with selinux \
-            --copy "${candidate_cli_package[0]}:/var/lib/openshell-conformance/candidate/openshell.rpm" \
-            --copy "${candidate_gateway_package[0]}:/var/lib/openshell-conformance/candidate/openshell-gateway.rpm" \
+            --install "${candidate_cli_package[0]}" \
+            --install "${candidate_gateway_package[0]}" \
             --copy conformance-input/openshell-conformance:/tmp/openshell-conformance \
-            --copy nix/test-guest/conformance-plans/gateway-upgrade-restart.toml:/tmp/conformance-plan.toml \
-            --provision openshell-rpm-latest-release \
+            --copy nix/test-guest/conformance-plans/gateway-restart.toml:/tmp/conformance-plan.toml \
+            --provision openshell-rpm \
             --provision gateway-podman \
-            --provision openshell-rpm-gateway-upgrade \
-            -- /tmp/openshell-conformance run --plan /tmp/conformance-plan.toml
+            -- /home/openshell/.local/bin/openshell-test-guest-as-gateway-user \
+              /tmp/openshell-conformance run --plan /tmp/conformance-plan.toml
