@@ -31,15 +31,8 @@ jobs:
     name: Publish core approval status
     if: github.repository_owner == 'NVIDIA'
     runs-on: ubuntu-latest
-    # Seeded so the guard step below can still publish a red status when the
-    # job fails before the publishing step resolves the head SHA itself — a
-    # checkout failure, or a transient API error. Step-level writes to
-    # $GITHUB_ENV override this for later steps, so post_status clearing it
-    # still works. Empty only on workflow_dispatch, where no SHA is known until
-    # the publishing step looks the pull request up.
     env:
       STATUS_CONTEXT: OpenShell / Core Approval
-      STATUS_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
     steps:
       # Check out the default branch, never the pull request head. This job runs
       # with a write-capable token, so it must not fetch or execute contributor
@@ -55,6 +48,7 @@ jobs:
           persist-credentials: false
 
       - name: Publish core approval status
+        id: publish
         timeout-minutes: 10
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -78,10 +72,9 @@ jobs:
               -f "description=$description" \
               -f "target_url=$target_url" >/dev/null
             # A status was published, so the guard step has nothing to add.
-            # $GITHUB_ENV is read once after the step finishes and the last
-            # write wins, so this correctly reflects whether any status was
-            # posted.
-            echo "STATUS_SHA=" >> "$GITHUB_ENV"
+            # Step outputs are collected after the step finishes, including
+            # when it fails, so this reaches the guard either way.
+            echo "posted=true" >> "$GITHUB_OUTPUT"
           }
 
           # A merge group only forms after the pull request satisfied this gate,
@@ -89,7 +82,6 @@ jobs:
           # success so the queue's required-check evaluation resolves instead of
           # waiting out check_response_timeout_minutes.
           if [ "$EVENT_NAME" = "merge_group" ]; then
-            echo "STATUS_SHA=$MERGE_GROUP_SHA" >> "$GITHUB_ENV"
             post_status "$MERGE_GROUP_SHA" success \
               "Approval enforced at pull request" "$RUN_URL"
             exit 0
@@ -104,7 +96,7 @@ jobs:
           fi
 
           HEAD_SHA=$(jq -r '.head.sha' <<< "$PR")
-          echo "STATUS_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
           AUTHOR=$(jq -r '.user.login' <<< "$PR")
           TARGET_URL="https://github.com/$GH_REPO/pull/$PR_NUMBER"
 
@@ -132,13 +124,25 @@ jobs:
       # would otherwise sit at "Expected" forever. Publish red so the state is
       # visible and the job can be re-run.
       - name: Publish a failure status if none was published
-        if: failure() && env.STATUS_SHA != ''
+        if: failure() && steps.publish.outputs.posted != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          # The step output covers a failure after the pull request was looked
+          # up, including on workflow_dispatch. The event payload covers a
+          # failure before that — a failed checkout, or a transient API error.
+          STATUS_SHA: ${{ steps.publish.outputs.head_sha || github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         shell: bash
         run: |
           set -euo pipefail
+
+          # workflow_dispatch aborting before the lookup leaves no SHA to
+          # address. Nothing can be published; say so rather than failing here.
+          if [ -z "$STATUS_SHA" ]; then
+            echo "::warning::No head SHA resolved; cannot publish a failure status."
+            exit 0
+          fi
+
           gh api --method POST "repos/$GH_REPO/statuses/$STATUS_SHA" \
             -f "state=failure" \
             -f "context=$STATUS_CONTEXT" \
