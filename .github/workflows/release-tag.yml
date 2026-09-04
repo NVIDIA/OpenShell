@@ -673,7 +673,7 @@ jobs:
     with:
       operation: sync
       channel: stable
-      source_ref: ${{ inputs.tag || github.ref_name }}
+      source_ref: ${{ needs.compute-versions.outputs.source_sha }}
       release_version: ${{ needs.compute-versions.outputs.semver }}
       version_slug: v${{ needs.compute-versions.outputs.semver }}
       display_name: Latest (v${{ needs.compute-versions.outputs.semver }})
