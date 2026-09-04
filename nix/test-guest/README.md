@@ -217,8 +217,10 @@ EOF
 `openshell-rpm` expects OpenShell to have been installed with `--install`. It
 uses the RPM-owned `/usr/bin` binaries and `openshell-gateway` user service,
 without copied development artifacts or a supervisor archive. Compose it with
-`gateway-rootless-podman` before an RPM action such as
-`openshell-rpm-gateway-upgrade`.
+`gateway-rootless-podman` to test the installed candidate directly. The
+`gateway-restart.toml` plan covers the candidate through smoke, lifecycle, and
+gateway-restart continuity checks. `gateway-upgrade-restart.toml` retains the
+separate upgrade action contract for dedicated upgrade testing.
 
 `openshell-rpm-latest-release` downloads and installs the latest stable
 OpenShell GitHub release for the guest architecture, then publishes the same
