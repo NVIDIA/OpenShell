@@ -1390,6 +1390,9 @@ message WatchSandboxRequest {
 
   // Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
   string log_min_level = 10;
+
+  // Resume streaming after this cursor (0 = from the beginning).
+  uint64 resume_after_cursor = 11;
 }
 
 // One event in a sandbox watch stream.
@@ -1406,6 +1409,8 @@ message SandboxStreamEvent {
     // Draft policy update notification.
     DraftPolicyUpdate draft_policy_update = 5;
   }
+  // Monotonic per-source position for resuming after a cursor.
+  uint64 cursor = 6;
 }
 
 // Log line correlated to a sandbox.

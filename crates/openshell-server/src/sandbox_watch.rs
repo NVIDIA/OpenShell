@@ -76,6 +76,8 @@ pub fn lag_warning_event(n: u64) -> openshell_core::proto::SandboxStreamEvent {
     use openshell_core::proto::sandbox_stream_event::Payload;
     openshell_core::proto::SandboxStreamEvent {
         payload: Some(Payload::Warning(lag_warning(n))),
+        // Warnings are not part of the resumable log/platform sequence.
+        cursor: 0,
     }
 }
 

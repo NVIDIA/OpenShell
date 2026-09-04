@@ -1031,6 +1031,8 @@ pub(super) async fn handle_watch_sandbox(
                                     sandbox.clone(),
                                 ),
                             ),
+                            // Status snapshots are re-read, not resumed by cursor.
+                            cursor: 0,
                         }))
                         .await;
 
@@ -1106,7 +1108,7 @@ pub(super) async fn handle_watch_sandbox(
                                 match state.store.get_message::<Sandbox>(&sandbox_id).await {
                                     Ok(Some(sandbox)) => {
                                         state.sandbox_index.update_from_sandbox(&sandbox);
-                                        if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone()))})).await.is_err() {
+                                        if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone())), cursor: 0 })).await.is_err() {
                                             return;
                                         }
                                         if stop_on_terminal {

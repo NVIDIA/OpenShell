@@ -2890,6 +2890,8 @@ impl ComputeRuntime {
                                     public_platform_event_from_driver(&event),
                                 ),
                             ),
+                            // Placeholder: platform_event_bus.publish() stamps the cursor.
+                            cursor: 0,
                         },
                     );
                 }
