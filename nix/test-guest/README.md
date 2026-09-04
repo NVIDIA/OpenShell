@@ -40,6 +40,7 @@ nix/test-guest/
 │   └── rocky.nix
 └── configuration/
     ├── docker.yml
+    ├── podman-rootful.yml
     ├── podman-rootless.yml
     ├── tasks/
     │   ├── podman-common.yml
@@ -50,6 +51,8 @@ nix/test-guest/
     └── selinux.yml
 └── provisioners/
     └── roles/
+        ├── gateway-podman/
+        ├── gateway-rootful-podman/
         ├── gateway-rootless-podman/
         ├── openshell-development/
         ├── openshell-rpm/
@@ -70,13 +73,13 @@ The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-gues
 
 ## Supported configurations
 
-| Distro | Docker | Rootless Podman | SELinux | Package format |
-| --- | --- | --- | --- | --- |
-| Ubuntu 24.04 | Yes | No | No | `.deb` |
-| Ubuntu 26.04 | Yes | Yes | No | `.deb` |
-| CentOS Stream 10 | No | No | Yes | `.rpm` |
-| Fedora 44 | No | Yes | Yes | `.rpm` |
-| Rocky Linux 9 | Yes | No | Yes | `.rpm` |
+| Distro | Docker | Rootful Podman | Rootless Podman | SELinux | Package format |
+| --- | --- | --- | --- | --- | --- |
+| Ubuntu 24.04 | Yes | Yes | No | No | `.deb` |
+| Ubuntu 26.04 | Yes | Yes | Yes | No | `.deb` |
+| CentOS Stream 10 | No | Yes | No | Yes | `.rpm` |
+| Fedora 44 | No | Yes | Yes | Yes | `.rpm` |
+| Rocky Linux 9 | Yes | Yes | No | Yes | `.rpm` |
 
 The `snapd` configuration is available for Ubuntu and prepares snapd for
 local Snap lifecycle experiments. It does not install Docker, because the Snap
@@ -90,6 +93,11 @@ installs the subordinate-ID utilities and rootless storage and network helpers.
 Both configurations verify rootless mode and the `pasta` network helper
 required by OpenShell sandbox callbacks. Ubuntu 24.04 ships Podman 4, which
 does not provide that helper.
+
+`podman-rootful` installs Podman and enables its system API socket. The
+`gateway-rootful-podman` provisioner then starts the selected OpenShell
+installation as root. It does not write a rootful-specific gateway setting;
+the gateway discovers the Podman socket available to its service account.
 
 List the available distros and configurations:
 
@@ -115,6 +123,7 @@ Other combinations use the same interface:
 
 ```shell
 nix run .#test-guest -- --distro rocky --with docker
+nix run .#test-guest -- --distro fedora --with podman-rootful
 nix run .#test-guest -- --distro ubuntu-26-04 --with podman-rootless
 nix run .#test-guest -- --distro fedora --with podman-rootless
 ```
@@ -189,8 +198,12 @@ EOF
 - `/usr/local/bin/openshell-gateway`
 - `/usr/local/lib/openshell-sandbox.tar`
 
-Compose it with `gateway-rootless-podman` to configure a rootless Podman
-gateway. For example, run conformance after the provisioners complete:
+Compose it with `gateway-rootless-podman` or `gateway-rootful-podman` to run
+the same Podman gateway configuration under the corresponding service account.
+The shared `gateway-podman` role generates configuration only for development
+artifacts. RPM installations retain their packaged service and first-start
+configuration. For example, run conformance after the rootless provisioners
+complete:
 
 ```shell
 nix run .#test-guest -- \
@@ -218,8 +231,25 @@ EOF
 `openshell-rpm` expects OpenShell to have been installed with `--install`. It
 uses the RPM-owned `/usr/bin` binaries and `openshell-gateway` user service,
 without copied development artifacts or a supervisor archive. Compose it with
-`gateway-rootless-podman` before an RPM action such as
-`openshell-rpm-gateway-upgrade`.
+either Podman gateway wrapper to test the installed version directly.
+
+For example, run the current RPMs through rootful Podman conformance with:
+
+```shell
+nix run .#test-guest -- \
+  --distro fedora --with podman-rootful --with selinux \
+  --install ./openshell.rpm \
+  --install ./openshell-gateway.rpm \
+  --copy ./openshell-conformance:/tmp/openshell-conformance \
+  --copy nix/test-guest/conformance-plans/gateway-restart.toml:/tmp/conformance-plan.toml \
+  --provision openshell-rpm \
+  --provision gateway-rootful-podman \
+  -- /home/openshell/.local/bin/openshell-test-guest-as-gateway-user \
+    /tmp/openshell-conformance run --plan /tmp/conformance-plan.toml
+```
+
+Use `podman-rootless` and `gateway-rootless-podman` for the equivalent rootless
+run. All copied binaries and RPMs must match the guest architecture.
 
 `openshell-rpm-latest-release` downloads and installs the latest stable
 OpenShell GitHub release for the guest architecture, then publishes the same
@@ -230,6 +260,10 @@ Versioned plans under `nix/test-guest/conformance-plans/` bind conformance
 scenarios to the stable action-command contracts installed by provisioners.
 Copy the applicable plan to the guest and pass it to `openshell-conformance run
 --plan`.
+
+`gateway-restart.toml` tests the installed version with smoke coverage and
+sandbox continuity across a gateway restart. `gateway-upgrade-restart.toml`
+retains the upgrade action contract for dedicated upgrade testing.
 
 ## Prepared VM cache
 
