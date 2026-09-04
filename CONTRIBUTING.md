@@ -68,6 +68,10 @@ Do not start substantial issue-backed work until a maintainer has accepted the i
 
 Use agents and the repository skills as needed to understand the affected code, evaluate tradeoffs, implement the smallest coherent change, and verify it. The pull request should explain what changed and how it was tested; it should not substitute an agent transcript for the contributor's understanding.
 
+Every pull request must be approved by someone listed in [MAINTAINERS.md](MAINTAINERS.md) before it can merge. This is enforced by the `OpenShell / Core Approval` status check, which turns green once one of those reviewers approves. Reviews from other contributors are welcome and count toward the general approval requirement, but they do not satisfy this check.
+
+Maintainers are not requested automatically. If your pull request has been idle, ask for a reviewer in the pull request or in the CNCF Slack channel rather than waiting.
+
 ## Agent Skills
 
 OpenShell keeps skills for using the product separate from skills for developing the repository.
