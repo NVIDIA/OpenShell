@@ -43,7 +43,7 @@ let
     "openshell-development"
     "openshell-rpm"
     "openshell-rpm-latest-release"
-    "gateway-rootless-podman"
+    "gateway-podman"
     "openshell-rpm-gateway-reinstall"
     "openshell-rpm-gateway-upgrade"
   ];

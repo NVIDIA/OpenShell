@@ -1,0 +1,135 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Publish gateway user-manager environment
+  ansible.builtin.set_fact:
+    openshell_gateway_user_environment:
+      HOME: "{{ openshell_gateway_service_home }}"
+      XDG_RUNTIME_DIR: "/run/user/{{ openshell_gateway_service_uid }}"
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ openshell_gateway_service_uid }}/bus"
+
+- name: Reload gateway user services
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+    scope: user
+  environment: "{{ openshell_gateway_user_environment }}"
+  become: true
+  become_user: "{{ openshell_gateway_service_user }}"
+
+- name: Start the gateway user service
+  ansible.builtin.systemd_service:
+    name: "{{ openshell_gateway_service }}"
+    enabled: true
+    state: started
+    scope: user
+  environment: "{{ openshell_gateway_user_environment }}"
+  become: true
+  become_user: "{{ openshell_gateway_service_user }}"
+
+- name: Register the provisioned gateway with its service account
+  ansible.builtin.command:
+    cmd: "{{ openshell_cli_bin }} gateway add {{ openshell_gateway_endpoint }} --local --name test-guest"
+  environment: "{{ openshell_gateway_user_environment }}"
+  become: true
+  become_user: "{{ openshell_gateway_service_user }}"
+
+- name: Wait for gateway CLI health
+  ansible.builtin.command:
+    cmd: "{{ openshell_cli_bin }} status"
+  environment: "{{ openshell_gateway_user_environment }}"
+  become: true
+  become_user: "{{ openshell_gateway_service_user }}"
+  register: gateway_health
+  changed_when: false
+  retries: 60
+  delay: 1
+  until: gateway_health.rc == 0
+  ignore_errors: true
+
+- name: Collect failed gateway service status
+  ansible.builtin.command:
+    cmd: "systemctl --user status {{ openshell_gateway_service }} --no-pager"
+  environment: "{{ openshell_gateway_user_environment }}"
+  become: true
+  become_user: "{{ openshell_gateway_service_user }}"
+  register: gateway_service_status
+  changed_when: false
+  failed_when: false
+  when: gateway_health is failed
+
+- name: Collect failed gateway service journal
+  ansible.builtin.command:
+    cmd: "journalctl --user -u {{ openshell_gateway_service }} --no-pager -n 200"
+  environment: "{{ openshell_gateway_user_environment }}"
+  become: true
+  become_user: "{{ openshell_gateway_service_user }}"
+  register: gateway_service_journal
+  changed_when: false
+  failed_when: false
+  when: gateway_health is failed
+
+- name: Report failed gateway service diagnostics
+  ansible.builtin.debug:
+    msg: |
+      {{ gateway_service_status.stdout }}
+      {{ gateway_service_journal.stdout }}
+  when: gateway_health is failed
+
+- name: Require gateway CLI health
+  ansible.builtin.assert:
+    that: gateway_health is not failed
+    fail_msg: The provisioned gateway did not become healthy.
+
+- name: Create the target gateway-control command directory
+  ansible.builtin.file:
+    path: "{{ openshell_gateway_restart_command | dirname }}"
+    state: directory
+    mode: "0700"
+
+- name: Install the gateway service-account command wrapper
+  ansible.builtin.copy:
+    dest: "{{ openshell_gateway_service_command }}"
+    mode: "0700"
+    content: |
+      #!/usr/bin/env bash
+      set -Eeuo pipefail
+      exec sudo -H -u {{ openshell_gateway_service_user }} env \
+        HOME={{ openshell_gateway_service_home }} \
+        XDG_RUNTIME_DIR=/run/user/{{ openshell_gateway_service_uid }} \
+        DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{{ openshell_gateway_service_uid }}/bus \
+        "$@"
+
+- name: Install the target gateway restart command
+  ansible.builtin.copy:
+    dest: "{{ openshell_gateway_restart_command }}"
+    mode: "0700"
+    content: |
+      #!/usr/bin/env bash
+      set -Eeuo pipefail
+      gateway_user_command={{ openshell_gateway_service_command | quote }}
+      "${gateway_user_command}" systemctl --user restart {{ openshell_gateway_service }}
+      for _ in $(seq 1 60); do
+        if "${gateway_user_command}" {{ openshell_cli_bin }} status >/dev/null 2>&1; then
+          exit 0
+        fi
+        sleep 1
+      done
+      "${gateway_user_command}" systemctl --user status {{ openshell_gateway_service }} --no-pager >&2 || true
+      exit 1
+
+- name: Install the target gateway diagnostics command
+  ansible.builtin.copy:
+    dest: "{{ openshell_gateway_diagnostics_command }}"
+    mode: "0700"
+    content: |
+      #!/usr/bin/env bash
+      set -u
+      gateway_user_command={{ openshell_gateway_service_command | quote }}
+      "${gateway_user_command}" systemctl --user status {{ openshell_gateway_service }} --no-pager || true
+      "${gateway_user_command}" journalctl --user -u {{ openshell_gateway_service }} --no-pager -n 200 || true
+      "${gateway_user_command}" podman info || true
+      "${gateway_user_command}" podman ps --all || true
+      if command -v getenforce >/dev/null 2>&1; then
+        getenforce || true
+      fi

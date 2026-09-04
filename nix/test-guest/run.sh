@@ -176,17 +176,27 @@ fi
 # shellcheck disable=SC1090
 . "${OPENSHELL_TEST_GUEST_DISTROS}/${distro}"
 
-	for item in "${configurations[@]}"; do
-		if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
+podman_mode=
+for item in "${configurations[@]}"; do
+	if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
 		[ ! -f "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}/${item}" ]; then
 		echo "unknown configuration: ${item:-<empty>}" >&2
 		exit 2
 	fi
+	case "${item}" in
+	podman-rootless)
+		podman_mode=rootless
+		;;
+	esac
 done
 for item in "${provisions[@]}"; do
 	if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
 		[ ! -d "${OPENSHELL_TEST_GUEST_PROVISIONERS}/${item}" ]; then
 		echo "unknown provisioner: ${item:-<empty>}" >&2
+		exit 2
+	fi
+	if [ "${item}" = gateway-podman ] && [ "${podman_mode}" != rootless ]; then
+		echo "gateway-podman requires --with podman-rootless" >&2
 		exit 2
 	fi
 done

@@ -34,3 +34,9 @@
 
     - name: Configure shared rootless Podman settings
       ansible.builtin.import_tasks: tasks/podman-rootless/shared.yml
+
+    - name: Record rootless Podman mode
+      ansible.builtin.copy:
+        dest: /etc/openshell-test-guest/podman-mode
+        content: "rootless\n"
+        mode: "0644"

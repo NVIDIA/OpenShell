@@ -50,7 +50,7 @@ nix/test-guest/
     └── selinux.yml
 └── provisioners/
     └── roles/
-        ├── gateway-rootless-podman/
+        ├── gateway-podman/
         ├── openshell-development/
         ├── openshell-rpm/
         └── openshell-rpm-gateway-upgrade/
@@ -188,7 +188,7 @@ EOF
 - `/usr/local/bin/openshell-gateway`
 - `/usr/local/lib/openshell-sandbox.tar`
 
-Compose it with `gateway-rootless-podman` to configure a rootless Podman
+Compose it with `gateway-podman` to configure a rootless Podman
 gateway. For example, run conformance after the provisioners complete:
 
 ```shell
@@ -199,7 +199,7 @@ nix run .#test-guest -- \
   --copy ./openshell-gateway:/usr/local/bin/openshell-gateway \
   --copy ./openshell-sandbox.tar:/usr/local/lib/openshell-sandbox.tar \
   --provision openshell-development \
-  --provision gateway-rootless-podman \
+  --provision gateway-podman \
   -- /usr/local/bin/openshell-conformance run --plan - <<'EOF'
 version = 1
 
@@ -217,12 +217,12 @@ EOF
 `openshell-rpm` expects OpenShell to have been installed with `--install`. It
 uses the RPM-owned `/usr/bin` binaries and `openshell-gateway` user service,
 without copied development artifacts or a supervisor archive. Compose it with
-`gateway-rootless-podman` before an RPM action such as
+`gateway-podman` before an RPM action such as
 `openshell-rpm-gateway-upgrade`.
 
 `openshell-rpm-latest-release` downloads and installs the latest stable
 OpenShell GitHub release for the guest architecture, then publishes the same
-RPM installation contract. Compose it with `gateway-rootless-podman` and an
+RPM installation contract. Compose it with `gateway-podman` and an
 RPM gateway action when testing an upgrade from the current release.
 
 Versioned plans under `nix/test-guest/conformance-plans/` bind conformance
