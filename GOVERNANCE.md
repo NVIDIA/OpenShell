@@ -57,6 +57,8 @@ An existing Maintainer may nominate a Contributor to become a Reviewer. A simple
 
 Maintainers have project-wide write, merge, and voting privileges. They are collectively responsible for steering OpenShell in a positive direction and for managing project resources and contributor access. The current Maintainers are listed in [MAINTAINERS.md](MAINTAINERS.md).
 
+Maintainer status is held by individual humans. AI agents, automated systems, service accounts, companies, and other organizations cannot be Maintainers or exercise Maintainer votes.
+
 Maintainers are responsible for:
 
 - Reviewing and merging contributions across the project.
@@ -100,8 +102,11 @@ Meeting the minimum participation requirements only establishes eligibility. A c
 - Support for new and occasional contributors.
 - A community-first perspective and an ability to act independently of the candidate's employer, friends, team, product, or organizational priorities.
 - Personal accountability for contributions and reviews, including the ability to explain, validate, and take responsibility for work produced with AI tools or agents.
+- Direct participation in OpenShell community calls, sufficient for the community to know the person behind the contributions and for Maintainers to assess the candidate's understanding, judgment, communication, and accountability.
 
 The use of AI or agents neither qualifies nor disqualifies a candidate. The Maintainer Council evaluates the candidate's demonstrated understanding, judgment, accountability, community participation, and the value they add to the project's human review and decision-making capacity. Raw contribution velocity, lines of code, and activity counts beyond the eligibility floor are not proxies for those qualities.
+
+Community call attendance is qualitative evidence, not an attendance quota or substitute for the other requirements. Candidates who cannot reasonably attend the regular call because of time zone, accessibility, or similar constraints may arrange equivalent direct, synchronous participation with community members and Maintainers. Video participation is not required.
 
 An existing Maintainer must nominate a candidate by sending a message to the [project mailing list](mailto:openshell-maintainers@ai-openshell.org). A simple majority vote of all active Maintainers approves the nomination. Nominations are evaluated without prejudice to employer or demographics and should consider the organizational diversity of the Maintainer Council.
 
