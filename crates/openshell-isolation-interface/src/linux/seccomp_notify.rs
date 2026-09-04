@@ -806,6 +806,14 @@ fn verify_notification_sizes() -> io::Result<()> {
 fn ioctl_ptr(fd: RawFd, request: libc::c_ulong, argument: *mut libc::c_void) -> io::Result<i64> {
     // SAFETY: every caller supplies the UAPI structure encoded into `request`,
     // alive and writable for the ioctl duration.
+    // `libc::ioctl` models the request as `c_ulong` for glibc and `c_int`
+    // for musl. Linux UAPI request values fit both representations.
+    #[cfg(target_env = "musl")]
+    let request = u32::try_from(request).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "ioctl request exceeds 32 bits")
+    })?;
+    #[cfg(target_env = "musl")]
+    let request = libc::c_int::from_ne_bytes(request.to_ne_bytes());
     let result = unsafe { libc::ioctl(fd, request, argument) };
     if result < 0 {
         Err(io::Error::last_os_error())
