@@ -218,15 +218,19 @@ if [ "${SCENARIO}" = "podman-options" ] && [ ! -f "${PODMAN_OPTIONS_ORACLE}" ]; 
 fi
 
 write_result() {
-  local variant=$1 source_sha=$2 schema=$3 status=$4 external_driver=$5
+  local variant=$1 source_sha=$2 schema=$3 status=$4 gateway=$5 cli=$6 conformance=$7 external_driver=$8
   local normalized_result="" external_driver_digest="" gateway_profile="in-tree"
+  local gateway_digest cli_digest conformance_digest
+  gateway_digest="$(sha256sum "${gateway}" | cut -d' ' -f1)"
+  cli_digest="$(sha256sum "${cli}" | cut -d' ' -f1)"
+  conformance_digest="$(sha256sum "${conformance}" | cut -d' ' -f1)"
   if [ -n "${external_driver}" ]; then
     external_driver_digest=",\"external_driver_sha256\":\"$(sha256sum "${external_driver}" | cut -d' ' -f1)\""
     gateway_profile="driver-free"
   fi
   if [ "${SCENARIO}" = "podman-options" ]; then normalized_result=",\"normalized_result\":\"${variant}.normalized.json\""; fi
   cat >"${RESULTS_DIR}/${variant}.json" <<EOF
-{"variant":"${variant}","source_sha":"${source_sha}","schema_version":${schema},"driver":"${DRIVER}","scenario":"${SCENARIO}","command_class":"${COMMAND_CLASS}","gateway_profile":"${gateway_profile}"${normalized_result}${external_driver_digest},"success":${status}}
+{"variant":"${variant}","source_sha":"${source_sha}","schema_version":${schema},"driver":"${DRIVER}","scenario":"${SCENARIO}","command_class":"${COMMAND_CLASS}","gateway_profile":"${gateway_profile}","gateway_sha256":"${gateway_digest}","cli_sha256":"${cli_digest}","conformance_sha256":"${conformance_digest}"${normalized_result}${external_driver_digest},"success":${status}}
 EOF
 }
 
@@ -302,7 +306,7 @@ run_variant() {
   else
     result_status=false
   fi
-  write_result "${variant}" "${source_sha}" "${schema}" "${result_status}" "${external_driver}"
+  write_result "${variant}" "${source_sha}" "${schema}" "${result_status}" "${gateway}" "${cli}" "${conformance}" "${external_driver}"
   [ "${result_status}" = true ]
 }
 
