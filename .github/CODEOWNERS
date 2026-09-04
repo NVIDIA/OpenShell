@@ -7,3 +7,15 @@
 
 # Vouch list — maintainers only (bot commits bypass, but manual edits need review)
 .github/VOUCHED.td @NVIDIA/openshell-codeowners
+
+# Approval machinery — these files decide who can merge. MAINTAINERS.md is the
+# approver list itself; the workflow and helper below evaluate it and publish
+# "OpenShell / Core Approval". A change to any of them silently redefines who
+# can approve anything, so each keeps an explicit owner after the wildcard above
+# was disabled. Scoped to these paths on purpose — owning all of .github/ would
+# reintroduce the fan-out this file just removed.
+/MAINTAINERS.md @NVIDIA/openshell-codeowners
+/.github/CODEOWNERS @NVIDIA/openshell-codeowners
+/.github/workflows/core-approval.yml @NVIDIA/openshell-codeowners
+/.github/zizmor.yml @NVIDIA/openshell-codeowners
+/tasks/scripts/core_approval.py @NVIDIA/openshell-codeowners
