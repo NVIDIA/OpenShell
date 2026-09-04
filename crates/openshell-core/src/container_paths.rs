@@ -74,6 +74,13 @@ pub const VM_GUEST_INIT_DROPIN_MANIFEST: &str = "/opt/openshell/init.d.manifest"
 /// secrets, so this is the same delivery the per-sandbox JWT already uses.
 pub const VM_GUEST_UPSTREAM_PROXY_AUTH_PATH: &str = "/opt/openshell/auth/upstream-proxy";
 
+/// Guest path for the corporate proxy CA bundle staged by the VM driver.
+///
+/// The bundle is operator-owned but not secret. The driver validates it and
+/// writes it into each sandbox overlay with mode `0644`, then passes only this
+/// guest path to the supervisor.
+pub const VM_GUEST_PROXY_CA_PATH: &str = "/opt/openshell/tls/proxy-ca.pem";
+
 /// Guest path for the driver-authored supervisor argument list in VM sandboxes.
 ///
 /// Podman and Kubernetes build the supervisor's command line directly; the VM
@@ -120,6 +127,7 @@ mod tests {
             VM_GUEST_TLS_KEY_PATH,
             VM_GUEST_SANDBOX_TOKEN_PATH,
             VM_GUEST_UPSTREAM_PROXY_AUTH_PATH,
+            VM_GUEST_PROXY_CA_PATH,
             VM_GUEST_INIT_DROPIN_DIR,
             VM_GUEST_INIT_DROPIN_MANIFEST,
             VM_GUEST_SUPERVISOR_ARGS_PATH,

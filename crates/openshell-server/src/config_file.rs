@@ -745,10 +745,6 @@ credential_drivers = ["kubernetes-secrets"]
 grpc_rate_limit_requests = 120
 grpc_rate_limit_window_seconds = 60
 policy_validation_failure_mode = "retain_last_valid"
-default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
-supervisor_image = "ghcr.io/nvidia/openshell/supervisor:latest"
-client_tls_secret_name = "openshell-sandbox-tls"
-service_account_name = "openshell-sandbox"
 
 [openshell.gateway.tls]
 cert_path = "/etc/openshell/certs/gateway.pem"
@@ -774,10 +770,6 @@ namespace = "agents"
         let file = load(tmp.path()).expect("valid file parses");
         let gw = &file.openshell.gateway;
         assert_eq!(gw.log_level.as_deref(), Some("info"));
-        assert_eq!(
-            gw.default_image.as_deref(),
-            Some("ghcr.io/nvidia/openshell-community/sandboxes/base:latest")
-        );
         assert_eq!(gw.grpc_rate_limit_requests, Some(120));
         assert_eq!(gw.grpc_rate_limit_window_seconds, Some(60));
         assert_eq!(
@@ -791,7 +783,18 @@ namespace = "agents"
             Some(&["kubernetes-secrets".to_string()][..])
         );
         assert!(gw.default_credential_driver.is_none());
-        assert!(file.openshell.drivers.contains_key("kubernetes"));
+        let kubernetes = file
+            .openshell
+            .drivers
+            .get("kubernetes")
+            .and_then(toml::Value::as_table)
+            .expect("kubernetes driver table");
+        assert_eq!(
+            kubernetes
+                .get("default_image")
+                .and_then(toml::Value::as_str),
+            Some("ghcr.io/nvidia/openshell/sandbox:latest")
+        );
         assert!(
             file.openshell
                 .credential_drivers

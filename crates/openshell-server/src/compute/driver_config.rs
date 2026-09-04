@@ -361,9 +361,12 @@ socket_path = "/run/openshell/kyma.sock"
             );
             let file: config_file::ConfigFile = toml::from_str(&source).expect("valid TOML");
 
-            let local_error =
-                driver_config_from_context::<EmptyDriverConfig>(test_context(Some(&file)), "kyma")
-                    .expect_err("local driver TLS field must be rejected");
+            let local_error = driver_config_from_context::<EmptyDriverConfig>(
+                test_context(Some(&file)),
+                "kyma",
+                &[],
+            )
+            .expect_err("local driver TLS field must be rejected");
             assert!(local_error.to_string().contains(field));
             assert!(local_error.to_string().contains("[openshell.gateway]"));
 
