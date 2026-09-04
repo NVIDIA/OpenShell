@@ -117,6 +117,8 @@ impl TracingLogBus {
             payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
                 log.clone(),
             )),
+            // Placeholder: publish() stamps the real cursor from next_seq.
+            cursor: 0,
         };
         self.publish(&log.sandbox_id, evt, Self::DEFAULT_TAIL);
     }
@@ -178,6 +180,8 @@ where
             payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
                 log,
             )),
+            // Placeholder: publish() stamps the real cursor from next_seq.
+            cursor: 0,
         };
         self.bus.publish(&sandbox_id, evt, self.default_tail);
     }
@@ -307,7 +311,10 @@ mod tests {
         let mut rx = bus.subscribe(sandbox_id);
 
         // Publish an event
-        let evt = SandboxStreamEvent { payload: None };
+        let evt = SandboxStreamEvent {
+            payload: None,
+            cursor: 0,
+        };
         bus.publish(sandbox_id, evt);
         assert!(rx.try_recv().is_ok());
 
@@ -331,7 +338,10 @@ mod tests {
 
         // New subscription should work
         let mut new_rx = bus.subscribe(sandbox_id);
-        let evt = SandboxStreamEvent { payload: None };
+        let evt = SandboxStreamEvent {
+            payload: None,
+            cursor: 0,
+        };
         bus.publish(sandbox_id, evt);
         assert!(new_rx.try_recv().is_ok());
     }
@@ -361,6 +371,7 @@ mod tests {
                     message: format!("Message {i}"),
                     metadata: HashMap::new(),
                 })),
+                cursor: 0,
             };
             bus.publish(sandbox_id, evt);
         }
@@ -401,7 +412,10 @@ mod tests {
         let bus = PlatformEventBus::new();
         let sandbox_id = "sb-7";
 
-        let evt = SandboxStreamEvent { payload: None };
+        let evt = SandboxStreamEvent {
+            payload: None,
+            cursor: 0,
+        };
         bus.publish(sandbox_id, evt);
         assert_eq!(bus.tail(sandbox_id, 10).len(), 1);
 
