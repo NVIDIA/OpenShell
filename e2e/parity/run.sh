@@ -19,6 +19,9 @@ RESULTS_DIR="${OPENSHELL_PARITY_RESULTS_DIR:-}"
 WRAPPER="${OPENSHELL_PARITY_PODMAN_WRAPPER:-${ROOT}/e2e/with-podman-gateway.sh}"
 PODMAN_OPTIONS_ORACLE="${OPENSHELL_PARITY_PODMAN_OPTIONS_ORACLE:-${ROOT}/e2e/parity/podman-options.sh}"
 PODMAN_BIN="${OPENSHELL_PARITY_PODMAN_BIN:-podman}"
+DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+SANDBOX_IMAGE_REQUEST="${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}"
+PARITY_SANDBOX_RUNTIME_IMAGE=""
 TEMP_WORKTREE=""
 RUN_DIR=""
 
@@ -108,7 +111,8 @@ cleanup() {
     # isolated container store from Podman's user namespace before falling back
     # to ordinary cleanup for runs that never reached the container runtime.
     if { [ -d "${RUN_DIR}/baseline/data/containers/storage" ] \
-      || [ -d "${RUN_DIR}/candidate/data/containers/storage" ]; } \
+      || [ -d "${RUN_DIR}/candidate/data/containers/storage" ] \
+      || [ -d "${RUN_DIR}/sandbox-resolver/data/containers/storage" ]; } \
       && command -v "${PODMAN_BIN}" >/dev/null 2>&1; then
       "${PODMAN_BIN}" unshare rm -rf -- "${RUN_DIR}" >/dev/null 2>&1 || true
     fi
@@ -334,6 +338,54 @@ if [ "${SCENARIO}" = "podman-options" ] && [ ! -f "${PODMAN_OPTIONS_ORACLE}" ]; 
   exit 2
 fi
 
+podman_in_resolver_store() {
+  local resolver_home="${RUN_DIR}/sandbox-resolver"
+  mkdir -p "${resolver_home}/config" "${resolver_home}/state" \
+    "${resolver_home}/cache" "${resolver_home}/data"
+  env -u CONTAINER_HOST -u CONTAINER_CONNECTION -u CONTAINERS_STORAGE_CONF \
+    -u CONTAINERS_CONF -u CONTAINERS_REGISTRIES_CONF -u CONTAINERS_REGISTRIES_CONF_DIR \
+    -u CONTAINERS_POLICY -u PODMAN_CONNECTIONS_CONF -u DOCKER_HOST \
+    XDG_CONFIG_HOME="${resolver_home}/config" \
+    XDG_STATE_HOME="${resolver_home}/state" \
+    XDG_CACHE_HOME="${resolver_home}/cache" \
+    XDG_DATA_HOME="${resolver_home}/data" \
+    "${PODMAN_BIN}" "$@"
+}
+
+resolve_parity_sandbox_image() {
+  local image_id image_digest repository
+  if [ -n "${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-}" ] \
+     && ! [[ "${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE}" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]]; then
+    echo "ERROR: OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE must be digest-pinned for parity runs." >&2
+    exit 2
+  fi
+  case "${SANDBOX_IMAGE_REQUEST}" in
+    */*) ;;
+    *)
+      echo "ERROR: parity sandbox image must use a fully qualified repository: ${SANDBOX_IMAGE_REQUEST}" >&2
+      exit 2
+      ;;
+  esac
+  echo "Resolving parity sandbox image once: ${SANDBOX_IMAGE_REQUEST}"
+  podman_in_resolver_store pull "${SANDBOX_IMAGE_REQUEST}" >/dev/null
+  image_id="$(podman_in_resolver_store image inspect --format '{{.Id}}' "${SANDBOX_IMAGE_REQUEST}")"
+  image_id="${image_id#sha256:}"
+  image_digest="$(podman_in_resolver_store image inspect --format '{{.Digest}}' "${SANDBOX_IMAGE_REQUEST}")"
+  repository="${SANDBOX_IMAGE_REQUEST%%@*}"
+  case "${repository##*/}" in
+    *:*) repository="${repository%:*}" ;;
+  esac
+  PARITY_SANDBOX_RUNTIME_IMAGE="${repository}@${image_digest}"
+  if ! [[ "${image_id}" =~ ^[0-9a-f]{64}$ ]] \
+     || ! [[ "${PARITY_SANDBOX_RUNTIME_IMAGE}" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]]; then
+    echo "ERROR: could not resolve one immutable parity sandbox image from ${SANDBOX_IMAGE_REQUEST}." >&2
+    exit 2
+  fi
+  echo "Using one immutable parity sandbox image for both variants: ${PARITY_SANDBOX_RUNTIME_IMAGE} (ID ${image_id})"
+}
+
+resolve_parity_sandbox_image
+
 write_result() {
   local variant=$1 source_sha=$2 schema=$3 status=$4
   local gateway_digest=$5 cli_digest=$6 conformance_digest=$7 external_driver_digest_value=$8 supervisor_digest=$9 supervisor_dockerfile_digest=${10}
@@ -430,6 +482,7 @@ run_variant() {
     -u CONTAINER_HOST -u CONTAINER_CONNECTION -u CONTAINERS_STORAGE_CONF \
     -u CONTAINERS_CONF -u CONTAINERS_REGISTRIES_CONF -u CONTAINERS_REGISTRIES_CONF_DIR \
     -u CONTAINERS_POLICY -u PODMAN_CONNECTIONS_CONF -u DOCKER_HOST \
+    -u OPENSHELL_SANDBOX_IMAGE -u OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE \
     OPENSHELL_PARITY_VARIANT="${variant}" \
     OPENSHELL_E2E_CONFIG_SCHEMA_VERSION="${schema}" \
     OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER="$([ "${SCENARIO}" = external-driver ] && printf 1 || printf 0)" \
@@ -437,6 +490,8 @@ run_variant() {
     OPENSHELL_E2E_SUPERVISOR_BIN="${supervisor}" \
     OPENSHELL_E2E_SUPERVISOR_DOCKERFILE="${supervisor_dockerfile}" \
     OPENSHELL_E2E_FORCE_TEMP_PODMAN_SERVICE=1 \
+    OPENSHELL_E2E_REQUIRE_DIGEST_PINNED_SANDBOX_IMAGE=1 \
+    OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE="${PARITY_SANDBOX_RUNTIME_IMAGE}" \
     OPENSHELL_SUPERVISOR_IMAGE="${supervisor_image}" \
     OPENSHELL_E2E_PODMAN_OPTION_PROFILE="${option_profile}" \
     OPENSHELL_PARITY_ORACLE_RESULT="${RESULTS_DIR}/${variant}.normalized.json" \

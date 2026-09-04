@@ -79,9 +79,12 @@ for variable in \
   OPENSHELL_COMPUTE_DRIVER_SOCKET OPENSHELL_DRIVERS OPENSHELL_PODMAN_SOCKET \
   CONTAINER_HOST CONTAINER_CONNECTION CONTAINERS_STORAGE_CONF CONTAINERS_CONF \
   CONTAINERS_REGISTRIES_CONF CONTAINERS_REGISTRIES_CONF_DIR CONTAINERS_POLICY \
-  PODMAN_CONNECTIONS_CONF DOCKER_HOST; do
+  PODMAN_CONNECTIONS_CONF DOCKER_HOST OPENSHELL_SANDBOX_IMAGE; do
   [ -z "${!variable:-}" ] || exit 23
 done
+expected_sandbox="ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:$(printf '%064d' 0)"
+[ "${OPENSHELL_E2E_REQUIRE_DIGEST_PINNED_SANDBOX_IMAGE:-0}" = 1 ] || exit 24
+[ "${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-}" = "${expected_sandbox}" ] || exit 25
 printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$OPENSHELL_PARITY_VARIANT" "$OPENSHELL_E2E_CONFIG_SCHEMA_VERSION" "$OPENSHELL_GATEWAY_BIN" "$OPENSHELL_BIN" "$OPENSHELL_CONFORMANCE_BIN" "$MISE_TRUSTED_CONFIG_PATHS" "${OPENSHELL_E2E_PODMAN_OPTION_PROFILE:-}" "${OPENSHELL_PARITY_ORACLE_RESULT:-}" "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-}" "${OPENSHELL_EXTERNAL_DRIVER_BIN:-}" "${OPENSHELL_E2E_SUPERVISOR_BIN:-}" >>"$OPENSHELL_PARITY_TEST_CALLS"
 mkdir -p "$XDG_DATA_HOME/containers/storage"
 case "${OPENSHELL_E2E_CONFIG_SCHEMA_VERSION}" in
@@ -120,9 +123,22 @@ cat >"${WORKDIR}/bin/fake-podman" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"$OPENSHELL_PARITY_TEST_PODMAN_CALLS"
-[ "$1" = unshare ] || exit 19
-shift
-exec "$@"
+case "$1" in
+  pull) exit 0 ;;
+  image)
+    [ "$2" = inspect ] || exit 19
+    case "$4" in
+      '{{.Id}}') printf 'sha256:%064d\n' 0 ;;
+      '{{.Digest}}') printf 'sha256:%064d\n' 0 ;;
+      *) exit 19 ;;
+    esac
+    ;;
+  unshare)
+    shift
+    exec "$@"
+    ;;
+  *) exit 19 ;;
+esac
 EOF
 cat >"${WORKDIR}/bin/fake-conformance" <<'EOF'
 #!/usr/bin/env bash
@@ -180,6 +196,7 @@ CONTAINERS_REGISTRIES_CONF_DIR=/tmp/untrusted-registries.d \
 CONTAINERS_POLICY=/tmp/untrusted-policy.json \
 PODMAN_CONNECTIONS_CONF=/tmp/untrusted-connections.json \
 DOCKER_HOST=tcp://untrusted.invalid:2375 \
+OPENSHELL_SANDBOX_IMAGE=untrusted.invalid/sandbox:latest \
   run_harness
 assert_contains "${WORKDIR}/calls" "baseline|1|${WORKDIR}/results/artifacts/baseline/gateway|${WORKDIR}/results/artifacts/baseline/cli|${WORKDIR}/results/artifacts/baseline/conformance"
 assert_contains "${WORKDIR}/calls" "candidate|2|${WORKDIR}/results/artifacts/candidate/gateway|${WORKDIR}/results/artifacts/candidate/cli|${WORKDIR}/results/artifacts/candidate/conformance"
@@ -194,8 +211,17 @@ assert_contains "${WORKDIR}/results/candidate.json" '"success":true'
 assert_contains "${WORKDIR}/results/comparison.json" '"parity":true'
 assert_not_contains "${WORKDIR}/results/baseline.json" 'raw output'
 assert_contains "${WORKDIR}/results/baseline.log" 'raw output is intentionally not normalized'
+assert_contains "${WORKDIR}/podman-calls" 'pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest'
 assert_contains "${WORKDIR}/podman-calls" 'unshare rm -rf -- '
 assert_contains "${WORKDIR}/podman-calls" 'openshell-parity-run.'
+
+set +e
+OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE=untrusted.invalid/sandbox:latest \
+  run_harness >"${WORKDIR}/mutable-sandbox.out" 2>&1
+status=$?
+set -e
+assert_status "${status}" 2
+assert_contains "${WORKDIR}/mutable-sandbox.out" 'must be digest-pinned for parity runs'
 
 run_harness --scenario external-driver
 assert_contains "${WORKDIR}/calls" "|1|${WORKDIR}/results/artifacts/baseline/external-driver|${WORKDIR}/results/artifacts/baseline/supervisor"
