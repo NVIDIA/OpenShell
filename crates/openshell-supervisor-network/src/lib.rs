@@ -9,7 +9,6 @@
 //! aggregate them.
 
 pub mod identity;
-pub mod inference_routes;
 pub mod l7;
 pub mod opa;
 pub(crate) mod policy_dns;

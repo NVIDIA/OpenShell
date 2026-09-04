@@ -176,8 +176,8 @@ pub struct Networking {
 /// # Errors
 ///
 /// Returns an error if proxy mode is requested but the proxy configuration,
-/// OPA engine, or identity cache is missing, if inference route resolution
-/// fails, or if the proxy server fails to start.
+/// OPA engine, or identity cache is missing, or if the proxy server fails to
+/// start.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_networking(
     policy: &SandboxPolicy,
@@ -190,7 +190,6 @@ pub async fn run_networking(
     sandbox_id: Option<&str>,
     sandbox_name: Option<&str>,
     openshell_endpoint: Option<&str>,
-    #[allow(unused_variables)] inference_routes: Option<&str>,
     denial_tx: Option<UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
     agent_proposals: AgentProposals,
@@ -425,14 +424,6 @@ pub async fn run_networking(
             SocketAddr::new(ip, port)
         });
 
-        // Build inference context for local routing of intercepted inference calls.
-        let inference_ctx = crate::inference_routes::build_inference_context(
-            sandbox_id,
-            openshell_endpoint,
-            inference_routes,
-        )
-        .await?;
-
         let proxy_handle = ProxyHandle::start_with_bind_addr(
             proxy_policy,
             bind_addr,
@@ -440,7 +431,6 @@ pub async fn run_networking(
             cache,
             entrypoint_pid.clone(),
             tls_state,
-            inference_ctx,
             Some(provider_credentials.clone()),
             Some(policy_local_ctx.clone()),
             denial_tx.clone(),

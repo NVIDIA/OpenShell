@@ -105,10 +105,9 @@ bash examples/sandbox-policy-quickstart/demo.sh
 
 ## How It Works
 
-OpenShell isolates each sandbox in its own container with policy-enforced egress routing. A lightweight gateway coordinates sandbox lifecycle, and every outbound connection is intercepted by the policy engine, which does one of three things:
+OpenShell isolates each sandbox in its own container with policy-enforced egress routing. A lightweight gateway coordinates sandbox lifecycle, and every outbound connection is intercepted by the policy engine, which either:
 
 - **Allows** — the destination and binary match a policy block.
-- **Routes for inference** — strips caller credentials, injects backend credentials, and forwards to the managed model.
 - **Denies** — blocks the request and logs it.
 
 | Component          | Role                                                                                         |
@@ -116,22 +115,20 @@ OpenShell isolates each sandbox in its own container with policy-enforced egress
 | **Gateway**        | Control-plane API that coordinates sandbox lifecycle and acts as the auth boundary.          |
 | **Sandbox**        | Isolated runtime with container supervision and policy-enforced egress routing.              |
 | **Policy Engine**  | Enforces filesystem, network, and process constraints from application layer down to kernel. |
-| **Privacy Router** | Privacy-aware LLM routing that keeps sensitive context on sandbox compute.                   |
 
 OpenShell runs a gateway control plane that manages sandbox lifecycle through a configured compute driver. Supported compute platforms include Docker, Podman, MicroVM, and Kubernetes.
 
 ## Protection Layers
 
-OpenShell applies defense in depth across four policy domains:
+OpenShell applies defense in depth across three policy domains:
 
 | Layer      | What it protects                                    | When it applies             |
 | ---------- | --------------------------------------------------- | --------------------------- |
 | Filesystem | Prevents reads/writes outside allowed paths.        | Locked at sandbox creation. |
 | Network    | Blocks unauthorized outbound connections.           | Hot-reloadable at runtime.  |
 | Process    | Blocks privilege escalation and dangerous syscalls. | Locked at sandbox creation. |
-| Inference  | Reroutes model API calls to controlled backends.    | Hot-reloadable at runtime.  |
 
-Policies are declarative YAML files. Static sections (filesystem, process) are locked at creation; dynamic sections (network, inference) can be hot-reloaded on a running sandbox with `openshell policy set`.
+Policies are declarative YAML files. Static sections (filesystem, process) are locked at creation; network policy can be hot-reloaded on a running sandbox with `openshell policy set`.
 
 ## Providers
 
@@ -174,7 +171,7 @@ Docker-backed GPU sandboxes auto-select CDI when available and otherwise fall ba
 | `openshell provider create --type [type] --from-existing`  | Create a credential provider from env vars.     |
 | `openshell policy set <name> --policy file.yaml`           | Apply or update a policy on a running sandbox.  |
 | `openshell policy get <name>`                              | Show the active policy.                         |
-| `openshell inference set --provider <p> --model <m>`       | Configure the `inference.local` endpoint.       |
+| `openshell sandbox create --provider <p>`                  | Attach a provider and its endpoint policy.      |
 | `openshell logs [name] --tail`                             | Stream sandbox logs.                            |
 | `openshell term`                                           | Launch the real-time terminal UI for debugging. |
 

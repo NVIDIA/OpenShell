@@ -1246,4 +1246,29 @@ mod tests {
         assert!(keys.contains(&"MY_ACCESS_KEY"));
         assert!(!keys.contains(&"PRIMARY_KEY"));
     }
+    #[test]
+    fn parse_cli_setting_value_parses_bool_aliases() {
+        let yes_value = parse_cli_setting_value("ocsf_json_enabled", "yes").expect("parse yes");
+        assert_eq!(yes_value.value, Some(setting_value::Value::BoolValue(true)));
+
+        let zero_value = parse_cli_setting_value("ocsf_json_enabled", "0").expect("parse 0");
+        assert_eq!(
+            zero_value.value,
+            Some(setting_value::Value::BoolValue(false))
+        );
+    }
+
+    #[test]
+    fn parse_cli_setting_value_rejects_invalid_bool() {
+        let err = parse_cli_setting_value("ocsf_json_enabled", "maybe")
+            .expect_err("invalid bool should fail");
+        assert!(err.to_string().contains("invalid bool value"));
+    }
+
+    #[test]
+    fn parse_cli_setting_value_rejects_unknown_key() {
+        let err =
+            parse_cli_setting_value("unknown_key", "value").expect_err("unknown key should fail");
+        assert!(err.to_string().contains("unknown setting key"));
+    }
 }

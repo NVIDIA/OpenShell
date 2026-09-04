@@ -184,6 +184,48 @@ async fn sqlite_in_memory_store_survives_pool_connection_replacement() {
     }
 }
 
+#[tokio::test]
+async fn remove_inference_routes_migration_preserves_other_objects() {
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect to sqlite");
+
+    sqlx::query("CREATE TABLE objects (id TEXT PRIMARY KEY, object_type TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .expect("create objects table");
+    sqlx::query(
+        "INSERT INTO objects (id, object_type) VALUES ('route', 'inference_route'), ('sandbox', 'sandbox')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed objects");
+
+    sqlx::raw_sql(include_str!(
+        "../../migrations/sqlite/007_remove_inference_routes.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("apply migration");
+
+    let remaining: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, object_type FROM objects ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("list remaining objects");
+    assert_eq!(remaining, vec![("sandbox".into(), "sandbox".into())]);
+
+    assert_eq!(
+        include_str!("../../migrations/postgres/007_remove_inference_routes.sql"),
+        include_str!("../../migrations/sqlite/007_remove_inference_routes.sql"),
+        "SQLite and PostgreSQL migrations must remove the same records"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn sqlite_connect_restricts_db_file_permissions() {

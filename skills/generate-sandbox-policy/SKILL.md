@@ -496,9 +496,9 @@ The `filesystem_policy` and `landlock` sections above are sensible defaults.
 Process identity is omitted so the selected compute driver can choose it. For
 Docker and Podman, each omitted identity field falls back to the image's OCI
 `USER`. Tell the user these are defaults and may need adjustment for their
-environment. Gateway inference is configured separately through `openshell
-inference set/get`. The generated `network_policies` block is the primary
-output.
+environment. Inference providers contribute their own endpoint policy when
+attached to a sandbox. The generated `network_policies` block is the primary
+output for additional application access.
 
 When the user explicitly requests `process.run_as_user` or
 `process.run_as_group`, accept `sandbox` or a numeric UID/GID from `1` through

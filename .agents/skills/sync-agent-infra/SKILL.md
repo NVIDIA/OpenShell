@@ -45,7 +45,7 @@ Use this map when product behavior, commands, or development workflows change. I
 | Sandbox policy schema, presets, or enforcement behavior | `generate-sandbox-policy`, `openshell-cli` |
 | Supervisor middleware policy, registrations, runtime, or failure behavior | `generate-sandbox-policy`, `openshell-cli`, `debug-openshell-cluster` |
 | Gateway deployment, Helm, runtime drivers, or health checks | `debug-openshell-cluster`, `helm-dev-environment` |
-| Inference routing, providers, or `inference.local` behavior | `debug-inference`, `openshell-cli` |
+| Inference providers, native inference access, or local model endpoints | `debug-inference`, `openshell-cli` |
 | TUI architecture, navigation, data fetching, or UX | `tui-development` |
 | Release artifacts or post-publish smoke coverage | `test-release-canary` |
 | GitHub Actions workflows, required checks, or CI diagnostics | `watch-github-actions`; also `test-release-canary` for release smoke coverage |

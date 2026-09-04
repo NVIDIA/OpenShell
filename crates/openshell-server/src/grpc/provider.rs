@@ -2293,8 +2293,7 @@ fn provider_credential_not_expired(provider: &Provider, key: &str, now_ms: i64) 
 }
 
 fn is_non_injectable_provider_credential(provider: &Provider, key: &str) -> bool {
-    openshell_core::inference::normalize_inference_provider_type(&provider.r#type)
-        == Some("google-vertex-ai")
+    normalize_provider_type(&provider.r#type) == Some("google-vertex-ai")
         && key == "GOOGLE_SERVICE_ACCOUNT_KEY"
 }
 
@@ -2981,15 +2980,12 @@ pub(super) fn provider_profile_endpoints_are_active(
     if profile.source != "builtin" {
         return true;
     }
-    let Some(inference_profile) = openshell_core::inference::profile_for(&profile.id) else {
-        return true;
+    let (base_url_keys, default_base_url): (&[&str], &str) = match profile.id.as_str() {
+        "openai" => (&["OPENAI_BASE_URL"], "https://api.openai.com"),
+        "anthropic" => (&["ANTHROPIC_BASE_URL"], "https://api.anthropic.com"),
+        _ => return true,
     };
-    if !matches!(inference_profile.provider_type, "openai" | "anthropic") {
-        return true;
-    }
-
-    let configured_base_url = inference_profile
-        .base_url_config_keys
+    let configured_base_url = base_url_keys
         .iter()
         .find_map(|key| provider.config.get(*key))
         .map(|value| value.trim())
@@ -2997,7 +2993,7 @@ pub(super) fn provider_profile_endpoints_are_active(
     configured_base_url.is_none_or(|configured| {
         configured
             .trim_end_matches('/')
-            .eq_ignore_ascii_case(inference_profile.default_base_url.trim_end_matches('/'))
+            .eq_ignore_ascii_case(default_base_url.trim_end_matches('/'))
     })
 }
 

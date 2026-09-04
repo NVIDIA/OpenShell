@@ -59,10 +59,6 @@ pub mod test {
     pub use super::generated::openshell::test::v1::*;
 }
 
-pub mod inference {
-    pub use super::generated::openshell::inference::v1;
-}
-
 pub mod middleware {
     pub use super::generated::openshell::middleware::v1;
 }
@@ -73,7 +69,6 @@ pub mod gateway_interceptor {
 
 pub use datamodel::v1::*;
 pub use gateway_interceptor::v1::*;
-pub use inference::v1::*;
 pub use middleware::v1::*;
 pub use openshell::*;
 pub use sandbox::v1::*;

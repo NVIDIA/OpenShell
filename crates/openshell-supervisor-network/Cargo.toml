@@ -3,7 +3,7 @@
 
 [package]
 name = "openshell-supervisor-network"
-description = "Network component of the OpenShell supervisor: proxy, L7 enforcement, OPA, inference routing, denial aggregator"
+description = "Network component of the OpenShell supervisor: proxy, L7 enforcement, OPA, and denial aggregation"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,7 +14,6 @@ rust-version.workspace = true
 openshell-core = { path = "../openshell-core", features = ["oauth"] }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
-openshell-router = { path = "../openshell-router" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
 
 apollo-parser = { workspace = true }

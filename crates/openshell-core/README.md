@@ -46,7 +46,6 @@ router agree on provider defaults. Profiles define:
 - Auth header style.
 - Default upstream headers.
 - Client-supplied passthrough headers.
-- Supported inference protocol shapes.
 
 Do not duplicate provider-specific inference behavior in callers. Add shared
 behavior here, then consume it from the gateway, sandbox, and router.

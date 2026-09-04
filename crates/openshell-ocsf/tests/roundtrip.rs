@@ -197,12 +197,16 @@ fn api_activity_round_trips() {
         .status(StatusId::Success)
         .http_request(HttpRequest {
             http_method: HttpMethod::Post,
-            url: Some(Url::new("https", "inference.local", "/v1/chat", 443)),
+            url: Some(Url::new(
+                "https",
+                "integrate.api.nvidia.com",
+                "/v1/chat",
+                443,
+            )),
         })
-        .dst_endpoint(Endpoint::from_domain("inference.local", 443))
+        .dst_endpoint(Endpoint::from_domain("integrate.api.nvidia.com", 443))
         .ai_model(AiModel::new("llama-3.1-8b", "nvidia"))
-        .message("inference request routed")
-        .unmapped("route", "system")
+        .message("inference request completed")
         .build();
 
     assert_round_trips("api_activity", &event);

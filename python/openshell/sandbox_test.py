@@ -23,7 +23,6 @@ from openshell.sandbox import (
     _PYTHON_CLOUDPICKLE_BOOTSTRAP,
     _SANDBOX_PYTHON_BIN,
     ClientCredentialsAuth,
-    InferenceRouteClient,
     Sandbox,
     SandboxClient,
     SandboxError,
@@ -401,34 +400,6 @@ class _FakeStub:
         yield openshell_pb2.ExecSandboxEvent(
             exit=openshell_pb2.ExecSandboxExit(exit_code=0)
         )
-
-
-class _FakeInferenceStub:
-    def __init__(self) -> None:
-        self.set_request = None
-        self.get_request = None
-
-    def SetInferenceRoute(self, request: Any, timeout: float | None = None) -> Any:
-        self.set_request = request
-        _ = timeout
-
-        class _Response:
-            provider_name = request.provider_name
-            model_id = request.model_id
-            version = 1
-
-        return _Response()
-
-    def GetInferenceRoute(self, request: Any, timeout: float | None = None) -> Any:
-        self.get_request = request
-        _ = timeout
-
-        class _Response:
-            provider_name = "openai-dev"
-            model_id = "gpt-4.1"
-            version = 2
-
-        return _Response()
 
 
 def _client_with_fake_stub(stub: object) -> SandboxClient:
@@ -1877,40 +1848,6 @@ def test_sandbox_wrapper_defaults_match_from_active_cluster(
     assert captured["insecure"] is False
 
 
-def test_inference_set_route_forwards_workspace_and_no_verify() -> None:
-    stub = _FakeInferenceStub()
-    client = cast("InferenceRouteClient", object.__new__(InferenceRouteClient))
-    client._timeout = 30.0
-    client._stub = cast("Any", stub)
-
-    client.set_route(
-        workspace="production",
-        provider_name="openai-dev",
-        model_id="gpt-4.1",
-        no_verify=True,
-    )
-
-    assert stub.set_request is not None
-    assert stub.set_request.no_verify is True
-    assert stub.set_request.workspace == "production"
-
-
-def test_inference_get_route_forwards_workspace() -> None:
-    stub = _FakeInferenceStub()
-    client = cast("InferenceRouteClient", object.__new__(InferenceRouteClient))
-    client._timeout = 30.0
-    client._stub = cast("Any", stub)
-
-    config = client.get_route(workspace="staging")
-
-    assert stub.get_request is not None
-    assert stub.get_request.workspace == "staging"
-    assert config.provider_name == "openai-dev"
-    assert config.model_id == "gpt-4.1"
-    assert config.version == 2
-
-
-# ---------------------------------------------------------------------------
 # Encoding regression tests (utf-8 explicit on all config file reads/writes)
 # ---------------------------------------------------------------------------
 

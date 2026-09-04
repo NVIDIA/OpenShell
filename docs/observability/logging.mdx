@@ -59,9 +59,8 @@ OpenShell maps sandbox events to these OCSF classes:
 | `SSH:` | SSH Activity | 4007 | SSH handshakes, authentication, channel operations |
 | `PROC:` | Process Activity | 1007 | Process start, exit, timeout, signal failures |
 | `FINDING:` | Detection Finding | 2004 | Security findings (nonce replay, proxy bypass, unsafe policy) |
-| `CONFIG:` | Device Config State Change | 5019 | Policy load/reload, Landlock, TLS setup, inference routes |
+| `CONFIG:` | Device Config State Change | 5019 | Policy load/reload, Landlock, and TLS setup |
 | `LIFECYCLE:` | Application Lifecycle | 6002 | Sandbox supervisor start, SSH server ready |
-| `API:INFERENCE` | API Activity | 6003 | AI model inference calls through `inference.local` (model, provider, latency, tokens) |
 
 ## Reading the Shorthand Format
 

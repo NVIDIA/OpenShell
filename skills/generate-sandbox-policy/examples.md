@@ -857,8 +857,8 @@ network_policies:
 
 The agent notes that `filesystem_policy` and `landlock` are sensible defaults
 that may need adjustment. Process identity is omitted so the compute driver can
-select it. Gateway inference is configured separately via `openshell inference
-set/get` rather than an `inference` policy block.
+select it. Inference endpoints may also come from an attached provider profile;
+the explicit policy block above is appropriate when no such profile is used.
 
 ---
 

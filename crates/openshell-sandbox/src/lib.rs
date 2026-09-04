@@ -122,7 +122,6 @@ pub async fn run_sandbox(
     ssh_socket_path: Option<String>,
     _health_check: bool,
     _health_port: u16,
-    inference_routes: Option<String>,
     ocsf_enabled: Arc<AtomicBool>,
     ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     network_enabled: bool,
@@ -548,7 +547,6 @@ pub async fn run_sandbox(
                 sandbox_id.as_deref(),
                 sandbox_name_for_agg.as_deref(),
                 openshell_endpoint_for_proxy.as_deref(),
-                inference_routes.as_deref(),
                 denial_tx,
                 activity_tx,
                 agent_proposals.clone(),
@@ -4914,8 +4912,7 @@ filesystem_policy:
 
     #[test]
     fn discover_policy_restrictive_default_blocks_network() {
-        // In cluster mode we keep proxy mode enabled so `inference.local`
-        // can always be routed through proxy/OPA controls.
+        // The restrictive default keeps all network access behind proxy/OPA controls.
         let proto = openshell_policy::restrictive_default_policy();
         let local_policy = SandboxPolicy::try_from(proto).expect("conversion should succeed");
         assert!(matches!(local_policy.network.mode, NetworkMode::Proxy));

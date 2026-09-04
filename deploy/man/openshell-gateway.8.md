@@ -18,9 +18,8 @@ openshell-gateway - OpenShell gateway server daemon
 
 **openshell-gateway** is the control-plane server for OpenShell. It
 manages sandbox lifecycle, stores provider credentials, delivers
-network and filesystem policies to sandboxes, routes inference
-requests, and provides the SSH tunnel endpoint for CLI-to-sandbox
-connections.
+network and filesystem policies to sandboxes, and provides the SSH
+tunnel endpoint for CLI-to-sandbox connections.
 
 When installed via a Linux package, the gateway runs as a systemd user
 service. The packaged service starts from built-in defaults and reads
