@@ -252,7 +252,23 @@ pub fn parse_jsonrpc_body_with_options(
         let mut has_response = false;
         for item in &items {
             match parse_jsonrpc_message(item, inspection_options) {
-                Ok(JsonRpcMessageInfo::Call(call)) => calls.push(call),
+                Ok(JsonRpcMessageInfo::Call(call)) => {
+                    // Initialization establishes the MCP exchange before any
+                    // profile-specific request rules apply. A batch has no
+                    // single bootstrap exchange, so fail closed before policy
+                    // evaluation can forward any member.
+                    if inspection_options.mode == JsonRpcInspectionMode::Mcp
+                        && call.method == "initialize"
+                    {
+                        return JsonRpcRequestInfo::rejected(
+                            true,
+                            JsonRpcInspectionError::invalid_message(
+                                "MCP initialize must not appear in a batch",
+                            ),
+                        );
+                    }
+                    calls.push(call);
+                }
                 Ok(JsonRpcMessageInfo::Response) => has_response = true,
                 Err(error) => {
                     return JsonRpcRequestInfo::rejected(
@@ -804,6 +820,39 @@ mod tests {
         assert_eq!(info.calls.len(), 2);
         assert_eq!(info.calls[0].tool.as_deref(), Some("read_status"));
         assert_eq!(info.calls[1].tool.as_deref(), Some("search_web"));
+    }
+
+    #[test]
+    fn mcp_initialize_is_not_valid_in_a_batch() {
+        let body = br#"[
+            {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}},
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_status","arguments":{}}}
+        ]"#;
+        let info = parse_jsonrpc_body(body, JsonRpcInspectionMode::Mcp);
+
+        assert!(info.is_batch);
+        assert!(info.calls.is_empty());
+        assert!(!info.has_response);
+        assert_eq!(
+            info.error.as_ref().map(JsonRpcInspectionError::detail),
+            Some("MCP initialize must not appear in a batch")
+        );
+    }
+
+    #[test]
+    fn generic_jsonrpc_keeps_batch_initialize_behavior() {
+        let body = br#"[
+            {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}},
+            {"jsonrpc":"2.0","id":2,"method":"reports.list","params":{}}
+        ]"#;
+        let info = parse_jsonrpc_body(body, JsonRpcInspectionMode::JsonRpc);
+
+        assert!(
+            info.error.is_none(),
+            "generic batch should remain valid: {info:?}"
+        );
+        assert!(info.is_batch);
+        assert_eq!(info.calls.len(), 2);
     }
 
     #[test]
