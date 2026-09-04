@@ -7,7 +7,7 @@ templates:
   - templates/statefulset.yaml
 
 tests:
-  - it: rejects a disabled primary gateway listener
+  - it: rejects primary gateway port 0
     template: templates/statefulset.yaml
     set:
       service.port: 0
@@ -70,3 +70,60 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "service.metricsPort must be 0 \\(disabled\\) or between 1 and 65535"
+
+  - it: rejects a boolean primary port
+    template: templates/statefulset.yaml
+    set:
+      service.port: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.port must be an integer"
+
+  - it: rejects a boolean health port
+    template: templates/statefulset.yaml
+    set:
+      service.healthPort: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.healthPort must be an integer"
+
+  - it: rejects a boolean metrics port
+    template: templates/statefulset.yaml
+    set:
+      service.metricsPort: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.metricsPort must be an integer"
+
+  - it: rejects a fractional metrics port
+    template: templates/statefulset.yaml
+    set:
+      service.metricsPort: 9090.5
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.metricsPort must be an integer"
+
+  - it: rejects a metrics listener above the valid port range
+    template: templates/statefulset.yaml
+    set:
+      service.metricsPort: 65536
+    asserts:
+      - failedTemplate:
+          errorPattern: "service.metricsPort must be 0 \\(disabled\\) or between 1 and 65535"
+
+  - it: accepts boundary ports with metrics disabled
+    template: templates/gateway-config.yaml
+    set:
+      service.port: 1
+      service.healthPort: 65535
+      service.metricsPort: 0
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^bind_address\s*=\s*"0\.0\.0\.0:1"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^health_bind_address\s*=\s*"0\.0\.0\.0:65535"$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^metrics_bind_address\s*='
