@@ -14,6 +14,8 @@ openshell-gateway - OpenShell gateway server daemon
 
 **openshell-gateway** \[*OPTIONS*\]
 
+**openshell-gateway** **config preflight** [**--path** *PATH*]
+
 # DESCRIPTION
 
 **openshell-gateway** is the control-plane server for OpenShell. It
@@ -110,6 +112,28 @@ Compute driver settings such as sandbox image, callback endpoint, image
 pull policy, network name, VM state directory, and guest TLS material are
 configured in the TOML file passed with **--config**.
 
+# CONFIGURATION PREFLIGHT
+
+Validate a gateway configuration before starting the daemon:
+
+    openshell-gateway config preflight [--path PATH]
+
+With no path, preflight validates a nonempty OPENSHELL_GATEWAY_CONFIG. If that
+variable is unset, it optionally validates an auto-discovered XDG config. The
+absence of either config succeeds. An explicit missing path, legacy schema-v1
+file, invalid TOML, symlink, or nonregular file fails with a nonzero status.
+Preflight merges file and environment values and applies read-only startup checks
+for rate-limit, TLS, interceptor, and middleware relationships. Preflight never
+changes the file and reports that failed input was preserved.
+
+The Debian and Ubuntu systemd user unit runs preflight before certificate
+generation, while retaining its EnvironmentFile and bare ExecStart behavior. The
+Snap wrapper first validates a nonempty OPENSHELL_GATEWAY_CONFIG. Otherwise it
+validates the canonical SNAP_COMMON/gateway.toml path whenever it exists or is a
+symlink. A broken symlink fails preflight before the gateway is started. Correct
+or manually migrate an operator-owned v1 file, then run preflight again before
+restarting the service.
+
 # SYSTEMD INTEGRATION
 
 The package installs a systemd user unit at
@@ -126,8 +150,9 @@ View logs:
     journalctl --user -u openshell-gateway
     journalctl --user -u openshell-gateway -f
 
-The unit runs **openshell-gateway generate-certs** as an **ExecStartPre**
-step on first start. This generates a self-signed PKI bundle for mTLS
+The unit runs **openshell-gateway config preflight** and then
+**openshell-gateway generate-certs** as **ExecStartPre** steps. Certificate
+generation creates a self-signed PKI bundle for mTLS
 and sandbox JWT signing material, adding missing JWT files to older
 TLS-only installs when needed. The packaged unit sets
 **OPENSHELL_LOCAL_TLS_DIR** to *~/.local/state/openshell/tls* and uses that

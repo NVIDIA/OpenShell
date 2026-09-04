@@ -28,6 +28,42 @@ impl GuestTlsPaths {
 }
 
 impl GuestTlsPaths {
+    fn configured_paths(
+        gateway: &config_file::GatewayFileSection,
+    ) -> (Option<&PathBuf>, Option<&PathBuf>, Option<&PathBuf>) {
+        (
+            gateway.guest_tls_ca.as_ref(),
+            gateway.guest_tls_cert.as_ref(),
+            gateway.guest_tls_key.as_ref(),
+        )
+    }
+
+    /// Validate guest TLS relationships without reading certificate files.
+    pub(crate) fn validate_configuration(
+        gateway: Option<&config_file::GatewayFileSection>,
+        tls_disabled: bool,
+    ) -> std::result::Result<(), String> {
+        let configured = gateway.map(Self::configured_paths);
+        let provided = configured
+            .is_some_and(|(ca, cert, key)| ca.is_some() || cert.is_some() || key.is_some());
+        if tls_disabled && provided {
+            return Err(
+                "guest_tls_ca, guest_tls_cert, and guest_tls_key require gateway TLS; remove them or omit --disable-tls"
+                    .to_string(),
+            );
+        }
+        if let Some((ca, cert, key)) = configured
+            && (ca.is_some() || cert.is_some() || key.is_some())
+            && (ca.is_none() || cert.is_none() || key.is_none())
+        {
+            return Err(
+                "guest TLS requires one complete bundle: guest_tls_ca, guest_tls_cert, and guest_tls_key"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Resolve gateway-owned guest TLS inputs. Explicit TOML values take
     /// precedence over the package-managed local bundle; partial bundles are
     /// rejected before any driver is deserialized or constructed.
@@ -36,35 +72,12 @@ impl GuestTlsPaths {
         local: Option<&LocalTlsPaths>,
         tls_disabled: bool,
     ) -> std::result::Result<Option<Self>, String> {
-        let configured = gateway.map(|gateway| {
-            (
-                gateway.guest_tls_ca.as_ref(),
-                gateway.guest_tls_cert.as_ref(),
-                gateway.guest_tls_key.as_ref(),
-            )
-        });
-        let provided = configured
-            .is_some_and(|(ca, cert, key)| ca.is_some() || cert.is_some() || key.is_some());
-
+        Self::validate_configuration(gateway, tls_disabled)?;
         if tls_disabled {
-            if provided {
-                return Err(
-                    "guest_tls_ca, guest_tls_cert, and guest_tls_key require gateway TLS; remove them or omit --disable-tls"
-                        .to_string(),
-                );
-            }
             return Ok(None);
         }
 
-        if let Some((ca, cert, key)) = configured
-            && (ca.is_some() || cert.is_some() || key.is_some())
-        {
-            let (Some(ca), Some(cert), Some(key)) = (ca, cert, key) else {
-                return Err(
-                    "guest TLS requires one complete bundle: guest_tls_ca, guest_tls_cert, and guest_tls_key"
-                        .to_string(),
-                );
-            };
+        if let Some((Some(ca), Some(cert), Some(key))) = gateway.map(Self::configured_paths) {
             for (field, path) in [
                 ("guest_tls_ca", ca),
                 ("guest_tls_cert", cert),

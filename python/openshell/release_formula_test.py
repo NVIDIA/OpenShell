@@ -214,3 +214,38 @@ def test_rpm_migration_exec_start_pre_argument_order() -> None:
         "/usr/share/openshell-gateway/gateway.toml.default "
         "/usr/share/openshell-gateway/gateway.toml.default.v1"
     ) in spec
+
+
+def test_schema_v2_debian_and_snap_preflight_wiring() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    unit = (repo_root / "deploy/deb/openshell-gateway.service").read_text(
+        encoding="utf-8"
+    )
+    wrapper = (repo_root / "tasks/scripts/snap-gateway-wrapper.sh").read_text(
+        encoding="utf-8"
+    )
+    package_deb = (repo_root / "tasks/scripts/package-deb.sh").read_text(
+        encoding="utf-8"
+    )
+    preflight = "ExecStartPre=/usr/bin/openshell-gateway config preflight"
+    certs = "ExecStartPre=/usr/bin/openshell-gateway generate-certs"
+    assert preflight in unit
+    assert unit.index(preflight) < unit.index(certs)
+    assert "EnvironmentFile=-%E/openshell/gateway.env" in unit
+    assert "ExecStart=/usr/bin/openshell-gateway" in unit
+    assert "$src_dir/openshell-gateway.service" in package_deb
+    assert "$pkgroot/usr/lib/systemd/user/openshell-gateway.service" in package_deb
+    assert 'if [ -n "${OPENSHELL_GATEWAY_CONFIG:-}" ]; then' in wrapper
+    assert (
+        'elif [ -e "$CANONICAL_CONFIG_FILE" ] || [ -L "$CANONICAL_CONFIG_FILE" ]; then'
+        in wrapper
+    )
+    assert wrapper.count('"${SNAP}/bin/openshell-gateway" config preflight') == 4
+    assert 'config preflight "--path=$cli_config"' in wrapper
+    assert 'config preflight --path "$CANONICAL_CONFIG_FILE"' in wrapper
+    assert (
+        'exec "${SNAP}/bin/openshell-gateway" --config "$CANONICAL_CONFIG_FILE" "$@"'
+        in wrapper
+    )
+    assert wrapper.count('exec "${SNAP}/bin/openshell-gateway" "$@"') == 3
+    assert '[ -f "$CANONICAL_CONFIG_FILE" ]' not in wrapper
