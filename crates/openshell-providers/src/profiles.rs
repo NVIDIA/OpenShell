@@ -3,8 +3,6 @@
 
 //! Declarative provider type profiles.
 
-#![allow(deprecated)] // NetworkBinary::harness remains in the public proto for compatibility.
-
 use openshell_core::mcp::{DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion};
 use openshell_core::proto::{
     GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
@@ -19,7 +17,6 @@ use openshell_policy::{
     L7EndpointFields, L7Protocol, validate_explicit_tcp_additional_fields,
     validate_l7_endpoint_semantics,
 };
-use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
@@ -591,7 +588,6 @@ pub struct GraphqlOperationProfile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinaryProfile {
     pub path: String,
-    pub harness: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1032,13 +1028,7 @@ impl Serialize for BinaryProfile {
     where
         S: Serializer,
     {
-        if !self.harness {
-            return serializer.serialize_str(&self.path);
-        }
-        let mut state = serializer.serialize_struct("BinaryProfile", 2)?;
-        state.serialize_field("path", &self.path)?;
-        state.serialize_field("harness", &self.harness)?;
-        state.end()
+        serializer.serialize_str(&self.path)
     }
 }
 
@@ -1057,19 +1047,23 @@ impl<'de> Deserialize<'de> for BinaryProfile {
         #[derive(Deserialize)]
         struct BinaryProfileObject {
             path: String,
-            #[serde(default)]
-            harness: bool,
+            #[serde(flatten)]
+            extra: HashMap<String, serde_json::Value>,
         }
 
         match BinaryProfileInput::deserialize(deserializer)? {
-            BinaryProfileInput::Path(path) => Ok(Self {
-                path,
-                harness: false,
-            }),
-            BinaryProfileInput::Object(binary) => Ok(Self {
-                path: binary.path,
-                harness: binary.harness,
-            }),
+            BinaryProfileInput::Path(path) => Ok(Self { path }),
+            BinaryProfileInput::Object(binary) => {
+                if !binary.extra.is_empty() {
+                    let mut fields = binary.extra.keys().cloned().collect::<Vec<_>>();
+                    fields.sort();
+                    return Err(de::Error::custom(format!(
+                        "unsupported provider profile binary fields: {}; binaries accept only 'path' and the deprecated 'harness' field was removed in 0.1.0",
+                        fields.join(", ")
+                    )));
+                }
+                Ok(Self { path: binary.path })
+            }
         }
     }
 }
@@ -1579,14 +1573,12 @@ fn canonicalize_mcp_profile_versions(versions: &mut [String]) {
 fn binary_to_proto(binary: &BinaryProfile) -> NetworkBinary {
     NetworkBinary {
         path: binary.path.clone(),
-        harness: binary.harness,
     }
 }
 
 fn binary_from_proto(binary: &NetworkBinary) -> BinaryProfile {
     BinaryProfile {
         path: binary.path.clone(),
-        harness: binary.harness,
     }
 }
 
@@ -5144,7 +5136,6 @@ endpoints:
     allow_uninspected_credentials: true
 binaries:
   - path: /usr/bin/custom
-    harness: true
 ",
         )
         .expect("profile should parse");
@@ -5186,10 +5177,11 @@ binaries:
             Some("GET")
         );
         assert_eq!(rest_ep.deny_rules[0].method, "POST");
-        assert!(proto.binaries[0].harness);
+        assert_eq!(proto.binaries[0].path, "/usr/bin/custom");
 
-        let reparsed = parse_profile_yaml(&profile_to_yaml(&profile).expect("serialize YAML"))
-            .expect("serialized profile should parse");
+        let serialized = profile_to_yaml(&profile).expect("serialize YAML");
+        assert!(serialized.contains("- /usr/bin/custom"));
+        let reparsed = parse_profile_yaml(&serialized).expect("serialized profile should parse");
         let reprotoo = reparsed.to_proto();
         assert_eq!(reprotoo.endpoints[0].access, "read-only");
         assert_eq!(reprotoo.endpoints[1].rules.len(), 1);
@@ -5197,7 +5189,28 @@ binaries:
         assert_eq!(reprotoo.endpoints[1].ports, vec![443, 8443]);
         assert!(reprotoo.endpoints[1].allow_uninspected_credentials);
         assert!(!reprotoo.endpoints[1].provider_credentialed);
-        assert!(reprotoo.binaries[0].harness);
+        assert_eq!(reprotoo.binaries[0].path, "/usr/bin/custom");
+    }
+
+    #[test]
+    fn profile_yaml_rejects_removed_binary_harness_field() {
+        let error = parse_profile_yaml(
+            r"
+id: legacy-binary
+display_name: Legacy binary
+binaries:
+  - path: /usr/bin/custom
+    harness: true
+",
+        )
+        .expect_err("removed harness field must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("'harness' field was removed in 0.1.0"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

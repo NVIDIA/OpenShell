@@ -94,3 +94,93 @@ pub fn all_workspaces_selector() -> WorkspaceSelector {
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use prost::Message;
+
+    use super::SandboxPolicy;
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyNetworkBinary {
+        #[prost(string, tag = "1")]
+        path: String,
+        #[prost(bool, tag = "2")]
+        harness: bool,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyNetworkPolicyRule {
+        #[prost(message, repeated, tag = "3")]
+        binaries: Vec<LegacyNetworkBinary>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacySandboxPolicy {
+        #[prost(map = "string, message", tag = "5")]
+        network_policies: HashMap<String, LegacyNetworkPolicyRule>,
+    }
+
+    #[test]
+    fn sandbox_policy_ignores_removed_network_binary_harness_wire_field() {
+        let legacy = LegacySandboxPolicy {
+            network_policies: HashMap::from([(
+                "legacy".to_string(),
+                LegacyNetworkPolicyRule {
+                    binaries: vec![LegacyNetworkBinary {
+                        path: "/usr/bin/curl".to_string(),
+                        harness: true,
+                    }],
+                },
+            )]),
+        };
+
+        let decoded = SandboxPolicy::decode(legacy.encode_to_vec().as_slice())
+            .expect("legacy policy should decode");
+        assert_eq!(
+            decoded.network_policies["legacy"].binaries[0].path,
+            "/usr/bin/curl"
+        );
+
+        let round_tripped =
+            LegacySandboxPolicy::decode(decoded.encode_to_vec().as_slice()).unwrap();
+        assert!(!round_tripped.network_policies["legacy"].binaries[0].harness);
+    }
+
+    #[test]
+    fn network_binary_reserves_removed_harness_name_and_tag() {
+        let descriptor = prost_types::FileDescriptorSet::decode(crate::FILE_DESCRIPTOR_SET)
+            .expect("descriptor set should decode");
+        let network_binary = descriptor
+            .file
+            .iter()
+            .find(|file| file.package.as_deref() == Some("openshell.sandbox.v1"))
+            .and_then(|file| {
+                file.message_type
+                    .iter()
+                    .find(|message| message.name.as_deref() == Some("NetworkBinary"))
+            })
+            .expect("NetworkBinary descriptor should exist");
+
+        assert!(
+            network_binary
+                .field
+                .iter()
+                .all(|field| field.name.as_deref() != Some("harness"))
+        );
+        assert!(
+            network_binary
+                .reserved_range
+                .iter()
+                .any(|range| range.start == Some(2) && range.end == Some(3))
+        );
+        assert!(
+            network_binary
+                .reserved_name
+                .iter()
+                .any(|name| name == "harness")
+        );
+    }
+}

@@ -20,8 +20,11 @@ const DEFAULT_JSON_RPC_MAX_BODY_BYTES: u32 = 64 * 1024;
 /// has one unambiguous endpoint contract, proposing a second generic L4
 /// endpoint loses inspection metadata and can make the effective policy
 /// ambiguous. Preserve the existing contract instead. Sandbox-owned rules are
-/// expanded in place; provider-owned rules remain immutable and are mirrored
-/// into the requested sandbox-owned overlay.
+/// expanded in place only when they already authorize the observed binaries.
+/// A new advisor-observed binary stays in a separate endpoint-provenance-marked
+/// rule so it cannot inherit exact-host private-address trust. Provider-owned
+/// rules remain immutable and are mirrored into the requested sandbox-owned
+/// overlay.
 pub fn canonicalize_advisor_add_rule(
     base_policy: &SandboxPolicy,
     effective_policy: &SandboxPolicy,
@@ -84,30 +87,52 @@ pub fn canonicalize_advisor_add_rule(
         .iter()
         .filter(|(name, _)| !is_provider_rule_name(name))
         .filter_map(|(name, rule)| {
-            rule.endpoints
+            (rule.endpoints.iter().any(|endpoint| {
+                let mut normalized = endpoint.clone();
+                normalized.provider_credentialed = false;
+                normalized.advisor_proposed = false;
+                normalize_endpoint(&mut normalized);
+                normalized == contract
+            }) && incoming_rule
+                .binaries
                 .iter()
-                .any(|endpoint| {
-                    let mut normalized = endpoint.clone();
-                    normalized.provider_credentialed = false;
-                    normalized.advisor_proposed = false;
-                    normalize_endpoint(&mut normalized);
-                    normalized == contract
-                })
-                .then_some(name.clone())
+                .all(|binary| binary_scope_covers(rule, binary)))
+            .then_some(name.clone())
         })
         .collect::<Vec<_>>();
     sandbox_owners.sort();
 
     let mut contract = contract;
-    if sandbox_owners.is_empty() {
+    let target_name = if let Some(owner) = sandbox_owners.first() {
+        if let Some(endpoint) =
+            base_policy.network_policies[owner]
+                .endpoints
+                .iter()
+                .find(|endpoint| {
+                    let mut normalized = (*endpoint).clone();
+                    normalized.provider_credentialed = false;
+                    normalized.advisor_proposed = false;
+                    normalize_endpoint(&mut normalized);
+                    normalized == contract
+                })
+        {
+            contract.advisor_proposed = endpoint.advisor_proposed;
+        }
+        owner.clone()
+    } else {
         // A provider-owned contract is mirrored into a new sandbox-owned
         // advisor overlay, so retain the incoming proposal provenance.
         contract.advisor_proposed = incoming_endpoint.advisor_proposed;
-    }
-    let target_name = sandbox_owners
-        .first()
-        .cloned()
-        .unwrap_or_else(|| requested_rule_name.to_string());
+        let mut candidate = requested_rule_name.to_string();
+        let mut suffix = 2_u32;
+        while base_policy.network_policies.contains_key(&candidate)
+            || effective_policy.network_policies.contains_key(&candidate)
+        {
+            candidate = format!("{requested_rule_name}_{suffix}");
+            suffix += 1;
+        }
+        candidate
+    };
     let mut canonical = incoming_rule.clone();
     canonical.name.clone_from(&target_name);
     canonical.endpoints = vec![contract];
@@ -1153,10 +1178,13 @@ fn add_rule(
         incoming_rule.name = rule_name.to_string();
     }
 
-    // Endpoint-overlap fallback: when a chunk arrives with a new rule_name
-    // that doesn't already exist, fold it into a same-host/port rule if one
-    // is present. This is intentional for user-authored policies (incremental
-    // refinements live under one rule name).
+    // Endpoint-overlap fallback: when an explicit chunk arrives with a new
+    // rule_name that doesn't already exist, fold it into a same-host/port rule
+    // if one is present. This is intentional for user-authored policies
+    // (incremental refinements live under one rule name). Advisor-proposed
+    // endpoints must stay on their requested key: folding one into an explicit
+    // endpoint would clear its provenance and let a newly observed binary
+    // inherit exact-host private-address trust.
     //
     // Provider-injected rules (`_provider_*` — see `compose.rs::provider_rule_name`)
     // are deliberately EXCLUDED from this fallback. Provider profiles supply a
@@ -1171,7 +1199,11 @@ fn add_rule(
     let requested_key_exists = policy.network_policies.contains_key(rule_name);
     let target_key = if requested_key_exists {
         Some(rule_name.to_string())
-    } else {
+    } else if incoming_rule
+        .endpoints
+        .iter()
+        .all(|endpoint| !endpoint.advisor_proposed)
+    {
         let mut keys: Vec<_> = policy.network_policies.keys().cloned().collect();
         keys.sort();
         keys.into_iter()
@@ -1184,6 +1216,8 @@ fn add_rule(
                         rules_share_endpoint(existing_rule, &incoming_rule)
                     })
             })
+    } else {
+        None
     };
 
     match target_key {
@@ -2054,12 +2088,6 @@ fn expand_access_preset(protocol: &str, access: &str) -> Option<Vec<L7Rule>> {
 fn append_unique_binaries(existing: &mut Vec<NetworkBinary>, incoming: &[NetworkBinary]) {
     let mut seen: HashSet<String> = existing.iter().map(|binary| binary.path.clone()).collect();
     for binary in incoming {
-        if let Some(existing_binary) = existing.iter_mut().find(|item| item.path == binary.path) {
-            if !is_advisor_proposed_binary(binary) {
-                mark_user_declared_binary(existing_binary);
-            }
-            continue;
-        }
         if seen.insert(binary.path.clone()) {
             existing.push(binary.clone());
         }
@@ -2118,30 +2146,8 @@ fn dedup_strings(values: &mut Vec<String>) {
 }
 
 fn dedup_binaries(values: &mut Vec<NetworkBinary>) {
-    let mut deduped: Vec<NetworkBinary> = Vec::with_capacity(values.len());
-    for binary in std::mem::take(values) {
-        if let Some(existing) = deduped.iter_mut().find(|item| item.path == binary.path) {
-            if !is_advisor_proposed_binary(&binary) {
-                mark_user_declared_binary(existing);
-            }
-        } else {
-            deduped.push(binary);
-        }
-    }
-    *values = deduped;
-}
-
-fn is_advisor_proposed_binary(binary: &NetworkBinary) -> bool {
-    #[allow(deprecated)]
-    let advisor_proposed = binary.harness;
-    advisor_proposed
-}
-
-fn mark_user_declared_binary(binary: &mut NetworkBinary) {
-    #[allow(deprecated)]
-    {
-        binary.harness = false;
-    }
+    let mut seen = HashSet::new();
+    values.retain(|binary| seen.insert(binary.path.clone()));
 }
 
 fn dedup_l7_rules(values: &mut Vec<L7Rule>) {
@@ -2248,18 +2254,6 @@ mod tests {
         }
     }
 
-    fn advisor_binary(path: &str) -> NetworkBinary {
-        let mut binary = NetworkBinary {
-            path: path.to_string(),
-            ..Default::default()
-        };
-        #[allow(deprecated)]
-        {
-            binary.harness = true;
-        }
-        binary
-    }
-
     fn rest_rule(method: &str, path: &str) -> L7Rule {
         L7Rule {
             allow: Some(L7Allow {
@@ -2276,7 +2270,7 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_advisor_expands_existing_inspected_rule_without_l7_downgrade() {
+    fn canonicalize_advisor_keeps_new_binary_separate_from_explicit_rule() {
         let mut existing_endpoint = endpoint("index.crates.io", 443);
         existing_endpoint.protocol = "rest".to_string();
         existing_endpoint.enforcement = "enforce".to_string();
@@ -2286,7 +2280,6 @@ mod tests {
             endpoints: vec![existing_endpoint.clone()],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/cargo".to_string(),
-                ..Default::default()
             }],
         };
         let mut base = SandboxPolicy::default();
@@ -2298,7 +2291,7 @@ mod tests {
         let incoming = NetworkPolicyRule {
             name: "allow_index_crates_io_443".to_string(),
             endpoints: vec![observed],
-            binaries: vec![advisor_binary("/usr/bin/curl")],
+            binaries: vec![binary("/usr/bin/curl")],
         };
 
         let (rule_name, canonical) = canonicalize_advisor_add_rule(
@@ -2309,13 +2302,116 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(rule_name, "cargo_registry");
-        assert_eq!(canonical.endpoints, vec![existing_endpoint]);
+        assert_eq!(rule_name, "allow_index_crates_io_443");
+        assert_eq!(canonical.endpoints[0].protocol, existing_endpoint.protocol);
+        assert_eq!(canonical.endpoints[0].access, existing_endpoint.access);
+        assert!(canonical.endpoints[0].advisor_proposed);
         assert_eq!(canonical.binaries[0].path, "/usr/bin/curl");
-        #[allow(deprecated)]
-        {
-            assert!(canonical.binaries[0].harness);
-        }
+    }
+
+    #[test]
+    fn canonicalize_advisor_avoids_explicit_requested_key_collision() {
+        let mut base = SandboxPolicy::default();
+        base.network_policies.insert(
+            "allow_index_crates_io_443".to_string(),
+            NetworkPolicyRule {
+                name: "explicit-index".to_string(),
+                endpoints: vec![endpoint("index.crates.io", 443)],
+                binaries: vec![binary("/usr/bin/cargo")],
+            },
+        );
+        let incoming = NetworkPolicyRule {
+            name: "allow_index_crates_io_443".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "index.crates.io".to_string(),
+                port: 443,
+                advisor_proposed: true,
+                ..Default::default()
+            }],
+            binaries: vec![binary("/usr/bin/curl")],
+        };
+
+        let (rule_name, canonical) =
+            canonicalize_advisor_add_rule(&base, &base, "allow_index_crates_io_443", &incoming)
+                .unwrap();
+        assert_eq!(rule_name, "allow_index_crates_io_443_2");
+        assert!(canonical.endpoints[0].advisor_proposed);
+
+        let merged = merge_policy(
+            base,
+            &[PolicyMergeOp::AddRule {
+                rule_name: rule_name.clone(),
+                rule: canonical,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            merged.policy.network_policies["allow_index_crates_io_443"].binaries,
+            vec![binary("/usr/bin/cargo")]
+        );
+        assert!(merged.policy.network_policies[&rule_name].endpoints[0].advisor_proposed);
+    }
+
+    #[test]
+    fn canonicalize_advisor_reuses_explicit_rule_for_existing_binary() {
+        let existing_endpoint = endpoint("index.crates.io", 443);
+        let existing = NetworkPolicyRule {
+            name: "cargo-registry".to_string(),
+            endpoints: vec![existing_endpoint],
+            binaries: vec![binary("/usr/bin/curl")],
+        };
+        let mut base = SandboxPolicy::default();
+        base.network_policies
+            .insert("cargo_registry".to_string(), existing);
+        let incoming = NetworkPolicyRule {
+            name: "allow_index_crates_io_443".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "index.crates.io".to_string(),
+                port: 443,
+                advisor_proposed: true,
+                ..Default::default()
+            }],
+            binaries: vec![binary("/usr/bin/curl")],
+        };
+
+        let (rule_name, canonical) =
+            canonicalize_advisor_add_rule(&base, &base, "allow_index_crates_io_443", &incoming)
+                .unwrap();
+
+        assert_eq!(rule_name, "cargo_registry");
+        assert!(!canonical.endpoints[0].advisor_proposed);
+    }
+
+    #[test]
+    fn canonicalize_advisor_preserves_existing_advisor_endpoint_provenance() {
+        let mut advisor_endpoint = endpoint("index.crates.io", 443);
+        advisor_endpoint.advisor_proposed = true;
+        let mut base = SandboxPolicy::default();
+        base.network_policies.insert(
+            "advisor_index".to_string(),
+            NetworkPolicyRule {
+                name: "advisor-index".to_string(),
+                endpoints: vec![advisor_endpoint],
+                binaries: vec![binary("/usr/bin/curl")],
+            },
+        );
+        let incoming = NetworkPolicyRule {
+            name: "allow_index_crates_io_443".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "index.crates.io".to_string(),
+                port: 443,
+                advisor_proposed: true,
+                ..Default::default()
+            }],
+            binaries: vec![binary("/usr/bin/curl")],
+        };
+
+        let (rule_name, canonical) =
+            canonicalize_advisor_add_rule(&base, &base, "allow_index_crates_io_443", &incoming)
+                .unwrap();
+
+        assert_eq!(rule_name, "advisor_index");
+        assert!(canonical.endpoints[0].advisor_proposed);
     }
 
     #[test]
@@ -2343,7 +2439,7 @@ mod tests {
                 advisor_proposed: true,
                 ..Default::default()
             }],
-            binaries: vec![advisor_binary("/usr/bin/curl")],
+            binaries: vec![binary("/usr/bin/curl")],
         };
 
         let (rule_name, canonical) =
@@ -2378,7 +2474,7 @@ mod tests {
             NetworkPolicyRule {
                 name: "existing-advisor".to_string(),
                 endpoints: vec![advisor_endpoint],
-                binaries: vec![advisor_binary("/usr/bin/curl")],
+                binaries: vec![binary("/usr/bin/curl")],
             },
         );
 
@@ -2400,16 +2496,17 @@ mod tests {
                 advisor_proposed: true,
                 ..Default::default()
             }],
-            binaries: vec![advisor_binary("/usr/bin/python")],
+            binaries: vec![binary("/usr/bin/python")],
         };
 
         let (rule_name, canonical) =
             canonicalize_advisor_add_rule(&base, &effective, "advisor_example", &incoming)
                 .expect("provenance alone must not create multiple endpoint contracts");
 
-        assert_eq!(rule_name, "existing_advisor");
+        assert_eq!(rule_name, "advisor_example");
         assert_eq!(canonical.endpoints[0].protocol, "rest");
         assert_eq!(canonical.endpoints[0].access, "read-only");
+        assert!(canonical.endpoints[0].advisor_proposed);
     }
 
     #[test]
@@ -2437,7 +2534,7 @@ mod tests {
                 advisor_proposed: true,
                 ..Default::default()
             }],
-            binaries: vec![advisor_binary("/usr/bin/curl")],
+            binaries: vec![binary("/usr/bin/curl")],
         };
 
         let (rule_name, canonical) = canonicalize_advisor_add_rule(
@@ -2479,7 +2576,6 @@ mod tests {
     fn binary(path: &str) -> NetworkBinary {
         NetworkBinary {
             path: path.to_string(),
-            ..Default::default()
         }
     }
 
@@ -3663,7 +3759,6 @@ mod tests {
                 endpoints: vec![endpoint("api.github.com", 443)],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -3700,14 +3795,14 @@ mod tests {
     }
 
     #[test]
-    fn add_rule_user_binary_clears_advisor_marker_for_same_path() {
+    fn add_rule_deduplicates_binary_path() {
         let mut policy = restrictive_default_policy();
         policy.network_policies.insert(
             "existing".to_string(),
             NetworkPolicyRule {
                 name: "existing".to_string(),
                 endpoints: vec![endpoint("api.github.com", 443)],
-                binaries: vec![advisor_binary("/usr/bin/curl")],
+                binaries: vec![binary("/usr/bin/curl")],
             },
         );
 
@@ -3716,7 +3811,6 @@ mod tests {
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -3731,22 +3825,18 @@ mod tests {
 
         let rule = &result.policy.network_policies["existing"];
         assert_eq!(rule.binaries.len(), 1);
-        #[allow(deprecated)]
-        {
-            assert!(!rule.binaries[0].harness);
-        }
+        assert_eq!(rule.binaries[0].path, "/usr/bin/curl");
     }
 
     #[test]
-    fn add_rule_duplicate_binaries_prefer_user_declared_marker() {
+    fn add_rule_deduplicates_binary_paths_within_incoming_rule() {
         let incoming = NetworkPolicyRule {
             name: "incoming".to_string(),
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![
-                advisor_binary("/usr/bin/curl"),
+                binary("/usr/bin/curl"),
                 NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 },
             ],
         };
@@ -3762,10 +3852,7 @@ mod tests {
 
         let rule = &result.policy.network_policies["github"];
         assert_eq!(rule.binaries.len(), 1);
-        #[allow(deprecated)]
-        {
-            assert!(!rule.binaries[0].harness);
-        }
+        assert_eq!(rule.binaries[0].path, "/usr/bin/curl");
     }
 
     #[test]
@@ -3778,7 +3865,6 @@ mod tests {
                 endpoints: vec![endpoint("api.example.com", 443)],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/python".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -3792,7 +3878,7 @@ mod tests {
                 advisor_proposed: true,
                 ..Default::default()
             }],
-            binaries: vec![advisor_binary("/usr/bin/python")],
+            binaries: vec![binary("/usr/bin/python")],
         };
 
         let result = merge_policy(
@@ -3806,13 +3892,7 @@ mod tests {
 
         let rule = &result.policy.network_policies["app-api"];
         assert_eq!(rule.binaries.len(), 1, "binary should still dedupe");
-        #[allow(deprecated)]
-        {
-            assert!(
-                !rule.binaries[0].harness,
-                "existing user binary provenance should be retained"
-            );
-        }
+        assert_eq!(rule.binaries[0].path, "/usr/bin/python");
         let internal_endpoint = rule
             .endpoints
             .iter()
@@ -4162,7 +4242,6 @@ mod tests {
                 endpoints: vec![endpoint("api.github.com", 443)],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/gh".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -4186,7 +4265,6 @@ mod tests {
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -4209,7 +4287,6 @@ mod tests {
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -4239,7 +4316,6 @@ mod tests {
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -4251,7 +4327,6 @@ mod tests {
                 endpoints: vec![endpoint("api.github.com", 443)],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/git".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -4282,7 +4357,6 @@ mod tests {
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -4297,7 +4371,6 @@ mod tests {
                 endpoints: vec![endpoint("api.github.com", 443)],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/git".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -4333,7 +4406,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -4352,7 +4424,6 @@ mod tests {
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -4379,7 +4450,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -4401,7 +4471,6 @@ mod tests {
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -4424,7 +4493,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/git".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -4458,7 +4526,6 @@ mod tests {
                 endpoints: vec![endpoint("api.github.com", 443)],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -4523,7 +4590,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/gh".to_string(),
-                ..Default::default()
             }],
         };
         let composed = compose_effective_policy(
@@ -4554,7 +4620,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let result = merge_policy(
@@ -4622,7 +4687,6 @@ mod tests {
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let result = merge_policy(
@@ -4664,6 +4728,42 @@ mod tests {
             "got warnings: {:?}",
             result.warnings
         );
+    }
+
+    #[test]
+    fn add_rule_keeps_advisor_binary_separate_from_explicit_endpoint() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "cargo_registry".to_string(),
+            NetworkPolicyRule {
+                name: "cargo-registry".to_string(),
+                endpoints: vec![endpoint("index.crates.io", 443)],
+                binaries: vec![binary("/usr/bin/cargo")],
+            },
+        );
+
+        let mut advisor_endpoint = endpoint("index.crates.io", 443);
+        advisor_endpoint.advisor_proposed = true;
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "allow_index_crates_io_443".to_string(),
+                rule: NetworkPolicyRule {
+                    name: "allow_index_crates_io_443".to_string(),
+                    endpoints: vec![advisor_endpoint],
+                    binaries: vec![binary("/usr/bin/curl")],
+                },
+            }],
+        )
+        .expect("advisor rule should remain separate");
+
+        let explicit = &result.policy.network_policies["cargo_registry"];
+        assert!(!explicit.endpoints[0].advisor_proposed);
+        assert_eq!(explicit.binaries, vec![binary("/usr/bin/cargo")]);
+
+        let advisor = &result.policy.network_policies["allow_index_crates_io_443"];
+        assert!(advisor.endpoints[0].advisor_proposed);
+        assert_eq!(advisor.binaries, vec![binary("/usr/bin/curl")]);
     }
 
     fn endpoint_with_ports(host: &str, ports: &[u32]) -> NetworkEndpoint {
