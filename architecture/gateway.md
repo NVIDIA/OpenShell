@@ -192,7 +192,7 @@ Supported auth modes:
 | Plaintext | Local development or a trusted reverse proxy boundary. |
 | Unauthenticated local users | Trusted Kubernetes dev or fully trusted proxy deployments only. |
 | Cloudflare JWT | Edge-authenticated deployments where Cloudflare Access supplies identity. |
-| OIDC | Bearer-token auth for users, with browser or device-code PKCE and client credentials login. |
+| OIDC | Bearer-token auth for users, with browser or device-code PKCE and client credentials login. JWKS validation accepts RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, and EdDSA (Ed25519) signing keys. |
 
 The CLI persists the scopes requested during OIDC login in gateway metadata and
 reuses them when refreshing an access token. This preserves the intended API
@@ -335,6 +335,10 @@ Domain code should depend on the object-store contract, not SQL dialect details.
 This keeps the gateway data model portable across storage backends and leaves
 room for future stores that can provide the same object, label, version, and
 scope semantics.
+
+For in-memory SQLite, the adapter retains a dedicated keepalive connection for
+the store lifetime. Operational connection replacement therefore preserves the
+shared in-memory schema and objects instead of creating an empty database.
 
 The SQLite adapter tightens the on-disk database file to mode `0o600` on every
 connect so that provider API keys, SSH session tokens, and sandbox metadata are
@@ -756,9 +760,22 @@ identity and configured compute driver.
 
 The gateway forwards OTLP configuration, its configured gateway name, and W3C
 trace context to managed external drivers. Built-in drivers use dedicated
-in-process providers that preserve the same RPC trace boundary. Each driver
+in-process providers that preserve the same RPC trace boundary. A shared
+compute-driver tracing descriptor derives provider layers and standalone
+installation from each driver's service identity, and routes both the shared
+RPC boundary target and that driver's crate target prefix. A shared RPC tracer
+owns unary and streaming boundary outcomes. Each driver
 exports to the configured collector under its own service name and carries the
-gateway name as a resource attribute.
+gateway name and configured compute driver as resource attributes.
+Compute-driver client and server spans share the fully qualified protobuf
+operation name, such as `openshell.compute.v1.ComputeDriver/CreateSandbox`,
+in both the span name and `rpc.method`; the current RPC semantic conventions
+integrate the service into that fully qualified method and do not emit
+`rpc.service`. `service.name` and span kind distinguish the two sides.
+Backend-prefixed spans describe implementation work beneath that boundary.
+Streaming `WatchSandboxes` spans remain open for the stream lifetime on both
+sides. A terminal stream status records its outcome;
+consumer teardown without a terminal status leaves the span status unset.
 
 Two invariants shape the failure behavior. Telemetry is diagnostic, so no OTLP
 failure stops the gateway from serving: a malformed endpoint is logged at

@@ -1,0 +1,6 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+openshell_rpm_latest_release_api_url: https://api.github.com/repos/NVIDIA/OpenShell/releases/latest
+openshell_rpm_latest_release_download_dir: /var/lib/openshell-conformance/baseline

@@ -49,6 +49,11 @@ on:
         description: Optional previous stable tag override
         required: false
         type: string
+      upload_sarif:
+        description: Upload manual-run results to Code Scanning
+        required: false
+        default: false
+        type: boolean
       allow_full_bootstrap:
         description: Allow a full scan when no previous stable tag exists
         required: false
@@ -65,6 +70,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  CODEX_SECURITY_MAX_CONCURRENT_THREADS: "8"
   CODEX_SECURITY_REASONING_EFFORT: medium
   NVIDIA_INFERENCE_BASE_URL: https://inference-api.nvidia.com/v1
   NVIDIA_INFERENCE_MODEL: openai/openai/gpt-5.6-sol
@@ -72,6 +78,8 @@ env:
 jobs:
   analyze:
     name: Codex Security (${{ inputs.candidate_ref || github.ref_name }})
+    # The agent executes no shell commands on the repository self-hosted runner,
+    # so its preflight never scopes the diff and it seals no draft.
     runs-on: ubuntu-latest
     timeout-minutes: 120
     outputs:
@@ -93,6 +101,17 @@ jobs:
         with:
           python-version: "3.14"
 
+      # Codex confines model-run commands with bubblewrap, which needs
+      # unprivileged user namespaces. Ubuntu 24.04 restricts those through
+      # AppArmor, so bubblewrap cannot set up the sandbox network namespace and
+      # the scan agent executes nothing at all.
+      - name: Allow unprivileged user namespaces
+        run: |
+          set -euo pipefail
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
       - name: Install Codex Security
         run: |
           set -euo pipefail
@@ -110,6 +129,25 @@ jobs:
           set -euo pipefail
           test -x "$CODEX_SECURITY_BIN"
           "$CODEX_SECURITY_BIN" --version
+
+      # The range resolver has to come from the workflow's own revision. A
+      # scanned candidate predates it, and running the resolver from the
+      # revision under scan would let that revision pick its own scan range.
+      - name: Check out the workflow revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: workflow-revision
+          sparse-checkout: tasks/scripts
+          persist-credentials: false
+
+      - name: Stage the range resolver
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$RUNNER_TEMP/range-resolver"
+          cp workflow-revision/tasks/scripts/release.py \
+            workflow-revision/tasks/scripts/codex_security_range.py \
+            "$RUNNER_TEMP/range-resolver/"
+          rm -rf workflow-revision
 
       - name: Check out the pre-release
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -139,17 +177,17 @@ jobs:
             args+=(--allow-full-bootstrap)
           fi
 
-          node tasks/scripts/codex-security-release-range.mjs "${args[@]}"
+          python3 "$RUNNER_TEMP/range-resolver/codex_security_range.py" "${args[@]}"
 
       - name: Scan changes since the previous stable
         env:
           BASE_SHA: ${{ steps.range.outputs.base_sha }}
           CODEX_SECURITY_BIN: ${{ runner.temp }}/codex-security/node_modules/.bin/codex-security
-          CODEX_SECURITY_STATE_DIR: ${{ runner.temp }}/codex-security-state
+          CODEX_SECURITY_STATE_DIR: ${{ runner.temp }}/codex-security-state-${{ github.run_id }}-${{ github.run_attempt }}
           HEAD_SHA: ${{ steps.range.outputs.candidate_sha }}
           NVIDIA_INFERENCE_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
-          SCAN_DIR: ${{ runner.temp }}/codex-security-results
+          SCAN_DIR: ${{ runner.temp }}/codex-security-results-${{ github.run_id }}-${{ github.run_attempt }}
           SCAN_SCOPE: ${{ steps.range.outputs.scan_scope }}
         run: |
           set -euo pipefail
@@ -174,6 +212,8 @@ jobs:
             --codex 'model_providers.nvidia.env_key="NVIDIA_INFERENCE_API_KEY"' \
             --codex 'model_providers.nvidia.wire_api="responses"' \
             --codex 'model_providers.nvidia.supports_websockets=false' \
+            --codex "features.multi_agent_v2.max_concurrent_threads_per_session=$CODEX_SECURITY_MAX_CONCURRENT_THREADS" \
+            --codex 'approval_policy="never"' \
             --output-dir "$SCAN_DIR" \
             --headless > /dev/null
 
@@ -181,7 +221,7 @@ jobs:
         env:
           CODEX_SECURITY_BIN: ${{ runner.temp }}/codex-security/node_modules/.bin/codex-security
           SARIF_FILE: ${{ runner.temp }}/codex-security.sarif
-          SCAN_DIR: ${{ runner.temp }}/codex-security-results
+          SCAN_DIR: ${{ runner.temp }}/codex-security-results-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
           "$CODEX_SECURITY_BIN" export "$SCAN_DIR" \
@@ -205,6 +245,7 @@ jobs:
             echo
             echo "- Train: \`$TRAIN\`"
             echo "- Candidate: \`$CANDIDATE_TAG\`"
+            echo "- Maximum concurrent agent threads: $CODEX_SECURITY_MAX_CONCURRENT_THREADS"
             if [ "$SCAN_SCOPE" = "diff" ]; then
               echo "- Previous stable: \`$BASE_TAG\`"
               echo "- Commits in cumulative diff: $COMMIT_COUNT"
@@ -218,6 +259,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload SARIF to Code Scanning
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.upload_sarif }}
         uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
         with:
           sarif_file: ${{ runner.temp }}/codex-security.sarif
@@ -227,7 +269,7 @@ jobs:
 
   result:
     name: OpenShell / Codex Security (informational)
-    if: always()
+    if: ${{ always() }}
     needs: analyze
     runs-on: ubuntu-latest
     permissions: {}

@@ -242,6 +242,15 @@ CONFIG_PATH="${STATE_DIR}/gateway.toml"
 # The config may reference credential-bearing material (e.g. proxy_auth_file);
 # keep it owner-only regardless of the ambient umask.
 install -m 600 /dev/null "${CONFIG_PATH}"
+
+# Kubernetes is a shared deployment, so its sandbox JWTs must expire. Local
+# drivers omit ttl_secs and inherit the gateway's non-expiring default, so a
+# sandbox restarted while the gateway is down can still reconnect.
+GATEWAY_JWT_TTL_CONFIG=""
+if [[ "${DRIVER}" == "kubernetes" ]]; then
+  GATEWAY_JWT_TTL_CONFIG="ttl_secs = 3600"
+fi
+
 cat >"${CONFIG_PATH}" <<EOF
 [openshell]
 version = 1
@@ -263,7 +272,7 @@ signing_key_path = "${TLS_DIR}/jwt/signing.pem"
 public_key_path = "${TLS_DIR}/jwt/public.pem"
 kid_path = "${TLS_DIR}/jwt/kid"
 gateway_id = "${GATEWAY_NAME}"
-ttl_secs = 3600
+${GATEWAY_JWT_TTL_CONFIG}
 EOF
 
 cat >>"${CONFIG_PATH}" <<EOF

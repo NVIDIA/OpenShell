@@ -1112,6 +1112,11 @@ fn network_endpoint_from_json(
     if endpoint.host.trim().is_empty() {
         return Err("endpoint.host is required".to_string());
     }
+    if let Some(reason) =
+        openshell_policy::agent_authored_transport_rejection(&endpoint.protocol, &endpoint.tls)
+    {
+        return Err(reason.to_string());
+    }
 
     let mut ports = endpoint.ports;
     if ports.is_empty() && endpoint.port > 0 {
@@ -1482,6 +1487,47 @@ mod tests {
         let error = proposal_chunks_from_body(body).unwrap_err();
         assert!(error.contains("query strings"));
         assert!(!error.contains("secret"));
+    }
+
+    #[test]
+    fn proposal_chunks_from_body_rejects_native_tcp_and_tls_skip() {
+        for endpoint in [
+            r#"{"host":"db.example.com","port":5432,"protocol":"tcp"}"#,
+            r#"{"host":"api.example.com","port":443,"tls":"skip"}"#,
+        ] {
+            let body = format!(
+                r#"{{
+                    "operations": [{{
+                        "addRule": {{
+                            "ruleName": "raw_transport",
+                            "rule": {{"endpoints": [{endpoint}]}}
+                        }}
+                    }}]
+                }}"#
+            );
+
+            let error = proposal_chunks_from_body(body.as_bytes()).unwrap_err();
+            assert!(error.contains("administrator"), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn proposal_chunks_from_body_accepts_omitted_protocol_with_default_tls() {
+        let body = br#"{
+            "operations": [{
+                "addRule": {
+                    "ruleName": "explicit_proxy",
+                    "rule": {
+                        "endpoints": [{"host":"api.example.com","port":443}]
+                    }
+                }
+            }]
+        }"#;
+
+        let chunks = proposal_chunks_from_body(body).unwrap();
+        let endpoint = &chunks[0].proposed_rule.as_ref().unwrap().endpoints[0];
+        assert!(endpoint.protocol.is_empty());
+        assert!(endpoint.tls.is_empty());
     }
 
     #[test]

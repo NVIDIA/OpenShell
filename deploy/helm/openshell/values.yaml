@@ -413,7 +413,7 @@ server:
     # -- Expected audience claim for the API resource server.
     # This should match the server's --oidc-audience, NOT the CLI client ID.
     audience: "openshell-cli"
-    # -- JWKS key cache TTL in seconds.
+    # -- JWKS key cache TTL in seconds. Must be greater than zero.
     jwksTtl: 3600
     # -- Dot-separated path to the roles array in the JWT claims.
     # Keycloak: "realm_access.roles", Entra ID: "roles", Okta: "groups".

@@ -14,34 +14,56 @@ use openshell_core::SetResourceVersion;
 use openshell_core::paths::set_file_owner_only;
 use openshell_core::proto::Sandbox;
 use prost::Message;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePoolOptions};
 use sqlx::{Connection, QueryBuilder, Row, Sqlite, SqlitePool};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::Mutex;
 
 static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
+static IN_MEMORY_DB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
 
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+    in_memory_keepalive: Option<Arc<Mutex<Option<SqliteConnection>>>>,
+}
+
+#[cfg(test)]
+pub(super) async fn replace_pool_connection(store: &SqliteStore) -> PersistenceResult<()> {
+    let connection = store.pool.acquire().await.map_err(|e| map_db_error(&e))?;
+    connection.close().await.map_err(|e| map_db_error(&e))
 }
 
 impl SqliteStore {
     /// Closes the connection pool.
     #[cfg(test)]
     pub(crate) async fn close_for_test(&self) {
-        self.pool.close().await;
+        self.close().await;
     }
 
     pub async fn connect(url: &str) -> PersistenceResult<Self> {
         let is_in_memory = url.contains(":memory:") || url.contains("mode=memory");
         let max_connections = if is_in_memory { 1 } else { 5 };
 
-        let options = SqliteConnectOptions::from_str(url)
+        let mut options = SqliteConnectOptions::from_str(url)
             .map_err(|e| map_db_error(&e))?
             .create_if_missing(true);
+
+        if is_in_memory {
+            if options.get_filename().as_os_str().is_empty()
+                || options.get_filename() == Path::new(":memory:")
+            {
+                let sequence = IN_MEMORY_DB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                options = options.filename(format!("file:openshell-in-memory-{sequence}"));
+            }
+            options = options.shared_cache(true);
+        }
 
         let mut pool_options = SqlitePoolOptions::new()
             .max_connections(max_connections)
@@ -55,6 +77,15 @@ impl SqliteStore {
         // so we can restrict the permissions after the database is connected.
         let db_path = (!is_in_memory).then(|| options.get_filename().to_path_buf());
 
+        let in_memory_keepalive = if is_in_memory {
+            let connection = SqliteConnection::connect_with(&options)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+            Some(Arc::new(Mutex::new(Some(connection))))
+        } else {
+            None
+        };
+
         let pool = pool_options
             .connect_with(options)
             .await
@@ -65,7 +96,10 @@ impl SqliteStore {
             restrict_db_file_permissions(&path)?;
         }
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            in_memory_keepalive,
+        })
     }
 
     pub async fn migrate(&self) -> PersistenceResult<()> {
@@ -88,6 +122,12 @@ impl SqliteStore {
     #[cfg(any(test, feature = "test-support"))]
     pub async fn close(&self) {
         self.pool.close().await;
+        if let Some(keepalive) = &self.in_memory_keepalive {
+            let connection = keepalive.lock().await.take();
+            if let Some(connection) = connection {
+                let _ = connection.close().await;
+            }
+        }
     }
 
     pub async fn put(

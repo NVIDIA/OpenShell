@@ -23,9 +23,11 @@ openshell sandbox create -- claude
 The trailing command is the sandbox's canonical main process. OpenShell starts
 it once, streams its output, and returns its exit status. Exit code 0 leaves a
 retained sandbox in `Completed`; a nonzero exit leaves it in `Error` with a
-`MainProcessFailed` condition. With no trailing command, OpenShell
-starts `/bin/bash -l` in a retained pseudo-terminal. Add `--detach` to create
-the sandbox without attaching:
+`MainProcessFailed` condition. With no trailing command, OpenShell starts a
+login shell in a retained pseudo-terminal: `/bin/bash -l` when the image
+provides bash, otherwise a shell detected in the image such as `/bin/sh` on
+minimal bases like Alpine. Add `--detach` to create the sandbox without
+attaching:
 
 ```shell
 openshell sandbox create --name worker --detach -- ./worker

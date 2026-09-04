@@ -297,11 +297,12 @@ async fn handle_create_sandbox_inner(
         (resolved, Some(provenance))
     };
 
-    // Every newly persisted sandbox has one explicit canonical process. This
-    // portable default also preserves compatibility with callers compiled
-    // before the main-process field was introduced.
+    // Leave an omitted command empty rather than persisting a concrete shell:
+    // the supervisor resolves the default login shell against the sandbox image
+    // (bash when present, otherwise /bin/sh on minimal images like Alpine),
+    // which the gateway cannot do since it does not see the sandbox filesystem.
+    // The default is an interactive login shell, so request a TTY.
     if spec.command.is_empty() {
-        spec.command = vec!["/bin/bash".to_string(), "-l".to_string()];
         spec.tty = true;
     }
 

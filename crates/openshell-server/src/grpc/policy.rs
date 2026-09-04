@@ -4306,6 +4306,18 @@ pub(super) async fn handle_submit_policy_analysis(
         }
 
         let rule_ref = chunk.proposed_rule.as_ref().expect("checked above");
+        if req.analysis_mode == "agent_authored"
+            && let Some(reason) = rule_ref.endpoints.iter().find_map(|endpoint| {
+                openshell_policy::agent_authored_transport_rejection(
+                    &endpoint.protocol,
+                    &endpoint.tls,
+                )
+            })
+        {
+            rejected += 1;
+            rejection_reasons.push(format!("chunk '{}': {reason}", chunk.rule_name));
+            continue;
+        }
         let incoming_observation_key = rule_ref.endpoints.first().and_then(|endpoint| {
             rule_ref.binaries.first().map(|binary| {
                 (
@@ -11298,7 +11310,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_all_skips_later_tls_conflict_and_applies_compatible_prefix() {
+    async fn approve_all_skips_later_endpoint_conflict_and_applies_compatible_prefix() {
         let state = test_server_state().await;
         let sandbox_id = "sb-approve-all-conflict";
         let sandbox_name = "approve-all-conflict";
@@ -11339,13 +11351,15 @@ mod tests {
                         ..Default::default()
                     },
                     PolicyChunk {
-                        rule_name: "passthrough".to_string(),
+                        rule_name: "conflicting".to_string(),
                         proposed_rule: Some(NetworkPolicyRule {
-                            name: "passthrough".to_string(),
+                            name: "conflicting".to_string(),
                             endpoints: vec![NetworkEndpoint {
                                 host: "shared.example.com".to_string(),
                                 port: 443,
-                                tls: "skip".to_string(),
+                                protocol: "graphql".to_string(),
+                                enforcement: "enforce".to_string(),
+                                access: "read-only".to_string(),
                                 advisor_proposed: true,
                                 ..Default::default()
                             }],
@@ -11423,7 +11437,7 @@ mod tests {
             .unwrap();
         let policy = ProtoSandboxPolicy::decode(revision.policy_payload.as_slice()).unwrap();
         assert!(policy.network_policies.contains_key("inspected"));
-        assert!(!policy.network_policies.contains_key("passthrough"));
+        assert!(!policy.network_policies.contains_key("conflicting"));
     }
 
     #[tokio::test]
@@ -13884,6 +13898,91 @@ mod tests {
             "rejection reason must cite the reserved-prefix rule. got: {:?}",
             response.rejection_reasons,
         );
+    }
+
+    #[tokio::test]
+    async fn agent_authored_submit_rejects_native_tcp_and_tls_skip_but_allows_explicit_proxy() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+
+        let state = test_server_state().await;
+        let sandbox_name = "reject-agent-raw-transports";
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-reject-agent-raw-transports",
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let endpoint = |protocol: &str, tls: &str| NetworkEndpoint {
+            host: "api.example.com".to_string(),
+            port: 443,
+            protocol: protocol.to_string(),
+            tls: tls.to_string(),
+            ..Default::default()
+        };
+        let chunk = |name: &str, endpoint: NetworkEndpoint| PolicyChunk {
+            rule_name: name.to_string(),
+            proposed_rule: Some(NetworkPolicyRule {
+                name: name.to_string(),
+                endpoints: vec![endpoint],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+
+        let response = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![
+                    chunk("native_tcp", endpoint("tcp", "")),
+                    chunk("raw_tls", endpoint("", "skip")),
+                    chunk("explicit_proxy", endpoint("", "")),
+                ],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.accepted_chunks, 1);
+        assert_eq!(response.rejected_chunks, 2);
+        assert_eq!(response.rejection_reasons.len(), 2);
+        assert!(
+            response
+                .rejection_reasons
+                .iter()
+                .any(|reason| reason.contains("protocol tcp"))
+        );
+        assert!(
+            response
+                .rejection_reasons
+                .iter()
+                .any(|reason| reason.contains("tls: skip"))
+        );
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name.to_string(),
+                status_filter: String::new(),
+                workspace: "default".to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(draft.chunks.len(), 1);
+        assert_eq!(draft.chunks[0].rule_name, "explicit_proxy");
     }
 
     #[tokio::test]

@@ -118,7 +118,7 @@ scopes_claim  = ""                     # empty disables scope enforcement
 
 [openshell.drivers.kubernetes]
 namespace                    = "openshell"
-default_image                = "ghcr.io/nvidia/openshell/sandbox:latest"
+default_image                = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 image_pull_policy            = "IfNotPresent"
 supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:latest"
 supervisor_image_pull_policy = "IfNotPresent"
@@ -128,7 +128,7 @@ host_gateway_ip              = "10.0.0.1"
 ssh_socket_path              = "/run/openshell/ssh.sock"
 
 [openshell.drivers.docker]
-default_image     = "ghcr.io/nvidia/openshell/sandbox:latest"
+default_image     = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 image_pull_policy = "IfNotPresent"
 sandbox_namespace = "docker-dev"
 grpc_endpoint     = "https://host.openshell.internal:8080"
@@ -141,7 +141,7 @@ guest_tls_key     = "/etc/openshell/certs/client-key.pem"
 
 [openshell.drivers.podman]
 socket_path       = "/run/podman/podman.sock"
-default_image     = "ghcr.io/nvidia/openshell/sandbox:latest"
+default_image     = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 image_pull_policy = "missing"   # Podman vocabulary: always | missing | never | newer
 supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"
 network_name      = "openshell"
@@ -229,7 +229,7 @@ compute_drivers = ["kubernetes"]
 
 [openshell.drivers.kubernetes]
 namespace        = "agents"
-default_image    = "ghcr.io/nvidia/openshell/sandbox:0.9.0"
+default_image    = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 supervisor_image = "ghcr.io/nvidia/openshell/supervisor:0.9.0"
 grpc_endpoint    = "https://openshell-gateway.agents.svc:8080"
 ```
@@ -254,7 +254,7 @@ gateway:
     drivers:
       kubernetes:
         namespace: agents
-        default_image: ghcr.io/nvidia/openshell/sandbox:0.9.0
+        default_image: ghcr.io/nvidia/openshell-community/sandboxes/base:latest
         supervisor_image: ghcr.io/nvidia/openshell/supervisor:0.9.0
 ```
 

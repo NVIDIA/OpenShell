@@ -105,7 +105,7 @@ disable_tls = false
 
 # Shared driver defaults. These inherit into [openshell.drivers.<name>] tables
 # when the driver-specific table does not override them.
-default_image           = "ghcr.io/nvidia/openshell/sandbox:latest"
+default_image           = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 # Defaults to the gateway version; override to pin a specific build.
 # supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
 client_tls_secret_name  = "openshell-client-tls"
@@ -174,7 +174,7 @@ service_name = "openshell-gateway"
 [openshell.gateway.oidc]
 issuer        = "https://idp.example.com/realms/openshell"
 audience      = "openshell-cli"
-jwks_ttl_secs = 3600
+jwks_ttl_secs = 3600 # Must be greater than zero.
 roles_claim   = "realm_access.roles"
 admin_role    = "openshell-admin"
 user_role     = "openshell-user"
@@ -237,7 +237,7 @@ The OpenTelemetry SDK logs export failures after startup. Spans in a failed batc
 
 Only OpenTelemetry traces are exported. Inbound gRPC and HTTP requests produce server spans named for the RPC or HTTP method. Store and compute-driver operations appear as child spans. Internal reconciliation, credential-refresh, and driver-watch loops create operation roots for their store work because no inbound request supplies a parent. The gateway continues valid W3C `traceparent` context and starts a new trace when none is supplied. Request spans carry `method`, `path`, and the `request_id` that also appears in gateway logs. Health endpoint spans use DEBUG level and are not exported by the default INFO filter.
 
-The gateway forwards the OTLP configuration, configured gateway name, and W3C trace context to managed external drivers. Built-in drivers also export their spans to the same collector through dedicated in-process providers. Driver spans retain the gateway trace context, use a distinct service name such as `openshell-driver-docker` or `openshell-driver-podman`, and carry the gateway name as the `openshell.gateway.name` resource attribute. Operator-run external drivers own their own telemetry configuration.
+The gateway forwards the OTLP configuration, configured gateway name, configured compute driver, and W3C trace context to managed external drivers. Built-in drivers also export their spans to the same collector through dedicated in-process providers. Driver spans retain the gateway trace context, use a distinct service name such as `openshell-driver-docker` or `openshell-driver-podman`, and carry the same `openshell.gateway.name` and `openshell.gateway.compute_driver` resource attributes as gateway spans. Compute-driver client and server spans use the same fully qualified protobuf operation name, such as `openshell.compute.v1.ComputeDriver/CreateSandbox`, in both the span name and `rpc.method`. The service name and span kind distinguish each side. Backend-prefixed child spans identify implementation work. A streaming watch records a terminal status when observed; consumer teardown without a terminal status leaves the span status unset. Operator-run external drivers own their own telemetry configuration.
 
 For Helm deployments, set `server.otlp.endpoint` to render this table. The
 optional `server.otlp.serviceName` value overrides the gateway service name;
@@ -481,7 +481,7 @@ workspace_mode                 = "shared"
 # gateway_id                   = "openshell"
 namespace                      = "agents"
 service_account_name           = "openshell-sandbox"
-default_image                  = "ghcr.io/nvidia/openshell/sandbox:latest"
+default_image                  = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 image_pull_policy              = "IfNotPresent"
 image_pull_secrets             = ["regcred"]
 # Defaults to the gateway version; override to pin a specific build.
@@ -604,7 +604,7 @@ compute_drivers = ["docker"]
 
 [openshell.drivers.docker]
 socket_path        = "/var/run/docker.sock"
-default_image      = "ghcr.io/nvidia/openshell/sandbox:latest"
+default_image      = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 # Docker vocabulary: Always | IfNotPresent | Never. Empty behaves like IfNotPresent.
 image_pull_policy  = "IfNotPresent"
 sandbox_namespace  = "docker-dev"
@@ -648,7 +648,7 @@ compute_drivers = ["podman"]
 # asks the podman CLI where its socket is, and fails to start if neither finds
 # one. Set this to pin a specific Podman machine instead.
 socket_path             = "/run/user/1000/podman/podman.sock"
-default_image           = "ghcr.io/nvidia/openshell/sandbox:latest"
+default_image           = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 image_pull_policy       = "missing"   # always | missing | never | newer
 grpc_endpoint           = "https://host.containers.internal:17670"
 # The gateway overwrites gateway_port from bind_address at runtime.
@@ -781,10 +781,10 @@ compute_drivers = ["vm"]
 state_dir        = "/var/lib/openshell/vm"
 # Where the gateway looks for the openshell-driver-vm subprocess binary.
 driver_dir       = "/usr/local/libexec/openshell"
-default_image    = "ghcr.io/nvidia/openshell/sandbox:latest"
+default_image    = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 grpc_endpoint    = "https://host.containers.internal:17670"
 # Empty falls back to default_image.
-bootstrap_image  = "ghcr.io/nvidia/openshell/sandbox:latest"
+bootstrap_image  = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 krun_log_level   = 1
 vcpus            = 2
 mem_mib          = 2048

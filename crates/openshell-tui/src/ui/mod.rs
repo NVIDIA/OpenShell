@@ -74,8 +74,8 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(20), // metadata
-            Constraint::Percentage(80), // policy or logs
+            Constraint::Length(sandbox_detail::required_height(app)), // metadata
+            Constraint::Min(0),                                       // policy or logs
         ])
         .split(area);
 
@@ -736,5 +736,30 @@ mod tests {
             .collect::<String>();
         assert_eq!(rendered, expected);
         assert!(!rendered.contains("ALPHA"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_delete_confirmation_is_visible_in_standard_terminal() {
+        let mut app = test_app();
+        app.screen = Screen::Sandbox;
+        app.focus = Focus::SandboxPolicy;
+        app.sandbox_names = vec!["test-sandbox".to_string()];
+        app.sandbox_count = 1;
+        app.confirm_delete = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            text.contains("Delete sandbox 'test-sandbox'?"),
+            "sandbox screen was: {text:?}"
+        );
     }
 }

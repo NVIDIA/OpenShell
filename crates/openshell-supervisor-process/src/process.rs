@@ -225,11 +225,14 @@ fn apply_canonical_process_environment(
     user_environment: &HashMap<String, String>,
 ) {
     let (session_user, session_home) = session_user_and_home(policy, workspace.home());
+    // Resolve a shell present in the sandbox image (minimal images such as
+    // Alpine ship only `/bin/sh`, not bash). Runs in the supervisor.
+    let shell = openshell_core::shell::detect_login_shell();
 
     for (key, value) in [
         ("HOME", session_home.as_str()),
         ("USER", session_user.as_str()),
-        ("SHELL", "/bin/bash"),
+        ("SHELL", shell.as_str()),
         (
             "TERM",
             if interactive {
@@ -900,15 +903,19 @@ impl ProcessHandle {
             }
         }
 
+        // Name the program in the error: a bare "No such file or directory"
+        // here is otherwise indistinguishable from a missing working directory
+        // or interpreter, and is a common failure on images that lack the
+        // requested shell/binary (e.g. bash on Alpine).
         #[cfg(target_os = "linux")]
         let mut child = spawn_command_with_supervisor_identity_namespace(cmd)
             .into_diagnostic()
-            .wrap_err("failed to spawn sandbox entrypoint process")?;
+            .wrap_err_with(|| format!("failed to spawn sandbox entrypoint process '{program}'"))?;
         #[cfg(not(target_os = "linux"))]
         let mut child = cmd
             .spawn()
             .into_diagnostic()
-            .wrap_err("failed to spawn sandbox entrypoint process")?;
+            .wrap_err_with(|| format!("failed to spawn sandbox entrypoint process '{program}'"))?;
         let pid = child.id().unwrap_or(0);
         managed_children::register(pid);
 
@@ -2475,7 +2482,10 @@ mod tests {
             Some(&current_user.dir.to_string_lossy().as_ref())
         );
         assert_eq!(variables.get("USER"), Some(&current_user.name.as_str()));
-        assert_eq!(variables.get("SHELL"), Some(&"/bin/bash"));
+        // SHELL is the shell detected in the current root filesystem, not a
+        // hardcoded path (bash-less images resolve to /bin/sh).
+        let expected_shell = openshell_core::shell::detect_login_shell();
+        assert_eq!(variables.get("SHELL"), Some(&expected_shell.as_str()));
         assert_eq!(variables.get("TERM"), Some(&"xterm-256color"));
     }
 

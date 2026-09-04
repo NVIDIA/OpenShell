@@ -1,0 +1,86 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Create development gateway state directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0700"
+  loop:
+    - "{{ openshell_gateway_state_root }}"
+    - "{{ openshell_gateway_state_root }}/xdg/config"
+    - "{{ openshell_gateway_state_root }}/xdg/cache"
+    - "{{ openshell_gateway_state_root }}/xdg/data"
+    - "{{ openshell_gateway_state_root }}/xdg/state"
+    - /home/openshell/.config/systemd/user
+
+- name: Generate development gateway certificates
+  ansible.builtin.command:
+    cmd: "{{ openshell_gateway_bin }} generate-certs --output-dir {{ openshell_gateway_state_root }}/pki"
+    creates: "{{ openshell_gateway_state_root }}/pki/jwt/signing.pem"
+
+- name: Write rootless Podman gateway configuration
+  ansible.builtin.copy:
+    dest: "{{ openshell_gateway_state_root }}/gateway.toml"
+    mode: "0600"
+    content: |
+      [openshell]
+      version = 1
+
+      [openshell.gateway]
+      bind_address = "127.0.0.1:8080"
+      log_level = "info"
+      compute_drivers = ["podman"]
+      disable_tls = true
+
+      [openshell.gateway.auth]
+      allow_unauthenticated_users = true
+
+      [openshell.gateway.gateway_jwt]
+      signing_key_path = "{{ openshell_gateway_state_root }}/pki/jwt/signing.pem"
+      public_key_path = "{{ openshell_gateway_state_root }}/pki/jwt/public.pem"
+      kid_path = "{{ openshell_gateway_state_root }}/pki/jwt/kid"
+      gateway_id = "openshell-test-guest"
+      ttl_secs = 0
+
+      [openshell.drivers.podman]
+      default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+      supervisor_image = "{{ openshell_supervisor_image }}"
+      image_pull_policy = "always"
+      network_name = "openshell-test-guest"
+      grpc_endpoint = "http://host.containers.internal:8080"
+
+- name: Check for the development supervisor image
+  ansible.builtin.command:
+    cmd: "podman image exists {{ openshell_supervisor_image }}"
+  register: openshell_supervisor_image_exists
+  changed_when: false
+  failed_when: false
+
+- name: Import the development supervisor image
+  ansible.builtin.command:
+    cmd: >-
+      podman import --change 'ENTRYPOINT ["/openshell-sandbox"]'
+      {{ openshell_supervisor_archive }} {{ openshell_supervisor_image }}
+  when: openshell_supervisor_image_exists.rc != 0
+
+- name: Install the development gateway user service
+  ansible.builtin.copy:
+    dest: "/home/openshell/.config/systemd/user/{{ openshell_gateway_service }}"
+    mode: "0600"
+    content: |
+      [Unit]
+      Description=OpenShell development test guest gateway
+      After=podman.socket
+
+      [Service]
+      Environment=XDG_CONFIG_HOME={{ openshell_gateway_state_root }}/xdg/config
+      Environment=XDG_CACHE_HOME={{ openshell_gateway_state_root }}/xdg/cache
+      Environment=XDG_DATA_HOME={{ openshell_gateway_state_root }}/xdg/data
+      Environment=XDG_STATE_HOME={{ openshell_gateway_state_root }}/xdg/state
+      ExecStart={{ openshell_gateway_bin }} --config {{ openshell_gateway_state_root }}/gateway.toml
+      Restart=on-failure
+
+      [Install]
+      WantedBy=default.target

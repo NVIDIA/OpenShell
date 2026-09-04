@@ -111,7 +111,9 @@ impl std::str::FromStr for Mode {
 #[command(about = "Process sandbox and monitor", long_about = None)]
 struct Args {
     /// Command to execute in the sandbox.
-    /// Defaults to `/bin/bash -l` if neither this nor the driver specification is provided.
+    /// Defaults to a login shell if neither this nor the driver specification is
+    /// provided: `/bin/bash -l` when available, otherwise a shell detected in the
+    /// sandbox image (e.g. `/bin/sh` on Alpine).
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
 
@@ -600,6 +602,7 @@ fn main() -> Result<()> {
         // `ocsf_json_enabled` setting changes. The JSONL layer checks it
         // on each event and short-circuits when false.
         let ocsf_enabled = Arc::new(AtomicBool::new(false));
+        let ocsf_schema_version = Arc::new(std::sync::Mutex::new(String::new()));
 
         // Keep guards alive for the entire process. When a guard is dropped the
         // non-blocking writer flushes remaining logs.
@@ -618,7 +621,9 @@ fn main() -> Result<()> {
                 .ok()
                 .map(|roller| {
                     let (writer, guard) = tracing_appender::non_blocking(roller);
-                    let layer = OcsfJsonlLayer::new(writer).with_enabled_flag(ocsf_enabled.clone());
+                    let layer = OcsfJsonlLayer::new(writer)
+                        .with_enabled_flag(ocsf_enabled.clone())
+                        .with_target_version(ocsf_schema_version.clone());
                     (layer, guard)
                 });
             let (jsonl_layer, jsonl_guard) = match jsonl_logging {
@@ -678,6 +683,12 @@ fn main() -> Result<()> {
             )
         };
 
+        // An omitted command (the gateway leaves the default empty rather than
+        // baking a shell it cannot verify) is resolved to a login shell here, in
+        // the supervisor, so it matches the sandbox image: bash when present,
+        // otherwise /bin/sh (e.g. Alpine). An explicit command is used verbatim.
+        let command = resolve_default_command(command);
+
         info!(command = ?command, "Starting sandbox");
         // Note: "Starting sandbox" stays as plain info!() since the OCSF context
         // is not yet initialized at this point (run_sandbox hasn't been called).
@@ -708,6 +719,7 @@ fn main() -> Result<()> {
             args.health_port,
             args.inference_routes,
             ocsf_enabled,
+            ocsf_schema_version,
             args.mode.network,
             args.mode.process,
             upstream_proxy_args,
@@ -716,6 +728,20 @@ fn main() -> Result<()> {
     })?;
 
     std::process::exit(exit_code);
+}
+
+/// Resolve an omitted canonical command to a login shell that exists in this
+/// sandbox image. Empty means "use the default": the gateway leaves an omitted
+/// command empty rather than persisting a shell it cannot verify, so the
+/// supervisor picks one here against the real sandbox filesystem (bash when
+/// present, otherwise `/bin/sh`). An explicit command is returned unchanged.
+fn resolve_default_command(command: Vec<String>) -> Vec<String> {
+    if !command.is_empty() {
+        return command;
+    }
+    let shell = openshell_core::shell::detect_login_shell();
+    info!(shell = %shell, "no command specified; resolved default login shell");
+    vec![shell, "-l".to_string()]
 }
 
 #[cfg(test)]

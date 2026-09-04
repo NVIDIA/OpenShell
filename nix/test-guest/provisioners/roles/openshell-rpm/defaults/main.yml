@@ -1,0 +1,8 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+openshell_rpm_cli_bin: /usr/bin/openshell
+openshell_rpm_gateway_bin: /usr/bin/openshell-gateway
+openshell_rpm_gateway_service: openshell-gateway.service
+openshell_rpm_gateway_endpoint: https://127.0.0.1:17670

@@ -1,0 +1,59 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Require RPM gateway provisioner dependencies
+  ansible.builtin.assert:
+    that:
+      - openshell_install_source | default('') == 'rpm'
+      - openshell_cli_bin is defined
+      - openshell_gateway_service is defined
+      - openshell_gateway_runtime | default('') == 'rootless-podman'
+    fail_msg: >-
+      openshell-rpm-gateway-upgrade requires openshell-rpm and a configured
+      gateway runtime.
+
+- name: Verify candidate RPMs for upgrade
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ openshell_rpm_upgrade_cli }}"
+    - "{{ openshell_rpm_upgrade_gateway }}"
+  register: openshell_rpm_upgrade_candidates
+
+- name: Require copied candidate RPMs
+  ansible.builtin.assert:
+    that: item.stat.exists
+    fail_msg: "missing required RPM upgrade candidate: {{ item.item }}"
+  loop: "{{ openshell_rpm_upgrade_candidates.results }}"
+
+- name: Install the target RPM upgrade command
+  ansible.builtin.copy:
+    dest: "{{ openshell_rpm_upgrade_command }}"
+    mode: "0700"
+    content: |
+      #!/usr/bin/env bash
+      set -Eeuo pipefail
+      baseline_cli="$(rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' openshell)"
+      baseline_gateway="$(rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' openshell-gateway)"
+      candidate_cli="$(rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' {{ openshell_rpm_upgrade_cli }})"
+      candidate_gateway="$(rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' {{ openshell_rpm_upgrade_gateway }})"
+      if [[ "$candidate_cli" == "$baseline_cli" || "$candidate_gateway" == "$baseline_gateway" ]]; then
+        echo "candidate RPMs must differ from the installed baseline" >&2
+        exit 1
+      fi
+      sudo dnf install -y --allowerasing --nogpgcheck {{ openshell_rpm_upgrade_cli }} {{ openshell_rpm_upgrade_gateway }}
+      installed_cli="$(rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' openshell)"
+      installed_gateway="$(rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' openshell-gateway)"
+      if [[ "$installed_cli" != "$candidate_cli" || "$installed_gateway" != "$candidate_gateway" ]]; then
+        echo "installed RPMs do not match the candidate RPMs" >&2
+        exit 1
+      fi
+      rpm -V openshell openshell-gateway
+      systemctl --user daemon-reload
+      systemctl --user restart {{ openshell_gateway_service }}
+      for _ in $(seq 1 60); do
+        {{ openshell_cli_bin }} status >/dev/null 2>&1 && exit 0
+        sleep 1
+      done
+      exit 1

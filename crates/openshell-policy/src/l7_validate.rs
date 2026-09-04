@@ -49,6 +49,26 @@ pub fn is_explicit_tcp_protocol(protocol: &str) -> bool {
     protocol.eq_ignore_ascii_case("tcp")
 }
 
+/// Reject transport choices that an in-sandbox agent must not grant itself.
+///
+/// An omitted protocol remains allowed: it uses the established explicit
+/// proxy, which canonicalizes forward HTTP authorities and terminates TLS by
+/// default. Native transparent TCP and `tls: skip` bypass those application
+/// authority checks, so only an administrator may author them directly.
+pub fn agent_authored_transport_rejection(protocol: &str, tls: &str) -> Option<&'static str> {
+    if is_explicit_tcp_protocol(protocol) {
+        return Some(
+            "agent-authored proposals cannot request protocol tcp; ask an administrator to add native TCP access explicitly",
+        );
+    }
+    if tls.eq_ignore_ascii_case("skip") {
+        return Some(
+            "agent-authored proposals cannot request tls: skip; ask an administrator to add raw TLS access explicitly",
+        );
+    }
+    None
+}
+
 /// Reject additional L7-only fields represented outside
 /// [`L7EndpointFields`] by the runtime and provider-profile schemas.
 ///
@@ -67,6 +87,24 @@ pub fn validate_explicit_tcp_additional_fields(
         "protocol tcp does not support L7-only fields: {}; remove those fields",
         present_fields.join(", ")
     )]
+}
+
+#[cfg(test)]
+mod agent_transport_tests {
+    use super::agent_authored_transport_rejection;
+
+    #[test]
+    fn omitted_protocol_with_default_tls_remains_available_to_agents() {
+        assert_eq!(agent_authored_transport_rejection("", ""), None);
+    }
+
+    #[test]
+    fn agent_cannot_request_native_tcp_or_skip_tls_inspection() {
+        assert!(agent_authored_transport_rejection("tcp", "").is_some());
+        assert!(agent_authored_transport_rejection("TCP", "terminate").is_some());
+        assert!(agent_authored_transport_rejection("", "skip").is_some());
+        assert!(agent_authored_transport_rejection("rest", "SKIP").is_some());
+    }
 }
 
 /// Fields extracted from an endpoint definition needed for L7 semantic

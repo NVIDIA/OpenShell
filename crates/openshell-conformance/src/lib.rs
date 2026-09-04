@@ -4,6 +4,7 @@
 //! Reusable support for portable `OpenShell` CLI conformance scenarios.
 
 pub mod executor;
+pub mod plan;
 mod scenarios;
 
 use std::collections::BTreeSet;
@@ -23,25 +24,56 @@ use tokio::time::sleep;
 
 use self::executor::{CliExecutionError, CliExecutor, ProcessCli};
 
-pub use scenarios::SMOKE_SCENARIO;
+pub use plan::{ConformancePlan, HostAction, PlanDiagnostics, PlanRun, WorkloadExpectation};
+pub use scenarios::{SANDBOX_CONTINUITY_SCENARIO, SMOKE_SCENARIO};
 
 /// An installed conformance scenario.
 #[derive(Debug)]
 pub struct Scenario {
     pub name: &'static str,
     pub description: &'static str,
-    run: for<'a> fn(&'a mut OpenShellRunner) -> ScenarioFuture<'a>,
+    requires_plan: bool,
+    run: for<'a> fn(&'a mut OpenShellRunner, &'a PlanRun) -> ScenarioFuture<'a>,
+    validate_plan_run: Option<PlanRunValidator>,
 }
 
 pub type ScenarioFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+type PlanRunValidator = fn(&PlanRun) -> Result<(), String>;
 
 impl Scenario {
-    pub async fn run(&self, runner: &mut OpenShellRunner) -> Result<(), String> {
-        (self.run)(runner).await
+    pub async fn run(
+        &self,
+        runner: &mut OpenShellRunner,
+        plan_run: &PlanRun,
+    ) -> Result<(), String> {
+        self.validate_plan_run(plan_run)?;
+        (self.run)(runner, plan_run).await
+    }
+
+    pub fn validate_plan_run(&self, plan_run: &PlanRun) -> Result<(), String> {
+        self.validate_plan_run.map_or_else(
+            || default_validate_plan_run(plan_run),
+            |validate| validate(plan_run),
+        )
+    }
+
+    /// Whether this scenario may run only through an explicit target plan.
+    pub fn requires_plan(&self) -> bool {
+        self.requires_plan
     }
 }
 
-const SCENARIOS: &[Scenario] = &[SMOKE_SCENARIO];
+fn default_validate_plan_run(plan_run: &PlanRun) -> Result<(), String> {
+    if plan_run.workload_expectation.is_some() || !plan_run.actions.is_empty() {
+        return Err(format!(
+            "scenario {:?} does not accept workload_expectation or actions",
+            plan_run.scenario
+        ));
+    }
+    Ok(())
+}
+
+const SCENARIOS: &[Scenario] = &[SMOKE_SCENARIO, SANDBOX_CONTINUITY_SCENARIO];
 
 /// Returns every scenario compiled into this distribution.
 pub fn scenarios() -> &'static [Scenario] {
@@ -51,6 +83,13 @@ pub fn scenarios() -> &'static [Scenario] {
 /// Finds a scenario by its stable command-line name.
 pub fn scenario(name: &str) -> Option<&'static Scenario> {
     scenarios().iter().find(|candidate| candidate.name == name)
+}
+
+/// Returns scenarios that need no host-level disruption capability.
+pub fn default_scenarios() -> impl Iterator<Item = &'static Scenario> {
+    scenarios()
+        .iter()
+        .filter(|scenario| !scenario.requires_plan)
 }
 
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -245,10 +284,24 @@ struct AuthenticationOutput {
 /// Runs `OpenShell` commands for one conformance scenario and owns its cleanup.
 pub struct OpenShellRunner {
     cli: Arc<dyn CliExecutor>,
+    host_action_executor: Option<Arc<dyn HostActionExecutor>>,
     run_id: String,
     scenario: String,
     known_sandboxes: BTreeSet<String>,
     finished: bool,
+}
+
+/// Executes one target-supplied host-side action from an explicit plan.
+///
+/// This intentionally differs from [`CliExecutor`]: that executor models
+/// `OpenShell` CLI invocations through the runner's configured binary and emits
+/// structured command results, while an action is a plan-owned executable with
+/// no caller-provided arguments.
+pub trait HostActionExecutor: Send + Sync {
+    fn execute(
+        &self,
+        action: &HostAction,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
 }
 
 /// A runner command with diagnostic context but no timeout yet.
@@ -292,11 +345,42 @@ impl OpenShellRunner {
     pub fn with_executor(cli: Arc<dyn CliExecutor>, scenario: &str) -> Self {
         Self {
             cli,
+            host_action_executor: None,
             run_id: generate_run_id(),
             scenario: scenario.to_string(),
             known_sandboxes: BTreeSet::new(),
             finished: false,
         }
+    }
+
+    /// Attaches the target-side executor used only by explicit plan actions.
+    #[must_use]
+    pub fn with_host_action_executor(
+        mut self,
+        host_action_executor: Arc<dyn HostActionExecutor>,
+    ) -> Self {
+        self.host_action_executor = Some(host_action_executor);
+        self
+    }
+
+    /// Execute a target-supplied action declared by the active plan.
+    pub async fn execute_host_action(&self, action: &HostAction) -> Result<(), String> {
+        let Some(host_action_executor) = &self.host_action_executor else {
+            return Err(format!(
+                "{} requires a host action executor; run this scenario through an explicit plan",
+                self.context(&format!("action/{}", action.name))
+            ));
+        };
+        eprintln!(
+            "{} applying target host action",
+            self.context(&format!("action/{}", action.name))
+        );
+        host_action_executor.execute(action).await.map_err(|error| {
+            format!(
+                "{} failed: {error}",
+                self.context(&format!("action/{}", action.name))
+            )
+        })
     }
 
     pub fn id(&self) -> &str {

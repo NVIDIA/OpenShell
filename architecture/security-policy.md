@@ -97,6 +97,13 @@ raw relay by default. A `protocol: rest` endpoint can opt in to
 after an allowed `101` upgrade; server-to-client traffic and all other upgraded
 protocols remain raw passthrough.
 
+A `protocol: tcp` hostname is a connection-routing constraint, not an
+application-authority boundary. Transparent capture validates the approved DNS
+name, pinned destination address, port, and calling binary before opening the
+stream, but it does not inspect TLS SNI, HTTP `Host`, or another protocol-level
+destination. Compatible shared infrastructure can therefore let a client
+select another tenant, virtual host, or service behind the approved front door.
+
 ## Credentialed Endpoints
 
 OpenShell keeps provider credentials on paths it can inspect or rewrite by
@@ -216,6 +223,12 @@ through the proposal loop instead of treating the denial as terminal.
 
 1. **Submit.** Both proposers POST through the same `SubmitPolicyAnalysis`
    path. Each chunk is persisted with its `analysis_mode` for audit provenance.
+   Agent-authored chunks cannot request `protocol: tcp` or `tls: skip`; the
+   sandbox-local API rejects those transport choices for immediate feedback,
+   and the gateway repeats the check before persistence.
+   Omitted-protocol endpoints remain available through the explicit proxy with
+   default TLS termination and HTTP authority checks. Administrators can still
+   author native TCP and raw TLS policy directly.
 2. **Build and validate the candidate.** The gateway first canonicalizes a
    mechanistic proposal against the live effective policy. If an endpoint is
    already governed by an inspected or provider-owned contract, the candidate
