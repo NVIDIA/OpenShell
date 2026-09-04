@@ -4176,7 +4176,9 @@ name = "openshell-isolation-interface"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "libc",
  "openshell-core",
+ "rustix 1.1.4",
  "tokio",
 ]
 
