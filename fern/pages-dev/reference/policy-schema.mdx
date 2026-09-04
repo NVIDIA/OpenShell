@@ -193,8 +193,10 @@ Each endpoint defines a reachable destination and optional inspection rules.
 - `access` and `rules` are mutually exclusive; setting both is rejected.
 - `protocol: tcp` requires a valid DNS hostname. Hostless `allowed_ips`, IP-literal hosts, trailing-dot names, and malformed DNS selectors are rejected with a policy-validation error.
 - `protocol: tcp` requires at least one port and rejects L7-only fields, including `path`, `enforcement`, `access`, `rules`, `deny_rules`, request rewriting and credential signing fields, and GraphQL, JSON-RPC, or MCP options.
+- A `protocol: tcp` hostname constrains connection routing, not application authority. OpenShell does not inspect TLS SNI, HTTP `Host`, or another protocol-level destination in the stream. Compatible shared infrastructure can therefore expose other tenants, virtual hosts, or services behind an allowed hostname.
 - A sandbox runtime must support policy DNS and transparent TCP capture before it can activate a policy containing `protocol: tcp`. Docker and Podman provide this runtime support.
 - Adding the first `protocol: tcp` endpoint to a running sandbox that started without one is rejected atomically because its DNS and capture substrate is startup infrastructure. Recreate the sandbox with a TCP endpoint. A sandbox that started with the substrate can remove and re-add TCP endpoints dynamically.
+- Policy-advisor agent proposals cannot request `protocol: tcp` or `tls: skip`. Add native TCP or raw TLS access through an administrator-authored policy. Agent proposals may omit `protocol` to use the explicit proxy with its default TLS termination and HTTP authority checks.
 - When `protocol` is set, at least one of `access` or `rules` is required for `rest`, `websocket`, `graphql`, and `sql`.
 - `mcp` and `json-rpc` reject `access` presets; use explicit `rules`.
 - `json-rpc` requires explicit `rules` with `allow.method`.

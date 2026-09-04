@@ -46,7 +46,7 @@ versions:
 - display-name: Latest (v0.0.116)
   path: ./versions/latest.yml
   slug: latest
-- display-name: Dev (v0.0.117.dev56)
+- display-name: Dev
   path: ./versions/dev.yml
   slug: dev
   availability: beta
