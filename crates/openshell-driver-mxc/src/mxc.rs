@@ -71,6 +71,42 @@ pub struct MxcNetwork {
     pub proxy: Option<SocketAddr>,
 }
 
+/// Directional clipboard access in the MXC top-level `ui` policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MxcClipboardAccess {
+    None,
+    Read,
+    Write,
+    All,
+}
+
+impl MxcClipboardAccess {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::All => "all",
+        }
+    }
+}
+
+/// Cross-platform MXC UI policy emitted for a process container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MxcUi {
+    pub disable: bool,
+    pub clipboard: MxcClipboardAccess,
+    pub injection: bool,
+}
+
+fn ui_json(ui: &MxcUi) -> serde_json::Value {
+    serde_json::json!({
+        "disable": ui.disable,
+        "clipboard": ui.clipboard.as_str(),
+        "injection": ui.injection,
+    })
+}
+
 /// `processContainer`-specific knobs (one-shot `AppContainer` backend).
 #[derive(Debug, Default, Clone)]
 pub struct MxcProcessContainer {
@@ -142,6 +178,7 @@ fn oneshot_config_json(
     pc: &MxcProcessContainer,
     process: &MxcProcess,
     network: Option<&MxcNetwork>,
+    ui: Option<&MxcUi>,
 ) -> serde_json::Value {
     let mut filesystem_json = serde_json::Map::new();
     if !filesystem.readwrite_paths.is_empty() {
@@ -181,6 +218,9 @@ fn oneshot_config_json(
     });
     if let Some(network) = network {
         config["network"] = network_json(network);
+    }
+    if let Some(ui) = ui {
+        config["ui"] = ui_json(ui);
     }
     config
 }
@@ -575,9 +615,16 @@ impl WxcExecInvoker {
         pc: MxcProcessContainer,
         process: MxcProcess,
         network: Option<MxcNetwork>,
+        ui: Option<MxcUi>,
     ) -> Result<tokio::process::Child, InvokerError> {
-        let config =
-            oneshot_config_json(container_id, &filesystem, &pc, &process, network.as_ref());
+        let config = oneshot_config_json(
+            container_id,
+            &filesystem,
+            &pc,
+            &process,
+            network.as_ref(),
+            ui.as_ref(),
+        );
         if self.mock {
             let grants: Vec<String> = filesystem
                 .readwrite_paths
@@ -803,9 +850,39 @@ mod tests {
             env: Vec::new(),
             timeout: 0,
         };
-        let config = oneshot_config_json("sb-1", &filesystem, &pc, &process, None);
+        let config = oneshot_config_json("sb-1", &filesystem, &pc, &process, None, None);
 
         assert!(config.get("network").is_none());
+        assert!(config.get("ui").is_none());
+    }
+
+    #[test]
+    fn oneshot_config_json_emits_typed_ui_policy() {
+        let filesystem = MxcFilesystem::default();
+        let pc = MxcProcessContainer::default();
+        let process = MxcProcess {
+            command_line: "cmd /c exit 0".into(),
+            cwd: "C:\\work\\demo".into(),
+            env: Vec::new(),
+            timeout: 0,
+        };
+        let ui = MxcUi {
+            disable: false,
+            clipboard: MxcClipboardAccess::Write,
+            injection: true,
+        };
+        let config = oneshot_config_json("sb-ui", &filesystem, &pc, &process, None, Some(&ui));
+
+        assert_eq!(config["ui"]["disable"], false);
+        assert_eq!(config["ui"]["clipboard"], "write");
+        assert_eq!(config["ui"]["injection"], true);
+    }
+
+    #[test]
+    fn isolation_provision_config_never_synthesizes_ui() {
+        let config =
+            provision_config_json(DEFAULT_CONFIGURATION_ID, &MxcFilesystem::default(), None);
+        assert!(config.get("ui").is_none());
     }
 
     #[test]

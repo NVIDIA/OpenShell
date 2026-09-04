@@ -49,6 +49,15 @@ pub enum MxcBackend {
     ProcessContainer,
 }
 
+impl MxcBackend {
+    const fn containment(self) -> &'static str {
+        match self {
+            Self::IsolationSession => "isolation_session",
+            Self::ProcessContainer => "processcontainer",
+        }
+    }
+}
+
 /// Configuration for the MXC compute driver.
 ///
 /// Loaded from `[openshell.drivers.mxc]` in the gateway TOML file, or from
@@ -459,6 +468,7 @@ impl MxcComputeBackend {
             resource_capabilities: None,
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
+            supports_ui_policy: self.config.backend == MxcBackend::ProcessContainer,
         }
     }
 
@@ -498,6 +508,7 @@ impl MxcComputeBackend {
                 &MapCtx {
                     sandbox_id: sandbox_id.to_string(),
                     egress,
+                    containment: self.config.backend.containment().into(),
                 },
             )
             .map_err(|error| tonic::Status::invalid_argument(error.to_string()))
@@ -885,6 +896,7 @@ async fn run_lifecycle(
     let mut readwrite_paths = mapped.readwrite_paths;
     append_tls_readwrite_grant(&mut readwrite_paths, host_proxy_ca_paths.as_ref());
     let readonly_paths = mapped.readonly_paths;
+    let ui = mapped.ui;
     let filesystem = MxcFilesystem {
         readwrite_paths,
         readonly_paths,
@@ -968,7 +980,14 @@ async fn run_lifecycle(
                 capabilities: config.pc_capabilities.clone(),
             };
             match invoker
-                .run_oneshot(&sandbox_id, filesystem, process_container, process, network)
+                .run_oneshot(
+                    &sandbox_id,
+                    filesystem,
+                    process_container,
+                    process,
+                    network,
+                    ui,
+                )
                 .await
             {
                 Ok(child) => child,
@@ -1217,11 +1236,24 @@ mod lifecycle_tests {
     use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
     use openshell_core::proto::{
         FilesystemPolicy, MiddlewareEndpointSelector, NetworkMiddlewareConfig, SandboxPolicy,
+        UiClipboardAccess, UiPolicy,
     };
     use std::time::Duration;
 
     fn driver_sandbox(id: &str) -> DriverSandbox {
         driver_sandbox_with_command(id, "", vec!["cmd".into(), "/c".into(), "exit 0".into()])
+    }
+
+    #[test]
+    fn ui_policy_capability_tracks_configured_backend() {
+        let process_container = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
+        assert!(process_container.capabilities().supports_ui_policy);
+
+        let isolation_session = MxcComputeBackend::new_mocked(MxcComputeConfig {
+            backend: MxcBackend::IsolationSession,
+            ..Default::default()
+        });
+        assert!(!isolation_session.capabilities().supports_ui_policy);
     }
 
     fn driver_sandbox_with_command(id: &str, cwd: &str, command: Vec<String>) -> DriverSandbox {
@@ -1490,6 +1522,9 @@ mod lifecycle_tests {
             recorded.get("network").is_none(),
             "coarse path must not emit an MXC network block"
         );
+        assert_eq!(recorded["ui"]["disable"], true);
+        assert_eq!(recorded["ui"]["clipboard"], "none");
+        assert_eq!(recorded["ui"]["injection"], false);
 
         let host_path = std::path::Path::new(tmp.path()).join("hello.txt");
         let mut found = false;
@@ -1547,6 +1582,7 @@ mod lifecycle_tests {
             driver_sandbox_with_command("sb-egress", &share, cmd),
             policy.clone(),
         );
+
         backend
             .create_sandbox(&sandbox)
             .await
@@ -1614,6 +1650,52 @@ mod lifecycle_tests {
             }
         }
         assert!(saw_redirect, "expected EgressRedirect platform event");
+    }
+
+    #[tokio::test]
+    async fn processcontainer_live_config_carries_explicit_ui_policy() {
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
+        let mut policy = fs_policy(&[]);
+        policy.ui = Some(UiPolicy {
+            allow_graphical_ui: true,
+            clipboard: UiClipboardAccess::All as i32,
+            allow_input_injection: true,
+        });
+        let sandbox = with_policy(driver_sandbox("sb-pc-ui"), policy);
+        backend
+            .create_sandbox(&sandbox)
+            .await
+            .expect("create accepted");
+        let _ = wait_for(&backend, "sb-pc-ui", |_| {
+            crate::mxc::mock_recorded_config("sb-pc-ui").is_some()
+        })
+        .await;
+        let recorded = crate::mxc::mock_recorded_config("sb-pc-ui")
+            .expect("mock recorded processContainer config");
+        assert_eq!(recorded["ui"]["disable"], false);
+        assert_eq!(recorded["ui"]["clipboard"], "all");
+        assert_eq!(recorded["ui"]["injection"], true);
+    }
+
+    #[tokio::test]
+    async fn isolation_session_rejects_ui_before_lifecycle_side_effects() {
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig {
+            backend: MxcBackend::IsolationSession,
+            ..Default::default()
+        });
+        let policy = SandboxPolicy {
+            ui: Some(UiPolicy::default()),
+            ..Default::default()
+        };
+        let sandbox = with_policy(driver_sandbox("sb-iso-ui"), policy);
+        let error = backend
+            .create_sandbox(&sandbox)
+            .await
+            .expect_err("isolation UI must be rejected synchronously");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("ui"));
+        assert!(backend.list_sandboxes().await.is_empty());
+        assert!(crate::mxc::mock_recorded_config("sb-iso-ui").is_none());
     }
 
     #[tokio::test]

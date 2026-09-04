@@ -606,6 +606,7 @@ impl DockerComputeDriver {
             }),
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
+            supports_ui_policy: false,
         }
     }
 

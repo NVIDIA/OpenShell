@@ -117,6 +117,7 @@ func SandboxPolicyFromProto(p *sbv1.SandboxPolicy) *types.SandboxPolicy {
 		Filesystem: filesystemPolicyFromProto(p.GetFilesystem()),
 		Landlock:   landlockPolicyFromProto(p.GetLandlock()),
 		Process:    processPolicyFromProto(p.GetProcess()),
+		UI:         uiPolicyFromProto(p.GetUi()),
 	}
 	if np := p.GetNetworkPolicies(); np != nil {
 		result.NetworkPolicies = make(map[string]types.NetworkPolicyRule, len(np))
@@ -148,6 +149,7 @@ func SandboxPolicyToProto(p *types.SandboxPolicy) *sbv1.SandboxPolicy {
 		Filesystem: filesystemPolicyToProto(p.Filesystem),
 		Landlock:   landlockPolicyToProto(p.Landlock),
 		Process:    processPolicyToProto(p.Process),
+		Ui:         uiPolicyToProto(p.UI),
 	}
 	if p.NetworkPolicies != nil {
 		result.NetworkPolicies = make(map[string]*sbv1.NetworkPolicyRule, len(p.NetworkPolicies))
@@ -182,6 +184,58 @@ func SandboxPolicyToProtoChecked(p *types.SandboxPolicy) (*sbv1.SandboxPolicy, e
 		result.NetworkMiddlewares[name].Config = config
 	}
 	return result, nil
+}
+
+func uiPolicyFromProto(p *sbv1.UiPolicy) *types.UIPolicy {
+	if p == nil {
+		return nil
+	}
+	return &types.UIPolicy{
+		AllowGraphicalUI:    p.GetAllowGraphicalUi(),
+		Clipboard:           uiClipboardAccessFromProto(p.GetClipboard()),
+		AllowInputInjection: p.GetAllowInputInjection(),
+	}
+}
+
+func uiPolicyToProto(p *types.UIPolicy) *sbv1.UiPolicy {
+	if p == nil {
+		return nil
+	}
+	return &sbv1.UiPolicy{
+		AllowGraphicalUi:    p.AllowGraphicalUI,
+		Clipboard:           uiClipboardAccessToProto(p.Clipboard),
+		AllowInputInjection: p.AllowInputInjection,
+	}
+}
+
+func uiClipboardAccessFromProto(v sbv1.UiClipboardAccess) types.UIClipboardAccess {
+	switch v {
+	case sbv1.UiClipboardAccess_UI_CLIPBOARD_ACCESS_NONE:
+		return types.UIClipboardAccessNone
+	case sbv1.UiClipboardAccess_UI_CLIPBOARD_ACCESS_READ:
+		return types.UIClipboardAccessRead
+	case sbv1.UiClipboardAccess_UI_CLIPBOARD_ACCESS_WRITE:
+		return types.UIClipboardAccessWrite
+	case sbv1.UiClipboardAccess_UI_CLIPBOARD_ACCESS_ALL:
+		return types.UIClipboardAccessAll
+	default:
+		return types.UIClipboardAccessUnspecified
+	}
+}
+
+func uiClipboardAccessToProto(v types.UIClipboardAccess) sbv1.UiClipboardAccess {
+	switch v {
+	case types.UIClipboardAccessNone:
+		return sbv1.UiClipboardAccess_UI_CLIPBOARD_ACCESS_NONE
+	case types.UIClipboardAccessRead:
+		return sbv1.UiClipboardAccess_UI_CLIPBOARD_ACCESS_READ
+	case types.UIClipboardAccessWrite:
+		return sbv1.UiClipboardAccess_UI_CLIPBOARD_ACCESS_WRITE
+	case types.UIClipboardAccessAll:
+		return sbv1.UiClipboardAccess_UI_CLIPBOARD_ACCESS_ALL
+	default:
+		return sbv1.UiClipboardAccess_UI_CLIPBOARD_ACCESS_UNSPECIFIED
+	}
 }
 
 func middlewareConfigFromProto(m *sbv1.NetworkMiddlewareConfig) types.NetworkMiddlewareConfig {

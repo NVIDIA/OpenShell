@@ -293,6 +293,7 @@ enum BeginDelete {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ComputeDriverInfoSnapshot {
     /// Gateway-selected driver name used for routing and `driver_config` keys.
     pub name: String,
@@ -312,6 +313,9 @@ pub struct ComputeDriverInfoSnapshot {
     pub rootfs_tar_staging_dir: String,
     /// Maximum rootfs tar file size in bytes.
     pub rootfs_tar_max_bytes: u64,
+    /// Whether this configured driver instance completely enforces the portable
+    /// UI policy contract.
+    pub supports_ui_policy: bool,
 }
 
 /// Interval between store-vs-backend reconciliation sweeps.
@@ -667,6 +671,7 @@ impl ComputeRuntime {
             resource_capabilities: capabilities.resource_capabilities,
             rootfs_tar_staging_dir: capabilities.rootfs_tar_staging_dir,
             rootfs_tar_max_bytes: capabilities.rootfs_tar_max_bytes,
+            supports_ui_policy: capabilities.supports_ui_policy,
         };
         let default_image = capabilities.default_image;
         let gateway_listener_requirements = match driver
@@ -904,6 +909,7 @@ impl ComputeRuntime {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
+        self.validate_policy_capabilities(sandbox)?;
         let mut driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
         // Peek, never consume: create runs the same path immediately after and
@@ -928,12 +934,31 @@ impl ComputeRuntime {
             .map(|_| ())
     }
 
+    fn validate_policy_capabilities(&self, sandbox: &Sandbox) -> Result<(), Status> {
+        let has_explicit_ui = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.policy.as_ref())
+            .and_then(|policy| policy.ui.as_ref())
+            .is_some();
+        if has_explicit_ui && !self.driver_info.supports_ui_policy {
+            return Err(Status::invalid_argument(format!(
+                "compute driver '{}' does not support the complete UI policy contract; remove the explicit ui section or select a supporting driver/backend",
+                self.driver_info.name
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn create_sandbox(
         &self,
         sandbox: Sandbox,
         sandbox_token: Option<String>,
         await_main_process_attachment: bool,
     ) -> Result<Sandbox, Status> {
+        // Defense in depth for internal callers that bypass the public create
+        // handler's ValidateSandboxCreate step. This check has no side effects.
+        self.validate_policy_capabilities(&sandbox)?;
         let sandbox_id = sandbox.object_id().to_string();
         let mut sandbox = sandbox;
 
@@ -4771,6 +4796,7 @@ impl ComputeDriver for NoopTestDriver {
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
+                supports_ui_policy: false,
             },
         ))
     }
@@ -4918,6 +4944,7 @@ pub async fn new_test_runtime_with_driver(
             resource_capabilities: None,
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
+            supports_ui_policy: false,
         },
         telemetry_compute_driver: TelemetryComputeDriver::custom(),
         driver_process: None,
@@ -4944,6 +4971,7 @@ mod tests {
         GetSandboxResponse, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
         ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesSandboxEvent,
     };
+    use openshell_core::proto::{SandboxPolicy as PublicSandboxPolicy, UiPolicy};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as TestMutex};
@@ -5201,6 +5229,8 @@ mod tests {
         listed_sandboxes: Vec<DriverSandbox>,
         current_sandboxes: Vec<DriverSandbox>,
         workspace_rpcs_unimplemented: bool,
+        validate_create_calls: AtomicUsize,
+        create_calls: AtomicUsize,
     }
 
     #[tonic::async_trait]
@@ -5233,6 +5263,7 @@ mod tests {
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
+                supports_ui_policy: false,
             }))
         }
 
@@ -5249,6 +5280,7 @@ mod tests {
             &self,
             _request: Request<ValidateSandboxCreateRequest>,
         ) -> Result<tonic::Response<ValidateSandboxCreateResponse>, Status> {
+            self.validate_create_calls.fetch_add(1, Ordering::Relaxed);
             Ok(tonic::Response::new(ValidateSandboxCreateResponse {}))
         }
 
@@ -5300,6 +5332,7 @@ mod tests {
             &self,
             _request: Request<CreateSandboxRequest>,
         ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
+            self.create_calls.fetch_add(1, Ordering::Relaxed);
             Ok(tonic::Response::new(CreateSandboxResponse {}))
         }
 
@@ -5577,6 +5610,7 @@ mod tests {
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
+                supports_ui_policy: false,
             }))
         }
 
@@ -5790,6 +5824,7 @@ mod tests {
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
+                supports_ui_policy: false,
             },
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process: None,
@@ -5805,6 +5840,83 @@ mod tests {
             replica_id: "test-replica".to_string(),
             rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
         }
+    }
+
+    fn sandbox_with_explicit_ui(id: &str) -> Sandbox {
+        let mut sandbox = sandbox_record(id, "ui-policy", SandboxPhase::Provisioning);
+        sandbox.spec = Some(SandboxSpec {
+            policy: Some(PublicSandboxPolicy {
+                ui: Some(UiPolicy::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        sandbox
+    }
+
+    #[tokio::test]
+    async fn explicit_ui_policy_rejects_before_unsupported_driver_validation() {
+        let driver = Arc::new(TestDriver::default());
+        let runtime = test_runtime(driver.clone()).await;
+
+        let error = runtime
+            .validate_sandbox_create(&sandbox_with_explicit_ui("sb-ui-validate"))
+            .await
+            .expect_err("an unsupported driver must reject explicit UI policy");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("complete UI policy contract"));
+        assert_eq!(
+            driver.validate_create_calls.load(Ordering::Relaxed),
+            0,
+            "gateway capability validation must run before the driver RPC"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_ui_policy_rejects_before_unsupported_driver_create() {
+        let driver = Arc::new(TestDriver::default());
+        let runtime = test_runtime(driver.clone()).await;
+
+        let error = runtime
+            .create_sandbox(sandbox_with_explicit_ui("sb-ui-create"), None, false)
+            .await
+            .expect_err("an internal caller must not bypass UI capability validation");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert_eq!(
+            driver.create_calls.load(Ordering::Relaxed),
+            0,
+            "unsupported UI policy must fail before provisioning"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_ui_policy_reaches_driver_when_capability_is_complete() {
+        let driver = Arc::new(TestDriver::default());
+        let mut runtime = test_runtime(driver.clone()).await;
+        runtime.driver_info.supports_ui_policy = true;
+
+        runtime
+            .validate_sandbox_create(&sandbox_with_explicit_ui("sb-ui-supported"))
+            .await
+            .expect("a driver advertising complete UI support accepts validation");
+
+        assert_eq!(driver.validate_create_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn absent_ui_policy_preserves_unsupported_driver_behavior() {
+        let driver = Arc::new(TestDriver::default());
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-no-ui", "no-ui-policy", SandboxPhase::Provisioning);
+
+        runtime
+            .validate_sandbox_create(&sandbox)
+            .await
+            .expect("an absent UI section must preserve existing behavior");
+
+        assert_eq!(driver.validate_create_calls.load(Ordering::Relaxed), 1);
     }
 
     async fn test_runtime_with_gateway_managed_lifecycle(
@@ -9905,6 +10017,7 @@ mod tests {
                 }),
                 workspace: "default".to_string(),
             }],
+            ..Default::default()
         }))
         .await;
 
@@ -10076,6 +10189,7 @@ mod tests {
                 })),
                 workspace: "default".to_string(),
             }],
+            ..Default::default()
         }))
         .await;
 

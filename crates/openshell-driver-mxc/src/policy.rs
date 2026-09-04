@@ -19,6 +19,7 @@
 
 use std::net::SocketAddr;
 
+use crate::mxc::{MxcClipboardAccess, MxcUi};
 use openshell_core::proto::SandboxPolicy;
 use thiserror::Error;
 
@@ -38,6 +39,9 @@ pub struct MappedConfig {
     /// Loopback address MXC redirects sandbox egress to. `None` when governed
     /// egress is disabled.
     pub proxy_addr: Option<SocketAddr>,
+    /// Top-level MXC UI policy for process containers. Isolation sessions keep
+    /// this absent because current MXC rejects the section on presence.
+    pub ui: Option<MxcUi>,
 }
 
 /// Context passed to the mapper alongside the policy.
@@ -49,6 +53,8 @@ pub struct MapCtx {
     /// Pattern-C governed-egress redirect address. When set, the embedded
     /// mapper uses `split_policy`; otherwise it uses the coarse MXC map.
     pub egress: Option<SocketAddr>,
+    /// MXC containment backend selected by the live driver.
+    pub containment: String,
 }
 
 /// A policy rule that the active mapper cannot enforce.
@@ -109,6 +115,39 @@ fn extract_paths(config: &serde_json::Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn extract_ui(config: &serde_json::Value) -> Result<Option<MxcUi>, MapError> {
+    let Some(ui) = config.get("ui") else {
+        return Ok(None);
+    };
+    let disable = ui["disable"]
+        .as_bool()
+        .ok_or_else(|| MapError::Internal("mapped MXC ui.disable is not a boolean".into()))?;
+    let clipboard = match ui["clipboard"].as_str() {
+        Some("none") => MxcClipboardAccess::None,
+        Some("read") => MxcClipboardAccess::Read,
+        Some("write") => MxcClipboardAccess::Write,
+        Some("all") => MxcClipboardAccess::All,
+        Some(value) => {
+            return Err(MapError::Internal(format!(
+                "mapped MXC ui.clipboard has unknown value '{value}'"
+            )));
+        }
+        None => {
+            return Err(MapError::Internal(
+                "mapped MXC ui.clipboard is not a string".into(),
+            ));
+        }
+    };
+    let injection = ui["injection"]
+        .as_bool()
+        .ok_or_else(|| MapError::Internal("mapped MXC ui.injection is not a boolean".into()))?;
+    Ok(Some(MxcUi {
+        disable,
+        clipboard,
+        injection,
+    }))
+}
+
 impl PolicyMapper for EmbeddedPolicyMapper {
     fn map(&self, policy: Option<&SandboxPolicy>, ctx: &MapCtx) -> Result<MappedConfig, MapError> {
         let policy = policy.ok_or_else(|| {
@@ -122,7 +161,7 @@ impl PolicyMapper for EmbeddedPolicyMapper {
             // Pattern C: MXC handles filesystem + a proxy redirect, while the
             // host CONNECT proxy receives the network-only trimmed policy.
             let opts = crate::policy_map::MxcMappingOptions {
-                containment: "processcontainer".to_owned(),
+                containment: ctx.containment.clone(),
                 container_id: ctx.sandbox_id.clone(),
                 proxy_redirect: Some(addr),
                 ..Default::default()
@@ -144,7 +183,7 @@ impl PolicyMapper for EmbeddedPolicyMapper {
             // yields an `error` loss for any host allowlist, which rejects
             // network policy below.
             let opts = crate::policy_map::MxcMappingOptions {
-                containment: "isolation_session".to_owned(),
+                containment: ctx.containment.clone(),
                 container_id: ctx.sandbox_id.clone(),
                 ..Default::default()
             };
@@ -176,12 +215,14 @@ impl PolicyMapper for EmbeddedPolicyMapper {
             .iter()
             .map(|p| normalize_path(p))
             .collect();
+        let ui = extract_ui(&config)?;
 
         Ok(MappedConfig {
             readwrite_paths: readwrite,
             readonly_paths: readonly,
             trimmed_policy,
             proxy_addr,
+            ui,
         })
     }
 }
@@ -197,6 +238,15 @@ mod tests {
         MapCtx {
             sandbox_id: "sb-test".into(),
             egress: None,
+            containment: "isolation_session".into(),
+        }
+    }
+
+    fn processcontainer_ctx() -> MapCtx {
+        MapCtx {
+            sandbox_id: "sb-test".into(),
+            egress: None,
+            containment: "processcontainer".into(),
         }
     }
 
@@ -256,6 +306,53 @@ mod tests {
     }
 
     #[test]
+    fn embedded_rejects_explicit_ui_on_isolation_session() {
+        use openshell_core::proto::UiPolicy;
+
+        let mapper = EmbeddedPolicyMapper;
+        let policy = SandboxPolicy {
+            ui: Some(UiPolicy::default()),
+            ..Default::default()
+        };
+        let err = mapper.map(Some(&policy), &demo_ctx()).unwrap_err();
+        match err {
+            MapError::Unsupported(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].rule_kind, "ui");
+            }
+            MapError::Internal(message) => {
+                panic!("expected unsupported UI, got internal error: {message}")
+            }
+        }
+    }
+
+    #[test]
+    fn embedded_carries_typed_ui_for_processcontainer() {
+        use openshell_core::proto::{UiClipboardAccess, UiPolicy};
+
+        let mapper = EmbeddedPolicyMapper;
+        let policy = SandboxPolicy {
+            ui: Some(UiPolicy {
+                allow_graphical_ui: true,
+                clipboard: UiClipboardAccess::Read as i32,
+                allow_input_injection: true,
+            }),
+            ..Default::default()
+        };
+        let result = mapper
+            .map(Some(&policy), &processcontainer_ctx())
+            .expect("processContainer UI maps");
+        assert_eq!(
+            result.ui,
+            Some(MxcUi {
+                disable: false,
+                clipboard: MxcClipboardAccess::Read,
+                injection: true,
+            })
+        );
+    }
+
+    #[test]
     fn embedded_split_normalizes_paths_and_returns_proxy_handoff() {
         use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
         let mapper = EmbeddedPolicyMapper;
@@ -282,6 +379,7 @@ mod tests {
             sandbox_id: "sb-egress".into(),
 
             egress: Some(proxy_addr),
+            containment: "processcontainer".into(),
         };
 
         let config = mapper.map(Some(&policy), &ctx).unwrap();

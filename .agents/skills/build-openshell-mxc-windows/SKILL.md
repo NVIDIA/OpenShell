@@ -153,6 +153,8 @@ mise run --skip-tools windows:build:x64
 mise run --skip-tools windows:build:arm64
 mise run --skip-tools windows:test:x64
 mise run --skip-tools windows:test:unsupported:x64
+mise run --skip-tools windows:test:mxc-real:x64
+mise run --skip-tools windows:test:mxc-real:arm64
 ```
 
 For full validation, detect the Windows host architecture first and choose the
@@ -241,6 +243,8 @@ crypto dependency builds.
 | `windows:test:arm64` | Runs native ARM64 workspace tests with `--no-fail-fast` and the same package exclusions. Rejects non-ARM64 hosts. |
 | `windows:test:unsupported:x64` | Re-runs focused `openshell-gateway` tests for unsupported Windows driver behavior. |
 | `windows:test:unsupported:arm64` | Re-runs the same focused contracts natively on ARM64. Rejects non-ARM64 hosts. |
+| `windows:test:mxc-real:x64` | Runs the serial, ignored real-`wxc-exec` integration suite natively on x64 through the MSVC wrapper. Rejects non-x64 hosts. |
+| `windows:test:mxc-real:arm64` | Runs the same real-`wxc-exec` suite natively on ARM64. Rejects non-ARM64 hosts. |
 | `windows:artifacts` | Reports size and SHA256 for release artifacts that exist. |
 | `windows:ci` | Runs the full ordered x64-host Windows CI lane, plus ARM64 check/build when not skipped. |
 
@@ -310,6 +314,8 @@ Useful log files:
 | `test-aarch64-pc-windows-msvc.log` | Full native ARM64 workspace test output. |
 | `test-x86_64-pc-windows-msvc-unsupported-*.log` | Focused unsupported-driver contract output. |
 | `test-aarch64-pc-windows-msvc-unsupported-*.log` | Focused native ARM64 contract output. |
+| `test-x86_64-pc-windows-msvc-mxc-real.log` | Native x64 real-MXC integration output. |
+| `test-aarch64-pc-windows-msvc-mxc-real.log` | Native ARM64 real-MXC integration output. |
 
 The first check builds bundled Z3 from source through `z3-sys`. Cargo stores the
 native build output in its target tree, so the Windows target cache reuses it.

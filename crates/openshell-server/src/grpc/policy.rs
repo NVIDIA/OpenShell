@@ -18431,6 +18431,35 @@ mod tests {
     }
 
     #[test]
+    fn policy_hash_distinguishes_ui_absence_presence_and_values() {
+        use openshell_core::proto::{UiClipboardAccess, UiPolicy};
+
+        let absent = ProtoSandboxPolicy::default();
+        let explicit_deny = ProtoSandboxPolicy {
+            ui: Some(UiPolicy::default()),
+            ..Default::default()
+        };
+        let clipboard_read = ProtoSandboxPolicy {
+            ui: Some(UiPolicy {
+                clipboard: UiClipboardAccess::Read as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_ne!(
+            deterministic_policy_hash(&absent),
+            deterministic_policy_hash(&explicit_deny),
+            "an explicitly present deny-only UI block remains hash-significant"
+        );
+        assert_ne!(
+            deterministic_policy_hash(&explicit_deny),
+            deterministic_policy_hash(&clipboard_read),
+            "UI capability changes must produce a new policy hash"
+        );
+    }
+
+    #[test]
     fn policy_hash_is_stable_across_middleware_config_field_insertion_order() {
         use prost_types::{Struct, Value, value::Kind};
         use std::collections::BTreeMap;

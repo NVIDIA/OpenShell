@@ -8,18 +8,40 @@ per-request egress decisions.
 For the field-by-field YAML reference, use
 [Policy Schema Reference](../docs/reference/policy-schema.mdx).
 
+## Windows MXC Static Enforcement
+
+On native Windows, the MXC driver cannot rely on Linux Landlock or setuid. It
+maps portable static filesystem and UI controls from `SandboxPolicy` into MXC
+configuration. UI controls are available only with the MXC
+`process_container` backend; all omitted UI fields retain deny-by-default
+values, and other compute runtimes reject an explicit UI policy.
+
 ## Policy Areas
 
 | Area | Enforcement |
 |---|---|
 | Filesystem | Landlock restricts read-only and read-write paths. |
 | Process | The supervisor launches the agent as an unprivileged user with reduced capabilities. |
+| UI | Within an explicit UI section, omitted display, clipboard, and input-injection fields deny. The MXC driver's OpenShell `process_container` backend (MXC containment `processcontainer`) can selectively enable them. Other configured backends reject the entire explicit section before provisioning. |
 | Network | The proxy evaluates destination, port, calling binary, and optional L7 rules. |
 | Provider access | Attached provider profiles contribute endpoint and binary rules; credentials remain bound to profile-authorized endpoints. |
 | Runtime settings | Typed settings are delivered with policy and can be global or sandbox scoped. |
 
-Filesystem and process policy are startup-time controls. Network policy is
+Filesystem, process, and UI policy are startup-time controls. Network policy is
 dynamic and can be hot-reloaded when the new policy validates successfully.
+
+The UI schema names portable capabilities rather than Windows primitives:
+graphical output, directional clipboard access, and synthetic input. The
+configured compute driver advertises whether it completely enforces this
+contract. Any explicit section, including `{}`, is rejected before driver
+validation or provisioning when that capability is false. The MXC
+`process_container` mapper translates the fields to MXC's top-level `ui` object
+under its `processcontainer` containment value and treats omitted fields inside
+the section as deny. That object is common to MXC's 0.8 stable and 0.9
+development schemas. Both schema lines reject it for `isolation_session`, so
+that backend advertises no support and the mapper also rejects it in depth.
+Linux, macOS, and other non-MXC paths advertise no support: explicit UI policy
+fails closed, while an absent section leaves their runtime behavior unchanged.
 
 Before applying Landlock, the supervisor enriches baseline filesystem paths that
 the runtime needs. Missing baseline paths are skipped so one absent runtime path

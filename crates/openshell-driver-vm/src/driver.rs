@@ -786,6 +786,7 @@ impl VmDriver {
                 .to_string_lossy()
                 .into_owned(),
             rootfs_tar_max_bytes: self.config.rootfs_tar_max_bytes(),
+            supports_ui_policy: false,
         }
     }
 
