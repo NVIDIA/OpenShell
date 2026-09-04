@@ -70,18 +70,18 @@ The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-gues
 
 ## Supported configurations
 
-| Distro | Docker | Rootless Podman | SELinux | Package format |
-| --- | --- | --- | --- | --- |
-| Ubuntu 24.04 | Yes | No | No | `.deb` |
-| Ubuntu 26.04 | Yes | Yes | No | `.deb` |
-| CentOS Stream 10 | No | No | Yes | `.rpm` |
-| Fedora 44 | No | Yes | Yes | `.rpm` |
-| Rocky Linux 9 | Yes | No | Yes | `.rpm` |
+| Distro | Docker package | Docker Snap | Rootless Podman | SELinux | Package format |
+| --- | --- | --- | --- | --- | --- |
+| Ubuntu 24.04 | Yes | Yes | No | No | `.deb` |
+| Ubuntu 26.04 | Yes | Yes | Yes | No | `.deb` |
+| CentOS Stream 10 | No | No | No | Yes | `.rpm` |
+| Fedora 44 | No | No | Yes | Yes | `.rpm` |
+| Rocky Linux 9 | Yes | No | No | Yes | `.rpm` |
 
 The `snapd` configuration is available for Ubuntu and prepares snapd for
-local Snap lifecycle experiments. It does not install Docker, because the Snap
-gateway reproduction uses the Docker **Snap** and its `docker:docker-daemon`
-interface rather than the host-package Docker configuration.
+local Snap lifecycle experiments. Add `docker-snap` after `snapd` to install
+the Docker **Snap** and model the `docker:docker-daemon` interface used by the
+OpenShell Snap. This is separate from the host-package Docker configuration.
 
 `podman-rootless` configures the explicit rootless Podman guest setup used by
 OpenShell tests. It supports Fedora and Ubuntu 26.04 or later. Ubuntu adds the
@@ -331,27 +331,26 @@ nix run .#test-guest -- \
   -- openshell --version
 ```
 
-## Reproduce Snap gateway startup
+## Verify Snap gateway status
 
-The gateway Snap must be native to the guest architecture. Copy an existing
-Snap artifact and the reproduction script into a prepared Ubuntu guest, then
-run the script as root. It follows the Release Canary ordering exactly: install
-the Snap, connect Docker/log/system interfaces, and immediately query the
-gateway. On each failure it prints snapd and gateway journals.
+The candidate Snap must be native to the guest architecture. The `openshell-snap`
+provisioner installs it, connects the Docker/log/system interfaces, registers the
+local gateway, and waits for `openshell status`, matching the Release Canary
+validation flow.
 
 ```shell
 nix run .#test-guest -- \
   --distro ubuntu-24-04 \
   --with snapd \
+  --with docker-snap \
   --keep \
-  --copy ./openshell_*.snap:/tmp/openshell.snap \
-  --copy ./nix/test-guest/scripts/snap-gateway-repro.sh:/usr/local/bin/snap-gateway-repro \
-  -- sudo /usr/local/bin/snap-gateway-repro /tmp/openshell.snap 10 30
+  --copy ./openshell_*.snap:/var/lib/openshell-conformance/candidate/openshell.snap \
+  --provision openshell-snap \
+  -- true
 ```
 
 `--keep` retains the overlay and serial log when diagnosing a failure. The
-runner prints their location after shutdown. The final `30` accepts automatic
-recovery for up to 30 seconds; omit it to require the canary's immediate check.
+runner prints their location after shutdown.
 
 
 The destination must be an absolute guest path. Use bare octal permission bits
@@ -361,7 +360,8 @@ from `000` through `777` for explicit modes.
 
 ```text
 --distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
---with NAME         Apply docker, podman-rootless, selinux, or snapd; repeatable
+--with NAME         Apply docker, docker-snap, podman-rootless, selinux, or snapd; repeatable
+--provision NAME    Apply a post-artifact system provisioner; repeatable
 --install PATH      Install a .deb or .rpm package; repeatable
 --copy SRC:DEST[:MODE]
                     Copy a regular file into the guest; use MODE when provided,
