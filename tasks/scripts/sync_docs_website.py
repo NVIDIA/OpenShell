@@ -125,6 +125,7 @@ def reset_directory(src: Path, dst: Path) -> None:
     ensure_existing(src, "source directory")
     if dst.exists():
         shutil.rmtree(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src, dst)
 
 
@@ -390,7 +391,7 @@ def normalize_manifest_components(data: YamlMapping) -> None:
         if isinstance(raw_experimental, dict)
         else {}
     )
-    experimental["mdx-components"] = ["./components"]
+    experimental["mdx-components"] = ["../docs/_components", "./components"]
     data["experimental"] = experimental
 
 
@@ -406,6 +407,14 @@ def refresh_shared_fern(
         source_dir = source_fern / directory
         if source_dir.exists():
             reset_directory(source_dir, target_fern / directory)
+
+    source_mdx_components = source_fern.parent / "docs" / "_components"
+    target_mdx_components = target_fern.parent / "docs" / "_components"
+    if source_mdx_components.exists():
+        reset_directory(source_mdx_components, target_mdx_components)
+    elif target_mdx_components.exists():
+        shutil.rmtree(target_mdx_components)
+
     copy_if_exists(source_fern / "main.css", target_fern / "main.css")
     copy_if_exists(source_fern / "fern.config.json", target_fern / "fern.config.json")
 

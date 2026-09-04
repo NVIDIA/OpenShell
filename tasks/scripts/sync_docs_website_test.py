@@ -207,6 +207,10 @@ def _make_source_tree(root: Path, *, marker: str = "source") -> None:
     docs = root / "docs"
     docs.mkdir(parents=True)
     (docs / "intro.mdx").write_text(f"# {marker}\n", encoding="utf-8")
+    (docs / "_components").mkdir()
+    (docs / "_components" / "Badge.tsx").write_text(
+        f"export const Badge = '{marker}';\n", encoding="utf-8"
+    )
     (docs / "index.yml").write_text(
         yaml.safe_dump({"navigation": [{"page": "Intro", "path": "intro.mdx"}]}),
         encoding="utf-8",
@@ -303,7 +307,7 @@ def test_dev_sync_registers_exact_commit_without_copying_docs(tmp_path: Path) ->
     config = read_yaml(fern / "docs.yml")
     assert config["title"] == "dev-shell"
     assert config["experimental"] == {
-        "mdx-components": ["./components"],
+        "mdx-components": ["../docs/_components", "./components"],
         "basepath-aware": True,
     }
     assert config["versions"] == [
@@ -316,6 +320,10 @@ def test_dev_sync_registers_exact_commit_without_copying_docs(tmp_path: Path) ->
     ]
     assert (fern / "assets" / "logo.svg").read_text() == "<dev-shell/>"
     assert (fern / "components" / "Card.tsx").is_file()
+    assert (website / "docs" / "_components" / "Badge.tsx").read_text() == (
+        "export const Badge = 'dev-shell';\n"
+    )
+    assert sorted(path.name for path in (website / "docs").iterdir()) == ["_components"]
 
 
 def test_stable_sync_creates_immutable_version_and_promotes_latest(
@@ -609,6 +617,9 @@ def test_only_dev_refreshes_shared_fern_files(tmp_path: Path) -> None:
     assert read_yaml(fern / "docs.yml")["title"] == "dev"
     assert (fern / "components" / "Card.tsx").read_text() == (
         "export const Card = 'dev';\n"
+    )
+    assert (website / "docs" / "_components" / "Badge.tsx").read_text() == (
+        "export const Badge = 'dev';\n"
     )
 
 

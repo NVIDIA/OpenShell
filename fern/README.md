@@ -53,7 +53,7 @@ Release Tag follows the same sequence for a non-prerelease tag after the release
 
 The sync and publish workflows share the `docs-website` concurrency group. This serializes writes and publication. Queued runs remain pending instead of replacing one another.
 
-The `dev` update also owns the shared Fern configuration, components, assets, and CSS on `docs-website`. Stable releases only add tag refs and cannot replace those shared files. This keeps the site configuration aligned with `main` while Fern reads each release's documentation from its tag.
+The `dev` update also owns the shared Fern configuration, components, assets, and CSS on `docs-website`. It copies `docs/_components/` as the shared MDX component bundle because Fern resolves explicit imports in ref-backed pages against the shared preview checkout. Stable releases only add tag refs and cannot replace those shared files. This keeps the site configuration and component implementations aligned with `main` while Fern reads each release's pages and navigation from its tag. Shared components must remain compatible with the props used by retained versions.
 
 Fern's local development server skips ref-backed versions. Use the pull request preview workflow to verify the complete multi-version site because preview publication resolves the configured refs without updating the production site.
 
