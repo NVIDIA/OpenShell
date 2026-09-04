@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 import subprocess
 import tomllib
 from pathlib import Path
@@ -13,6 +16,9 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RESULTS_PATH = REPO_ROOT / "e2e/configs/gateway/schema-v2-live-results.toml"
 CAPABILITY_PATH = REPO_ROOT / "e2e/configs/gateway/schema-v2-capability-parity.toml"
+COMPUTE_BOUNDARY_PATH = (
+    REPO_ROOT / "e2e/configs/gateway/schema-v2-compute-boundary-comparison.json"
+)
 
 REQUIRED_HEADER_FIELDS = {
     "manifest_version",
@@ -43,6 +49,15 @@ REQUIRED_STEP_8_IDS = {
 REQUIRED_STEP_9_IDS = {
     "vm-guest-security-and-spiffe",
     "vm-launch-and-resource-configuration",
+}
+REQUIRED_STEP_10_IDS = {"compute-driver-boundary-parity"}
+STEP_10_CANDIDATE_COMMIT = "4a39da510e4d278a24dd60291149519c9a570b46"
+STEP_10_REPORT_SHA256 = (
+    "65541eec5f642461a88b04b5459474fd7a475adeb7071a65a53fe183caad6a01"
+)
+STEP_10_EVIDENCE_BUNDLES = {
+    "in_tree": "target/parity/step10-intree-4a39da51",
+    "external_uds": "target/parity/step10-external-4a39da51",
 }
 ALLOWED_STATUSES = {
     "pass",
@@ -179,6 +194,145 @@ def test_step_9_records_vm_runtime_dispositions() -> None:
     assert {result["id"] for result in results} == REQUIRED_STEP_9_IDS
     assert all(result["status"] == "platform_blocked" for result in results)
     assert all(result["driver"] == "vm" for result in results)
+
+
+def test_step_10_records_verified_compute_boundary_parity(tmp_path: Path) -> None:
+    results = [
+        result for result in load_toml(RESULTS_PATH)["result"] if result["step"] == 10
+    ]
+    assert {result["id"] for result in results} == REQUIRED_STEP_10_IDS
+    assert results[0]["status"] == "pass"
+
+    with COMPUTE_BOUNDARY_PATH.open(encoding="utf-8") as report_file:
+        report = json.load(report_file)
+    assert report["manifest_version"] == 2
+    assert report["baseline_commit"] == load_toml(RESULTS_PATH)["baseline_commit"]
+    assert report["candidate_commit"] == results[0]["validated_candidate_commit"]
+    assert report["candidate_commit"] == STEP_10_CANDIDATE_COMMIT
+    assert report["retained_evidence_bundles"] == STEP_10_EVIDENCE_BUNDLES
+    assert (
+        hashlib.sha256(COMPUTE_BOUNDARY_PATH.read_bytes()).hexdigest()
+        == STEP_10_REPORT_SHA256
+    )
+    assert report["classification"] == "pass"
+    assert report["accepted"] is True
+    assert all(report["oracle"].values())
+    assert all(report["verification"].values())
+
+    launch_attestations = []
+    for topology_name in ("in_tree", "external_uds"):
+        topology = report[topology_name]
+        assert topology["classification"] == "pass"
+        assert topology["parity"] is True
+        assert topology["accepted"] is True
+        assert re.fullmatch(r"[0-9a-f]{64}", topology["comparison_sha256"])
+        baseline_launch = topology["baseline"]["launch_attestation"]
+        candidate_launch = topology["candidate"]["launch_attestation"]
+        for field in (
+            "sandbox_image_id",
+            "sandbox_image_digest",
+            "sandbox_runtime_image",
+            "supervisor_base_image",
+            "supervisor_base_image_id",
+            "supervisor_base_image_digest",
+            "supervisor_package_manifest_sha256",
+        ):
+            assert baseline_launch[field] == candidate_launch[field]
+        launch_attestations.extend((baseline_launch, candidate_launch))
+
+        for variant_name, schema_version in (("baseline", 1), ("candidate", 2)):
+            variant = topology[variant_name]
+            assert variant["schema_version"] == schema_version
+            assert variant["success"] is True
+            assert variant["artifacts_verified"] is True
+            assert variant["raw_output_verified"] is True
+            assert all(
+                re.fullmatch(r"[0-9a-f]{64}", digest)
+                for digest in variant["artifact_sha256"].values()
+            )
+            assert all(
+                re.fullmatch(r"[0-9a-f]{64}", digest)
+                for digest in variant["raw_evidence_sha256"].values()
+            )
+            launch = variant["launch_attestation"]
+            supervisor_digest = launch["supervisor_image_digest"]
+            assert re.fullmatch(r"sha256:[0-9a-f]{64}", supervisor_digest)
+            assert launch["supervisor_runtime_image"].endswith(f"@{supervisor_digest}")
+            sandbox_digest = launch["sandbox_image_digest"]
+            assert re.fullmatch(r"sha256:[0-9a-f]{64}", sandbox_digest)
+            assert launch["sandbox_image_request"] == launch["sandbox_runtime_image"]
+            assert launch["sandbox_runtime_image"].endswith(f"@{sandbox_digest}")
+
+    for field in (
+        "sandbox_image_id",
+        "sandbox_image_digest",
+        "sandbox_runtime_image",
+        "supervisor_base_image",
+        "supervisor_base_image_id",
+        "supervisor_base_image_digest",
+        "supervisor_base_runtime_image",
+        "supervisor_package_manifest_sha256",
+        "supervisor_dockerfile_sha256_before_execution",
+    ):
+        assert len({launch[field] for launch in launch_attestations}) == 1, field
+
+    external_sockets = []
+    for variant_name in ("baseline", "candidate"):
+        external_variant = report["external_uds"][variant_name]
+        external_launch = external_variant["launch_attestation"]
+        assert external_launch["compute_driver_transport"] == "remote_uds"
+        assert external_launch["external_compute_driver"] is True
+        assert external_launch["external_driver_grpc_endpoint"].startswith("https://")
+        assert external_launch["external_driver_host_gateway_ip"] == "host-gateway"
+        assert external_launch["external_driver_userns"] is None
+        assert external_launch["external_driver_spiffe"] is False
+        assert external_launch["external_driver_proxy"] is False
+        assert external_launch["external_driver_app_armor"] is False
+        driver_environment = external_launch["external_driver_environment"]
+        assert driver_environment["OPENSHELL_COMPUTE_DRIVER_SOCKET"]
+        assert driver_environment["OPENSHELL_PODMAN_SOCKET"]
+        assert driver_environment["OPENSHELL_GRPC_ENDPOINT"].startswith("https://")
+        assert driver_environment["OPENSHELL_ENABLE_BIND_MOUNTS"] is True
+        for tls_field in (
+            "OPENSHELL_PODMAN_TLS_CA",
+            "OPENSHELL_PODMAN_TLS_CERT",
+            "OPENSHELL_PODMAN_TLS_KEY",
+        ):
+            assert re.fullmatch(
+                r"[0-9a-f]{64}", driver_environment[tls_field]["sha256"]
+            )
+        external_sockets.append(driver_environment["OPENSHELL_COMPUTE_DRIVER_SOCKET"])
+        assert f"{variant_name}.driver.log" in external_variant["raw_evidence_sha256"]
+        assert f"{variant_name}.exec.stdout" in external_variant["raw_evidence_sha256"]
+    assert len(set(external_sockets)) == 2
+
+    evidence_paths = {
+        name: REPO_ROOT / relative_path
+        for name, relative_path in STEP_10_EVIDENCE_BUNDLES.items()
+    }
+    present = {name: path.is_dir() for name, path in evidence_paths.items()}
+    assert len(set(present.values())) == 1, "Step 10 retained evidence is incomplete"
+    if all(present.values()):
+        reproduced = tmp_path / "schema-v2-compute-boundary-comparison.json"
+        subprocess.run(
+            [
+                "python3",
+                str(REPO_ROOT / "e2e/parity/verify-results.py"),
+                "--baseline-sha",
+                report["baseline_commit"],
+                "--candidate-sha",
+                STEP_10_CANDIDATE_COMMIT,
+                "--in-tree",
+                STEP_10_EVIDENCE_BUNDLES["in_tree"],
+                "--external-uds",
+                STEP_10_EVIDENCE_BUNDLES["external_uds"],
+                "--output",
+                str(reproduced),
+            ],
+            cwd=REPO_ROOT,
+            check=True,
+        )
+        assert reproduced.read_bytes() == COMPUTE_BOUNDARY_PATH.read_bytes()
 
 
 def test_platform_blocked_results_name_owner_lane_and_blocker() -> None:

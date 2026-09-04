@@ -177,3 +177,22 @@ status = "platform_blocked"
 owner = "OpenShell Linux VM security CI lane"
 lane = "linux-x86_64-kvm-libkrun-proxy-spiffe"
 blocker = "The guest JWT mode and visibility, private owner-marker and sandbox-state persistence, callback recovery, TLS key permissions, proxy credential containment, and guest-reachable SPIFFE TCP behavior require a booted VM. The assigned lane must add authenticated-proxy and Workload API TCP fixtures to the paired libkrun/KVM run."
+
+[[result]]
+id = "compute-driver-boundary-parity"
+step = 10
+capability = "In-tree and external-UDS compute-driver execution with sandbox callback connectivity"
+driver = "podman"
+status = "pass"
+validated_baseline_commit = "74960ebfaeec4673885089ed995fad902459749f"
+validated_candidate_commit = "4a39da510e4d278a24dd60291149519c9a570b46"
+lane = "local-linux-x86_64-rootless-podman-5.8.2"
+evidence = [
+  "Fresh exact-source gateway, CLI, conformance, Podman driver, and supervisor artifacts were staged before execution, hashed, executed from retained staging directories, and verified unchanged after execution.",
+  "Driver-free baseline and candidate gateways completed the same authenticated status, create, Ready, list, callback-exec, delete, and list-empty oracle through distinct-content external-driver executables over separate UDS endpoints; in-tree gateways completed the same oracle.",
+  "External drivers ran under env -i with a complete allowlisted environment attestation covering compute and Podman sockets, callback endpoint and TLS-file hashes, pull policy, images, network, timeouts, and bind mounts; successful driver logs were retained and hashed.",
+  "The verifier bound each transport-only gateway socket_path to the driver process input and required distinct baseline and candidate compute sockets, Podman sockets, networks, and callback TLS paths.",
+  "All four runs executed one repository-digest-pinned sandbox image and matched its image ID and manifest digest. They also matched the supervisor base-image identity, digest-pinned base reference, source Dockerfile, installed-package manifest, and same-source runtime artifacts across topologies.",
+  "Each variant built its supervisor image from its own staged supervisor binary in a forced temporary Podman service and isolated store; all supervisor runtime image references were digest-pinned.",
+  "A staged and hashed transparent CLI wrapper retained exact exec stdout bytes; the verifier tied them to the unique conformance run ID, required authenticated preflight and every lifecycle exit 0, and hashed result, launch, driver, raw-log, exec-stdout, gateway-configuration, package, and staged-artifact evidence.",
+]
