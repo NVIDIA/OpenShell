@@ -967,3 +967,41 @@ compute_driver = "kyma"
 [openshell.drivers.kyma]
 socket_path = "/run/openshell/kyma-compute-driver.sock"
 ```
+
+## Preflight package configuration {#gateway-config-preflight}
+
+Before starting a package-managed gateway, validate the selected file without
+changing it:
+
+```shell
+openshell-gateway config preflight --path ~/.config/openshell/gateway.toml
+```
+
+Without --path, the command validates a nonempty OPENSHELL_GATEWAY_CONFIG.
+Otherwise, it validates an existing XDG gateway config when one is discovered.
+When neither source selects a config, preflight succeeds. An explicit missing path,
+a legacy schema-v1 file, invalid TOML, a symlink, or any nonregular file fails.
+Preflight also merges the selected file with the current `OPENSHELL_*` environment
+and applies read-only startup checks for rate-limit pairs, TLS relationships,
+interceptor registrations, and supervisor middleware registrations. It validates
+complete guest TLS path sets without requiring package-generated certificates to
+exist before certificate generation. A failed preflight always preserves the
+file; it never migrates, replaces, or rewrites configuration.
+
+Debian and Ubuntu run this preflight from the systemd user unit before local
+certificate generation. The unit still loads the gateway.env environment file
+and starts the gateway with no configuration arguments. Snap validates a nonempty
+OPENSHELL_GATEWAY_CONFIG first; otherwise it validates and passes its canonical
+SNAP_COMMON/gateway.toml only when that path exists in the filesystem. A broken
+symlink is therefore rejected instead of being treated as absent.
+
+Package startup does not modify an operator-owned v1 file. Back it up, follow
+[Migrate to schema version 2](#migrate-to-schema-version-2), then validate the
+result explicitly before restarting the service:
+
+```shell
+cp ~/.config/openshell/gateway.toml ~/.config/openshell/gateway.toml.v1.bak
+$EDITOR ~/.config/openshell/gateway.toml
+openshell-gateway config preflight --path ~/.config/openshell/gateway.toml
+systemctl --user restart openshell-gateway
+```

@@ -739,6 +739,11 @@ impl Default for MiddlewareRegistry {
     }
 }
 
+/// Validate one external middleware registration without opening its transport.
+pub fn validate_registration_config(registration: &SupervisorMiddlewareService) -> Result<()> {
+    validate_registration(registration).map(|_| ())
+}
+
 fn validate_registration(registration: &SupervisorMiddlewareService) -> Result<Duration> {
     if !is_stable_identifier(&registration.name) {
         return Err(miette!(

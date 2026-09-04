@@ -310,3 +310,46 @@ status = "platform_blocked"
 owner = "OpenShell credential driver E2E lane"
 lane = "kubernetes-vault-uds-credential-drivers-paired"
 blocker = "The host has no assigned disposable Kubernetes Secrets or Vault backend and no retained paired UDS credential-driver execution. Existing backend E2E coverage is candidate-oriented. The assigned lane must compare in-tree and remote transport validation plus opaque store and retrieve behavior using isolated namespaces, Vault state, sockets, databases, and credentials."
+
+# Step 12 resolves deterministic package-startup blockers without claiming that
+# source-tree tests substitute for installation, upgrade, or refresh evidence.
+
+[[result]]
+id = "rpm-package-upgrade"
+step = 12
+capability = "RPM schema-v1 default migration and operator-edited configuration preservation"
+driver = "packaging"
+status = "platform_blocked"
+owner = "OpenShell RPM package upgrade CI lane"
+lane = "fedora-rpm-prior-release-upgrade"
+blocker = "Deterministic migration tests prove exact-default replacement, edited-file preservation, mode preservation, idempotence, and unsafe-path rejection, but no prior RPM was installed and upgraded on this host. The assigned lane must verify package ownership and permissions, service restart, exact and edited schema-v1 files, and rollback-safe failure behavior."
+
+[[result]]
+id = "debian-package-upgrade"
+step = 12
+capability = "Debian prior-artifact upgrade with schema-v1 configuration preservation"
+driver = "packaging"
+status = "platform_blocked"
+owner = "OpenShell Debian package upgrade CI lane"
+lane = "ubuntu-debian-prior-release-upgrade"
+blocker = "The source-tree tests prove Debian preflight selection, source-free diagnostics, non-mutation, and ordering before certificate generation, but dpkg-deb and an installed prior Debian artifact are unavailable. The assigned lane must preserve generated and edited schema-v1 files, exercise manual conversion, and prove successful schema-v2 service restart after upgrade."
+
+[[result]]
+id = "snap-package-refresh"
+step = 12
+capability = "Snap prior-release refresh with schema-v1 configuration preservation"
+driver = "packaging"
+status = "platform_blocked"
+owner = "OpenShell Snap refresh CI lane"
+lane = "ubuntu-snap-prior-release-refresh"
+blocker = "The source-tree tests prove Snap config precedence, preflight failure handling, and non-mutation, but this host cannot install and refresh confined Snap revisions. The assigned lane must refresh a prior Snap with generated and edited schema-v1 files, exercise manual conversion, and prove successful schema-v2 daemon startup."
+
+[[result]]
+id = "homebrew-package-upgrade"
+step = 12
+capability = "Homebrew prior-release upgrade with package-default and operator configuration preservation"
+driver = "packaging"
+status = "platform_blocked"
+owner = "OpenShell macOS Homebrew package upgrade CI lane"
+lane = "macos-homebrew-prior-release-upgrade"
+blocker = "No Homebrew formula installation or prior-release upgrade ran on this Linux host. The assigned macOS lane must upgrade a prior formula with recognized package defaults and edited schema-v1 configuration, verify only provable defaults migrate automatically, and prove successful schema-v2 service restart."

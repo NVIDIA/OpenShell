@@ -741,3 +741,19 @@ When handing results back to the user, include:
 - Service exposure status.
 - Sandbox workload status.
 - The exact command that failed and the shortest fix.
+
+## Package Configuration Preflight
+
+For a Debian, Ubuntu, or Snap gateway that stops before certificate generation or
+daemon startup, validate the selected configuration without starting the service:
+
+    openshell-gateway config preflight [--path PATH]
+
+Without a path, preflight validates a nonempty OPENSHELL_GATEWAY_CONFIG or an
+auto-discovered XDG config; no config succeeds. An explicit missing path, legacy
+schema-v1 file, malformed TOML, symlink, or nonregular file fails before the
+gateway ExecStart. It also applies read-only effective-config checks for rate
+limits, TLS, interceptors, and supervisor middleware. Preflight preserves every
+failed file. Do not advise users to
+delete or rewrite it automatically; back it up and follow the manual schema-v2
+migration in the Gateway Configuration reference.

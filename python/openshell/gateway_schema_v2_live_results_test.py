@@ -67,6 +67,12 @@ REQUIRED_STEP_11_IDS = {
     "supervisor-middleware-registration",
     "unsafe-unauthenticated-user-mode",
 }
+REQUIRED_STEP_12_IDS = {
+    "debian-package-upgrade",
+    "homebrew-package-upgrade",
+    "rpm-package-upgrade",
+    "snap-package-refresh",
+}
 STEP_10_CANDIDATE_COMMIT = "4a39da510e4d278a24dd60291149519c9a570b46"
 STEP_10_REPORT_SHA256 = (
     "65541eec5f642461a88b04b5459474fd7a475adeb7071a65a53fe183caad6a01"
@@ -369,6 +375,40 @@ def test_step_11_records_cross_cutting_live_lane_dispositions() -> None:
         assert result["status"] == "platform_blocked"
         for field in ("status", "owner", "lane", "blocker"):
             assert result[field] == disposition[field]
+
+
+def test_step_12_keeps_real_package_upgrade_lanes_blocked() -> None:
+    results = [
+        result for result in load_toml(RESULTS_PATH)["result"] if result["step"] == 12
+    ]
+
+    assert {result["id"] for result in results} == REQUIRED_STEP_12_IDS
+    assert all(result["status"] == "platform_blocked" for result in results)
+    by_id = {result["id"]: result for result in results}
+
+    rpm = by_id["rpm-package-upgrade"]
+    assert rpm["owner"] == "OpenShell RPM package upgrade CI lane"
+    assert rpm["lane"] == "fedora-rpm-prior-release-upgrade"
+    assert "prior RPM" in rpm["blocker"]
+    assert "installed and upgraded" in rpm["blocker"]
+
+    debian = by_id["debian-package-upgrade"]
+    assert debian["owner"] == "OpenShell Debian package upgrade CI lane"
+    assert debian["lane"] == "ubuntu-debian-prior-release-upgrade"
+    assert "installed prior Debian artifact" in debian["blocker"]
+    assert "source-tree tests" in debian["blocker"]
+
+    snap = by_id["snap-package-refresh"]
+    assert snap["owner"] == "OpenShell Snap refresh CI lane"
+    assert snap["lane"] == "ubuntu-snap-prior-release-refresh"
+    assert "refresh confined Snap revisions" in snap["blocker"]
+    assert "source-tree tests" in snap["blocker"]
+
+    homebrew = by_id["homebrew-package-upgrade"]
+    assert homebrew["owner"] == "OpenShell macOS Homebrew package upgrade CI lane"
+    assert homebrew["lane"] == "macos-homebrew-prior-release-upgrade"
+    assert "prior-release upgrade" in homebrew["blocker"]
+    assert "Linux host" in homebrew["blocker"]
 
 
 def test_platform_blocked_results_name_owner_lane_and_blocker() -> None:

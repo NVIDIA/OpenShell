@@ -148,5 +148,11 @@ def test_operator_edited_package_configuration_is_never_auto_rewritten() -> None
         if change["id"] == "package-default-only-auto-migration"
     )
 
-    assert "byte-identical package defaults" in package_policy["schema_v2_contract"]
+    contract = package_policy["schema_v2_contract"]
+    assert "byte-identical package defaults" in contract
+    assert "Debian and Snap preserve every legacy file" in contract
+    assert "fail closed through read-only package preflight" in contract
+    assert "manual-migration guidance" in contract
+    assert "no safe provenance marker" in contract
     assert "preserve every edited file" in package_policy["migration"]
+    assert "manual schema-v2 conversion" in package_policy["migration"]

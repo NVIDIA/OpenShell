@@ -155,3 +155,24 @@ Kubernetes deployments use the OpenShell Helm chart. For step-by-step installati
 - To register, select, and inspect gateways, refer to [Gateways](/sandboxes/manage-gateways).
 - To supply API keys or tokens, refer to [Manage Providers](/sandboxes/manage-providers).
 - To control what the agent can access, refer to [Policies](/sandboxes/policies).
+
+## Validate a package-managed gateway configuration
+
+Debian and Ubuntu packages validate the selected gateway configuration before
+generating local certificates or starting the service. Snap does the same before
+its gateway daemon starts. The validation never changes the file. If startup reports a legacy schema,
+malformed TOML, a symlink, or a nonregular configuration path, fix or manually
+migrate the operator-owned file instead of deleting it.
+
+Check the selected file before restarting a service:
+
+```shell
+openshell-gateway config preflight --path ~/.config/openshell/gateway.toml
+```
+
+Without --path, preflight checks a nonempty OPENSHELL_GATEWAY_CONFIG or an
+auto-discovered XDG config; no config is also a successful result. Debian keeps
+its bare service invocation and gateway.env semantics. Snap gives a nonempty
+OPENSHELL_GATEWAY_CONFIG precedence over SNAP_COMMON/gateway.toml.
+See [Gateway Configuration](/reference/gateway-config#gateway-config-preflight)
+for preflight details and manual schema-v1 migration steps.

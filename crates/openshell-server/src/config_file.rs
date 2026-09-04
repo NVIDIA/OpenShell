@@ -20,7 +20,8 @@
 //! values.
 
 use std::collections::BTreeMap;
-use std::io::Cursor;
+use std::fs::OpenOptions;
+use std::io::{Cursor, Read as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -329,6 +330,8 @@ pub enum ConfigFileError {
         #[source]
         source: std::io::Error,
     },
+    #[error("gateway config path '{}' is not a regular file ({kind})", path.display())]
+    NonRegular { path: PathBuf, kind: &'static str },
     #[error("failed to parse gateway config file '{}': {source}", path.display())]
     Parse {
         path: PathBuf,
@@ -379,20 +382,103 @@ pub enum ConfigFileError {
     },
 }
 
-/// Load and validate a TOML config file.
-///
-/// Configuration files must declare exactly [`SCHEMA_VERSION`]. Running
-/// without a config file still uses CLI, environment, and built-in defaults.
-#[cfg_attr(target_os = "windows", allow(clippy::result_large_err))]
-pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
-    let contents = std::fs::read_to_string(path).map_err(|source| ConfigFileError::Io {
-        path: path.to_path_buf(),
+const CONFIG_MIGRATION_URL: &str =
+    "https://docs.nvidia.com/openshell/latest/reference/gateway-config#migrate-to-schema-version-2";
+
+/// Stable package-preflight failure with no configuration contents attached.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "gateway config preflight failed: path='{}' category={} detected_version={}; the file was preserved unchanged; migrate it before restarting the gateway: {CONFIG_MIGRATION_URL}",
+    path.display(),
+    category,
+    detected_version
+)]
+pub struct ConfigPreflightError {
+    path: PathBuf,
+    category: &'static str,
+    detected_version: String,
+}
+
+impl ConfigPreflightError {
+    pub(crate) fn invalid_current(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            category: "malformed",
+            detected_version: SCHEMA_VERSION.to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    fn category(&self) -> &'static str {
+        self.category
+    }
+
+    #[cfg(test)]
+    fn detected_version(&self) -> &str {
+        &self.detected_version
+    }
+}
+
+fn non_regular_kind(metadata: &std::fs::Metadata) -> &'static str {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        "symlink"
+    } else if file_type.is_dir() {
+        "directory"
+    } else {
+        "non-regular"
+    }
+}
+
+fn read_config_contents(path: &Path) -> Result<String, ConfigFileError> {
+    let path_buf = path.to_path_buf();
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| ConfigFileError::Io {
+        path: path_buf.clone(),
         source,
     })?;
+    if !metadata.file_type().is_file() {
+        return Err(ConfigFileError::NonRegular {
+            path: path_buf,
+            kind: non_regular_kind(&metadata),
+        });
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path).map_err(|source| ConfigFileError::Io {
+        path: path_buf.clone(),
+        source,
+    })?;
+    let opened_metadata = file.metadata().map_err(|source| ConfigFileError::Io {
+        path: path_buf.clone(),
+        source,
+    })?;
+    if !opened_metadata.file_type().is_file() {
+        return Err(ConfigFileError::NonRegular {
+            path: path_buf,
+            kind: non_regular_kind(&opened_metadata),
+        });
+    }
+
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|source| ConfigFileError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(contents)
+}
+
+fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigFileError> {
     if contents.trim().is_empty() {
         return Err(ConfigFileError::MissingVersion);
     }
-    let file: ConfigFile = toml::from_str(&contents).map_err(|source| ConfigFileError::Parse {
+    let file: ConfigFile = toml::from_str(contents).map_err(|source| ConfigFileError::Parse {
         path: path.to_path_buf(),
         source,
     })?;
@@ -432,6 +518,97 @@ pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
     }
 
     Ok(file)
+}
+
+fn detected_version(contents: &str) -> String {
+    let Ok(value) = contents.parse::<toml::Value>() else {
+        return "unavailable".to_string();
+    };
+    let Some(openshell) = value.get("openshell") else {
+        return "missing".to_string();
+    };
+    let Some(openshell) = openshell.as_table() else {
+        return "unavailable".to_string();
+    };
+    openshell.get("version").map_or_else(
+        || "missing".to_string(),
+        |version| {
+            version
+                .as_integer()
+                .map_or_else(|| "unavailable".to_string(), |version| version.to_string())
+        },
+    )
+}
+
+fn preflight_error(
+    path: &Path,
+    detected_version: String,
+    source: ConfigFileError,
+) -> ConfigPreflightError {
+    let category = match &source {
+        ConfigFileError::NonRegular { .. } => "non_regular_path",
+        ConfigFileError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
+            "missing_path"
+        }
+        ConfigFileError::Io { source, .. } if source.kind() == std::io::ErrorKind::InvalidData => {
+            "malformed"
+        }
+        ConfigFileError::Io { .. } => "unreadable_path",
+        ConfigFileError::MissingVersion => "missing_version",
+        ConfigFileError::UnsupportedVersion { version: 1 } => "legacy_schema_v1",
+        ConfigFileError::UnsupportedVersion { version } if *version > SCHEMA_VERSION => {
+            "future_version"
+        }
+        ConfigFileError::UnsupportedVersion { .. } => "unsupported_version",
+        ConfigFileError::Parse { .. }
+        | ConfigFileError::SecretInFile { .. }
+        | ConfigFileError::InvalidValue { .. }
+        | ConfigFileError::InvalidDriverTable { .. }
+        | ConfigFileError::MiddlewareTlsCaRead { .. }
+        | ConfigFileError::MiddlewareTlsCaInvalid { .. } => "malformed",
+    };
+    ConfigPreflightError {
+        path: path.to_path_buf(),
+        category,
+        detected_version,
+    }
+}
+
+/// Validate a gateway configuration without starting the gateway or writing state.
+#[cfg_attr(target_os = "windows", allow(clippy::result_large_err))]
+pub fn preflight(path: &Path) -> Result<ConfigFile, ConfigPreflightError> {
+    let contents = read_config_contents(path)
+        .map_err(|source| preflight_error(path, "unavailable".to_string(), source))?;
+    let version = detected_version(&contents);
+    if version == "missing" {
+        return Err(preflight_error(
+            path,
+            version,
+            ConfigFileError::MissingVersion,
+        ));
+    }
+    if let Ok(version_number) = version.parse::<u32>()
+        && version_number != SCHEMA_VERSION
+    {
+        return Err(preflight_error(
+            path,
+            version,
+            ConfigFileError::UnsupportedVersion {
+                version: version_number,
+            },
+        ));
+    }
+    parse_and_validate(path, &contents).map_err(|source| preflight_error(path, version, source))
+}
+
+/// Load and validate a TOML config file.
+///
+/// Configuration files must declare exactly [`SCHEMA_VERSION`]. Running
+/// without a config file still uses CLI, environment, and built-in defaults.
+#[cfg_attr(target_os = "windows", allow(clippy::result_large_err))]
+pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
+    let contents = read_config_contents(path)?;
+    parse_and_validate(path, &contents)
 }
 
 /// Return a driver's table without gateway-level inheritance.
@@ -1044,6 +1221,99 @@ ssh_gateway_port = 8080
     fn accepts_current_version() {
         let tmp = write_raw_tmp("[openshell]\nversion = 2\n");
         load(tmp.path()).expect("schema version 2 must be accepted");
+        preflight(tmp.path()).expect("schema version 2 must pass preflight");
+    }
+
+    #[test]
+    fn preflight_classifies_versions_and_malformed_files_without_disclosing_contents() {
+        for (contents, category, version) in [
+            ("[openshell]\nversion = 1\n", "legacy_schema_v1", "1"),
+            ("[openshell]\n", "missing_version", "missing"),
+            ("[openshell]\nversion = 3\n", "future_version", "3"),
+            ("[openshell]\nversion = 0\n", "unsupported_version", "0"),
+            ("[openshell]\nversion = 'two'\n", "malformed", "unavailable"),
+            (
+                "[openshell]\nversion = 2\nsecret-value = [",
+                "malformed",
+                "unavailable",
+            ),
+            (
+                "[openshell]\nversion = 2\n[openshell.gateway]\nunknown = 'secret-value'\n",
+                "malformed",
+                "2",
+            ),
+        ] {
+            let tmp = write_raw_tmp(contents);
+            let error = preflight(tmp.path()).expect_err("preflight must reject fixture");
+            assert_eq!(error.category(), category, "contents: {contents}");
+            assert_eq!(error.detected_version(), version, "contents: {contents}");
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains(&format!("category={category}")));
+            assert!(diagnostic.contains(&format!("detected_version={version}")));
+            assert!(diagnostic.contains("the file was preserved unchanged"));
+            assert!(diagnostic.contains(CONFIG_MIGRATION_URL));
+            assert!(!diagnostic.contains("secret-value"));
+            assert!(!format!("{error:?}").contains("secret-value"));
+            assert!(std::error::Error::source(&error).is_none());
+        }
+    }
+
+    #[test]
+    fn preflight_classifies_missing_path() {
+        let path = Path::new("/nonexistent/openshell-preflight.toml");
+        let error = preflight(path).expect_err("missing explicit path must fail");
+        assert_eq!(error.category(), "missing_path");
+        assert_eq!(error.detected_version(), "unavailable");
+        assert!(error.to_string().contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn preflight_rejects_directory_as_non_regular() {
+        let tmp = tempfile::tempdir().unwrap();
+        let error = preflight(tmp.path()).expect_err("directory must fail preflight");
+        assert_eq!(error.category(), "non_regular_path");
+        assert_eq!(error.detected_version(), "unavailable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_and_runtime_reject_symlinks_without_following_them() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.toml");
+        let link = dir.path().join("gateway.toml");
+        std::fs::write(&target, "[openshell]\nversion = 2\n").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = preflight(&link).expect_err("symlink must fail preflight");
+        assert_eq!(error.category(), "non_regular_path");
+        assert!(matches!(
+            load(&link),
+            Err(ConfigFileError::NonRegular { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_rejects_fifo_without_blocking() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("gateway.toml");
+        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let error = preflight(&fifo).expect_err("FIFO must fail preflight");
+        assert_eq!(error.category(), "non_regular_path");
+    }
+
+    #[test]
+    fn preflight_classifies_non_utf8_as_malformed() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), [0xff, 0xfe]).unwrap();
+        let error = preflight(tmp.path()).expect_err("non-UTF-8 config must fail");
+        assert_eq!(error.category(), "malformed");
+        assert_eq!(error.detected_version(), "unavailable");
     }
 
     #[test]

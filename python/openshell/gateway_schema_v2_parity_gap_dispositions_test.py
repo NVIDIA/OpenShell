@@ -13,6 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 GAP_LEDGER_PATH = (
     REPO_ROOT / "e2e/configs/gateway/schema-v2-parity-gap-dispositions.toml"
 )
+LIVE_RESULTS_PATH = REPO_ROOT / "e2e/configs/gateway/schema-v2-live-results.toml"
 
 REQUIRED_HEADER_FIELDS = {
     "ledger_version",
@@ -145,6 +146,41 @@ def test_step_6_gap_dispositions_are_resolved() -> None:
     }
     assert all(gap["severity"] == "none" for gap in step_6_gaps)
     assert all(gap["disposition"] == "resolved" for gap in step_6_gaps)
+
+
+def test_step_12_product_gaps_are_resolved_without_claiming_live_package_parity() -> (
+    None
+):
+    step_12_gaps = [gap for gap in load_ledger()["gaps"] if gap["owner_step"] == 12]
+    assert {gap["id"] for gap in step_12_gaps} == {
+        "debian-snap-v1-upgrade",
+        "rpm-exact-default-migration",
+    }
+
+    debian_snap = next(
+        gap for gap in step_12_gaps if gap["id"] == "debian-snap-v1-upgrade"
+    )
+    assert debian_snap["severity"] == "none"
+    assert debian_snap["disposition"] == "resolved"
+    assert "source-free, read-only preflight" in debian_snap["candidate_behavior"]
+    assert "fail closed" in debian_snap["resolution"]
+    assert "manual migration" in debian_snap["resolution"]
+    assert "no safe default-provenance marker" in debian_snap["resolution"]
+    assert "platform-blocked" in debian_snap["validation"]
+
+    with LIVE_RESULTS_PATH.open("rb") as results_file:
+        package_results = {
+            result["id"]: result
+            for result in tomllib.load(results_file)["result"]
+            if result["step"] == 12
+        }
+    for result_id in (
+        "debian-package-upgrade",
+        "homebrew-package-upgrade",
+        "rpm-package-upgrade",
+        "snap-package-refresh",
+    ):
+        assert package_results[result_id]["status"] == "platform_blocked"
 
 
 def test_legacy_environment_resolution_preserves_singular_semantics() -> None:

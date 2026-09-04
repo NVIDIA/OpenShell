@@ -38,9 +38,30 @@ struct Cli {
 enum Commands {
     /// Generate mTLS PKI and write Kubernetes Secrets (Helm pre-install hook).
     GenerateCerts(certgen::CertgenArgs),
+    /// Inspect gateway configuration without starting the service.
+    Config(ConfigArgs),
 }
 
 #[derive(clap::Args, Debug)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    command: ConfigCommand,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum ConfigCommand {
+    /// Validate the selected configuration without modifying it or starting the gateway.
+    Preflight(ConfigPreflightArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct ConfigPreflightArgs {
+    /// Explicit configuration path. Overrides `OPENSHELL_GATEWAY_CONFIG` and XDG discovery.
+    #[arg(long)]
+    path: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Clone, Debug)]
 #[allow(clippy::struct_excessive_bools)]
 struct RunArgs {
     /// Path to a TOML configuration file (see RFC 0003).
@@ -235,6 +256,9 @@ pub async fn run_cli_with_compute_drivers(compute_drivers: ComputeDriverRegistry
 
     match cli.command {
         Some(Commands::GenerateCerts(args)) => certgen::run(args).await,
+        Some(Commands::Config(args)) => match args.command {
+            ConfigCommand::Preflight(args) => run_config_preflight(args, cli.run, &matches),
+        },
         None => Box::pin(run_from_args(cli.run, matches, compute_drivers)).await,
     }
 }
@@ -636,13 +660,129 @@ fn parse_compute_driver(value: &str) -> std::result::Result<String, String> {
     openshell_core::config::normalize_compute_driver_name(value)
 }
 
+fn run_config_preflight(
+    args: ConfigPreflightArgs,
+    mut run: RunArgs,
+    matches: &ArgMatches,
+) -> Result<()> {
+    let path = if let Some(path) = args.path {
+        Some(path)
+    } else {
+        resolve_config_path(&run)?
+    };
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let file = config_file::preflight(&path).map_err(|error| miette::miette!("{error}"))?;
+    merge_file_into_args(&mut run, &file.openshell.gateway, matches);
+    validate_preflight_semantics(&run, matches, &file)
+        .map_err(|_| config_file::ConfigPreflightError::invalid_current(&path))
+        .map_err(|error| miette::miette!("{error}"))
+}
+
+fn validate_preflight_semantics(
+    args: &RunArgs,
+    matches: &ArgMatches,
+    file: &ConfigFile,
+) -> Result<()> {
+    let gateway = &file.openshell.gateway;
+    validate_grpc_rate_limit_args(
+        args.grpc_rate_limit_requests,
+        args.grpc_rate_limit_window_seconds,
+    )?;
+    GuestTlsPaths::validate_configuration(Some(gateway), args.disable_tls)
+        .map_err(|error| miette::miette!("invalid gateway guest TLS configuration: {error}"))?;
+
+    let has_client_ca = args.tls_client_ca.is_some();
+    let mtls_auth_enabled = resolve_mtls_auth_enabled(args, matches, Some(file), None);
+    if args.disable_tls && has_client_ca {
+        return Err(miette::miette!(
+            "--disable-tls and --tls-client-ca are mutually exclusive"
+        ));
+    }
+    if mtls_auth_enabled && args.disable_tls {
+        return Err(miette::miette!("mTLS user authentication requires TLS"));
+    }
+    if mtls_auth_enabled && !has_client_ca {
+        return Err(miette::miette!(
+            "mTLS user authentication requires --tls-client-ca"
+        ));
+    }
+    if !args.disable_tls && args.tls_cert.is_some() != args.tls_key.is_some() {
+        return Err(miette::miette!(
+            "gateway TLS requires both --tls-cert and --tls-key"
+        ));
+    }
+    if !args.disable_tls && has_client_ca && args.tls_cert.is_none() && args.tls_key.is_none() {
+        return Err(miette::miette!(
+            "an explicit --tls-client-ca requires --tls-cert and --tls-key"
+        ));
+    }
+    if !args.disable_tls
+        && let Some(tls) = gateway.tls.as_ref()
+    {
+        crate::tls::validate_external_cert_config(
+            tls.external_cert_path.as_deref(),
+            tls.external_key_path.as_deref(),
+            &tls.external_server_names,
+        )
+        .map_err(|error| miette::miette!("{error}"))?;
+    }
+    openshell_gateway_interceptors::validate_configs(&gateway.interceptors)
+        .map_err(|error| miette::miette!("{error}"))?;
+    let mut middleware_names = std::collections::HashSet::new();
+    for middleware in &file.openshell.supervisor.middleware {
+        let registration = openshell_core::proto::SupervisorMiddlewareService::try_from(middleware)
+            .map_err(|error| miette::miette!("{error}"))?;
+        openshell_supervisor_middleware::validate_registration_config(&registration)?;
+        if !middleware_names.insert(registration.name) {
+            return Err(miette::miette!(
+                "duplicate supervisor middleware registration"
+            ));
+        }
+    }
+    if args.name.trim().is_empty() {
+        return Err(miette::miette!("gateway name must not be empty"));
+    }
+
+    let health_bind = resolve_aux_listener(
+        args.bind_address,
+        args.health_port,
+        matches,
+        "health_port",
+        || gateway.health_bind_address,
+    );
+    let metrics_bind = resolve_aux_listener(
+        args.bind_address,
+        args.metrics_port,
+        matches,
+        "metrics_port",
+        || gateway.metrics_bind_address,
+    );
+    if health_bind.is_some_and(|address| address.port() == args.port)
+        || metrics_bind.is_some_and(|address| address.port() == args.port)
+        || health_bind
+            .zip(metrics_bind)
+            .is_some_and(|(health, metrics)| health.port() == metrics.port())
+    {
+        return Err(miette::miette!("gateway listener ports must be distinct"));
+    }
+    Ok(())
+}
+
 fn resolve_config_path(args: &RunArgs) -> Result<Option<PathBuf>> {
     if let Some(path) = args.config.clone() {
         return Ok(Some(path));
     }
 
     let default_path = defaults::default_gateway_config_path()?;
-    Ok(default_path.is_file().then_some(default_path))
+    match std::fs::symlink_metadata(&default_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        // Fail closed when the path exists or cannot be inspected. Returning it
+        // lets the shared loader produce the same safe, path-specific error used
+        // for an explicit configuration instead of treating it as absent.
+        Ok(_) | Err(_) => Ok(Some(default_path)),
+    }
 }
 
 fn apply_runtime_defaults(args: &mut RunArgs) -> Result<Option<LocalTlsPaths>> {
@@ -1385,6 +1525,237 @@ mod tests {
             cli.command,
             Some(super::Commands::GenerateCerts(_))
         ));
+    }
+
+    #[test]
+    fn config_preflight_subcommand_parses_without_runtime_requirements() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _db = EnvVarGuard::remove("OPENSHELL_DB_URL");
+        let _config = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+
+        let cli = Cli::try_parse_from([
+            "openshell-gateway",
+            "config",
+            "preflight",
+            "--path",
+            "/tmp/gateway.toml",
+        ])
+        .expect("config preflight should parse without runtime arguments");
+
+        assert!(matches!(
+            cli.command,
+            Some(super::Commands::Config(super::ConfigArgs {
+                command: super::ConfigCommand::Preflight(_)
+            }))
+        ));
+    }
+
+    #[test]
+    fn config_preflight_validates_explicit_path_without_creating_state() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let state_parent = tempfile::tempdir().unwrap();
+        let state_home = state_parent.path().join("not-created");
+        let config = config_home.path().join("gateway.toml");
+        std::fs::write(&config, "[openshell]\nversion = 2\n").unwrap();
+        let _config_env = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+        let _state = EnvVarGuard::set("XDG_STATE_HOME", state_home.to_str().unwrap());
+        let (run, matches) = parse_with_args(&["openshell-gateway"]);
+
+        super::run_config_preflight(
+            super::ConfigPreflightArgs { path: Some(config) },
+            run,
+            &matches,
+        )
+        .expect("valid explicit config passes preflight");
+
+        assert!(
+            !state_home.exists(),
+            "preflight must not create runtime state"
+        );
+    }
+
+    #[test]
+    fn config_preflight_explicit_path_overrides_environment_selection() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy.toml");
+        let current = dir.path().join("current.toml");
+        std::fs::write(&legacy, "[openshell]\nversion = 1\n").unwrap();
+        std::fs::write(&current, "[openshell]\nversion = 2\n").unwrap();
+        let _config_env = EnvVarGuard::set("OPENSHELL_GATEWAY_CONFIG", legacy.to_str().unwrap());
+        let (run, matches) = parse_with_args(&["openshell-gateway"]);
+
+        let error = super::run_config_preflight(
+            super::ConfigPreflightArgs { path: None },
+            run.clone(),
+            &matches,
+        )
+        .expect_err("environment-selected legacy config must fail");
+        assert!(error.to_string().contains("category=legacy_schema_v1"));
+
+        super::run_config_preflight(
+            super::ConfigPreflightArgs {
+                path: Some(current),
+            },
+            run,
+            &matches,
+        )
+        .expect("explicit preflight path must override environment selection");
+    }
+
+    #[test]
+    fn config_preflight_allows_absent_auto_discovery_but_rejects_explicit_absence() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let _config_env = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+        let _config_home =
+            EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
+        let (run, matches) = parse_with_args(&["openshell-gateway"]);
+
+        super::run_config_preflight(
+            super::ConfigPreflightArgs { path: None },
+            run.clone(),
+            &matches,
+        )
+        .expect("absent auto-discovered config is optional");
+
+        let missing = config_home.path().join("missing.toml");
+        let error = super::run_config_preflight(
+            super::ConfigPreflightArgs {
+                path: Some(missing.clone()),
+            },
+            run,
+            &matches,
+        )
+        .expect_err("explicit missing config must fail");
+        assert!(error.to_string().contains("category=missing_path"));
+        assert!(error.to_string().contains(&missing.display().to_string()));
+    }
+
+    #[test]
+    fn config_preflight_rejects_effective_semantic_errors() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _config_env = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "rate-limit",
+                "[openshell]\nversion = 2\n[openshell.gateway]\nname = 'secret-semantic-marker'\ngrpc_rate_limit_requests = 10\n",
+            ),
+            (
+                "guest-tls",
+                "[openshell]\nversion = 2\n[openshell.gateway]\nguest_tls_ca = '/tls/ca.pem'\n",
+            ),
+            (
+                "external-tls",
+                "[openshell]\nversion = 2\n[openshell.gateway.tls]\ncert_path = '/tls/server.pem'\nkey_path = '/tls/server-key.pem'\nexternal_cert_path = '/tls/external.pem'\nexternal_server_names = ['external.example']\n",
+            ),
+            (
+                "interceptor",
+                "[openshell]\nversion = 2\n[[openshell.gateway.interceptors]]\nname = ''\ngrpc_endpoint = 'https://interceptor.example'\n",
+            ),
+            (
+                "middleware",
+                "[openshell]\nversion = 2\n[[openshell.supervisor.middleware]]\nname = 'guard'\ngrpc_endpoint = 'http://127.0.0.1:50051'\nallow_insecure_transport = true\nmax_payload_bytes = 1024\ntimeout = 'invalid'\n",
+            ),
+        ];
+
+        for (name, contents) in cases {
+            let path = dir.path().join(format!("{name}.toml"));
+            std::fs::write(&path, contents).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let (run, matches) = parse_with_args(&["openshell-gateway"]);
+            let result = super::run_config_preflight(
+                super::ConfigPreflightArgs {
+                    path: Some(path.clone()),
+                },
+                run,
+                &matches,
+            );
+            let Err(error) = result else {
+                panic!("{name}: invalid effective configuration passed preflight");
+            };
+            assert!(error.to_string().contains("category=malformed"), "{name}");
+            assert!(error.to_string().contains("detected_version=2"), "{name}");
+            assert!(!error.to_string().contains("secret-semantic-marker"));
+            assert!(!format!("{error:?}").contains("secret-semantic-marker"));
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{name}");
+        }
+    }
+
+    #[test]
+    fn config_preflight_matches_effective_tls_environment_semantics() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _config_env = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+        let dir = tempfile::tempdir().unwrap();
+        let partial_external = dir.path().join("partial-external.toml");
+        std::fs::write(
+            &partial_external,
+            "[openshell]\nversion = 2\n[openshell.gateway.tls]\ncert_path = '/tls/server.pem'\nkey_path = '/tls/server-key.pem'\nexternal_cert_path = '/tls/external.pem'\nexternal_server_names = ['external.example']\n",
+        )
+        .unwrap();
+        let disable_tls = EnvVarGuard::set("OPENSHELL_DISABLE_TLS", "true");
+        let (run, matches) = parse_with_args(&["openshell-gateway"]);
+        super::run_config_preflight(
+            super::ConfigPreflightArgs {
+                path: Some(partial_external),
+            },
+            run,
+            &matches,
+        )
+        .expect("inactive TLS table must not block an effective plaintext gateway");
+        drop(disable_tls);
+
+        let config = dir.path().join("client-ca-only.toml");
+        std::fs::write(&config, "[openshell]\nversion = 2\n").unwrap();
+        let _disable_tls = EnvVarGuard::remove("OPENSHELL_DISABLE_TLS");
+        let _client_ca = EnvVarGuard::set("OPENSHELL_TLS_CLIENT_CA", "/tls/ca.pem");
+        let _cert = EnvVarGuard::remove("OPENSHELL_TLS_CERT");
+        let _key = EnvVarGuard::remove("OPENSHELL_TLS_KEY");
+        let (run, matches) = parse_with_args(&["openshell-gateway"]);
+        let error = super::run_config_preflight(
+            super::ConfigPreflightArgs { path: Some(config) },
+            run,
+            &matches,
+        )
+        .expect_err("client CA without an explicit server pair must fail before cert generation");
+        assert!(error.to_string().contains("category=malformed"));
+    }
+
+    #[test]
+    fn config_preflight_allows_complete_future_generated_tls_paths() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _config_env = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gateway.toml");
+        std::fs::write(
+            &path,
+            "[openshell]\nversion = 2\n[openshell.gateway]\nguest_tls_ca = '/future/ca.pem'\nguest_tls_cert = '/future/client.pem'\nguest_tls_key = '/future/client-key.pem'\n",
+        )
+        .unwrap();
+        let (run, matches) = parse_with_args(&["openshell-gateway"]);
+
+        super::run_config_preflight(
+            super::ConfigPreflightArgs { path: Some(path) },
+            run,
+            &matches,
+        )
+        .expect("complete package-generated TLS paths may not exist before certificate generation");
     }
 
     #[test]

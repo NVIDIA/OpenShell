@@ -23,14 +23,14 @@ owner_step = 6
 
 [[gaps]]
 id = "debian-snap-v1-upgrade"
-severity = "blocker"
+severity = "none"
 parity_relation = "upgrade_regression"
-disposition = "must_fix_before_release_gate"
+disposition = "resolved"
 origin_main_behavior = "Debian auto-discovers a persistent schema-v1 XDG gateway.toml and Snap passes a persistent schema-v1 SNAP_COMMON gateway.toml."
-candidate_behavior = "The schema-v2 gateway rejects those files, and neither package currently performs a package-specific migration or preflight."
-impact = "Upgrading a working installation can leave its gateway service unable to start."
-resolution = "Add package-specific preflight behavior that never overwrites edited configuration, recognizes any package-generated v1 default that is safe to migrate, and reports an actionable manual migration diagnostic for every preserved v1 file."
-validation = "Upgrade real prior Debian and Snap artifacts with generated and edited v1 files; verify safe migration or deterministic operator guidance, file preservation, and successful restart after conversion."
+candidate_behavior = "Debian and Snap run the gateway's source-free, read-only preflight against the same effectively selected config before certificate generation or daemon startup; rejected legacy files, schema/layout errors, and documented cross-field startup errors remain unchanged with actionable migration guidance. Selected driver-specific fields remain lazily validated at driver construction."
+impact = "The package startup regression is resolved without inferring provenance or overwriting operator-owned configuration; release remains gated on real Debian upgrade and Snap refresh execution."
+resolution = "Use the shared strict schema-v2 layout parser plus documented read-only effective startup checks, fail closed for explicit, unsafe, or legacy paths, preserve optional absence, and require manual migration because historical Debian and Snap generators have no safe default-provenance marker."
+validation = "Deterministic Rust, shell, and Python tests cover selection precedence, stable diagnostics, content non-disclosure, semantic checks, file preservation, and package ordering. Real prior Debian upgrade and Snap refresh lanes remain platform-blocked and must verify preserved v1 files plus successful restart after manual conversion."
 owner_step = 12
 
 [[gaps]]
