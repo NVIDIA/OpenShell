@@ -237,17 +237,16 @@ release for the guest architecture, stores its versioned RPMs under
 `/var/lib/openshell-conformance/baseline`, and publishes a target-side
 latest-release apply command.
 
-For an upgrade test, order the latest-release source first so it initializes the
-guest, then make the candidate source available for the lifecycle action:
+For gateway restart continuity, provision the candidate source first so it
+initializes the guest:
 
 ```shell
---provision openshell-latest-release-rpm-source \
 --provision openshell-candidate-rpm-source \
 --provision gateway-podman
 ```
 
-The upgrade plan applies the candidate source and then uses the independent
-gateway-restart action to verify continuity across a subsequent gateway restart.
+The gateway-restart plan runs one `gateway-restart` action to verify continuity
+across the restart.
 
 `openshell-binaries-contract`, `openshell-rpm-contract`, and
 `openshell-rpm-source` are internal composition roles used by the public source
