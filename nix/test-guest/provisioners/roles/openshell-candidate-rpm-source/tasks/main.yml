@@ -1,0 +1,11 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Prepare the candidate RPM source
+  ansible.builtin.include_role:
+    name: openshell-rpm-source
+  vars:
+    openshell_rpm_source_name: candidate
+    openshell_rpm_source_cli_package: "{{ openshell_rpm_candidate_cli_package }}"
+    openshell_rpm_source_gateway_package: "{{ openshell_rpm_candidate_gateway_package }}"
