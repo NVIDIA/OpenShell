@@ -14,6 +14,7 @@ DRIVER=""
 SCENARIO="smoke"
 COMMAND_CLASS="conformance_smoke"
 BASELINE_WORKTREE="${OPENSHELL_PARITY_BASELINE_WORKTREE:-}"
+CANDIDATE_WORKTREE="${OPENSHELL_PARITY_CANDIDATE_WORKTREE:-${ROOT}}"
 RESULTS_DIR="${OPENSHELL_PARITY_RESULTS_DIR:-}"
 WRAPPER="${OPENSHELL_PARITY_PODMAN_WRAPPER:-${ROOT}/e2e/with-podman-gateway.sh}"
 PODMAN_OPTIONS_ORACLE="${OPENSHELL_PARITY_PODMAN_OPTIONS_ORACLE:-${ROOT}/e2e/parity/podman-options.sh}"
@@ -31,6 +32,7 @@ Overrides:
   OPENSHELL_PARITY_CANDIDATE_{GATEWAY,CLI,CONFORMANCE}_BIN
   OPENSHELL_PARITY_{BASELINE,CANDIDATE}_EXTERNAL_DRIVER_BIN
   OPENSHELL_PARITY_{BASELINE,CANDIDATE}_CARGO_TARGET_DIR
+  OPENSHELL_PARITY_CANDIDATE_WORKTREE (clean checkout at the current HEAD)
 EOF
 }
 
@@ -84,7 +86,16 @@ if ! [[ "${BASELINE_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
   exit 2
 fi
 BASELINE_SHA="${BASELINE_SHA,,}"
-CANDIDATE_SHA="$(git -C "${ROOT}" rev-parse HEAD)"
+EXPECTED_CANDIDATE_SHA="$(git -C "${ROOT}" rev-parse HEAD)"
+if [ ! -d "${CANDIDATE_WORKTREE}" ]; then
+  echo "ERROR: candidate worktree does not exist: ${CANDIDATE_WORKTREE}" >&2
+  exit 2
+fi
+CANDIDATE_SHA="$(git -C "${CANDIDATE_WORKTREE}" rev-parse HEAD 2>/dev/null || true)"
+if [ "${CANDIDATE_SHA}" != "${EXPECTED_CANDIDATE_SHA}" ]; then
+  echo "ERROR: candidate worktree must be at current commit ${EXPECTED_CANDIDATE_SHA}: ${CANDIDATE_WORKTREE}" >&2
+  exit 2
+fi
 
 cleanup() {
   local status=$?
@@ -128,6 +139,16 @@ else
   BASELINE_WORKTREE="${TEMP_WORKTREE}"
 fi
 
+require_clean_source() {
+  local variant=$1 source_root=$2 dirty
+  dirty="$(git -C "${source_root}" status --porcelain=v1 --untracked-files=all)"
+  if [ -n "${dirty}" ]; then
+    echo "ERROR: ${variant} source worktree must be clean before building parity artifacts: ${source_root}" >&2
+    printf '%s\n' "${dirty}" >&2
+    exit 2
+  fi
+}
+
 RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/openshell-parity-run.XXXXXX")"
 RESULTS_DIR="${RESULTS_DIR:-${ROOT}/target/parity/results}"
 mkdir -p "${RESULTS_DIR}"
@@ -157,14 +178,17 @@ build_variant() {
   conformance="${conformance_override:-${target_dir}/debug/openshell-conformance}"
 
   if [ -z "${gateway_override}" ]; then
+    require_clean_source "${variant}" "${source_root}"
     echo "Building ${variant} gateway in ${target_dir}..."
     (cd "${source_root}" && CARGO_TARGET_DIR="${target_dir}" cargo build "${jobs[@]}" -p openshell-gateway --bin openshell-gateway "${gateway_features[@]}")
   fi
   if [ -z "${cli_override}" ]; then
+    require_clean_source "${variant}" "${source_root}"
     echo "Building ${variant} CLI in ${target_dir}..."
     (cd "${source_root}" && CARGO_TARGET_DIR="${target_dir}" cargo build "${jobs[@]}" -p openshell-cli)
   fi
   if [ -z "${conformance_override}" ]; then
+    require_clean_source "${variant}" "${source_root}"
     echo "Building ${variant} conformance CLI in ${target_dir}..."
     (cd "${source_root}" && CARGO_TARGET_DIR="${target_dir}" cargo build "${jobs[@]}" -p openshell-conformance-cli)
   fi
@@ -179,7 +203,7 @@ build_variant() {
 BASELINE_GATEWAY="" BASELINE_CLI="" BASELINE_CONFORMANCE=""
 CANDIDATE_GATEWAY="" CANDIDATE_CLI="" CANDIDATE_CONFORMANCE=""
 build_variant baseline "${BASELINE_WORKTREE}" "${OPENSHELL_PARITY_BASELINE_CARGO_TARGET_DIR:-}" "${OPENSHELL_PARITY_BASELINE_GATEWAY_BIN:-}" "${OPENSHELL_PARITY_BASELINE_CLI_BIN:-}" "${OPENSHELL_PARITY_BASELINE_CONFORMANCE_BIN:-}" BASELINE_GATEWAY BASELINE_CLI BASELINE_CONFORMANCE
-build_variant candidate "${ROOT}" "${OPENSHELL_PARITY_CANDIDATE_CARGO_TARGET_DIR:-}" "${OPENSHELL_PARITY_CANDIDATE_GATEWAY_BIN:-}" "${OPENSHELL_PARITY_CANDIDATE_CLI_BIN:-}" "${OPENSHELL_PARITY_CANDIDATE_CONFORMANCE_BIN:-}" CANDIDATE_GATEWAY CANDIDATE_CLI CANDIDATE_CONFORMANCE
+build_variant candidate "${CANDIDATE_WORKTREE}" "${OPENSHELL_PARITY_CANDIDATE_CARGO_TARGET_DIR:-}" "${OPENSHELL_PARITY_CANDIDATE_GATEWAY_BIN:-}" "${OPENSHELL_PARITY_CANDIDATE_CLI_BIN:-}" "${OPENSHELL_PARITY_CANDIDATE_CONFORMANCE_BIN:-}" CANDIDATE_GATEWAY CANDIDATE_CLI CANDIDATE_CONFORMANCE
 
 BASELINE_GATEWAY_ORIGIN=built_by_harness
 BASELINE_CLI_ORIGIN=built_by_harness
@@ -205,6 +229,7 @@ build_external_driver() {
   case "${target_dir}" in /*) ;; *) target_dir="${ROOT}/${target_dir}" ;; esac
   binary="${override:-${target_dir}/debug/openshell-driver-podman}"
   if [ -z "${override}" ]; then
+    require_clean_source "${variant}" "${source_root}"
     echo "Building ${variant} external Podman driver in ${target_dir}..."
     (cd "${source_root}" && CARGO_TARGET_DIR="${target_dir}" cargo build -p openshell-driver-podman --bin openshell-driver-podman)
   fi
@@ -222,7 +247,7 @@ if [ "${SCENARIO}" = external-driver ]; then
   [ -z "${OPENSHELL_PARITY_CANDIDATE_EXTERNAL_DRIVER_BIN:-}" ] || CANDIDATE_EXTERNAL_DRIVER_ORIGIN=supplied_override
 fi
 build_external_driver baseline "${BASELINE_WORKTREE}" "${OPENSHELL_PARITY_BASELINE_CARGO_TARGET_DIR:-}" "${OPENSHELL_PARITY_BASELINE_EXTERNAL_DRIVER_BIN:-}" BASELINE_EXTERNAL_DRIVER
-build_external_driver candidate "${ROOT}" "${OPENSHELL_PARITY_CANDIDATE_CARGO_TARGET_DIR:-}" "${OPENSHELL_PARITY_CANDIDATE_EXTERNAL_DRIVER_BIN:-}" CANDIDATE_EXTERNAL_DRIVER
+build_external_driver candidate "${CANDIDATE_WORKTREE}" "${OPENSHELL_PARITY_CANDIDATE_CARGO_TARGET_DIR:-}" "${OPENSHELL_PARITY_CANDIDATE_EXTERNAL_DRIVER_BIN:-}" CANDIDATE_EXTERNAL_DRIVER
 if [ "${SCENARIO}" = external-driver ]; then
   baseline_external_realpath="$(realpath "${BASELINE_EXTERNAL_DRIVER}")"
   candidate_external_realpath="$(realpath "${CANDIDATE_EXTERNAL_DRIVER}")"
