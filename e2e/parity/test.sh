@@ -195,7 +195,7 @@ assert_contains "${WORKDIR}/results/baseline.json" '"external_driver_origin":"su
 assert_contains "${WORKDIR}/results/baseline.launch.json" '"compute_driver_transport":"remote_uds"'
 assert_contains "${WORKDIR}/results/baseline.launch.json" '"external_driver_pull_policy":"missing"'
 assert_contains "${WORKDIR}/results/baseline.launch.json" '"supervisor_image_digest":"sha256:'
-assert_contains "${WORKDIR}/results/baseline.launch.json" '"supervisor_runtime_image":"openshell/supervisor:parity-baseline-'
+assert_contains "${WORKDIR}/results/baseline.launch.json" '"supervisor_runtime_image":"localhost/openshell/supervisor:parity-baseline-'
 assert_contains "${WORKDIR}/results/candidate.launch.json" '"external_driver_pull_policy":"if_not_present"'
 assert_contains "${WORKDIR}/results/baseline.json" '"gateway_sha256"'
 assert_contains "${WORKDIR}/results/baseline.json" '"cli_sha256"'

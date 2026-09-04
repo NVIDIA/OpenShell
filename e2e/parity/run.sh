@@ -409,7 +409,7 @@ run_variant() {
   local variant=$1 source_sha=$2 schema=$3 gateway=$4 cli=$5 conformance=$6 external_driver=$7 supervisor=$8 supervisor_dockerfile=$9
   local gateway_digest=${10} cli_digest=${11} conformance_digest=${12} external_driver_digest=${13} supervisor_digest=${14} supervisor_dockerfile_digest=${15}
   local result_status variant_home="${RUN_DIR}/${variant}"
-  local supervisor_image="openshell/supervisor:parity-${variant}-${source_sha:0:12}"
+  local supervisor_image="localhost/openshell/supervisor:parity-${variant}-${source_sha:0:12}"
   mkdir -p "${variant_home}/config" "${variant_home}/state" "${variant_home}/cache" "${variant_home}/data"
   echo "==> schema parity ${variant} (schema v${schema}, ${DRIVER}, ${SCENARIO})"
   local option_profile=""
