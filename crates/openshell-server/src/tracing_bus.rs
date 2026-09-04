@@ -18,6 +18,7 @@ use tracing_subscriber::layer::Context;
 pub struct TracingLogBus {
     inner: Arc<Mutex<Inner>>,
     pub(crate) platform_event_bus: PlatformEventBus,
+    seq: SeqAllocator,
 }
 
 #[derive(Debug)]
@@ -29,7 +30,49 @@ struct Inner {
 struct PerSandbox {
     sender: broadcast::Sender<SandboxStreamEvent>,
     tail: VecDeque<(u64, SandboxStreamEvent)>,
-    next_seq: u64,
+}
+
+impl PerSandbox {
+    fn new() -> Self {
+        let (tx, _rx) = broadcast::channel(1024);
+        Self {
+            sender: tx,
+            tail: VecDeque::new(),
+        }
+    }
+}
+
+/// Per-sandbox monotonic sequence allocator.
+///
+/// Shared across the resumable buses (`TracingLogBus`, `PlatformEventBus`) so
+/// cursors are unique and strictly ordered within a single sandbox's merged
+/// stream. Stamping at publish time keeps tail cursors stable across client
+/// reconnects, which is what a single `resume_after_cursor` needs.
+#[derive(Debug, Clone, Default)]
+struct SeqAllocator {
+    inner: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+impl SeqAllocator {
+    /// Return the next sequence number for this sandbox.
+    ///
+    /// Seq starts at 1 so the proto default `resume_after_cursor` (0) means
+    /// "from the beginning" without skipping event 1.
+    fn next(&self, sandbox_id: &str) -> u64 {
+        let mut counters = self.inner.lock().expect("seq allocator lock poisoned");
+        let counter = counters.entry(sandbox_id.to_string()).or_insert(1);
+        let seq = *counter;
+        *counter += 1;
+        seq
+    }
+
+    /// Drop the counter for a sandbox once its buses are torn down.
+    fn remove(&self, sandbox_id: &str) {
+        self.inner
+            .lock()
+            .expect("seq allocator lock poisoned")
+            .remove(sandbox_id);
+    }
 }
 
 impl Default for TracingLogBus {
@@ -41,11 +84,15 @@ impl Default for TracingLogBus {
 impl TracingLogBus {
     #[must_use]
     pub fn new() -> Self {
+        // One allocator, shared with the platform event bus so both draw from
+        // a single per-sandbox cursor space.
+        let seq = SeqAllocator::default();
         Self {
             inner: Arc::new(Mutex::new(Inner {
-                per_id: HashMap::<String, PerSandbox>::new(),
+                per_id: HashMap::new(),
             })),
-            platform_event_bus: PlatformEventBus::new(),
+            platform_event_bus: PlatformEventBus::new(seq.clone()),
+            seq,
         }
     }
 
@@ -61,16 +108,7 @@ impl TracingLogBus {
         inner
             .per_id
             .entry(sandbox_id.to_string())
-            .or_insert_with(|| {
-                let (tx, _rx) = broadcast::channel(1024);
-                PerSandbox {
-                    sender: tx,
-                    tail: VecDeque::new(),
-                    // Seq starts at 1 so the proto default resume_after_cursor
-                    // (0) means "from the beginning" without skipping event 1.
-                    next_seq: 1,
-                }
-            })
+            .or_insert_with(PerSandbox::new)
             .sender
             .clone()
     }
@@ -86,6 +124,8 @@ impl TracingLogBus {
     pub fn remove(&self, sandbox_id: &str) {
         let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
         inner.per_id.remove(sandbox_id);
+        drop(inner);
+        self.seq.remove(sandbox_id);
     }
 
     pub fn tail(&self, sandbox_id: &str, max: usize) -> Vec<SandboxStreamEvent> {
@@ -126,20 +166,22 @@ impl TracingLogBus {
     /// Default tail buffer capacity (lines per sandbox).
     const DEFAULT_TAIL: usize = 2000;
 
-    fn publish(&self, sandbox_id: &str, event: SandboxStreamEvent, tail_cap: usize) {
-        let tx = self.sender_for(sandbox_id);
-        let _ = tx.send(event.clone());
+    fn publish(&self, sandbox_id: &str, mut event: SandboxStreamEvent, tail_cap: usize) {
+        // Allocate the cursor first; next() takes and releases its own lock
+        // before we lock `inner`, so the two locks are never nested.
+        let seq = self.seq.next(sandbox_id);
+        event.cursor = seq;
 
         let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
-        let per_sandbox = inner
+        let per = inner
             .per_id
-            .get_mut(sandbox_id)
-            .expect("sender_for inserted the entry above");
-        let seq = per_sandbox.next_seq;
-        per_sandbox.next_seq += 1;
-        per_sandbox.tail.push_back((seq, event));
-        while per_sandbox.tail.len() > tail_cap {
-            per_sandbox.tail.pop_front();
+            .entry(sandbox_id.to_string())
+            .or_insert_with(PerSandbox::new);
+
+        let _ = per.sender.send(event.clone());
+        per.tail.push_back((seq, event));
+        while per.tail.len() > tail_cap {
+            per.tail.pop_front();
         }
     }
 }
@@ -305,7 +347,7 @@ mod tests {
 
     #[test]
     fn platform_event_bus_remove_cleans_up() {
-        let bus = PlatformEventBus::new();
+        let bus = PlatformEventBus::new(SeqAllocator::default());
         let sandbox_id = "sb-4";
 
         let mut rx = bus.subscribe(sandbox_id);
@@ -330,7 +372,7 @@ mod tests {
 
     #[test]
     fn platform_event_bus_subscribe_after_remove_creates_fresh_channel() {
-        let bus = PlatformEventBus::new();
+        let bus = PlatformEventBus::new(SeqAllocator::default());
         let sandbox_id = "sb-5";
 
         let _old_rx = bus.subscribe(sandbox_id);
@@ -348,7 +390,7 @@ mod tests {
 
     #[test]
     fn platform_event_bus_remove_nonexistent_is_noop() {
-        let bus = PlatformEventBus::new();
+        let bus = PlatformEventBus::new(SeqAllocator::default());
         // Should not panic
         bus.remove("nonexistent");
     }
@@ -357,7 +399,7 @@ mod tests {
     fn platform_event_bus_tail_returns_buffered_events() {
         use openshell_core::proto::{PlatformEvent, sandbox_stream_event};
 
-        let bus = PlatformEventBus::new();
+        let bus = PlatformEventBus::new(SeqAllocator::default());
         let sandbox_id = "sb-6";
 
         // Publish some events
@@ -402,14 +444,14 @@ mod tests {
 
     #[test]
     fn platform_event_bus_tail_empty_sandbox() {
-        let bus = PlatformEventBus::new();
+        let bus = PlatformEventBus::new(SeqAllocator::default());
         let events = bus.tail("nonexistent", 10);
         assert!(events.is_empty());
     }
 
     #[test]
     fn platform_event_bus_remove_clears_tail() {
-        let bus = PlatformEventBus::new();
+        let bus = PlatformEventBus::new(SeqAllocator::default());
         let sandbox_id = "sb-7";
 
         let evt = SandboxStreamEvent {
@@ -429,13 +471,8 @@ mod tests {
 /// This keeps platform events isolated from tracing capture.
 #[derive(Debug, Clone)]
 pub(crate) struct PlatformEventBus {
-    inner: Arc<Mutex<PlatformEventBusInner>>,
-}
-
-#[derive(Debug)]
-struct PlatformEventBusInner {
-    senders: HashMap<String, broadcast::Sender<SandboxStreamEvent>>,
-    tails: HashMap<String, VecDeque<SandboxStreamEvent>>,
+    inner: Arc<Mutex<Inner>>,
+    seq: SeqAllocator,
 }
 
 impl PlatformEventBus {
@@ -443,24 +480,24 @@ impl PlatformEventBus {
     /// Platform events are infrequent (typically 5-10 per sandbox lifecycle).
     const DEFAULT_TAIL: usize = 50;
 
-    fn new() -> Self {
+    /// Build a platform event bus sharing `seq` with its owning `TracingLogBus`
+    /// so both stamp cursors from the same per-sandbox sequence.
+    fn new(seq: SeqAllocator) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(PlatformEventBusInner {
-                senders: HashMap::new(),
-                tails: HashMap::new(),
+            inner: Arc::new(Mutex::new(Inner {
+                per_id: HashMap::new(),
             })),
+            seq,
         }
     }
 
     fn sender_for(&self, sandbox_id: &str) -> broadcast::Sender<SandboxStreamEvent> {
         let mut inner = self.inner.lock().expect("platform event bus lock poisoned");
         inner
-            .senders
+            .per_id
             .entry(sandbox_id.to_string())
-            .or_insert_with(|| {
-                let (tx, _rx) = broadcast::channel(1024);
-                tx
-            })
+            .or_insert_with(PerSandbox::new)
+            .sender
             .clone()
     }
 
@@ -468,15 +505,22 @@ impl PlatformEventBus {
         self.sender_for(sandbox_id).subscribe()
     }
 
-    pub(crate) fn publish(&self, sandbox_id: &str, event: SandboxStreamEvent) {
-        let tx = self.sender_for(sandbox_id);
-        let _ = tx.send(event.clone());
+    pub(crate) fn publish(&self, sandbox_id: &str, mut event: SandboxStreamEvent) {
+        // Allocate before locking `inner` (same non-nested lock order as
+        // TracingLogBus::publish).
+        let seq = self.seq.next(sandbox_id);
+        event.cursor = seq;
 
         let mut inner = self.inner.lock().expect("platform event bus lock poisoned");
-        let deque = inner.tails.entry(sandbox_id.to_string()).or_default();
-        deque.push_back(event);
-        while deque.len() > Self::DEFAULT_TAIL {
-            deque.pop_front();
+        let per = inner
+            .per_id
+            .entry(sandbox_id.to_string())
+            .or_insert_with(PerSandbox::new);
+
+        let _ = per.sender.send(event.clone());
+        per.tail.push_back((seq, event));
+        while per.tail.len() > Self::DEFAULT_TAIL {
+            per.tail.pop_front();
         }
     }
 
@@ -484,9 +528,16 @@ impl PlatformEventBus {
     pub(crate) fn tail(&self, sandbox_id: &str, max: usize) -> Vec<SandboxStreamEvent> {
         let inner = self.inner.lock().expect("platform event bus lock poisoned");
         inner
-            .tails
+            .per_id
             .get(sandbox_id)
-            .map(|d| d.iter().rev().take(max).cloned().collect::<Vec<_>>())
+            .map(|d| {
+                d.tail
+                    .iter()
+                    .rev()
+                    .take(max)
+                    .map(|(_seq, event)| event.clone())
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default()
             .into_iter()
             .rev()
@@ -499,7 +550,6 @@ impl PlatformEventBus {
     /// and frees the tail buffer.
     pub(crate) fn remove(&self, sandbox_id: &str) {
         let mut inner = self.inner.lock().expect("platform event bus lock poisoned");
-        inner.senders.remove(sandbox_id);
-        inner.tails.remove(sandbox_id);
+        inner.per_id.remove(sandbox_id);
     }
 }
