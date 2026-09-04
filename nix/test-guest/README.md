@@ -230,9 +230,25 @@ EOF
 `openshell-rpm` expects OpenShell to have been installed with `--install`. It
 uses the RPM-owned `/usr/bin` binaries and `openshell-gateway` user service,
 without copied development artifacts or a supervisor archive. Compose it with
-`gateway-podman` to start the installed version. The existing upgrade flow uses
-the same role with the rootless configuration before
-`openshell-rpm-gateway-upgrade`.
+`gateway-podman` to test the installed version directly.
+
+For example, run the current RPMs through rootful Podman conformance with:
+
+```shell
+nix run .#test-guest -- \
+  --distro fedora --with podman-rootful --with selinux \
+  --install ./openshell.rpm \
+  --install ./openshell-gateway.rpm \
+  --copy ./openshell-conformance:/tmp/openshell-conformance \
+  --copy nix/test-guest/conformance-plans/gateway-restart.toml:/tmp/conformance-plan.toml \
+  --provision openshell-rpm \
+  --provision gateway-podman \
+  -- /home/openshell/.local/bin/openshell-test-guest-as-gateway-user \
+    /tmp/openshell-conformance run --plan /tmp/conformance-plan.toml
+```
+
+Use `podman-rootless` for the equivalent rootless run. All copied binaries and
+RPMs must match the guest architecture.
 
 `openshell-rpm-latest-release` downloads and installs the latest stable
 OpenShell GitHub release for the guest architecture, then publishes the same
@@ -243,6 +259,10 @@ Versioned plans under `nix/test-guest/conformance-plans/` bind conformance
 scenarios to the stable action-command contracts installed by provisioners.
 Copy the applicable plan to the guest and pass it to `openshell-conformance run
 --plan`.
+
+`gateway-restart.toml` tests the installed version with smoke coverage and
+sandbox continuity across a gateway restart. `gateway-upgrade-restart.toml`
+retains the upgrade action contract for dedicated upgrade testing.
 
 ## Prepared VM cache
 
