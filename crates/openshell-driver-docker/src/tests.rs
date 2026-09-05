@@ -3202,6 +3202,13 @@ fn lifecycle_fence_rejects_polled_exit_from_before_restart() {
     fences.finish_start("sandbox-1");
     assert!(!fences.start_in_progress("sandbox-1"));
 
+    fences.request_stop("sandbox-1", "demo");
+    assert!(fences.stop_requested("sandbox-1", ""));
+    assert!(fences.stop_requested("", "demo"));
+    fences.clear_stop("sandbox-1", "demo");
+    assert!(!fences.stop_requested("sandbox-1", "demo"));
+    fences.request_stop("sandbox-1", "demo");
+
     fences.record_previous_exit("sandbox-1", Some("2026-08-12T16:39:13Z"));
     assert_eq!(
         fences.previous_exit("sandbox-1").as_deref(),
@@ -3236,8 +3243,10 @@ fn lifecycle_fence_rejects_polled_exit_from_before_restart() {
         Some(&new_exit),
     ));
 
-    fences.remove("sandbox-1");
+    fences.remove("sandbox-1", "demo");
     assert!(fences.previous_exit("sandbox-1").is_none());
+    assert!(!fences.stop_requested("sandbox-1", ""));
+    assert!(!fences.stop_requested("", "demo"));
 }
 
 fn exited_sandbox_with_ready_reason(reason: &str) -> DriverSandbox {

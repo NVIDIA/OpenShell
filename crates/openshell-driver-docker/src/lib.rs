@@ -302,6 +302,7 @@ struct DockerLifecycleEventFences {
 struct DockerLifecycleFenceState {
     previous_finished_at: HashMap<String, String>,
     starts_in_progress: HashSet<String>,
+    stops_requested: HashSet<String>,
 }
 
 impl DockerLifecycleEventFences {
@@ -327,6 +328,46 @@ impl DockerLifecycleEventFences {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .starts_in_progress
             .contains(sandbox_id)
+    }
+
+    fn request_stop(&self, sandbox_id: &str, sandbox_name: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !sandbox_id.is_empty() {
+            state.stops_requested.insert(format!("id:{sandbox_id}"));
+        }
+        if !sandbox_name.is_empty() {
+            state.stops_requested.insert(format!("name:{sandbox_name}"));
+        }
+    }
+
+    fn clear_stop(&self, sandbox_id: &str, sandbox_name: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !sandbox_id.is_empty() {
+            state.stops_requested.remove(&format!("id:{sandbox_id}"));
+        }
+        if !sandbox_name.is_empty() {
+            state
+                .stops_requested
+                .remove(&format!("name:{sandbox_name}"));
+        }
+    }
+
+    fn stop_requested(&self, sandbox_id: &str, sandbox_name: &str) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (!sandbox_id.is_empty() && state.stops_requested.contains(&format!("id:{sandbox_id}")))
+            || (!sandbox_name.is_empty()
+                && state
+                    .stops_requested
+                    .contains(&format!("name:{sandbox_name}")))
     }
 
     fn record_previous_exit(&self, sandbox_id: &str, finished_at: Option<&str>) {
@@ -355,13 +396,17 @@ impl DockerLifecycleEventFences {
             .cloned()
     }
 
-    fn remove(&self, sandbox_id: &str) {
+    fn remove(&self, sandbox_id: &str, sandbox_name: &str) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.previous_finished_at.remove(sandbox_id);
         state.starts_in_progress.remove(sandbox_id);
+        state.stops_requested.remove(&format!("id:{sandbox_id}"));
+        state
+            .stops_requested
+            .remove(&format!("name:{sandbox_name}"));
     }
 }
 
@@ -1526,6 +1571,16 @@ impl DockerComputeDriver {
         {
             Ok(control) => control,
             Err(status) => {
+                if self
+                    .lifecycle_event_fences
+                    .stop_requested(&sandbox.id, &sandbox.name)
+                {
+                    debug!(
+                        sandbox_id = %sandbox.id,
+                        "Ignoring Docker supervisor startup interruption after an explicit stop"
+                    );
+                    return span_status.finish(Ok(()));
+                }
                 let _ = self
                     .docker
                     .remove_container(
@@ -1542,6 +1597,17 @@ impl DockerComputeDriver {
                 ));
             }
         };
+        if self
+            .lifecycle_event_fences
+            .stop_requested(&sandbox.id, &sandbox.name)
+        {
+            stop_docker_control_process(control).await;
+            debug!(
+                sandbox_id = %sandbox.id,
+                "Discarded Docker supervisor that became ready after an explicit stop"
+            );
+            return span_status.finish(Ok(()));
+        }
         self.replace_control_process(&sandbox.id, control).await;
         self.publish_docker_progress(
             &sandbox.id,
@@ -2038,6 +2104,8 @@ impl DockerComputeDriver {
     ) -> Result<bool, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         require_sandbox_identifier(sandbox_id, sandbox_name)?;
+        self.lifecycle_event_fences
+            .clear_stop(sandbox_id, sandbox_name);
         self.lifecycle_event_fences.begin_start(sandbox_id);
         let result =
             Box::pin(self.start_sandbox_with_lifecycle_fence(sandbox_id, sandbox_name)).await;
@@ -2962,10 +3030,24 @@ impl ComputeDriver for DockerComputeDriver {
         let request = request.into_inner();
         require_sandbox_identifier(&request.sandbox_id, &request.sandbox_name)?;
 
-        self.stop_sandbox_inner(&request.sandbox_id, &request.sandbox_name)
-            .await?;
-        self.publish_container_snapshot(&request.sandbox_id, &request.sandbox_name)
-            .await?;
+        self.lifecycle_event_fences
+            .request_stop(&request.sandbox_id, &request.sandbox_name);
+        if let Err(error) = self
+            .stop_sandbox_inner(&request.sandbox_id, &request.sandbox_name)
+            .await
+        {
+            self.lifecycle_event_fences
+                .clear_stop(&request.sandbox_id, &request.sandbox_name);
+            return Err(error);
+        }
+        if let Err(error) = self
+            .publish_container_snapshot(&request.sandbox_id, &request.sandbox_name)
+            .await
+        {
+            self.lifecycle_event_fences
+                .clear_stop(&request.sandbox_id, &request.sandbox_name);
+            return Err(error);
+        }
         span_status.finish(Ok(Response::new(StopSandboxResponse {})))
     }
 
@@ -3010,7 +3092,8 @@ impl ComputeDriver for DockerComputeDriver {
         let deleted = self
             .delete_sandbox_inner(&request.sandbox_id, &request.sandbox_name)
             .await?;
-        self.lifecycle_event_fences.remove(&event_sandbox_id);
+        self.lifecycle_event_fences
+            .remove(&event_sandbox_id, &request.sandbox_name);
         if deleted && !event_sandbox_id.is_empty() {
             let _ = self.events.send(WatchSandboxesEvent {
                 payload: Some(watch_sandboxes_event::Payload::Deleted(
