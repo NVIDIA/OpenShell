@@ -162,15 +162,15 @@ alpha called with path /:
   sub: demo-user
   aud: alpha, account
   scope: alpha profile email
-  azp: spiffe://openshell.local/openshell/sandbox/<sandbox-id>
-  client_id: spiffe://openshell.local/openshell/sandbox/<sandbox-id>
+  azp: spiffe://openshell.local/openshell/sandbox/<namespace>.<pod-name>.<sandbox-id>
+  client_id: spiffe://openshell.local/openshell/sandbox/<namespace>.<pod-name>.<sandbox-id>
 
 beta called with path /:
   sub: demo-user
   aud: beta, account
   scope: beta profile email
-  azp: spiffe://openshell.local/openshell/sandbox/<sandbox-id>
-  client_id: spiffe://openshell.local/openshell/sandbox/<sandbox-id>
+  azp: spiffe://openshell.local/openshell/sandbox/<namespace>.<pod-name>.<sandbox-id>
+  client_id: spiffe://openshell.local/openshell/sandbox/<namespace>.<pod-name>.<sandbox-id>
 ```
 
 The token issuer logs both token exchange phases:
@@ -182,9 +182,9 @@ KUBECONFIG="$DEMO_KUBECONFIG" kubectl -n default logs deployment/token-exchange-
 Example log lines:
 
 ```text
-issued intermediate token for user=demo-user audience=spiffe://openshell.local/openshell/sandbox/<sandbox-id>
-issued final token for user=demo-user audience=alpha client=spiffe://openshell.local/openshell/sandbox/<sandbox-id>
-issued final token for user=demo-user audience=beta client=spiffe://openshell.local/openshell/sandbox/<sandbox-id>
+issued intermediate token for user=demo-user audience=spiffe://openshell.local/openshell/sandbox/<namespace>.<pod-name>.<sandbox-id>
+issued final token for user=demo-user audience=alpha client=spiffe://openshell.local/openshell/sandbox/<namespace>.<pod-name>.<sandbox-id>
+issued final token for user=demo-user audience=beta client=spiffe://openshell.local/openshell/sandbox/<namespace>.<pod-name>.<sandbox-id>
 ```
 
 ## Automated Demo
