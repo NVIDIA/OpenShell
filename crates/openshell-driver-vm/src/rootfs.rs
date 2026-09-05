@@ -1523,6 +1523,13 @@ mod tests {
 
     #[test]
     fn recover_rootfs_image_accepts_clean_ext4_image() {
+        if !e2fs_tool_candidates("e2fsck")
+            .iter()
+            .any(|candidate| Command::new(candidate).arg("-V").output().is_ok())
+        {
+            return;
+        }
+
         let dir = unique_temp_dir();
         let source = dir.join("source");
         let image = dir.join("overlay.ext4");
