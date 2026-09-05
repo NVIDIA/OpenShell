@@ -315,11 +315,11 @@ func TestSandboxCreate(t *testing.T) {
 		"default",
 		"my-sandbox",
 		spec,
-		labels,
-		CreateOptions{ServiceExposures: []ServiceExposure{
-			{TargetPort: 4500},
-			{Service: "metrics", TargetPort: 9090},
-		}},
+		WithLabels(labels),
+		WithServiceExposures(
+			ServiceExposure{TargetPort: 4500},
+			ServiceExposure{Service: "metrics", TargetPort: 9090},
+		),
 	)
 
 	require.NoError(t, err)
@@ -337,6 +337,43 @@ func TestSandboxCreate(t *testing.T) {
 	assert.Equal(t, "metrics", mock.createRequest.GetServiceExposures()[1].GetService())
 }
 
+func TestSandboxCreate_WithAnnotations(t *testing.T) {
+	mock := newMockSandboxServer()
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	annotations := map[string]string{"purpose": "ci-test"}
+	result, err := client.Create(context.Background(), "default", "ann-sandbox", &SandboxSpec{}, WithAnnotations(annotations))
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	require.NotNil(t, mock.createRequest)
+	assert.Equal(t, map[string]string{"purpose": "ci-test"}, mock.createRequest.Annotations)
+}
+
+func TestSandboxCreate_WithLabelsAndAnnotations(t *testing.T) {
+	mock := newMockSandboxServer()
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	labels := map[string]string{"env": "staging"}
+	annotations := map[string]string{"owner": "team-a"}
+	result, err := client.Create(context.Background(), "default", "both-sandbox", &SandboxSpec{},
+		WithLabels(labels), WithAnnotations(annotations))
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	require.NotNil(t, mock.createRequest)
+	assert.Equal(t, map[string]string{"env": "staging"}, mock.createRequest.Labels)
+	assert.Equal(t, map[string]string{"owner": "team-a"}, mock.createRequest.Annotations)
+}
+
 func TestSandboxCreate_DefaultGPURequest(t *testing.T) {
 	mock := newMockSandboxServer()
 	client, cleanup := setupSandboxTest(t, mock)
@@ -344,7 +381,7 @@ func TestSandboxCreate_DefaultGPURequest(t *testing.T) {
 
 	result, err := client.Create(context.Background(), "default", "gpu-sandbox", &SandboxSpec{
 		GPU: true,
-	}, nil)
+	})
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -367,7 +404,7 @@ func TestSandboxCreate_RejectsUnrepresentableResourcesBeforeRPC(t *testing.T) {
 
 	_, err := client.Create(context.Background(), "default", "bad", &SandboxSpec{
 		Template: &SandboxTemplate{Resources: map[string]any{"invalid": make(chan int)}},
-	}, nil)
+	})
 	require.Error(t, err)
 	assert.True(t, IsInvalidArgument(err))
 	mock.mu.Lock()
@@ -382,7 +419,7 @@ func TestSandboxCreateFromTemplateRejectsGPUOverrideBeforeRPC(t *testing.T) {
 
 	_, err := client.CreateFromTemplate(context.Background(), "default", "bad", "gpu-kata", &SandboxSpec{
 		GPU: true,
-	}, nil)
+	})
 
 	require.Error(t, err)
 	assert.True(t, IsInvalidArgument(err))
@@ -400,7 +437,7 @@ func TestSandboxCreateFromTemplateSendsCommandAndTTY(t *testing.T) {
 		Providers: []string{"github"},
 		Command:   []string{"/opt/worker", "--serve"},
 		TTY:       true,
-	}, map[string]string{"team": "runtime"})
+	}, WithLabels(map[string]string{"team": "runtime"}))
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -422,7 +459,7 @@ func TestSandboxCreate_AlreadyExists(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	_, err := client.Create(context.Background(), "default", "dup", &SandboxSpec{}, nil)
+	_, err := client.Create(context.Background(), "default", "dup", &SandboxSpec{})
 
 	require.Error(t, err)
 	assert.True(t, IsAlreadyExists(err))

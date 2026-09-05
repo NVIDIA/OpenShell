@@ -18,7 +18,7 @@ func TestMyOperator(t *testing.T) {
     ctx := context.Background()
 
     // Use client exactly like the real SDK
-    sb, err := client.Sandboxes().Create(ctx, "default", "test-sandbox", &v1.SandboxSpec{}, nil)
+    sb, err := client.Sandboxes().Create(ctx, "default", "test-sandbox", &v1.SandboxSpec{})
     require.NoError(t, err)
     assert.Equal(t, "Provisioning", string(sb.Status.Phase))
 }
@@ -79,7 +79,7 @@ client := fake.NewClient()
 ctx := context.Background()
 
 // Create starts in Provisioning
-sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{}, nil)
+sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{})
 assert.Equal(t, types.SandboxProvisioning, sb.Status.Phase)
 
 // WaitReady transitions to Ready (synchronous in fake)
@@ -109,7 +109,7 @@ require.NoError(t, err)
 defer watcher.Stop()
 
 // Create a sandbox — triggers an ADDED event
-client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{}, nil)
+client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{})
 
 // Read the event from the channel
 event := <-watcher.ResultChan()
@@ -128,7 +128,7 @@ watcher, err := client.Sandboxes().Watch(ctx, "default", "my-sandbox", v1.WatchO
 require.NoError(t, err)
 
 // Create and transition to Ready
-client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{}, nil)
+client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{})
 client.Sandboxes().WaitReady(ctx, "default", "my-sandbox")
 
 // Drain events — channel closes after the Ready event

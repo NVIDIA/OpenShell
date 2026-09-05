@@ -5,11 +5,60 @@ package types
 
 import "time"
 
-// CreateOptions configures resource creation.
-type CreateOptions struct {
-	Annotations map[string]string
-	// ServiceExposures are loopback HTTP services registered with the sandbox.
-	ServiceExposures []ServiceExposure
+// createConfig holds configuration for Create calls.
+type createConfig struct {
+	labels           map[string]string
+	annotations      map[string]string
+	serviceExposures []ServiceExposure
+}
+
+// CreateOption configures a Create call.
+type CreateOption func(*createConfig)
+
+// WithLabels sets labels on the created resource.
+func WithLabels(labels map[string]string) CreateOption {
+	return func(c *createConfig) {
+		c.labels = labels
+	}
+}
+
+// WithAnnotations sets annotations on the created resource.
+func WithAnnotations(annotations map[string]string) CreateOption {
+	return func(c *createConfig) {
+		c.annotations = annotations
+	}
+}
+
+// WithServiceExposures registers loopback HTTP services with the created
+// sandbox. Leave Service empty for the unnamed endpoint.
+func WithServiceExposures(exposures ...ServiceExposure) CreateOption {
+	return func(c *createConfig) {
+		c.serviceExposures = exposures
+	}
+}
+
+// ApplyCreateOptions applies options and returns the config.
+func ApplyCreateOptions(opts []CreateOption) createConfig { //nolint:revive // unexported return is intentional; consumed only by v1 package
+	var cfg createConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return cfg
+}
+
+// Labels returns the configured labels.
+func (c *createConfig) Labels() map[string]string {
+	return c.labels
+}
+
+// Annotations returns the configured annotations.
+func (c *createConfig) Annotations() map[string]string {
+	return c.annotations
+}
+
+// ServiceExposures returns the configured service exposures.
+func (c *createConfig) ServiceExposures() []ServiceExposure {
+	return c.serviceExposures
 }
 
 // ListOptions configures resource listing with pagination and filtering.

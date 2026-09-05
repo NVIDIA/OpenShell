@@ -19,7 +19,7 @@ func TestSandboxLifecycle(t *testing.T) {
 
     ctx := context.Background()
 
-    sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{}, nil)
+    sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{})
     require.NoError(t, err)
     assert.Equal(t, types.SandboxProvisioning, sb.Status.Phase)
 

@@ -68,7 +68,7 @@ Create a sandbox with a Python image:
     sandbox, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{
         Template: &v1.SandboxTemplate{Image: "python:3.12"},
         Environment: map[string]string{"LANG": "en_US.UTF-8"},
-    }, nil)
+    })
     if err != nil {
         log.Fatal(err)
     }
