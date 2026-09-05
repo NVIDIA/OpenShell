@@ -284,6 +284,30 @@ Domain objects use shared metadata: stable server-generated IDs, human-readable
 names, creation timestamps, and labels. Crate-level details live in
 `crates/openshell-core/README.md`.
 
+### Watch streams
+
+`WatchSandbox` merges three per-sandbox sources into one client stream: status
+snapshots, server/sandbox logs, and platform events. Logs and platform events
+are resumable; a shared per-sandbox counter stamps each with a monotonic
+`cursor` so the merged stream is linearly ordered across both sources. Status
+snapshots and warnings are re-read on demand and carry `cursor = 0`.
+
+The gateway holds a bounded in-memory tail per sandbox. Loss is reported with
+two distinct, documented behaviors:
+
+- **Recoverable lag** — a broadcast receiver falls behind and the server skips
+  ahead. The stream emits a `SandboxStreamWarning` event and continues; the
+  client sees the gap as a cursor discontinuity.
+- **Unrecoverable gap** — a reconnect requests `resume_after_cursor` below the
+  oldest buffered cursor (the tail has been trimmed past it). The server sends a
+  snapshot, then terminates the stream with `OUT_OF_RANGE` carrying the
+  requested and earliest-available cursors so the client can restart cleanly.
+
+On resume the server replays only events after the client's cursor from both
+resumable sources, merged in cursor order, before entering live delivery — no
+loss and no duplication. Clients track the highest observed `cursor` and pass it
+as `resume_after_cursor` on reconnect.
+
 ## Persistence
 
 The gateway persistence layer is a protobuf object store. Domain services store
