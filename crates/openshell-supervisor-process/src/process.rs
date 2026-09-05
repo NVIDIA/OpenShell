@@ -829,11 +829,11 @@ impl ProcessHandle {
             }
         }
 
-        // Set OTEL env vars so agent SDKs export to the supervisor's OTLP receiver
-        if netns_fd.is_some() {
-            for (key, value) in child_env::otel_env_vars("http://127.0.0.1:4318", "http/protobuf") {
-                cmd.env(key, value);
-            }
+        // Set OTEL env vars so agent SDKs export to the supervisor's OTLP receiver.
+        // The relay binds on 127.0.0.1:4318 inside the agent's network namespace
+        // (all current topologies keep the process supervisor co-located with the agent).
+        for (key, value) in child_env::otel_env_vars("http://127.0.0.1:4318", "http/protobuf") {
+            cmd.env(key, value);
         }
 
         // Probe Landlock availability and emit OCSF logs from the parent

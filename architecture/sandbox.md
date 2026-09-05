@@ -481,12 +481,24 @@ Agent process --> OTLP HTTP (127.0.0.1:4318) --> Supervisor receiver
 
 ### Receiver Binding
 
-The OTLP HTTP receiver always binds to `127.0.0.1:4318`. For Docker/Podman
-drivers where the supervisor creates a network namespace, the bind happens
-inside the namespace via `bind_tcp_in_netns()`. For Kubernetes and VM drivers,
-the supervisor and agent share the same network namespace, so a direct bind
-suffices. The receiver accepts both `application/x-protobuf` and
+The OTLP HTTP receiver binds to `127.0.0.1:4318` only when the relay is
+active (the gateway has `[openshell.gateway.otlp]` configured and confirms
+the `telemetry_relay` capability). When OTLP is not configured, no port is
+bound and no receiver runs.
+
+The bind address depends on the supervisor topology. In all current
+topologies, the process supervisor runs co-located with the agent workload,
+so `127.0.0.1` is reachable from the agent. For Docker/Podman drivers
+where the supervisor creates a network namespace, the bind happens inside
+the namespace via `bind_tcp_in_netns()`. For Kubernetes and VM drivers,
+the supervisor and agent share the same network namespace, so a direct
+bind suffices. The receiver accepts both `application/x-protobuf` and
 `application/json` content types.
+
+Future topologies where the process supervisor moves out of the workload
+pod would require the bind address and the `OTEL_EXPORTER_OTLP_ENDPOINT`
+env var to reflect the supervisor's reachable address from the agent's
+perspective (e.g., a service IP or pod IP).
 
 ### Span Enrichment
 
