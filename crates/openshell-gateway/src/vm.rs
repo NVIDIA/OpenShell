@@ -104,9 +104,8 @@ pub struct VmComputeConfig {
     /// for policy-approved TLS egress from VM sandboxes.
     ///
     /// Deployment-level configuration, not a per-sandbox setting: it is passed
-    /// to the driver, which puts it on the guest supervisor's argv. A proxy on
-    /// this host's loopback is reachable from a guest only through the gvproxy
-    /// host alias `host.openshell.internal`.
+    /// to the driver, which passes it to the host supervisor. The supervisor
+    /// resolves `host.openshell.internal` to host loopback.
     pub https_proxy: Option<String>,
 
     /// Comma-separated `NO_PROXY` list. Bypasses only the corporate proxy,

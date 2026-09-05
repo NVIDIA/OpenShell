@@ -17,7 +17,6 @@ let
         artifacts = [
           "libkrun.so"
           "libkrunfw.so.5"
-          "gvproxy"
           "umoci"
         ];
       };
@@ -27,7 +26,6 @@ let
         artifacts = [
           "libkrun.so"
           "libkrunfw.so.5"
-          "gvproxy"
           "umoci"
         ];
       };
@@ -37,7 +35,6 @@ let
         artifacts = [
           "libkrun.dylib"
           "libkrunfw.5.dylib"
-          "gvproxy"
           "umoci"
         ];
       };
@@ -59,7 +56,6 @@ stdenv.mkDerivation {
 
     mkdir -p "$out"
     tar --extract --file ${archive} --directory "$out"
-
     mkdir -p "$out/compressed"
     for artifact in ${lib.escapeShellArgs runtime.artifacts}; do
       zstd -19 -T1 "$out/$artifact" -o "$out/compressed/$artifact.zst"

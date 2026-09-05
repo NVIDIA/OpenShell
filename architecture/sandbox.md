@@ -320,11 +320,12 @@ file and builds the `Proxy-Authorization: Basic` header; a credential that is
 empty, contains control characters, or is not in `user:pass` form is fatal on
 both sides.
 
-The VM driver runs `openshell-supervisor` on the host. Corporate-proxy
-credentials, private CA keys, policy, and gateway credentials never enter the
-guest. The NIC-less guest reaches the host supervisor only through the
-authenticated vsock channel; the host supervisor performs DNS and upstream
-connections.
+The VM driver starts `openshell-supervisor` on the host and
+`openshell-sandbox` as capability-free guest PID 1. Corporate proxy arguments,
+credentials, private CA keys, policy, and gateway credentials stay host-side.
+Both libkrun and QEMU guests are NIC-less; intercepted workload connections
+cross the authenticated vsock channel. A gateway-host proxy is addressed as
+`host.openshell.internal`, which the host supervisor normalizes to `127.0.0.1`.
 
 The Docker driver runs `openshell-supervisor` in a separate companion container.
 Its private named volume contains supervisor bootstrap and channel material.

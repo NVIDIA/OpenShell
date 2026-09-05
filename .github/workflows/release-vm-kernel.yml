@@ -1,6 +1,6 @@
 name: Release VM Kernel
 
-# Build custom libkrunfw (kernel firmware) + libkrun (VMM) + gvproxy for all
+# Build custom libkrunfw (kernel firmware) + libkrun (VMM) for all
 # supported openshell-driver-vm platforms. Artifacts are uploaded to the
 # rolling "vm-runtime" GitHub Release and consumed by normal dev/tag release
 # workflows when building the openshell-driver-vm binary.
@@ -237,7 +237,7 @@ jobs:
 
             ### Kernel Runtime Artifacts
 
-            Pre-built kernel runtime (libkrunfw + libkrun + gvproxy + umoci) for embedding
+            Pre-built kernel runtime (libkrunfw + libkrun + umoci) for embedding
             into the `openshell-driver-vm` binary. These are rebuilt on demand when the
             kernel config or pinned dependency versions change.
 

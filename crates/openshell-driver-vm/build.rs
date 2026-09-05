@@ -3,13 +3,17 @@
 
 //! Build script for openshell-driver-vm.
 //!
-//! This crate embeds the sandbox supervisor plus the minimal libkrun runtime
+//! This crate embeds the sandbox, host supervisor, and minimal libkrun runtime
 //! artifacts it needs to boot VMs without a separate VM runtime binary.
 
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 fn main() {
+    if env::var_os("CARGO_FEATURE_COMPUTE_DRIVER").is_none() {
+        return;
+    }
+
     println!("cargo:rerun-if-env-changed=OPENSHELL_VM_RUNTIME_COMPRESSED_DIR");
 
     if let Ok(dir) = env::var("OPENSHELL_VM_RUNTIME_COMPRESSED_DIR") {
@@ -19,8 +23,8 @@ fn main() {
             "libkrunfw.so.5.zst",
             "libkrun.dylib.zst",
             "libkrunfw.5.dylib.zst",
-            "gvproxy.zst",
             "openshell-sandbox.zst",
+            "openshell-supervisor.zst",
             "umoci.zst",
         ] {
             println!("cargo:rerun-if-changed={dir}/{name}");
@@ -38,7 +42,14 @@ fn main() {
             println!("cargo:warning=VM runtime not available for {target_os}-{target_arch}");
             generate_stub_resources(
                 &out_dir,
-                &["libkrun", "libkrunfw", "openshell-sandbox.zst", "umoci.zst"],
+                &[
+                    "libkrun",
+                    "libkrunfw",
+                    "openshell-sandbox.zst",
+                    "openshell-supervisor.zst",
+                    "openshell-runtime.tar.zst",
+                    "umoci.zst",
+                ],
             );
             return;
         }
@@ -54,8 +65,9 @@ fn main() {
             &[
                 &format!("{libkrun_name}.zst"),
                 &format!("{libkrunfw_name}.zst"),
-                "gvproxy.zst",
                 "openshell-sandbox.zst",
+                "openshell-supervisor.zst",
+                "openshell-runtime.tar.zst",
                 "umoci.zst",
             ],
         );
@@ -74,10 +86,17 @@ fn main() {
             format!("{libkrunfw_name}.zst"),
             format!("{libkrunfw_name}.zst"),
         ),
-        ("gvproxy.zst".to_string(), "gvproxy.zst".to_string()),
         (
             "openshell-sandbox.zst".to_string(),
             "openshell-sandbox.zst".to_string(),
+        ),
+        (
+            "openshell-supervisor.zst".to_string(),
+            "openshell-supervisor.zst".to_string(),
+        ),
+        (
+            "openshell-runtime.tar.zst".to_string(),
+            "openshell-runtime.tar.zst".to_string(),
         ),
         ("umoci.zst".to_string(), "umoci.zst".to_string()),
     ];
