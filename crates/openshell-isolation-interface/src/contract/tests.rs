@@ -370,9 +370,48 @@ fn confirmation_evidence() -> SandboxConfirmEvidence {
         tcp_deny_round_trip: true,
         authenticated_supervisor: true,
         session_epoch: "epoch-1".to_string(),
-        direct_egress_blocked: true,
+        driver_fence: DriverFenceEvidence::Vm {
+            generation: "generation-1".to_string(),
+            network_device_count: 0,
+        },
         resource_claims: BTreeMap::new(),
     }
+}
+
+#[test]
+fn driver_fence_evidence_is_backend_specific_and_fail_closed() {
+    let docker = DriverFenceEvidence::Docker {
+        container_id: "sha256:container".to_string(),
+        network_mode: "none".to_string(),
+        unexpected_networks: Vec::new(),
+    };
+    let kubernetes = DriverFenceEvidence::Kubernetes {
+        network_policy_uid: "policy-uid".to_string(),
+        network_policy_resource_version: "42".to_string(),
+        ingress_isolated: true,
+        egress_isolated: true,
+        egress_rule_count: 0,
+    };
+    let vm = DriverFenceEvidence::Vm {
+        generation: "generation-1".to_string(),
+        network_device_count: 0,
+    };
+
+    assert!(docker.validate_for_backend("docker").is_ok());
+    assert!(
+        kubernetes
+            .validate_for_backend("kubernetes-proxy-pod")
+            .is_ok()
+    );
+    assert!(vm.validate_for_backend("vm").is_ok());
+    assert!(docker.validate_for_backend("vm").is_err());
+
+    let drifted = DriverFenceEvidence::Docker {
+        container_id: "sha256:container".to_string(),
+        network_mode: "bridge".to_string(),
+        unexpected_networks: vec!["bridge".to_string()],
+    };
+    assert!(drifted.validate_for_backend("docker").is_err());
 }
 
 /// The backend-independent supervisor sequence. Identical for every backend:
@@ -727,7 +766,7 @@ fn workload_identity_rejects_root_and_normalizes_groups() {
     let identity = ResolvedWorkloadIdentity::new(
         1000,
         1001,
-        vec![1003, 1002, 1003],
+        vec![1003, 1001, 1002, 1003],
         "policy".into(),
         "digest".into(),
     )

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Denial aggregator — collects and deduplicates proxy deny events.
+//! Supervisor denial aggregator — collects and deduplicates proxy deny events.
 //!
 //! The proxy emits a [`DenialEvent`] each time a connection or request is
 //! denied. The [`DenialAggregator`] receives these events via an MPSC channel,

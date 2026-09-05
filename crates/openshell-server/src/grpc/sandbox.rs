@@ -298,7 +298,7 @@ async fn handle_create_sandbox_inner(
     };
 
     // Leave an omitted command empty rather than persisting a concrete shell:
-    // the supervisor resolves the default login shell against the sandbox image
+    // the sandbox boundary resolves the default login shell against the agent image
     // (bash when present, otherwise /bin/sh on minimal images like Alpine),
     // which the gateway cannot do since it does not see the sandbox filesystem.
     // The default is an interactive login shell, so request a TTY.
@@ -2207,10 +2207,7 @@ fn sandbox_relay_reachable(state: &ServerState, sandbox: &Sandbox) -> bool {
     let phase = SandboxPhase::try_from(sandbox.phase()).ok();
     matches!(phase, Some(SandboxPhase::Ready))
         || (matches!(phase, Some(SandboxPhase::Completed | SandboxPhase::Error))
-            && state.supervisor_sessions.has_session(sandbox.object_id())
-            && !state
-                .supervisor_sessions
-                .terminal_delivery_finalized(sandbox.object_id()))
+            && state.supervisor_sessions.has_session(sandbox.object_id()))
 }
 
 pub(super) async fn handle_create_ssh_session(
@@ -5814,6 +5811,9 @@ mod tests {
                 .supervisor_sessions
                 .finalize_main_process_exit("sandbox-work")
         );
+        assert!(sandbox_relay_reachable(&state, &sandbox));
+
+        assert!(state.supervisor_sessions.disconnect("sandbox-work"));
         assert!(!sandbox_relay_reachable(&state, &sandbox));
     }
 
@@ -6577,7 +6577,16 @@ mod tests {
 
         let mut sandbox = test_sandbox("cross-ws", Vec::new());
         sandbox.metadata.as_mut().unwrap().workspace = "other-workspace".to_string();
+        sandbox.set_phase(SandboxPhase::Completed as i32);
         state.store.put_message(&sandbox).await.unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        let _ = state.supervisor_sessions.register(
+            sandbox.object_id().to_string(),
+            "retained-terminal-session".to_string(),
+            tx,
+            shutdown_tx,
+        );
 
         // --- handle_watch_sandbox ---
         let err = handle_watch_sandbox(

@@ -1,32 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Process component of the `OpenShell` supervisor.
+//! Access-plane component of the `OpenShell` supervisor.
 //!
-//! Owns the entrypoint process spawn, SSH server, supervisor session, network
-//! namespace, bypass monitor, child environment construction, skills install,
-//! and log push. Populated by follow-up commits as modules migrate out of
-//! `openshell-sandbox`.
+//! Owns SSH access, retained canonical-process I/O, gateway supervisor
+//! sessions, skills, and log forwarding. Workload spawning and in-sandbox
+//! enforcement live exclusively in `openshell-sandbox`.
 
-pub mod boundary_exec;
-pub mod boundary_io;
-pub mod child_env;
 pub mod debug_rpc;
-#[cfg(unix)]
-pub mod identity;
+pub mod delegated;
 pub mod log_push;
 pub mod main_session;
-pub mod managed_children;
-pub mod process;
-pub mod run;
-pub mod sandbox;
 pub mod skills;
 pub mod ssh;
 pub mod supervisor_session;
 
 mod unix_socket;
-
-#[cfg(target_os = "linux")]
-pub mod bypass_monitor;
-#[cfg(target_os = "linux")]
-pub mod netns;

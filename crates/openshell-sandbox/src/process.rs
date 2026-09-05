@@ -6,33 +6,27 @@
 use crate::child_env;
 #[cfg(target_os = "linux")]
 use crate::managed_children;
-#[cfg(target_os = "linux")]
-use crate::netns::NetworkNamespace;
 use crate::sandbox;
 #[cfg(target_os = "linux")]
 use miette::WrapErr;
 use miette::{IntoDiagnostic, Result};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::{Gid, Group, Pid, Uid, User};
-use openshell_core::policy::{NetworkMode, SandboxPolicy};
+use openshell_core::policy::SandboxPolicy;
 use std::collections::HashMap;
 use std::ffi::CString;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-#[cfg(target_os = "linux")]
-use std::os::fd::RawFd;
-#[cfg(target_os = "linux")]
-use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(any(test, unix))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
-#[cfg(target_os = "linux")]
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tracing::{debug, info};
 
@@ -46,18 +40,6 @@ fn set_controlling_tty(fd: libc::c_int) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
-}
-
-/// Process/filesystem enforcement performed by the process supervisor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProcessEnforcementMode {
-    /// Preserve the existing supervisor behavior: prepare filesystem policy,
-    /// drop privileges, and apply Landlock/seccomp to workload processes.
-    Full,
-    /// Preserve process launch and SSH/session behavior, but skip controls
-    /// that require root or extra Linux capabilities. Kubernetes sidecar mode
-    /// uses this when network policy is enforced by the network sidecar.
-    NetworkOnly,
 }
 
 /// Numeric identity components resolved once from driver-owned metadata.
@@ -128,34 +110,43 @@ impl ResolvedWorkspace {
     }
 }
 
-impl ProcessEnforcementMode {
-    #[must_use]
-    pub const fn uses_privileged_process_setup(self) -> bool {
-        matches!(self, Self::Full)
-    }
-
-    #[must_use]
-    pub const fn enforces_child_sandbox(self) -> bool {
-        matches!(self, Self::Full | Self::NetworkOnly)
-    }
-}
-
 #[cfg(target_os = "linux")]
 pub(crate) fn prepare_child_sandbox(
     policy: &SandboxPolicy,
     workdir: Option<&str>,
-    enforcement_mode: ProcessEnforcementMode,
+    runtime_read_only: &[PathBuf],
 ) -> Result<Option<sandbox::linux::PreparedSandbox>> {
-    if !enforcement_mode.enforces_child_sandbox() {
-        return Ok(None);
-    }
-
-    let prepared = if enforcement_mode.uses_privileged_process_setup() {
-        sandbox::linux::prepare(policy, workdir)
-    } else {
-        sandbox::linux::prepare_current_user(policy, workdir)
-    }?;
+    let effective_policy = policy_with_runtime_read_only(policy, runtime_read_only);
+    let prepared = sandbox::linux::prepare_capability_free(&effective_policy, workdir)?;
     Ok(Some(prepared))
+}
+
+#[cfg(target_os = "linux")]
+fn policy_with_runtime_read_only(
+    policy: &SandboxPolicy,
+    runtime_read_only: &[PathBuf],
+) -> SandboxPolicy {
+    let mut effective_policy = policy.clone();
+    for path in runtime_read_only {
+        if !effective_policy.filesystem.read_only.contains(path) {
+            effective_policy.filesystem.read_only.push(path.clone());
+        }
+    }
+    effective_policy
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn ca_runtime_read_only_paths(ca_paths: Option<&(PathBuf, PathBuf)>) -> Vec<PathBuf> {
+    let Some((certificate, bundle)) = ca_paths else {
+        return Vec::new();
+    };
+    let mut paths = Vec::with_capacity(3);
+    if let Some(directory) = certificate.parent() {
+        paths.push(directory.to_path_buf());
+    }
+    paths.push(certificate.clone());
+    paths.push(bundle.clone());
+    paths
 }
 
 const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
@@ -172,6 +163,19 @@ const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
     openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
 ];
 
+const PROXY_ENV_VARS: &[&str] = &[
+    "ALL_PROXY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "grpc_proxy",
+    "NODE_USE_ENV_PROXY",
+];
+
 pub fn is_supervisor_only_env_var(key: &str) -> bool {
     SUPERVISOR_ONLY_ENV_VARS.contains(&key)
 }
@@ -180,6 +184,27 @@ fn strip_supervisor_only_env(cmd: &mut Command) {
     for key in SUPERVISOR_ONLY_ENV_VARS {
         cmd.env_remove(key);
     }
+}
+
+/// Remove ambient proxy routing from a transparently mediated child.
+pub fn strip_proxy_env(cmd: &mut Command) {
+    for key in PROXY_ENV_VARS {
+        cmd.env_remove(key);
+    }
+}
+
+/// [`strip_proxy_env`] for synchronous exec commands.
+pub fn strip_proxy_env_std(cmd: &mut std::process::Command) {
+    for key in PROXY_ENV_VARS {
+        cmd.env_remove(key);
+    }
+}
+
+/// Whether an environment key can redirect a child around transparent
+/// network mediation.
+#[must_use]
+pub fn is_proxy_env_var(key: &str) -> bool {
+    PROXY_ENV_VARS.contains(&key)
 }
 
 fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>) {
@@ -396,262 +421,52 @@ fn validate_capability_bounding_set_clear(
     }
 }
 
-// Pins the pre-seccomp child mount namespace where supervisor identity sockets
-// are shadowed. Children enter it with setns before dropping privileges.
 #[cfg(target_os = "linux")]
-static SUPERVISOR_IDENTITY_MOUNT_NS: OnceLock<Option<SupervisorIdentityMountNamespace>> =
-    OnceLock::new();
+static WORKLOAD_LAUNCHER: OnceLock<
+    openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+> = OnceLock::new();
 
+/// Install the sandbox-owned launcher that every later workload spawn must
+/// traverse. A second launcher would create a second listener generation and
+/// is therefore rejected.
 #[cfg(target_os = "linux")]
-pub struct SupervisorIdentityMountNamespace {
-    spawn_tx: mpsc::Sender<SupervisorIdentitySpawnJob>,
+pub fn configure_workload_launcher(
+    launcher: openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+) -> std::io::Result<()> {
+    WORKLOAD_LAUNCHER.set(launcher).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "workload launcher was already configured",
+        )
+    })
 }
 
 #[cfg(target_os = "linux")]
-type SupervisorIdentityNsRef = &'static SupervisorIdentityMountNamespace;
-#[cfg(target_os = "linux")]
-type SupervisorIdentitySpawnJob = Box<dyn FnOnce() + Send + 'static>;
-
-#[cfg(target_os = "linux")]
-impl SupervisorIdentityMountNamespace {
-    fn from_socket_path(socket_path: &str) -> Result<Option<Self>> {
-        let Some(target) = supervisor_identity_mount_target(socket_path)? else {
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            spawn_tx: start_supervisor_identity_spawn_worker(target)?,
-        }))
-    }
+pub fn spawn_command_with_workload_launcher(mut cmd: Command) -> std::io::Result<Child> {
+    let launcher = WORKLOAD_LAUNCHER.get().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "sandbox workload launcher is not configured",
+        )
+    })?;
+    let runtime = tokio::runtime::Handle::current();
+    launcher.execute(move || {
+        let _guard = runtime.enter();
+        cmd.spawn()
+    })?
 }
 
 #[cfg(target_os = "linux")]
-pub fn prepare_supervisor_identity_mount_namespace_from_env() -> Result<()> {
-    if SUPERVISOR_IDENTITY_MOUNT_NS.get().is_some() {
-        return Ok(());
-    }
-
-    let Some((_env_name, socket_path)) = supervisor_identity_socket_path_from_env() else {
-        let _ = SUPERVISOR_IDENTITY_MOUNT_NS.set(None);
-        return Ok(());
-    };
-    let namespace = SupervisorIdentityMountNamespace::from_socket_path(&socket_path)?;
-    let _ = SUPERVISOR_IDENTITY_MOUNT_NS.set(namespace);
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-pub fn supervisor_identity_mount_from_env() -> Result<Option<SupervisorIdentityNsRef>> {
-    let Some(namespace) = SUPERVISOR_IDENTITY_MOUNT_NS.get() else {
-        if supervisor_identity_socket_path_from_env().is_some() {
-            return Err(miette::miette!(
-                "supervisor identity mount namespace was not prepared before startup hardening"
-            ));
-        }
-        return Ok(None);
-    };
-    Ok(namespace.as_ref())
-}
-
-#[cfg(target_os = "linux")]
-pub fn spawn_command_with_supervisor_identity_namespace(
-    mut cmd: Command,
-) -> std::io::Result<Child> {
-    let namespace = supervisor_identity_mount_from_env()
-        .map_err(|err| std::io::Error::other(err.to_string()))?;
-    let Some(namespace) = namespace else {
-        return cmd.spawn();
-    };
-    namespace.spawn_tokio_command(cmd)
-}
-
-#[cfg(target_os = "linux")]
-pub fn spawn_std_command_with_supervisor_identity_namespace(
+pub fn spawn_std_command_with_workload_launcher(
     mut cmd: std::process::Command,
 ) -> std::io::Result<std::process::Child> {
-    let namespace = supervisor_identity_mount_from_env()
-        .map_err(|err| std::io::Error::other(err.to_string()))?;
-    let Some(namespace) = namespace else {
-        return cmd.spawn();
-    };
-    namespace.spawn_std_command(cmd)
-}
-
-#[cfg(target_os = "linux")]
-impl SupervisorIdentityMountNamespace {
-    fn spawn_tokio_command(&self, mut cmd: Command) -> std::io::Result<Child> {
-        let (result_tx, result_rx) = mpsc::channel();
-        let handle = tokio::runtime::Handle::current();
-        self.spawn_tx
-            .send(Box::new(move || {
-                let _guard = handle.enter();
-                let _ = result_tx.send(cmd.spawn());
-            }))
-            .map_err(|_| std::io::Error::other("supervisor identity spawn worker stopped"))?;
-        result_rx
-            .recv()
-            .map_err(|_| std::io::Error::other("supervisor identity spawn worker dropped result"))?
-    }
-
-    fn spawn_std_command(
-        &self,
-        mut cmd: std::process::Command,
-    ) -> std::io::Result<std::process::Child> {
-        let (result_tx, result_rx) = mpsc::channel();
-        self.spawn_tx
-            .send(Box::new(move || {
-                let _ = result_tx.send(cmd.spawn());
-            }))
-            .map_err(|_| std::io::Error::other("supervisor identity spawn worker stopped"))?;
-        result_rx
-            .recv()
-            .map_err(|_| std::io::Error::other("supervisor identity spawn worker dropped result"))?
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn start_supervisor_identity_spawn_worker(
-    target: PathBuf,
-) -> Result<mpsc::Sender<SupervisorIdentitySpawnJob>> {
-    let (spawn_tx, spawn_rx) = mpsc::channel::<SupervisorIdentitySpawnJob>();
-    let (ready_tx, ready_rx) = mpsc::channel::<std::io::Result<()>>();
-    std::thread::Builder::new()
-        .name("openshell-identity-spawn".into())
-        .spawn(move || {
-            let setup = (|| -> std::io::Result<()> {
-                private_mount_namespace()?;
-                let target =
-                    cstring_path(&target).map_err(|err| std::io::Error::other(err.to_string()))?;
-                mount_empty_tmpfs(&target)
-            })();
-            let ready = match &setup {
-                Ok(()) => Ok(()),
-                Err(err) => Err(std::io::Error::new(
-                    err.kind(),
-                    format!("supervisor identity setup failed: {err}"),
-                )),
-            };
-            let _ = ready_tx.send(ready);
-            if setup.is_err() {
-                return;
-            }
-            while let Ok(job) = spawn_rx.recv() {
-                job();
-            }
-        })
-        .map_err(|err| miette::miette!("failed to spawn supervisor identity worker: {err}"))?;
-    ready_rx
-        .recv()
-        .map_err(|err| miette::miette!("supervisor identity worker did not start: {err}"))?
-        .map_err(|err| miette::miette!("{err}"))?;
-    Ok(spawn_tx)
-}
-
-#[cfg(target_os = "linux")]
-fn supervisor_identity_socket_path_from_env() -> Option<(&'static str, String)> {
-    std::env::var(openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET)
-        .ok()
-        .filter(|socket_path| !socket_path.trim().is_empty())
-        .map(|socket_path| {
-            (
-                openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
-                socket_path,
-            )
-        })
-}
-
-#[cfg(any(test, target_os = "linux"))]
-fn supervisor_identity_mount_target(socket_path: &str) -> Result<Option<PathBuf>> {
-    let trimmed = socket_path.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    if trimmed.starts_with("tcp:") {
-        return Ok(None);
-    }
-    let path = trimmed.strip_prefix("unix:").unwrap_or(trimmed);
-    let path = Path::new(path);
-    if !path.is_absolute() {
-        return Err(miette::miette!(
-            "{} must be an absolute UNIX socket path",
-            openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET
-        ));
-    }
-    let Some(parent) = path.parent() else {
-        return Err(miette::miette!(
-            "{} has no parent directory",
-            openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET
-        ));
-    };
-    if parent == Path::new("/") {
-        return Err(miette::miette!(
-            "{} must live below a dedicated directory, not directly under /",
-            openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET
-        ));
-    }
-    if is_shared_root_mount_shadow(parent) {
-        return Err(miette::miette!(
-            "{} must live below a dedicated subdirectory; refusing to hide shared directory {}",
-            openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
-            parent.display()
-        ));
-    }
-    Ok(Some(parent.to_path_buf()))
-}
-
-#[cfg(any(test, target_os = "linux"))]
-fn is_shared_root_mount_shadow(parent: &Path) -> bool {
-    matches!(parent.to_str(), Some("/run" | "/var" | "/tmp" | "/etc"))
-}
-
-#[cfg(target_os = "linux")]
-fn cstring_path(path: &Path) -> Result<CString> {
-    CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| miette::miette!("path contains an interior NUL byte: {}", path.display()))
-}
-
-#[cfg(target_os = "linux")]
-fn private_mount_namespace() -> std::io::Result<()> {
-    #[allow(unsafe_code)]
-    let rc = unsafe { libc::unshare(libc::CLONE_NEWNS) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    #[allow(unsafe_code)]
-    let rc = unsafe {
-        let flags: libc::c_ulong = libc::MS_REC | libc::MS_PRIVATE;
-        libc::mount(
-            std::ptr::null(),
-            c"/".as_ptr(),
-            std::ptr::null(),
-            flags,
-            std::ptr::null(),
+    let launcher = WORKLOAD_LAUNCHER.get().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "sandbox workload launcher is not configured",
         )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn mount_empty_tmpfs(target: &CString) -> std::io::Result<()> {
-    #[allow(unsafe_code)]
-    let rc = unsafe {
-        let flags: libc::c_ulong =
-            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC | libc::MS_RDONLY;
-        libc::mount(
-            c"tmpfs".as_ptr(),
-            target.as_ptr(),
-            c"tmpfs".as_ptr(),
-            flags,
-            c"mode=0555,size=4k".as_ptr().cast(),
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    })?;
+    launcher.execute(move || cmd.spawn())?
 }
 
 /// Handle to a running process.
@@ -659,6 +474,8 @@ pub struct ProcessHandle {
     child: Child,
     pid: u32,
     io: Option<ProcessIo>,
+    terminal: Arc<AtomicBool>,
+    signal_lock: Arc<std::sync::Mutex<()>>,
     #[cfg(target_os = "linux")]
     managed_child: Option<managed_children::ManagedChild>,
 }
@@ -688,9 +505,6 @@ impl ProcessHandle {
         workspace: &ResolvedWorkspace,
         interactive: bool,
         policy: &SandboxPolicy,
-        resolved_identity: ResolvedProcessIdentity,
-        enforcement_mode: ProcessEnforcementMode,
-        netns: Option<&NetworkNamespace>,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
@@ -700,9 +514,6 @@ impl ProcessHandle {
             workspace,
             interactive,
             policy,
-            resolved_identity,
-            enforcement_mode,
-            netns.and_then(NetworkNamespace::ns_fd),
             ca_paths,
             provider_env,
         )
@@ -721,8 +532,6 @@ impl ProcessHandle {
         workspace: &ResolvedWorkspace,
         interactive: bool,
         policy: &SandboxPolicy,
-        resolved_identity: ResolvedProcessIdentity,
-        enforcement_mode: ProcessEnforcementMode,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
@@ -732,8 +541,6 @@ impl ProcessHandle {
             workspace,
             interactive,
             policy,
-            resolved_identity,
-            enforcement_mode,
             ca_paths,
             provider_env,
         )
@@ -747,9 +554,6 @@ impl ProcessHandle {
         workspace: &ResolvedWorkspace,
         interactive: bool,
         policy: &SandboxPolicy,
-        resolved_identity: ResolvedProcessIdentity,
-        enforcement_mode: ProcessEnforcementMode,
-        netns_fd: Option<RawFd>,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
@@ -800,29 +604,7 @@ impl ProcessHandle {
             cmd.current_dir(dir);
         }
 
-        if matches!(policy.network.mode, NetworkMode::Proxy) {
-            let proxy = policy.network.proxy.as_ref().ok_or_else(|| {
-                miette::miette!(
-                    "Network mode is set to proxy but no proxy configuration was provided"
-                )
-            })?;
-            // When using network namespace, set proxy URL to the veth host IP
-            if netns_fd.is_some() {
-                // The proxy is on 10.200.0.1:3128 (or configured port)
-                let port = proxy.http_addr.map_or(3128, |addr| addr.port());
-                let proxy_url = format!("http://10.200.0.1:{port}");
-                // Both uppercase and lowercase variants: curl/wget use uppercase,
-                // gRPC C-core (libgrpc) checks lowercase http_proxy/https_proxy.
-                for (key, value) in child_env::proxy_env_vars(&proxy_url) {
-                    cmd.env(key, value);
-                }
-            } else if let Some(http_addr) = proxy.http_addr {
-                let proxy_url = format!("http://{http_addr}");
-                for (key, value) in child_env::proxy_env_vars(&proxy_url) {
-                    cmd.env(key, value);
-                }
-            }
-        }
+        strip_proxy_env(&mut cmd);
 
         // Set TLS trust store env vars so sandbox processes trust the ephemeral CA
         if let Some((ca_cert_path, combined_bundle_path)) = ca_paths {
@@ -835,25 +617,26 @@ impl ProcessHandle {
         // process where the tracing subscriber is functional. The child's
         // pre_exec context cannot reliably emit structured logs.
         #[cfg(target_os = "linux")]
-        if enforcement_mode.enforces_child_sandbox() {
-            sandbox::linux::log_sandbox_readiness(policy, workspace.root());
-        }
+        sandbox::linux::log_sandbox_readiness(policy, workspace.root());
 
-        // Phase 1: Prepare Landlock ruleset by opening PathFds.
-        // In full mode this runs before drop_privileges() so root-only paths
-        // can be opened. In sidecar network-only mode the container already
-        // runs as the sandbox UID, so inaccessible paths are unavailable to
-        // the workload and best-effort compatibility skips them.
+        // Prepare the Landlock ruleset as the workload UID. Inaccessible paths
+        // are already unavailable to the child and remain omitted.
         #[cfg(target_os = "linux")]
-        let prepared_sandbox = prepare_child_sandbox(policy, workspace.root(), enforcement_mode)
+        let runtime_read_only = ca_runtime_read_only_paths(ca_paths);
+        let prepared_sandbox = prepare_child_sandbox(policy, workspace.root(), &runtime_read_only)
             .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
+        #[cfg(target_os = "linux")]
+        let mut child_hardening =
+            openshell_isolation_interface::linux::child_seccomp::prepare(std::process::id())
+                .map_err(|error| {
+                    miette::miette!("prepare child self-protection filter: {error}")
+                })?;
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
         // proper terminal control for shells and interactive programs.
         // SAFETY: pre_exec runs after fork but before exec in the child process.
         // setpgid and setns are async-signal-safe and safe to call in this context.
         {
-            let policy = policy.clone();
             // Wrap in Option so we can .take() it out of the FnMut closure.
             // pre_exec is only called once (after fork, before exec).
             #[cfg(target_os = "linux")]
@@ -870,25 +653,6 @@ impl ProcessHandle {
                         return Err(std::io::Error::last_os_error());
                     }
 
-                    // Enter network namespace before applying other restrictions.
-                    if let Some(fd) = netns_fd {
-                        let result = libc::setns(fd, libc::CLONE_NEWNET);
-                        if result != 0 {
-                            return Err(std::io::Error::other(format!(
-                                "failed to enter network namespace: {}",
-                                std::io::Error::last_os_error()
-                            )));
-                        }
-                    }
-
-                    // Drop privileges. initgroups/setgid/setuid need access to
-                    // /etc/group and /etc/passwd which would be blocked if
-                    // Landlock were already enforced.
-                    if enforcement_mode.uses_privileged_process_setup() {
-                        drop_privileges_with_identity(&policy, resolved_identity)
-                            .map_err(|err| std::io::Error::other(err.to_string()))?;
-                    }
-
                     harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
 
                     // Phase 2 (as unprivileged user): Enforce the prepared
@@ -896,7 +660,7 @@ impl ProcessHandle {
                     // restrict_self() does not require root.
                     #[cfg(target_os = "linux")]
                     if let Some(prepared) = prepared_sandbox.take() {
-                        sandbox::linux::enforce(prepared)
+                        sandbox::linux::enforce_capability_free(prepared, &mut child_hardening)
                             .map_err(|err| std::io::Error::other(err.to_string()))?;
                     }
 
@@ -910,7 +674,7 @@ impl ProcessHandle {
         // or interpreter, and is a common failure on images that lack the
         // requested shell/binary (e.g. bash on Alpine).
         #[cfg(target_os = "linux")]
-        let mut child = spawn_command_with_supervisor_identity_namespace(cmd)
+        let mut child = spawn_command_with_workload_launcher(cmd)
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to spawn sandbox entrypoint process '{program}'"))?;
         #[cfg(not(target_os = "linux"))]
@@ -937,6 +701,8 @@ impl ProcessHandle {
             child,
             pid,
             io: Some(io),
+            terminal: Arc::new(AtomicBool::new(false)),
+            signal_lock: Arc::new(std::sync::Mutex::new(())),
             #[cfg(target_os = "linux")]
             managed_child,
         })
@@ -950,8 +716,6 @@ impl ProcessHandle {
         workspace: &ResolvedWorkspace,
         interactive: bool,
         policy: &SandboxPolicy,
-        resolved_identity: ResolvedProcessIdentity,
-        enforcement_mode: ProcessEnforcementMode,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
@@ -1002,19 +766,7 @@ impl ProcessHandle {
             cmd.current_dir(dir);
         }
 
-        if matches!(policy.network.mode, NetworkMode::Proxy) {
-            let proxy = policy.network.proxy.as_ref().ok_or_else(|| {
-                miette::miette!(
-                    "Network mode is set to proxy but no proxy configuration was provided"
-                )
-            })?;
-            if let Some(http_addr) = proxy.http_addr {
-                let proxy_url = format!("http://{http_addr}");
-                for (key, value) in child_env::proxy_env_vars(&proxy_url) {
-                    cmd.env(key, value);
-                }
-            }
-        }
+        strip_proxy_env(&mut cmd);
 
         // Set TLS trust store env vars so sandbox processes trust the ephemeral CA
         if let Some((ca_cert_path, combined_bundle_path)) = ca_paths {
@@ -1044,20 +796,9 @@ impl ProcessHandle {
                         return Err(std::io::Error::last_os_error());
                     }
 
-                    // Drop privileges before applying sandbox restrictions.
-                    // initgroups/setgid/setuid need access to /etc/group and /etc/passwd
-                    // which may be blocked by Landlock.
-                    if enforcement_mode.uses_privileged_process_setup() {
-                        drop_privileges_with_identity(&policy, resolved_identity)
-                            .map_err(|err| std::io::Error::other(err.to_string()))?;
-                    }
-
                     harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
-
-                    if enforcement_mode.enforces_child_sandbox() {
-                        sandbox::apply(&policy, workdir.as_deref())
-                            .map_err(|err| std::io::Error::other(err.to_string()))?;
-                    }
+                    sandbox::apply(&policy, workdir.as_deref())
+                        .map_err(|err| std::io::Error::other(err.to_string()))?;
 
                     Ok(())
                 });
@@ -1085,6 +826,8 @@ impl ProcessHandle {
             child,
             pid,
             io: Some(io),
+            terminal: Arc::new(AtomicBool::new(false)),
+            signal_lock: Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -1099,6 +842,12 @@ impl ProcessHandle {
         self.io.take().expect("canonical process I/O already taken")
     }
 
+    /// Shared state used by an independent boundary signal handle.
+    #[must_use]
+    pub fn signaling_state(&self) -> (Arc<AtomicBool>, Arc<std::sync::Mutex<()>>) {
+        (self.terminal.clone(), self.signal_lock.clone())
+    }
+
     /// Wait for the process to exit.
     ///
     /// # Errors
@@ -1106,6 +855,11 @@ impl ProcessHandle {
     /// Returns an error if waiting fails.
     pub async fn wait(&mut self) -> std::io::Result<ProcessStatus> {
         let status = self.child.wait().await;
+        let _signal_guard = self
+            .signal_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.terminal.store(true, Ordering::Release);
         #[cfg(target_os = "linux")]
         if let Some(child) = self.managed_child.take() {
             managed_children::unregister(child);
@@ -1118,6 +872,11 @@ impl ProcessHandle {
     pub fn try_wait(&mut self) -> std::io::Result<Option<ProcessStatus>> {
         let status = self.child.try_wait()?;
         if status.is_some() {
+            let _signal_guard = self
+                .signal_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.terminal.store(true, Ordering::Release);
             #[cfg(target_os = "linux")]
             if let Some(child) = self.managed_child.take() {
                 managed_children::unregister(child);
@@ -1132,6 +891,13 @@ impl ProcessHandle {
     ///
     /// Returns an error if the signal cannot be sent.
     pub fn signal(&self, sig: Signal) -> Result<()> {
+        let _signal_guard = self
+            .signal_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.terminal.load(Ordering::Acquire) {
+            return Err(miette::miette!("process has exited"));
+        }
         let pid = i32::try_from(self.pid).unwrap_or(i32::MAX);
         signal::kill(Pid::from_raw(pid), sig).into_diagnostic()
     }
@@ -2577,18 +2343,6 @@ mod tests {
         assert!(validate_sandbox_group_with_identity(&policy, resolved).is_ok());
     }
 
-    #[test]
-    fn full_enforcement_uses_privileged_setup_and_child_sandbox() {
-        assert!(ProcessEnforcementMode::Full.uses_privileged_process_setup());
-        assert!(ProcessEnforcementMode::Full.enforces_child_sandbox());
-    }
-
-    #[test]
-    fn network_only_enforcement_keeps_child_sandbox_without_privileged_setup() {
-        assert!(!ProcessEnforcementMode::NetworkOnly.uses_privileged_process_setup());
-        assert!(ProcessEnforcementMode::NetworkOnly.enforces_child_sandbox());
-    }
-
     #[cfg(target_os = "linux")]
     fn capability_bounding_set_clear_available() -> bool {
         capctl::caps::CapState::get_current()
@@ -3439,6 +3193,79 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_ca_paths_are_added_to_the_effective_read_only_policy() {
+        let mut policy = policy_with_process(ProcessPolicy::default());
+        policy.filesystem.read_only = vec![PathBuf::from("/usr")];
+        let certificate = PathBuf::from("/run/openshell-proxy-ca/ca.crt");
+        let bundle = PathBuf::from("/run/openshell-proxy-ca/ca-bundle.crt");
+
+        let effective = policy_with_runtime_read_only(
+            &policy,
+            &[certificate.clone(), bundle.clone(), certificate.clone()],
+        );
+
+        assert_eq!(policy.filesystem.read_only, vec![PathBuf::from("/usr")]);
+        assert_eq!(
+            effective.filesystem.read_only,
+            vec![PathBuf::from("/usr"), certificate, bundle]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn runtime_ca_material_remains_readable_after_landlock_for_non_root_workload() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ca_directory = root.path().join("openshell-proxy-ca");
+        std::fs::create_dir(&ca_directory).unwrap();
+        std::fs::set_permissions(&ca_directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let certificate = ca_directory.join("ca.crt");
+        let bundle = ca_directory.join("ca-bundle.crt");
+        let denied = root.path().join("not-authorized");
+        for path in [&certificate, &bundle, &denied] {
+            std::fs::write(path, b"public certificate material").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+
+        let mut policy = policy_with_process(ProcessPolicy::default());
+        policy.landlock = LandlockPolicy {
+            compatibility: openshell_core::policy::LandlockCompatibility::HardRequirement,
+        };
+        let runtime_paths =
+            ca_runtime_read_only_paths(Some(&(certificate.clone(), bundle.clone())));
+        let Ok(Some(prepared)) = prepare_child_sandbox(&policy, None, &runtime_paths) else {
+            return;
+        };
+
+        match unsafe { fork() }.expect("fork should succeed") {
+            ForkResult::Child => {
+                let dropped = if nix::unistd::geteuid().is_root() {
+                    unsafe {
+                        libc::setgroups(0, std::ptr::null()) == 0
+                            && libc::setgid(42_235) == 0
+                            && libc::setuid(42_234) == 0
+                    }
+                } else {
+                    true
+                };
+                let valid = dropped
+                    && sandbox::linux::enforce(prepared).is_ok()
+                    && std::fs::read(&certificate).is_ok()
+                    && std::fs::read(&bundle).is_ok()
+                    && std::fs::read(&denied).is_err();
+                unsafe { libc::_exit(i32::from(!valid)) };
+            }
+            ForkResult::Parent { child } => assert_eq!(
+                waitpid(child, None).expect("waitpid should succeed"),
+                WaitStatus::Exited(child, 0),
+                "Landlock must preserve non-root access only to admitted public CA material"
+            ),
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn validate_oci_workspace_rejects_restrictive_parent() {
@@ -3900,57 +3727,32 @@ mod tests {
         assert!(stdout.contains("OPENSHELL_ENDPOINT=https://gateway.example.test"));
     }
 
-    #[test]
-    fn supervisor_identity_mount_target_uses_socket_parent() {
-        assert_eq!(
-            supervisor_identity_mount_target("/spiffe-workload-api/spire-agent.sock")
-                .expect("plain path should parse"),
-            Some(PathBuf::from("/spiffe-workload-api"))
-        );
-        assert_eq!(
-            supervisor_identity_mount_target("unix:/spiffe-workload-api/spire-agent.sock")
-                .expect("unix path should parse"),
-            Some(PathBuf::from("/spiffe-workload-api"))
-        );
-    }
-
-    #[test]
-    fn supervisor_identity_mount_target_ignores_empty_socket_path() {
-        assert_eq!(
-            supervisor_identity_mount_target("   ").expect("empty path should be ignored"),
-            None
-        );
-    }
-
-    #[test]
-    fn supervisor_identity_mount_target_rejects_unhideable_endpoints() {
-        assert_eq!(
-            supervisor_identity_mount_target("tcp:127.0.0.1:8081")
-                .expect("tcp endpoint should not require mount hiding"),
-            None
-        );
-        assert!(supervisor_identity_mount_target("spiffe-workload-api/spire-agent.sock").is_err());
-        assert!(supervisor_identity_mount_target("/spire-agent.sock").is_err());
-    }
-
-    #[test]
-    fn supervisor_identity_mount_target_rejects_shared_root_shadowing() {
-        for socket_path in [
-            "/run/spire-agent.sock",
-            "/var/spire-agent.sock",
-            "/tmp/spire-agent.sock",
-            "/etc/spire-agent.sock",
-        ] {
-            let err = supervisor_identity_mount_target(socket_path)
-                .expect_err("shared root shadowing should be rejected");
-            assert!(err.to_string().contains("dedicated subdirectory"));
+    #[tokio::test]
+    async fn transparent_mediation_removes_ambient_proxy_routing() {
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.env_clear()
+            .stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::null())
+            .env("PATH", "/usr/bin:/bin");
+        for key in PROXY_ENV_VARS {
+            cmd.env(key, "http://ambient-proxy.invalid:3128");
         }
 
-        assert_eq!(
-            supervisor_identity_mount_target("/run/spire/spire-agent.sock")
-                .expect("dedicated subdirectory should be accepted"),
-            Some(PathBuf::from("/run/spire"))
-        );
+        strip_proxy_env(&mut cmd);
+
+        let output = cmd.output().await.expect("spawn env");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("utf8");
+        for key in PROXY_ENV_VARS {
+            assert!(
+                !stdout
+                    .lines()
+                    .any(|line| line.starts_with(&format!("{key}="))),
+                "{key} must not redirect a transparently mediated process"
+            );
+        }
+        assert!(stdout.contains("PATH=/usr/bin:/bin"));
     }
 
     // ---- Numeric UID tests (Phase 2) ----

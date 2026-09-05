@@ -14,7 +14,7 @@ use std::sync::Once;
 /// Opaque handle to a prepared-but-not-yet-enforced sandbox.
 /// Holds the Landlock ruleset with `PathFds` opened before child exec.
 pub struct PreparedSandbox {
-    landlock: Option<landlock::PreparedRuleset>,
+    landlock: Vec<landlock::PreparedRuleset>,
     policy: SandboxPolicy,
 }
 
@@ -25,20 +25,41 @@ pub struct PreparedSandbox {
 pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<PreparedSandbox> {
     let landlock = landlock::prepare(policy, workdir)?;
     Ok(PreparedSandbox {
-        landlock,
+        landlock: landlock.into_iter().collect(),
         policy: policy.clone(),
     })
 }
 
 /// Phase 1 for already-unprivileged workloads.
 ///
-/// Opens Landlock `PathFds` as the current UID. This is used by Kubernetes
-/// sidecar mode, where the agent container already runs as the sandbox user.
+/// Opens Landlock `PathFds` as the current workload UID.
 pub fn prepare_current_user(
     policy: &SandboxPolicy,
     workdir: Option<&str>,
 ) -> Result<PreparedSandbox> {
     let landlock = landlock::prepare_current_user(policy, workdir)?;
+    Ok(PreparedSandbox {
+        landlock: landlock.into_iter().collect(),
+        policy: policy.clone(),
+    })
+}
+
+/// Prepare the mandatory capability-free filesystem baseline plus the
+/// optional user policy.
+///
+/// The baseline is always a hard requirement. It grants access to each
+/// top-level filesystem entry independently while deliberately omitting the
+/// driver-owned `/.openshell` hierarchy. Applying the user ruleset after the
+/// baseline intersects the two policies; it can narrow the baseline but can
+/// never make the private hierarchy visible.
+pub fn prepare_capability_free(
+    policy: &SandboxPolicy,
+    workdir: Option<&str>,
+) -> Result<PreparedSandbox> {
+    let baseline = landlock::prepare_capability_free_baseline()?;
+    let user = landlock::prepare_current_user(policy, workdir)?;
+    let mut landlock = vec![baseline];
+    landlock.extend(user);
     Ok(PreparedSandbox {
         landlock,
         policy: policy.clone(),
@@ -50,9 +71,28 @@ pub fn prepare_current_user(
 /// Calls `restrict_self()` for Landlock and applies seccomp filters.
 /// Neither operation requires root privileges.
 pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
-    if let Some(ruleset) = prepared.landlock {
+    for ruleset in prepared.landlock {
         landlock::enforce(ruleset)?;
     }
+    seccomp::apply(&prepared.policy)?;
+    Ok(())
+}
+
+/// Enforce the capability-free child filter stack.
+///
+/// Landlock precedes sandbox-TGID self-protection. The ordinary workload
+/// filter is installed last. The final filter blocks any later seccomp
+/// installation, so this order is mandatory for capability-free children.
+pub fn enforce_capability_free(
+    prepared: PreparedSandbox,
+    child_hardening: &mut openshell_isolation_interface::linux::child_seccomp::ChildHardeningProgram,
+) -> Result<()> {
+    for ruleset in prepared.landlock {
+        landlock::enforce(ruleset)?;
+    }
+    child_hardening
+        .install()
+        .map_err(|error| miette::miette!("install child self-protection filter: {error}"))?;
     seccomp::apply(&prepared.policy)?;
     Ok(())
 }

@@ -330,13 +330,16 @@ pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
     verify_notification_sizes()?;
     set_no_new_privileges()?;
 
-    match install_listener_with_flags(syscalls, true) {
-        Ok(listener) => Ok(listener),
-        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
-            install_listener_with_flags(syscalls, false)
+    install_listener_with_flags(syscalls, true).map_err(|error| {
+        if error.raw_os_error() == Some(libc::EINVAL) {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "seccomp WAIT_KILLABLE_RECV is required (Linux 5.19 or newer)",
+            )
+        } else {
+            error
         }
-        Err(error) => Err(error),
-    }
+    })
 }
 
 /// Install the capability-free workload networking listener on the calling
@@ -357,7 +360,6 @@ pub fn install_workload_listener() -> io::Result<NotificationListener> {
         libc::SYS_sendmsg,
         libc::SYS_sendmmsg,
         libc::SYS_getpeername,
-        libc::SYS_getsockname,
         libc::SYS_setsockopt,
     ])
 }
@@ -492,55 +494,22 @@ fn probe_addfd_send() -> io::Result<()> {
 
 fn probe_task_memory_copy() -> io::Result<()> {
     let source = 0x1122_3344_5566_7788_u64;
-    let mut copied = 0_u64;
-    let local = libc::iovec {
-        iov_base: std::ptr::addr_of_mut!(copied).cast(),
-        iov_len: size_of::<u64>(),
-    };
-    let remote = libc::iovec {
-        iov_base: std::ptr::addr_of!(source).cast_mut().cast(),
-        iov_len: size_of::<u64>(),
-    };
-    // SAFETY: both iovecs point to live same-process u64 values for the full
-    // call. This is an admission probe, not the cross-task production codec.
-    let read = unsafe {
-        libc::process_vm_readv(
-            libc::getpid(),
-            std::ptr::addr_of!(local),
-            1,
-            std::ptr::addr_of!(remote),
-            1,
-            0,
-        )
-    };
-    let word_size = isize::try_from(size_of::<u64>()).expect("u64 size fits isize");
-    if read != word_size || copied != source {
-        return Err(io::Error::last_os_error());
+    let tid = std::process::id();
+    let mut source_bytes = [0_u8; size_of::<u64>()];
+    super::task_memory::read_exact(tid, std::ptr::addr_of!(source) as u64, &mut source_bytes)?;
+    let mut copied = u64::from_ne_bytes(source_bytes);
+    if copied != source {
+        return Err(io::Error::other("task-memory probe read wrong value"));
     }
 
     let replacement = 0xaabb_ccdd_eeff_0011_u64;
-    let local = libc::iovec {
-        iov_base: std::ptr::addr_of!(replacement).cast_mut().cast(),
-        iov_len: size_of::<u64>(),
-    };
-    let remote = libc::iovec {
-        iov_base: std::ptr::addr_of_mut!(copied).cast(),
-        iov_len: size_of::<u64>(),
-    };
-    // SAFETY: both iovecs point to live same-process u64 values for the full
-    // call. The write is bounded to the destination value.
-    let written = unsafe {
-        libc::process_vm_writev(
-            libc::getpid(),
-            std::ptr::addr_of!(local),
-            1,
-            std::ptr::addr_of!(remote),
-            1,
-            0,
-        )
-    };
-    if written != word_size || copied != replacement {
-        return Err(io::Error::last_os_error());
+    super::task_memory::write_exact(
+        tid,
+        std::ptr::addr_of_mut!(copied) as u64,
+        &replacement.to_ne_bytes(),
+    )?;
+    if copied != replacement {
+        return Err(io::Error::other("task-memory probe wrote wrong value"));
     }
     Ok(())
 }

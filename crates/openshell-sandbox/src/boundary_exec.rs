@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Co-located implementation of RFC 0012 in-boundary exec.
+//! Workload-side implementation of RFC 0012 sandbox exec.
 
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -19,51 +19,36 @@ use openshell_isolation_interface::contract::{
     BoundarySignal, BoundaryTerminal, ExecSession, ExecSpec,
 };
 
-use crate::process::{ProcessEnforcementMode, ResolvedProcessIdentity};
-
-/// The co-located executor. Every spawn reuses the same admitted policy and
+/// The sandbox executor. Every spawn reuses the same admitted policy and
 /// execution-environment controls while taking a fresh provider credential
 /// snapshot.
 #[derive(Clone)]
 pub struct LocalBoundaryExec {
     policy: SandboxPolicy,
     base_workdir: Option<String>,
-    netns_fd: Option<Arc<OwnedFd>>,
-    proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(std::path::PathBuf, std::path::PathBuf)>>,
     provider_credentials: ProviderCredentialState,
     user_environment: HashMap<String, String>,
-    resolved_identity: ResolvedProcessIdentity,
-    enforcement_mode: ProcessEnforcementMode,
     runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
 }
 
 impl LocalBoundaryExec {
-    /// Construct one executor for an active co-located boundary.
-    #[allow(clippy::too_many_arguments)]
+    /// Construct the executor owned by an active sandbox boundary.
     #[must_use]
     pub fn new(
         policy: SandboxPolicy,
         base_workdir: Option<String>,
-        netns_fd: Option<Arc<OwnedFd>>,
-        proxy_url: Option<String>,
         ca_file_paths: Option<Arc<(std::path::PathBuf, std::path::PathBuf)>>,
         provider_credentials: ProviderCredentialState,
         user_environment: HashMap<String, String>,
-        resolved_identity: ResolvedProcessIdentity,
-        enforcement_mode: ProcessEnforcementMode,
         runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
     ) -> Self {
         Self {
             policy,
             base_workdir,
-            netns_fd,
-            proxy_url,
             ca_file_paths,
             provider_credentials,
             user_environment,
-            resolved_identity,
-            enforcement_mode,
             runtime,
         }
     }
@@ -77,16 +62,31 @@ impl LocalBoundaryExec {
         let effective_workdir = spec.workdir.as_deref().or(self.base_workdir.as_deref());
         let (session_user, session_home) =
             crate::process::session_user_and_home(&self.policy, effective_workdir);
-        crate::ssh::apply_child_env(
-            &mut command,
-            &session_home,
-            &session_user,
-            if spec.pty { "xterm-256color" } else { "dumb" },
-            self.proxy_url.as_deref(),
-            self.ca_file_paths.as_deref(),
-            &self.provider_credentials.child_env_with_gcp_resolved(),
-            &self.user_environment,
-        );
+        let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
+        command
+            .env_clear()
+            .env(openshell_core::sandbox_env::SANDBOX, "1")
+            .env("HOME", session_home)
+            .env("USER", session_user)
+            .env("SHELL", "/bin/bash")
+            .env("PATH", path)
+            .env("TERM", if spec.pty { "xterm-256color" } else { "dumb" });
+        for (key, value) in &self.user_environment {
+            if !key.starts_with("OPENSHELL_") {
+                command.env(key, value);
+            }
+        }
+        if let Some((ca_cert_path, combined_bundle_path)) = self.ca_file_paths.as_deref() {
+            for (key, value) in crate::child_env::tls_env_vars(ca_cert_path, combined_bundle_path) {
+                command.env(key, value);
+            }
+        }
+        for (key, value) in self.provider_credentials.child_env_with_gcp_resolved() {
+            if !crate::process::is_supervisor_only_env_var(&key) {
+                command.env(key, value);
+            }
+        }
+        crate::process::strip_proxy_env_std(&mut command);
         for (key, value) in &spec.env {
             if !key.starts_with("OPENSHELL_") {
                 command.env(key, value);
@@ -103,10 +103,10 @@ impl LocalBoundaryExec {
         &self,
         workdir: Option<&str>,
     ) -> Result<Option<crate::sandbox::linux::PreparedSandbox>, BackendError> {
-        if self.enforcement_mode.enforces_child_sandbox() {
-            crate::sandbox::linux::log_sandbox_readiness(&self.policy, workdir);
-        }
-        crate::process::prepare_child_sandbox(&self.policy, workdir, self.enforcement_mode)
+        crate::sandbox::linux::log_sandbox_readiness(&self.policy, workdir);
+        let runtime_read_only =
+            crate::process::ca_runtime_read_only_paths(self.ca_file_paths.as_deref());
+        crate::process::prepare_child_sandbox(&self.policy, workdir, &runtime_read_only)
             .map_err(|error| BackendError::Process(error.to_string()))
     }
 
@@ -120,19 +120,27 @@ impl LocalBoundaryExec {
         let effective_workdir = spec.workdir.as_deref().or(self.base_workdir.as_deref());
         #[cfg(target_os = "linux")]
         let prepared = self.prepare_sandbox(effective_workdir)?;
-        crate::ssh::unsafe_pty::install_dedicated_process_group(&mut command);
-        crate::ssh::unsafe_pty::install_pre_exec_no_pty(
+        #[cfg(target_os = "linux")]
+        let child_hardening =
+            openshell_isolation_interface::linux::child_seccomp::prepare(std::process::id())
+                .map_err(|error| BackendError::Process(error.to_string()))?;
+        crate::pty::install_dedicated_process_group(&mut command);
+        crate::pty::install_pre_exec_no_pty(
             &mut command,
             self.policy.clone(),
             effective_workdir.map(str::to_string),
-            self.netns_fd.as_deref().map(AsRawFd::as_raw_fd),
-            self.resolved_identity,
-            self.enforcement_mode,
             #[cfg(target_os = "linux")]
             prepared,
-        );
+            #[cfg(target_os = "linux")]
+            child_hardening,
+        )
+        .map_err(|error| BackendError::Process(error.to_string()))?;
         #[cfg(target_os = "linux")]
         let mut child_registry = crate::managed_children::lock();
+        #[cfg(target_os = "linux")]
+        let mut child = crate::process::spawn_std_command_with_workload_launcher(command)
+            .map_err(|error| BackendError::Process(error.to_string()))?;
+        #[cfg(not(target_os = "linux"))]
         let mut child = command
             .spawn()
             .map_err(|error| BackendError::Process(error.to_string()))?;
@@ -222,19 +230,27 @@ impl LocalBoundaryExec {
         let effective_workdir = spec.workdir.as_deref().or(self.base_workdir.as_deref());
         #[cfg(target_os = "linux")]
         let prepared = self.prepare_sandbox(effective_workdir)?;
-        crate::ssh::unsafe_pty::install_pre_exec(
+        #[cfg(target_os = "linux")]
+        let child_hardening =
+            openshell_isolation_interface::linux::child_seccomp::prepare(std::process::id())
+                .map_err(|error| BackendError::Process(error.to_string()))?;
+        crate::pty::install_pre_exec(
             &mut command,
             self.policy.clone(),
             effective_workdir.map(str::to_string),
             slave_fd,
-            self.netns_fd.as_deref().map(AsRawFd::as_raw_fd),
-            self.resolved_identity,
-            self.enforcement_mode,
             #[cfg(target_os = "linux")]
             prepared,
-        );
+            #[cfg(target_os = "linux")]
+            child_hardening,
+        )
+        .map_err(|error| BackendError::Process(error.to_string()))?;
         #[cfg(target_os = "linux")]
         let mut child_registry = crate::managed_children::lock();
+        #[cfg(target_os = "linux")]
+        let mut child = crate::process::spawn_std_command_with_workload_launcher(command)
+            .map_err(|error| BackendError::Process(error.to_string()))?;
+        #[cfg(not(target_os = "linux"))]
         let mut child = command
             .spawn()
             .map_err(|error| BackendError::Process(error.to_string()))?;
@@ -331,7 +347,7 @@ struct LocalTerminal {
 #[async_trait]
 impl BoundaryTerminal for LocalTerminal {
     async fn resize(&self, cols: u16, rows: u16) -> Result<(), BackendError> {
-        crate::ssh::unsafe_pty::set_winsize(
+        crate::pty::set_winsize(
             self.master.as_raw_fd(),
             Winsize {
                 ws_row: rows.max(1),
@@ -476,12 +492,26 @@ impl BoundaryProcess for LocalExecProcess {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use std::sync::Once;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn executor() -> LocalBoundaryExec {
+        static LAUNCHER: Once = Once::new();
+        LAUNCHER.call_once(|| {
+            let (launcher, listener) =
+                openshell_isolation_interface::linux::workload_launcher::start()
+                    .expect("start test workload launcher");
+            std::thread::spawn(move || {
+                while let Ok(notification) = listener.receive() {
+                    let _ = listener.respond_errno(notification.id, libc::EPERM);
+                }
+            });
+            crate::process::configure_workload_launcher(launcher)
+                .expect("configure test workload launcher");
+        });
         LocalBoundaryExec::new(
             SandboxPolicy {
                 version: 1,
@@ -492,8 +522,6 @@ mod tests {
             },
             None,
             None,
-            None,
-            None,
             ProviderCredentialState::from_environment(
                 0,
                 HashMap::new(),
@@ -501,8 +529,6 @@ mod tests {
                 HashMap::new(),
             ),
             HashMap::new(),
-            ResolvedProcessIdentity::default(),
-            ProcessEnforcementMode::NetworkOnly,
             crate::boundary_io::BoundaryRuntimeState::new(),
         )
     }

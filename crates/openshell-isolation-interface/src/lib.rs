@@ -7,9 +7,8 @@
 //! the supervisor role drives it through one contract. The supervisor-facing
 //! contract lives in [`contract`]: an object-safe, runtime-selectable backend
 //! plus a fixed chain of boxed lifecycle states the supervisor advances without
-//! branching on where the boundary sits. The same calls work whether the
-//! boundary lives in the agent's container (the in-pod backend) or further out
-//! (a microVM, a node daemon, a separate pod).
+//! branching on placement. Each driver places a sandbox boundary beside the
+//! workload and connects it to a separate supervisor.
 //!
 //! The backend establishes standing enforcement before untrusted code runs and
 //! ensures launch-time controls are in force before each process's first
@@ -47,7 +46,11 @@ pub struct AgentSpec {
     pub interactive: bool,
 }
 
+/// Versioned control-to-boundary wire types shared by every backend.
+pub mod boundary_protocol;
 pub mod contract;
+/// Reusable control-side implementation for a remote boundary endpoint.
+pub mod remote;
 
 /// Linux-only primitives shared by capability-free sandbox implementations.
 #[cfg(target_os = "linux")]
