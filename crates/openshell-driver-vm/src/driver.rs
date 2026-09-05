@@ -690,9 +690,9 @@ impl VmDriver {
                     return Ok(sibling);
                 }
             }
-            return Err(Status::failed_precondition(
+            Err(Status::failed_precondition(
                 "the native host supervisor is missing; install openshell-supervisor beside openshell-driver-vm or set OPENSHELL_VM_SUPERVISOR_BIN",
-            ));
+            ))
         }
 
         #[cfg(target_os = "linux")]
