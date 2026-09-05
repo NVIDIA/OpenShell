@@ -316,9 +316,9 @@ impl L7ConfigStanza {
 ///
 /// The stanza schema stays tied to this crate's canonical serde definitions, so
 /// adding a new supported field requires updating this conversion next to the
-/// type that parses it. MCP revision fields are validated before the alias is
-/// flattened so invalid authoring cannot disappear when version metadata is
-/// omitted from the returned runtime-only fields.
+/// type that parses it. MCP revision fields are validated and materialized
+/// before the alias is flattened so both runtime ingress paths receive the
+/// same canonical allowlist.
 pub fn l7_config_alias_runtime_fields(
     stanza: L7ConfigStanza,
     value: serde_json::Value,
@@ -338,12 +338,15 @@ pub fn l7_config_alias_runtime_fields(
                 .map_err(|error| miette::miette!("invalid mcp config: {error}"))?;
             validate_authored_mcp_versions(config.versions.as_deref(), "invalid mcp config")?;
             let McpConfigDef {
-                versions: _,
+                versions,
                 max_body_bytes,
                 strict_tool_names,
                 allow_all_known_mcp_methods,
             } = config;
+            let mut versions = versions.unwrap_or_else(default_mcp_versions);
+            canonicalize_mcp_versions(&mut versions);
             let mut fields = Vec::new();
+            fields.push(("mcp_versions", serde_json::json!(versions)));
             if max_body_bytes > 0 {
                 fields.push(("json_rpc_max_body_bytes", serde_json::json!(max_body_bytes)));
             }
@@ -2560,6 +2563,10 @@ network_policies:
         assert_eq!(
             fields,
             vec![
+                (
+                    "mcp_versions",
+                    serde_json::json!(["2025-03-26", "2025-06-18", "2025-11-25"])
+                ),
                 ("json_rpc_max_body_bytes", serde_json::json!(131_072)),
                 ("mcp_strict_tool_names", serde_json::json!(false)),
                 ("mcp_allow_all_known_mcp_methods", serde_json::json!(true)),
@@ -2570,10 +2577,16 @@ network_policies:
             L7ConfigStanza::Mcp,
             serde_json::json!({"strict_tool_names": false}),
         )
-        .expect("runtime alias parsing does not select a wire profile yet");
+        .expect("runtime alias parsing supplies the pinned wire profile");
         assert_eq!(
             runtime_only_fields,
-            vec![("mcp_strict_tool_names", serde_json::json!(false))]
+            vec![
+                (
+                    "mcp_versions",
+                    serde_json::json!([DEFAULT_MCP_PROTOCOL_VERSION.as_str()])
+                ),
+                ("mcp_strict_tool_names", serde_json::json!(false))
+            ]
         );
 
         let err = l7_config_alias_runtime_fields(
