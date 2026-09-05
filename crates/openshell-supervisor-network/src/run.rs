@@ -37,6 +37,7 @@ use crate::l7::tls::{
 use crate::opa::OpaEngine;
 use crate::policy_local::PolicyLocalContext;
 use crate::proxy::ProxyHandle;
+use openshell_isolation_interface::contract::{DnsMediationSource, NetworkMediationSource};
 
 #[cfg(target_os = "linux")]
 pub struct TransparentRuntimeSetup {
@@ -155,6 +156,7 @@ pub struct Networking {
     /// loop so it can publish updated `SandboxPolicy` snapshots that the
     /// `policy.local` route handler returns to the workload.
     pub policy_local_ctx: Arc<PolicyLocalContext>,
+    _mediated_policy_dns: Option<crate::policy_dns::PolicyDnsRuntime>,
     #[cfg(target_os = "linux")]
     _policy_dns: Option<crate::policy_dns::PolicyDnsRuntime>,
     #[cfg(target_os = "linux")]
@@ -198,6 +200,8 @@ pub async fn run_networking(
     upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
     host_gateway_ip: Option<IpAddr>,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
+    network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
+    dns_mediation_source: Option<Arc<dyn DnsMediationSource>>,
 ) -> Result<Networking> {
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
@@ -314,10 +318,29 @@ pub async fn run_networking(
     // the proxy, so it's owned here.
     let identity_cache = opa_engine.map(|_| Arc::new(BinaryIdentityCache::new()));
 
-    // Generate ephemeral CA and TLS state for HTTPS L7 inspection.
+    // Load a provisioned CA when the boundary lifetime outlives this control
+    // process; otherwise generate an ephemeral CA.
     // The CA cert is written to disk so sandbox processes can trust it.
     let (tls_state, ca_file_paths) = if matches!(policy.network.mode, NetworkMode::Proxy) {
-        match SandboxCa::generate() {
+        let configured_ca = match (
+            std::env::var_os(openshell_core::sandbox_env::PROXY_CA_CERT),
+            std::env::var_os(openshell_core::sandbox_env::PROXY_CA_KEY),
+        ) {
+            (Some(certificate), Some(private_key)) => Some(SandboxCa::load_from_paths(
+                std::path::Path::new(&certificate),
+                std::path::Path::new(&private_key),
+            )?),
+            (None, None) => None,
+            _ => {
+                return Err(miette::miette!(
+                    "{} and {} must be configured together",
+                    openshell_core::sandbox_env::PROXY_CA_CERT,
+                    openshell_core::sandbox_env::PROXY_CA_KEY,
+                ));
+            }
+        };
+        let durable_ca = configured_ca.is_some();
+        match configured_ca.map_or_else(SandboxCa::generate, Ok) {
             Ok(ca) => {
                 let tls_dir = std::env::var(openshell_core::sandbox_env::PROXY_TLS_DIR)
                     .unwrap_or_else(|_| openshell_core::container_paths::TLS_ROOT.to_string());
@@ -357,7 +380,11 @@ pub async fn run_networking(
                                 .severity(SeverityId::Informational)
                                 .status(StatusId::Success)
                                 .state(StateId::Enabled, "enabled")
-                                .message("TLS termination enabled: ephemeral CA generated")
+                                .message(if durable_ca {
+                                    "TLS termination enabled: provisioned CA loaded"
+                                } else {
+                                    "TLS termination enabled: ephemeral CA generated"
+                                })
                                 .build()
                         );
                         (Some(state), Some(paths))
@@ -401,6 +428,21 @@ pub async fn run_networking(
         }
     } else {
         (None, None)
+    };
+
+    let mediated_policy_dns = if let Some(source) = dns_mediation_source {
+        let engine = opa_engine
+            .cloned()
+            .ok_or_else(|| miette::miette!("Mediated DNS requires an OPA engine"))?;
+        Some(crate::policy_dns::PolicyDnsRuntime::start_mediated(
+            engine,
+            source,
+            host_gateway_ip,
+            crate::policy_dns::PolicyDnsRuntimeConfig::for_epoch(0)?,
+            engine_ready_rx.clone(),
+        )?)
+    } else {
+        None
     };
 
     let proxy_handle = if matches!(policy.network.mode, NetworkMode::Proxy) {
@@ -450,6 +492,10 @@ pub async fn run_networking(
             engine_ready_rx,
             upstream_proxy_args,
             host_gateway_ip,
+            network_mediation_source,
+            mediated_policy_dns
+                .as_ref()
+                .map(|runtime| runtime.store.clone()),
         )
         .await?;
         Some(proxy_handle)
@@ -495,6 +541,7 @@ pub async fn run_networking(
         proxy: proxy_handle,
         ca_file_paths,
         policy_local_ctx,
+        _mediated_policy_dns: mediated_policy_dns,
         #[cfg(target_os = "linux")]
         _policy_dns: policy_dns,
         #[cfg(target_os = "linux")]

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Anonymous sandbox network activity counter aggregation.
+//! Anonymous supervised network activity counter aggregation.
 //!
 //! Producer-side types (`ActivityEvent`, `ActivitySender`,
 //! `ACTIVITY_EVENT_QUEUE_CAPACITY`, `try_record_activity`) live in

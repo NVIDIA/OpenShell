@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Mechanistic policy mapper — deterministically converts denial summaries into
+//! Supervisor policy mapper — deterministically converts denial summaries into
 //! draft `NetworkPolicyRule` proposals.
 //!
 //! This is the "zero-LLM" baseline for policy recommendations. It inspects

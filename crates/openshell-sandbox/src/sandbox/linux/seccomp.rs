@@ -25,10 +25,9 @@
 //! The risk is contained by existing sandbox layers:
 //! - **Privilege drop**: `CAP_NET_ADMIN` is not granted, so all write operations
 //!   (add/delete routes, addresses, interfaces) fail with `EPERM` regardless.
-//! - **Network namespace**: the sandboxed process sees only `lo` and one veth;
-//!   no host interfaces are visible.
-//! - **nftables bypass rules**: all non-proxy traffic is rejected at the
-//!   netfilter level regardless of what the sandbox learns about its interfaces.
+//! - **Driver outer fence**: direct workload egress is rejected outside this
+//!   process by Docker network-none, Kubernetes `NetworkPolicy`, or a NIC-less
+//!   VM.
 //!
 //! Every other netlink protocol (`NETLINK_SOCK_DIAG`, `NETLINK_NETFILTER`,
 //! `NETLINK_AUDIT`, `NETLINK_XFRM`, `NETLINK_GENERIC`, etc.) remains blocked.

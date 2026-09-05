@@ -205,6 +205,20 @@ impl SocketRegistry {
         self.entries.is_empty()
     }
 
+    /// Whether another socket would exceed the configured bound.
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.entries.len() >= self.capacity
+    }
+
+    /// Retain only sockets that remain installed in a workload descriptor
+    /// table. The trusted broker's temporary source descriptors are excluded
+    /// from `installed` by the caller.
+    pub fn retain_installed(&mut self, installed: &std::collections::BTreeSet<u64>) {
+        self.entries
+            .retain(|inode, _entry| installed.contains(inode));
+    }
+
     /// Stage a newly created source descriptor without publishing it.
     pub fn stage(&self, source: OwnedFd, metadata: SocketMetadata) -> io::Result<TentativeSocket> {
         if self.entries.len() >= self.capacity {
@@ -226,6 +240,19 @@ impl SocketRegistry {
 
     /// Publish a tentative socket only after ADDFD-SEND has succeeded.
     pub fn commit(&mut self, tentative: TentativeSocket) -> io::Result<SocketIdentity> {
+        self.commit_with_state(tentative, SocketState::Created)
+    }
+
+    /// Publish a tentative socket in a caller-proven initial state.
+    ///
+    /// Accepted sockets are created and classified by the trusted broker, so
+    /// they enter the registry directly as [`SocketState::AcceptedLocal`]
+    /// rather than pretending to be unconnected.
+    pub fn commit_with_state(
+        &mut self,
+        tentative: TentativeSocket,
+        state: SocketState,
+    ) -> io::Result<SocketIdentity> {
         if self.entries.len() >= self.capacity {
             return Err(io::Error::from_raw_os_error(libc::EMFILE));
         }
@@ -238,13 +265,17 @@ impl SocketRegistry {
             ));
         }
         let identity = tentative.identity;
+        let retain_source = matches!(
+            state,
+            SocketState::Created | SocketState::Bound { .. } | SocketState::Listening { .. }
+        );
         self.entries.insert(
             identity.inode,
             SocketEntry {
                 identity,
                 metadata: tentative.metadata,
-                state: SocketState::Created,
-                retained_preconnect: Some(tentative.source),
+                state,
+                retained_preconnect: retain_source.then_some(tentative.source),
             },
         );
         Ok(identity)
@@ -408,5 +439,23 @@ mod tests {
                 .identity(),
             identity
         );
+    }
+
+    #[test]
+    fn collection_reclaims_only_uninstalled_socket_metadata() {
+        let mut registry = SocketRegistry::new(12, 2).unwrap();
+        let first = registry
+            .commit(registry.stage(tcp_socket(), metadata()).unwrap())
+            .unwrap();
+        let second = registry
+            .commit(registry.stage(tcp_socket(), metadata()).unwrap())
+            .unwrap();
+        assert!(registry.is_full());
+
+        registry.retain_installed(&std::collections::BTreeSet::from([first.inode]));
+
+        assert_eq!(registry.len(), 1);
+        assert!(registry.remove_inode(first.inode));
+        assert!(!registry.remove_inode(second.inode));
     }
 }
