@@ -13,7 +13,7 @@ use openshell_core::policy::{
     FilesystemPolicy, LandlockCompatibility, LandlockPolicy, ProcessPolicy,
 };
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
-use openshell_policy::L7ConfigStanza;
+use openshell_policy::{L7ConfigStanza, L7Protocol as PolicyL7Protocol};
 use openshell_supervisor_middleware::{ChainEntry, ChainRunner, MiddlewareRegistry};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -446,6 +446,7 @@ impl OpaEngine {
         let mut data: serde_json::Value = serde_json::from_str(&data_json_str)
             .map_err(|e| miette::miette!("internal: failed to parse proto JSON: {e}"))?;
         inject_runtime_policy_data(&mut data, require_binary_identity);
+        normalize_endpoint_protocols(&mut data);
 
         // Validate BEFORE expanding presets
         let (errors, warnings) = crate::l7::validate_l7_policies(&data);
@@ -1387,6 +1388,7 @@ fn preprocess_yaml_data(
     let mut data: serde_json::Value = serde_yml::from_str(yaml_str)
         .map_err(|e| miette::miette!("failed to parse YAML data: {e}"))?;
     inject_runtime_policy_data(&mut data, require_binary_identity);
+    normalize_endpoint_protocols(&mut data);
 
     // Normalize port → ports for all endpoints so Rego always sees "ports" array.
     normalize_endpoint_ports(&mut data);
@@ -1434,6 +1436,57 @@ fn preprocess_yaml_data(
     emit_l7_config_warnings(&expansion_warnings, "L7 access preset expansion warning");
 
     serde_json::to_string(&data).map_err(|e| miette::miette!("failed to serialize data: {e}"))
+}
+
+/// Canonicalize recognized protocol spellings before L7 validation or Rego use.
+///
+/// Rust parses protocol names case-insensitively, while Rego compares stable
+/// wire keys. Publishing one canonical spelling keeps rule validation, typed
+/// routing, and authorization on the same protocol branch.
+fn normalize_endpoint_protocols(data: &mut serde_json::Value) {
+    let Some(policies) = data
+        .get_mut("network_policies")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+
+    for policy in policies.values_mut() {
+        let Some(endpoints) = policy
+            .get_mut("endpoints")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+
+        for endpoint in endpoints {
+            let Some(endpoint) = endpoint.as_object_mut() else {
+                continue;
+            };
+            let Some(protocol) = endpoint.get("protocol").and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let canonical = if protocol.eq_ignore_ascii_case("tcp") {
+                Some("tcp")
+            } else {
+                PolicyL7Protocol::parse(protocol).map(|protocol| match protocol {
+                    PolicyL7Protocol::Rest => "rest",
+                    PolicyL7Protocol::Websocket => "websocket",
+                    PolicyL7Protocol::Graphql => "graphql",
+                    PolicyL7Protocol::Sql => "sql",
+                    PolicyL7Protocol::JsonRpc => "json-rpc",
+                    PolicyL7Protocol::Mcp => "mcp",
+                })
+            };
+            if let Some(canonical) = canonical {
+                endpoint.insert(
+                    "protocol".to_string(),
+                    serde_json::Value::String(canonical.to_string()),
+                );
+            }
+        }
+    }
 }
 
 /// Normalize endpoint port/ports in JSON data.
@@ -1547,6 +1600,9 @@ fn normalize_l7_config_alias(
     };
     if config.is_null() {
         ep.remove(key);
+        if stanza == L7ConfigStanza::Mcp {
+            errors.push(format!("{loc}.{key}: mcp config must be an object"));
+        }
         return;
     }
     match openshell_policy::l7_config_alias_runtime_fields(stanza, config) {
@@ -5057,7 +5113,55 @@ network_policies:
             .expect("expected MCP endpoint config");
         let l7 = crate::l7::parse_l7_config(&config).expect("parse L7 endpoint config");
 
+        let config_json: serde_json::Value = serde_json::from_str(
+            &config
+                .to_json_str()
+                .expect("endpoint config must serialize as JSON"),
+        )
+        .expect("endpoint config must be valid JSON");
+        assert_eq!(
+            config_json["protocol"],
+            serde_json::json!("mcp"),
+            "OPA data must use the canonical protocol key"
+        );
         assert_eq!(l7.mcp_versions, vec![DEFAULT_MCP_PROTOCOL_VERSION]);
+        assert!(eval_l7(
+            &engine,
+            &l7_jsonrpc_input("mcp.example.com", 443, "/", "tools/list")
+        ));
+        assert!(!eval_l7(
+            &engine,
+            &l7_jsonrpc_input("mcp.example.com", 443, "/", "tools/call")
+        ));
+    }
+
+    #[test]
+    fn yaml_load_rejects_rest_shaped_rules_on_mixed_case_mcp_protocol() {
+        let data = r#"
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: MCP
+        rules:
+          - allow:
+              method: POST
+              path: "**"
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+
+        let Err(error) = OpaEngine::from_strings(TEST_POLICY, data) else {
+            panic!("mixed-case MCP must not bypass MCP rule validation");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("mcp L7 rules must use method/tool, not path/query"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -5126,6 +5230,40 @@ network_policies:
                 .contains("mcp.versions and mcp_versions cannot both be set"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn yaml_load_rejects_null_mcp_config_before_defaulting() {
+        for mcp_fields in [
+            "mcp: null",
+            "mcp: null\n        mcp_versions: [\"2025-11-25\"]",
+        ] {
+            let data = format!(
+                r#"
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: mcp
+        {mcp_fields}
+        rules:
+          - allow:
+              method: tools/list
+    binaries:
+      - {{ path: /usr/bin/curl }}
+"#
+            );
+
+            let Err(error) = OpaEngine::from_strings(TEST_POLICY, &data) else {
+                panic!("null MCP config must reject activation");
+            };
+            assert!(
+                error.to_string().contains("mcp config must be an object"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -5607,6 +5745,13 @@ network_policies:
                 .query_endpoint_config(&input)
                 .expect("query endpoint config")
                 .expect("expected MCP endpoint config");
+            let config_json: serde_json::Value = serde_json::from_str(
+                &config
+                    .to_json_str()
+                    .expect("endpoint config must serialize as JSON"),
+            )
+            .expect("endpoint config must be valid JSON");
+            assert_eq!(config_json["protocol"], serde_json::json!("mcp"));
             let l7 = crate::l7::parse_l7_config(&config).expect("parse L7 endpoint config");
             assert_eq!(
                 l7.mcp_versions,
