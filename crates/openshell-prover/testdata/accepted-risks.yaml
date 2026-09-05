@@ -3,5 +3,5 @@
 
 accepted_risks:
   - query: inference_relay
-    reason: "Demo environment — inference.local not configured."
+    reason: "Demo environment — optional inference relay not configured."
     accepted_by: demo

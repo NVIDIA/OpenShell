@@ -4,9 +4,8 @@
 use std::collections::HashMap;
 
 use openshell_core::google_cloud;
-use openshell_core::inference;
 
-use crate::{Provider, ProviderPlugin};
+use crate::{Provider, ProviderPlugin, VERTEX_AI_PROJECT_ID_KEY, VERTEX_AI_REGION_KEY};
 
 pub struct VertexProvider;
 
@@ -18,7 +17,7 @@ impl ProviderPlugin for VertexProvider {
     fn inject_env(&self, provider: &Provider, env: &mut HashMap<String, String>) {
         if let Some(project) = provider
             .config
-            .get(inference::VERTEX_AI_PROJECT_ID_KEY)
+            .get(VERTEX_AI_PROJECT_ID_KEY)
             .filter(|v| !v.trim().is_empty())
         {
             let trimmed = project.trim().to_string();
@@ -32,7 +31,7 @@ impl ProviderPlugin for VertexProvider {
 
         if let Some(region) = provider
             .config
-            .get(inference::VERTEX_AI_REGION_KEY)
+            .get(VERTEX_AI_REGION_KEY)
             .filter(|v| !v.trim().is_empty())
         {
             let trimmed = region.trim().to_string();

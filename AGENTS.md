@@ -39,8 +39,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-conformance-cli/` | Conformance CLI | Distributable `list` and `run` entrypoint for gateway conformance |
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
 | `crates/openshell-sandbox/` | Sandbox runtime | Container supervision, policy-enforced egress routing |
-| `crates/openshell-policy/` | Policy engine | Filesystem, network, process, and inference constraints |
-| `crates/openshell-router/` | Privacy router | Privacy-aware LLM routing |
+| `crates/openshell-policy/` | Policy engine | Filesystem, network, and process constraints |
 | `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
 | `crates/openshell-gateway-interceptors/` | Gateway interceptors | Intercepts and transforms configured gRPC requests at the gateway routing boundary |
 | `crates/openshell-ocsf/` | OCSF logging | OCSF v1.8.0 event types, builders, shorthand/JSONL formatters, tracing layers |
@@ -60,12 +59,11 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-driver-mxc/` | MXC compute driver | Windows in-process `ComputeDriver` backend for MXC sandbox execution |
 | `crates/openshell-driver-podman/` | Podman compute driver | In-process `ComputeDriver` backend for local Podman sandbox containers |
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
-| `crates/openshell-driver-mxc/` | Microsoft MXC compute driver | In-process Windows AppContainer and isolation-session compute backend |
 | `crates/openshell-prover/` | Policy prover | Policy verification and proof generation |
 | `crates/openshell-server-macros/` | Server macros | Compile-time helpers for gateway RPC authorization |
 | `crates/openshell-supervisor-middleware/` | Middleware runtime | Generic middleware registry, remote service integration, and chain execution |
 | `crates/openshell-supervisor-middleware-builtins/` | Built-in middleware | First-party in-process middleware implementations |
-| `crates/openshell-supervisor-network/` | Network supervisor | Proxying, L7 enforcement, policy evaluation, and inference routing |
+| `crates/openshell-supervisor-network/` | Network supervisor | Proxying, L7 enforcement, policy evaluation, and credential injection |
 | `crates/openshell-supervisor-process/` | Process supervisor | Process lifecycle, namespace, and bypass monitoring |
 | `crates/openshell-vfio/` | VFIO support | PCI and GPU passthrough preparation and lifecycle |
 | `python/openshell/` | Python SDK | Python bindings and CLI packaging |
@@ -116,7 +114,7 @@ Use an OCSF builder + `ocsf_emit!()` for events that represent **observable sand
 - SSH authentication (accepted, denied, nonce replay)
 - Process lifecycle (start, exit, timeout, signal failure)
 - Security findings (unsafe policy, unavailable controls, replay attacks)
-- Configuration changes (policy load/reload, TLS setup, inference routes, settings)
+- Configuration changes (policy load/reload, TLS setup, settings)
 - Application lifecycle (supervisor start, SSH server ready)
 
 ### When to use plain tracing
@@ -138,7 +136,7 @@ Use `info!()`, `debug!()`, `warn!()` for **internal operational plumbing** that 
 | SSH sessions | `SshActivityBuilder` | Authentication, channel operations |
 | Process start/stop | `ProcessActivityBuilder` | Entrypoint lifecycle, signal failures |
 | Security alerts | `DetectionFindingBuilder` | Nonce replay, bypass detection, unsafe policy. Dual-emit with the domain event. |
-| Policy/config changes | `ConfigStateChangeBuilder` | Policy load, Landlock apply, TLS setup, inference routes, settings |
+| Policy/config changes | `ConfigStateChangeBuilder` | Policy load, Landlock apply, TLS setup, settings |
 | Supervisor lifecycle | `AppLifecycleBuilder` | Sandbox start, SSH server ready/failed |
 
 ### Severity guidelines

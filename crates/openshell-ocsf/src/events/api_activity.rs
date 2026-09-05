@@ -110,7 +110,7 @@ mod tests {
             actor: Actor {
                 process: Process::new("supervisor", 1),
             },
-            src_endpoint: Endpoint::from_domain("inference.local", 443),
+            src_endpoint: Endpoint::from_domain("api.anthropic.com", 443),
             http_request: None,
             http_response: None,
             dst_endpoint: None,
@@ -128,7 +128,7 @@ mod tests {
         assert_eq!(json["activity_id"], 99);
         assert_eq!(json["api"]["operation"], "POST /v1/messages");
         assert_eq!(json["actor"]["process"]["name"], "supervisor");
-        assert_eq!(json["src_endpoint"]["domain"], "inference.local");
+        assert_eq!(json["src_endpoint"]["domain"], "api.anthropic.com");
         assert_eq!(json["ai_model"]["name"], "claude-3-haiku");
     }
 

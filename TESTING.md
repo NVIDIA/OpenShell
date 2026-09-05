@@ -136,8 +136,6 @@ def test_multiply(sandbox):
 |---|---|---|
 | `sandbox_client` | session | gRPC client connected to the active gateway |
 | `sandbox` | function | Factory returning a `Sandbox` context manager |
-| `inference_client` | session | Client for managing inference routes |
-| `mock_inference_route` | session | Creates a mock OpenAI-protocol route for tests |
 
 ### Rust CLI E2E (`e2e/rust/`)
 

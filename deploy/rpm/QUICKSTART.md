@@ -144,13 +144,12 @@ openshell provider create --name openai --type openai \
 openshell provider list
 ```
 
-## Configure inference routing (optional)
+## Configure an inference provider (optional)
 
-To route inference requests through a specific provider and model:
+Attach an inference provider so the sandbox can call its native endpoint:
 
 ```shell
-openshell inference set --provider openai --model gpt-4
-openshell inference get
+openshell sandbox create --provider openai
 ```
 
 ## Next steps

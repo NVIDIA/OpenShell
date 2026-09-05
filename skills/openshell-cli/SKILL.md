@@ -1,6 +1,6 @@
 ---
 name: openshell-cli
-description: Guide agents through using the OpenShell CLI (openshell) for sandbox management, gateway registration, provider configuration and refresh, policy iteration, settings, service exposure, BYOC workflows, and inference routing. Covers basic through advanced multi-step workflows. Trigger keywords - openshell, sandbox create, sandbox exec, sandbox connect, logs, provider create, provider profile, provider refresh, policy set, policy get, settings, service expose, forward, port forward, BYOC, bring your own container, inference, use openshell, run openshell, CLI usage, manage sandbox, manage provider, gateway add, gateway select.
+description: Guide agents through using the OpenShell CLI (openshell) for sandbox management, gateway registration, provider configuration and refresh, policy iteration, settings, service exposure, BYOC workflows, and native inference providers. Covers basic through advanced multi-step workflows. Trigger keywords - openshell, sandbox create, sandbox exec, sandbox connect, logs, provider create, provider profile, provider refresh, policy set, policy get, settings, service expose, forward, port forward, BYOC, bring your own container, inference, use openshell, run openshell, CLI usage, manage sandbox, manage provider, gateway add, gateway select.
 ---
 
 # OpenShell CLI
@@ -9,7 +9,7 @@ Guide agents through using the `openshell` CLI for sandbox and platform manageme
 
 ## Overview
 
-The OpenShell CLI (`openshell`) is the primary interface for managing sandboxes, providers, policies, settings, exposed services, inference routes, and gateway registrations. Gateway service lifecycle is handled outside the CLI by packages, systemd, or Helm. This skill teaches agents how to orchestrate CLI commands for common and complex workflows.
+The OpenShell CLI (`openshell`) is the primary interface for managing sandboxes, providers, policies, settings, exposed services, and gateway registrations. Gateway service lifecycle is handled outside the CLI by packages, systemd, or Helm. This skill teaches agents how to orchestrate CLI commands for common and complex workflows.
 
 **Companion skill**: For creating or modifying sandbox policy YAML content (network rules, L7 inspection, access presets), use the `generate-sandbox-policy` skill. This skill covers the CLI *commands* for the policy lifecycle; `generate-sandbox-policy` covers policy *content authoring*.
 
@@ -38,7 +38,7 @@ Use `openshell --help` and nested `--help` output as the authority for the insta
 - [Manage sandboxes](https://docs.nvidia.com/openshell/latest/sandboxes/manage-sandboxes.md)
 - [Manage providers](https://docs.nvidia.com/openshell/latest/sandboxes/manage-providers.md)
 - [Sandbox policies](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md)
-- [Inference routing](https://docs.nvidia.com/openshell/latest/sandboxes/inference-routing.md)
+- [Inference providers](https://docs.nvidia.com/openshell/latest/sandboxes/inference-routing.md)
 
 ---
 
@@ -700,29 +700,17 @@ The user does not need to disconnect. Policy updates are hot-reloaded; `--wait` 
 openshell sandbox delete work-session
 ```
 
-## Workflow 7: Managed Inference
+## Workflow 7: Native Inference Providers
 
-Configure the user-facing `inference.local` route or the system inference route used by platform functions.
-
-Ensure the provider exists, then set the route:
+Create an inference provider and attach it to the sandbox that needs it:
 
 ```bash
-openshell provider list
-openshell inference set \
-  --provider nvidia \
-  --model nvidia/nemotron-3-nano-30b-a3b
+openshell provider create --name nvidia --type nvidia --credential NVIDIA_API_KEY
+openshell sandbox provider attach work-session nvidia
+openshell sandbox provider list work-session
 ```
 
-This updates the managed `inference.local` route. Endpoint verification runs before the route is saved. Use `--no-verify` only when verification is intentionally impossible, and use `--timeout SECONDS` to configure the request timeout. Add `--system` to `set` or `update` for the platform-only system route.
-
-Inspect both configurations:
-
-```bash
-openshell inference get
-openshell inference get --system
-```
-
-Agents send HTTPS requests to `inference.local`; the sandbox intercepts them and routes them through the configured inference route. Sandbox policy remains separate from inference route configuration.
+The application calls the provider's native endpoint and selects its model and timeout. OpenShell injects credentials only for endpoints declared by the provider profile. For a private, local, or alternate endpoint, import an endpoint-bearing custom profile before creating the provider; a base URL override alone does not expand a built-in profile's network policy.
 
 ## Workflow 8: Gateway Management
 
@@ -835,4 +823,4 @@ $ openshell sandbox upload --help
 |-------|------------|
 | `generate-sandbox-policy` | Creating or modifying policy YAML content (network rules, L7 inspection, access presets, endpoint configuration, and network middleware) |
 | `debug-openshell-cluster` | Diagnosing gateway deployment, runtime, or health failures |
-| `debug-inference` | Diagnosing `inference.local`, host-backed local inference, and provider base URL issues |
+| `debug-inference` | Diagnosing provider-native inference, host-backed local models, and endpoint policy issues |

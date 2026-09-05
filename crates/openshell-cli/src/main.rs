@@ -264,7 +264,6 @@ const HELP_TEMPLATE: &str = "\
   gateway:     Manage gateways
   status:      Show gateway status and information
   whoami:      Show the authenticated user identity
-  inference:   Manage inference configuration
   doctor:      Diagnose gateway issues
 
 \x1b[1mADDITIONAL COMMANDS\x1b[0m
@@ -399,12 +398,6 @@ const GATEWAY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   $ openshell gateway select my-gateway
   $ openshell gateway info
   $ openshell gateway remove my-gateway
-";
-
-const INFERENCE_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
-  $ openshell inference set --provider openai --model gpt-4
-  $ openshell inference get
-  $ openshell inference update --model gpt-4-turbo
 ";
 
 const DOCTOR_HELP: &str = "\x1b[1mALIAS\x1b[0m
@@ -606,13 +599,6 @@ enum Commands {
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
         output: OutputFormat,
-    },
-
-    /// Manage inference configuration.
-    #[command(after_help = INFERENCE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
-    Inference {
-        #[command(subcommand)]
-        command: Option<InferenceCommands>,
     },
 
     // ===================================================================
@@ -1243,80 +1229,6 @@ enum GatewayCommands {
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
         output: OutputFormat,
-    },
-}
-
-// -----------------------------------------------------------------------
-// Inference commands
-// -----------------------------------------------------------------------
-
-#[derive(Subcommand, Debug)]
-enum InferenceCommands {
-    /// Set workspace-level inference provider and model.
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Set {
-        /// Provider name.
-        #[arg(long, add = ArgValueCompleter::new(completers::complete_provider_names))]
-        provider: String,
-
-        /// Model identifier to force for generation calls.
-        #[arg(long)]
-        model: String,
-
-        /// Configure the system inference route instead of the user-facing
-        /// route. System inference is used by platform functions (e.g. the
-        /// agent harness) and is not accessible to user code.
-        #[arg(long)]
-        system: bool,
-
-        /// Skip endpoint verification before saving the route.
-        #[arg(long)]
-        no_verify: bool,
-
-        /// Request timeout in seconds for inference calls (0 = default 60s).
-        #[arg(long, default_value_t = 0)]
-        timeout: u64,
-    },
-
-    /// Update workspace-level inference configuration (partial update).
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Update {
-        /// Provider name (unchanged if omitted).
-        #[arg(long, add = ArgValueCompleter::new(completers::complete_provider_names))]
-        provider: Option<String>,
-
-        /// Model identifier (unchanged if omitted).
-        #[arg(long)]
-        model: Option<String>,
-
-        /// Target the system inference route.
-        #[arg(long)]
-        system: bool,
-
-        /// Skip endpoint verification before saving the route.
-        #[arg(long)]
-        no_verify: bool,
-
-        /// Request timeout in seconds for inference calls (0 = default 60s, unchanged if omitted).
-        #[arg(long)]
-        timeout: Option<u64>,
-    },
-
-    /// Get workspace-level inference provider and model.
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Get {
-        /// Show the system inference route instead of the user-facing route.
-        /// When omitted, both routes are displayed.
-        #[arg(long)]
-        system: bool,
-    },
-
-    /// Delete a workspace-level inference route.
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Delete {
-        /// Delete the system inference route instead of the user-facing route.
-        #[arg(long)]
-        system: bool,
     },
 }
 
@@ -3116,69 +3028,6 @@ async fn run_async() -> Result<()> {
         }
 
         // -----------------------------------------------------------
-        // Inference commands
-        // -----------------------------------------------------------
-        Some(Commands::Inference {
-            command: Some(command),
-        }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
-            let endpoint = &ctx.endpoint;
-            let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
-            match command {
-                InferenceCommands::Set {
-                    provider,
-                    model,
-                    system,
-                    no_verify,
-                    timeout,
-                } => {
-                    let route_name = if system { "sandbox-system" } else { "" };
-                    run::gateway_inference_set(
-                        endpoint,
-                        &provider,
-                        &model,
-                        route_name,
-                        no_verify,
-                        timeout,
-                        &cli.workspace,
-                        &tls,
-                    )
-                    .await?;
-                }
-                InferenceCommands::Update {
-                    provider,
-                    model,
-                    system,
-                    no_verify,
-                    timeout,
-                } => {
-                    let route_name = if system { "sandbox-system" } else { "" };
-                    run::gateway_inference_update(
-                        endpoint,
-                        provider.as_deref(),
-                        model.as_deref(),
-                        route_name,
-                        no_verify,
-                        timeout,
-                        &cli.workspace,
-                        &tls,
-                    )
-                    .await?;
-                }
-                InferenceCommands::Get { system } => {
-                    let route_name = if system { Some("sandbox-system") } else { None };
-                    run::gateway_inference_get(endpoint, route_name, &cli.workspace, &tls).await?;
-                }
-                InferenceCommands::Delete { system } => {
-                    let route_name = if system { "sandbox-system" } else { "" };
-                    run::gateway_inference_delete(endpoint, route_name, &cli.workspace, &tls)
-                        .await?;
-                }
-            }
-        }
-
-        // -----------------------------------------------------------
         // Sandbox commands
         // -----------------------------------------------------------
         Some(Commands::Sandbox {
@@ -4031,13 +3880,6 @@ async fn run_async() -> Result<()> {
                 .print_help()
                 .expect("Failed to print help");
         }
-        Some(Commands::Inference { command: None }) => {
-            Cli::command()
-                .find_subcommand_mut("inference")
-                .expect("inference subcommand exists")
-                .print_help()
-                .expect("Failed to print help");
-        }
         Some(Commands::Rule { command: None }) => {
             Cli::command()
                 .find_subcommand_mut("rule")
@@ -4395,54 +4237,6 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Logs { name: Some(ref name), .. }) if name == "sandbox-1"
-        ));
-    }
-
-    #[test]
-    fn inference_set_accepts_no_verify_flag() {
-        let cli = Cli::try_parse_from([
-            "openshell",
-            "inference",
-            "set",
-            "--provider",
-            "openai-dev",
-            "--model",
-            "gpt-4.1",
-            "--no-verify",
-        ])
-        .expect("inference set should parse --no-verify");
-
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Inference {
-                command: Some(InferenceCommands::Set {
-                    no_verify: true,
-                    ..
-                })
-            })
-        ));
-    }
-
-    #[test]
-    fn inference_update_accepts_no_verify_flag() {
-        let cli = Cli::try_parse_from([
-            "openshell",
-            "inference",
-            "update",
-            "--provider",
-            "openai-dev",
-            "--no-verify",
-        ])
-        .expect("inference update should parse --no-verify");
-
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Inference {
-                command: Some(InferenceCommands::Update {
-                    no_verify: true,
-                    ..
-                })
-            })
         ));
     }
 
