@@ -4344,7 +4344,7 @@ fn build_env_list(
     upsert_env(
         &mut env,
         openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT,
-        "http://127.0.0.1:4318",
+        openshell_core::sandbox_env::OTLP_RECEIVER_ENDPOINT,
     );
     upsert_env(
         &mut env,

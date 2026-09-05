@@ -247,6 +247,15 @@ pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 /// Set to `http/protobuf` when the telemetry relay is active.
 pub const OTEL_EXPORTER_OTLP_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
 
+/// Default OTLP receiver bind address and port. All current topologies keep the
+/// process supervisor co-located with the agent, so localhost is correct. Future
+/// topologies that move the supervisor out of the agent's network namespace
+/// would derive the address from the topology (e.g., pod IP via downward API).
+pub const OTLP_RECEIVER_ADDR: &str = "127.0.0.1:4318";
+
+/// Default OTLP receiver endpoint URL for agent env var injection.
+pub const OTLP_RECEIVER_ENDPOINT: &str = "http://127.0.0.1:4318";
+
 // The corporate upstream-proxy configuration deliberately has no reserved
 // environment variables: it travels on the supervisor's argv
 // (`--upstream-proxy` and friends), which a sandbox image cannot forge the

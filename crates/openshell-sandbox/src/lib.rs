@@ -955,12 +955,17 @@ pub async fn run_sandbox(
             None
         };
 
-        // Telemetry relay: bind OTLP receiver on 127.0.0.1:4318 for all
-        // Linux topologies. For Docker/Podman with a netns, bind inside the
-        // namespace. For K8s/VM (shared namespace), bind directly.
+        // Telemetry relay: bind OTLP receiver for all Linux topologies.
+        // All current topologies keep the process supervisor co-located with
+        // the agent, so 127.0.0.1 is reachable from agent processes. Future
+        // topologies that move the supervisor out of the workload pod would
+        // need to derive the bind address from the topology (e.g., pod IP
+        // via downward API) and update OTEL_EXPORTER_OTLP_ENDPOINT to match.
         let telemetry_rx = {
             #[cfg(target_os = "linux")]
             {
+                let otlp_addr = openshell_core::sandbox_env::OTLP_RECEIVER_ADDR;
+
                 let (telemetry_session_tx, telemetry_session_rx) =
                     tokio::sync::mpsc::channel::<openshell_core::proto::SupervisorMessage>(64);
 
@@ -982,13 +987,13 @@ pub async fn run_sandbox(
                     telemetry_session_tx,
                 );
 
-                let localhost_addr: std::net::SocketAddr = "127.0.0.1:4318".parse().unwrap();
+                let bind_addr: std::net::SocketAddr = otlp_addr.parse().unwrap();
 
                 if let Some(ns) = netns.as_ref() {
-                    match ns.bind_tcp_in_netns("127.0.0.1:4318").await {
+                    match ns.bind_tcp_in_netns(otlp_addr).await {
                         Ok(listener) => {
                             let handle = relay.start_with_listener(listener);
-                            tracing::info!(bind = %localhost_addr, "telemetry relay started (netns)");
+                            tracing::info!(bind = %bind_addr, "telemetry relay started (netns)");
                             telemetry_relay_handle = Some(handle);
                         }
                         Err(e) => {
@@ -996,9 +1001,9 @@ pub async fn run_sandbox(
                         }
                     }
                 } else {
-                    match relay.start(localhost_addr).await {
+                    match relay.start(bind_addr).await {
                         Ok(handle) => {
-                            tracing::info!(bind = %localhost_addr, "telemetry relay started");
+                            tracing::info!(bind = %bind_addr, "telemetry relay started");
                             telemetry_relay_handle = Some(handle);
                         }
                         Err(e) => {

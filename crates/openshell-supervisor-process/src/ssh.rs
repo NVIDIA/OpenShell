@@ -1222,7 +1222,7 @@ fn apply_child_env(
         for (key, value) in child_env::proxy_env_vars(url) {
             cmd.env(key, value);
         }
-        for (key, value) in child_env::otel_env_vars("http://127.0.0.1:4318", "http/protobuf") {
+        for (key, value) in child_env::otel_env_vars(openshell_core::sandbox_env::OTLP_RECEIVER_ENDPOINT, "http/protobuf") {
             cmd.env(key, value);
         }
     }
