@@ -82,6 +82,10 @@ apps:
   gateway:
     command: bin/openshell-gateway-wrapper
     daemon: simple
+    # Do not start before the Docker interface is available. The
+    # connect-plug-docker hook enables and starts the gateway after Docker
+    # access is granted, including for store-managed auto-connections.
+    install-mode: disable
     # refresh-mode: endure prevents snapd from restarting the gateway daemon
     # during snap refreshes, which would kill active sandbox sessions.
     # Operators must manually restart the service after a refresh if needed.

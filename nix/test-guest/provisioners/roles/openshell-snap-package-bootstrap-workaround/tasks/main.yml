@@ -1,0 +1,48 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Verify prebuilt OpenShell gateway binary
+  become: true
+  ansible.builtin.stat:
+    path: "{{ openshell_jwt_workaround_gateway_bin }}"
+  register: openshell_jwt_workaround_gateway_bin_stat
+
+- name: Require prebuilt OpenShell gateway binary
+  ansible.builtin.assert:
+    that:
+      - openshell_jwt_workaround_gateway_bin_stat.stat.exists
+      - openshell_jwt_workaround_gateway_bin_stat.stat.executable
+    fail_msg: >-
+      Missing executable JWT workaround gateway binary:
+      {{ openshell_jwt_workaround_gateway_bin }}
+
+- name: Create OpenShell Snap gateway state directory
+  become: true
+  ansible.builtin.file:
+    path: "{{ openshell_snap_gateway_state_dir }}"
+    state: directory
+    mode: "0700"
+
+- name: Generate OpenShell Snap PKI and sandbox JWT bundle before Snap installation
+  become: true
+  ansible.builtin.command:
+    cmd: >-
+      {{ openshell_jwt_workaround_gateway_bin }} generate-certs
+      --output-dir {{ openshell_snap_gateway_tls_dir }}
+      --server-san host.openshell.internal
+    creates: "{{ openshell_snap_gateway_tls_dir }}/jwt/signing.pem"
+
+- name: Configure the temporary OpenShell Snap package workaround
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ openshell_snap_gateway_config }}"
+    mode: "0600"
+    content: |
+      [openshell.gateway.auth]
+      allow_unauthenticated_users = true
+
+      [openshell.gateway.gateway_jwt]
+      signing_key_path = "{{ openshell_snap_gateway_tls_dir }}/jwt/signing.pem"
+      public_key_path = "{{ openshell_snap_gateway_tls_dir }}/jwt/public.pem"
+      kid_path = "{{ openshell_snap_gateway_tls_dir }}/jwt/kid"

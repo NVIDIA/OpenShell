@@ -1,0 +1,10 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Temporary package-workaround role. Remove when the Snap service creates this
+# bundle itself before its first gateway start.
+openshell_jwt_workaround_gateway_bin: /var/lib/openshell-conformance/workarounds/openshell-gateway
+openshell_snap_gateway_state_dir: /var/snap/openshell/common
+openshell_snap_gateway_tls_dir: "{{ openshell_snap_gateway_state_dir }}/tls"
+openshell_snap_gateway_config: "{{ openshell_snap_gateway_state_dir }}/gateway.toml"

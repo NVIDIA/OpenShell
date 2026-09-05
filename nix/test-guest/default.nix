@@ -30,6 +30,7 @@ let
     podman-rootless = ./configuration/podman-rootless.yml;
     selinux = ./configuration/selinux.yml;
     snapd = ./configuration/snapd.yml;
+    docker-snap = ./configuration/docker-snap.yml;
   };
 
   configurationTasks = [
@@ -46,6 +47,7 @@ let
     "gateway-rootless-podman"
     "openshell-rpm-gateway-reinstall"
     "openshell-rpm-gateway-upgrade"
+    "openshell-snap"
   ];
 
   mkDistroProfile =
