@@ -1516,6 +1516,11 @@ fn sandbox_bundle_stages_private_mutual_tls_material() {
         Some(&(0o755, 0, 0)),
         "the workload must not be able to replace the supervisor secret directory"
     );
+    assert_eq!(
+        entries.get(Path::new(".openshell/channel/sandbox")),
+        Some(&(0o711, u64::from(identity.uid), u64::from(identity.gid))),
+        "the supervisor must be able to traverse to the authenticated socket without reading sandbox secrets"
+    );
 }
 
 #[test]
