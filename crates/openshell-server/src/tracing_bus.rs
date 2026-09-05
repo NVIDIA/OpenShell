@@ -749,7 +749,6 @@ impl PlatformEventBus {
             .collect()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn tail_after(
         &self,
         sandbox_id: &str,

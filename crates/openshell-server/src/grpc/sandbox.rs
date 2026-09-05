@@ -1751,6 +1751,7 @@ pub(super) async fn handle_watch_sandbox(
     let log_sources = req.log_sources;
     let log_min_level = req.log_min_level;
     let event_tail = req.event_tail;
+    let resume_after_cursor = req.resume_after_cursor;
 
     let (tx, rx) = mpsc::channel::<Result<SandboxStreamEvent, Status>>(256);
     let state = state.clone();
@@ -1833,13 +1834,58 @@ pub(super) async fn handle_watch_sandbox(
                 }
             }
 
-            // Replay tail logs (best-effort), filtered by log_since_time and log_sources.
-            if follow_logs {
-                for evt in state.tracing_log_bus.tail(&sandbox_id, log_tail as usize) {
-                    if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
-                        ref log,
-                    )) = evt.payload
-                    {
+            if resume_after_cursor > 0 {
+                // Resume: replay events strictly after the client's cursor from both
+                // resumable buses. Either bus reporting a trimmed range is an
+                // unrecoverable gap -> terminate with a documented status.
+                use openshell_core::proto::sandbox_stream_event::Payload;
+
+                let log_replay = if follow_logs {
+                    Some(
+                        state
+                            .tracing_log_bus
+                            .tail_after(&sandbox_id, resume_after_cursor),
+                    )
+                } else {
+                    None
+                };
+
+                let platform_replay = if follow_events {
+                    Some(
+                        state
+                            .tracing_log_bus
+                            .platform_event_bus
+                            .tail_after(&sandbox_id, resume_after_cursor),
+                    )
+                } else {
+                    None
+                };
+
+                // Gap check FIRST (borrows), before the merge moves the vecs.
+                for replay in [&log_replay, &platform_replay] {
+                    if let Some(Err(gap)) = replay {
+                        let _ = tx.send(Err(Status::out_of_range(format!(
+                                "resume cursor {} is no longer available; earliest resumable cursor is {}",
+                                gap.requested_after, gap.oldest_available
+                            ))))
+                            .await;
+                        return;
+                    }
+                }
+
+                // Merge both buses by shared cursor, then emit ascending.
+                let mut merged: Vec<SandboxStreamEvent> = Vec::new();
+                if let Some(Ok(v)) = log_replay {
+                    merged.extend(v);
+                }
+                if let Some(Ok(v)) = platform_replay {
+                    merged.extend(v);
+                }
+
+                merged.sort_by_key(|e| e.cursor);
+
+                for evt in merged {
+                    if let Some(Payload::Log(ref log)) = evt.payload {
                         if let Some(since_time) = log_since_time.as_ref() {
                             let Some(event_time) = log.event_time.as_ref() else {
                                 continue;
@@ -1864,17 +1910,52 @@ pub(super) async fn handle_watch_sandbox(
                         return;
                     }
                 }
-            }
+            } else {
+                // Replay tail logs (best-effort), filtered by log_since_time and log_sources.
+                if follow_logs {
+                    for evt in state.tracing_log_bus.tail(&sandbox_id, log_tail as usize) {
+                        if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
+                            ref log,
+                        )) = evt.payload
+                        {
+                            if let Some(since_time) = log_since_time.as_ref() {
+                                let Some(event_time) = log.event_time.as_ref() else {
+                                    continue;
+                                };
+                                let Ok(ordering) = openshell_core::time::compare_timestamps(
+                                    event_time,
+                                    since_time,
+                                ) else {
+                                    continue;
+                                };
+                                if ordering == std::cmp::Ordering::Less {
+                                    continue;
+                                }
+                            }
+                            if !log_sources.is_empty() && !source_matches(&log.source, &log_sources)
+                            {
+                                continue;
+                            }
+                            if !level_matches(&log.level, &log_min_level) {
+                                continue;
+                            }
+                        }
+                        if tx.send(Ok(evt)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
 
-            // Replay buffered platform events.
-            if follow_events {
-                for evt in state
-                    .tracing_log_bus
-                    .platform_event_bus
-                    .tail(&sandbox_id, event_tail as usize)
-                {
-                    if tx.send(Ok(evt)).await.is_err() {
-                        return;
+                // Replay buffered platform events.
+                if follow_events {
+                    for evt in state
+                        .tracing_log_bus
+                        .platform_event_bus
+                        .tail(&sandbox_id, event_tail as usize)
+                    {
+                        if tx.send(Ok(evt)).await.is_err() {
+                            return;
+                        }
                     }
                 }
             }
