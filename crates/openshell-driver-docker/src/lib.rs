@@ -84,6 +84,11 @@ const WATCH_BUFFER: usize = 128;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const WATCH_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SUPERVISOR_READY_TIMEOUT: Duration = Duration::from_secs(90);
+// The gateway closes a supervisor session as soon as it commits a sandbox to
+// Stopping, just before the compute-driver StopSandbox RPC arrives. Give that
+// request a bounded opportunity to mark the control exit intentional before
+// publishing a fail-closed runtime error.
+const SUPERVISOR_INTENTIONAL_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const SUPERVISOR_HEALTH_INTERVAL_NS: i64 = 250_000_000;
 const SUPERVISOR_HEALTH_TIMEOUT_NS: i64 = 2_000_000_000;
 const SUPERVISOR_HEALTH_START_PERIOD_NS: i64 = 60_000_000_000;
@@ -4477,6 +4482,21 @@ async fn spawn_docker_control_process(
             }
             result = wait => {
                 if monitored_shutdown.load(Ordering::Acquire) {
+                    let _ = monitored_docker.remove_container(
+                        &monitored_supervisor_id,
+                        Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+                    ).await;
+                    return;
+                }
+                if matches!(
+                    tokio::time::timeout(
+                        SUPERVISOR_INTENTIONAL_SHUTDOWN_GRACE,
+                        &mut shutdown_requested,
+                    )
+                    .await,
+                    Ok(Ok(())),
+                ) || monitored_shutdown.load(Ordering::Acquire)
+                {
                     let _ = monitored_docker.remove_container(
                         &monitored_supervisor_id,
                         Some(RemoveContainerOptionsBuilder::default().force(true).build()),
