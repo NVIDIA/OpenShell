@@ -384,6 +384,8 @@ async fn run_single_session(
         _ => return Err("expected SessionAccepted or SessionRejected".into()),
     };
 
+    // Stage 1 leaves startup fetches and polling authoritative.
+    drop(accepted.bootstrap);
     let heartbeat_secs = accepted.heartbeat_interval_secs.max(5);
     let event = session_established_event(
         openshell_ocsf::ctx::ctx(),
@@ -419,7 +421,7 @@ async fn run_single_session(
                 };
                 handle_gateway_message(
                     &msg,
-                    &context,
+                    || context,
                 );
             }
             _ = heartbeat_interval.tick() => {
@@ -486,7 +488,21 @@ struct GatewayMessageContext<'a> {
     terminating: &'a Arc<AtomicBool>,
 }
 
-fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<'_>) {
+fn handle_gateway_message<'a>(
+    msg: &GatewayMessage,
+    context: impl FnOnce() -> GatewayMessageContext<'a>,
+) {
+    if matches!(
+        msg.payload,
+        Some(
+            gateway_message::Payload::ConfigUpdate(_)
+                | gateway_message::Payload::SessionAccepted(_)
+        )
+    ) {
+        // Stage 1 deliberately neither applies nor acknowledges snapshots.
+        return;
+    }
+    let context = context();
     match &msg.payload {
         Some(gateway_message::Payload::Heartbeat(_)) => {
             // Gateway heartbeat — nothing to do.
@@ -894,6 +910,62 @@ mod target_tests {
 #[cfg(test)]
 mod ocsf_event_tests {
     use super::*;
+    use openshell_core::proto::{
+        ConfigBootstrap, ConfigUpdate, InferenceBundleSnapshot, ProviderEnvironmentSnapshot,
+        SandboxConfigSnapshot, SessionAccepted, config_update,
+    };
+    use std::sync::atomic::AtomicUsize;
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone)]
+    struct EventCount(Arc<AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCount {
+        fn on_event(&self, _: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn config_deliveries_do_not_access_runtime_or_emit_logs() {
+        let environment = ProviderEnvironmentSnapshot {
+            environment: [("TOKEN".into(), "secret-marker".into())].into(),
+            ..Default::default()
+        };
+        let bootstrap = ConfigBootstrap {
+            sandbox_config: Some(SandboxConfigSnapshot::default()),
+            provider_environment: Some(environment.clone()),
+            inference_bundle: Some(InferenceBundleSnapshot::default()),
+        };
+        let mut messages = vec![GatewayMessage {
+            payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
+                bootstrap: Some(bootstrap),
+                ..Default::default()
+            })),
+        }];
+        for component in [
+            config_update::Component::SandboxConfig(SandboxConfigSnapshot::default()),
+            config_update::Component::ProviderEnvironment(environment),
+            config_update::Component::InferenceBundle(InferenceBundleSnapshot::default()),
+        ] {
+            messages.push(GatewayMessage {
+                payload: Some(gateway_message::Payload::ConfigUpdate(ConfigUpdate {
+                    component: Some(component),
+                    ..Default::default()
+                })),
+            });
+        }
+        let events = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(EventCount(events.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            for message in messages {
+                handle_gateway_message(&message, || {
+                    panic!("ignored snapshots must not access runtime or RPC clients")
+                });
+            }
+        });
+        assert_eq!(events.load(Ordering::SeqCst), 0);
+    }
 
     fn ctx() -> SandboxContext {
         SandboxContext {

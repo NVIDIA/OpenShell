@@ -52,6 +52,7 @@ struct LiveSession {
     /// removing a session that has since been superseded by a reconnect.
     session_id: String,
     tx: mpsc::Sender<GatewayMessage>,
+    config_sequences: [u64; 3],
     /// Fires when this session is superseded by a reconnect so the old session
     /// task can exit promptly — dropping its own `tx` clone and closing the
     /// outbound stream. Without this, a concurrent `open_relay` that grabbed
@@ -127,6 +128,7 @@ impl SupervisorSessionRegistry {
                 sandbox_id,
                 session_id,
                 tx,
+                config_sequences: [0; 3],
                 shutdown,
                 terminal_delivery_finalized: false,
                 connected_at: Instant::now(),
@@ -139,6 +141,50 @@ impl SupervisorSessionRegistry {
                 true
             }
             None => false,
+        }
+    }
+
+    pub(crate) fn deliver_config(
+        &self,
+        sandbox_id: &str,
+        message: crate::supervisor_config::SupervisorConfigMessage,
+    ) -> crate::supervisor_config::DeliveryDisposition {
+        use crate::supervisor_config::{DeliveryDisposition, SupervisorConfigMessage};
+        use openshell_core::proto::config_update::Component;
+
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(session) = sessions.get_mut(sandbox_id) else {
+            return DeliveryDisposition::NoActiveSession;
+        };
+        let payload = match message {
+            SupervisorConfigMessage::Bootstrap(bootstrap) => {
+                gateway_message::Payload::SessionAccepted(SessionAccepted {
+                    session_id: session.session_id.clone(),
+                    heartbeat_interval_secs: HEARTBEAT_INTERVAL_SECS,
+                    bootstrap: Some(*bootstrap),
+                })
+            }
+            SupervisorConfigMessage::Update(mut update) => {
+                let index = match update.component {
+                    Some(Component::SandboxConfig(_)) => 0,
+                    Some(Component::ProviderEnvironment(_)) => 1,
+                    Some(Component::InferenceBundle(_)) => 2,
+                    None => return DeliveryDisposition::InvalidComponent,
+                };
+                let Some(sequence) = session.config_sequences[index].checked_add(1) else {
+                    return DeliveryDisposition::QueueUnavailable;
+                };
+                session.config_sequences[index] = sequence;
+                update.update_id = Uuid::new_v4().to_string();
+                update.component_sequence = sequence;
+                gateway_message::Payload::ConfigUpdate(*update)
+            }
+        };
+        match session.tx.try_send(GatewayMessage {
+            payload: Some(payload),
+        }) {
+            Ok(()) => DeliveryDisposition::Delivered,
+            Err(_) => DeliveryDisposition::QueueUnavailable,
         }
     }
 
@@ -752,9 +798,25 @@ pub async fn handle_connect_supervisor(
         "supervisor session: accepted"
     );
 
-    // Step 2: Create and register the outbound channel.
+    let bootstrap = crate::supervisor_config::build_bootstrap(state, &sandbox_id).await;
+    let bootstrap_outcome = if bootstrap.is_some() {
+        "enqueued"
+    } else {
+        "omitted"
+    };
+
+    // Acceptance must precede live deliveries, including a concurrent mutation.
     let (tx, rx) = mpsc::channel::<GatewayMessage>(64);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tx.try_send(GatewayMessage {
+        payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
+            session_id: session_id.clone(),
+            heartbeat_interval_secs: HEARTBEAT_INTERVAL_SECS,
+            bootstrap,
+        })),
+    })
+    .map_err(|_| Status::internal("failed to send session accepted"))?;
+    metrics::counter!("openshell_supervisor_config_bootstrap_delivery_total", "outcome" => bootstrap_outcome).increment(1);
     let superseded = state.supervisor_sessions.register(
         sandbox_id.clone(),
         session_id.clone(),
@@ -767,22 +829,6 @@ pub async fn handle_connect_supervisor(
             session_id = %session_id,
             "supervisor session: superseded previous session"
         );
-    }
-
-    // Step 3: Send SessionAccepted.
-    let accepted = GatewayMessage {
-        payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
-            session_id: session_id.clone(),
-            heartbeat_interval_secs: HEARTBEAT_INTERVAL_SECS,
-        })),
-    };
-    if tx.send(accepted).await.is_err() {
-        // Only evict ourselves — a faster reconnect may already have
-        // superseded this registration.
-        state
-            .supervisor_sessions
-            .remove_if_current(&sandbox_id, &session_id);
-        return Err(Status::internal("failed to send session accepted"));
     }
 
     if superseded {
@@ -982,8 +1028,12 @@ fn handle_supervisor_message(
     msg: SupervisorMessage,
 ) {
     match msg.payload {
-        Some(supervisor_message::Payload::Heartbeat(_)) => {
-            // Heartbeat received — nothing to do for now.
+        Some(
+            supervisor_message::Payload::ConfigUpdateResult(_)
+            | supervisor_message::Payload::ConfigBootstrapResult(_)
+            | supervisor_message::Payload::Heartbeat(_),
+        ) => {
+            // Stage 1 does not record stream apply results.
         }
         Some(supervisor_message::Payload::RelayOpenResult(result)) => {
             if result.success {

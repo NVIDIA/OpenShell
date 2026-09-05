@@ -396,6 +396,23 @@ message GetSandboxConfigResponse {
   bool extension_authentication_enabled = 12;
 }
 
+// Complete effective configuration. Revisions are equality-only fingerprints;
+// policy versions retain their monotonic, source-scoped meaning.
+message SandboxConfigSnapshot {
+  SandboxPolicy policy = 1;
+  uint32 version = 2;
+  string policy_hash = 3;
+  map<string, EffectiveSetting> settings = 4;
+  uint64 config_revision = 5;
+  PolicySource policy_source = 6;
+  uint32 global_policy_version = 7;
+  uint64 provider_env_revision = 8;
+  repeated SupervisorMiddlewareService supervisor_middleware_services = 9;
+  string workspace = 10;
+  string policy_validation_failure_mode = 11;
+  bool extension_authentication_enabled = 12;
+}
+
 // Connection details for one operator-registered supervisor middleware service.
 // V1 supports plaintext and server-authenticated TLS gRPC.
 message SupervisorMiddlewareService {

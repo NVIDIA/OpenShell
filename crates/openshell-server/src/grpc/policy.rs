@@ -22,6 +22,7 @@ use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
 #[cfg(test)]
 use crate::provider_profile_sources::ProviderProfileSources;
+use crate::supervisor_config::{Components, ConfigChange};
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
@@ -1526,6 +1527,10 @@ async fn auto_approve_chunk(
             return Err(status);
         }
     };
+    state.config_publisher.publish(
+        state,
+        ConfigChange::Sandbox(sandbox_id.to_string(), Components::ConfigAndProviders),
+    );
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
     let now_ms = current_time_ms();
@@ -2316,6 +2321,16 @@ pub(super) async fn handle_get_sandbox_config(
 
     let sandbox =
         super::sandbox::fetch_and_authorize_sandbox(state, &principal, &sandbox_id).await?;
+    build_sandbox_config_snapshot(state, &sandbox)
+        .await
+        .map(|snapshot| Response::new(snapshot.into()))
+}
+
+pub async fn build_sandbox_config_snapshot(
+    state: &ServerState,
+    sandbox: &Sandbox,
+) -> Result<openshell_core::proto::SandboxConfigSnapshot, Status> {
+    let sandbox_id = sandbox.object_id();
     let workspace = sandbox.object_workspace().to_string();
     let sandbox_provider_names = sandbox
         .spec
@@ -2330,7 +2345,7 @@ pub(super) async fn handle_get_sandbox_config(
     // Try to get the latest policy from the policy history table.
     let latest = state
         .store
-        .get_latest_policy(&sandbox_id)
+        .get_latest_policy(sandbox_id)
         .await
         .map_err(|e| Status::internal(format!("fetch policy history failed: {e}")))?;
 
@@ -2349,55 +2364,19 @@ pub(super) async fn handle_get_sandbox_config(
             record.policy_hash,
         )
     } else {
-        // Lazy backfill: no policy history exists yet.
+        // Legacy records without history remain readable until startup repair.
         let spec = sandbox
             .spec
             .as_ref()
             .ok_or_else(|| Status::internal("sandbox has no spec"))?;
 
-        match spec.policy.clone() {
-            None => {
-                debug!(
-                    sandbox_id = %sandbox_id,
-                    "GetSandboxConfig: no policy configured, returning empty response"
-                );
-                (None, 0, String::new())
-            }
-            Some(spec_policy) => {
+        spec.policy.clone().map_or_else(
+            || (None, 0, String::new()),
+            |spec_policy| {
                 let hash = deterministic_policy_hash(&spec_policy);
-                let payload = spec_policy.encode_to_vec();
-                let policy_id = uuid::Uuid::new_v4().to_string();
-
-                if let Err(e) = state
-                    .store
-                    .put_policy_revision(&policy_id, &sandbox_id, &workspace, 1, &payload, &hash)
-                    .await
-                {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        error = %e,
-                        "Failed to backfill policy version 1"
-                    );
-                } else if let Err(e) = state
-                    .store
-                    .update_policy_status(&sandbox_id, 1, "loaded", None, None)
-                    .await
-                {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        error = %e,
-                        "Failed to mark backfilled policy as loaded"
-                    );
-                }
-
-                info!(
-                    sandbox_id = %sandbox_id,
-                    "GetSandboxConfig served from spec (backfilled version 1)"
-                );
-
                 (Some(spec_policy), 1, hash)
-            }
-        }
+            },
+        )
     };
 
     let global_settings = load_global_settings(state.store.as_ref()).await?;
@@ -2462,7 +2441,7 @@ pub(super) async fn handle_get_sandbox_config(
             effective_policy,
             &provider_policy_context.credentialed_scopes,
         );
-        report_uninspected_credentialed_endpoints(effective_policy, &sandbox_id);
+        report_uninspected_credentialed_endpoints(effective_policy, sandbox_id);
         policy_hash = deterministic_policy_hash(effective_policy);
     }
 
@@ -2490,7 +2469,7 @@ pub(super) async fn handle_get_sandbox_config(
     );
     if let Some(policy) = policy.as_ref() {
         validate_policy_credential_bindings_for_sandbox(
-            state.as_ref(),
+            state,
             &provider_profile_catalog,
             &workspace,
             &sandbox_provider_names,
@@ -2507,7 +2486,7 @@ pub(super) async fn handle_get_sandbox_config(
     )
     .await?;
 
-    Ok(Response::new(GetSandboxConfigResponse {
+    Ok(openshell_core::proto::SandboxConfigSnapshot {
         policy,
         version,
         policy_hash,
@@ -2524,7 +2503,50 @@ pub(super) async fn handle_get_sandbox_config(
             .as_str()
             .to_string(),
         extension_authentication_enabled: state.sandbox_jwt_issuer.is_some(),
-    }))
+    })
+}
+
+pub async fn initialize_policy_history(store: &Store, sandbox: &Sandbox) -> Result<(), Status> {
+    let Some(policy) = sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref()) else {
+        return Ok(());
+    };
+    store
+        .put_initial_policy_revision(
+            &PolicyRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                sandbox_id: sandbox.object_id().to_string(),
+                version: 1,
+                policy_payload: policy.encode_to_vec(),
+                policy_hash: deterministic_policy_hash(policy),
+                status: "loaded".to_string(),
+                load_error: None,
+                created_at_ms: current_time_ms(),
+                loaded_at_ms: None,
+                provenance: HashMap::new(),
+            },
+            sandbox.object_workspace(),
+        )
+        .await
+        .map_err(|_| Status::internal("initial policy history persistence failed"))
+}
+
+pub async fn repair_policy_history(store: &Store) -> Result<(), Status> {
+    let mut cursor = None;
+    loop {
+        let records = store
+            .list_by_type_after(Sandbox::object_type(), cursor.as_ref(), 100)
+            .await
+            .map_err(|_| Status::internal("policy history repair lookup failed"))?;
+        if records.is_empty() {
+            return Ok(());
+        }
+        for record in &records {
+            let sandbox = Sandbox::decode(record.payload.as_slice())
+                .map_err(|_| Status::internal("policy history repair decode failed"))?;
+            initialize_policy_history(store, &sandbox).await?;
+        }
+        cursor = records.last().map(crate::persistence::ObjectCursor::from);
+    }
 }
 
 #[cfg(test)]
@@ -3021,9 +3043,26 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
     drop(request);
 
+    let mut snapshot = build_provider_environment_snapshot(state, &sandbox_id).await?;
+    if !supports_static_credential_bindings {
+        snapshot
+            .environment
+            .retain(|key, _| snapshot.non_secret_environment_keys.contains(key));
+        snapshot
+            .credential_expires_at_ms
+            .retain(|key, _| snapshot.environment.contains_key(key));
+        snapshot.static_credential_bindings.clear();
+    }
+    Ok(Response::new(snapshot.into()))
+}
+
+pub async fn build_provider_environment_snapshot(
+    state: &ServerState,
+    sandbox_id: &str,
+) -> Result<openshell_core::proto::ProviderEnvironmentSnapshot, Status> {
     let sandbox = state
         .store
-        .get_message::<Sandbox>(&sandbox_id)
+        .get_message::<Sandbox>(sandbox_id)
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
@@ -3046,11 +3085,11 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     )
     .await?;
     let effective_policy = current_effective_policy_for_sandbox(
-        state.as_ref(),
+        state,
         &provider_profile_catalog,
         &workspace,
         &sandbox,
-        &sandbox_id,
+        sandbox_id,
     )
     .await?;
     let policy_credential_bindings =
@@ -3073,11 +3112,11 @@ pub(super) async fn handle_get_sandbox_provider_environment(
             &provider_records,
             &policy_credential_bindings,
             &state.credentials,
-            Some(&sandbox_id),
+            Some(sandbox_id),
         )
         .await?;
 
-    if supports_static_credential_bindings {
+    {
         let unbound_static_keys = provider_environment
             .static_credential_keys
             .iter()
@@ -3098,12 +3137,6 @@ pub(super) async fn handle_get_sandbox_provider_environment(
             provider_environment.credential_expires_at_ms.remove(&key);
             provider_environment.static_credential_keys.remove(&key);
         }
-    } else {
-        for key in &provider_environment.static_credential_keys {
-            provider_environment.environment.remove(key);
-            provider_environment.credential_expires_at_ms.remove(key);
-        }
-        provider_environment.static_credential_bindings.clear();
     }
 
     info!(
@@ -3121,14 +3154,14 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         .cloned()
         .collect();
 
-    Ok(Response::new(GetSandboxProviderEnvironmentResponse {
+    Ok(openshell_core::proto::ProviderEnvironmentSnapshot {
         environment: provider_environment.environment,
         provider_env_revision,
         credential_expires_at_ms: provider_environment.credential_expires_at_ms,
         dynamic_credentials: provider_environment.dynamic_credentials,
         static_credential_bindings: provider_environment.static_credential_bindings,
         non_secret_environment_keys,
-    }))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3267,6 +3300,9 @@ async fn handle_update_config_inner(
                 if changed {
                     global_settings.revision = global_settings.revision.wrapping_add(1);
                     save_global_settings(state.store.as_ref(), &global_settings).await?;
+                    state
+                        .config_publisher
+                        .publish(state, ConfigChange::Global(Components::ConfigAndProviders));
                 }
                 return Ok(update_config_response(
                     u32::try_from(current.version).unwrap_or(0),
@@ -3325,6 +3361,10 @@ async fn handle_update_config_inner(
                 save_global_settings(state.store.as_ref(), &global_settings).await?;
             }
 
+            state
+                .config_publisher
+                .publish(state, ConfigChange::Global(Components::ConfigAndProviders));
+
             return Ok(update_config_response(
                 u32::try_from(next_version).unwrap_or(0),
                 hash,
@@ -3367,6 +3407,10 @@ async fn handle_update_config_inner(
 
             global_settings.revision = global_settings.revision.wrapping_add(1);
             save_global_settings(state.store.as_ref(), &global_settings).await?;
+
+            state
+                .config_publisher
+                .publish(state, ConfigChange::Global(Components::ConfigAndProviders));
 
             if req.delete_setting
                 && key == POLICY_SETTING_KEY
@@ -3450,6 +3494,12 @@ async fn handle_update_config_inner(
             )
             .await?;
 
+            if removed {
+                state.config_publisher.publish(
+                    state,
+                    ConfigChange::Sandbox(sandbox_id.clone(), Components::ConfigAndProviders),
+                );
+            }
             return Ok(update_config_response(
                 0,
                 String::new(),
@@ -3494,6 +3544,12 @@ async fn handle_update_config_inner(
         )
         .await?;
 
+        if changed {
+            state.config_publisher.publish(
+                state,
+                ConfigChange::Sandbox(sandbox_id.clone(), Components::ConfigAndProviders),
+            );
+        }
         return Ok(update_config_response(
             0,
             String::new(),
@@ -3556,6 +3612,10 @@ async fn handle_update_config_inner(
         };
 
         state.sandbox_watch_bus.notify(&sandbox_id);
+        state.config_publisher.publish(
+            state,
+            ConfigChange::Sandbox(sandbox_id.clone(), Components::ConfigAndProviders),
+        );
         emit_gateway_policy_audit_log(
             &sandbox_id,
             sandbox.object_name(),
@@ -3758,6 +3818,10 @@ async fn handle_update_config_inner(
         })?
     };
     response_annotations = committed_annotations;
+    state.config_publisher.publish(
+        state,
+        ConfigChange::Sandbox(sandbox_id.clone(), Components::ConfigAndProviders),
+    );
     state.sandbox_watch_bus.notify(&sandbox_id);
 
     if backfill_policy.is_some() {
@@ -3809,6 +3873,10 @@ async fn handle_update_config_inner(
         .supersede_older_policies(&sandbox_id, next_version)
         .await;
 
+    state.config_publisher.publish(
+        state,
+        ConfigChange::Sandbox(sandbox_id.clone(), Components::ConfigAndProviders),
+    );
     state.sandbox_watch_bus.notify(&sandbox_id);
 
     info!(
@@ -4748,6 +4816,10 @@ async fn handle_approve_draft_chunk_inner(
             return Err(status);
         }
     };
+    state.config_publisher.publish(
+        state,
+        ConfigChange::Sandbox(sandbox_id.clone(), Components::ConfigAndProviders),
+    );
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
     let now_ms = current_time_ms();
@@ -5163,6 +5235,12 @@ async fn handle_approve_all_draft_chunks_inner(
         }
     };
 
+    if !accepted.is_empty() {
+        state.config_publisher.publish(
+            state,
+            ConfigChange::Sandbox(sandbox_id.clone(), Components::ConfigAndProviders),
+        );
+    }
     for (chunk, _, chunk_summary) in &accepted {
         let now_ms = current_time_ms();
         clear_pending_application_error(state, &chunk.id).await;
@@ -5364,6 +5442,10 @@ async fn handle_undo_draft_chunk_inner(
     );
 
     let (version, hash) = remove_chunk_from_policy(state, &sandbox_id, &workspace, &chunk).await?;
+    state.config_publisher.publish(
+        state,
+        ConfigChange::Sandbox(sandbox_id.clone(), Components::ConfigAndProviders),
+    );
 
     // Clear any prior rejection_reason on the way back to "pending" so an
     // agent reading the chunk via policy.local cannot see a stale guidance
@@ -9408,6 +9490,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sandbox_config_read_does_not_create_policy_history() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-read-only",
+                "read-only",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        let first = get_sandbox_policy(&state, "sb-read-only").await;
+        let second = get_sandbox_policy(&state, "sb-read-only").await;
+        assert_eq!(first, second);
+        assert!(
+            state
+                .store
+                .get_latest_policy("sb-read-only")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn sandbox_config_composition_is_jit_and_does_not_persist_provider_layers() {
         let state = test_server_state().await;
         state
@@ -9426,6 +9535,7 @@ mod tests {
             .await
             .unwrap();
 
+        repair_policy_history(&state.store).await.unwrap();
         let effective_policy = get_sandbox_policy(&state, "sb-jit").await;
         assert!(
             effective_policy
@@ -9438,7 +9548,7 @@ mod tests {
             .get_latest_policy("sb-jit")
             .await
             .unwrap()
-            .expect("sandbox policy should be lazily backfilled");
+            .expect("sandbox policy should be initialized by repair");
         let persisted_policy = ProtoSandboxPolicy::decode(persisted.policy_payload.as_slice())
             .expect("persisted sandbox policy should decode");
         assert!(
@@ -9514,6 +9624,7 @@ mod tests {
             .await
             .unwrap();
 
+        repair_policy_history(&state.store).await.unwrap();
         let before_policy = get_sandbox_policy(&state, "sb-custom-policy-update").await;
         assert!(
             before_policy.network_policies["_provider_work_custom"]
@@ -9579,7 +9690,7 @@ mod tests {
             .get_latest_policy("sb-custom-policy-update")
             .await
             .unwrap()
-            .expect("sandbox policy should be lazily backfilled");
+            .expect("sandbox policy should be initialized by repair");
         let persisted_policy =
             ProtoSandboxPolicy::decode(persisted_policy.policy_payload.as_slice())
                 .expect("persisted sandbox policy should decode");

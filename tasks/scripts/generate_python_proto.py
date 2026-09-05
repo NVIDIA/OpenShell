@@ -16,70 +16,11 @@ PROTO_FILES = [
     "proto/sandbox.proto",
 ]
 
-LINE_REWRITES = {
-    "python/openshell/_proto/inference_pb2.py": [
-        (
-            r"^import datamodel_pb2 as datamodel__pb2$",
-            "from . import datamodel_pb2 as datamodel__pb2",
-        ),
-        (
-            r"^import options_pb2 as options__pb2$",
-            "from . import options_pb2 as options__pb2",
-        ),
-    ],
-    "python/openshell/_proto/inference_pb2_grpc.py": [
-        (
-            r"^import inference_pb2 as inference__pb2$",
-            "from . import inference_pb2 as inference__pb2",
-        ),
-    ],
-    "python/openshell/_proto/openshell_pb2_grpc.py": [
-        (
-            r"^import openshell_pb2 as openshell__pb2$",
-            "from . import openshell_pb2 as openshell__pb2",
-        ),
-        (
-            r"^import sandbox_pb2 as sandbox__pb2$",
-            "from . import sandbox_pb2 as sandbox__pb2",
-        ),
-    ],
-    "python/openshell/_proto/openshell_pb2.py": [
-        (
-            r"^import datamodel_pb2 as datamodel__pb2$",
-            "from . import datamodel_pb2 as datamodel__pb2",
-        ),
-        (
-            r"^import options_pb2 as options__pb2$",
-            "from . import options_pb2 as options__pb2",
-        ),
-        (
-            r"^import sandbox_pb2 as sandbox__pb2$",
-            "from . import sandbox_pb2 as sandbox__pb2",
-        ),
-    ],
-    "python/openshell/_proto/datamodel_pb2.py": [
-        (
-            r"^import options_pb2 as options__pb2$",
-            "from . import options_pb2 as options__pb2",
-        ),
-        (
-            r"^import sandbox_pb2 as sandbox__pb2$",
-            "from . import sandbox_pb2 as sandbox__pb2",
-        ),
-    ],
-    "python/openshell/_proto/datamodel_pb2_grpc.py": [
-        (
-            r"^import datamodel_pb2 as datamodel__pb2$",
-            "from . import datamodel_pb2 as datamodel__pb2",
-        ),
-    ],
-    "python/openshell/_proto/sandbox_pb2_grpc.py": [
-        (
-            r"^import sandbox_pb2 as sandbox__pb2$",
-            "from . import sandbox_pb2 as sandbox__pb2",
-        ),
-    ],
-}
+LOCAL_MODULES = [f"{Path(path).stem}_pb2" for path in PROTO_FILES]
+LOCAL_IMPORT = re.compile(
+    rf"^import ({'|'.join(re.escape(module) for module in LOCAL_MODULES)}) as (\w+)$",
+    re.MULTILINE,
+)
 
 
 def main() -> None:
@@ -97,13 +38,11 @@ def main() -> None:
         check=True,
     )
 
-    for path, rules in LINE_REWRITES.items():
-        file_path = Path(path)
-        text = file_path.read_text()
-        text = text.replace("from . from . import", "from . import")
-        for pattern, replacement in rules:
-            text = re.sub(pattern, replacement, text, flags=re.MULTILINE)
-        file_path.write_text(text)
+    for module in LOCAL_MODULES:
+        for suffix in (".py", ".pyi", "_grpc.py"):
+            file_path = Path("python/openshell/_proto") / f"{module}{suffix}"
+            text = LOCAL_IMPORT.sub(r"from . import \1 as \2", file_path.read_text())
+            file_path.write_text(text)
 
 
 if __name__ == "__main__":

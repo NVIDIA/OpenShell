@@ -8,6 +8,7 @@ package openshell.v1;
 import "datamodel.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/struct.proto";
+import "inference.proto";
 import "options.proto";
 import "sandbox.proto";
 
@@ -22,16 +23,12 @@ import "sandbox.proto";
 service OpenShell {
   // Check the health of the service.
   rpc Health(HealthRequest) returns (HealthResponse) {
-    option (openshell.options.v1.authorization) = {
-      auth_mode: "unauthenticated"
-    };
+    option (openshell.options.v1.authorization) = {auth_mode: "unauthenticated"};
   }
 
   // Return the authenticated caller identity established by the gateway.
   rpc GetCurrentUser(GetCurrentUserRequest) returns (GetCurrentUserResponse) {
-    option (openshell.options.v1.authorization) = {
-      auth_mode: "bearer"
-    };
+    option (openshell.options.v1.authorization) = {auth_mode: "bearer"};
   }
 
   // Fetch elevated live gateway runtime metadata.
@@ -71,8 +68,7 @@ service OpenShell {
   }
 
   // Create a reusable sandbox workload template.
-  rpc CreateSandboxTemplate(CreateSandboxTemplateRequest)
-      returns (SandboxTemplateResponse) {
+  rpc CreateSandboxTemplate(CreateSandboxTemplateRequest) returns (SandboxTemplateResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
@@ -81,8 +77,7 @@ service OpenShell {
   }
 
   // Fetch a reusable sandbox workload template by name.
-  rpc GetSandboxTemplate(GetSandboxTemplateRequest)
-      returns (SandboxTemplateResponse) {
+  rpc GetSandboxTemplate(GetSandboxTemplateRequest) returns (SandboxTemplateResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:read"
@@ -91,8 +86,7 @@ service OpenShell {
   }
 
   // List reusable sandbox workload templates.
-  rpc ListSandboxTemplates(ListSandboxTemplatesRequest)
-      returns (ListSandboxTemplatesResponse) {
+  rpc ListSandboxTemplates(ListSandboxTemplatesRequest) returns (ListSandboxTemplatesResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:read"
@@ -101,8 +95,7 @@ service OpenShell {
   }
 
   // Delete a reusable sandbox workload template by name.
-  rpc DeleteSandboxTemplate(DeleteSandboxTemplateRequest)
-      returns (DeleteSandboxTemplateResponse) {
+  rpc DeleteSandboxTemplate(DeleteSandboxTemplateRequest) returns (DeleteSandboxTemplateResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
@@ -111,8 +104,7 @@ service OpenShell {
   }
 
   // List provider records attached to a sandbox.
-  rpc ListSandboxProviders(ListSandboxProvidersRequest)
-      returns (ListSandboxProvidersResponse) {
+  rpc ListSandboxProviders(ListSandboxProvidersRequest) returns (ListSandboxProvidersResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:read"
@@ -121,8 +113,7 @@ service OpenShell {
   }
 
   // Attach a provider record to an existing sandbox.
-  rpc AttachSandboxProvider(AttachSandboxProviderRequest)
-      returns (AttachSandboxProviderResponse) {
+  rpc AttachSandboxProvider(AttachSandboxProviderRequest) returns (AttachSandboxProviderResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
@@ -131,8 +122,7 @@ service OpenShell {
   }
 
   // Detach a provider record from an existing sandbox.
-  rpc DetachSandboxProvider(DetachSandboxProviderRequest)
-      returns (DetachSandboxProviderResponse) {
+  rpc DetachSandboxProvider(DetachSandboxProviderRequest) returns (DetachSandboxProviderResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
@@ -278,8 +268,7 @@ service OpenShell {
   }
 
   // List available provider type profiles.
-  rpc ListProviderProfiles(ListProviderProfilesRequest)
-      returns (ListProviderProfilesResponse) {
+  rpc ListProviderProfiles(ListProviderProfilesRequest) returns (ListProviderProfilesResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:read"
@@ -288,8 +277,7 @@ service OpenShell {
   }
 
   // Fetch one provider type profile by id.
-  rpc GetProviderProfile(GetProviderProfileRequest)
-      returns (ProviderProfileResponse) {
+  rpc GetProviderProfile(GetProviderProfileRequest) returns (ProviderProfileResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:read"
@@ -298,8 +286,7 @@ service OpenShell {
   }
 
   // Import custom provider type profiles.
-  rpc ImportProviderProfiles(ImportProviderProfilesRequest)
-      returns (ImportProviderProfilesResponse) {
+  rpc ImportProviderProfiles(ImportProviderProfilesRequest) returns (ImportProviderProfilesResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
@@ -308,8 +295,7 @@ service OpenShell {
   }
 
   // Update an existing custom provider type profile.
-  rpc UpdateProviderProfiles(UpdateProviderProfilesRequest)
-      returns (UpdateProviderProfilesResponse) {
+  rpc UpdateProviderProfiles(UpdateProviderProfilesRequest) returns (UpdateProviderProfilesResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
@@ -318,8 +304,7 @@ service OpenShell {
   }
 
   // Validate provider type profiles without registering them.
-  rpc LintProviderProfiles(LintProviderProfilesRequest)
-      returns (LintProviderProfilesResponse) {
+  rpc LintProviderProfiles(LintProviderProfilesRequest) returns (LintProviderProfilesResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:read"
@@ -337,8 +322,7 @@ service OpenShell {
   }
 
   // Fetch refresh status for one provider or provider credential.
-  rpc GetProviderRefreshStatus(GetProviderRefreshStatusRequest)
-      returns (GetProviderRefreshStatusResponse) {
+  rpc GetProviderRefreshStatus(GetProviderRefreshStatusRequest) returns (GetProviderRefreshStatusResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:read"
@@ -347,8 +331,7 @@ service OpenShell {
   }
 
   // Configure gateway-owned refresh material for one provider credential.
-  rpc ConfigureProviderRefresh(ConfigureProviderRefreshRequest)
-      returns (ConfigureProviderRefreshResponse) {
+  rpc ConfigureProviderRefresh(ConfigureProviderRefreshRequest) returns (ConfigureProviderRefreshResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
@@ -357,8 +340,7 @@ service OpenShell {
   }
 
   // Record a gateway-owned refresh request for one provider credential.
-  rpc RotateProviderCredential(RotateProviderCredentialRequest)
-      returns (RotateProviderCredentialResponse) {
+  rpc RotateProviderCredential(RotateProviderCredentialRequest) returns (RotateProviderCredentialResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
@@ -367,8 +349,7 @@ service OpenShell {
   }
 
   // Delete gateway-owned refresh configuration for one provider credential.
-  rpc DeleteProviderRefresh(DeleteProviderRefreshRequest)
-      returns (DeleteProviderRefreshResponse) {
+  rpc DeleteProviderRefresh(DeleteProviderRefreshRequest) returns (DeleteProviderRefreshResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
@@ -386,8 +367,7 @@ service OpenShell {
   }
 
   // Delete a custom provider type profile by id.
-  rpc DeleteProviderProfile(DeleteProviderProfileRequest)
-      returns (DeleteProviderProfileResponse) {
+  rpc DeleteProviderProfile(DeleteProviderProfileRequest) returns (DeleteProviderProfileResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "provider:write"
@@ -396,8 +376,7 @@ service OpenShell {
   }
 
   // Get sandbox settings by id (called by sandbox entrypoint and poll loop).
-  rpc GetSandboxConfig(openshell.sandbox.v1.GetSandboxConfigRequest)
-      returns (openshell.sandbox.v1.GetSandboxConfigResponse) {
+  rpc GetSandboxConfig(openshell.sandbox.v1.GetSandboxConfigRequest) returns (openshell.sandbox.v1.GetSandboxConfigResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "dual"
       scope: "config:read"
@@ -412,8 +391,7 @@ service OpenShell {
   // orthogonal to workspace membership. Deployments that enable scope
   // enforcement configure the IdP to grant config:read (or openshell:all)
   // to all sandbox users, so this does not block least-privilege flows.
-  rpc GetGatewayConfig(openshell.sandbox.v1.GetGatewayConfigRequest)
-      returns (openshell.sandbox.v1.GetGatewayConfigResponse) {
+  rpc GetGatewayConfig(openshell.sandbox.v1.GetGatewayConfigRequest) returns (openshell.sandbox.v1.GetGatewayConfigResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "config:read"
@@ -421,8 +399,7 @@ service OpenShell {
   }
 
   // Update settings or policy at sandbox or global scope.
-  rpc UpdateConfig(UpdateConfigRequest)
-      returns (UpdateConfigResponse) {
+  rpc UpdateConfig(UpdateConfigRequest) returns (UpdateConfigResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "dual"
       scope: "config:write"
@@ -431,8 +408,7 @@ service OpenShell {
   }
 
   // Get the load status of a specific policy version.
-  rpc GetSandboxPolicyStatus(GetSandboxPolicyStatusRequest)
-      returns (GetSandboxPolicyStatusResponse) {
+  rpc GetSandboxPolicyStatus(GetSandboxPolicyStatusRequest) returns (GetSandboxPolicyStatusResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:read"
@@ -441,8 +417,7 @@ service OpenShell {
   }
 
   // List policy history for a sandbox.
-  rpc ListSandboxPolicies(ListSandboxPoliciesRequest)
-      returns (ListSandboxPoliciesResponse) {
+  rpc ListSandboxPolicies(ListSandboxPoliciesRequest) returns (ListSandboxPoliciesResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:read"
@@ -451,28 +426,19 @@ service OpenShell {
   }
 
   // Report policy load result (called by sandbox after reload attempt).
-  rpc ReportPolicyStatus(ReportPolicyStatusRequest)
-      returns (ReportPolicyStatusResponse) {
-    option (openshell.options.v1.authorization) = {
-      auth_mode: "sandbox"
-    };
+  rpc ReportPolicyStatus(ReportPolicyStatusRequest) returns (ReportPolicyStatusResponse) {
+    option (openshell.options.v1.authorization) = {auth_mode: "sandbox"};
   }
 
   // Get provider environment for a sandbox (called by sandbox supervisor at startup).
-  rpc GetSandboxProviderEnvironment(GetSandboxProviderEnvironmentRequest)
-      returns (GetSandboxProviderEnvironmentResponse) {
-    option (openshell.options.v1.authorization) = {
-      auth_mode: "sandbox"
-    };
+  rpc GetSandboxProviderEnvironment(GetSandboxProviderEnvironmentRequest) returns (GetSandboxProviderEnvironmentResponse) {
+    option (openshell.options.v1.authorization) = {auth_mode: "sandbox"};
   }
 
   // Exchange a stored provider subject token for an intermediate token scoped
   // to the calling supervisor's SPIFFE identity.
-  rpc ExchangeProviderSubjectToken(ExchangeProviderSubjectTokenRequest)
-      returns (ExchangeProviderSubjectTokenResponse) {
-    option (openshell.options.v1.authorization) = {
-      auth_mode: "sandbox"
-    };
+  rpc ExchangeProviderSubjectToken(ExchangeProviderSubjectTokenRequest) returns (ExchangeProviderSubjectTokenResponse) {
+    option (openshell.options.v1.authorization) = {auth_mode: "sandbox"};
   }
 
   // Fetch recent sandbox logs (one-shot).
@@ -486,9 +452,7 @@ service OpenShell {
 
   // Push sandbox supervisor logs to the server (client-streaming).
   rpc PushSandboxLogs(stream PushSandboxLogsRequest) returns (PushSandboxLogsResponse) {
-    option (openshell.options.v1.authorization) = {
-      auth_mode: "sandbox"
-    };
+    option (openshell.options.v1.authorization) = {auth_mode: "sandbox"};
   }
 
   // Persistent supervisor-to-gateway session (bidirectional streaming).
@@ -499,24 +463,17 @@ service OpenShell {
   // bytes flow over RelayStream calls (separate HTTP/2 streams on the same
   // connection), not over this stream.
   rpc ConnectSupervisor(stream SupervisorMessage) returns (stream GatewayMessage) {
-    option (openshell.options.v1.authorization) = {
-      auth_mode: "sandbox"
-    };
+    option (openshell.options.v1.authorization) = {auth_mode: "sandbox"};
   }
 
   // Persist the canonical main process result before the supervisor exits.
   rpc ReportMainProcessExit(ReportMainProcessExitRequest) returns (ReportMainProcessExitResponse) {
-    option (openshell.options.v1.authorization) = {
-      auth_mode: "sandbox"
-    };
+    option (openshell.options.v1.authorization) = {auth_mode: "sandbox"};
   }
 
   // Confirm that foreground terminal delivery completed naturally.
-  rpc FinalizeMainProcessExit(FinalizeMainProcessExitRequest)
-      returns (FinalizeMainProcessExitResponse) {
-    option (openshell.options.v1.authorization) = {
-      auth_mode: "sandbox"
-    };
+  rpc FinalizeMainProcessExit(FinalizeMainProcessExitRequest) returns (FinalizeMainProcessExitResponse) {
+    option (openshell.options.v1.authorization) = {auth_mode: "sandbox"};
   }
 
   // Raw byte relay between supervisor and gateway.
@@ -531,9 +488,7 @@ service OpenShell {
   // This rides the same TCP+TLS+HTTP/2 connection as ConnectSupervisor —
   // no new TLS handshake, no reverse HTTP CONNECT.
   rpc RelayStream(stream RelayFrame) returns (stream RelayFrame) {
-    option (openshell.options.v1.authorization) = {
-      auth_mode: "sandbox"
-    };
+    option (openshell.options.v1.authorization) = {auth_mode: "sandbox"};
   }
 
   // Watch a sandbox and stream updates.
@@ -555,11 +510,8 @@ service OpenShell {
   // ---------------------------------------------------------------------------
 
   // Submit denial analysis results from sandbox (summaries + proposed chunks).
-  rpc SubmitPolicyAnalysis(SubmitPolicyAnalysisRequest)
-      returns (SubmitPolicyAnalysisResponse) {
-    option (openshell.options.v1.authorization) = {
-      auth_mode: "sandbox"
-    };
+  rpc SubmitPolicyAnalysis(SubmitPolicyAnalysisRequest) returns (SubmitPolicyAnalysisResponse) {
+    option (openshell.options.v1.authorization) = {auth_mode: "sandbox"};
   }
 
   // Get draft policy recommendations for a sandbox.
@@ -572,8 +524,7 @@ service OpenShell {
   }
 
   // Approve a single draft policy chunk (merges into active policy).
-  rpc ApproveDraftChunk(ApproveDraftChunkRequest)
-      returns (ApproveDraftChunkResponse) {
+  rpc ApproveDraftChunk(ApproveDraftChunkRequest) returns (ApproveDraftChunkResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "config:write"
@@ -582,8 +533,7 @@ service OpenShell {
   }
 
   // Reject a single draft policy chunk.
-  rpc RejectDraftChunk(RejectDraftChunkRequest)
-      returns (RejectDraftChunkResponse) {
+  rpc RejectDraftChunk(RejectDraftChunkRequest) returns (RejectDraftChunkResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "config:write"
@@ -592,8 +542,7 @@ service OpenShell {
   }
 
   // Approve all pending draft chunks (skips security-flagged unless forced).
-  rpc ApproveAllDraftChunks(ApproveAllDraftChunksRequest)
-      returns (ApproveAllDraftChunksResponse) {
+  rpc ApproveAllDraftChunks(ApproveAllDraftChunksRequest) returns (ApproveAllDraftChunksResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "config:write"
@@ -620,8 +569,7 @@ service OpenShell {
   }
 
   // Clear all pending draft chunks for a sandbox.
-  rpc ClearDraftChunks(ClearDraftChunksRequest)
-      returns (ClearDraftChunksResponse) {
+  rpc ClearDraftChunks(ClearDraftChunksRequest) returns (ClearDraftChunksResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "config:write"
@@ -644,9 +592,7 @@ service OpenShell {
   // drivers receive the gateway JWT directly from the create-sandbox flow
   // and never call this RPC.
   rpc IssueSandboxToken(IssueSandboxTokenRequest) returns (IssueSandboxTokenResponse) {
-    option (openshell.options.v1.authorization) = {
-      auth_mode: "sandbox"
-    };
+    option (openshell.options.v1.authorization) = {auth_mode: "sandbox"};
   }
 
   // Renew the calling sandbox's gateway JWT. Older tokens remain valid
@@ -655,11 +601,8 @@ service OpenShell {
   // task at ~80% of the token's lifetime; the new token is cached in
   // memory only — the on-disk bootstrap file is intentionally not
   // rewritten.
-  rpc RefreshSandboxToken(RefreshSandboxTokenRequest)
-      returns (RefreshSandboxTokenResponse) {
-    option (openshell.options.v1.authorization) = {
-      auth_mode: "sandbox"
-    };
+  rpc RefreshSandboxToken(RefreshSandboxTokenRequest) returns (RefreshSandboxTokenResponse) {
+    option (openshell.options.v1.authorization) = {auth_mode: "sandbox"};
   }
 
   // ---------------------------------------------------------------------------
@@ -770,7 +713,6 @@ message RefreshSandboxTokenResponse {
   repeated ExtensionServiceCredential extension_credentials = 3;
 }
 
-
 // Health check request.
 message HealthRequest {}
 
@@ -836,7 +778,6 @@ message ComputeDriverCapabilities {
 
   // Driver-reported implementation version from the startup capability snapshot.
   string driver_version = 2;
-
 }
 
 // Public sandbox resource exposed by the OpenShell API.
@@ -1483,7 +1424,6 @@ message ExecSandboxWindowResize {
   uint32 rows = 2;
 }
 
-
 // SSH session record stored in persistence.
 message SshSession {
   // Kubernetes-style metadata (id, name, labels, timestamps, resource version).
@@ -1768,8 +1708,8 @@ message ProviderCredentialRefreshMaterial {
 // maps a strategy-defined semantic output id to a sibling credential whose
 // env_vars receive the minted value.
 message ProviderCredentialRefreshOutput {
-  string output = 1;      // strategy-defined semantic output id (e.g. "session_token")
-  string credential = 2;  // sibling credential name whose env_vars receive this output
+  string output = 1; // strategy-defined semantic output id (e.g. "session_token")
+  string credential = 2; // sibling credential name whose env_vars receive this output
 }
 
 message ProviderCredentialRefresh {
@@ -2356,6 +2296,8 @@ message SupervisorMessage {
     SupervisorHeartbeat heartbeat = 2;
     RelayOpenResult relay_open_result = 3;
     RelayClose relay_close = 4;
+    ConfigUpdateResult config_update_result = 5;
+    ConfigBootstrapResult config_bootstrap_result = 6;
   }
 }
 
@@ -2367,6 +2309,7 @@ message GatewayMessage {
     GatewayHeartbeat heartbeat = 3;
     RelayOpen relay_open = 4;
     RelayClose relay_close = 5;
+    ConfigUpdate config_update = 6;
   }
 }
 
@@ -2384,6 +2327,100 @@ message SessionAccepted {
   string session_id = 1;
   // Recommended heartbeat interval in seconds.
   uint32 heartbeat_interval_secs = 2;
+  // Additive rollout payload. Stage 1 supervisors ignore it and keep polling.
+  // Absent if construction failed; Stage 1 acceptance does not require it.
+  ConfigBootstrap bootstrap = 3;
+}
+
+// Complete provider environment for endpoint-binding-capable supervisors.
+// Contains credentials; never log or persist this snapshot or its envelopes.
+message ProviderEnvironmentSnapshot {
+  map<string, string> environment = 1 [(openshell.options.v1.secret) = true];
+  uint64 provider_env_revision = 2;
+  map<string, int64> credential_expires_at_ms = 3;
+  map<string, ProviderProfileCredential> dynamic_credentials = 4;
+  map<string, StaticCredentialBinding> static_credential_bindings = 5;
+  repeated string non_secret_environment_keys = 6;
+}
+
+// All gateway-owned components required to initialize or resynchronize a session.
+message ConfigBootstrap {
+  openshell.sandbox.v1.SandboxConfigSnapshot sandbox_config = 1;
+  ProviderEnvironmentSnapshot provider_environment = 2 [(openshell.options.v1.secret) = true];
+  openshell.inference.v1.InferenceBundleSnapshot inference_bundle = 3 [(openshell.options.v1.secret) = true];
+}
+
+// Level-triggered replacement for exactly one component, never a patch or hint.
+// Intermediate revisions may be coalesced. Do not fetch in response to an update.
+message ConfigUpdate {
+  string update_id = 1;
+  // Nonzero, increasing within one session and component. Reset on reconnect.
+  uint64 component_sequence = 2;
+  oneof component {
+    openshell.sandbox.v1.SandboxConfigSnapshot sandbox_config = 3;
+    ProviderEnvironmentSnapshot provider_environment = 4 [(openshell.options.v1.secret) = true];
+    openshell.inference.v1.InferenceBundleSnapshot inference_bundle = 5 [(openshell.options.v1.secret) = true];
+  }
+}
+
+enum ConfigComponent {
+  CONFIG_COMPONENT_UNSPECIFIED = 0;
+  CONFIG_COMPONENT_SANDBOX_CONFIG = 1;
+  CONFIG_COMPONENT_PROVIDER_ENVIRONMENT = 2;
+  CONFIG_COMPONENT_INFERENCE_BUNDLE = 3;
+}
+
+enum ConfigOutcome {
+  CONFIG_OUTCOME_UNSPECIFIED = 0;
+  CONFIG_OUTCOME_APPLIED = 1;
+  CONFIG_OUTCOME_ALREADY_CURRENT = 2;
+  CONFIG_OUTCOME_RETAINED_LOCAL_OVERRIDE = 3;
+  CONFIG_OUTCOME_DEGRADED = 4;
+  CONFIG_OUTCOME_FAILED_RETAINING_LAST_KNOWN_GOOD = 5;
+  CONFIG_OUTCOME_FAILED_CLOSED = 6;
+  CONFIG_OUTCOME_UNSUPPORTED = 7;
+}
+
+// Identity of the payload attempted, not the gateway's latest desired revision.
+message ConfigSnapshotRevision {
+  uint64 config_revision = 1;
+  uint32 policy_version = 2;
+  openshell.sandbox.v1.PolicySource policy_source = 3;
+  uint32 global_policy_version = 4;
+  uint64 provider_env_revision = 5;
+  string inference_revision = 6;
+}
+
+// Reserved for Stage 2. Stage 1 peers neither emit nor process results.
+// The authenticated stream fences this result to its session and instance.
+message ConfigUpdateResult {
+  string update_id = 1;
+  uint64 component_sequence = 2;
+  ConfigComponent component = 3;
+  ConfigSnapshotRevision snapshot_revision = 4;
+  ConfigOutcome outcome = 5;
+  string sanitized_error = 6;
+}
+
+message ConfigComponentResult {
+  ConfigComponent component = 1;
+  ConfigSnapshotRevision snapshot_revision = 2;
+  ConfigOutcome outcome = 3;
+  string sanitized_error = 4;
+}
+
+enum ConfigBootstrapStatus {
+  CONFIG_BOOTSTRAP_STATUS_UNSPECIFIED = 0;
+  CONFIG_BOOTSTRAP_STATUS_READY = 1;
+  CONFIG_BOOTSTRAP_STATUS_DEGRADED = 2;
+  CONFIG_BOOTSTRAP_STATUS_FAILED = 3;
+}
+
+// Reserved for Stage 2; distinct component outcomes must not be flattened.
+message ConfigBootstrapResult {
+  ConfigBootstrapStatus aggregate_status = 1;
+  repeated ConfigComponentResult components = 2;
+  string sanitized_error = 3;
 }
 
 // Gateway rejects the supervisor session.

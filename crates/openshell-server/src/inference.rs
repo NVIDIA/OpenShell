@@ -87,7 +87,7 @@ impl Inference for InferenceService {
             Some(&self.state.credentials),
         )
         .await
-        .map(Response::new)
+        .map(|snapshot| Response::new(snapshot.into()))
     }
 
     async fn set_inference_route(
@@ -128,6 +128,13 @@ impl Inference for InferenceService {
             .as_ref()
             .ok_or_else(|| Status::internal("managed route missing config"))?;
 
+        self.state.config_publisher.publish(
+            &self.state,
+            crate::supervisor_config::ConfigChange::Workspace(
+                workspace.clone(),
+                crate::supervisor_config::Components::Inference,
+            ),
+        );
         Ok(Response::new(SetInferenceRouteResponse {
             provider_name: config.provider_name.clone(),
             model_id: config.model_id.clone(),
@@ -217,6 +224,15 @@ impl Inference for InferenceService {
             .delete_by_name(InferenceRoute::object_type(), &workspace, route_name)
             .await
             .map_err(|e| Status::internal(format!("delete route failed: {e}")))?;
+        if deleted {
+            self.state.config_publisher.publish(
+                &self.state,
+                crate::supervisor_config::ConfigChange::Workspace(
+                    workspace,
+                    crate::supervisor_config::Components::Inference,
+                ),
+            );
+        }
         Ok(Response::new(DeleteInferenceRouteResponse { deleted }))
     }
 }
@@ -1036,14 +1052,16 @@ async fn resolve_inference_bundle(
     store: &Store,
     workspace: &str,
 ) -> Result<GetInferenceBundleResponse, Status> {
-    resolve_inference_bundle_with_credentials(store, workspace, None).await
+    resolve_inference_bundle_with_credentials(store, workspace, None)
+        .await
+        .map(Into::into)
 }
 
-async fn resolve_inference_bundle_with_credentials(
+pub async fn resolve_inference_bundle_with_credentials(
     store: &Store,
     workspace: &str,
     credentials: Option<&crate::credentials::CredentialRuntime>,
-) -> Result<GetInferenceBundleResponse, Status> {
+) -> Result<openshell_core::proto::InferenceBundleSnapshot, Status> {
     let mut routes = Vec::new();
     if let Some(r) = resolve_route_by_name_with_credentials(
         store,
@@ -1092,7 +1110,7 @@ async fn resolve_inference_bundle_with_credentials(
         format!("{:016x}", hasher.finish())
     };
 
-    Ok(GetInferenceBundleResponse {
+    Ok(openshell_core::proto::InferenceBundleSnapshot {
         routes,
         revision,
         generated_at_ms: now_ms,

@@ -123,6 +123,7 @@ test-support = []
 
 [dev-dependencies]
 base64 = { workspace = true }
+tonic-prost = { workspace = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "ring"] }
 rcgen = { version = "0.13", features = ["crypto", "pem"] }
 rsa = { version = "0.9", features = ["pem"] }

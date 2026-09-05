@@ -5,6 +5,8 @@
 //!
 //! This module re-exports the generated protobuf types and service definitions.
 
+mod snapshots;
+
 #[allow(
     clippy::all,
     clippy::pedantic,

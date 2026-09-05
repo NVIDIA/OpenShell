@@ -793,6 +793,45 @@ LIMIT $3 OFFSET $4
         Ok(rows.into_iter().map(row_to_object_record).collect())
     }
 
+    pub async fn put_initial_policy_revision(
+        &self,
+        record: &PolicyRecord,
+        workspace: &str,
+    ) -> PersistenceResult<()> {
+        let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        // Use the same sandbox lock as policy mutations before checking for history.
+        let sandbox = sqlx::query(
+            "SELECT id FROM objects WHERE object_type = 'sandbox' AND id = $1 FOR UPDATE",
+        )
+        .bind(&record.sandbox_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        if sandbox.is_some() {
+            sqlx::query(
+                r"
+INSERT INTO objects (
+    object_type, id, scope, version, status, payload, created_at_ms, updated_at_ms, workspace
+)
+SELECT $1, $2, $3, 1, 'loaded', $4, $5, $5, $6
+WHERE NOT EXISTS (SELECT 1 FROM objects WHERE object_type = $1 AND scope = $3)
+ON CONFLICT DO NOTHING
+",
+            )
+            .bind(POLICY_OBJECT_TYPE)
+            .bind(&record.id)
+            .bind(&record.sandbox_id)
+            .bind(policy_payload_from_record(record)?)
+            .bind(record.created_at_ms)
+            .bind(workspace)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        }
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
     pub async fn put_policy_revision(
         &self,
         id: &str,

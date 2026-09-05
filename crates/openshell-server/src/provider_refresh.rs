@@ -1838,10 +1838,11 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if let Err(err) = run_refresh_worker_tick(
+            if let Err(err) = run_refresh_worker_tick_with_publisher(
                 state.store.as_ref(),
                 Some(&state.credentials),
                 Some(&state.compute),
+                Some(&state),
             )
             .await
             {
@@ -1860,10 +1861,11 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         due_count = tracing::field::Empty,
     )
 )]
-async fn run_refresh_worker_tick(
+async fn run_refresh_worker_tick_with_publisher(
     store: &Store,
     credentials: Option<&crate::credentials::CredentialRuntime>,
     compute: Option<&crate::compute::ComputeRuntime>,
+    publisher: Option<&std::sync::Arc<crate::ServerState>>,
 ) -> Result<(), Status> {
     let now_ms = current_time_ms();
     let states = list_all_refresh_states(store).await.inspect_err(|_| {
@@ -1978,7 +1980,7 @@ async fn run_refresh_worker_tick(
             status = %state.status,
             "refreshing provider credential"
         );
-        if let Err(err) = refresh_provider_credential(
+        let result = refresh_provider_credential(
             store,
             state.object_workspace(),
             credentials,
@@ -1986,8 +1988,19 @@ async fn run_refresh_worker_tick(
             &state.provider_name,
             &state.credential_key,
         )
-        .await
+        .await;
+        if result.is_ok()
+            && let Some(server) = publisher
         {
+            server.config_publisher.publish(
+                server,
+                crate::supervisor_config::ConfigChange::Workspace(
+                    state.object_workspace().to_string(),
+                    crate::supervisor_config::Components::All,
+                ),
+            );
+        }
+        if let Err(err) = result {
             warn!(
                 provider = %state.provider_name,
                 credential_key = %state.credential_key,
@@ -2000,6 +2013,15 @@ async fn run_refresh_worker_tick(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+async fn run_refresh_worker_tick(
+    store: &Store,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
+    compute: Option<&crate::compute::ComputeRuntime>,
+) -> Result<(), Status> {
+    run_refresh_worker_tick_with_publisher(store, credentials, compute, None).await
 }
 
 #[cfg(test)]

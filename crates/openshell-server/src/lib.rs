@@ -36,6 +36,7 @@ mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
 mod ssh_sessions;
+pub mod supervisor_config;
 pub mod supervisor_session;
 mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
@@ -297,6 +298,9 @@ pub struct ServerState {
     /// query session state to surface supervisor readiness.
     pub supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 
+    pub supervisor_config_router: Arc<dyn supervisor_config::SupervisorConfigRouter>,
+    pub(crate) config_publisher: supervisor_config::SupervisorConfigPublisher,
+
     /// Set once graceful gateway shutdown begins so stream handlers can
     /// distinguish expected transport closes from runtime failures.
     pub(crate) gateway_shutting_down: AtomicBool,
@@ -415,6 +419,10 @@ impl ServerState {
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),
+            supervisor_config_router: Arc::new(
+                supervisor_config::LocalSupervisorConfigRouter::new(supervisor_sessions.clone()),
+            ),
+            config_publisher: supervisor_config::SupervisorConfigPublisher::default(),
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
@@ -683,6 +691,9 @@ pub(crate) async fn run_server(
     // first snapshots observe the post-start backend state. Explicitly stopped
     // sandboxes remain stopped.
     ensure_default_workspace(&store).await?;
+    grpc::policy::repair_policy_history(&store)
+        .await
+        .map_err(|_| Error::config("policy history repair failed"))?;
     grpc::policy::validate_provider_composition_startup_preflight(&state)
         .await
         .map_err(|error| {

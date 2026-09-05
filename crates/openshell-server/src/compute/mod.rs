@@ -940,6 +940,14 @@ impl ComputeRuntime {
                 }
             })?;
 
+        if let Err(status) =
+            crate::grpc::policy::initialize_policy_history(&self.store, &sandbox).await
+        {
+            let _ = self.store.delete(Sandbox::object_type(), &sandbox_id).await;
+            self.sandbox_index.remove_sandbox(&sandbox_id);
+            return Err(status);
+        }
+
         if let Some(token) = sandbox_token
             && let Some(spec) = driver_sandbox.spec.as_mut()
         {
@@ -948,7 +956,7 @@ impl ComputeRuntime {
         if let Some(spec) = driver_sandbox.spec.as_mut() {
             spec.await_main_process_attachment = await_main_process_attachment;
         }
-        match self
+        let create_result = self
             .driver
             .call(
                 openshell_otel::rpc::CREATE_SANDBOX,
@@ -961,8 +969,16 @@ impl ComputeRuntime {
                         .await
                 },
             )
-            .await
-        {
+            .await;
+        if create_result.is_err() {
+            let _ = self.store.delete(Sandbox::object_type(), &sandbox_id).await;
+            let _ = self
+                .store
+                .delete_by_scope(POLICY_OBJECT_TYPE, &sandbox_id)
+                .await;
+            self.sandbox_index.remove_sandbox(&sandbox_id);
+        }
+        match create_result {
             Ok(_) => {
                 self.sandbox_watch_bus.notify(sandbox.object_id());
                 if let Some(metadata) = sandbox.metadata.as_mut() {
@@ -971,32 +987,15 @@ impl ComputeRuntime {
                 Ok(sandbox)
             }
             Err(status) if status.code() == Code::AlreadyExists => {
-                let _ = self
-                    .store
-                    .delete(Sandbox::object_type(), sandbox.object_id())
-                    .await;
-                self.sandbox_index.remove_sandbox(sandbox.object_id());
                 Err(Status::already_exists("sandbox already exists"))
             }
             Err(status) if status.code() == Code::FailedPrecondition => {
-                let _ = self
-                    .store
-                    .delete(Sandbox::object_type(), sandbox.object_id())
-                    .await;
-                self.sandbox_index.remove_sandbox(sandbox.object_id());
                 Err(Status::failed_precondition(status.message().to_string()))
             }
-            Err(err) => {
-                let _ = self
-                    .store
-                    .delete(Sandbox::object_type(), sandbox.object_id())
-                    .await;
-                self.sandbox_index.remove_sandbox(sandbox.object_id());
-                Err(Status::internal(format!(
-                    "create sandbox failed: {}",
-                    err.message()
-                )))
-            }
+            Err(err) => Err(Status::internal(format!(
+                "create sandbox failed: {}",
+                err.message()
+            ))),
         }
     }
 
@@ -4818,6 +4817,7 @@ pub async fn new_test_runtime_with_driver(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy_store::PolicyStoreExt;
     use futures::stream;
     use openshell_core::proto::compute::v1::{
         CreateSandboxResponse, DeleteSandboxResponse, GetCapabilitiesResponse, GetSandboxRequest,
@@ -5158,6 +5158,7 @@ mod tests {
         get_release: Semaphore,
         get_blocked: AtomicBool,
         get_outcome: TestMutex<ControlledGetOutcome>,
+        create_policy_store: TestMutex<Option<Arc<Store>>>,
     }
 
     impl ControlledDriver {
@@ -5191,6 +5192,7 @@ mod tests {
                 get_release: Semaphore::new(0),
                 get_blocked: AtomicBool::new(false),
                 get_outcome: TestMutex::new(ControlledGetOutcome::Missing),
+                create_policy_store: TestMutex::new(None),
             })
         }
 
@@ -5381,8 +5383,22 @@ mod tests {
 
         async fn create_sandbox(
             &self,
-            _request: Request<CreateSandboxRequest>,
+            request: Request<CreateSandboxRequest>,
         ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
+            let store = self.create_policy_store.lock().unwrap().clone();
+            if let Some(store) = store {
+                let id = request.into_inner().sandbox.unwrap().id;
+                let revision = store
+                    .get_latest_policy(&id)
+                    .await
+                    .unwrap()
+                    .expect("history must precede driver startup");
+                assert_eq!(revision.version, 1);
+                store
+                    .update_policy_status(&id, 1, "failed", Some("test apply failure"), None)
+                    .await
+                    .unwrap();
+            }
             Ok(tonic::Response::new(CreateSandboxResponse {}))
         }
 
@@ -6728,7 +6744,11 @@ mod tests {
         }
 
         let runtime = test_runtime(Arc::new(FailingDriver::default())).await;
-        let sandbox = sandbox_record("sb-fail", "sandbox-fail", SandboxPhase::Provisioning);
+        let mut sandbox = sandbox_record("sb-fail", "sandbox-fail", SandboxPhase::Provisioning);
+        sandbox.spec = Some(SandboxSpec {
+            policy: Some(openshell_core::proto::SandboxPolicy::default()),
+            ..Default::default()
+        });
 
         let traced = test_exporter::install_traced();
         async {
@@ -6739,6 +6759,15 @@ mod tests {
         }
         .instrument(tracing::info_span!("request"))
         .await;
+
+        assert!(
+            runtime
+                .store
+                .get_latest_policy("sb-fail")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let driver_span = traced.span_with(
             "openshell.compute.v1.ComputeDriver/CreateSandbox",
@@ -10935,6 +10964,28 @@ mod tests {
                 FakeComputeDriverCall::GetGatewayListenerRequirements,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn initial_policy_history_exists_before_driver_start_and_preserves_reports() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        *driver.create_policy_store.lock().unwrap() = Some(runtime.store.clone());
+        let mut sandbox =
+            sandbox_record("sb-policy-init", "policy-init", SandboxPhase::Provisioning);
+        sandbox.spec = Some(SandboxSpec {
+            policy: Some(openshell_core::proto::SandboxPolicy::default()),
+            ..Default::default()
+        });
+        runtime.create_sandbox(sandbox, None, false).await.unwrap();
+        let revision = runtime
+            .store
+            .get_latest_policy("sb-policy-init")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(revision.status, "failed");
+        assert_eq!(revision.load_error.as_deref(), Some("test apply failure"));
     }
 
     #[tokio::test]

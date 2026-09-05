@@ -427,6 +427,14 @@ async fn handle_create_sandbox_inner(
         .create_sandbox(sandbox, sandbox_token, await_main_process_attachment)
         .await?;
 
+    state.config_publisher.publish(
+        state,
+        crate::supervisor_config::ConfigChange::Sandbox(
+            id.clone(),
+            crate::supervisor_config::Components::All,
+        ),
+    );
+
     info!(
         sandbox_id = %id,
         sandbox_name = %name,
@@ -1103,6 +1111,15 @@ pub(super) async fn handle_attach_sandbox_provider(
         .map_err(|e| super::persistence_error_to_status(e, "attach sandbox provider"))?;
 
     let attached = attached.load(Ordering::Relaxed);
+    if attached {
+        state.config_publisher.publish(
+            state,
+            crate::supervisor_config::ConfigChange::Sandbox(
+                sandbox_id,
+                crate::supervisor_config::Components::ConfigAndProviders,
+            ),
+        );
+    }
 
     info!(
         sandbox_name = %request.sandbox_name,
@@ -1202,6 +1219,15 @@ pub(super) async fn handle_detach_sandbox_provider(
         .map_err(|e| super::persistence_error_to_status(e, "detach sandbox provider"))?;
 
     let detached = detached.load(Ordering::Relaxed);
+    if detached {
+        state.config_publisher.publish(
+            state,
+            crate::supervisor_config::ConfigChange::Sandbox(
+                sandbox_id,
+                crate::supervisor_config::Components::ConfigAndProviders,
+            ),
+        );
+    }
 
     info!(
         sandbox_name = %request.sandbox_name,

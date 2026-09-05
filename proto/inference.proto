@@ -11,19 +11,15 @@ import "options.proto";
 // Inference service provides workspace-scoped inference route configuration and bundle delivery.
 service Inference {
   // Return the resolved inference route bundle for sandbox-local execution.
-  rpc GetInferenceBundle(GetInferenceBundleRequest)
-      returns (GetInferenceBundleResponse) {
-    option (openshell.options.v1.authorization) = {
-      auth_mode: "sandbox"
-    };
+  rpc GetInferenceBundle(GetInferenceBundleRequest) returns (GetInferenceBundleResponse) {
+    option (openshell.options.v1.authorization) = {auth_mode: "sandbox"};
   }
 
   // Set the inference route for a workspace.
   //
   // This controls how requests sent to `inference.local` are routed
   // for sandboxes in the specified workspace.
-  rpc SetInferenceRoute(SetInferenceRouteRequest)
-      returns (SetInferenceRouteResponse) {
+  rpc SetInferenceRoute(SetInferenceRouteRequest) returns (SetInferenceRouteResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "inference:write"
@@ -32,8 +28,7 @@ service Inference {
   }
 
   // Get the inference route for a workspace.
-  rpc GetInferenceRoute(GetInferenceRouteRequest)
-      returns (GetInferenceRouteResponse) {
+  rpc GetInferenceRoute(GetInferenceRouteRequest) returns (GetInferenceRouteResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "inference:read"
@@ -42,8 +37,7 @@ service Inference {
   }
 
   // Delete an inference route from a workspace.
-  rpc DeleteInferenceRoute(DeleteInferenceRouteRequest)
-      returns (DeleteInferenceRouteResponse) {
+  rpc DeleteInferenceRoute(DeleteInferenceRouteRequest) returns (DeleteInferenceRouteResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "inference:write"
@@ -169,5 +163,13 @@ message GetInferenceBundleResponse {
   // Opaque revision tag for cache freshness checks.
   string revision = 2;
   // Timestamp (epoch ms) when this bundle was generated.
+  int64 generated_at_ms = 3;
+}
+
+// Complete replacement bundle. Contains credentials; never log or persist it.
+message InferenceBundleSnapshot {
+  repeated ResolvedRoute routes = 1;
+  // Equality-only content identity, not an ordered generation.
+  string revision = 2;
   int64 generated_at_ms = 3;
 }

@@ -490,10 +490,21 @@ interleave a profile mutation with a sandbox provider-set mutation that would
 leave an ambiguous final dynamic-token state or a deleted custom profile that is
 still referenced by a sandbox.
 
-Policy and runtime settings are delivered together through the effective sandbox
-config path. A gateway-global policy can override sandbox-scoped policy. The
-sandbox supervisor polls for config revisions and hot-reloads dynamic policy
-when the policy engine accepts the update.
+Policy and runtime settings are delivered together through the effective sandbox config path. A gateway-global policy can override sandbox-scoped policy. The sandbox supervisor still polls for config revisions and hot-reloads dynamic policy when the policy engine accepts the update.
+
+### Supervisor configuration delivery
+
+`ConnectSupervisor` also carries complete configuration snapshots. Session acceptance includes a `ConfigBootstrap` containing sandbox config, provider environment, and inference routes. A live `ConfigUpdate` replaces one complete component; it is neither a patch nor an instruction to fetch. The Stage 1 supervisor explicitly ignores these payloads without logging their contents or acknowledging them. Startup fetches, polling, policy status reports, and CLI wait behavior remain authoritative. `ConfigUpdateResult` and `ConfigBootstrapResult` are defined for the next stage but have no apply-status effect yet.
+
+The polling handlers and stream publisher share read-only snapshot builders. Builders do not create policy history. Sandbox creation initializes history before starting the compute driver, and gateway startup repairs legacy records before accepting connections. Initialization atomically inserts version one with the legacy loaded status only when history is absent; it never rewrites an existing revision or apply result. Reads can serve an uninitialized legacy record from its sandbox spec without writing it.
+
+After a committed policy, settings, provider, profile, attachment, credential rotation, or inference mutation, a shared publisher queues a bounded notification and builds the latest effective snapshots. Workspace changes fan out within that workspace; global settings and platform provider profiles fan out across workspaces. A snapshot may reflect a newer commit than its triggering notification. Database state remains authoritative, and publication failure cannot fail a committed mutation.
+
+`SupervisorConfigRouter` accepts typed configuration payloads and hides session channels from mutation handlers. Its initial implementation delivers locally. The session registry serializes enqueue and reconnect replacement, assigning update IDs and component-local sequences within the current session. Policy versions identify policy state; config, provider, and inference revisions compare for equality, not ordering. Remote owner lookup and authenticated peer forwarding belong behind this boundary in PR #1868, not in mutation callers.
+
+Both publication notifications and session messages use bounded queues. Stage 1 drops saturated live deliveries and records metrics because polling repairs missed updates. Payloads are capped below the stream decoder limit, and bootstrap construction has a deadline. Missing or oversized bootstrap data does not reject a Stage 1 connection. Provider and inference envelopes contain credentials: they stay in memory, are never logged or persisted, and delivery diagnostics report only bounded metadata and dispositions.
+
+The protobuf additions preserve existing field numbers and polling responses. A pre-Stage 1 supervisor ignores the unknown bootstrap field and decodes an unknown live-update envelope as an absent payload; its existing receiver warns without closing the session. New supervisors also accept older gateways that omit bootstrap. This compatibility does not authorize applying snapshots without the later apply and acknowledgement protocol.
 
 External supervisor middleware registration is operator-owned configuration
 under `[[openshell.supervisor.middleware]]`. At startup the gateway connects to

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{ObjectType, PersistenceError, Store, generate_name, test_store};
+use super::{ObjectType, PersistenceError, PolicyRecord, Store, generate_name, test_store};
 use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use openshell_core::proto::datamodel::v1::ObjectMeta as ProtoObjectMeta;
 use openshell_core::proto::{ObjectForTest, Sandbox, SandboxPolicy, SandboxSpec};
@@ -997,6 +997,91 @@ fn policy_test_sandbox(id: &str, name: &str) -> Sandbox {
         spec: Some(SandboxSpec::default()),
         ..Default::default()
     }
+}
+
+#[tokio::test]
+async fn initial_policy_history_is_insert_only() {
+    assert_initial_policy_history_is_insert_only(&test_store().await).await;
+}
+
+#[tokio::test]
+#[ignore = "requires OPENSHELL_TEST_POSTGRES_URL pointing to a test database"]
+async fn postgres_initial_policy_history_is_insert_only() {
+    let url = std::env::var("OPENSHELL_TEST_POSTGRES_URL").expect("test database URL");
+    let store = Store::connect(&url).await.unwrap();
+    assert_initial_policy_history_is_insert_only(&store).await;
+}
+
+async fn assert_initial_policy_history_is_insert_only(store: &Store) {
+    let id = uuid::Uuid::new_v4().to_string();
+    let sandbox = policy_test_sandbox(&id, &id);
+    let record = PolicyRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        sandbox_id: id.clone(),
+        version: 1,
+        policy_payload: SandboxPolicy::default().encode_to_vec(),
+        policy_hash: "initial-hash".into(),
+        status: "loaded".into(),
+        load_error: None,
+        created_at_ms: 1,
+        loaded_at_ms: None,
+        provenance: StdHashMap::new(),
+    };
+    store
+        .put_initial_policy_revision(&record, "default")
+        .await
+        .unwrap();
+    assert!(store.get_latest_policy(&id).await.unwrap().is_none());
+
+    store.put_message(&sandbox).await.unwrap();
+    let (first, second) = tokio::join!(
+        store.put_initial_policy_revision(&record, "default"),
+        store.put_initial_policy_revision(&record, "default"),
+    );
+    first.unwrap();
+    second.unwrap();
+    let initial = store.get_latest_policy(&id).await.unwrap().unwrap();
+    assert_eq!(initial.status, "loaded");
+    assert_eq!(initial.policy_hash, record.policy_hash);
+    assert_eq!(store.list_policies(&id, 10, 0).await.unwrap().len(), 1);
+
+    store
+        .update_policy_status(&id, 1, "failed", Some("apply failed"), None)
+        .await
+        .unwrap();
+    store
+        .put_initial_policy_revision(&record, "default")
+        .await
+        .unwrap();
+    let failed = store.get_latest_policy(&id).await.unwrap().unwrap();
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.load_error.as_deref(), Some("apply failed"));
+
+    store
+        .put_policy_revision(
+            &uuid::Uuid::new_v4().to_string(),
+            &id,
+            "default",
+            2,
+            &record.policy_payload,
+            "new-hash",
+        )
+        .await
+        .unwrap();
+    store
+        .put_initial_policy_revision(&record, "default")
+        .await
+        .unwrap();
+    let latest = store.get_latest_policy(&id).await.unwrap().unwrap();
+    assert_eq!(latest.version, 2);
+    assert_eq!(latest.status, "pending");
+    assert_eq!(store.list_policies(&id, 10, 0).await.unwrap().len(), 2);
+
+    store
+        .delete_by_scope(super::POLICY_OBJECT_TYPE, &id)
+        .await
+        .unwrap();
+    store.delete(Sandbox::object_type(), &id).await.unwrap();
 }
 
 #[tokio::test]

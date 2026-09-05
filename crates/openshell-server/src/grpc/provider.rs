@@ -2516,6 +2516,13 @@ pub(super) async fn handle_create_provider(
     .await;
     match result {
         Ok(provider) => {
+            state.config_publisher.publish(
+                state,
+                crate::supervisor_config::ConfigChange::Workspace(
+                    workspace.clone(),
+                    crate::supervisor_config::Components::All,
+                ),
+            );
             emit_provider_lifecycle(
                 &provider.r#type,
                 LifecycleOperation::Create,
@@ -2738,6 +2745,10 @@ pub(super) async fn handle_import_provider_profiles(
         if let Some(metadata) = stored.metadata.as_mut() {
             metadata.resource_version = result.resource_version;
         }
+        state.config_publisher.publish(
+            state,
+            crate::supervisor_config::ConfigChange::ProviderProfile(workspace.clone()),
+        );
         let resource_version = stored_profile_resource_version(&stored);
         imported.push(profile_response_payload(
             stored.profile.unwrap_or_default(),
@@ -2868,6 +2879,10 @@ pub(super) async fn handle_update_provider_profiles(
         )
         .await
         .map_err(|e| super::persistence_error_to_status(e, "update provider profile"))?;
+    state.config_publisher.publish(
+        state,
+        crate::supervisor_config::ConfigChange::ProviderProfile(workspace.clone()),
+    );
     if let Some(metadata) = stored.metadata.as_mut() {
         metadata.resource_version = result.resource_version;
     }
@@ -2963,6 +2978,12 @@ pub(super) async fn handle_delete_provider_profile(
         .await
         .map_err(|e| Status::internal(format!("delete provider profile failed: {e}")))?;
 
+    if deleted {
+        state.config_publisher.publish(
+            state,
+            crate::supervisor_config::ConfigChange::ProviderProfile(workspace),
+        );
+    }
     Ok(Response::new(DeleteProviderProfileResponse { deleted }))
 }
 
@@ -3734,6 +3755,13 @@ pub(super) async fn handle_update_provider(
     .await;
     match result {
         Ok(provider) => {
+            state.config_publisher.publish(
+                state,
+                crate::supervisor_config::ConfigChange::Workspace(
+                    workspace.clone(),
+                    crate::supervisor_config::Components::All,
+                ),
+            );
             emit_provider_lifecycle(
                 &provider.r#type,
                 LifecycleOperation::Update,
@@ -4662,6 +4690,13 @@ pub(super) async fn handle_configure_provider_refresh(
             .await?;
     }
 
+    state.config_publisher.publish(
+        state,
+        crate::supervisor_config::ConfigChange::Workspace(
+            workspace,
+            crate::supervisor_config::Components::All,
+        ),
+    );
     Ok(Response::new(ConfigureProviderRefreshResponse {
         status: Some(crate::provider_refresh::refresh_status_from_state(
             &state_record,
@@ -4704,6 +4739,13 @@ pub(super) async fn handle_rotate_provider_credential(
     )
     .await?;
 
+    state.config_publisher.publish(
+        state,
+        crate::supervisor_config::ConfigChange::Workspace(
+            workspace,
+            crate::supervisor_config::Components::All,
+        ),
+    );
     Ok(Response::new(RotateProviderCredentialResponse {
         status: Some(crate::provider_refresh::refresh_status_from_state(
             &refresh_state,
@@ -4812,6 +4854,15 @@ pub(super) async fn handle_delete_provider_refresh(
             })?;
     }
 
+    if deleted_refresh_state {
+        state.config_publisher.publish(
+            state,
+            crate::supervisor_config::ConfigChange::Workspace(
+                workspace,
+                crate::supervisor_config::Components::All,
+            ),
+        );
+    }
     Ok(Response::new(DeleteProviderRefreshResponse {
         deleted: deleted_refresh_state,
     }))
@@ -4845,6 +4896,15 @@ pub(super) async fn handle_delete_provider(
     .await;
     match result {
         Ok(deleted) => {
+            if deleted {
+                state.config_publisher.publish(
+                    state,
+                    crate::supervisor_config::ConfigChange::Workspace(
+                        workspace,
+                        crate::supervisor_config::Components::All,
+                    ),
+                );
+            }
             let outcome = TelemetryOutcome::from_success(deleted);
             emit_provider_profile_lifecycle(
                 provider_profile.unwrap_or(TelemetryProviderProfile::Custom),
