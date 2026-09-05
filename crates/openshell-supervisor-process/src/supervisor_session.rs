@@ -876,8 +876,10 @@ mod target_tests {
 mod ocsf_event_tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
     struct UnusedPortForward;
 
+    #[cfg(target_os = "linux")]
     #[async_trait::async_trait]
     impl BoundaryPortForward for UnusedPortForward {
         async fn connect(
