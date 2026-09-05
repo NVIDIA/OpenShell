@@ -246,9 +246,13 @@ pub async fn run_sandbox(
     admitted_isolation_backend: Option<String>,
     main_exit_marker: Option<std::path::PathBuf>,
 ) -> Result<i32> {
-    let (program, args) = command
-        .split_first()
-        .ok_or_else(|| miette::miette!("No command specified"))?;
+    // An empty command is the versioned scratch-sandbox sentinel. The
+    // external supervisor cannot inspect the workload filesystem, so preserve
+    // it for openshell-sandbox to resolve against the agent image.
+    let (program, args) = command.split_first().map_or_else(
+        || (String::new(), Vec::new()),
+        |(program, args)| (program.clone(), args.to_vec()),
+    );
 
     // Initialize the process-wide OCSF context early so that events emitted
     // during policy loading (filesystem config, validation) have a context.
@@ -453,8 +457,8 @@ pub async fn run_sandbox(
         sandbox_id: sandbox_id.clone().unwrap_or_default(),
         policy: policy.clone(),
         agent: openshell_isolation_interface::AgentSpec {
-            program: program.clone(),
-            args: args.to_vec(),
+            program,
+            args,
             workdir: workspace,
             timeout_secs,
             interactive,

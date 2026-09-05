@@ -298,7 +298,7 @@ async fn handle_create_sandbox_inner(
     };
 
     // Leave an omitted command empty rather than persisting a concrete shell:
-    // the supervisor resolves the default login shell against the sandbox image
+    // the sandbox boundary resolves the default login shell against the agent image
     // (bash when present, otherwise /bin/sh on minimal images like Alpine),
     // which the gateway cannot do since it does not see the sandbox filesystem.
     // The default is an interactive login shell, so request a TTY.

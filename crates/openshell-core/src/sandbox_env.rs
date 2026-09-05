@@ -39,7 +39,8 @@ const MAIN_PROCESS_SPEC_BASE64URL_PREFIX: &str = "base64url:";
 pub struct MainProcessConfig {
     pub version: u32,
     /// Canonical command. Empty means "no command supplied": the supervisor
-    /// resolves the default login shell against the sandbox image. A non-empty
+    /// asks the sandbox boundary to resolve the default login shell against
+    /// the agent image. A non-empty
     /// command is the exact program+args and is run verbatim.
     pub command: Vec<String>,
     pub tty: bool,
@@ -51,8 +52,8 @@ impl MainProcessConfig {
     pub const VERSION: u32 = 1;
 
     /// Default config for a sandbox created without a command. The command is
-    /// left empty on purpose: the supervisor picks a login shell that exists in
-    /// the sandbox image (bash when present, otherwise `/bin/sh`). A TTY is
+    /// left empty on purpose: the sandbox boundary picks a login shell that
+    /// exists in the agent image (bash when present, otherwise `/bin/sh`). A TTY is
     /// requested because the default is an interactive login shell.
     #[must_use]
     pub fn scratch() -> Self {
@@ -99,7 +100,7 @@ impl MainProcessConfig {
             ));
         }
         // An empty command is valid: it means "no command supplied", and the
-        // supervisor resolves the default login shell. Only a present-but-blank
+        // sandbox boundary resolves the default login shell. Only a present-but-blank
         // program is rejected.
         if !config.command.is_empty() && config.command[0].is_empty() {
             return Err(format!(
@@ -316,7 +317,7 @@ mod tests {
 
     #[test]
     fn omitted_command_stays_empty_for_supervisor_resolution() {
-        // No command supplied → empty command; the supervisor resolves the
+        // No command supplied → empty command; the sandbox boundary resolves the
         // default login shell against the sandbox image.
         let empty = crate::proto::compute::v1::DriverSandboxSpec::default();
         assert!(
