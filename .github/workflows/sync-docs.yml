@@ -4,6 +4,49 @@
 name: Sync Docs Website
 
 on:
+  workflow_call:
+    inputs:
+      operation:
+        description: "Whether to sync or remove a docs snapshot"
+        required: true
+        type: string
+      channel:
+        description: "Docs channel to update or remove"
+        required: true
+        type: string
+      source_ref:
+        description: "Source commit SHA, branch, or tag to snapshot when operation=sync"
+        required: false
+        type: string
+      release_version:
+        description: "Release version used to order mutable channels"
+        required: false
+        type: string
+      version_slug:
+        description: "Version slug when channel=version"
+        required: false
+        type: string
+      display_name:
+        description: "Optional version selector display name"
+        required: false
+        type: string
+      availability:
+        description: "Optional Fern availability status"
+        required: false
+        type: string
+      publish:
+        description: "Publish production docs after syncing"
+        required: false
+        default: false
+        type: boolean
+      allow_rollback:
+        description: "Allow an explicitly requested mutable-channel rollback"
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      FERN_TOKEN:
+        required: false
   workflow_dispatch:
     inputs:
       operation:
@@ -21,9 +64,14 @@ on:
         options:
           - dev
           - latest
+          - stable
           - version
       source_ref:
         description: "Source commit SHA, branch, or tag to snapshot when operation=sync"
+        required: false
+        type: string
+      release_version:
+        description: "Release version, e.g. 0.1.2 or 0.1.3.dev4"
         required: false
         type: string
       version_slug:
@@ -31,9 +79,23 @@ on:
         required: false
         type: string
       display_name:
-        description: "Optional version selector display name"
+        description: "Optional selector name, e.g. Dev"
         required: false
         type: string
+      availability:
+        description: "Optional Fern status: beta, deprecated, ga, or stable"
+        required: false
+        type: string
+      publish:
+        description: "Publish production docs after syncing"
+        required: false
+        default: false
+        type: boolean
+      allow_rollback:
+        description: "Allow an explicitly requested mutable-channel rollback"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -41,6 +103,7 @@ permissions:
 concurrency:
   group: docs-website
   cancel-in-progress: false
+  queue: max
 
 defaults:
   run:
@@ -65,6 +128,7 @@ jobs:
           OPERATION: ${{ inputs.operation }}
           CHANNEL: ${{ inputs.channel }}
           SOURCE_REF: ${{ inputs.source_ref }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
           VERSION_SLUG: ${{ inputs.version_slug }}
         run: |
           set -euo pipefail
@@ -72,8 +136,12 @@ jobs:
             echo "source_ref is required when operation=sync" >&2
             exit 1
           fi
-          if [[ "$CHANNEL" == "version" && -z "$VERSION_SLUG" ]]; then
-            echo "version_slug is required when channel=version" >&2
+          if [[ "$CHANNEL" =~ ^(dev|latest|stable)$ && -z "$RELEASE_VERSION" ]]; then
+            echo "release_version is required for dev, latest, and stable channels" >&2
+            exit 1
+          fi
+          if [[ "$CHANNEL" =~ ^(stable|version)$ && -z "$VERSION_SLUG" ]]; then
+            echo "version_slug is required for stable and version channels" >&2
             exit 1
           fi
 
@@ -96,6 +164,7 @@ jobs:
         uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
         with:
           version: "0.10.12"
+          python-version: "3.13"
 
       - name: Update docs snapshot
         # Inputs flow in as quoted env vars to avoid shell injection; see the
@@ -104,17 +173,32 @@ jobs:
           OPERATION: ${{ inputs.operation }}
           CHANNEL: ${{ inputs.channel }}
           SOURCE_REF: ${{ inputs.source_ref }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
           VERSION_SLUG: ${{ inputs.version_slug }}
           DISPLAY_NAME: ${{ inputs.display_name }}
+          AVAILABILITY: ${{ inputs.availability }}
+          ALLOW_ROLLBACK: ${{ inputs.allow_rollback }}
         run: |
+          SOURCE_SHA=""
+          if [[ "$OPERATION" == "sync" ]]; then
+            SOURCE_SHA=$(git -C source rev-parse HEAD)
+          fi
+          rollback_args=()
+          if [[ "$ALLOW_ROLLBACK" == "true" ]]; then
+            rollback_args+=(--allow-rollback)
+          fi
           uv run automation/tasks/scripts/sync_docs_website.py \
             --operation "$OPERATION" \
             --source-root source \
             --docs-website-root docs-website \
             --channel "$CHANNEL" \
             --source-ref "$SOURCE_REF" \
+            --source-sha "$SOURCE_SHA" \
+            --release-version "$RELEASE_VERSION" \
             --version-slug "$VERSION_SLUG" \
-            --display-name "$DISPLAY_NAME"
+            --display-name "$DISPLAY_NAME" \
+            --availability "$AVAILABILITY" \
+            "${rollback_args[@]}"
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -160,3 +244,10 @@ jobs:
             git commit -m "docs(website): remove ${target} docs"
           fi
           git push origin HEAD:docs-website
+
+      - name: Publish Fern docs
+        if: ${{ inputs.publish }}
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+        working-directory: docs-website/fern
+        run: fern generate --docs

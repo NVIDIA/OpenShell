@@ -488,9 +488,9 @@ mise run docs
 
 PRs that touch `docs/**` or `fern/**` are validated by `.github/workflows/branch-docs.yml`, and they get a preview when `FERN_TOKEN` is available to the workflow.
 
-Fern docs publishing is handled by the `publish-fern-docs` job in `.github/workflows/release-tag.yml` when a stable release tag is created.
+Release Dev publishes the `dev` docs version from `main`. Release Tag publishes an immutable stable version and updates `latest`. See [fern/README.md](fern/README.md) for the source layout, version model, and publishing workflows.
 
-`docs/` is the source-of-truth docs tree. `fern/` contains the site config, components, and theme assets that publish those pages.
+`docs/` is the source-of-truth docs tree. `fern/` contains the site configuration, components, theme assets, and its README.
 
 See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authoring guide.
 

@@ -450,13 +450,7 @@ See `CI.md` for the contributor workflow, labels, and maintainer merge-queue wor
 
 ## Docs Site
 
-Published docs live in `docs/`. Navigation lives in `docs/index.yml`. Fern site
-configuration, components, theme assets, and publish settings live in `fern/`.
-
-Use `mise run docs` for strict validation and `mise run docs:serve` for local
-preview. PR previews are produced by `.github/workflows/branch-docs.yml` when
-Fern credentials are available. Production docs publish from the release tag
-workflow.
+Published docs live in `docs/`, and Fern site configuration lives in `fern/`. See [fern/README.md](../fern/README.md) for the source layout, local development commands, version model, and publishing workflows.
 
 ## Validation Expectations
 
