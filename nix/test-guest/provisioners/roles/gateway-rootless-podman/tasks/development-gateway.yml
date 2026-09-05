@@ -26,12 +26,12 @@
     mode: "0600"
     content: |
       [openshell]
-      version = 1
+      version = 2
 
       [openshell.gateway]
       bind_address = "127.0.0.1:8080"
       log_level = "info"
-      compute_drivers = ["podman"]
+      compute_driver = "podman"
       disable_tls = true
 
       [openshell.gateway.auth]
@@ -42,7 +42,6 @@
       public_key_path = "{{ openshell_gateway_state_root }}/pki/jwt/public.pem"
       kid_path = "{{ openshell_gateway_state_root }}/pki/jwt/kid"
       gateway_id = "openshell-test-guest"
-      ttl_secs = 0
 
       [openshell.drivers.podman]
       default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"

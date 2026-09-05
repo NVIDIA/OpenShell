@@ -53,7 +53,7 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
         "v0.0.10/openshell-driver-vm-aarch64-apple-darwin.tar.gz"
     ) in formula
     assert 'sha256 "' + "b" * 64 + '"' in formula
-    assert "OPENSHELL_DRIVERS: " not in formula
+    assert "OPENSHELL_COMPUTE_DRIVER: " not in formula
     assert 'OPENSHELL_GATEWAY_CONFIG: "#{var}/openshell/gateway.toml"' not in formula
     assert "init-gateway-config.sh" not in formula
     assert 'gateway_config = var/"openshell/gateway.toml"' in formula
@@ -64,12 +64,31 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
         flags=re.DOTALL,
     )
     assert generated_config is not None
+    assert "version = 2" in generated_config.group("contents")
     assert "[openshell.gateway]" in generated_config.group("contents")
     assert "bind_address =" not in generated_config.group("contents")
-    assert 'bind_address = "[::1]:17670"' in formula
+
+    legacy_empty_config = re.search(
+        r"legacy_empty_gateway_config_contents = <<~TOML\n(?P<contents>.*?)\n    TOML",
+        formula,
+        flags=re.DOTALL,
+    )
+    assert legacy_empty_config is not None
+    assert "version = 1" in legacy_empty_config.group("contents")
+    assert "bind_address =" not in legacy_empty_config.group("contents")
+
+    legacy_ipv6_config = re.search(
+        r"legacy_ipv6_gateway_config_contents = <<~TOML\n(?P<contents>.*?)\n    TOML",
+        formula,
+        flags=re.DOTALL,
+    )
+    assert legacy_ipv6_config is not None
+    assert "version = 1" in legacy_ipv6_config.group("contents")
+    assert 'bind_address = "[::1]:17670"' in legacy_ipv6_config.group("contents")
+    assert "gateway_config.read == legacy_empty_gateway_config_contents ||" in formula
     assert "gateway_config.read == legacy_ipv6_gateway_config_contents" in formula
     assert "gateway_config.write gateway_config_contents" in formula
-    assert '# compute_drivers = ["vm"]' not in formula
+    assert '# compute_driver = "vm"' not in formula
     assert (
         "openshell gateway add https://localhost:17670 --local --name openshell"
         in formula
@@ -142,12 +161,15 @@ def test_snap_docker_connect_hook_restarts_gateway() -> None:
     )
 
 
-def test_rpm_spec_uses_gateway_defaults_without_config_helper() -> None:
+def test_rpm_spec_seeds_and_migrates_gateway_defaults() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     spec = (repo_root / "openshell.spec").read_text(encoding="utf-8")
 
     assert "init-gateway-config.sh" not in spec
     assert "init-pki.sh" not in spec
+    assert "migrate-gateway-config.sh" in spec
+    assert "gateway.toml.default.v1" in spec
+    assert "%{name}-gateway-migrate-config" in spec
     assert "Environment=OPENSHELL_LOCAL_TLS_DIR=%%h/.local/state/openshell/tls" in spec
     assert (
         "openshell-gateway generate-certs --output-dir ${OPENSHELL_LOCAL_TLS_DIR}"
@@ -155,7 +177,7 @@ def test_rpm_spec_uses_gateway_defaults_without_config_helper() -> None:
     )
     assert "EnvironmentFile=-%%E/openshell/gateway.env" in spec
     assert "%%S/openshell/tls" not in spec
-    assert "Environment=OPENSHELL_DRIVERS" not in spec
+    assert "Environment=OPENSHELL_COMPUTE_DRIVER" not in spec
     assert "Environment=OPENSHELL_BIND_ADDRESS" not in spec
     assert "Environment=OPENSHELL_PODMAN_TLS_CA" not in spec
     assert "ExecStart=/usr/bin/openshell-gateway" in spec
@@ -180,3 +202,50 @@ def test_deb_user_service_uses_gateway_defaults_without_config_helper() -> None:
     assert "ExecStart=/usr/bin/openshell-gateway" in unit
     assert "--config" not in unit
     assert "--db-url" not in unit
+
+
+def test_rpm_migration_exec_start_pre_argument_order() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    spec = (repo_root / "openshell.spec").read_text(encoding="utf-8")
+
+    assert (
+        "ExecStartPre=%{_libexecdir}/%{name}-gateway-migrate-config "
+        "%%E/openshell/gateway.toml "
+        "/usr/share/openshell-gateway/gateway.toml.default "
+        "/usr/share/openshell-gateway/gateway.toml.default.v1"
+    ) in spec
+
+
+def test_schema_v2_debian_and_snap_preflight_wiring() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    unit = (repo_root / "deploy/deb/openshell-gateway.service").read_text(
+        encoding="utf-8"
+    )
+    wrapper = (repo_root / "tasks/scripts/snap-gateway-wrapper.sh").read_text(
+        encoding="utf-8"
+    )
+    package_deb = (repo_root / "tasks/scripts/package-deb.sh").read_text(
+        encoding="utf-8"
+    )
+    preflight = "ExecStartPre=/usr/bin/openshell-gateway config preflight"
+    certs = "ExecStartPre=/usr/bin/openshell-gateway generate-certs"
+    assert preflight in unit
+    assert unit.index(preflight) < unit.index(certs)
+    assert "EnvironmentFile=-%E/openshell/gateway.env" in unit
+    assert "ExecStart=/usr/bin/openshell-gateway" in unit
+    assert "$src_dir/openshell-gateway.service" in package_deb
+    assert "$pkgroot/usr/lib/systemd/user/openshell-gateway.service" in package_deb
+    assert 'if [ -n "${OPENSHELL_GATEWAY_CONFIG:-}" ]; then' in wrapper
+    assert (
+        'elif [ -e "$CANONICAL_CONFIG_FILE" ] || [ -L "$CANONICAL_CONFIG_FILE" ]; then'
+        in wrapper
+    )
+    assert wrapper.count('"${SNAP}/bin/openshell-gateway" config preflight') == 4
+    assert 'config preflight -- "$@"' in wrapper
+    assert 'config preflight -- --config "$CANONICAL_CONFIG_FILE" "$@"' in wrapper
+    assert (
+        'exec "${SNAP}/bin/openshell-gateway" --config "$CANONICAL_CONFIG_FILE" "$@"'
+        in wrapper
+    )
+    assert wrapper.count('exec "${SNAP}/bin/openshell-gateway" "$@"') == 3
+    assert '[ -f "$CANONICAL_CONFIG_FILE" ]' not in wrapper

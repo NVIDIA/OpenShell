@@ -439,7 +439,12 @@ fn condition_from_state(state: &ContainerState) -> DriverCondition {
             Some(HealthState { status }) if status == "starting" => {
                 ("False", "HealthCheckStarting", String::new())
             }
-            _ => ("False", CONDITION_STARTING, String::new()),
+            None => (
+                "True",
+                CONDITION_RUNNING,
+                "Container is running".to_string(),
+            ),
+            Some(_) => ("False", CONDITION_STARTING, String::new()),
         },
         "created" => ("False", "ContainerCreated", String::new()),
         "exited" | "stopped" => {
@@ -576,6 +581,44 @@ mod tests {
         assert_eq!(cond.status, "True");
         assert_eq!(cond.reason, "HealthCheckPassed");
         assert_eq!(cond.last_transition_time, "2026-04-14T10:00:00Z");
+    }
+
+    #[test]
+    fn condition_running_without_healthcheck_is_ready() {
+        let state = ContainerState {
+            status: "running".to_string(),
+            running: true,
+            exit_code: 0,
+            oom_killed: false,
+            health: None,
+            started_at: Some("2026-04-14T10:00:00Z".to_string()),
+            finished_at: None,
+        };
+        let cond = condition_from_state(&state);
+        assert_eq!(cond.r#type, "Ready");
+        assert_eq!(cond.status, "True");
+        assert_eq!(cond.reason, CONDITION_RUNNING);
+        assert_eq!(cond.message, "Container is running");
+        assert_eq!(cond.last_transition_time, "2026-04-14T10:00:00Z");
+    }
+
+    #[test]
+    fn condition_running_with_pending_healthcheck_is_not_ready() {
+        let state = ContainerState {
+            status: "running".to_string(),
+            running: true,
+            exit_code: 0,
+            oom_killed: false,
+            health: Some(HealthState {
+                status: "starting".to_string(),
+            }),
+            started_at: Some("2026-04-14T10:00:00Z".to_string()),
+            finished_at: None,
+        };
+        let condition = condition_from_state(&state);
+        assert_eq!(condition.r#type, "Ready");
+        assert_eq!(condition.status, "False");
+        assert_eq!(condition.reason, "HealthCheckStarting");
     }
 
     #[test]

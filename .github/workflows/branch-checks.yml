@@ -233,6 +233,11 @@ jobs:
       - name: Test
         run: mise run test:python
 
+      - name: Test local gateway configuration helpers
+        run: |
+          bash tasks/scripts/test-gateway-pull-policy.sh
+          bash tasks/scripts/test-gateway-config.sh
+
   go:
     name: Go SDK
     needs: pr_metadata

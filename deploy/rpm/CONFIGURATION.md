@@ -17,10 +17,10 @@ The defaults are tuned for rootless Podman use:
 
 ```toml
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
-compute_drivers = ["podman"]
+compute_driver = "podman"
 ```
 
 The RPM does not override `bind_address`. The primary listener uses the
@@ -28,15 +28,17 @@ built-in `127.0.0.1:17670` default. The Podman driver reports the callback
 interface it needs, and the gateway adds a separate listener scoped to that
 interface. This keeps the general API off unrelated host interfaces.
 
-`compute_drivers = ["podman"]` pins the compute driver to Podman. Without
+`compute_driver = "podman"` pins the compute driver to Podman. Without
 this, the gateway auto-detects in order: Kubernetes, Podman, Docker. Pinning
 prevents unexpected driver selection if Docker is also installed on the host.
 
 ### Customizing the configuration
 
-Edit `~/.config/openshell/gateway.toml` directly. The template at
-`/usr/share/openshell-gateway/gateway.toml.default` is not read at runtime
-and is not overwritten by RPM upgrades.
+Edit `~/.config/openshell/gateway.toml` directly. The package-owned template at
+`/usr/share/openshell-gateway/gateway.toml.default` is not read at runtime and
+may change during an RPM upgrade. The active user copy is preserved. During a
+schema-v2 upgrade, the service replaces only an exact package-generated v1
+copy; it never rewrites an edited configuration.
 
 To apply environment variable overrides that persist across upgrades without
 editing the TOML file, add them to `~/.config/openshell/gateway.env`:
@@ -215,10 +217,10 @@ overrides that persist across package upgrades.
 | TOML option | Default | Description |
 |-------------|---------|-------------|
 | `bind_address` | `127.0.0.1:17670` (gateway default) | Address for the primary gRPC/HTTP API listener. |
-| `compute_drivers` | `["podman"]` (RPM default) | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The RPM default pins to Podman. |
-| `default_image` | `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` | Default sandbox image. |
-| `supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Supervisor image mounted into Podman sandboxes. |
-| `guest_tls_ca`, `guest_tls_cert`, `guest_tls_key` | auto-generated paths | Client TLS material bind-mounted into sandbox containers. |
+| `compute_driver` | `"podman"` (RPM default) | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The RPM default pins to Podman; legacy `compute_drivers` lists are rejected. |
+| `[openshell.drivers.podman].default_image` | `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` | Default sandbox image. |
+| `[openshell.drivers.podman].supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Supervisor image mounted into Podman sandboxes. |
+| `[openshell.gateway].guest_tls_ca`, `guest_tls_cert`, `guest_tls_key` | auto-generated paths | Gateway-owned client TLS material injected into the selected local driver and mounted into sandbox containers. |
 | `[openshell.gateway.tls]` paths | auto-generated paths | Server TLS certificate, key, and client CA. |
 | `disable_tls` | unset | Set to `true` to disable TLS. |
 
@@ -232,14 +234,15 @@ settings:
 
 ```toml
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
-compute_drivers = ["podman"]
-default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+compute_driver = "podman"
 
 [openshell.drivers.podman]
-image_pull_policy = "missing"
+default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+image_pull_policy = "if_not_present"
+health_check_interval_secs = 10
 network_name = "openshell"
 stop_timeout_secs = 10
 ```
@@ -247,7 +250,7 @@ stop_timeout_secs = 10
 ### Image management
 
 The gateway pulls container images automatically on first sandbox
-creation. The default pull policy is `missing`, which means images are
+creation. The default pull policy is `if_not_present`, which means images are
 pulled once and then cached by Podman.
 
 To update cached images:
@@ -260,9 +263,10 @@ podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
 Or set `image_pull_policy = "always"` in
 `[openshell.drivers.podman]` to pull on every sandbox creation.
 
-To pin specific image versions instead of `:latest`:
+To pin specific image versions instead of `:latest`, set these values in
+`[openshell.drivers.podman]`:
 
-```shell
+```toml
 supervisor_image = "ghcr.io/nvidia/openshell/supervisor:v0.0.37"
 default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:v0.0.37"
 ```

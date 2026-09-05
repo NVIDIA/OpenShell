@@ -21,12 +21,16 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=tasks/scripts/gateway-toml.sh
+source "${ROOT}/tasks/scripts/gateway-toml.sh"
+# shellcheck source=tasks/scripts/gateway-pull-policy.sh
+source "${ROOT}/tasks/scripts/gateway-pull-policy.sh"
 PORT="${OPENSHELL_SERVER_PORT:-18080}"
 GATEWAY_NAME="${OPENSHELL_PODMAN_GATEWAY_NAME:-podman-dev}"
 STATE_DIR="${OPENSHELL_PODMAN_GATEWAY_STATE_DIR:-${OPENSHELL_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-podman}}"
 SANDBOX_NAMESPACE="${OPENSHELL_SANDBOX_NAMESPACE:-podman-dev}"
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}"
-SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}"
+SANDBOX_IMAGE_PULL_POLICY="$(normalize_image_pull_policy "${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-if_not_present}")"
 GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-}"
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
 PRIMARY_BIND_IP="${OPENSHELL_BIND_ADDRESS:-127.0.0.1}"
@@ -88,32 +92,6 @@ ensure_podman_supervisor_image() {
     echo "ERROR: expected supervisor image '${supervisor_image}' after build" >&2
     exit 1
   fi
-}
-
-podman_pull_policy() {
-  case "$1" in
-    Always|always) echo "always" ;;
-    IfNotPresent|ifnotpresent|missing|"") echo "missing" ;;
-    Never|never) echo "never" ;;
-    Newer|newer) echo "newer" ;;
-    *)
-      echo "ERROR: unsupported Podman image pull policy '$1'" >&2
-      exit 2
-      ;;
-  esac
-}
-
-# Escape a value for embedding in a double-quoted TOML basic string, so
-# quotes, backslashes, or control characters in an environment value cannot
-# corrupt gateway.toml or inject extra configuration keys.
-toml_escape() {
-  local s=$1
-  s=${s//\\/\\\\}
-  s=${s//\"/\\\"}
-  s=${s//$'\n'/\\n}
-  s=${s//$'\r'/\\r}
-  s=${s//$'\t'/\\t}
-  printf '%s' "${s}"
 }
 
 port_is_in_use() {
@@ -215,12 +193,11 @@ CONFIG_PATH="${STATE_DIR}/gateway.toml"
 install -m 600 /dev/null "${CONFIG_PATH}"
 cat >"${CONFIG_PATH}" <<EOF
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
 name = "${GATEWAY_NAME}"
-compute_drivers = ["podman"]
-default_image = "${SANDBOX_IMAGE}"
+compute_driver = "podman"
 disable_tls = true
 
 [openshell.gateway.auth]
@@ -234,8 +211,13 @@ gateway_id = "${GATEWAY_NAME}"
 ttl_secs = 3600
 
 [openshell.drivers.podman]
+default_image = "${SANDBOX_IMAGE}"
 supervisor_image = "${SUPERVISOR_IMAGE}"
-image_pull_policy = "$(podman_pull_policy "${SANDBOX_IMAGE_PULL_POLICY}")"
+image_pull_policy = "${SANDBOX_IMAGE_PULL_POLICY}"
+# Local development requires supervisor mount setup that Podman's runtime
+# profile may deny. Production configs preserve Podman's default when omitted.
+app_armor_profile = "Unconfined"
+health_check_interval_secs = 10
 EOF
 
 if [[ -n "${GRPC_ENDPOINT}" ]]; then
@@ -300,6 +282,6 @@ exec "${GATEWAY_BIN}" \
   --bind-address "${PRIMARY_BIND_IP}" \
   --port "${PORT}" \
   --log-level "${LOG_LEVEL}" \
-  --drivers podman \
+  --compute-driver podman \
   --disable-tls \
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"

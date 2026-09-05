@@ -4,7 +4,7 @@
 //! Podman compute driver.
 
 use crate::client::{ContainerListEntry, PodmanApiError, PodmanClient, VolumeInspect};
-use crate::config::PodmanComputeConfig;
+use crate::config::{PodmanComputeConfig, podman_image_pull_policy};
 use crate::container::{self, LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, PodmanSandboxDriverConfig};
 use crate::watcher::{
     self, LifecycleEventFences, WatchStream, driver_sandbox_from_inspect,
@@ -13,8 +13,9 @@ use crate::watcher::{
 use openshell_core::ComputeDriverError;
 use openshell_core::config::CDI_GPU_DEVICE_ALL;
 use openshell_core::driver_utils::{
-    SUPERVISOR_IMAGE_BINARY_PATH, extract_first_tar_entry, supervisor_image_should_refresh,
-    temp_extract_container_name, validate_linux_elf_binary, write_cache_binary_atomic,
+    GatewayCallbackTopology, SUPERVISOR_IMAGE_BINARY_PATH, extract_first_tar_entry,
+    gateway_callback_endpoint, supervisor_image_should_refresh, temp_extract_container_name,
+    validate_linux_elf_binary, write_cache_binary_atomic,
 };
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
@@ -366,15 +367,10 @@ impl PodmanComputeDriver {
             }
         }
 
-        // Validate TLS configuration before connecting.  Partial configs
-        // (e.g. CA set but cert/key missing) are rejected early so operators
-        // get a clear error instead of a silent fallback to plaintext HTTP.
-        config.validate_tls_config()?;
-        config.validate_runtime_limits()?;
-        config.validate_host_gateway_ip()?;
-        config.validate_proxy_config()?;
-        config.canonicalize_userns()?;
-        config.validate_userns_mappings()?;
+        // Validate and normalize configuration before connecting. Partial TLS
+        // and invalid resource, proxy, SPIFFE, AppArmor, or userns settings
+        // fail before the runtime is contacted.
+        config.validate_configuration()?;
 
         let client = PodmanClient::new(socket_path);
 
@@ -411,11 +407,16 @@ impl PodmanComputeDriver {
                         info.host.cgroup_version
                     )));
                 }
+                validate_apparmor_support(
+                    config.app_armor_profile.as_ref(),
+                    info.host.security.apparmor_enabled,
+                )?;
                 info!(
                     cgroup_version = %info.host.cgroup_version,
                     network_backend = %info.host.network_backend,
                     rootless = info.host.security.rootless,
                     rootless_network_cmd = %info.host.rootless_network_cmd,
+                    apparmor_enabled = info.host.security.apparmor_enabled,
                     "Connected to Podman"
                 );
                 (info.host.security.rootless, info.host.rootless_network_cmd)
@@ -437,14 +438,10 @@ impl PodmanComputeDriver {
         // Auto-detect the gRPC callback endpoint before deciding whether this
         // topology needs the Podman bridge gateway address.
         if config.grpc_endpoint.is_empty() {
-            let scheme = if config.tls_enabled() {
-                "https"
-            } else {
-                "http"
-            };
-            config.grpc_endpoint = format!(
-                "{scheme}://host.containers.internal:{}",
-                config.gateway_port
+            config.grpc_endpoint = gateway_callback_endpoint(
+                GatewayCallbackTopology::Podman,
+                config.gateway_port,
+                config.tls_enabled(),
             );
             info!(
                 grpc_endpoint = %config.grpc_endpoint,
@@ -791,7 +788,7 @@ impl PodmanComputeDriver {
                             .to_string(),
                     ));
                 }
-                let pull_policy = self.config.image_pull_policy.as_str();
+                let pull_policy = podman_image_pull_policy(self.config.image_pull_policy);
                 info!(image = %image, policy = %pull_policy, "Ensuring sandbox image");
                 self.client
                     .pull_image(image, pull_policy)
@@ -1385,6 +1382,26 @@ impl PodmanComputeDriver {
             lifecycle_event_fences: LifecycleEventFences::default(),
         }
     }
+}
+
+fn validate_apparmor_support(
+    profile: Option<&openshell_core::AppArmorProfile>,
+    apparmor_enabled: bool,
+) -> Result<(), PodmanApiError> {
+    let requires_apparmor = matches!(
+        profile,
+        Some(
+            openshell_core::AppArmorProfile::RuntimeDefault
+                | openshell_core::AppArmorProfile::Localhost(_)
+        )
+    );
+    if requires_apparmor && !apparmor_enabled {
+        return Err(PodmanApiError::InvalidInput(
+            "app_armor_profile requires AppArmor, but Podman reports AppArmor is unavailable; install/enable AppArmor or use Unconfined explicitly"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn supervisor_image_pull_policy(image: &str) -> &'static str {
@@ -2201,6 +2218,26 @@ mod tests {
             requirements[0].selector,
             Some(Selector::ExactBindAddress("10.90.1.1:17670".to_string()))
         );
+    }
+
+    #[test]
+    fn confined_apparmor_profiles_follow_podman_capability() {
+        use openshell_core::AppArmorProfile;
+
+        for profile in [
+            AppArmorProfile::RuntimeDefault,
+            AppArmorProfile::Localhost("openshell-supervisor".to_string()),
+        ] {
+            validate_apparmor_support(Some(&profile), true)
+                .expect("confined profile should be accepted when Podman reports AppArmor");
+            let error = validate_apparmor_support(Some(&profile), false)
+                .expect_err("confined profile must fail when AppArmor is unavailable");
+            assert!(error.to_string().contains("AppArmor is unavailable"));
+        }
+        validate_apparmor_support(Some(&AppArmorProfile::Unconfined), false)
+            .expect("Unconfined does not require AppArmor support");
+        validate_apparmor_support(None, false)
+            .expect("an omitted profile preserves Podman's runtime behavior");
     }
 
     #[test]

@@ -38,6 +38,20 @@ immediately without a grace period. Finalization is persisted separately from
 the exit result; the gateway deletes an ephemeral sandbox only after the
 finalized supervisor session disconnects.
 
+## Configuration Boundary
+
+The gateway accepts exactly schema version 2. Missing, legacy, and future
+versions fail before runtime construction, and driver settings belong only to
+`[openshell.drivers.<name>]`. The process does not migrate legacy files.
+Package lifecycle code may replace an exact package-generated v1 default, but
+it preserves edited configurations for explicit operator migration.
+
+Gateway listener TLS and sandbox callback TLS are separate inputs. A selected
+local Docker, Podman, or VM driver requires a complete guest bundle whenever
+the gateway listener uses TLS; package-managed local TLS can supply that bundle.
+Kubernetes instead projects guest credentials through its configured Secret.
+The gateway validates this requirement before constructing the selected driver.
+
 ## Protocol and Auth
 
 The gateway listens on one service port and multiplexes gRPC and HTTP traffic.
@@ -246,10 +260,10 @@ controllers and `agents.x-k8s.io/v1alpha1` ownerReferences from existing
 deployments. Supervisors renew gateway JWTs in memory before expiry only while
 the sandbox record still exists. Older tokens are not server-revoked; shared
 deployments bound replay exposure with short `gateway_jwt.ttl_secs` lifetimes.
-The config default is
-`gateway_jwt.ttl_secs = 0` for local single-player Docker, Podman, and VM
-gateways; those tokens carry `exp = 0` and do not expire. Kubernetes and other
-shared deployments should set a positive TTL.
+Omitting `gateway_jwt.ttl_secs` selects non-expiring tokens for local
+single-player Docker, Podman, and VM gateways; those tokens carry `exp = 0`.
+Kubernetes and other shared deployments should set a positive TTL. Explicit
+zero is rejected.
 
 Gateway JWT signing-key rotation is currently an offline operator action. The
 runtime loads one active signing key and one matching public verification key
@@ -694,9 +708,10 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 ```
 
 The TOML file is opt-in via `--config <PATH>` / `OPENSHELL_GATEWAY_CONFIG`.
-Driver implementation settings live in the TOML driver tables. See
-`docs/reference/gateway-config.mdx` for worked per-driver examples and RFC
-0003 for the full schema.
+Driver implementation settings live exclusively in TOML driver tables. The
+selector is the singular `[openshell.gateway] compute_driver`; legacy
+`compute_drivers` lists are rejected. See `docs/reference/gateway-config.mdx`
+for worked per-driver examples and RFC 0003 for the full schema.
 
 Each installation has an operator-assigned gateway name. Configure it with
 `[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`.
@@ -710,26 +725,20 @@ aliases, network names, and the sandbox JWT issuer.
 `database_url` is env-only and rejected when present in the file
 (`OPENSHELL_DB_URL` / `--db-url`).
 
-### Driver inheritance
+### Driver ownership
 
-`[openshell.gateway]` carries a small set of values (`sandbox_namespace`,
-`default_image`,
-`supervisor_image`, `guest_tls_ca/cert/key`, `client_tls_secret_name`,
-`host_gateway_ip`, `enable_user_namespaces`) that are inherited into each
-driver's `[openshell.drivers.<name>]` table when the driver-specific table
-does not override them. The allowlist is per-driver so a gateway-wide
-default cannot land in a driver that does not understand it (e.g.
-`client_tls_secret_name` is K8s-only).
+`[openshell.gateway]` contains gateway process settings only. Each selected
+driver reads its own configuration exclusively from
+`[openshell.drivers.<name>]`; values are never inherited from gateway scope.
+Kubernetes owns `namespace`, `default_image`, `supervisor_image`,
+`client_tls_secret_name`, `service_account_name`, `host_gateway_ip`,
+`enable_user_namespaces`, and `sa_token_ttl_secs`. Docker uses
+`sandbox_label` instead of the legacy `sandbox_namespace` name. Podman and VM
+likewise own their image, endpoint, and runtime settings in their tables.
 
-`image_pull_policy` is intentionally **not** inheritable: Kubernetes uses
-`Always | IfNotPresent | Never` (passed verbatim to the K8s API) while
-Podman uses the lowercase enum `always | missing | never | newer`. No
-value means the same thing in both, so the key lives only under each
-driver's own table.
-
-Driver-specific values that are not part of the inheritance allowlist
-(e.g. Podman `socket_path`, VM `vcpus`) only come from the driver's own
-table.
+`image_pull_policy` uses the shared canonical vocabulary
+`always | if_not_present | never | newer`. Drivers translate it to their runtime
+APIs; `newer` is supported only by Podman and rejected by Docker and Kubernetes.
 
 ### OTLP export
 
@@ -803,7 +812,10 @@ system entry instead of pretending to delete package-manager owned state.
 - Gateway TLS and client certificate distribution are deployment concerns owned
   by the operator or packaging layer.
 - Compute runtimes own the mechanics of starting workloads and injecting
-  callback configuration.
+  callback configuration. Local Docker, Podman, and VM callback endpoints can
+  be derived from their fixed host aliases. Kubernetes requires an explicit
+  endpoint from deployment topology; Helm renders it from the gateway Service
+  name and namespace rather than inferring it from sandbox placement.
 - Docker-backed local gateways use Docker's `host-gateway` callback alias on
   macOS and Docker Desktop-style runtimes. They request IPv4 loopback callback
   reachability and add a listener only when the primary does not cover it.

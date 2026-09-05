@@ -199,7 +199,7 @@ GATEWAY_ENDPOINT="http://127.0.0.1:$GATEWAY_PORT"
 write_gateway_config() {
   cat >"$GATEWAY_CONFIG" <<EOF
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway.auth]
 allow_unauthenticated_users = true
@@ -209,7 +209,6 @@ signing_key_path = "$JWT_DIR/signing.pem"
 public_key_path = "$JWT_DIR/public.pem"
 kid_path = "$JWT_DIR/kid"
 gateway_id = "$RUN_ID"
-ttl_secs = 0
 
 [[openshell.supervisor.middleware]]
 name = "content-guard-example"
@@ -318,7 +317,7 @@ wait_for_middleware() {
 
 start_gateway() {
   printf 'INFO starting gateway\n'
-  env -u OPENSHELL_DRIVERS "$GATEWAY_BIN" \
+  env -u OPENSHELL_COMPUTE_DRIVER "$GATEWAY_BIN" \
     --config "$GATEWAY_CONFIG" \
     --bind-address 127.0.0.1 \
     --port "$GATEWAY_PORT" \

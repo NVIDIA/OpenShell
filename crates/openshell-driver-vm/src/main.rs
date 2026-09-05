@@ -91,8 +91,8 @@ struct Args {
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
 
-    #[arg(long, env = "OPENSHELL_GRPC_ENDPOINT")]
-    openshell_endpoint: Option<String>,
+    #[arg(long = "grpc-endpoint", env = "OPENSHELL_GRPC_ENDPOINT")]
+    grpc_endpoint: Option<String>,
 
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE", default_value = "")]
     default_image: String,
@@ -115,6 +115,52 @@ struct Args {
 
     #[arg(long = "guest-tls-key", env = "OPENSHELL_VM_TLS_KEY")]
     guest_tls_key: Option<PathBuf>,
+
+    /// Corporate forward proxy for supervisor TLS egress.
+    #[arg(long, env = "OPENSHELL_VM_UPSTREAM_PROXY")]
+    upstream_proxy: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_VM_UPSTREAM_NO_PROXY")]
+    upstream_no_proxy: Option<String>,
+
+    /// Root-owned gateway-host file containing `user:pass` proxy credentials.
+    #[arg(long, env = "OPENSHELL_VM_UPSTREAM_PROXY_AUTH_FILE")]
+    upstream_proxy_auth_file: Option<PathBuf>,
+
+    /// Explicitly acknowledge cleartext Basic authentication to an http proxy.
+    #[arg(
+        long,
+        env = "OPENSHELL_VM_UPSTREAM_PROXY_AUTH_ALLOW_INSECURE",
+        default_value_t = false
+    )]
+    upstream_proxy_auth_allow_insecure: bool,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_VM_UPSTREAM_PROXY_CONNECT_BY_HOSTNAME",
+        default_value_t = false
+    )]
+    upstream_proxy_connect_by_hostname: bool,
+
+    /// Gateway-host PEM CA bundle trusted for the corporate proxy and for
+    /// server certificates re-signed by a TLS-intercepting proxy.
+    #[arg(long, env = "OPENSHELL_VM_UPSTREAM_PROXY_CA_BUNDLE")]
+    upstream_proxy_ca_bundle: Option<PathBuf>,
+
+    /// Guest-reachable SPIFFE Workload API endpoint (`tcp:IP:port`).
+    #[arg(
+        long = "provider-spiffe-workload-api-tcp-endpoint",
+        env = "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_TCP_ENDPOINT"
+    )]
+    provider_spiffe_workload_api_tcp_endpoint: Option<String>,
+
+    /// Explicit acknowledgement that the configured Workload API listener is exposed to VM guests.
+    #[arg(
+        long,
+        env = "OPENSHELL_PROVIDER_SPIFFE_ALLOW_GUEST_TCP",
+        default_value_t = false
+    )]
+    provider_spiffe_allow_guest_tcp: bool,
 
     #[arg(long, env = "OPENSHELL_VM_KRUN_LOG_LEVEL", default_value_t = 1)]
     krun_log_level: u32,
@@ -142,30 +188,6 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_VM_SANDBOX_GID")]
     sandbox_gid: Option<u32>,
-
-    // Corporate forward proxy for sandbox egress. Operator-owned: these reach
-    // the guest supervisor on its argv, which the sandbox image and the
-    // user-supplied environment cannot influence.
-    #[arg(long, env = "OPENSHELL_VM_HTTPS_PROXY")]
-    https_proxy: Option<String>,
-
-    #[arg(long, env = "OPENSHELL_VM_NO_PROXY")]
-    no_proxy: Option<String>,
-
-    #[arg(long, env = "OPENSHELL_VM_PROXY_AUTH_FILE")]
-    proxy_auth_file: Option<String>,
-
-    // Value-taking rather than a presence flag so an explicit `false` in
-    // `[openshell.drivers.vm]` survives the gateway -> driver hop and still
-    // trips the "acknowledgement without a credential" check.
-    #[arg(long, env = "OPENSHELL_VM_PROXY_AUTH_ALLOW_INSECURE")]
-    proxy_auth_allow_insecure: Option<bool>,
-
-    #[arg(long, env = "OPENSHELL_VM_PROXY_CONNECT_BY_HOSTNAME")]
-    proxy_connect_by_hostname: Option<bool>,
-
-    #[arg(long, env = "OPENSHELL_VM_PROXY_CA_BUNDLE")]
-    proxy_ca_bundle: Option<String>,
 
     #[arg(long, hide = true)]
     vm_backend: Option<String>,
@@ -235,8 +257,8 @@ async fn main() -> Result<()> {
     }
 
     let driver = VmDriver::new(VmDriverConfig {
-        openshell_endpoint: args
-            .openshell_endpoint
+        grpc_endpoint: args
+            .grpc_endpoint
             .ok_or_else(|| miette::miette!("OPENSHELL_GRPC_ENDPOINT is required"))?,
         state_dir: args.state_dir.clone(),
         launcher_bin: None,
@@ -250,17 +272,23 @@ async fn main() -> Result<()> {
         guest_tls_ca: args.guest_tls_ca.clone(),
         guest_tls_cert: args.guest_tls_cert.clone(),
         guest_tls_key: args.guest_tls_key.clone(),
+        upstream_proxy: openshell_core::UpstreamProxyConfig {
+            https_proxy: args.upstream_proxy.clone(),
+            no_proxy: args.upstream_no_proxy.clone(),
+            proxy_auth_file: args.upstream_proxy_auth_file.clone(),
+            proxy_auth_allow_insecure: args.upstream_proxy_auth_allow_insecure.then_some(true),
+            proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname.then_some(true),
+        },
+        proxy_ca_bundle: args.upstream_proxy_ca_bundle.clone(),
+        provider_spiffe_workload_api_tcp_endpoint: args
+            .provider_spiffe_workload_api_tcp_endpoint
+            .clone(),
+        provider_spiffe_allow_guest_tcp: args.provider_spiffe_allow_guest_tcp,
         gpu_enabled: args.gpu,
         gpu_mem_mib: args.gpu_mem_mib,
         gpu_vcpus: args.gpu_vcpus,
         sandbox_uid: args.sandbox_uid,
         sandbox_gid: args.sandbox_gid,
-        https_proxy: args.https_proxy.clone(),
-        no_proxy: args.no_proxy.clone(),
-        proxy_auth_file: args.proxy_auth_file.clone(),
-        proxy_auth_allow_insecure: args.proxy_auth_allow_insecure,
-        proxy_connect_by_hostname: args.proxy_connect_by_hostname,
-        proxy_ca_bundle: args.proxy_ca_bundle.clone(),
     })
     .await
     .map_err(|err| miette::miette!("{err}"))?;
@@ -636,57 +664,47 @@ mod tests {
     fn corporate_proxy_flags_parse_into_driver_settings() {
         let args = Args::parse_from([
             "openshell-driver-vm",
-            "--openshell-endpoint",
-            "https://host.openshell.internal:17670",
-            "--https-proxy",
+            "--upstream-proxy",
             "http://proxy.corp.com:8080",
-            "--no-proxy",
+            "--upstream-no-proxy",
             "10.0.0.0/8,.svc.cluster.local",
-            "--proxy-auth-file",
+            "--upstream-proxy-auth-file",
             "/etc/openshell/secrets/proxy-auth",
-            "--proxy-auth-allow-insecure",
-            "true",
-            "--proxy-connect-by-hostname",
-            "false",
-            "--proxy-ca-bundle",
+            "--upstream-proxy-auth-allow-insecure",
+            "--upstream-proxy-connect-by-hostname",
+            "--upstream-proxy-ca-bundle",
             "/etc/openshell/tls/proxy-ca.pem",
         ]);
 
         assert_eq!(
-            args.https_proxy.as_deref(),
+            args.upstream_proxy.as_deref(),
             Some("http://proxy.corp.com:8080")
         );
         assert_eq!(
-            args.no_proxy.as_deref(),
+            args.upstream_no_proxy.as_deref(),
             Some("10.0.0.0/8,.svc.cluster.local")
         );
         assert_eq!(
-            args.proxy_auth_file.as_deref(),
-            Some("/etc/openshell/secrets/proxy-auth")
+            args.upstream_proxy_auth_file.as_deref(),
+            Some(PathBuf::from("/etc/openshell/secrets/proxy-auth").as_path())
         );
-        assert_eq!(args.proxy_auth_allow_insecure, Some(true));
-        // Value-taking rather than a presence flag, so the gateway can
-        // forward an explicit `false` from `[openshell.drivers.vm]`.
-        assert_eq!(args.proxy_connect_by_hostname, Some(false));
+        assert!(args.upstream_proxy_auth_allow_insecure);
+        assert!(args.upstream_proxy_connect_by_hostname);
         assert_eq!(
-            args.proxy_ca_bundle.as_deref(),
-            Some("/etc/openshell/tls/proxy-ca.pem")
+            args.upstream_proxy_ca_bundle.as_deref(),
+            Some(PathBuf::from("/etc/openshell/tls/proxy-ca.pem").as_path())
         );
     }
 
     #[test]
     fn corporate_proxy_settings_default_to_unset() {
-        let args = Args::parse_from([
-            "openshell-driver-vm",
-            "--openshell-endpoint",
-            "https://host.openshell.internal:17670",
-        ]);
-        assert!(args.https_proxy.is_none());
-        assert!(args.no_proxy.is_none());
-        assert!(args.proxy_auth_file.is_none());
-        assert!(args.proxy_auth_allow_insecure.is_none());
-        assert!(args.proxy_connect_by_hostname.is_none());
-        assert!(args.proxy_ca_bundle.is_none());
+        let args = Args::parse_from(["openshell-driver-vm"]);
+        assert!(args.upstream_proxy.is_none());
+        assert!(args.upstream_no_proxy.is_none());
+        assert!(args.upstream_proxy_auth_file.is_none());
+        assert!(!args.upstream_proxy_auth_allow_insecure);
+        assert!(!args.upstream_proxy_connect_by_hostname);
+        assert!(args.upstream_proxy_ca_bundle.is_none());
     }
 
     #[test]
@@ -762,6 +780,28 @@ mod tests {
         let args = Args::parse_from(["openshell-driver-vm"]);
         let err = compute_driver_listen_mode(&args).expect_err("default TCP should be disabled");
         assert!(err.contains("--bind-socket is required"));
+    }
+
+    #[test]
+    fn accepts_canonical_grpc_endpoint_flag() {
+        let args = Args::try_parse_from([
+            "openshell-driver-vm",
+            "--grpc-endpoint",
+            "http://127.0.0.1:8080",
+        ])
+        .unwrap();
+        assert_eq!(args.grpc_endpoint.as_deref(), Some("http://127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn rejects_legacy_openshell_endpoint_flag() {
+        let error = Args::try_parse_from([
+            "openshell-driver-vm",
+            "--openshell-endpoint",
+            "http://127.0.0.1:8080",
+        ])
+        .expect_err("legacy --openshell-endpoint must be rejected");
+        assert!(error.to_string().contains("--openshell-endpoint"));
     }
 
     #[test]

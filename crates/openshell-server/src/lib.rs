@@ -97,11 +97,11 @@ struct GatewayExtensionCredential {
 }
 
 fn extension_token_ttl(issuer: &auth::sandbox_jwt::SandboxJwtIssuer) -> Duration {
-    if issuer.ttl().is_zero() {
-        Duration::from_secs(15 * 60)
-    } else {
-        issuer.ttl().min(MAX_EXTENSION_TOKEN_TTL)
-    }
+    issuer
+        .sandbox_token_ttl()
+        .map_or(Duration::from_secs(15 * 60), |ttl| {
+            ttl.min(MAX_EXTENSION_TOKEN_TTL)
+        })
 }
 
 /// Mint the gateway-caller credential for one extension registration.
@@ -249,6 +249,7 @@ pub(crate) struct ServerStartupConfig {
     pub config_file: Option<config_file::ConfigFile>,
     pub guest_tls: Option<compute::driver_config::GuestTlsPaths>,
     pub compute_driver: ComputeDriverSelection,
+    pub legacy_compute_driver_env_seen: bool,
 }
 
 /// Server state shared across handlers.
@@ -449,6 +450,7 @@ pub(crate) async fn run_server(
         config_file,
         guest_tls,
         compute_driver,
+        legacy_compute_driver_env_seen: _,
     } = startup;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -496,7 +498,7 @@ pub(crate) async fn run_server(
                 &signing_pem,
                 kid.clone(),
                 &jwt.gateway_id,
-                Duration::from_secs(jwt.ttl_secs),
+                jwt.sandbox_token_ttl(),
             )
             .map_err(Error::config)?,
         );
@@ -506,7 +508,7 @@ pub(crate) async fn run_server(
         );
         info!(
             gateway_id = %jwt.gateway_id,
-            ttl_secs = jwt.ttl_secs,
+            ttl_secs = jwt.ttl_secs.map(std::num::NonZeroU64::get),
             "gateway-minted sandbox JWT enabled"
         );
         (Some(issuer), Some(authenticator))
@@ -1058,6 +1060,10 @@ pub enum ComputeDriverInstance {
 /// Factory for a compute driver linked into a gateway binary.
 #[async_trait::async_trait]
 pub trait ComputeDriverFactory: Send + Sync {
+    /// Validate selected-driver configuration without starting a driver,
+    /// connecting a transport, or modifying runtime state.
+    fn validate_config(&self, context: ComputeDriverConfigContext<'_>) -> Result<()>;
+
     async fn build(&self, context: ComputeDriverBuildContext<'_>) -> Result<ComputeDriverInstance>;
 }
 
@@ -1262,45 +1268,46 @@ impl ComputeDriverRegistry {
         ComputeDriverDetection { available }
     }
 
-    pub(crate) fn select(&self, configured_drivers: &[String]) -> Result<ComputeDriverSelection> {
-        match configured_drivers {
-            [] => {
+    pub(crate) fn select(&self, configured_driver: Option<&str>) -> Result<ComputeDriverSelection> {
+        match configured_driver {
+            None => {
                 let detection = self.detect();
                 if detection.selected().is_none() {
                     return Err(Error::config(
                         "no compute driver configured and auto-detection found no suitable installed \
-                         driver; set --drivers <name> or OPENSHELL_DRIVERS=<name>",
+                        driver; set --compute-driver <name> or OPENSHELL_COMPUTE_DRIVER=<name>",
                     ));
                 }
                 Ok(ComputeDriverSelection::AutoDetected(detection))
             }
-            [driver] => {
+            Some(driver) => {
                 let name = openshell_core::config::normalize_compute_driver_name(driver)
                     .map_err(Error::config)?;
                 Ok(ComputeDriverSelection::Configured { name })
             }
-            drivers => Err(Error::config(format!(
-                "multiple compute drivers are not supported yet; configured drivers: {}",
-                drivers.join(",")
-            ))),
         }
     }
 }
 
-pub struct ComputeDriverBuildContext<'a> {
-    driver_name: String,
+/// Read-only inputs available while validating a selected compute driver.
+///
+/// This context deliberately exposes no shutdown handle, runtime store, or
+/// transport client. Implementations must remain deterministic and must not
+/// start processes, connect sockets, or modify state.
+#[derive(Clone, Copy)]
+pub struct ComputeDriverConfigContext<'a> {
+    driver_name: &'a str,
     gateway_name: &'a str,
     gateway_bind_address: SocketAddr,
     gateway_log_level: &'a str,
     driver_startup: compute::driver_config::DriverStartupContext<'a>,
-    shutdown_rx: watch::Receiver<bool>,
     inherited_config_keys: &'static [&'static str],
 }
 
-impl ComputeDriverBuildContext<'_> {
+impl ComputeDriverConfigContext<'_> {
     #[must_use]
     pub fn driver_name(&self) -> &str {
-        &self.driver_name
+        self.driver_name
     }
 
     #[must_use]
@@ -1328,10 +1335,65 @@ impl ComputeDriverBuildContext<'_> {
         self.driver_startup.gateway_tls_enabled
     }
 
+    /// Deserialize the selected driver's merged TOML table.
+    pub fn driver_config<T>(&self) -> Result<T>
+    where
+        T: Default + serde::de::DeserializeOwned,
+    {
+        compute::driver_config::driver_config_from_context(
+            self.driver_startup,
+            self.driver_name,
+            self.inherited_config_keys,
+        )
+    }
+}
+
+pub struct ComputeDriverBuildContext<'a> {
+    config: ComputeDriverConfigContext<'a>,
+    shutdown_rx: watch::Receiver<bool>,
+}
+
+impl ComputeDriverBuildContext<'_> {
+    #[must_use]
+    pub fn config_context(&self) -> ComputeDriverConfigContext<'_> {
+        self.config
+    }
+
+    #[must_use]
+    pub fn driver_name(&self) -> &str {
+        self.config.driver_name()
+    }
+
+    #[must_use]
+    pub fn gateway_name(&self) -> &str {
+        self.config.gateway_name()
+    }
+
+    #[must_use]
+    pub fn gateway_bind_address(&self) -> SocketAddr {
+        self.config.gateway_bind_address()
+    }
+
+    #[must_use]
+    pub fn gateway_log_level(&self) -> &str {
+        self.config.gateway_log_level()
+    }
+
+    #[must_use]
+    pub fn gateway_port(&self) -> u16 {
+        self.config.gateway_port()
+    }
+
+    #[must_use]
+    pub fn gateway_tls_enabled(&self) -> bool {
+        self.config.gateway_tls_enabled()
+    }
+
     /// Gateway client credentials that a local driver may mount into guests.
     #[must_use]
     pub fn guest_tls_paths(&self) -> Option<(&Path, &Path, &Path)> {
-        self.driver_startup
+        self.config
+            .driver_startup
             .guest_tls
             .map(compute::driver_config::GuestTlsPaths::as_paths)
     }
@@ -1341,11 +1403,7 @@ impl ComputeDriverBuildContext<'_> {
     where
         T: Default + serde::de::DeserializeOwned,
     {
-        compute::driver_config::driver_config_from_context(
-            self.driver_startup,
-            &self.driver_name,
-            self.inherited_config_keys,
-        )
+        self.config.driver_config()
     }
 
     #[must_use]
@@ -1355,7 +1413,8 @@ impl ComputeDriverBuildContext<'_> {
 
     #[must_use]
     pub fn otlp_config(&self) -> Option<&config_file::OtlpConfig> {
-        self.driver_startup
+        self.config
+            .driver_startup
             .file
             .and_then(|file| file.openshell.gateway.otlp.as_ref())
     }
@@ -1374,30 +1433,39 @@ async fn build_compute_runtime(
     supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<ComputeRuntime> {
-    let driver = resolve_configured_compute_driver(registry, selection.name(), driver_startup)?;
+    let driver = validate_compute_driver_config(
+        registry,
+        selection.name(),
+        &config.name,
+        config.bind_address,
+        &config.log_level,
+        driver_startup,
+    )?;
     let telemetry_compute_driver = driver.telemetry_compute_driver(registry);
     info!(driver = %driver.name(), "Using compute driver");
     if config
         .gateway_jwt
         .as_ref()
-        .is_some_and(|jwt| jwt.ttl_secs == 0)
+        .is_some_and(|jwt| jwt.sandbox_token_ttl().is_none())
         && !driver.is_local_singleplayer(registry)
     {
         warn!(
-            "Gateway configured with non-expiring sandbox JWTs; set gateway_jwt.ttl_secs > 0 for shared deployments"
+            "Gateway configured with non-expiring sandbox JWTs (gateway_jwt.ttl_secs is omitted or zero); set gateway_jwt.ttl_secs > 0 for shared deployments"
         );
     }
 
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
             let build_context = ComputeDriverBuildContext {
-                driver_name: registration.name.clone(),
-                gateway_name: &config.name,
-                gateway_bind_address: config.bind_address,
-                gateway_log_level: &config.log_level,
-                driver_startup,
+                config: ComputeDriverConfigContext {
+                    driver_name: &registration.name,
+                    gateway_name: &config.name,
+                    gateway_bind_address: config.bind_address,
+                    gateway_log_level: &config.log_level,
+                    driver_startup,
+                    inherited_config_keys: registration.inherited_config_keys,
+                },
                 shutdown_rx,
-                inherited_config_keys: registration.inherited_config_keys,
             };
             let instance = registration.factory.build(build_context).await?;
             match instance {
@@ -1500,8 +1568,38 @@ fn configured_compute_driver(
     config: &Config,
     driver_startup: compute::driver_config::DriverStartupContext<'_>,
 ) -> Result<ConfiguredComputeDriver> {
-    let selection = registry.select(&config.compute_drivers)?;
+    let selection = registry.select(config.compute_driver.as_deref())?;
     resolve_configured_compute_driver(registry, selection.name(), driver_startup)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_compute_driver_config(
+    registry: &ComputeDriverRegistry,
+    driver_name: &str,
+    gateway_name: &str,
+    gateway_bind_address: SocketAddr,
+    gateway_log_level: &str,
+    driver_startup: compute::driver_config::DriverStartupContext<'_>,
+) -> Result<ConfiguredComputeDriver> {
+    let driver = resolve_configured_compute_driver(registry, driver_name, driver_startup)?;
+    match &driver {
+        ConfiguredComputeDriver::Registered(registration) => {
+            registration
+                .factory
+                .validate_config(ComputeDriverConfigContext {
+                    driver_name: &registration.name,
+                    gateway_name,
+                    gateway_bind_address,
+                    gateway_log_level,
+                    driver_startup,
+                    inherited_config_keys: registration.inherited_config_keys,
+                })?;
+        }
+        ConfiguredComputeDriver::Remote { name } => {
+            compute::driver_config::remote_driver_config_from_context(driver_startup, name)?;
+        }
+    }
+    Ok(driver)
 }
 
 fn resolve_configured_compute_driver(
@@ -1590,7 +1688,7 @@ mod tests {
         BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, ExtensionKind,
         GatewayListenerScope, MultiplexService, ServerState, TlsAcceptor,
         allow_plaintext_service_http, bind_gateway_listeners, classify_initial_bytes,
-        configured_compute_driver, is_benign_tls_handshake_failure,
+        configured_compute_driver, extension_token_ttl, is_benign_tls_handshake_failure,
         mint_gateway_extension_credential, serve_gateway_listener,
     };
     use openshell_core::{
@@ -1636,16 +1734,37 @@ mod tests {
     }
 
     fn extension_test_issuer() -> Arc<crate::auth::sandbox_jwt::SandboxJwtIssuer> {
+        extension_test_issuer_with_ttl(Some(Duration::from_secs(900)))
+    }
+
+    fn extension_test_issuer_with_ttl(
+        ttl: Option<Duration>,
+    ) -> Arc<crate::auth::sandbox_jwt::SandboxJwtIssuer> {
         let material = openshell_bootstrap::jwt::generate_jwt_key().expect("jwt key");
         Arc::new(
             crate::auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
                 material.signing_key_pem.as_bytes(),
                 material.kid,
                 "gateway-a",
-                Duration::from_secs(900),
+                ttl,
             )
             .expect("issuer"),
         )
+    }
+
+    #[test]
+    fn non_expiring_sandbox_tokens_use_finite_extension_ttl() {
+        let issuer = extension_test_issuer_with_ttl(None);
+        assert_eq!(extension_token_ttl(&issuer), Duration::from_secs(15 * 60));
+    }
+
+    #[test]
+    fn extension_token_ttl_is_capped_at_one_hour() {
+        let issuer = extension_test_issuer_with_ttl(Some(Duration::from_secs(24 * 60 * 60)));
+        assert_eq!(extension_token_ttl(&issuer), Duration::from_secs(60 * 60));
+
+        let short = extension_test_issuer_with_ttl(Some(Duration::from_secs(5 * 60)));
+        assert_eq!(extension_token_ttl(&short), Duration::from_secs(5 * 60));
     }
 
     #[test]
@@ -1764,6 +1883,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl super::ComputeDriverFactory for TestComputeDriverFactory {
+        fn validate_config(
+            &self,
+            _context: super::ComputeDriverConfigContext<'_>,
+        ) -> openshell_core::Result<()> {
+            Ok(())
+        }
+
         async fn build(
             &self,
             _context: super::ComputeDriverBuildContext<'_>,
@@ -2097,7 +2223,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let config = Config::new(None).with_compute_drivers(std::iter::empty::<String>());
+        let config = Config::new(None);
         let result =
             configured_compute_driver(&registry, &config, test_driver_startup(&config, None))
                 .unwrap();
@@ -2167,24 +2293,8 @@ mod tests {
     }
 
     #[test]
-    fn configured_compute_driver_rejects_multiple_entries() {
-        let config = Config::new(None).with_compute_drivers(["alpha", "beta"]);
-        let err = configured_compute_driver(
-            &test_compute_drivers(),
-            &config,
-            test_driver_startup(&config, None),
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("multiple compute drivers are not supported yet")
-        );
-        assert!(err.to_string().contains("alpha,beta"));
-    }
-
-    #[test]
     fn configured_compute_driver_accepts_registered_name() {
-        let config = Config::new(None).with_compute_drivers(["beta"]);
+        let config = Config::new(None).with_compute_driver("beta");
         let registry = test_compute_drivers();
         let driver =
             configured_compute_driver(&registry, &config, test_driver_startup(&config, None))
@@ -2201,7 +2311,7 @@ mod tests {
 
     #[test]
     fn configured_compute_driver_resolves_named_remote() {
-        let config = Config::new(None).with_compute_drivers(["kyma"]);
+        let config = Config::new(None).with_compute_driver("kyma");
         let registry = test_compute_drivers();
 
         let driver =
@@ -2228,7 +2338,7 @@ mod tests {
     #[test]
     fn configured_compute_driver_uses_endpoint_override() {
         let config = Config::new(None)
-            .with_compute_drivers(["alpha"])
+            .with_compute_driver("alpha")
             .with_compute_driver_endpoint("alpha", "/run/openshell/alpha.sock");
         let registry = test_compute_drivers();
 
@@ -2248,7 +2358,7 @@ mod tests {
     #[test]
     fn configured_compute_driver_uses_builtin_endpoint_override() {
         let config = Config::new(None)
-            .with_compute_drivers(["beta"])
+            .with_compute_driver("beta")
             .with_compute_driver_endpoint("beta", "/run/openshell/beta.sock");
 
         let driver = configured_compute_driver(

@@ -54,10 +54,10 @@ start_gateway() {
     mkdir -p "$STATE_DIR"
     cat >"$config" <<EOF
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
-compute_drivers = ["vm"]
+compute_driver = "vm"
 disable_tls = true
 
 [openshell.drivers.vm]
@@ -68,7 +68,7 @@ EOF
     OPENSHELL_SERVER_PORT="$PORT" \
     OPENSHELL_HEALTH_PORT="$health_port" \
     OPENSHELL_DB_URL="sqlite:$STATE_DIR/openshell.db" \
-    OPENSHELL_DRIVERS=vm \
+    OPENSHELL_COMPUTE_DRIVER=vm \
     OPENSHELL_GATEWAY_CONFIG="$config" \
     OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="$ROOT/target/vm-runtime-compressed" \
     nohup "$ROOT/target/debug/openshell-gateway" --disable-tls \

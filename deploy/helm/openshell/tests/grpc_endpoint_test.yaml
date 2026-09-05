@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: Kubernetes gateway callback endpoint
+
+templates:
+  - templates/gateway-config.yaml
+
+release:
+  name: team-a
+  namespace: gateway-system
+
+tests:
+  - it: derives callback from the gateway Service when sandbox namespace differs
+    set:
+      server.sandboxNamespace: agent-sandboxes
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^namespace\s*=\s*"agent-sandboxes"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^grpc_endpoint\s*=\s*"https://team-a-openshell\.gateway-system\.svc\.cluster\.local:8080"$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^grpc_endpoint\s*=.*agent-sandboxes'

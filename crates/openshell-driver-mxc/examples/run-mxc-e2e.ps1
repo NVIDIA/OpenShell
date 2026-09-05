@@ -240,7 +240,7 @@ Step "Prepare DemoDir $DemoDir"
 New-Item -ItemType Directory -Force $DemoDir | Out-Null
 Ok "DemoDir ready"
 
-$env:OPENSHELL_DRIVERS       = "mxc"
+$env:OPENSHELL_COMPUTE_DRIVER       = "mxc"
 $env:OPENSHELL_MXC_SHARE_DIR = $DemoDir
 
 # ── Start gateway ─────────────────────────────────────────────────────────────

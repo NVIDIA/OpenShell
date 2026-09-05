@@ -1,0 +1,109 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Step 11 dispositions for the cross-cutting gateway capabilities that are not
+# exercised by the compute-driver waves. The paired deterministic preflight is
+# regression evidence only: it does not replace a candidate-owned oracle that
+# drives both gateway processes and observes the same live behavior.
+manifest_version = 1
+baseline_commit = "74960ebfaeec4673885089ed995fad902459749f"
+candidate_commit = "363d8540830b2ea294d43198daa2b7a283a2face"
+overall_status = "platform_blocked"
+
+[deterministic_preflight]
+status = "pass"
+baseline_attestation = "e2e/configs/gateway/schema-v2-step11-baseline-attestation.txt"
+baseline_attestation_sha256 = "df3c5e1dcb073eb8db0cb28377516523b331d44fc6f5a5fefab2e92273efaf51"
+candidate_attestation = "e2e/configs/gateway/schema-v2-step11-candidate-attestation.txt"
+candidate_attestation_sha256 = "2562bff73eba8042199597e814b618b12b93994d15e4ae36e902347347d95fed"
+commands = [
+  "cargo test -q -p openshell-server --lib",
+  "cargo test -q -p openshell-gateway-interceptors",
+  "cargo test -q -p openshell-supervisor-middleware",
+  "cargo test -q -p openshell-otel-test-support",
+  "cargo test -q -p openshell-server --test multiplex_tls_integration",
+  "cargo test -q -p openshell-server --test edge_tunnel_auth",
+]
+evidence = [
+  "The frozen baseline passed 1,455 openshell-server library tests with 8 ignored; the candidate passed 1,481 with 8 ignored.",
+  "Both revisions passed 49 gateway-interceptor tests, 85 supervisor-middleware tests, 5 multiplex TLS integration tests, and 5 edge-tunnel authentication tests.",
+  "The openshell-otel-test-support crate compiled successfully on both revisions but currently defines no tests; OTLP behavior is exercised by openshell-server unit tests and still requires a collector-backed live lane.",
+  "Both runs used checkout-local target directories with sccache disabled after a prior ENOSPC event corrupted the shared cache.",
+]
+
+[[capabilities]]
+id = "oidc-bearer-authentication"
+status = "platform_blocked"
+owner = "OpenShell auth and OIDC CI lane"
+lane = "linux-oidc-paired-keycloak-jwks"
+blocker = "The host has no isolated paired issuer fixture that presents equivalent signed tokens to both exact-source gateways. Existing Keycloak and OIDC suites are candidate-oriented and cannot establish schema-v1/schema-v2 audience, role, scope, expiry, signature, and key-rotation parity without a shared candidate-owned oracle."
+
+[[capabilities]]
+id = "mtls-user-authentication"
+status = "platform_blocked"
+owner = "OpenShell gateway authentication CI lane"
+lane = "linux-mtls-user-principal-paired"
+blocker = "The paired TLS integration tests validate handshake policy but do not drive an authenticated user RPC through both gateways or prove certificate-to-principal mapping. A live lane must use isolated client PKI, equivalent schema files, and the same authorization oracle for enabled and disabled mTLS user authentication."
+
+[[capabilities]]
+id = "unsafe-unauthenticated-user-mode"
+status = "platform_blocked"
+owner = "OpenShell gateway authentication CI lane"
+lane = "linux-auth-chain-paired-isolated"
+blocker = "No paired live fixture currently proves that the trusted-development switch admits user requests while sandbox callbacks continue to require sandbox credentials. Candidate-only extension examples use this switch for setup, but that is not an authentication-boundary parity test."
+
+[[capabilities]]
+id = "gateway-minted-sandbox-jwt"
+status = "platform_blocked"
+owner = "OpenShell gateway JWT CI lane"
+lane = "linux-gateway-jwt-claims-paired"
+blocker = "Step 10 proved authenticated callback connectivity but did not capture and compare token claims. A controlled callback and extension fixture must verify issuer, gateway identity, key ID, audience, subject, token type, and expiry semantics for both gateways; explicit zero versus omitted TTL remains the ledgered gateway-jwt-zero-sentinel-removed intentional change."
+
+[[capabilities]]
+id = "otlp-observability"
+status = "platform_blocked"
+owner = "OpenShell observability CI lane"
+lane = "linux-otlp-grpc-collector-paired"
+blocker = "The deterministic exporter tests passed, but no retained paired collector capture proves emitted gateway and in-tree-driver spans, gateway name, service name, selected-driver resource attributes, or continued serving after collector failure. A loopback OTLP/gRPC collector lane must observe those outcomes from both exact-source processes."
+
+[[capabilities]]
+id = "gateway-interceptor-registration"
+status = "platform_blocked"
+owner = "OpenShell gateway interceptor CI lane"
+lane = "linux-gateway-interceptor-paired"
+blocker = "The interceptor library suite passed on both revisions, while the governance-interceptor smoke test remains candidate-only. A paired service must compare Describe validation, binding selection, unary request and response mutation, failure policy, timeout and size limits, and secret exclusion against both gateway schema variants."
+
+[[capabilities]]
+id = "supervisor-middleware-registration"
+status = "platform_blocked"
+owner = "OpenShell supervisor middleware CI lane"
+lane = "linux-supervisor-middleware-paired"
+blocker = "The middleware library suite passed on both revisions, while the content-guard smoke test remains candidate-only. A paired gateway, sandbox, and middleware fixture must compare Describe negotiation, policy distribution, guarded and unguarded traffic, failure policy, timeout, and payload limits; the field-name normalization remains the ledgered middleware-payload-name-normalized intentional change."
+
+[[capabilities]]
+id = "provider-profile-sources"
+status = "platform_blocked"
+owner = "OpenShell provider profile CI lane"
+lane = "linux-provider-profiles-interceptor-paired"
+blocker = "Server tests cover source construction and duplicate rejection, but no shared live interceptor catalog has been queried through both gateways. The assigned lane must compare builtin, user, and interceptor source ordering, normalized profile identities, duplicate rejection, discovery output, and failure handling with isolated persistent state."
+
+[[capabilities]]
+id = "inference-control-plane-configuration"
+status = "platform_blocked"
+owner = "OpenShell inference E2E lane"
+lane = "linux-inference-provider-routing-paired"
+blocker = "Existing inference routing tests are candidate-oriented and this host has no assigned paired provider and model-service fixture. The lane must configure providers and routes through each gateway control plane, observe the effective supervisor bundle, and compare model discovery and an inference request without reusing database state."
+
+[[capabilities]]
+id = "credential-driver-selection-and-kek"
+status = "platform_blocked"
+owner = "OpenShell credential security CI lane"
+lane = "linux-credential-kek-paired"
+blocker = "Both server suites passed deterministic selection, KEK, and credential tests, but they are revision-local tests rather than one candidate-owned live oracle. A paired lane must start isolated gateways with independent databases and KEKs, compare default encrypted storage and invalid selections, store and resolve opaque credentials, and verify that logs and configuration do not disclose secrets."
+
+[[capabilities]]
+id = "credential-driver-backend-tables"
+status = "platform_blocked"
+owner = "OpenShell credential driver E2E lane"
+lane = "kubernetes-vault-uds-credential-drivers-paired"
+blocker = "The host has no assigned disposable Kubernetes Secrets or Vault backend and no retained paired UDS credential-driver execution. Existing backend E2E coverage is candidate-oriented. The assigned lane must compare in-tree and remote transport validation plus opaque store and retrieve behavior using isolated namespaces, Vault state, sockets, databases, and credentials."

@@ -62,7 +62,7 @@ to the same Podman network.
 
 `START_GATEWAY=1` automates that same-network gateway setup. It mounts the host
 Podman socket into the gateway container, writes a temporary gateway config with
-`compute_drivers = ["podman"]`, and mounts the SPIRE Workload API socket at the
+`compute_driver = "podman"`, and mounts the SPIRE Workload API socket at the
 same absolute host path so the gateway can pass that path to sibling sandbox
 containers.
 
@@ -111,7 +111,7 @@ MANAGED_GATEWAY_HEALTH_PORT=18083
 GATEWAY_IMAGE=ghcr.io/nvidia/openshell/gateway:latest
 SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest
 SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:latest
-SANDBOX_IMAGE_PULL_POLICY=missing
+SANDBOX_IMAGE_PULL_POLICY=if_not_present
 PODMAN_STOP_TIMEOUT_SECS=3
 KEEP_DEMO=1
 KEEP_SANDBOX=1

@@ -104,7 +104,7 @@ contract:
 | `cap_add` | Grants supervisor-only capabilities required for namespace setup and process inspection. |
 | `apparmor=unconfined` | Avoids Docker's default profile blocking required mount operations. |
 | `restart_policy = no` | A canonical main-process exit remains terminal and is not silently restarted by Docker. |
-| `PidsLimit` | Enforces the sandbox PID budget at the Docker cgroup layer. Set `[openshell.drivers.docker].sandbox_pids_limit = 0` to inherit the Docker/runtime default. |
+| `PidsLimit` | Enforces the sandbox PID budget at the Docker cgroup layer. `[openshell.drivers.docker].sandbox_pids_limit` defaults to `2048`; explicit `0` is invalid. |
 | CDI GPU request | Uses opaque `driver_config.cdi_devices` values when set; otherwise selects the requested count of NVIDIA CDI GPUs in round-robin order when daemon CDI support is detected. Docker daemon `/info` can permit `nvidia.com/gpu=all` as a WSL2 all-only compatibility fallback, where it counts as one selectable device. Exact CDI device lists must not contain duplicates and must match the effective GPU count. |
 | `policy-dns-transparent-tcp` capability | Declares that the combined Docker supervisor can own namespace-local DNS/TCP capture and coupled workload restart. The shared supervisor still owns DNS eligibility, mappings, authorization, pinned dialing, relaying, and OCSF decisions. The marker is stripped from the workload environment. |
 
@@ -186,6 +186,25 @@ mounted into the container and exposed with:
 - `OPENSHELL_TLS_KEY`
 
 HTTP endpoints reject TLS material because the supervisor would not use it.
+
+## Corporate proxy, SPIFFE, and AppArmor
+
+`https_proxy`, `no_proxy`, and `proxy_auth_file` in
+`[openshell.drivers.docker]` are operator-owned supervisor settings. Docker
+passes the proxy URL and bypass list on the supervisor command line and mounts
+an optional `user:pass` auth file read-only at a root-only path. Credentials
+never appear in container environment or Docker labels. An auth file used with
+an `http://` proxy requires `proxy_auth_allow_insecure = true`; an `https://`
+proxy protects the Basic-auth header in its TLS session.
+
+Set `provider_spiffe_workload_api_socket` to an absolute host UNIX socket to
+project its dedicated parent directory into the supervisor and set
+`OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET` to the guest path. TCP URIs are
+rejected for this projection. `app_armor_profile` uses the shared
+`RuntimeDefault`, `Unconfined`, or `Localhost/<profile>` vocabulary. Docker
+uses explicit `Unconfined` by default because the supervisor's namespace mount
+setup is incompatible with `docker-default`; requested confined profiles fail
+at startup if Docker does not report AppArmor support.
 
 ## Environment Ownership
 

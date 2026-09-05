@@ -6,7 +6,9 @@
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::net::SocketAddr;
+use std::num::{NonZeroI64, NonZeroU64};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -28,6 +30,18 @@ pub const DEFAULT_GATEWAY_NAME: &str = "openshell";
 
 /// Default container stop timeout in seconds (SIGTERM → SIGKILL).
 pub const DEFAULT_STOP_TIMEOUT_SECS: u32 = 10;
+
+/// Default cgroup PID limit for local container sandboxes.
+pub const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
+
+/// Typed default cgroup PID limit for local container sandboxes.
+#[must_use]
+pub fn default_sandbox_pids_limit() -> Option<NonZeroI64> {
+    NonZeroI64::new(DEFAULT_SANDBOX_PIDS_LIMIT)
+}
+
+/// Default Docker bridge network name for local sandboxes.
+pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 
 /// Default domain used for browser-facing sandbox service URLs.
 pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
@@ -106,11 +120,6 @@ pub fn resolve_supervisor_image_tag(candidates: &[&str]) -> String {
 
 /// CDI device identifier for requesting all NVIDIA GPUs.
 pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
-
-/// Default maximum number of processes (PIDs) allowed inside a sandbox container.
-///
-/// Compute drivers may override this through backend configuration.
-pub const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
 
 /// Normalize a configured compute driver name.
 ///
@@ -194,12 +203,9 @@ pub struct Config {
     /// Database URL for persistence.
     pub database_url: String,
 
-    /// Compute drivers configured for the gateway.
-    ///
-    /// The config shape allows multiple drivers so the gateway can evolve
-    /// toward multi-backend routing. Current releases require exactly one
-    /// configured driver.
-    pub compute_drivers: Vec<String>,
+    /// Explicit compute driver configured for the gateway.
+    /// `None` enables runtime auto-detection.
+    pub compute_driver: Option<String>,
 
     /// Operator-provided endpoints for named remote compute drivers.
     ///
@@ -503,6 +509,225 @@ const fn default_jwks_ttl_secs() -> u64 {
     3600
 }
 
+/// Canonical policy controlling when a driver pulls a sandbox image.
+///
+/// Backends translate this shared vocabulary to their runtime API. `newer` is
+/// supported only by Podman; other backends reject it during configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImagePullPolicy {
+    /// Always pull, even if a local image is available.
+    Always,
+    /// Pull only when a local image is unavailable.
+    #[default]
+    IfNotPresent,
+    /// Never pull; fail when a local image is unavailable.
+    Never,
+    /// Pull only when the registry image is newer than the local copy.
+    Newer,
+}
+
+impl ImagePullPolicy {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::IfNotPresent => "if_not_present",
+            Self::Never => "never",
+            Self::Newer => "newer",
+        }
+    }
+}
+
+impl fmt::Display for ImagePullPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ImagePullPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "always" => Ok(Self::Always),
+            "if_not_present" => Ok(Self::IfNotPresent),
+            "never" => Ok(Self::Never),
+            "newer" => Ok(Self::Newer),
+            other => Err(format!(
+                "invalid image pull policy '{other}'; expected one of: always, if_not_present, never, newer"
+            )),
+        }
+    }
+}
+
+/// Canonical `AppArmor` confinement requested for a sandbox container.
+///
+/// Drivers translate this model to their runtime API. An omitted value leaves
+/// the runtime default unchanged; `Unconfined` is explicit because the
+/// supervisor needs mount operations that the default Docker/Podman profile
+/// commonly denies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppArmorProfile {
+    RuntimeDefault,
+    Unconfined,
+    Localhost(String),
+}
+
+impl AppArmorProfile {
+    #[must_use]
+    pub const fn kubernetes_type(&self) -> &'static str {
+        match self {
+            Self::RuntimeDefault => "RuntimeDefault",
+            Self::Unconfined => "Unconfined",
+            Self::Localhost(_) => "Localhost",
+        }
+    }
+
+    #[must_use]
+    pub fn localhost_profile(&self) -> Option<&str> {
+        match self {
+            Self::Localhost(profile) => Some(profile),
+            Self::RuntimeDefault | Self::Unconfined => None,
+        }
+    }
+
+    /// Translate to the OCI `apparmor=<profile>` security option.
+    ///
+    /// `RuntimeDefault` deliberately returns `None`: omitting an OCI option
+    /// asks Docker/Podman to apply their runtime default profile.
+    #[must_use]
+    pub fn oci_security_opt(&self) -> Option<String> {
+        match self {
+            Self::RuntimeDefault => None,
+            Self::Unconfined => Some("apparmor=unconfined".to_string()),
+            Self::Localhost(profile) => Some(format!("apparmor={profile}")),
+        }
+    }
+}
+
+impl fmt::Display for AppArmorProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RuntimeDefault => f.write_str("RuntimeDefault"),
+            Self::Unconfined => f.write_str("Unconfined"),
+            Self::Localhost(profile) => write!(f, "Localhost/{profile}"),
+        }
+    }
+}
+
+impl FromStr for AppArmorProfile {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "RuntimeDefault" => Ok(Self::RuntimeDefault),
+            "Unconfined" => Ok(Self::Unconfined),
+            other => match other.strip_prefix("Localhost/") {
+                Some("") => Err(
+                    "invalid AppArmor profile 'Localhost/'; expected non-empty profile name"
+                        .to_string(),
+                ),
+                Some(profile) if !profile.contains(char::is_whitespace) => {
+                    Ok(Self::Localhost(profile.to_string()))
+                }
+                Some(_) => {
+                    Err("invalid AppArmor localhost profile; whitespace is not allowed".to_string())
+                }
+                None => Err(format!(
+                    "unknown AppArmor profile '{other}'; expected 'RuntimeDefault', 'Unconfined', or 'Localhost/<profile-name>'"
+                )),
+            },
+        }
+    }
+}
+
+impl Serialize for AppArmorProfile {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for AppArmorProfile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_str(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Common local-driver corporate forward-proxy settings.
+///
+/// This type is `flatten`ed by local compute-driver tables, preserving the
+/// established TOML field names while keeping their safety contract shared.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpstreamProxyConfig {
+    pub https_proxy: Option<String>,
+    pub no_proxy: Option<String>,
+    pub proxy_auth_file: Option<PathBuf>,
+    pub proxy_auth_allow_insecure: Option<bool>,
+    pub proxy_connect_by_hostname: Option<bool>,
+}
+
+impl UpstreamProxyConfig {
+    /// Validate relationships that are independent of the container backend.
+    /// Credential contents are intentionally not read here and are never put
+    /// in an error message; drivers validate and stage them per sandbox.
+    pub fn validate(&self) -> Result<(), String> {
+        use crate::driver_utils::{UpstreamProxyUrlError, parse_upstream_proxy_url};
+
+        let proxy_secure = if let Some(url) = self.https_proxy.as_deref() {
+            parse_upstream_proxy_url(url)
+                .map_err(|err| match err {
+                    UpstreamProxyUrlError::Empty => "https_proxy must not be empty when set".to_string(),
+                    UpstreamProxyUrlError::InlineCredentials => "https_proxy must not embed credentials; supply them with proxy_auth_file so they are not stored in configuration or runtime metadata".to_string(),
+                    err => format!("https_proxy {err}"),
+                })?
+                .secure
+        } else {
+            false
+        };
+
+        if self
+            .no_proxy
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err("no_proxy must not be empty when set; omit it instead".to_string());
+        }
+        if self.no_proxy.is_some() && self.https_proxy.is_none() {
+            return Err("no_proxy is set but no https_proxy is configured".to_string());
+        }
+        if let Some(path) = self.proxy_auth_file.as_ref() {
+            if path.as_os_str().is_empty() {
+                return Err("proxy_auth_file must not be empty when set".to_string());
+            }
+            if self.https_proxy.is_none() {
+                return Err("proxy_auth_file is set but no https_proxy is configured".to_string());
+            }
+            if !proxy_secure && self.proxy_auth_allow_insecure != Some(true) {
+                return Err("proxy_auth_file sends a cleartext Basic credential to an http:// proxy; set proxy_auth_allow_insecure = true to acknowledge that exposure".to_string());
+            }
+        } else if self.proxy_auth_allow_insecure.is_some() {
+            return Err(
+                "proxy_auth_allow_insecure is set but no proxy_auth_file is configured".to_string(),
+            );
+        }
+        if self.proxy_connect_by_hostname.is_some() && self.https_proxy.is_none() {
+            return Err(
+                "proxy_connect_by_hostname is set but no https_proxy is configured".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Gateway-minted sandbox JWT configuration.
 ///
 /// Points the gateway at the Ed25519 signing key (produced by `certgen`)
@@ -522,18 +747,21 @@ pub struct GatewayJwtConfig {
     /// `openshell`.
     #[serde(default = "default_gateway_id")]
     pub gateway_id: String,
-    /// Token lifetime in seconds. A value of 0 disables expiration and is
-    /// intended only for local single-player deployments.
-    #[serde(default = "default_sandbox_token_ttl_secs")]
-    pub ttl_secs: u64,
+    /// Token lifetime in seconds. Omit the field for a non-expiring token.
+    /// Explicit zero is invalid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<NonZeroU64>,
+}
+
+impl GatewayJwtConfig {
+    /// Effective token lifetime. `None` represents a non-expiring token.
+    pub fn sandbox_token_ttl(&self) -> Option<Duration> {
+        self.ttl_secs.map(|ttl| Duration::from_secs(ttl.get()))
+    }
 }
 
 fn default_gateway_id() -> String {
     "openshell".to_string()
-}
-
-const fn default_sandbox_token_ttl_secs() -> u64 {
-    0
 }
 
 fn default_roles_claim() -> String {
@@ -569,7 +797,7 @@ impl Config {
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
             database_url: String::new(),
-            compute_drivers: vec![],
+            compute_driver: None,
             compute_driver_endpoints: BTreeMap::new(),
             credential_drivers: Vec::new(),
             default_credential_driver: None,
@@ -620,17 +848,10 @@ impl Config {
         self
     }
 
-    /// Create a new configuration with the configured compute drivers.
+    /// Create a new configuration with an explicit compute driver.
     #[must_use]
-    pub fn with_compute_drivers<I, D>(mut self, drivers: I) -> Self
-    where
-        I: IntoIterator<Item = D>,
-        D: ToString,
-    {
-        self.compute_drivers = drivers
-            .into_iter()
-            .map(|driver| driver.to_string())
-            .collect();
+    pub fn with_compute_driver(mut self, driver: impl ToString) -> Self {
+        self.compute_driver = Some(driver.to_string());
         self
     }
 
@@ -825,10 +1046,10 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
+        AppArmorProfile, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
         GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
-        GatewayProviderProfileSourceConfig, PolicyValidationFailureMode,
-        normalize_compute_driver_name,
+        GatewayProviderProfileSourceConfig, ImagePullPolicy, PolicyValidationFailureMode,
+        UpstreamProxyConfig, default_sandbox_pids_limit, normalize_compute_driver_name,
     };
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -922,7 +1143,242 @@ mod tests {
         }))
         .expect("gateway JWT config should deserialize with default ttl");
 
-        assert_eq!(cfg.ttl_secs, 0);
+        assert_eq!(cfg.ttl_secs, None);
+        assert_eq!(cfg.sandbox_token_ttl(), None);
+
+        let serialized = serde_json::to_value(&cfg).expect("gateway JWT config serializes");
+        assert!(serialized.get("ttl_secs").is_none());
+    }
+
+    #[test]
+    fn gateway_jwt_positive_ttl_serializes_and_has_effective_duration() {
+        let cfg: GatewayJwtConfig = serde_json::from_value(serde_json::json!({
+            "signing_key_path": "/tmp/signing.pem",
+            "public_key_path": "/tmp/public.pem",
+            "kid_path": "/tmp/kid",
+            "ttl_secs": 3600
+        }))
+        .expect("gateway JWT config should deserialize with positive ttl");
+
+        assert_eq!(cfg.sandbox_token_ttl(), Some(Duration::from_secs(3600)));
+        let serialized = serde_json::to_value(&cfg).expect("gateway JWT config serializes");
+        assert_eq!(serialized["ttl_secs"], 3600);
+    }
+
+    #[test]
+    fn gateway_jwt_ttl_rejects_zero() {
+        let error = serde_json::from_value::<GatewayJwtConfig>(serde_json::json!({
+            "signing_key_path": "/tmp/signing.pem",
+            "public_key_path": "/tmp/public.pem",
+            "kid_path": "/tmp/kid",
+            "ttl_secs": 0
+        }))
+        .expect_err("zero TTL must be rejected");
+        assert!(error.to_string().contains("invalid value: integer `0`"));
+    }
+
+    #[test]
+    fn image_pull_policy_uses_canonical_vocabulary() {
+        for (value, expected) in [
+            ("always", ImagePullPolicy::Always),
+            ("if_not_present", ImagePullPolicy::IfNotPresent),
+            ("never", ImagePullPolicy::Never),
+            ("newer", ImagePullPolicy::Newer),
+        ] {
+            assert_eq!(value.parse::<ImagePullPolicy>(), Ok(expected));
+            assert_eq!(expected.to_string(), value);
+            assert_eq!(serde_json::to_value(expected).unwrap(), value);
+        }
+        assert!("missing".parse::<ImagePullPolicy>().is_err());
+        assert!("IfNotPresent".parse::<ImagePullPolicy>().is_err());
+    }
+
+    #[test]
+    fn app_armor_profiles_round_trip_and_translate_for_each_backend() {
+        for (value, expected, kubernetes_type, localhost_profile, oci_security_opt) in [
+            (
+                "RuntimeDefault",
+                AppArmorProfile::RuntimeDefault,
+                "RuntimeDefault",
+                None,
+                None,
+            ),
+            (
+                "Unconfined",
+                AppArmorProfile::Unconfined,
+                "Unconfined",
+                None,
+                Some("apparmor=unconfined"),
+            ),
+            (
+                "Localhost/openshell-supervisor",
+                AppArmorProfile::Localhost("openshell-supervisor".to_string()),
+                "Localhost",
+                Some("openshell-supervisor"),
+                Some("apparmor=openshell-supervisor"),
+            ),
+        ] {
+            let parsed = value.parse::<AppArmorProfile>().expect("valid profile");
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.to_string(), value);
+            assert_eq!(parsed.kubernetes_type(), kubernetes_type);
+            assert_eq!(parsed.localhost_profile(), localhost_profile);
+            assert_eq!(parsed.oci_security_opt().as_deref(), oci_security_opt);
+
+            let json = serde_json::to_value(&parsed).expect("profile serializes");
+            assert_eq!(json, value);
+            assert_eq!(
+                serde_json::from_value::<AppArmorProfile>(json).expect("profile deserializes"),
+                parsed
+            );
+        }
+
+        for invalid in [
+            "Localhost/",
+            "Localhost/openshell profile",
+            "runtimeDefault",
+            "unconfined",
+            "Unknown",
+        ] {
+            assert!(
+                invalid.parse::<AppArmorProfile>().is_err(),
+                "{invalid} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_proxy_validation_enforces_cross_field_contract() {
+        let auth_file = Some("/run/secrets/proxy-auth".into());
+        let cases = [
+            ("default", UpstreamProxyConfig::default(), None),
+            (
+                "https auth",
+                UpstreamProxyConfig {
+                    https_proxy: Some("https://proxy.example:8443".to_string()),
+                    proxy_auth_file: auth_file.clone(),
+                    ..Default::default()
+                },
+                None,
+            ),
+            (
+                "acknowledged http auth",
+                UpstreamProxyConfig {
+                    https_proxy: Some("http://proxy.example:8080".to_string()),
+                    proxy_auth_file: auth_file.clone(),
+                    proxy_auth_allow_insecure: Some(true),
+                    ..Default::default()
+                },
+                None,
+            ),
+            (
+                "unacknowledged http auth",
+                UpstreamProxyConfig {
+                    https_proxy: Some("http://proxy.example:8080".to_string()),
+                    proxy_auth_file: auth_file.clone(),
+                    ..Default::default()
+                },
+                Some("proxy_auth_allow_insecure"),
+            ),
+            (
+                "no_proxy without proxy",
+                UpstreamProxyConfig {
+                    no_proxy: Some("localhost".to_string()),
+                    ..Default::default()
+                },
+                Some("no_proxy"),
+            ),
+            (
+                "blank no_proxy",
+                UpstreamProxyConfig {
+                    https_proxy: Some("https://proxy.example:8443".to_string()),
+                    no_proxy: Some("  ".to_string()),
+                    ..Default::default()
+                },
+                Some("no_proxy"),
+            ),
+            (
+                "auth file without proxy",
+                UpstreamProxyConfig {
+                    proxy_auth_file: auth_file,
+                    ..Default::default()
+                },
+                Some("proxy_auth_file"),
+            ),
+            (
+                "ack without auth file",
+                UpstreamProxyConfig {
+                    https_proxy: Some("http://proxy.example:8080".to_string()),
+                    proxy_auth_allow_insecure: Some(true),
+                    ..Default::default()
+                },
+                Some("proxy_auth_allow_insecure"),
+            ),
+            (
+                "hostname mode without proxy",
+                UpstreamProxyConfig {
+                    proxy_connect_by_hostname: Some(true),
+                    ..Default::default()
+                },
+                Some("proxy_connect_by_hostname"),
+            ),
+            (
+                "empty proxy",
+                UpstreamProxyConfig {
+                    https_proxy: Some(String::new()),
+                    ..Default::default()
+                },
+                Some("https_proxy"),
+            ),
+            (
+                "inline credentials",
+                UpstreamProxyConfig {
+                    https_proxy: Some(
+                        "https://secret-user:secret-password@proxy.example:8443".to_string(),
+                    ),
+                    ..Default::default()
+                },
+                Some("must not embed credentials"),
+            ),
+        ];
+
+        for (name, config, expected_error) in cases {
+            match expected_error {
+                None => config
+                    .validate()
+                    .unwrap_or_else(|error| panic!("{name}: {error}")),
+                Some(expected) => {
+                    let error = match config.validate() {
+                        Ok(()) => panic!("{name} should fail validation"),
+                        Err(error) => error,
+                    };
+                    assert!(error.contains(expected), "{name}: {error}");
+                    assert!(!error.contains("secret-user"), "{name}: {error}");
+                    assert!(!error.contains("secret-password"), "{name}: {error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn config_defaults_and_builder_use_singular_compute_driver() {
+        let config = Config::new(None);
+        assert_eq!(config.compute_driver, None);
+        assert_eq!(
+            Config::new(None)
+                .with_compute_driver("podman")
+                .compute_driver
+                .as_deref(),
+            Some("podman")
+        );
+    }
+
+    #[test]
+    fn typed_sandbox_pids_default_matches_positive_constant() {
+        assert_eq!(
+            default_sandbox_pids_limit().map(std::num::NonZeroI64::get),
+            Some(super::DEFAULT_SANDBOX_PIDS_LIMIT)
+        );
     }
 
     #[test]

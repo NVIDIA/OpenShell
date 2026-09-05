@@ -12,6 +12,9 @@ depends = [
   "test:sbom",
   "test:install-sh",
   "test:build-env",
+  "test:gateway-pull-policy",
+  "test:gateway-config",
+  "test:e2e-parity",
   "test:packaging-assets",
   "test:codex-security-release-range",
   "test:docs-website",
@@ -38,6 +41,12 @@ hide = true
 description = "Run build-env.sh helper shell tests"
 run = "tasks/scripts/test-build-env.sh"
 run_windows = "echo Skipping test:build-env: the Unix build-env.sh helper does not apply on Windows."
+hide = true
+
+["test:gateway-pull-policy"]
+description = "Test development gateway image pull-policy normalization"
+run = "tasks/scripts/test-gateway-pull-policy.sh"
+run_windows = "echo Skipping test:gateway-pull-policy: Unix gateway scripts do not apply on Windows."
 hide = true
 
 ["test:packaging-assets"]
@@ -271,3 +280,9 @@ run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debu
 ["e2e:openshift"]
 description = "Run OpenShift database-backend integration scenarios against a live cluster (requires oc CLI authenticated to an OpenShift cluster)"
 run = "e2e/rust/e2e-openshift.sh"
+
+["test:gateway-config"]
+description = "Test generated local gateway TOML without starting a runtime"
+run = "bash tasks/scripts/test-gateway-config.sh"
+run_windows = "echo Skipping test:gateway-config: Unix gateway scripts do not apply on Windows."
+hide = true

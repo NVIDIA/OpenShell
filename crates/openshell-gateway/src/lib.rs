@@ -70,6 +70,13 @@ struct UnsupportedWindowsFactory {
 #[cfg(all(target_os = "windows", feature = "in-tree-compute-drivers"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for UnsupportedWindowsFactory {
+    fn validate_config(
+        &self,
+        _context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<()> {
+        Err(unsupported_windows_compute_driver(self.name))
+    }
+
     async fn build(
         &self,
         _context: openshell_server::ComputeDriverBuildContext<'_>,
@@ -90,6 +97,14 @@ struct MxcFactory;
 #[cfg(all(target_os = "windows", feature = "in-tree-compute-drivers"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for MxcFactory {
+    fn validate_config(
+        &self,
+        context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<()> {
+        let _: openshell_driver_mxc::MxcComputeConfig = context.driver_config()?;
+        Ok(())
+    }
+
     async fn build(
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
@@ -117,16 +132,6 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
                 .with_telemetry_category(TelemetryComputeDriver::anonymous_category("kubernetes"))
                 .without_mtls_user_auth()
                 .with_in_process_tracing(openshell_driver_kubernetes::otel_tracing::TRACING)
-                .with_inherited_config_keys(&[
-                    "namespace",
-                    "default_image",
-                    "supervisor_image",
-                    "client_tls_secret_name",
-                    "service_account_name",
-                    "host_gateway_ip",
-                    "enable_user_namespaces",
-                    "sa_token_ttl_secs",
-                ])
         }),
         ComputeDriverRegistration::new(
             "podman",
@@ -139,14 +144,6 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
                 .with_telemetry_category(TelemetryComputeDriver::anonymous_category("podman"))
                 .with_local_singleplayer()
                 .with_in_process_tracing(openshell_driver_podman::otel_tracing::TRACING)
-                .with_inherited_config_keys(&[
-                    "default_image",
-                    "supervisor_image",
-                    "host_gateway_ip",
-                    "guest_tls_ca",
-                    "guest_tls_cert",
-                    "guest_tls_key",
-                ])
         }),
         ComputeDriverRegistration::new(
             "docker",
@@ -159,26 +156,11 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
                 .with_telemetry_category(TelemetryComputeDriver::anonymous_category("docker"))
                 .with_local_singleplayer()
                 .with_in_process_tracing(openshell_driver_docker::otel_tracing::TRACING)
-                .with_inherited_config_keys(&[
-                    "sandbox_namespace",
-                    "default_image",
-                    "supervisor_image",
-                    "host_gateway_ip",
-                    "guest_tls_ca",
-                    "guest_tls_cert",
-                    "guest_tls_key",
-                ])
         }),
         ComputeDriverRegistration::new("vm", u16::MAX, None, VmFactory).map(|registration| {
             registration
                 .with_telemetry_category(TelemetryComputeDriver::anonymous_category("vm"))
                 .with_local_singleplayer()
-                .with_inherited_config_keys(&[
-                    "default_image",
-                    "guest_tls_ca",
-                    "guest_tls_cert",
-                    "guest_tls_key",
-                ])
         }),
     ] {
         registry
@@ -194,18 +176,20 @@ struct KubernetesFactory;
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for KubernetesFactory {
+    fn validate_config(
+        &self,
+        context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<()> {
+        kubernetes_config(context)?
+            .validate_configuration()
+            .map_err(openshell_core::Error::config)
+    }
+
     async fn build(
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
-        let mut config: openshell_driver_kubernetes::KubernetesComputeConfig =
-            context.driver_config()?;
-        if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
-            config.workspace_default_storage_size = size;
-        }
-        if let Ok(storage_class) = std::env::var("OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS") {
-            config.workspace_storage_class = storage_class;
-        }
+        let config = kubernetes_config(context.config_context())?;
         let driver = openshell_driver_kubernetes::KubernetesComputeDriver::new(
             config,
             context.shutdown_receiver(),
@@ -220,17 +204,41 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
 }
 
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+fn kubernetes_config(
+    context: openshell_server::ComputeDriverConfigContext<'_>,
+) -> openshell_core::Result<openshell_driver_kubernetes::KubernetesComputeConfig> {
+    let mut config: openshell_driver_kubernetes::KubernetesComputeConfig =
+        context.driver_config()?;
+    if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
+        config.workspace_default_storage_size = size;
+    }
+    if let Ok(storage_class) = std::env::var("OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS") {
+        config.workspace_storage_class = storage_class;
+    }
+    Ok(config)
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 #[derive(Clone, Copy)]
 struct DockerFactory;
 
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for DockerFactory {
+    fn validate_config(
+        &self,
+        context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<()> {
+        let config: openshell_driver_docker::DockerComputeConfig = context.driver_config()?;
+        config.validate_configuration(context.gateway_bind_address())
+    }
+
     async fn build(
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let mut config: openshell_driver_docker::DockerComputeConfig = context.driver_config()?;
+        require_guest_tls_for_local_driver(&context, "docker")?;
         apply_guest_tls(
             &mut config.guest_tls_ca,
             &mut config.guest_tls_cert,
@@ -258,21 +266,21 @@ struct PodmanFactory;
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for PodmanFactory {
+    fn validate_config(
+        &self,
+        context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<()> {
+        podman_config(context)?
+            .validate_configuration()
+            .map_err(|error| openshell_core::Error::config(error.to_string()))
+    }
+
     async fn build(
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
-        let mut config: openshell_driver_podman::PodmanComputeConfig = context.driver_config()?;
-        config.gateway_port = context.gateway_port();
-        if let Ok(path) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
-            config.socket_path = Some(path.into());
-        }
-        if let Ok(ip) = std::env::var("OPENSHELL_PODMAN_HOST_GATEWAY_IP") {
-            config.host_gateway_ip = ip;
-        }
-        if let Ok(mode) = std::env::var("OPENSHELL_PODMAN_USERNS") {
-            config.userns = Some(mode);
-        }
+        let mut config = podman_config(context.config_context())?;
+        require_guest_tls_for_local_driver(&context, "podman")?;
         apply_guest_tls(
             &mut config.guest_tls_ca,
             &mut config.guest_tls_cert,
@@ -290,20 +298,52 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
 }
 
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+fn podman_config(
+    context: openshell_server::ComputeDriverConfigContext<'_>,
+) -> openshell_core::Result<openshell_driver_podman::PodmanComputeConfig> {
+    let mut config: openshell_driver_podman::PodmanComputeConfig = context.driver_config()?;
+    config.gateway_port = context.gateway_port();
+    if let Ok(path) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
+        config.socket_path = Some(path.into());
+    }
+    if let Ok(ip) = std::env::var("OPENSHELL_PODMAN_HOST_GATEWAY_IP") {
+        config.host_gateway_ip = ip;
+    }
+    if let Ok(mode) = std::env::var("OPENSHELL_PODMAN_USERNS") {
+        config.userns = Some(mode);
+    }
+    Ok(config)
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 #[derive(Clone, Copy)]
 struct VmFactory;
 
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for VmFactory {
+    fn validate_config(
+        &self,
+        context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<()> {
+        let mut config = vm_config(context)?;
+        if config.grpc_endpoint.trim().is_empty() {
+            let scheme = if context.gateway_tls_enabled() {
+                "https"
+            } else {
+                "http"
+            };
+            config.grpc_endpoint = format!("{scheme}://127.0.0.1:{}", context.gateway_port());
+        }
+        config.validate_configuration()
+    }
+
     async fn build(
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
-        let mut config: vm::VmComputeConfig = context.driver_config()?;
-        if config.state_dir.as_os_str().is_empty() {
-            config.state_dir = vm::VmComputeConfig::default_state_dir();
-        }
+        let mut config = vm_config(context.config_context())?;
+        require_guest_tls_for_local_driver(&context, "vm")?;
         if config.grpc_endpoint.trim().is_empty()
             && (!context.gateway_tls_enabled() || context.guest_tls_paths().is_some())
         {
@@ -334,6 +374,43 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
 }
 
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+fn vm_config(
+    context: openshell_server::ComputeDriverConfigContext<'_>,
+) -> openshell_core::Result<vm::VmComputeConfig> {
+    let mut config: vm::VmComputeConfig = context.driver_config()?;
+    if config.state_dir.as_os_str().is_empty() {
+        config.state_dir = vm::VmComputeConfig::default_state_dir();
+    }
+    Ok(config)
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+fn require_guest_tls_for_local_driver(
+    context: &openshell_server::ComputeDriverBuildContext<'_>,
+    driver_name: &str,
+) -> openshell_core::Result<()> {
+    validate_local_driver_guest_tls(
+        context.gateway_tls_enabled(),
+        context.guest_tls_paths().is_some(),
+        driver_name,
+    )
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+fn validate_local_driver_guest_tls(
+    gateway_tls_enabled: bool,
+    has_guest_tls: bool,
+    driver_name: &str,
+) -> openshell_core::Result<()> {
+    if gateway_tls_enabled && !has_guest_tls {
+        return Err(openshell_core::Error::config(format!(
+            "gateway TLS requires guest_tls_ca, guest_tls_cert, and guest_tls_key in [openshell.gateway] when using the {driver_name} compute driver"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 fn apply_guest_tls(
     ca: &mut Option<std::path::PathBuf>,
     cert: &mut Option<std::path::PathBuf>,
@@ -348,6 +425,59 @@ fn apply_guest_tls(
         *ca = Some(default_ca.to_owned());
         *cert = Some(default_cert.to_owned());
         *key = Some(default_key.to_owned());
+    }
+}
+
+#[cfg(all(test, not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+mod local_driver_tests {
+    use super::{
+        apply_guest_tls, install_default_compute_drivers, validate_local_driver_guest_tls,
+    };
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn linux_builtin_compute_driver_registry_has_expected_names() {
+        assert_eq!(
+            install_default_compute_drivers()
+                .installed_driver_names()
+                .collect::<Vec<_>>(),
+            ["docker", "kubernetes", "podman", "vm"]
+        );
+    }
+
+    #[test]
+    fn tls_enabled_local_drivers_require_a_guest_bundle() {
+        for driver_name in ["docker", "podman", "vm"] {
+            let error = validate_local_driver_guest_tls(true, false, driver_name)
+                .expect_err("TLS-enabled local driver must require guest TLS");
+            let message = error.to_string();
+            assert!(message.contains(driver_name));
+            assert!(message.contains("guest_tls_ca"));
+        }
+        validate_local_driver_guest_tls(true, true, "docker")
+            .expect("a complete guest bundle satisfies the requirement");
+        validate_local_driver_guest_tls(false, false, "docker")
+            .expect("plaintext gateways do not require guest TLS");
+    }
+
+    #[test]
+    fn package_managed_guest_bundle_is_injected_when_driver_paths_are_absent() {
+        let mut ca = None;
+        let mut cert = None;
+        let mut key = None;
+        apply_guest_tls(
+            &mut ca,
+            &mut cert,
+            &mut key,
+            Some((
+                Path::new("/managed/ca.pem"),
+                Path::new("/managed/client.pem"),
+                Path::new("/managed/client-key.pem"),
+            )),
+        );
+        assert_eq!(ca, Some(PathBuf::from("/managed/ca.pem")));
+        assert_eq!(cert, Some(PathBuf::from("/managed/client.pem")));
+        assert_eq!(key, Some(PathBuf::from("/managed/client-key.pem")));
     }
 }
 

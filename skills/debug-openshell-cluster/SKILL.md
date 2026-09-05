@@ -84,11 +84,27 @@ Before debugging the compute platform, inspect gateway logs for failures in depe
 For out-of-tree compute drivers, confirm the selected driver name and socket agree across CLI flags or `gateway.toml`, and that the operator-owned driver is running before the gateway starts:
 
 ```bash
-rg -n 'compute_drivers|socket_path' /etc/openshell/gateway.toml
+rg -n '^version|compute_driver|socket_path|guest_tls_' /etc/openshell/gateway.toml
 stat /run/openshell/<driver>.sock
 journalctl -u <driver-service> --no-pager --lines=200
 journalctl -u openshell-gateway --no-pager --lines=200
 ```
+
+Gateway configuration requires `[openshell] version = 2`, a singular
+`compute_driver` selector, and driver-owned settings under
+`[openshell.drivers.<name>]`. The gateway rejects legacy `compute_drivers` and
+`--drivers` selectors rather than silently migrating them. One valid, nonempty
+`OPENSHELL_DRIVERS` value remains a deprecated environment-only alias when the
+canonical selector is absent; the gateway selects that driver with a warning.
+Empty, invalid, comma-delimited, or conflicting values fail startup. Homebrew
+and RPM package startup migrates only exact package-generated v1 defaults. If
+an upgraded package still reports an unsupported version, inspect the active prefix or `~/.config/openshell/gateway.toml`; an edited v1 file must
+follow the published schema-v2 migration steps and must not be overwritten.
+Guest TLS CA, certificate, and key paths are the exception to driver ownership:
+configure the complete bundle under `[openshell.gateway]`, and the gateway
+injects it only into the selected local driver. TLS-enabled Docker, Podman, and
+VM drivers fail startup when neither those paths nor the package-managed local
+bundle is available; Kubernetes projects its bundle through a Secret.
 
 Custom names use `[openshell.drivers.<name>].socket_path`. A launch-time `--compute-driver-socket` override may also use `docker`, `podman`, `kubernetes`, or `vm`; the endpoint then takes precedence over built-in construction. First-party standalone drivers require the socket parent directory to be owned by the driver's effective UID, force its mode to `0700`, create the socket with mode `0600`, and accept only peers with that same UID. Check the parent and socket separately with `stat`; a gateway running under a different UID cannot connect even when filesystem permissions or group membership would otherwise allow it. Operator-supplied drivers must provide equivalent access control appropriate to their implementation. Check gateway logs for connection errors, `GetCapabilities` failures, or an unexpected advertised driver name. The advertised name is diagnostic metadata; negotiated features control optional behavior. The gateway does not create or supervise operator-supplied driver processes or sockets.
 
@@ -280,6 +296,20 @@ Use the log and rollout commands for the workload kind that exists in the
 release. Look for failed installs, unexpected values, missing namespace, wrong
 image tag, TLS settings that do not match the registered endpoint, and
 scheduling failures.
+
+The chart mounts the `gateway.toml` ConfigMap key directly at
+`/etc/openshell/gateway.toml` as a read-only `subPath` file. This avoids the
+atomic-writer symlink exposed by a ConfigMap directory mount because the gateway
+rejects symlinked configuration. A checksum pod-template annotation rolls the
+workload when the ConfigMap changes. If config preflight reports a symlink or
+nonregular path, inspect the rendered mount and confirm the workload rolled to
+the current chart revision:
+
+```bash
+kubectl -n openshell get deployment,statefulset -o yaml | rg -n 'gateway-config|mountPath|subPath|checksum/gateway-config'
+kubectl -n openshell rollout status <deployment-or-statefulset>/openshell
+kubectl -n openshell logs <gateway-pod> -c openshell-gateway --tail=200
+```
 
 `server.telemetryEnabled` renders `OPENSHELL_TELEMETRY_ENABLED` on the gateway
 pod, and the gateway propagates the effective value to sandbox supervisors.
@@ -610,6 +640,11 @@ Use the VM driver logs and host diagnostics available in the user's environment.
 
 - The VM driver process is running and reachable by the gateway.
 - The runtime rootfs exists and matches the expected architecture.
+- `mke2fs` or `mkfs.ext4` and `debugfs` from e2fsprogs are installed; explicit
+  `sandbox_uid`/`sandbox_gid` does not remove this prerequisite.
+- A persisted overlay identity error is resolved from its owner marker, overlay
+  upper layer, prepared rootfs, explicit config, or current image. Do not assign
+  `10001:10001` unless the persisted state reports that legacy identity.
 - Host virtualization support is enabled.
 - The sandbox supervisor can establish its callback connection to the gateway.
 
@@ -722,3 +757,22 @@ When handing results back to the user, include:
 - Service exposure status.
 - Sandbox workload status.
 - The exact command that failed and the shortest fix.
+
+## Package Configuration Preflight
+
+For a Debian, Ubuntu, or Snap gateway that stops before certificate generation or
+daemon startup, validate the selected configuration without starting the service:
+
+```shell
+openshell-gateway config preflight [--path PATH | -- GATEWAY_ARGS...]
+```
+
+Without a path, preflight validates a nonempty `OPENSHELL_GATEWAY_CONFIG` or an
+auto-discovered XDG config; no config succeeds. An explicit missing path, legacy
+schema-v1 file, malformed TOML, symlink, or nonregular file fails before gateway
+startup. It also applies read-only effective-config checks for driver selection
+and configuration, sockets, rate limits, TLS, interceptors, and supervisor
+middleware. Arguments after `--` validate the effective daemon invocation,
+including its command-line overrides. Preflight preserves every failed file. Do
+not advise users to delete or rewrite it automatically; back it up and follow the
+manual schema-v2 migration in the Gateway Configuration reference.

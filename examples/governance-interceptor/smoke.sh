@@ -325,7 +325,7 @@ generate_gateway_jwt_bundle() {
 write_gateway_config() {
   cat >"$GATEWAY_CONFIG" <<EOF
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
 provider_profile_sources = [
@@ -340,7 +340,6 @@ signing_key_path = "$JWT_DIR/signing.pem"
 public_key_path = "$JWT_DIR/public.pem"
 kid_path = "$JWT_DIR/kid"
 gateway_id = "$RUN_ID"
-ttl_secs = 0
 
 [[openshell.gateway.interceptors]]
 name = "provider-governance"
@@ -395,7 +394,7 @@ start_interceptor() {
 
 start_gateway() {
   printf 'INFO starting gateway\n'
-  env -u OPENSHELL_DRIVERS "$ROOT/target/debug/openshell-gateway" \
+  env -u OPENSHELL_COMPUTE_DRIVER "$ROOT/target/debug/openshell-gateway" \
     --config "$GATEWAY_CONFIG" \
     --bind-address 127.0.0.1 \
     --port "$GATEWAY_PORT" \

@@ -14,6 +14,8 @@ openshell-gateway - OpenShell gateway server daemon
 
 **openshell-gateway** \[*OPTIONS*\]
 
+**openshell-gateway** **config preflight** [**--path** *PATH* | **--** *GATEWAY_ARGS*...]
+
 # DESCRIPTION
 
 **openshell-gateway** is the control-plane server for OpenShell. It
@@ -58,12 +60,11 @@ TLS.
     stores SQLite state under *~/.local/state/openshell/gateway/*.
     Environment: **OPENSHELL_DB_URL**.
 
-**--drivers** *DRIVER*\[,*DRIVER*\]
-:   Compute driver. Accepts a comma-delimited list. The gateway
-    currently requires exactly one driver. Options: **podman**,
+**--compute-driver** *DRIVER*
+:   Compute driver. Selects exactly one driver. Options: **podman**,
     **docker**, **kubernetes**, **vm**. When unset, the gateway
     auto-detects Kubernetes, then Podman, then Docker. VM is opt-in.
-    Environment: **OPENSHELL_DRIVERS**.
+    Environment: **OPENSHELL_COMPUTE_DRIVER**.
 
 **--tls-cert** *PATH*
 :   Path to server TLS certificate file. Defaults to the local generated
@@ -111,6 +112,34 @@ Compute driver settings such as sandbox image, callback endpoint, image
 pull policy, network name, VM state directory, and guest TLS material are
 configured in the TOML file passed with **--config**.
 
+# CONFIGURATION PREFLIGHT
+
+Validate a gateway configuration before starting the daemon:
+
+    openshell-gateway config preflight [--path PATH | -- GATEWAY_ARGS...]
+
+With no path, preflight validates a nonempty OPENSHELL_GATEWAY_CONFIG. If that
+variable is unset, it optionally validates an auto-discovered XDG config. The
+absence of either config succeeds. An explicit missing path, legacy schema-v1
+file, invalid TOML, symlink, or nonregular file fails with a nonzero status.
+Preflight merges file and environment values and applies read-only startup checks
+for selector and socket normalization, registered compute-driver configuration,
+rate limits, TLS and mTLS, interceptors, and middleware. It does not construct a
+compute driver or connect to a transport. Preflight never changes the file and
+reports that failed input was preserved.
+
+Arguments after **--** replace **--path** mode and are parsed as the exact gateway
+daemon invocation. Package wrappers use this form so command-line overrides are
+validated before the same arguments reach startup.
+
+The Debian and Ubuntu systemd user unit runs preflight before certificate
+generation, while retaining its EnvironmentFile and bare ExecStart behavior. The
+Snap wrapper replays its effective daemon arguments through preflight. It first
+uses a nonempty OPENSHELL_GATEWAY_CONFIG. Otherwise it passes the canonical
+SNAP_COMMON/gateway.toml path whenever it exists or is a symlink. A broken symlink
+fails preflight before the gateway is started. Correct or manually migrate an
+operator-owned v1 file, then run preflight again before restarting the service.
+
 # SYSTEMD INTEGRATION
 
 The package installs a systemd user unit at
@@ -127,8 +156,9 @@ View logs:
     journalctl --user -u openshell-gateway
     journalctl --user -u openshell-gateway -f
 
-The unit runs **openshell-gateway generate-certs** as an **ExecStartPre**
-step on first start. This generates a self-signed PKI bundle for mTLS
+The unit runs **openshell-gateway config preflight** and then
+**openshell-gateway generate-certs** as **ExecStartPre** steps. Certificate
+generation creates a self-signed PKI bundle for mTLS
 and sandbox JWT signing material, adding missing JWT files to older
 TLS-only installs when needed. The packaged unit sets
 **OPENSHELL_LOCAL_TLS_DIR** to *~/.local/state/openshell/tls* and uses that

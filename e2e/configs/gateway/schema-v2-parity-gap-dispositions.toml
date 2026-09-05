@@ -1,0 +1,106 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Reviewed potential blockers for the schema-v2 parity campaign. A disposition
+# records whether the branch must change before parity can be claimed; it does
+# not record test execution results.
+ledger_version = 1
+issue = 2792
+baseline_commit = "74960ebfaeec4673885089ed995fad902459749f"
+candidate_start_commit = "8c868e430e9cd3284d7e274628419ab484ebcee0"
+
+[[gaps]]
+id = "legacy-environment-selector-upgrade"
+severity = "none"
+parity_relation = "regression"
+disposition = "resolved"
+origin_main_behavior = "OPENSHELL_DRIVERS accepts one driver name and is loaded by RPM, Debian, and Homebrew gateway services through gateway.env."
+candidate_behavior = "Schema v2 accepts one non-empty OPENSHELL_DRIVERS value as a deprecated environment-only alias, rejects ambiguity and conflicts, and keeps removed CLI flags rejected."
+impact = "The package-upgrade regression is resolved while preserving singular selector semantics and actionable migration guidance."
+resolution = "The gateway now accepts one non-empty OPENSHELL_DRIVERS value, preserves canonical selector precedence, rejects multiple values and conflicting canonical and legacy values, and emits one deprecation warning after tracing initialization without logging the selector."
+validation = "Paired frozen-baseline and candidate processes reached readiness through OPENSHELL_DRIVERS=podman; focused tests cover empty, plural, malformed, non-UTF-8, equal canonical, conflicting canonical, and remote-socket cases."
+owner_step = 6
+
+[[gaps]]
+id = "debian-snap-v1-upgrade"
+severity = "none"
+parity_relation = "upgrade_regression"
+disposition = "resolved"
+origin_main_behavior = "Debian auto-discovers a persistent schema-v1 XDG gateway.toml and Snap passes a persistent schema-v1 SNAP_COMMON gateway.toml."
+candidate_behavior = "Debian and Snap run the gateway's source-free, read-only preflight against the same effectively selected config before certificate generation or daemon startup; rejected legacy files, schema/layout errors, and documented cross-field startup errors remain unchanged with actionable migration guidance. Selected driver-specific fields remain lazily validated at driver construction."
+impact = "The package startup regression is resolved without inferring provenance or overwriting operator-owned configuration; release remains gated on real Debian upgrade and Snap refresh execution."
+resolution = "Use the shared strict schema-v2 layout parser plus documented read-only effective startup checks, fail closed for explicit, unsafe, or legacy paths, preserve optional absence, and require manual migration because historical Debian and Snap generators have no safe default-provenance marker."
+validation = "Deterministic Rust, shell, and Python tests cover selection precedence, stable diagnostics, content non-disclosure, semantic checks, file preservation, and package ordering. Real prior Debian upgrade and Snap refresh lanes remain platform-blocked and must verify preserved v1 files plus successful restart after manual conversion."
+owner_step = 12
+
+[[gaps]]
+id = "tls-require-client-auth-ignored"
+severity = "none"
+parity_relation = "preexisting_inaccessible_option"
+disposition = "resolved"
+origin_main_behavior = "The TOML schema accepts and documents require_client_auth, but runtime derives the value from client CA presence and OIDC instead of using the configured boolean."
+candidate_behavior = "Schema v2 rejects require_client_auth and documents the derived client CA and OIDC policy instead of silently accepting an ineffective security option."
+impact = "The misleading security-sensitive configuration claim is removed without weakening CA-only gateways or breaking bearer-only OIDC clients."
+resolution = "Security review selected removal over runtime wiring: the file-only TLS schema excludes require_client_auth while the internal runtime field continues enforcing the established client CA and OIDC policy."
+validation = "File parsing rejects require_client_auth; preparation tests cover CA-only and CA-plus-OIDC derivation; TLS integration tests cover required, optional, valid-CA, wrong-CA, and no-certificate handshakes."
+owner_step = 6
+
+[[gaps]]
+id = "unselected-driver-validation-claim"
+severity = "none"
+parity_relation = "documentation_gap"
+disposition = "resolved"
+origin_main_behavior = "Only the selected driver table receives driver-specific deserialization; unknown fields inside an unselected table are ignored."
+candidate_behavior = "Schema v2 validates every driver entry is a table and lazily validates driver-specific fields only when that driver is selected, as the reference now states."
+impact = "The documentation now distinguishes table-shape validation from selected-driver deserialization, so it no longer overstates startup guarantees."
+resolution = "The gateway configuration reference was narrowed to state that driver-specific fields are validated when their driver is selected."
+validation = "Configuration tests establish that every driver entry must be a TOML table and that selected driver tables reject unknown fields; the published reference describes the lazy boundary."
+owner_step = 6
+
+[[gaps]]
+id = "multi-driver-runtime-loss"
+severity = "none"
+parity_relation = "non_finding"
+disposition = "no_action"
+origin_main_behavior = "Schema v1 accepts a list-shaped selector but runtime rejects configurations containing more than one driver."
+candidate_behavior = "Schema v2 represents the existing invariant as one optional scalar driver."
+impact = "No working multi-driver runtime capability was removed."
+resolution = "Keep the singular selector in the intentional-change ledger and validate explicit selection plus auto-detection."
+validation = "Confirm origin/main rejects two configured drivers and the candidate supports one scalar or omission."
+owner_step = 5
+
+[[gaps]]
+id = "generated-e2e-selector-shape"
+severity = "none"
+parity_relation = "non_finding"
+disposition = "no_action"
+origin_main_behavior = "Committed E2E fixtures select one driver through the schema-v1 list."
+candidate_behavior = "Committed Docker and Podman fixtures and e2e/run.sh consistently use and require the schema-v2 scalar selector."
+impact = "No committed fixture mismatch was found."
+resolution = "Use the existing fixtures in live Docker and Podman parity lanes."
+validation = "Run both driver E2E wrappers and confirm the selected runtime creates a sandbox."
+owner_step = 5
+
+[[gaps]]
+id = "rpm-exact-default-migration"
+severity = "none"
+parity_relation = "non_finding"
+disposition = "no_action"
+origin_main_behavior = "The RPM service seeds its package-owned schema-v1 default."
+candidate_behavior = "The RPM pre-start migrator replaces only a byte-identical package v1 default and preserves edited or unsafe paths."
+impact = "The implemented exact-default path does not block parity, but environment-file and edited-config behavior remain covered by separate gaps."
+resolution = "Retain deterministic migration tests and add a real package upgrade lane."
+validation = "Upgrade an installed prior RPM with exact and edited defaults and verify restart, bytes, ownership, and mode."
+owner_step = 12
+
+[[gaps]]
+id = "gateway-owned-guest-tls"
+severity = "none"
+parity_relation = "non_finding"
+disposition = "no_action"
+origin_main_behavior = "Guest callback TLS may be inherited from gateway scope or overridden in the selected local driver table."
+candidate_behavior = "One complete gateway-owned bundle is validated and injected into the selected local driver; misplaced driver fields fail explicitly."
+impact = "The ownership change fails closed rather than silently disabling callback TLS."
+resolution = "Keep the ownership change in the intentional-change ledger and validate callback connectivity on Docker, Podman, and VM."
+validation = "Exercise complete, partial, misplaced, and plaintext combinations, then establish a real sandbox callback on each local driver."
+owner_step = 10

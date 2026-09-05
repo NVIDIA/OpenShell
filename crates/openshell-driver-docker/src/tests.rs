@@ -95,8 +95,8 @@ fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
 fn runtime_config() -> DockerDriverRuntimeConfig {
     DockerDriverRuntimeConfig {
         default_image: "image:latest".to_string(),
-        image_pull_policy: String::new(),
-        sandbox_namespace: "default".to_string(),
+        image_pull_policy: ImagePullPolicy::IfNotPresent,
+        sandbox_label: "default".to_string(),
         grpc_endpoint: "https://localhost:8443".to_string(),
         network_name: DEFAULT_DOCKER_NETWORK_NAME.to_string(),
         gateway_route: DockerGatewayRoute::Bridge {
@@ -122,9 +122,159 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         daemon_version: "28.0.0".to_string(),
         supports_gpu: false,
         allow_all_default_gpu: false,
-        sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
+        sandbox_pids_limit: None,
         enable_bind_mounts: false,
+        upstream_proxy: UpstreamProxyConfig::default(),
+        provider_spiffe_workload_api_socket: None,
+        app_armor_profile: Some(AppArmorProfile::Unconfined),
     }
+}
+
+#[test]
+fn docker_config_uses_canonical_sandbox_label_name() {
+    let config: DockerComputeConfig =
+        serde_json::from_value(serde_json::json!({ "sandbox_label": "tenant-a" })).unwrap();
+    assert_eq!(config.sandbox_label, "tenant-a");
+
+    let serialized = serde_json::to_value(config).unwrap();
+    assert_eq!(serialized["sandbox_label"], "tenant-a");
+    assert!(serialized.get("sandbox_namespace").is_none());
+}
+
+#[test]
+fn docker_config_rejects_legacy_sandbox_namespace() {
+    let error = serde_json::from_value::<DockerComputeConfig>(serde_json::json!({
+        "sandbox_namespace": "tenant-a"
+    }))
+    .expect_err("legacy sandbox_namespace must be rejected");
+    assert!(error.to_string().contains("sandbox_namespace"));
+}
+
+#[test]
+fn docker_config_keeps_explicit_unconfined_apparmor_default() {
+    let config: DockerComputeConfig = serde_json::from_value(serde_json::json!({}))
+        .expect("default Docker config should deserialize");
+    assert_eq!(config.app_armor_profile, Some(AppArmorProfile::Unconfined));
+    let serialized = serde_json::to_value(config).expect("config should serialize");
+    assert_eq!(serialized["app_armor_profile"], "Unconfined");
+}
+
+#[test]
+fn docker_config_defaults_to_driver_owned_pids_limit() {
+    let config: DockerComputeConfig = serde_json::from_value(serde_json::json!({}))
+        .expect("default Docker config should deserialize");
+    assert_eq!(
+        config.sandbox_pids_limit.map(std::num::NonZeroI64::get),
+        Some(openshell_core::config::DEFAULT_SANDBOX_PIDS_LIMIT)
+    );
+}
+
+#[test]
+fn docker_config_rejects_invalid_pids_limits() {
+    let zero = serde_json::from_value::<DockerComputeConfig>(serde_json::json!({
+        "sandbox_pids_limit": 0
+    }))
+    .expect_err("zero PID limit must be rejected");
+    assert!(zero.to_string().contains("invalid value: integer `0`"));
+
+    let negative: DockerComputeConfig = serde_json::from_value(serde_json::json!({
+        "sandbox_pids_limit": -1
+    }))
+    .expect("nonzero integer deserializes before semantic validation");
+    let error = validate_sandbox_pids_limit(negative.sandbox_pids_limit).unwrap_err();
+    assert!(error.to_string().contains("must be positive"));
+}
+
+#[test]
+fn docker_rejects_newer_image_pull_policy() {
+    let error = validate_image_pull_policy(ImagePullPolicy::Newer).unwrap_err();
+    assert!(error.to_string().contains("supported only by the Podman"));
+}
+
+#[test]
+fn docker_apparmor_profiles_render_and_require_daemon_capability() {
+    for (profile, expected) in [
+        (AppArmorProfile::RuntimeDefault, None),
+        (
+            AppArmorProfile::Unconfined,
+            Some(vec!["apparmor=unconfined".to_string()]),
+        ),
+        (
+            AppArmorProfile::Localhost("openshell-supervisor".to_string()),
+            Some(vec!["apparmor=openshell-supervisor".to_string()]),
+        ),
+    ] {
+        let mut config = runtime_config();
+        config.app_armor_profile = Some(profile.clone());
+        let body = build_container_create_body(&test_sandbox(), &config).unwrap();
+        assert_eq!(body.host_config.unwrap().security_opt, expected);
+    }
+
+    let unavailable = SystemInfo::default();
+    assert!(
+        validate_docker_app_armor_profile(Some(&AppArmorProfile::Unconfined), &unavailable).is_ok()
+    );
+    for confined in [
+        AppArmorProfile::RuntimeDefault,
+        AppArmorProfile::Localhost("openshell-supervisor".to_string()),
+    ] {
+        let error = validate_docker_app_armor_profile(Some(&confined), &unavailable)
+            .expect_err("confined profile requires daemon AppArmor support");
+        assert!(
+            error
+                .to_string()
+                .contains("Docker reports it is unavailable")
+        );
+    }
+
+    let available = SystemInfo {
+        security_options: Some(vec!["name=apparmor".to_string()]),
+        ..Default::default()
+    };
+    assert!(
+        validate_docker_app_armor_profile(
+            Some(&AppArmorProfile::Localhost(
+                "openshell-supervisor".to_string()
+            )),
+            &available
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn docker_config_uses_shared_proxy_contract_and_explicit_apparmor_default() {
+    let config: DockerComputeConfig = toml::from_str(
+        r#"
+https_proxy = "http://proxy.example:8080"
+no_proxy = ".svc"
+proxy_auth_file = "/run/secrets/proxy-auth"
+proxy_auth_allow_insecure = true
+app_armor_profile = "Localhost/openshell-supervisor"
+provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        config.upstream_proxy.https_proxy.as_deref(),
+        Some("http://proxy.example:8080")
+    );
+    assert_eq!(
+        config.app_armor_profile,
+        Some(AppArmorProfile::Localhost(
+            "openshell-supervisor".to_string()
+        ))
+    );
+    assert!(config.upstream_proxy.validate().is_ok());
+    assert!(
+        openshell_core::driver_utils::validate_provider_spiffe_unix_socket(
+            config
+                .provider_spiffe_workload_api_socket
+                .as_deref()
+                .unwrap()
+        )
+        .is_ok()
+    );
 }
 
 fn json_struct(value: serde_json::Value) -> prost_types::Struct {
@@ -529,7 +679,7 @@ async fn tracing_image_preparation_failure_exports_nested_failed_spans() {
         .build();
     let subscriber = tracing_subscriber::registry().with(otel_tracing::TRACING.layer(&provider));
     let mut config = runtime_config();
-    config.image_pull_policy = "unsupported".to_string();
+    config.image_pull_policy = ImagePullPolicy::Newer;
     let driver = test_driver_with_config(config);
 
     async {
@@ -1183,13 +1333,13 @@ fn docker_resource_limits_applies_cpu_and_memory_limits() {
 }
 
 #[test]
-fn docker_pids_limit_uses_driver_default_and_allows_runtime_inherit() {
+fn docker_pids_limit_uses_runtime_default_when_omitted() {
     assert_eq!(
-        docker_pids_limit(DEFAULT_SANDBOX_PIDS_LIMIT).unwrap(),
-        Some(DEFAULT_SANDBOX_PIDS_LIMIT)
+        docker_pids_limit(std::num::NonZeroI64::new(2048)).unwrap(),
+        Some(2048)
     );
-    assert_eq!(docker_pids_limit(0).unwrap(), None);
-    assert!(docker_pids_limit(-1).is_err());
+    assert_eq!(docker_pids_limit(None).unwrap(), None);
+    assert!(docker_pids_limit(std::num::NonZeroI64::new(-1)).is_err());
 }
 
 #[test]
@@ -1199,10 +1349,21 @@ fn docker_compute_config_disables_bind_mounts_by_default() {
 }
 
 #[test]
-fn container_create_body_sets_driver_owned_pids_limit() {
+fn container_create_body_omits_pids_limit_by_default() {
     let body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
     let host_config = body.host_config.expect("host config");
-    assert_eq!(host_config.pids_limit, Some(DEFAULT_SANDBOX_PIDS_LIMIT));
+    assert_eq!(host_config.pids_limit, None);
+}
+
+#[test]
+fn container_create_body_emits_configured_positive_pids_limit() {
+    let mut config = runtime_config();
+    config.sandbox_pids_limit = std::num::NonZeroI64::new(4096);
+    let body = build_container_create_body(&test_sandbox(), &config).unwrap();
+    assert_eq!(
+        body.host_config.expect("host config").pids_limit,
+        Some(4096)
+    );
 }
 
 #[test]
@@ -2139,6 +2300,51 @@ fn build_environment_uses_token_file_without_raw_token_env() {
 }
 
 #[test]
+fn docker_container_projects_proxy_and_spiffe_without_credential_metadata() {
+    let mut config = runtime_config();
+    config.upstream_proxy = UpstreamProxyConfig {
+        https_proxy: Some("https://proxy.example:8443".to_string()),
+        no_proxy: Some(".svc".to_string()),
+        proxy_auth_file: Some(PathBuf::from("/run/secrets/proxy-auth")),
+        proxy_auth_allow_insecure: None,
+        proxy_connect_by_hostname: Some(true),
+    };
+    config.provider_spiffe_workload_api_socket = Some(PathBuf::from("/run/spire/agent.sock"));
+    let body = build_container_create_body(&test_sandbox(), &config).unwrap();
+    let command = body.cmd.unwrap();
+    assert!(
+        command
+            .windows(2)
+            .any(|args| args == ["--upstream-proxy", "https://proxy.example:8443"])
+    );
+    assert!(
+        command
+            .windows(2)
+            .any(|args| args == ["--upstream-proxy-auth-file", UPSTREAM_PROXY_AUTH_MOUNT_PATH])
+    );
+    assert!(
+        command
+            .windows(2)
+            .any(|args| args == ["--upstream-no-proxy", ".svc"])
+    );
+    assert!(command.contains(&"--upstream-proxy-connect-by-hostname".to_string()));
+    let binds = body.host_config.unwrap().binds.unwrap();
+    assert!(
+        binds
+            .iter()
+            .any(|bind| bind.contains(UPSTREAM_PROXY_AUTH_MOUNT_PATH))
+    );
+    assert!(binds.contains(&format!(
+        "/run/spire:{PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR}:ro"
+    )));
+    assert!(binds.iter().all(|bind| !bind.contains("rbind")));
+    let env = body.env.unwrap();
+    assert!(env.iter().any(|entry| entry
+        == "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET=/spiffe-workload-api/agent.sock"));
+    assert!(!env.iter().any(|entry| entry.contains("proxy-auth")));
+}
+
+#[test]
 fn managed_container_label_filters_include_gateway_namespace() {
     let filters =
         managed_container_label_filters("tenant-a", [format!("{LABEL_SANDBOX_ID}=sbx-123")]);
@@ -2669,10 +2875,10 @@ fn build_container_create_body_uses_runtime_namespace_label() {
     // runtime config, not from `DriverSandbox.namespace`. The gateway
     // does not populate `DriverSandbox.namespace`, so a container created
     // with that empty value would not match subsequent list/get/find
-    // queries (which filter on `config.sandbox_namespace`), leaking
+    // queries (which filter on `config.sandbox_label`), leaking
     // sandboxes that the driver itself cannot observe.
     let mut config = runtime_config();
-    config.sandbox_namespace = "tenant-a".to_string();
+    config.sandbox_label = "tenant-a".to_string();
     let mut sandbox = test_sandbox();
     sandbox.namespace = "ignored-by-driver".to_string();
 
@@ -2991,6 +3197,32 @@ fn docker_guest_tls_paths_allows_plain_http_without_tls_flags() {
     })
     .unwrap();
     assert!(result.is_none());
+}
+
+#[test]
+fn docker_automatic_tls_detection_is_fail_closed_for_partial_bundles() {
+    for mask in 0_u8..8 {
+        let config = DockerComputeConfig {
+            guest_tls_ca: (mask & 1 != 0).then(|| PathBuf::from("/tmp/ca.pem")),
+            guest_tls_cert: (mask & 2 != 0).then(|| PathBuf::from("/tmp/cert.pem")),
+            guest_tls_key: (mask & 4 != 0).then(|| PathBuf::from("/tmp/key.pem")),
+            ..Default::default()
+        };
+        assert_eq!(
+            docker_guest_tls_configured(&config),
+            mask != 0,
+            "TLS presence mask {mask:03b}"
+        );
+
+        if mask != 0 && mask != 7 {
+            let mut inferred = config;
+            inferred.grpc_endpoint = "https://host.openshell.internal:8080".to_string();
+            assert!(
+                docker_guest_tls_paths(&inferred).is_err(),
+                "partial TLS presence mask {mask:03b} must fail"
+            );
+        }
+    }
 }
 
 #[test]

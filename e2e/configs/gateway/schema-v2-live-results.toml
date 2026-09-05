@@ -1,0 +1,355 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+manifest_version = 1
+baseline_commit = "74960ebfaeec4673885089ed995fad902459749f"
+candidate_start_commit = "8c868e430e9cd3284d7e274628419ab484ebcee0"
+
+# Step 5 establishes the portable status/create/Ready/list/exec/delete/list-empty
+# contract. A platform-blocked result is not parity evidence; each blocked row
+# names the lane that must replace it before the final release gate can pass.
+
+[[result]]
+id = "portable-lifecycle-podman"
+step = 5
+capability = "Portable sandbox lifecycle on the in-tree Podman compute driver"
+driver = "podman"
+status = "pass"
+validated_baseline_commit = "74960ebfaeec4673885089ed995fad902459749f"
+validated_candidate_commit = "a3860084d019ed2ac979e3eaa1ddf085a96b773c"
+lane = "local-linux-x86_64-rootless-podman-5.8.2"
+evidence = [
+  "Paired conformance smoke connected with authenticated mTLS on both variants.",
+  "Both variants passed status, create, Ready inspection, paginated list visibility, exact-output exec, delete, and eventual empty-list checks.",
+  "Normalized comparison recorded baseline_success=true, candidate_success=true, and parity=true; equal failures are rejected by the harness.",
+]
+
+[[result]]
+id = "portable-lifecycle-docker"
+step = 5
+capability = "Portable sandbox lifecycle on the in-tree Docker compute driver"
+driver = "docker"
+status = "platform_blocked"
+owner = "OpenShell Linux Docker CI lane"
+lane = "linux-x86_64-docker"
+blocker = "The validation host has no Docker CLI or Docker daemon socket. Step 7 and Step 13 must execute and assign this lane."
+
+[[result]]
+id = "portable-lifecycle-kubernetes"
+step = 5
+capability = "Portable sandbox lifecycle on the in-tree Kubernetes compute driver"
+driver = "kubernetes"
+status = "platform_blocked"
+owner = "OpenShell Kubernetes CI lane"
+lane = "ephemeral-kind-or-managed-kubernetes"
+blocker = "The active kubectl context is an external OpenShift cluster that this validation must not modify. The installed kind cluster belongs to another project; Step 8 and Step 13 must use a dedicated OpenShell cluster."
+
+[[result]]
+id = "portable-lifecycle-vm"
+step = 5
+capability = "Portable sandbox lifecycle on the standalone VM compute driver"
+driver = "vm"
+status = "platform_blocked"
+owner = "OpenShell Linux VM CI lane"
+lane = "linux-x86_64-kvm-libkrun"
+blocker = "The validation host has no prepared VM runtime bundle or built openshell-driver-vm executable. Step 9 and Step 13 must execute and assign this lane."
+
+[[result]]
+id = "portable-lifecycle-mxc"
+step = 5
+capability = "Portable sandbox lifecycle on the Windows MXC compute driver"
+driver = "mxc"
+status = "platform_blocked"
+owner = "OpenShell Windows MXC CI lane"
+lane = "windows-x64-and-windows-arm64-mxc"
+blocker = "The validation host is Linux and cannot execute the Windows MXC runtime. Step 13 must assign native Windows validation."
+
+[[result]]
+id = "gateway-wide-process-options"
+step = 6
+capability = "Gateway listeners, configuration precedence, persistence, and legacy singleton selector"
+driver = "gateway"
+status = "pass"
+validated_baseline_commit = "74960ebfaeec4673885089ed995fad902459749f"
+validated_candidate_commit = "e6aac1aa7c624c5df43535ab4fbe2bc6f9697dea"
+lane = "local-linux-x86_64-rootless-podman-5.8.2"
+evidence = [
+  "Fresh binaries from both recorded commits started against isolated schema-v1 and schema-v2 files, SQLite databases, ports, state directories, and a rootless Podman socket.",
+  "Both variants exposed primary, health, and metrics listeners; the CLI primary port beat conflicting environment and file values, and --health-port 0 disabled the file-configured auxiliary listener.",
+  "Both variants created and reopened the same isolated SQLite database, rejected database_url in TOML, identified the rejected field, and did not disclose its secret-bearing value.",
+  "Both variants accepted one legacy OPENSHELL_DRIVERS=podman selector when no canonical selector was present; the candidate emitted its deprecation warning without logging the value.",
+  "Normalized comparison recorded baseline_success=true, candidate_success=true, and parity=true.",
+]
+
+[[result]]
+id = "gateway-tls-client-auth-policy"
+step = 6
+capability = "Gateway TLS client-certificate handshake policy"
+driver = "gateway"
+status = "intentional_change"
+validated_baseline_commit = "74960ebfaeec4673885089ed995fad902459749f"
+validated_candidate_commit = "e6aac1aa7c624c5df43535ab4fbe2bc6f9697dea"
+lane = "local-linux-x86_64-deterministic-tls"
+evidence = [
+  "Security review confirmed that origin/main accepted require_client_auth in TOML but ignored it and instead derived runtime policy from client CA and OIDC presence.",
+  "Schema v2 now rejects the unsupported file field while preserving the established derived policy: CA without OIDC requires a client certificate, while CA with OIDC permits bearer-only clients and validates certificates that are presented.",
+  "Focused preparation tests cover both derived branches, and TLS integration tests pass required-certificate, optional-certificate, valid-CA, wrong-CA, and multiplexed HTTP/gRPC handshakes.",
+]
+
+[[result]]
+id = "docker-driver-option-parity"
+step = 7
+capability = "Docker image, callback, pull-policy, resource, security, provider, and mount options"
+driver = "docker"
+status = "platform_blocked"
+owner = "OpenShell Linux Docker CI lane"
+lane = "linux-x86_64-docker-with-apparmor-sub-lane"
+blocker = "The validation host has neither a Docker CLI nor a Docker daemon, and the Docker driver deliberately rejects the available Libpod socket. A dedicated Docker lane must run paired lifecycle and inspect-based resource, label, mount, callback, and pull-policy checks; candidate-only AppArmor, authenticated proxy, and SPIFFE checks must run on qualifying daemons."
+
+[[result]]
+id = "podman-driver-option-parity"
+step = 7
+capability = "Podman image, callback, pull-policy, resource, mount, bootstrap, SSH, and health options"
+driver = "podman"
+status = "intentional_change"
+validated_baseline_commit = "74960ebfaeec4673885089ed995fad902459749f"
+validated_candidate_commit = "e09070d4ba0b30f0ac278fbb9938c1520ecff696"
+lane = "local-linux-x86_64-rootless-podman-5.8.2"
+evidence = [
+  "Fresh binaries from both recorded commits ran the same candidate-owned oracle against isolated schema-v1 and schema-v2 gateway processes, state, PKI, sockets, networks, and container stores.",
+  "Both variants selected the same immutable sandbox image, mapped their schema-specific pull-policy spelling to Podman missing, applied 750m CPU and 384Mi memory limits, preserved managed labels, mounted read-only bind and tmpfs configuration, injected sandbox-token and guest-TLS bootstrap files, used the renamed SSH socket, became healthy at the configured seven-second interval, and completed callback exec.",
+  "The normalized results were identical except for pids_limit: the frozen baseline accepted 31 but sent Docker's ignored PidsLimit field and received Podman's 2048 default, while the candidate sent OCI resource_limits.pids.limit and applied 31.",
+  "comparison.json recorded baseline_success=true, candidate_success=true, parity=false, classification=intentional_change, intentional_change_id=podman-pid-limit-restored, and accepted=true.",
+]
+
+[[result]]
+id = "podman-qualified-security-option-parity"
+step = 7
+capability = "Podman AppArmor, authenticated proxy, SPIFFE, and rootful user-namespace options"
+driver = "podman"
+status = "platform_blocked"
+owner = "OpenShell Podman security matrix"
+lane = "linux-podman-apparmor-proxy-spiffe-rootful-userns"
+blocker = "The available daemon is rootless and reports AppArmor disabled, and this local run has no authenticated proxy or SPIFFE Workload API fixture. A qualifying rootful matrix must validate those environment-dependent options live; deterministic driver tests remain coverage, not parity evidence."
+
+[[result]]
+id = "kubernetes-core-option-parity"
+step = 8
+capability = "Kubernetes shared workspace, images, placement, bootstrap, security projection, resources, and combined supervisor options"
+driver = "kubernetes"
+status = "pass"
+validated_baseline_commit = "74960ebfaeec4673885089ed995fad902459749f"
+validated_candidate_commit = "0f08b5822e4da98c9ced3d4b0f2bf4f30dae28fd"
+lane = "kind-v1.36.1-rootless-podman-host-gateway"
+evidence = [
+  "Fresh candidate gateway and CLI binaries were built from the recorded candidate commit and bound by SHA-256, with the frozen baseline binary, in the retained artifact manifest.",
+  "Both host gateway variants used isolated schema-v1/schema-v2 files, SQLite stores, JWT keys, ports, namespaces, ServiceAccounts, Secrets, and resource names against a guarded disposable kind cluster.",
+  "Both variants reached Ready through authenticated callback, completed exact-marker exec, and produced matching Sandbox, Pod, and PVC semantics for images and pull policies, pull Secret, ServiceAccount, TLS and token projections, host aliases, SSH endpoint, runc placement, AppArmor request, UID/GID, CPU/memory, shared storage, managed metadata, and deletion.",
+  "comparison.json recorded baseline_success=true, candidate_success=true, parity=true, classification=pass, and accepted=true; private keys and all per-run Kubernetes fixtures were removed.",
+]
+
+[[result]]
+id = "kubernetes-qualified-option-parity"
+step = 8
+capability = "Kubernetes managed/operator workspaces, sidecar enforcement, proxy, SPIFFE, user namespaces, AppArmor enforcement, confidential runtimes, and GPUs"
+driver = "kubernetes"
+status = "platform_blocked"
+owner = "OpenShell Kubernetes qualified option matrix"
+lane = "kubernetes-managed-operator-sidecar-proxy-spire-userns-apparmor-kata-gpu"
+blocker = "The disposable core lane executed shared, combined, init-container, runc, and Unconfined values but did not execute the infrastructure-qualified alternatives. Assigned lanes must run paired managed/operator namespace discovery, sidecar network enforcement, authenticated proxy, SPIRE CSI, hostUsers=false, AppArmor RuntimeDefault/Localhost, image-volume, Kata RuntimeClass, and NVIDIA device-plugin GPU probes."
+
+[[result]]
+id = "vm-launch-and-resource-configuration"
+step = 9
+capability = "VM launch, callback, persistent state, images, resources, and guest identity"
+driver = "vm"
+status = "platform_blocked"
+owner = "OpenShell Linux VM CI lane"
+lane = "linux-x86_64-kvm-libkrun"
+blocker = "This host has no prepared VM runtime bundle and no frozen-baseline or candidate openshell-driver-vm executable linked to a runnable libkrun environment. Both source trees passed their deterministic VM library suites, but only a paired KVM/libkrun lane can prove Ready, exec, restart recovery, overlay persistence, resource sizing, callback equivalence, and deletion."
+
+[[result]]
+id = "vm-guest-security-and-spiffe"
+step = 9
+capability = "VM guest token containment, TLS, owner state, proxy credentials, and SPIFFE opt-in"
+driver = "vm"
+status = "platform_blocked"
+owner = "OpenShell Linux VM security CI lane"
+lane = "linux-x86_64-kvm-libkrun-proxy-spiffe"
+blocker = "The guest JWT mode and visibility, private owner-marker and sandbox-state persistence, callback recovery, TLS key permissions, proxy credential containment, and guest-reachable SPIFFE TCP behavior require a booted VM. The assigned lane must add authenticated-proxy and Workload API TCP fixtures to the paired libkrun/KVM run."
+
+[[result]]
+id = "compute-driver-boundary-parity"
+step = 10
+capability = "In-tree and external-UDS compute-driver execution with sandbox callback connectivity"
+driver = "podman"
+status = "pass"
+validated_baseline_commit = "74960ebfaeec4673885089ed995fad902459749f"
+validated_candidate_commit = "4a39da510e4d278a24dd60291149519c9a570b46"
+lane = "local-linux-x86_64-rootless-podman-5.8.2"
+evidence = [
+  "Fresh exact-source gateway, CLI, conformance, Podman driver, and supervisor artifacts were staged before execution, hashed, executed from retained staging directories, and verified unchanged after execution.",
+  "Driver-free baseline and candidate gateways completed the same authenticated status, create, Ready, list, callback-exec, delete, and list-empty oracle through distinct-content external-driver executables over separate UDS endpoints; in-tree gateways completed the same oracle.",
+  "External drivers ran under env -i with a complete allowlisted environment attestation covering compute and Podman sockets, callback endpoint and TLS-file hashes, pull policy, images, network, timeouts, and bind mounts; successful driver logs were retained and hashed.",
+  "The verifier bound each transport-only gateway socket_path to the driver process input and required distinct baseline and candidate compute sockets, Podman sockets, networks, and callback TLS paths.",
+  "All four runs executed one repository-digest-pinned sandbox image and matched its image ID and manifest digest. They also matched the supervisor base-image identity, digest-pinned base reference, source Dockerfile, installed-package manifest, and same-source runtime artifacts across topologies.",
+  "Each variant built its supervisor image from its own staged supervisor binary in a forced temporary Podman service and isolated store; all supervisor runtime image references were digest-pinned.",
+  "A staged and hashed transparent CLI wrapper retained exact exec stdout bytes; the verifier tied them to the unique conformance run ID, required authenticated preflight and every lifecycle exit 0, and hashed result, launch, driver, raw-log, exec-stdout, gateway-configuration, package, and staged-artifact evidence.",
+]
+
+# Step 11 inventories the remaining cross-cutting capabilities. Paired
+# deterministic suites passed, but they are regression preflight rather than
+# live parity evidence. Every row therefore remains assigned to a live lane.
+
+[[result]]
+id = "oidc-bearer-authentication"
+step = 11
+capability = "OIDC bearer token validation, role and scope authorization, and JWKS refresh"
+driver = "auth"
+status = "platform_blocked"
+owner = "OpenShell auth and OIDC CI lane"
+lane = "linux-oidc-paired-keycloak-jwks"
+blocker = "The host has no isolated paired issuer fixture that presents equivalent signed tokens to both exact-source gateways. Existing Keycloak and OIDC suites are candidate-oriented and cannot establish schema-v1/schema-v2 audience, role, scope, expiry, signature, and key-rotation parity without a shared candidate-owned oracle."
+
+[[result]]
+id = "mtls-user-authentication"
+step = 11
+capability = "mTLS client-certificate user identity and authorization"
+driver = "auth"
+status = "platform_blocked"
+owner = "OpenShell gateway authentication CI lane"
+lane = "linux-mtls-user-principal-paired"
+blocker = "The paired TLS integration tests validate handshake policy but do not drive an authenticated user RPC through both gateways or prove certificate-to-principal mapping. A live lane must use isolated client PKI, equivalent schema files, and the same authorization oracle for enabled and disabled mTLS user authentication."
+
+[[result]]
+id = "unsafe-unauthenticated-user-mode"
+step = 11
+capability = "Explicit trusted-development unauthenticated user mode with authenticated sandbox callbacks"
+driver = "auth"
+status = "platform_blocked"
+owner = "OpenShell gateway authentication CI lane"
+lane = "linux-auth-chain-paired-isolated"
+blocker = "No paired live fixture currently proves that the trusted-development switch admits user requests while sandbox callbacks continue to require sandbox credentials. Candidate-only extension examples use this switch for setup, but that is not an authentication-boundary parity test."
+
+[[result]]
+id = "gateway-minted-sandbox-jwt"
+step = 11
+capability = "Gateway-minted sandbox and extension JWT claims and lifetime semantics"
+driver = "auth"
+status = "platform_blocked"
+owner = "OpenShell gateway JWT CI lane"
+lane = "linux-gateway-jwt-claims-paired"
+blocker = "Step 10 proved authenticated callback connectivity but did not capture and compare token claims. A controlled callback and extension fixture must verify issuer, gateway identity, key ID, audience, subject, token type, and expiry semantics for both gateways; explicit zero versus omitted TTL remains the ledgered gateway-jwt-zero-sentinel-removed intentional change."
+
+[[result]]
+id = "otlp-observability"
+step = 11
+capability = "Gateway and in-tree driver OTLP traces and failure isolation"
+driver = "observability"
+status = "platform_blocked"
+owner = "OpenShell observability CI lane"
+lane = "linux-otlp-grpc-collector-paired"
+blocker = "The deterministic exporter tests passed, but no retained paired collector capture proves emitted gateway and in-tree-driver spans, gateway name, service name, selected-driver resource attributes, or continued serving after collector failure. A loopback OTLP/gRPC collector lane must observe those outcomes from both exact-source processes."
+
+[[result]]
+id = "gateway-interceptor-registration"
+step = 11
+capability = "Gateway interceptor registration, binding, mutation, and failure behavior"
+driver = "gateway-interceptor"
+status = "platform_blocked"
+owner = "OpenShell gateway interceptor CI lane"
+lane = "linux-gateway-interceptor-paired"
+blocker = "The interceptor library suite passed on both revisions, while the governance-interceptor smoke test remains candidate-only. A paired service must compare Describe validation, binding selection, unary request and response mutation, failure policy, timeout and size limits, and secret exclusion against both gateway schema variants."
+
+[[result]]
+id = "supervisor-middleware-registration"
+step = 11
+capability = "Supervisor middleware registration, policy distribution, and enforcement"
+driver = "supervisor-middleware"
+status = "platform_blocked"
+owner = "OpenShell supervisor middleware CI lane"
+lane = "linux-supervisor-middleware-paired"
+blocker = "The middleware library suite passed on both revisions, while the content-guard smoke test remains candidate-only. A paired gateway, sandbox, and middleware fixture must compare Describe negotiation, policy distribution, guarded and unguarded traffic, failure policy, timeout, and payload limits; the field-name normalization remains the ledgered middleware-payload-name-normalized intentional change."
+
+[[result]]
+id = "provider-profile-sources"
+step = 11
+capability = "Builtin, user, and interceptor provider-profile source composition"
+driver = "provider-profiles"
+status = "platform_blocked"
+owner = "OpenShell provider profile CI lane"
+lane = "linux-provider-profiles-interceptor-paired"
+blocker = "Server tests cover source construction and duplicate rejection, but no shared live interceptor catalog has been queried through both gateways. The assigned lane must compare builtin, user, and interceptor source ordering, normalized profile identities, duplicate rejection, discovery output, and failure handling with isolated persistent state."
+
+[[result]]
+id = "inference-control-plane-configuration"
+step = 11
+capability = "Persisted provider and route configuration delivered to sandbox inference"
+driver = "inference"
+status = "platform_blocked"
+owner = "OpenShell inference E2E lane"
+lane = "linux-inference-provider-routing-paired"
+blocker = "Existing inference routing tests are candidate-oriented and this host has no assigned paired provider and model-service fixture. The lane must configure providers and routes through each gateway control plane, observe the effective supervisor bundle, and compare model discovery and an inference request without reusing database state."
+
+[[result]]
+id = "credential-driver-selection-and-kek"
+step = 11
+capability = "Credential-driver selection, KEK handling, encrypted storage, and secret containment"
+driver = "credentials"
+status = "platform_blocked"
+owner = "OpenShell credential security CI lane"
+lane = "linux-credential-kek-paired"
+blocker = "Both server suites passed deterministic selection, KEK, and credential tests, but they are revision-local tests rather than one candidate-owned live oracle. A paired lane must start isolated gateways with independent databases and KEKs, compare default encrypted storage and invalid selections, store and resolve opaque credentials, and verify that logs and configuration do not disclose secrets."
+
+[[result]]
+id = "credential-driver-backend-tables"
+step = 11
+capability = "In-tree and remote credential-driver transport and opaque credential lifecycle"
+driver = "credential-driver"
+status = "platform_blocked"
+owner = "OpenShell credential driver E2E lane"
+lane = "kubernetes-vault-uds-credential-drivers-paired"
+blocker = "The host has no assigned disposable Kubernetes Secrets or Vault backend and no retained paired UDS credential-driver execution. Existing backend E2E coverage is candidate-oriented. The assigned lane must compare in-tree and remote transport validation plus opaque store and retrieve behavior using isolated namespaces, Vault state, sockets, databases, and credentials."
+
+# Step 12 resolves deterministic package-startup blockers without claiming that
+# source-tree tests substitute for installation, upgrade, or refresh evidence.
+
+[[result]]
+id = "rpm-package-upgrade"
+step = 12
+capability = "RPM schema-v1 default migration and operator-edited configuration preservation"
+driver = "packaging"
+status = "platform_blocked"
+owner = "OpenShell RPM package upgrade CI lane"
+lane = "fedora-rpm-prior-release-upgrade"
+blocker = "Deterministic migration tests prove exact-default replacement, edited-file preservation, mode preservation, idempotence, and unsafe-path rejection, but no prior RPM was installed and upgraded on this host. The assigned lane must verify package ownership and permissions, service restart, exact and edited schema-v1 files, and rollback-safe failure behavior."
+
+[[result]]
+id = "debian-package-upgrade"
+step = 12
+capability = "Debian prior-artifact upgrade with schema-v1 configuration preservation"
+driver = "packaging"
+status = "platform_blocked"
+owner = "OpenShell Debian package upgrade CI lane"
+lane = "ubuntu-debian-prior-release-upgrade"
+blocker = "The source-tree tests prove Debian preflight selection, source-free diagnostics, non-mutation, and ordering before certificate generation, but dpkg-deb and an installed prior Debian artifact are unavailable. The assigned lane must preserve generated and edited schema-v1 files, exercise manual conversion, and prove successful schema-v2 service restart after upgrade."
+
+[[result]]
+id = "snap-package-refresh"
+step = 12
+capability = "Snap prior-release refresh with schema-v1 configuration preservation"
+driver = "packaging"
+status = "platform_blocked"
+owner = "OpenShell Snap refresh CI lane"
+lane = "ubuntu-snap-prior-release-refresh"
+blocker = "The source-tree tests prove Snap config precedence, preflight failure handling, and non-mutation, but this host cannot install and refresh confined Snap revisions. The assigned lane must refresh a prior Snap with generated and edited schema-v1 files, exercise manual conversion, and prove successful schema-v2 daemon startup."
+
+[[result]]
+id = "homebrew-package-upgrade"
+step = 12
+capability = "Homebrew prior-release upgrade with package-default and operator configuration preservation"
+driver = "packaging"
+status = "platform_blocked"
+owner = "OpenShell macOS Homebrew package upgrade CI lane"
+lane = "macos-homebrew-prior-release-upgrade"
+blocker = "No Homebrew formula installation or prior-release upgrade ran on this Linux host. The assigned macOS lane must upgrade a prior formula with recognized package defaults and edited schema-v1 configuration, verify only provable defaults migrate automatically, and prove successful schema-v2 service restart."

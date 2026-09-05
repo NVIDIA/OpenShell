@@ -29,7 +29,6 @@ BOOT_START=$(date +%s%3N 2>/dev/null || date +%s)
 GVPROXY_GATEWAY_IP="192.168.127.1"
 GVPROXY_HOST_LOOPBACK_IP="192.168.127.254"
 GATEWAY_IP="$GVPROXY_GATEWAY_IP"
-SANDBOX_OWNER_NORMALIZED_MARKER="/opt/openshell/.sandbox-owner-normalized"
 
 GPU_ENABLED="${GPU_ENABLED:-false}"
 VM_NET_IP="${VM_NET_IP:-}"
@@ -90,7 +89,9 @@ sandbox_owner_from_passwd() {
         done < "$passwd_path"
     fi
 
-    printf '10001:10001\n'
+    # New images use the conventional sandbox UID. Existing images retain the
+    # sandbox account read above, including the legacy 10001:10001 identity.
+    printf '1000:1000\n'
 }
 
 source_overlay_env_if_present() {
@@ -103,6 +104,21 @@ source_overlay_env_if_present() {
 
 ensure_target_runtime() {
     local image_root="$1"
+    local sandbox_uid="${OPENSHELL_VM_SANDBOX_UID:-}"
+    local sandbox_gid="${OPENSHELL_VM_SANDBOX_GID:-}"
+    local replace_account=0
+
+    # An omitted identity means the image owns its sandbox account contract.
+    # Fall back to 1000 only when the image has no sandbox account at all.
+    if [ -n "$sandbox_uid" ] || [ -n "$sandbox_gid" ]; then
+        sandbox_uid="${sandbox_uid:-1000}"
+        sandbox_gid="${sandbox_gid:-$sandbox_uid}"
+        replace_account=1
+    elif ! grep -q '^sandbox:' "$image_root/etc/passwd" 2>/dev/null; then
+        sandbox_uid=1000
+        sandbox_gid=1000
+        replace_account=1
+    fi
 
     mkdir -p \
         "$image_root/srv" \
@@ -119,31 +135,31 @@ ensure_target_runtime() {
     fi
 
     touch "$image_root/etc/passwd" "$image_root/etc/group" "$image_root/etc/shadow" "$image_root/etc/gshadow"
-    if ! grep -q '^sandbox:' "$image_root/etc/group" 2>/dev/null; then
-        printf 'sandbox:x:10001:\n' >> "$image_root/etc/group"
-    fi
-    if ! grep -q '^sandbox:' "$image_root/etc/gshadow" 2>/dev/null; then
-        printf 'sandbox:!::\n' >> "$image_root/etc/gshadow"
-    fi
-    if ! grep -q '^sandbox:' "$image_root/etc/passwd" 2>/dev/null; then
-        printf 'sandbox:x:10001:10001:OpenShell Sandbox:/sandbox:/bin/sh\n' >> "$image_root/etc/passwd"
-    fi
-    if ! grep -q '^sandbox:' "$image_root/etc/shadow" 2>/dev/null; then
-        printf 'sandbox:!:20123:0:99999:7:::\n' >> "$image_root/etc/shadow"
+    if [ "$replace_account" -eq 1 ]; then
+        if grep -q '^sandbox:' "$image_root/etc/group" 2>/dev/null; then
+            sed -i "s|^sandbox:.*|sandbox:x:${sandbox_gid}:|" "$image_root/etc/group"
+        else
+            printf 'sandbox:x:%s:\n' "$sandbox_gid" >> "$image_root/etc/group"
+        fi
+        if ! grep -q '^sandbox:' "$image_root/etc/gshadow" 2>/dev/null; then
+            printf 'sandbox:!::\n' >> "$image_root/etc/gshadow"
+        fi
+        if grep -q '^sandbox:' "$image_root/etc/passwd" 2>/dev/null; then
+            sed -i "s|^sandbox:.*|sandbox:x:${sandbox_uid}:${sandbox_gid}:OpenShell Sandbox:/sandbox:/bin/sh|" "$image_root/etc/passwd"
+        else
+            printf 'sandbox:x:%s:%s:OpenShell Sandbox:/sandbox:/bin/sh\n' "$sandbox_uid" "$sandbox_gid" >> "$image_root/etc/passwd"
+        fi
+        if ! grep -q '^sandbox:' "$image_root/etc/shadow" 2>/dev/null; then
+            printf 'sandbox:!:20123:0:99999:7:::\n' >> "$image_root/etc/shadow"
+        fi
     fi
     local owner
-    local owner_normalized=0
     owner="$(sandbox_owner_for_root "$image_root")"
-    if chown -R "$owner" "$image_root/sandbox" 2>/dev/null; then
-        owner_normalized=1
-    elif chown -R 10001:10001 "$image_root/sandbox" 2>/dev/null; then
-        owner_normalized=1
+    if ! chown -R "$owner" "$image_root/sandbox" 2>/dev/null; then
+        ts "FATAL: failed to apply sandbox image ownership (${owner})"
+        exit 1
     fi
     chmod 0755 "$image_root/sandbox"
-    if [ "$owner_normalized" -eq 1 ]; then
-        mkdir -p "$image_root/opt/openshell"
-        printf '1\n' > "$image_root${SANDBOX_OWNER_NORMALIZED_MARKER}"
-    fi
 }
 
 prepare_guest_image_rootfs() {
@@ -275,16 +291,14 @@ exec_supervisor_in_newroot() {
                 "${bootstrap}/lib64/ld-linux-aarch64.so.1"; do
                 if [ -x "/newroot${loader}" ]; then
                     lib_path="${bootstrap}/lib:${bootstrap}/lib64:${bootstrap}/usr/lib:${bootstrap}/usr/lib64:${bootstrap}/lib/aarch64-linux-gnu:${bootstrap}/lib/x86_64-linux-gnu:${bootstrap}/usr/lib/aarch64-linux-gnu:${bootstrap}/usr/lib/x86_64-linux-gnu"
-                    exec "$chroot_bin" /newroot "$loader" --library-path "$lib_path" \
-                        "$supervisor" --workdir /sandbox "${SUPERVISOR_EXTRA_ARGS[@]+"${SUPERVISOR_EXTRA_ARGS[@]}"}"
+                    exec "$chroot_bin" /newroot "$loader" --library-path "$lib_path" "$supervisor" "$@"
                 fi
             done
-            exec "$chroot_bin" /newroot "$supervisor" --workdir /sandbox "${SUPERVISOR_EXTRA_ARGS[@]+"${SUPERVISOR_EXTRA_ARGS[@]}"}"
+            exec "$chroot_bin" /newroot "$supervisor" "$@"
         fi
 
         if [ -x /newroot/opt/openshell/bin/openshell-sandbox ]; then
-            exec "$chroot_bin" /newroot /opt/openshell/bin/openshell-sandbox \
-                --workdir /sandbox "${SUPERVISOR_EXTRA_ARGS[@]+"${SUPERVISOR_EXTRA_ARGS[@]}"}"
+            exec "$chroot_bin" /newroot /opt/openshell/bin/openshell-sandbox "$@"
         fi
     done
 
@@ -609,6 +623,50 @@ setup_gpu() {
     fi
 }
 
+reconcile_sandbox_account() {
+    local sandbox_uid="${OPENSHELL_VM_SANDBOX_UID:-}"
+    local sandbox_gid="${OPENSHELL_VM_SANDBOX_GID:-}"
+    local etc
+
+    [ -n "$sandbox_uid" ] && [ -n "$sandbox_gid" ] || return 0
+    [[ "$sandbox_uid" =~ ^[0-9]+$ ]] && [[ "$sandbox_gid" =~ ^[0-9]+$ ]] || {
+        ts "FATAL: invalid requested sandbox identity"
+        exit 1
+    }
+    etc="$(root_path /etc)"
+    mkdir -p "$etc"
+    touch "$etc/passwd" "$etc/group" "$etc/shadow" "$etc/gshadow"
+    if grep -q '^sandbox:' "$etc/group"; then
+        if ! awk -F: -v OFS=: -v gid="$sandbox_gid" \
+            '$1 == "sandbox" { $3 = gid } { print }' \
+            "$etc/group" >"$etc/group.openshell"; then
+            rm -f "$etc/group.openshell"
+            ts "FATAL: failed to reconcile sandbox group"
+            exit 1
+        fi
+        mv "$etc/group.openshell" "$etc/group"
+    else
+        printf 'sandbox:x:%s:\n' "$sandbox_gid" >> "$etc/group"
+    fi
+    if grep -q '^sandbox:' "$etc/passwd"; then
+        # Preserve image-owned account metadata (home, shell, and description)
+        # while restoring the UID/GID contract recorded for this overlay.
+        if ! awk -F: -v OFS=: -v uid="$sandbox_uid" -v gid="$sandbox_gid" \
+            '$1 == "sandbox" { $3 = uid; $4 = gid } { print }' \
+            "$etc/passwd" >"$etc/passwd.openshell"; then
+            rm -f "$etc/passwd.openshell"
+            ts "FATAL: failed to reconcile sandbox account"
+            exit 1
+        fi
+        mv "$etc/passwd.openshell" "$etc/passwd"
+    else
+        printf 'sandbox:x:%s:%s:OpenShell Sandbox:/sandbox:/bin/sh\n' "$sandbox_uid" "$sandbox_gid" >> "$etc/passwd"
+    fi
+    grep -q '^sandbox:' "$etc/gshadow" || printf 'sandbox:!::\n' >> "$etc/gshadow"
+    grep -q '^sandbox:' "$etc/shadow" || printf 'sandbox:!:20123:0:99999:7:::\n' >> "$etc/shadow"
+    ts "reconciled sandbox account (${sandbox_uid}:${sandbox_gid})"
+}
+
 setup_sandbox_workdir() {
     local sandbox_dir
     local owner
@@ -617,10 +675,13 @@ setup_sandbox_workdir() {
     owner="$(sandbox_owner)"
     mkdir -p "$sandbox_dir"
     current_owner="$(stat -c '%u:%g' "$sandbox_dir" 2>/dev/null || true)"
-    if [ "$current_owner" != "$owner" ] \
-        || [ ! -f "$(root_path "$SANDBOX_OWNER_NORMALIZED_MARKER")" ]; then
+    if [ "$owner" = "10001:10001" ]; then
+        ts "preserving legacy sandbox ownership (10001:10001)"
+    fi
+    if [ "$current_owner" != "$owner" ]; then
         if ! chown -R "$owner" "$sandbox_dir" 2>/dev/null; then
-            chown -R 10001:10001 "$sandbox_dir"
+            ts "FATAL: failed to apply sandbox ownership (${owner})"
+            exit 1
         fi
     fi
     chmod 0755 "$sandbox_dir"
@@ -747,6 +808,7 @@ run_post_overlay_setup() {
         echo 1 > /proc/sys/net/netfilter/nf_log_all_netns 2>/dev/null || true
     fi
 
+    reconcile_sandbox_account
     setup_sandbox_workdir
 
     configure_hostname
@@ -897,12 +959,13 @@ if [ -n "${OPENSHELL_SANDBOX_ID:-}" ]; then
 fi
 
 read_supervisor_extra_args
+set -- --workdir /sandbox "${SUPERVISOR_EXTRA_ARGS[@]+"${SUPERVISOR_EXTRA_ARGS[@]}"}"
 
 ts "starting openshell-sandbox supervisor"
 if [ "${ROOT_PREFIX:-}" = "/newroot" ]; then
-    exec_supervisor_in_newroot
+    exec_supervisor_in_newroot "$@"
 fi
-exec /opt/openshell/bin/openshell-sandbox --workdir /sandbox "${SUPERVISOR_EXTRA_ARGS[@]+"${SUPERVISOR_EXTRA_ARGS[@]}"}"
+exec /opt/openshell/bin/openshell-sandbox "$@"
 }
 
 if [ "${1:-}" != "--post-overlay" ]; then
