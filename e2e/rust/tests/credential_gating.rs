@@ -221,6 +221,7 @@ enum EndpointMode {
     TlsSkip,
     L4OptIn,
     RestBody { rewrite: bool },
+    WebSocket,
 }
 
 #[derive(Clone, Copy)]
@@ -244,6 +245,9 @@ fn write_policy(
         EndpointMode::RestBody { rewrite } => format!(
             "        protocol: rest\n        access: full\n        request_body_credential_rewrite: {rewrite}\n"
         ),
+        EndpointMode::WebSocket => {
+            "        protocol: websocket\n        access: read-write\n".to_string()
+        }
     };
     let credential_binding = match credential_source {
         CredentialSource::ProviderProfile => String::new(),
@@ -268,12 +272,7 @@ network_policies:
     endpoints:
       - host: {TEST_HOST}
         port: {port}
-{endpoint_options}{credential_binding}        allowed_ips:
-          - "10.0.0.0/8"
-          - "172.0.0.0/8"
-          - "192.168.0.0/16"
-          - "fc00::/7"
-    binaries:
+{endpoint_options}{credential_binding}    binaries:
       - path: /usr/bin/python*
       - path: /usr/local/bin/python*
       - path: /sandbox/.uv/python/*/bin/python*
@@ -281,27 +280,6 @@ network_policies:
     );
     file.write_all(policy.as_bytes())
         .map_err(|error| format!("write policy: {error}"))?;
-    file.flush()
-        .map_err(|error| format!("flush policy: {error}"))?;
-    Ok(file)
-}
-
-fn write_base_policy() -> Result<NamedTempFile, String> {
-    let mut file = NamedTempFile::new().map_err(|error| format!("create policy: {error}"))?;
-    file.write_all(
-        br#"version: 1
-filesystem_policy:
-  include_workdir: true
-  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
-  read_write: [/sandbox, /tmp, /dev/null]
-landlock:
-  compatibility: best_effort
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
-"#,
-    )
-    .map_err(|error| format!("write policy: {error}"))?;
     file.flush()
         .map_err(|error| format!("flush policy: {error}"))?;
     Ok(file)
@@ -836,7 +814,11 @@ async fn run_body_sandbox(
 }
 
 async fn run_profile_body_sandbox(port: u16) -> Result<String, String> {
-    let policy = write_base_policy()?;
+    let policy = write_policy(
+        port,
+        EndpointMode::RestBody { rewrite: false },
+        CredentialSource::ProviderProfile,
+    )?;
     let policy_path = policy
         .path()
         .to_str()
@@ -869,7 +851,11 @@ async fn assert_rest_body_backstop(server: &HttpProbeServer) -> Result<(), Strin
 }
 
 async fn assert_websocket_binary_denied(server: &BinaryWebSocketProbeServer) -> Result<(), String> {
-    let policy = write_base_policy()?;
+    let policy = write_policy(
+        server.port,
+        EndpointMode::WebSocket,
+        CredentialSource::ProviderProfile,
+    )?;
     let policy_path = policy
         .path()
         .to_str()

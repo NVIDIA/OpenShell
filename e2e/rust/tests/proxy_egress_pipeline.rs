@@ -3,16 +3,16 @@
 
 #![cfg(feature = "e2e")]
 
-//! E2E coverage for the shared explicit-proxy egress pipeline.
+//! E2E coverage for the transparent sandbox egress pipeline.
 //!
-//! These tests exercise behavior that must remain identical while CONNECT and
-//! forward HTTP converge on shared authorization, destination, and relay
-//! primitives:
-//! - live policy reloads affect new requests through both adapters and close a
-//!   pre-existing CONNECT HTTP stream before its next request is forwarded;
+//! Workloads connect directly to their requested destinations. Seccomp
+//! notification diverts those sockets to the supervisor without proxy
+//! environment variables or explicit CONNECT requests. These tests cover:
+//! - live policy reloads affect new requests and close a pre-existing HTTP
+//!   stream before its next request is forwarded;
 //! - `tls: skip` selects a byte-transparent TCP relay;
 //! - provider placeholders in HTTP headers and opted-in REST bodies are
-//!   resolved through both adapters without appearing in test output.
+//!   resolved without appearing in test output.
 
 use std::io::{self, Error, ErrorKind, Write};
 use std::process::Stdio;
@@ -22,6 +22,7 @@ use std::sync::{
 };
 
 use openshell_e2e::harness::binary::openshell_cmd;
+use openshell_e2e::harness::container::{SupportContainer, e2e_network_name};
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use serde_json::Value;
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
@@ -359,9 +360,9 @@ network_policies:
 }
 
 fn write_ip_literal_success_policy(
-    ip: &str,
-    explicit_port: u16,
-    implicit_port: u16,
+    explicit_ip: &str,
+    implicit_ip: &str,
+    port: u16,
 ) -> Result<NamedTempFile, String> {
     let mut file = NamedTempFile::new().map_err(|error| format!("create policy: {error}"))?;
     let policy = format!(
@@ -384,13 +385,14 @@ network_policies:
     name: destination_successes
     endpoints:
       - host: {ip}
-        port: {explicit_port}
-        allowed_ips: ["{ip}/32"]
-      - host: {ip}
-        port: {implicit_port}
+        port: {port}
+        allowed_ips: ["{explicit_ip}/32"]
+      - host: {implicit_ip}
+        port: {port}
     binaries:
       - path: "/**"
-"#
+"#,
+        ip = explicit_ip,
     );
     file.write_all(policy.as_bytes())
         .map_err(|error| format!("write policy: {error}"))?;
@@ -749,25 +751,14 @@ async fn handle_credential_probe(mut stream: TcpStream) -> io::Result<()> {
     stream.write_all(response.as_bytes()).await
 }
 
-fn proxy_status_script(host: &str, port: u16) -> String {
+fn transparent_status_script(host: &str, port: u16) -> String {
     format!(
         r#"
 import json
-import os
 import socket
-import urllib.parse
 
 HOST = {host:?}
 PORT = {port}
-
-def proxy_parts():
-    proxy_url = next(
-        os.environ[name]
-        for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")
-        if os.environ.get(name)
-    )
-    parsed = urllib.parse.urlparse(proxy_url)
-    return parsed.hostname, parsed.port or 80
 
 def read_headers(sock):
     data = b""
@@ -782,59 +773,41 @@ def status(response):
     parts = response.split(None, 2)
     return int(parts[1]) if len(parts) > 1 else 0
 
-def forward_status():
-    proxy_host, proxy_port = proxy_parts()
+def request_status(path):
     target = f"{{HOST}}:{{PORT}}"
-    with socket.create_connection((proxy_host, proxy_port), timeout=10) as sock:
-        sock.sendall(
-            f"GET http://{{target}}/forward HTTP/1.1\r\n"
-            f"Host: {{target}}\r\nConnection: close\r\n\r\n".encode()
-        )
-        return status(read_headers(sock))
+    try:
+        with socket.create_connection((HOST, PORT), timeout=10) as sock:
+            sock.sendall(
+                f"GET {{path}} HTTP/1.1\r\n"
+                f"Host: {{target}}\r\nConnection: close\r\n\r\n".encode()
+            )
+            return status(read_headers(sock))
+    except OSError as error:
+        return {{"errno": error.errno, "error": repr(error)}}
 
-def connect_status():
-    proxy_host, proxy_port = proxy_parts()
-    target = f"{{HOST}}:{{PORT}}"
-    with socket.create_connection((proxy_host, proxy_port), timeout=10) as sock:
-        sock.sendall(f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode())
-        code = status(read_headers(sock))
-        if code != 200:
-            return code
-        sock.sendall(
-            f"GET /connect HTTP/1.1\r\nHost: {{target}}\r\nConnection: close\r\n\r\n".encode()
-        )
-        return status(read_headers(sock))
-
-print(json.dumps({{"connect": connect_status(), "forward": forward_status()}}, sort_keys=True))
+print(json.dumps({{
+    "first": request_status("/first"),
+    "second": request_status("/second"),
+}}, sort_keys=True))
 "#,
         host = host,
         port = port,
     )
 }
 
-fn persistent_connect_script(host: &str, port: u16) -> String {
+fn persistent_transparent_script(host: &str, port: u16) -> String {
     format!(
         r#"
 import json
 import os
 import socket
 import time
-import urllib.parse
 
 HOST = {host:?}
 PORT = {port}
 READY = "/tmp/proxy-reload-ready"
 GO = "/tmp/proxy-reload-go"
 RESULT = "/tmp/proxy-reload-result"
-
-def proxy_parts():
-    proxy_url = next(
-        os.environ[name]
-        for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")
-        if os.environ.get(name)
-    )
-    parsed = urllib.parse.urlparse(proxy_url)
-    return parsed.hostname, parsed.port or 80
 
 def read_response(sock):
     data = b""
@@ -855,15 +828,11 @@ def read_response(sock):
         body += chunk
     return int(headers.split(None, 2)[1])
 
-proxy_host, proxy_port = proxy_parts()
 target = f"{{HOST}}:{{PORT}}"
 failed_closed = False
 second_status = 0
 try:
-    with socket.create_connection((proxy_host, proxy_port), timeout=10) as sock:
-        sock.sendall(f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode())
-        if read_response(sock) != 200:
-            raise RuntimeError("initial CONNECT was denied")
+    with socket.create_connection((HOST, PORT), timeout=10) as sock:
         sock.sendall(
             f"GET /before-reload HTTP/1.1\r\nHost: {{target}}\r\nConnection: keep-alive\r\n\r\n".encode()
         )
@@ -920,7 +889,7 @@ fn parse_json_line(output: &str) -> Value {
 }
 
 #[tokio::test]
-async fn policy_reload_updates_both_adapters_and_closes_existing_http_tunnel() {
+async fn policy_reload_updates_transparent_requests_and_closes_existing_http_stream() {
     let server = KeepAliveHttpServer::start()
         .await
         .expect("start keep-alive HTTP server");
@@ -950,7 +919,7 @@ async fn policy_reload_updates_both_adapters_and_closes_existing_http_tunnel() {
     .await
     .expect("wait for policy A");
 
-    let persistent_script = persistent_connect_script(TEST_SERVER_HOST, server.port);
+    let persistent_script = persistent_transparent_script(TEST_SERVER_HOST, server.port);
     guard
         .exec(&[
             "sh",
@@ -960,7 +929,7 @@ async fn policy_reload_updates_both_adapters_and_closes_existing_http_tunnel() {
             &persistent_script,
         ])
         .await
-        .expect("start persistent CONNECT client");
+        .expect("start persistent transparent client");
     wait_for_sandbox_file(
         &guard,
         "/tmp/proxy-reload-ready",
@@ -968,16 +937,19 @@ async fn policy_reload_updates_both_adapters_and_closes_existing_http_tunnel() {
     )
     .await;
 
-    let status_script = proxy_status_script(TEST_SERVER_HOST, server.port);
+    let status_script = transparent_status_script(TEST_SERVER_HOST, server.port);
     let before = guard
         .exec(&["python3", "-c", &status_script])
         .await
-        .expect("exercise both adapters before reload");
+        .expect("exercise transparent requests before reload");
     let before = parse_json_line(&before);
-    assert_eq!(before["connect"], 200, "CONNECT before reload: {before}");
     assert_eq!(
-        before["forward"], 200,
-        "forward HTTP before reload: {before}"
+        before["first"], 200,
+        "first request before reload: {before}"
+    );
+    assert_eq!(
+        before["second"], 200,
+        "second request before reload: {before}"
     );
 
     run_cli(&[
@@ -996,7 +968,7 @@ async fn policy_reload_updates_both_adapters_and_closes_existing_http_tunnel() {
     guard
         .exec(&["sh", "-c", "touch /tmp/proxy-reload-go"])
         .await
-        .expect("release persistent CONNECT client");
+        .expect("release persistent transparent client");
     let stale_tunnel = wait_for_sandbox_file(
         &guard,
         "/tmp/proxy-reload-result",
@@ -1006,16 +978,16 @@ async fn policy_reload_updates_both_adapters_and_closes_existing_http_tunnel() {
     let stale_tunnel = parse_json_line(&stale_tunnel);
     assert_eq!(
         stale_tunnel["failed_closed"], true,
-        "existing CONNECT HTTP stream forwarded after policy reload: {stale_tunnel}"
+        "existing transparent HTTP stream forwarded after policy reload: {stale_tunnel}"
     );
 
     let after = guard
         .exec(&["python3", "-c", &status_script])
         .await
-        .expect("exercise both adapters after reload");
+        .expect("exercise transparent requests after reload");
     let after = parse_json_line(&after);
-    assert_eq!(after["connect"], 403, "CONNECT after reload: {after}");
-    assert_eq!(after["forward"], 403, "forward HTTP after reload: {after}");
+    assert_ne!(after["first"], 200, "first request after reload: {after}");
+    assert_ne!(after["second"], 200, "second request after reload: {after}");
 
     guard.cleanup().await;
 }
@@ -1052,14 +1024,20 @@ async fn ambiguous_policy_update_is_rejected_without_replacing_active_policy() {
     .await
     .expect("wait for valid policy");
 
-    let status_script = proxy_status_script(TEST_SERVER_HOST, server.port);
+    let status_script = transparent_status_script(TEST_SERVER_HOST, server.port);
     let before = guard
         .exec(&["python3", "-c", &status_script])
         .await
-        .expect("exercise both adapters before invalid update");
+        .expect("exercise transparent requests before invalid update");
     let before = parse_json_line(&before);
-    assert_eq!(before["connect"], 200, "CONNECT before update: {before}");
-    assert_eq!(before["forward"], 200, "forward before update: {before}");
+    assert_eq!(
+        before["first"], 200,
+        "first request before update: {before}"
+    );
+    assert_eq!(
+        before["second"], 200,
+        "second request before update: {before}"
+    );
     let history_before = run_cli(&["policy", "list", &guard.name])
         .await
         .expect("list policy history before rejected update");
@@ -1093,15 +1071,15 @@ async fn ambiguous_policy_update_is_rejected_without_replacing_active_policy() {
     let after_rejection = guard
         .exec(&["python3", "-c", &status_script])
         .await
-        .expect("exercise both adapters after rejected update");
+        .expect("exercise transparent requests after rejected update");
     let after_rejection = parse_json_line(&after_rejection);
     assert_eq!(
-        after_rejection["connect"], 200,
-        "CONNECT should keep using the active valid policy: {after_rejection}"
+        after_rejection["first"], 200,
+        "first request should keep using the active valid policy: {after_rejection}"
     );
     assert_eq!(
-        after_rejection["forward"], 200,
-        "forward HTTP should keep using the active valid policy: {after_rejection}"
+        after_rejection["second"], 200,
+        "second request should keep using the active valid policy: {after_rejection}"
     );
     assert!(
         server.connection_count() > connections_before_rejection,
@@ -1112,69 +1090,25 @@ async fn ambiguous_policy_update_is_rejected_without_replacing_active_policy() {
 }
 
 #[tokio::test]
-async fn destination_denial_modes_match_across_connect_and_forward_adapters() {
+async fn transparent_destination_denials_fail_connect_with_eacces() {
     let policy = write_destination_denial_policy().expect("write destination denial policy");
     let policy_path = policy_path(&policy);
     let script = r#"
 import json
-import os
 import socket
-import urllib.parse
-
-proxy_url = next(
-    os.environ[name]
-    for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")
-    if os.environ.get(name)
-)
-parsed = urllib.parse.urlparse(proxy_url)
-
-def read_response(sock):
-    data = b""
-    while b"\r\n\r\n" not in data:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        data += chunk
-    headers, _, body = data.partition(b"\r\n\r\n")
-    length = 0
-    for line in headers.split(b"\r\n")[1:]:
-        if line.lower().startswith(b"content-length:"):
-            length = int(line.split(b":", 1)[1].strip())
-    while len(body) < length:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        body += chunk
-    status = int(headers.split(None, 2)[1])
-    return {"status": status, "body": json.loads(body.decode())}
-
-def connect_result(host, port):
-    with socket.create_connection((parsed.hostname, parsed.port or 80), timeout=10) as sock:
-        target = f"{host}:{port}"
-        sock.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
-        return read_response(sock)
-
-def forward_result(host, port):
-    with socket.create_connection((parsed.hostname, parsed.port or 80), timeout=10) as sock:
-        target = f"{host}:{port}"
-        sock.sendall(
-            f"GET http://{target}/probe HTTP/1.1\r\n"
-            f"Host: {target}\r\nConnection: close\r\n\r\n".encode()
-        )
-        return read_response(sock)
 
 targets = {
     "metadata": ("169.254.169.254", 80),
-    "loopback": ("127.0.0.1", 80),
     "control_plane": ("203.0.113.10", 6443),
     "outside_allowed_ips": ("203.0.113.10", 8080),
 }
 result = {}
 for name, target in targets.items():
-    result[name] = {
-        "connect": connect_result(*target),
-        "forward": forward_result(*target),
-    }
+    try:
+        with socket.create_connection(target, timeout=10):
+            result[name] = 0
+    except OSError as error:
+        result[name] = error.errno
 print(json.dumps(result, sort_keys=True))
 "#;
 
@@ -1182,81 +1116,46 @@ print(json.dumps(result, sort_keys=True))
         .await
         .expect("sandbox create");
     let result = parse_json_line(&guard.create_output);
-    for name in [
-        "metadata",
-        "loopback",
-        "control_plane",
-        "outside_allowed_ips",
-    ] {
-        for adapter in ["connect", "forward"] {
-            assert_eq!(
-                result[name][adapter]["status"], 403,
-                "{name} {adapter}: {result}"
-            );
-            assert_eq!(
-                result[name][adapter]["body"]["error"], "ssrf_denied",
-                "{name} {adapter}: {result}"
-            );
-        }
+    for name in ["metadata", "control_plane", "outside_allowed_ips"] {
+        assert_eq!(result[name], 13, "{name} should fail with EACCES: {result}");
     }
-    assert_eq!(
-        result["metadata"]["connect"]["body"]["detail"],
-        "CONNECT 169.254.169.254:80 blocked: declared endpoint check failed"
-    );
-    assert_eq!(
-        result["metadata"]["forward"]["body"]["detail"],
-        "GET 169.254.169.254:80 blocked: declared endpoint check failed"
-    );
-    assert_eq!(
-        result["control_plane"]["connect"]["body"]["detail"],
-        "CONNECT 203.0.113.10:6443 blocked: allowed_ips check failed"
-    );
-    assert_eq!(
-        result["outside_allowed_ips"]["forward"]["body"]["detail"],
-        "GET 203.0.113.10:8080 blocked: allowed_ips check failed"
-    );
 }
 
 #[tokio::test]
-async fn explicit_allowed_ips_and_implicit_ip_literals_succeed_through_both_adapters() {
-    let resolver = SandboxGuard::create(&[
-        "--",
-        "python3",
-        "-c",
-        "import socket; print('GATEWAY_IP=' + socket.gethostbyname('host.openshell.internal'))",
-    ])
-    .await
-    .expect("resolve host gateway inside sandbox");
-    let gateway_ip = resolver
-        .create_output
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("GATEWAY_IP="))
-        .expect("sandbox gateway IPv4 output")
-        .parse::<std::net::Ipv4Addr>()
-        .expect("host gateway must resolve to IPv4 for this e2e");
-
-    // Rootless Podman with pasta exposes its trusted host-gateway alias as a
-    // link-local address. The hostname receives a narrow runtime exemption,
-    // but the equivalent raw IP literal must remain hard-blocked. Other
-    // drivers still exercise the successful IP-literal path below.
-    if gateway_ip.is_loopback() || gateway_ip.is_link_local() || gateway_ip.is_unspecified() {
-        eprintln!(
-            "skipping IP-literal success assertions: host gateway {gateway_ip} is always blocked"
-        );
+async fn explicit_allowed_ips_and_implicit_ip_literals_succeed_transparently() {
+    if e2e_network_name().is_none() {
+        eprintln!("skipping IP-literal success assertions without a shared container network");
         return;
     }
 
-    let gateway_ip = gateway_ip.to_string();
+    const HTTP_SERVER: &str = r#"
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    let explicit_server = KeepAliveHttpServer::start()
-        .await
-        .expect("start explicit allowed_ips server");
-    let implicit_server = KeepAliveHttpServer::start()
-        .await
-        .expect("start implicit IP-literal server");
-    let policy =
-        write_ip_literal_success_policy(&gateway_ip, explicit_server.port, implicit_server.port)
-            .expect("write IP literal policy");
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"ok"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+ThreadingHTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
+"#;
+    let explicit_server =
+        SupportContainer::start_python("explicit-ip.openshell.test", HTTP_SERVER, 8000)
+            .await
+            .expect("start explicit allowed_ips support container");
+    let implicit_server =
+        SupportContainer::start_python("implicit-ip.openshell.test", HTTP_SERVER, 8000)
+            .await
+            .expect("start implicit IP-literal support container");
+    let explicit_ip = explicit_server.ip().expect("explicit support container IP");
+    let implicit_ip = implicit_server.ip().expect("implicit support container IP");
+    let policy = write_ip_literal_success_policy(&explicit_ip, &implicit_ip, 8000)
+        .expect("write IP literal policy");
     let policy_path = policy_path(&policy);
     let mut guard = SandboxGuard::create_keep_with_args(
         &["--policy", &policy_path],
@@ -1266,17 +1165,21 @@ async fn explicit_allowed_ips_and_implicit_ip_literals_succeed_through_both_adap
     .await
     .expect("create keep sandbox");
 
-    for (mode, port) in [
-        ("explicit_allowed_ips", explicit_server.port),
-        ("implicit_ip_literal", implicit_server.port),
+    for (mode, destination) in [
+        ("explicit_allowed_ips", explicit_ip.as_str()),
+        ("implicit_ip_literal", implicit_ip.as_str()),
     ] {
         let output = guard
-            .exec(&["python3", "-c", &proxy_status_script(&gateway_ip, port)])
+            .exec(&[
+                "python3",
+                "-c",
+                &transparent_status_script(destination, 8000),
+            ])
             .await
             .unwrap_or_else(|error| panic!("exercise {mode}: {error}"));
         let statuses = parse_json_line(&output);
-        assert_eq!(statuses["connect"], 200, "{mode} CONNECT: {statuses}");
-        assert_eq!(statuses["forward"], 200, "{mode} forward: {statuses}");
+        assert_eq!(statuses["first"], 200, "{mode} first request: {statuses}");
+        assert_eq!(statuses["second"], 200, "{mode} second request: {statuses}");
     }
 
     guard.cleanup().await;
@@ -1290,28 +1193,13 @@ async fn tls_skip_connect_relays_opaque_bytes_bidirectionally() {
     let policy_path = policy_path(&policy);
     let script = format!(
         r#"
-import os
 import socket
-import urllib.parse
 
 HOST = {host:?}
 PORT = {port}
 PAYLOAD = bytes([0x00, 0xff, 0x13, 0x37, 0x80, 0x0a]) + b"not-http-or-tls" + bytes(range(64))
 
-proxy_url = next(
-    os.environ[name]
-    for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")
-    if os.environ.get(name)
-)
-parsed = urllib.parse.urlparse(proxy_url)
-with socket.create_connection((parsed.hostname, parsed.port or 80), timeout=10) as sock:
-    target = f"{{HOST}}:{{PORT}}"
-    sock.sendall(f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode())
-    response = b""
-    while b"\r\n\r\n" not in response:
-        response += sock.recv(4096)
-    if int(response.split(None, 2)[1]) != 200:
-        raise RuntimeError("CONNECT was denied")
+with socket.create_connection((HOST, PORT), timeout=10) as sock:
     sock.sendall(PAYLOAD)
     echoed = b""
     while len(echoed) < len(PAYLOAD):
@@ -1338,7 +1226,7 @@ print("RAW_RELAY_OK")
 }
 
 #[tokio::test]
-async fn middleware_redacts_request_bodies_through_both_adapters() {
+async fn middleware_redacts_transparent_request_bodies() {
     let server = RequestBodyEchoServer::start()
         .await
         .expect("start request body echo server");
@@ -1348,20 +1236,11 @@ async fn middleware_redacts_request_bodies_through_both_adapters() {
     let script = format!(
         r#"
 import json
-import os
 import socket
-import urllib.parse
 
 HOST = {host:?}
 PORT = {port}
 SECRET = "sk-1234567890abcdef"
-
-proxy_url = next(
-    os.environ[name]
-    for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")
-    if os.environ.get(name)
-)
-parsed = urllib.parse.urlparse(proxy_url)
 
 def read_response(sock):
     data = b""
@@ -1395,22 +1274,12 @@ def request_bytes(target):
         "Connection: close\r\n\r\n"
     ).encode() + body
 
-target = f"{{HOST}}:{{PORT}}"
-with socket.create_connection((parsed.hostname, parsed.port or 80), timeout=10) as forward_sock:
-    forward_sock.sendall(request_bytes(f"http://{{target}}/middleware"))
-    forward = read_response(forward_sock)
+def request_once():
+    with socket.create_connection((HOST, PORT), timeout=10) as sock:
+        sock.sendall(request_bytes("/middleware"))
+        return read_response(sock)
 
-with socket.create_connection((parsed.hostname, parsed.port or 80), timeout=10) as connect_sock:
-    connect_sock.sendall(f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode())
-    connect_response = b""
-    while b"\r\n\r\n" not in connect_response:
-        connect_response += connect_sock.recv(4096)
-    if int(connect_response.split(None, 2)[1]) != 200:
-        raise RuntimeError("CONNECT was denied")
-    connect_sock.sendall(request_bytes("/middleware"))
-    connect = read_response(connect_sock)
-
-print(json.dumps({{"connect": connect, "forward": forward}}, sort_keys=True))
+print(json.dumps({{"first": request_once(), "second": request_once()}}, sort_keys=True))
 "#,
         host = TEST_SERVER_HOST,
         port = server.port,
@@ -1420,44 +1289,29 @@ print(json.dumps({{"connect": connect, "forward": forward}}, sort_keys=True))
         .await
         .expect("sandbox create");
     let result = parse_json_line(&guard.create_output);
-    for adapter in ["connect", "forward"] {
+    for request in ["first", "second"] {
         assert_eq!(
-            result[adapter]["api_key"], "[REDACTED]",
-            "{adapter} did not deliver the middleware-transformed body: {result}"
+            result[request]["api_key"], "[REDACTED]",
+            "{request} did not deliver the middleware-transformed body: {result}"
         );
     }
 }
 
 #[tokio::test]
-async fn fail_closed_middleware_blocks_uninspectable_connect_payload_before_upstream() {
+async fn fail_closed_middleware_blocks_uninspectable_transparent_payload_before_upstream() {
     let server = EchoServer::start().await.expect("start TCP echo server");
     let policy = write_middleware_policy(TEST_SERVER_HOST, server.port, "", "fail_closed")
         .expect("write fail-closed middleware policy");
     let policy_path = policy_path(&policy);
     let script = format!(
         r#"
-import os
 import socket
-import urllib.parse
 
 HOST = {host:?}
 PORT = {port}
 PAYLOAD = bytes([0x00, 0xff, 0x13, 0x37]) + b"not-http-or-tls"
 
-proxy_url = next(
-    os.environ[name]
-    for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")
-    if os.environ.get(name)
-)
-parsed = urllib.parse.urlparse(proxy_url)
-with socket.create_connection((parsed.hostname, parsed.port or 80), timeout=10) as sock:
-    target = f"{{HOST}}:{{PORT}}"
-    sock.sendall(f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode())
-    response = b""
-    while b"\r\n\r\n" not in response:
-        response += sock.recv(4096)
-    if int(response.split(None, 2)[1]) != 200:
-        raise RuntimeError("CONNECT was denied before tunnel establishment")
+with socket.create_connection((HOST, PORT), timeout=10) as sock:
     sock.sendall(PAYLOAD)
     denial = b""
     while True:
@@ -1518,7 +1372,7 @@ print("UNINSPECTABLE_MIDDLEWARE_BLOCKED")
 }
 
 #[tokio::test]
-async fn fail_open_middleware_bypasses_uninspectable_tls_skip_connect() {
+async fn fail_open_middleware_bypasses_uninspectable_transparent_tls_skip() {
     let server = EchoServer::start().await.expect("start TCP echo server");
     let policy = write_middleware_policy(
         TEST_SERVER_HOST,
@@ -1530,28 +1384,13 @@ async fn fail_open_middleware_bypasses_uninspectable_tls_skip_connect() {
     let policy_path = policy_path(&policy);
     let script = format!(
         r#"
-import os
 import socket
-import urllib.parse
 
 HOST = {host:?}
 PORT = {port}
 PAYLOAD = bytes([0x00, 0xff, 0x13, 0x37, 0x80]) + b"middleware-bypass"
 
-proxy_url = next(
-    os.environ[name]
-    for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")
-    if os.environ.get(name)
-)
-parsed = urllib.parse.urlparse(proxy_url)
-with socket.create_connection((parsed.hostname, parsed.port or 80), timeout=10) as sock:
-    target = f"{{HOST}}:{{PORT}}"
-    sock.sendall(f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode())
-    response = b""
-    while b"\r\n\r\n" not in response:
-        response += sock.recv(4096)
-    if int(response.split(None, 2)[1]) != 200:
-        raise RuntimeError("CONNECT was denied")
+with socket.create_connection((HOST, PORT), timeout=10) as sock:
     sock.sendall(PAYLOAD)
     echoed = b""
     while len(echoed) < len(PAYLOAD):
@@ -1588,7 +1427,7 @@ print("UNINSPECTABLE_MIDDLEWARE_BYPASSED")
 }
 
 #[tokio::test]
-async fn forward_pipeline_never_reaches_upstream_as_first_request_overflow() {
+async fn transparent_pipeline_never_reaches_upstream_as_first_request_overflow() {
     let server = PipelineProbeServer::start()
         .await
         .expect("start pipeline probe server");
@@ -1603,26 +1442,18 @@ async fn forward_pipeline_never_reaches_upstream_as_first_request_overflow() {
     let policy_path = policy_path(&policy);
     let script = format!(
         r#"
-import os
 import socket
-import urllib.parse
 
-proxy_url = next(
-    os.environ[name]
-    for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")
-    if os.environ.get(name)
-)
-parsed = urllib.parse.urlparse(proxy_url)
 target = "{host}:{port}"
 first = (
-    f"GET http://{{target}}/allowed HTTP/1.1\r\n"
+    f"GET /allowed HTTP/1.1\r\n"
     f"Host: {{target}}\r\nConnection: keep-alive\r\n\r\n"
 )
 second = (
-    f"POST http://{{target}}/blocked HTTP/1.1\r\n"
+    f"POST /blocked HTTP/1.1\r\n"
     f"Host: {{target}}\r\nContent-Length: 0\r\n\r\n"
 )
-with socket.create_connection((parsed.hostname, parsed.port or 80), timeout=10) as sock:
+with socket.create_connection(({host:?}, {port}), timeout=10) as sock:
     sock.sendall((first + second).encode())
     response = b""
     while True:
@@ -1630,9 +1461,11 @@ with socket.create_connection((parsed.hostname, parsed.port or 80), timeout=10) 
         if not chunk:
             break
         response += chunk
-if response.count(b"HTTP/1.1 ") != 1 or b" 200 " not in response.split(b"\r\n", 1)[0]:
+responses = response.count(b"HTTP/1.1 ")
+first_status = response.split(b"\r\n", 1)[0]
+if responses != 2 or b" 200 " not in first_status or b"HTTP/1.1 403 Forbidden" not in response:
     raise RuntimeError(f"unexpected pipelined response: {{response!r}}")
-print("FORWARD_PIPELINE_CLOSED")
+print("TRANSPARENT_PIPELINE_DENIED")
 "#,
         host = TEST_SERVER_HOST,
         port = server.port,
@@ -1642,8 +1475,8 @@ print("FORWARD_PIPELINE_CLOSED")
         .await
         .expect("sandbox create");
     assert!(
-        guard.create_output.contains("FORWARD_PIPELINE_CLOSED"),
-        "forward proxy did not close after one response:\n{}",
+        guard.create_output.contains("TRANSPARENT_PIPELINE_DENIED"),
+        "transparent HTTP stream did not deny the disallowed pipelined request:\n{}",
         guard.create_output
     );
 
@@ -1657,7 +1490,7 @@ print("FORWARD_PIPELINE_CLOSED")
 }
 
 #[tokio::test]
-async fn http_credentials_are_rewritten_in_headers_and_bodies_for_both_adapters() {
+async fn http_credentials_are_rewritten_in_transparent_headers_and_bodies() {
     let _provider_lock = PROVIDER_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1682,20 +1515,10 @@ async fn http_credentials_are_rewritten_in_headers_and_bodies_for_both_adapters(
 import json
 import os
 import socket
-import urllib.parse
 
 HOST = {host:?}
 PORT = {port}
 TOKEN = os.environ[{token_env:?}]
-
-def proxy_parts():
-    proxy_url = next(
-        os.environ[name]
-        for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")
-        if os.environ.get(name)
-    )
-    parsed = urllib.parse.urlparse(proxy_url)
-    return parsed.hostname, parsed.port or 80
 
 def read_response(sock):
     data = b""
@@ -1730,23 +1553,12 @@ def request_bytes(target):
         "Connection: close\r\n\r\n"
     ).encode() + body
 
-proxy_host, proxy_port = proxy_parts()
-target = f"{{HOST}}:{{PORT}}"
-with socket.create_connection((proxy_host, proxy_port), timeout=10) as forward_sock:
-    forward_sock.sendall(request_bytes(f"http://{{target}}/probe"))
-    forward = read_response(forward_sock)
+def request_once():
+    with socket.create_connection((HOST, PORT), timeout=10) as sock:
+        sock.sendall(request_bytes("/probe"))
+        return read_response(sock)
 
-with socket.create_connection((proxy_host, proxy_port), timeout=10) as connect_sock:
-    connect_sock.sendall(f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode())
-    connect_response = b""
-    while b"\r\n\r\n" not in connect_response:
-        connect_response += connect_sock.recv(4096)
-    if int(connect_response.split(None, 2)[1]) != 200:
-        raise RuntimeError("CONNECT was denied")
-    connect_sock.sendall(request_bytes("/probe"))
-    connect = read_response(connect_sock)
-
-print(json.dumps({{"connect": connect, "forward": forward}}, sort_keys=True))
+print(json.dumps({{"first": request_once(), "second": request_once()}}, sort_keys=True))
 "#,
             host = TEST_SERVER_HOST,
             port = server.port,
@@ -1772,18 +1584,18 @@ print(json.dumps({{"connect": connect, "forward": forward}}, sort_keys=True))
 
     let guard = result.expect("sandbox create");
     let result = parse_json_line(&guard.create_output);
-    for adapter in ["connect", "forward"] {
+    for request in ["first", "second"] {
         assert_eq!(
-            result[adapter]["header_resolved"], true,
-            "{adapter} header placeholder was not resolved: {result}"
+            result[request]["header_resolved"], true,
+            "{request} header placeholder was not resolved: {result}"
         );
         assert_eq!(
-            result[adapter]["body_resolved"], true,
-            "{adapter} body placeholder was not resolved: {result}"
+            result[request]["body_resolved"], true,
+            "{request} body placeholder was not resolved: {result}"
         );
         assert_eq!(
-            result[adapter]["saw_placeholder"], false,
-            "{adapter} leaked an unresolved placeholder upstream: {result}"
+            result[request]["saw_placeholder"], false,
+            "{request} leaked an unresolved placeholder upstream: {result}"
         );
     }
     assert!(
