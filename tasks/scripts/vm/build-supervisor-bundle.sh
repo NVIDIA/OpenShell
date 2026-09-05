@@ -60,6 +60,7 @@ esac
 
 SUPERVISOR_BIN="${ROOT}/target/${SANDBOX_RUST_TARGET}/release/openshell-sandbox"
 SUPERVISOR_OUTPUT="${OUTPUT_DIR}/openshell-sandbox.zst"
+GUEST_SUPERVISOR_BIN="${ROOT}/target/${SANDBOX_RUST_TARGET}/release/openshell-supervisor"
 HOST_SUPERVISOR_BIN="${ROOT}/target/release/openshell-supervisor"
 HOST_SUPERVISOR_OUTPUT="${OUTPUT_DIR}/openshell-supervisor.zst"
 SUPERVISOR_RUNTIME_OUTPUT="${OUTPUT_DIR}/openshell-runtime.tar.zst"
@@ -83,11 +84,11 @@ run_supervisor_build() {
     fi
 
     if command -v cargo-zigbuild >/dev/null 2>&1; then
-        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo zigbuild --release -p openshell-sandbox --target "${SANDBOX_RUST_TARGET}" \
+        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo zigbuild --release -p openshell-sandbox -p openshell-supervisor --target "${SANDBOX_RUST_TARGET}" \
             --manifest-path "${ROOT}/Cargo.toml"
     else
         echo "    cargo-zigbuild not found, falling back to cargo build..."
-        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p openshell-sandbox --target "${SANDBOX_RUST_TARGET}" \
+        ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p openshell-sandbox -p openshell-supervisor --target "${SANDBOX_RUST_TARGET}" \
             --manifest-path "${ROOT}/Cargo.toml"
     fi
     ${cargo_prefix[@]+"${cargo_prefix[@]}"} cargo build --release -p openshell-supervisor \
@@ -122,7 +123,7 @@ else
     fi
 fi
 
-if [ ! -f "${SUPERVISOR_BIN}" ] || [ ! -f "${HOST_SUPERVISOR_BIN}" ]; then
+if [ ! -f "${SUPERVISOR_BIN}" ] || [ ! -f "${GUEST_SUPERVISOR_BIN}" ] || [ ! -f "${HOST_SUPERVISOR_BIN}" ]; then
     echo "ERROR: sandbox or supervisor binary not found after build" >&2
     exit 1
 fi
@@ -142,9 +143,11 @@ esac
 
 echo "==> Building trusted supervisor helper runtime"
 STAGED_SUPERVISOR="${ROOT}/deploy/docker/.build/prebuilt-binaries/${DOCKER_ARCH}/openshell-sandbox"
+STAGED_CONTROL="${ROOT}/deploy/docker/.build/prebuilt-binaries/${DOCKER_ARCH}/openshell-supervisor"
 RUNTIME_IMAGE="openshell-vm-helper-runtime:${DOCKER_ARCH}-$$"
 mkdir -p "$(dirname "${STAGED_SUPERVISOR}")"
 cp "${SUPERVISOR_BIN}" "${STAGED_SUPERVISOR}"
+cp "${GUEST_SUPERVISOR_BIN}" "${STAGED_CONTROL}"
 
 case "$(uname -m)" in
     aarch64|arm64) HOST_DOCKER_ARCH="arm64" ;;

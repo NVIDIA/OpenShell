@@ -11,12 +11,10 @@ use crate::lifecycle::{
 };
 use crate::rootfs::{
     clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
-    extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root, recover_rootfs_image,
-    sandbox_guest_init_path, sandbox_guest_runtime_identity, set_rootfs_image_file_mode,
-    write_rootfs_image_file,
+    extract_host_supervisor, extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root,
+    recover_rootfs_image, sandbox_guest_init_path, sandbox_guest_runtime_identity,
+    set_rootfs_image_file_mode, validate_host_supervisor, write_rootfs_image_file,
 };
-#[cfg(target_os = "linux")]
-use crate::rootfs::{extract_host_supervisor, validate_host_supervisor};
 use crate::runtime::VmBackend;
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
@@ -161,7 +159,6 @@ const HOST_TOPOLOGY_PAYLOAD_FILE: &str = "topology.payload";
 /// a channel separate from the topology descriptor so descriptor verification
 /// is not self-referential.
 const DRIVER_ADMITTED_BACKEND: &str = "vm";
-#[cfg(target_os = "linux")]
 const HOST_SUPERVISOR_BINARY: &str = "host-runtime/openshell-supervisor";
 const VM_CONTROL_SOCKET: &str = "control.sock";
 const VM_CONTROL_PORT: u32 = 5500;
@@ -664,13 +661,6 @@ impl VmDriver {
         Ok(driver)
     }
 
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(
-            clippy::unused_async,
-            reason = "the shared call path awaits Linux extraction only"
-        )
-    )]
     async fn host_supervisor_binary(&self) -> Result<PathBuf, Status> {
         if let Some(configured) = std::env::var_os("OPENSHELL_VM_SUPERVISOR_BIN") {
             let configured = PathBuf::from(configured);
@@ -683,39 +673,23 @@ impl VmDriver {
             )));
         }
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            if let Some(parent) = self.launcher_bin.parent() {
-                let sibling = parent.join("openshell-supervisor");
-                if sibling.is_file() {
-                    return Ok(sibling);
-                }
-            }
-            Err(Status::failed_precondition(
-                "the native host supervisor is missing; install openshell-supervisor beside openshell-driver-vm or set OPENSHELL_VM_SUPERVISOR_BIN",
-            ))
+        let destination = self.config.state_dir.join(HOST_SUPERVISOR_BINARY);
+        if validate_host_supervisor(&destination).is_ok() {
+            return Ok(destination);
         }
-
-        #[cfg(target_os = "linux")]
-        {
-            let destination = self.config.state_dir.join(HOST_SUPERVISOR_BINARY);
-            if validate_host_supervisor(&destination).is_ok() {
-                return Ok(destination);
-            }
-            let _cache_guard = self.image_cache_lock.lock().await;
-            if validate_host_supervisor(&destination).is_ok() {
-                return Ok(destination);
-            }
-            let destination_for_extract = destination.clone();
-            tokio::task::spawn_blocking(move || extract_host_supervisor(&destination_for_extract))
-                .await
-                .map_err(|error| {
-                    Status::internal(format!("host supervisor extraction panicked: {error}"))
-                })?
-                .map_err(Status::failed_precondition)?;
-            validate_host_supervisor(&destination).map_err(Status::failed_precondition)?;
-            Ok(destination)
+        let _cache_guard = self.image_cache_lock.lock().await;
+        if validate_host_supervisor(&destination).is_ok() {
+            return Ok(destination);
         }
+        let destination_for_extract = destination.clone();
+        tokio::task::spawn_blocking(move || extract_host_supervisor(&destination_for_extract))
+            .await
+            .map_err(|error| {
+                Status::internal(format!("host supervisor extraction panicked: {error}"))
+            })?
+            .map_err(Status::failed_precondition)?;
+        validate_host_supervisor(&destination).map_err(Status::failed_precondition)?;
+        Ok(destination)
     }
 
     async fn spawn_host_supervisor(

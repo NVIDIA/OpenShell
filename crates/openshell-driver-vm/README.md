@@ -231,11 +231,12 @@ process exits, before it reports completion and while it retains the boundary
 for exec and forwarding. Driver startup reports that sandbox as terminal
 instead of relaunching the VM, even when the process exited successfully.
 
-When the packaged host supervisor is not installed beside the driver, the
-driver extracts its embedded copy into `<state-dir>/host-runtime`. It accepts a
-cached binary only when its SHA-256 content matches the embedded supervisor and
-it remains an executable regular file. Replacement is written and synced under
-a temporary name, then atomically renamed into place.
+The driver embeds a platform-native host supervisor and extracts it into
+`<state-dir>/host-runtime`. It accepts a cached binary only when its SHA-256
+content matches the embedded supervisor and it remains an executable regular
+file. Replacement is written and synced under a temporary name, then atomically
+renamed into place. `OPENSHELL_VM_SUPERVISOR_BIN` remains an explicit
+development override.
 
 ## Logs and debugging
 
@@ -294,12 +295,11 @@ The RPM gateway package is configured for the Podman driver.
 
 On Apple Silicon macOS, `install.sh` stages the generated `openshell.rb`
 formula from the selected release in the `nvidia/openshell` Homebrew tap.
-Homebrew installs `openshell`, `openshell-gateway`, `openshell-driver-vm`, and
-the native `openshell-supervisor` host binary beside the driver. It ad-hoc
-signs the driver with the Hypervisor entitlement in `post_install` and owns the
-`brew services` gateway lifecycle. The service also leaves `OPENSHELL_DRIVERS`
-unset so driver choice remains automatic unless the user explicitly overrides
-it.
+Homebrew installs `openshell`, `openshell-gateway`, and the self-contained
+`openshell-driver-vm` with its embedded native supervisor. It ad-hoc signs the
+driver with the Hypervisor entitlement in `post_install` and owns the `brew
+services` gateway lifecycle. The service also leaves `OPENSHELL_DRIVERS` unset
+so driver choice remains automatic unless the user explicitly overrides it.
 
 ## TODOs
 
