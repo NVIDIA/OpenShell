@@ -2,28 +2,40 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-- name: Create development gateway state directories
+- name: Publish development gateway paths
+  ansible.builtin.set_fact:
+    openshell_gateway_state_root: "{{ openshell_gateway_service_home }}/.local/share/openshell-test-guest"
+    openshell_gateway_config_home: "{{ openshell_gateway_service_home }}/.config"
+
+- name: Create development gateway directories
   ansible.builtin.file:
     path: "{{ item }}"
     state: directory
     mode: "0700"
+    owner: "{{ openshell_gateway_service_user }}"
+    group: "{{ openshell_gateway_service_user }}"
   loop:
     - "{{ openshell_gateway_state_root }}"
     - "{{ openshell_gateway_state_root }}/xdg/config"
     - "{{ openshell_gateway_state_root }}/xdg/cache"
     - "{{ openshell_gateway_state_root }}/xdg/data"
     - "{{ openshell_gateway_state_root }}/xdg/state"
-    - /home/openshell/.config/systemd/user
+    - "{{ openshell_gateway_config_home }}/systemd/user"
+  become: true
 
-- name: Generate development gateway certificates
+- name: Generate development gateway credentials
   ansible.builtin.command:
     cmd: "{{ openshell_gateway_bin }} generate-certs --output-dir {{ openshell_gateway_state_root }}/pki"
     creates: "{{ openshell_gateway_state_root }}/pki/jwt/signing.pem"
+  become: true
+  become_user: "{{ openshell_gateway_service_user }}"
 
-- name: Write rootless Podman gateway configuration
+- name: Write development Podman gateway configuration
   ansible.builtin.copy:
     dest: "{{ openshell_gateway_state_root }}/gateway.toml"
     mode: "0600"
+    owner: "{{ openshell_gateway_service_user }}"
+    group: "{{ openshell_gateway_service_user }}"
     content: |
       [openshell]
       version = 1
@@ -50,6 +62,7 @@
       image_pull_policy = "always"
       network_name = "openshell-test-guest"
       grpc_endpoint = "http://host.containers.internal:8080"
+  become: true
 
 - name: Check for the development supervisor image
   ansible.builtin.command:
@@ -57,6 +70,8 @@
   register: openshell_supervisor_image_exists
   changed_when: false
   failed_when: false
+  become: true
+  become_user: "{{ openshell_gateway_service_user }}"
 
 - name: Import the development supervisor image
   ansible.builtin.command:
@@ -64,11 +79,15 @@
       podman import --change 'ENTRYPOINT ["/openshell-sandbox"]'
       {{ openshell_supervisor_archive }} {{ openshell_supervisor_image }}
   when: openshell_supervisor_image_exists.rc != 0
+  become: true
+  become_user: "{{ openshell_gateway_service_user }}"
 
 - name: Install the development gateway user service
   ansible.builtin.copy:
-    dest: "/home/openshell/.config/systemd/user/{{ openshell_gateway_service }}"
+    dest: "{{ openshell_gateway_config_home }}/systemd/user/{{ openshell_gateway_service }}"
     mode: "0600"
+    owner: "{{ openshell_gateway_service_user }}"
+    group: "{{ openshell_gateway_service_user }}"
     content: |
       [Unit]
       Description=OpenShell development test guest gateway
@@ -84,3 +103,4 @@
 
       [Install]
       WantedBy=default.target
+  become: true
