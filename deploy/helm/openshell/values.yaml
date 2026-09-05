@@ -271,6 +271,19 @@ server:
   # the field, "RuntimeDefault" to force the runtime default profile, or
   # "Localhost/profile-name" for an operator-managed localhost profile.
   appArmorProfile: "Unconfined"
+  # -- Explicit UID for sandbox processes, the supervisor container
+  # securityContext, and the workspace PVC init container. Empty (default)
+  # = omit the field, letting the driver auto-detect from the OpenShift SCC
+  # annotation openshift.io/sa.scc.uid-range on the sandbox namespace and
+  # fall back to 1000 when that is absent. Set this on non-OpenShift
+  # clusters to pin a sandbox UID without the OpenShift-specific
+  # annotation. Any non-root UID is valid.
+  sandboxUid: ""
+  # -- Explicit GID paired with sandboxUid. Empty (default) = omit the
+  # field; the driver then reuses the resolved UID as the GID. Setting this
+  # without sandboxUid has no effect on UID resolution. Any non-root GID is
+  # valid.
+  sandboxGid: ""
   # Kubernetes compute driver settings.
   drivers:
     kubernetes:

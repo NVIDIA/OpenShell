@@ -284,6 +284,46 @@ tests:
           path: data["gateway.toml"]
           pattern: 'app_armor_profile\s*='
 
+  - it: omits the sandbox UID and GID by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_uid\s*='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_gid\s*='
+
+  # The driver parses both as TOML integers, so the trailing `$` anchors
+  # matter: a quoted scalar would be rejected at gateway startup rather
+  # than at render time.
+  - it: renders an explicit sandbox UID and GID under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxUid: 1500
+      server.sandboxGid: 1600
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?sandbox_uid\s*=\s*1500$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?sandbox_gid\s*=\s*1600$'
+
+  # resolve_sandbox_gid() falls back to the configured UID, so a bare
+  # sandboxUid must not drag an empty sandbox_gid into the config.
+  - it: renders the sandbox UID without a GID when only sandboxUid is set
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxUid: 1500
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\s*sandbox_uid\s*=\s*1500$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_gid\s*='
+
   - it: does not reuse gateway image pull secrets for sandbox pods
     template: templates/gateway-config.yaml
     set:
