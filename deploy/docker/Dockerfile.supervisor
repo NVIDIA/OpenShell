@@ -28,4 +28,6 @@ RUN apk add --no-cache iproute2 \
 COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /openshell-sandbox
 COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-supervisor /openshell-supervisor
 
-ENTRYPOINT ["/openshell-supervisor"]
+# Keep the image default usable by drivers that run the sandbox boundary in
+# this image. Split-topology drivers select /openshell-supervisor explicitly.
+ENTRYPOINT ["/openshell-sandbox"]
