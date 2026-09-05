@@ -56,7 +56,7 @@ use openshell_core::{
     settings::{self, SettingValueKind},
 };
 use openshell_ocsf::{
-    ConfigStateChangeBuilder, OCSF_TARGET, OcsfEvent, SandboxContext, SeverityId, StateId, StatusId,
+    ConfigStateChangeBuilder, OcsfEvent, SandboxContext, SeverityId, StateId, StatusId,
 };
 use openshell_policy::{
     PolicyMergeOp, ProviderPolicyLayer, canonicalize_advisor_add_rule, compose_effective_policy,
@@ -167,7 +167,7 @@ fn emit_gateway_policy_audit_log(
     version: i64,
     policy_hash: &str,
 ) {
-    let message = build_gateway_policy_audit_message(
+    let event = build_gateway_policy_audit_event(
         sandbox_id,
         sandbox_name,
         state_label,
@@ -176,11 +176,7 @@ fn emit_gateway_policy_audit_log(
         policy_hash,
         &[],
     );
-    info!(
-        target: OCSF_TARGET,
-        sandbox_id = %sandbox_id,
-        message = %message
-    );
+    openshell_ocsf::ocsf_emit!(event);
 }
 
 /// Emit a `CONFIG:APPROVED` audit event for an auto-approval — same event
@@ -205,7 +201,7 @@ fn emit_gateway_policy_auto_approve_audit_log(
         ("prover_delta", "empty".to_string()),
         ("resolved_from", resolved_from.to_string()),
     ];
-    let message = build_gateway_policy_audit_message(
+    let event = build_gateway_policy_audit_event(
         sandbox_id,
         sandbox_name,
         "approved",
@@ -214,14 +210,10 @@ fn emit_gateway_policy_auto_approve_audit_log(
         policy_hash,
         &extra,
     );
-    info!(
-        target: OCSF_TARGET,
-        sandbox_id = %sandbox_id,
-        message = %message
-    );
+    openshell_ocsf::ocsf_emit!(event);
 }
 
-fn build_gateway_policy_audit_message(
+fn build_gateway_policy_audit_event(
     sandbox_id: &str,
     sandbox_name: &str,
     state_label: &str,
@@ -229,7 +221,7 @@ fn build_gateway_policy_audit_message(
     version: i64,
     policy_hash: &str,
     extra_fields: &[(&str, String)],
-) -> String {
+) -> OcsfEvent {
     let ctx = SandboxContext {
         sandbox_id: sandbox_id.to_string(),
         sandbox_name: sandbox_name.to_string(),
@@ -253,8 +245,7 @@ fn build_gateway_policy_audit_message(
     for (key, value) in extra_fields {
         builder = builder.unmapped(key, value.clone());
     }
-    let event: OcsfEvent = builder.build();
-    event.format_shorthand()
+    builder.build()
 }
 
 fn summarize_cli_policy_merge_op(operation: &PolicyMergeOp) -> String {
@@ -16833,8 +16824,8 @@ mod tests {
     }
 
     #[test]
-    fn build_gateway_policy_audit_message_formats_ocsf_config_line() {
-        let message = build_gateway_policy_audit_message(
+    fn build_gateway_policy_audit_event_formats_ocsf_config_line() {
+        let message = build_gateway_policy_audit_event(
             "sb-123",
             "demo-sandbox",
             "merged",
@@ -16842,7 +16833,8 @@ mod tests {
             7,
             "sha256:testhash",
             &[],
-        );
+        )
+        .format_shorthand();
 
         assert_eq!(
             message,
@@ -16857,13 +16849,13 @@ mod tests {
     /// findings" — never "safe" — because the claim is about the prover's
     /// reasoning, not the world.
     #[test]
-    fn build_gateway_policy_audit_message_carries_auto_approve_provenance() {
+    fn build_gateway_policy_audit_event_carries_auto_approve_provenance() {
         let extra = [
             ("auto", "true".to_string()),
             ("source", "agent_authored".to_string()),
             ("prover_delta", "empty".to_string()),
         ];
-        let message = build_gateway_policy_audit_message(
+        let message = build_gateway_policy_audit_event(
             "sb-123",
             "demo-sandbox",
             "approved",
@@ -16871,7 +16863,8 @@ mod tests {
             12,
             "sha256:autohash",
             &extra,
-        );
+        )
+        .format_shorthand();
         assert!(
             message.contains("CONFIG:APPROVED"),
             "auto-approval reuses CONFIG:APPROVED; got: {message}"
