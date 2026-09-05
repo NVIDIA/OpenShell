@@ -7,8 +7,14 @@ import (
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 )
 
-// CreateOptions configures resource creation.
-type CreateOptions = types.CreateOptions
+// CreateOption configures a Create call.
+type CreateOption = types.CreateOption
+
+// WithLabels sets labels on the created resource.
+var WithLabels = types.WithLabels
+
+// WithAnnotations sets annotations on the created resource.
+var WithAnnotations = types.WithAnnotations
 
 // ListOptions configures resource listing with pagination and filtering.
 type ListOptions = types.ListOptions

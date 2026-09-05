@@ -20,7 +20,7 @@ type Config = types.Config
 type ClientInterface interface {
 	Sandboxes() SandboxInterface
 	SandboxTemplates() SandboxTemplateInterface
-	CreateSandboxFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
+	CreateSandboxFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, opts ...CreateOption) (*Sandbox, error)
 	Providers() ProviderInterface
 	Services() ServiceInterface
 	Exec() ExecInterface
@@ -125,8 +125,8 @@ func (c *Client) SandboxTemplates() SandboxTemplateInterface { return c.template
 
 // CreateSandboxFromTemplate creates a sandbox from a named workload template
 // without changing the legacy Sandboxes() interface.
-func (c *Client) CreateSandboxFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error) {
-	return c.templateCreate.CreateFromTemplate(ctx, workspace, name, templateName, spec, labels, opts...)
+func (c *Client) CreateSandboxFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, opts ...CreateOption) (*Sandbox, error) {
+	return c.templateCreate.CreateFromTemplate(ctx, workspace, name, templateName, spec, opts...)
 }
 
 // Providers returns the provider sub-client.

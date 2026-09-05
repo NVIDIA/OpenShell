@@ -120,8 +120,8 @@ func (fc *Client) SandboxTemplates() v1.SandboxTemplateInterface { return fc.tem
 
 // CreateSandboxFromTemplate creates a sandbox from a named workload template
 // without changing the legacy Sandboxes() interface.
-func (fc *Client) CreateSandboxFromTemplate(ctx context.Context, workspace, name, templateName string, spec *types.SandboxSpec, labels map[string]string, opts ...types.CreateOptions) (*types.Sandbox, error) {
-	return fc.templateCreate.CreateFromTemplate(ctx, workspace, name, templateName, spec, labels, opts...)
+func (fc *Client) CreateSandboxFromTemplate(ctx context.Context, workspace, name, templateName string, spec *types.SandboxSpec, opts ...types.CreateOption) (*types.Sandbox, error) {
+	return fc.templateCreate.CreateFromTemplate(ctx, workspace, name, templateName, spec, opts...)
 }
 
 // Providers returns the provider sub-client.
