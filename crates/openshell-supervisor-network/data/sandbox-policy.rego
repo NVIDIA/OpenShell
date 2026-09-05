@@ -900,8 +900,8 @@ _matching_endpoint_configs := [cfg |
 # Full matched endpoint records are kept separate from the legacy
 # endpoint-config list, which intentionally contains only connection/L7
 # metadata. The policy name and array index identify the endpoint within this
-# policy generation while the complete endpoint preserves explicit protocol
-# markers needed by later policy-DNS correlation.
+# policy generation while the complete endpoint preserves protocol markers
+# needed by later policy-DNS correlation.
 
 _policy_endpoint_records(policy_name, policy) := [record |
 	some endpoint_index, ep in policy.endpoints
@@ -922,12 +922,15 @@ _matching_endpoint_records := [record |
 
 # Endpoints eligible for policy DNS are a policy-data snapshot, not an
 # authorization decision. In particular, they do not depend on input.exec or
-# grant access to any process. Only endpoints that explicitly opt into raw TCP
-# and provide a resolvable host plus concrete ports are materialized.
+# grant access to any process. Every supported endpoint protocol is carried by
+# TCP, and an omitted protocol is the default L4 TCP form. Endpoints with a
+# resolvable host plus concrete ports are therefore materialized regardless of
+# whether later stream handling is L4, HTTP, WebSocket, or another L7 adapter.
 policy_dns_eligible_endpoint_records := [record |
 	some policy_name, policy in data.network_policies
 	some endpoint_index, ep in policy.endpoints
-	lower(object.get(ep, "protocol", "")) == "tcp"
+	protocol := lower(object.get(ep, "protocol", "tcp"))
+	protocol in {"tcp", "rest", "websocket", "graphql", "sql", "json-rpc", "mcp"}
 	object.get(ep, "host", "") != ""
 	ports := object.get(ep, "ports", [])
 	count(ports) > 0

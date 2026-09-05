@@ -10,6 +10,9 @@
 #![allow(unsafe_code)]
 
 use std::io;
+use std::mem::size_of;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::FileExt as _;
 
 /// Maximum number of task-memory bytes copied by one operation.
 pub const MAX_TASK_MEMORY_COPY: usize = 64 * 1024;
@@ -50,8 +53,14 @@ pub fn read_exact(tid: u32, address: u64, destination: &mut [u8]) -> io::Result<
             1,
             0,
         )
-    })?;
-    require_exact(copied, destination.len(), "task-memory read")
+    });
+    match copied {
+        Ok(copied) => require_exact(copied, destination.len(), "task-memory read"),
+        Err(error) if syscall_profile_denied(&error) => {
+            read_exact_from_proc_mem(tid, address, destination)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Write exactly all of `source` to `address` in `tid`.
@@ -90,10 +99,178 @@ pub fn write_exact(tid: u32, address: u64, source: &[u8]) -> io::Result<()> {
             1,
             0,
         )
-    })?;
-    require_exact(copied, source.len(), "task-memory write")
+    });
+    match copied {
+        Ok(copied) => require_exact(copied, source.len(), "task-memory write"),
+        Err(error) if syscall_profile_denied(&error) => {
+            write_exact_to_proc_mem(tid, address, source)
+        }
+        Err(error) => Err(error),
+    }
 }
 
+fn syscall_profile_denied(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EPERM | libc::EACCES | libc::ENOSYS)
+    )
+}
+
+fn read_exact_from_proc_mem(tid: u32, address: u64, destination: &mut [u8]) -> io::Result<()> {
+    let file = std::fs::File::open(format!("/proc/{tid}/mem"))?;
+    let copied = file.read_at(destination, address)?;
+    require_exact(copied, destination.len(), "proc task-memory read")
+}
+
+fn write_exact_to_proc_mem(tid: u32, address: u64, source: &[u8]) -> io::Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(format!("/proc/{tid}/mem"))?;
+    let copied = file.write_at(source, address)?;
+    require_exact(copied, source.len(), "proc task-memory write")
+}
+
+/// Prove same-UID parent-to-child read and write access under the active Yama,
+/// LSM, and outer seccomp posture.
+///
+/// Call this only from a single-threaded probe process. The child executes
+/// raw, allocation-free syscalls between `fork` and `_exit`.
+pub fn probe_child_access() -> io::Result<()> {
+    const INITIAL: u64 = 0x1122_3344_5566_7788;
+    const REPLACEMENT: u64 = 0xaabb_ccdd_eeff_0011;
+    // SAFETY: mmap creates one private anonymous page owned by this process.
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size_of::<u64>(),
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if mapping == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    let mapping_address = mapping as u64;
+    // SAFETY: mapping spans at least one aligned u64-sized region.
+    unsafe { mapping.cast::<u64>().write(INITIAL) };
+
+    // SAFETY: eventfd returns independently owned descriptors on success.
+    let ready = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+    if ready < 0 {
+        // SAFETY: mapping is the live region returned above.
+        unsafe { libc::munmap(mapping, size_of::<u64>()) };
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful eventfd returned one owned descriptor.
+    let ready = unsafe { OwnedFd::from_raw_fd(ready) };
+    // SAFETY: eventfd returns independently owned descriptors on success.
+    let proceed = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+    if proceed < 0 {
+        // SAFETY: mapping is the live region returned above.
+        unsafe { libc::munmap(mapping, size_of::<u64>()) };
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful eventfd returned one owned descriptor.
+    let proceed = unsafe { OwnedFd::from_raw_fd(proceed) };
+
+    // SAFETY: the caller promises this probe process is single-threaded. The
+    // child performs only raw syscalls and memory operations before `_exit`.
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        // SAFETY: mapping is the live region returned above.
+        unsafe { libc::munmap(mapping, size_of::<u64>()) };
+        return Err(io::Error::last_os_error());
+    }
+    if child == 0 {
+        // The sandbox remains nondumpable, but an exec'd workload must be
+        // observable by its same-UID ancestor. This child contains no trusted
+        // parent address space secrets beyond this synthetic probe value.
+        // SAFETY: these calls use live inherited eventfds and scalar prctl
+        // arguments. No Rust cleanup runs in the child.
+        unsafe {
+            if libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) < 0
+                || write_eventfd(ready.as_raw_fd()).is_err()
+                || read_eventfd(proceed.as_raw_fd()).is_err()
+                || mapping.cast::<u64>().read() != REPLACEMENT
+            {
+                libc::_exit(1);
+            }
+            libc::_exit(0);
+        }
+    }
+
+    let outcome = (|| {
+        read_eventfd(ready.as_raw_fd())?;
+        let mut observed = [0_u8; size_of::<u64>()];
+        read_exact(
+            u32::try_from(child).map_err(|_| io::Error::other("child PID does not fit u32"))?,
+            mapping_address,
+            &mut observed,
+        )?;
+        if u64::from_ne_bytes(observed) != INITIAL {
+            return Err(io::Error::other(
+                "cross-child memory read returned wrong data",
+            ));
+        }
+        write_exact(
+            u32::try_from(child).map_err(|_| io::Error::other("child PID does not fit u32"))?,
+            mapping_address,
+            &REPLACEMENT.to_ne_bytes(),
+        )?;
+        write_eventfd(proceed.as_raw_fd())?;
+        let mut status = 0;
+        // SAFETY: child is a live direct child and status points to storage.
+        if unsafe { libc::waitpid(child, std::ptr::addr_of_mut!(status), 0) } != child {
+            return Err(io::Error::last_os_error());
+        }
+        if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+            return Err(io::Error::other("cross-child memory probe failed in child"));
+        }
+        Ok(())
+    })();
+
+    if outcome.is_err() {
+        // SAFETY: a failed parent-side operation may leave this direct child
+        // blocked on eventfd. SIGKILL and waitpid guarantee cleanup.
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            libc::waitpid(child, std::ptr::null_mut(), 0);
+        }
+    }
+    // SAFETY: mapping is the live region returned above and no child remains.
+    unsafe { libc::munmap(mapping, size_of::<u64>()) };
+    outcome
+}
+
+fn read_eventfd(fd: libc::c_int) -> io::Result<()> {
+    let mut value = 0_u64;
+    // SAFETY: eventfd reads exactly one u64 into live storage.
+    let result = unsafe { libc::read(fd, std::ptr::addr_of_mut!(value).cast(), size_of::<u64>()) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    require_exact(
+        usize::try_from(result).map_err(|_| io::Error::other("eventfd read length invalid"))?,
+        size_of::<u64>(),
+        "eventfd read",
+    )
+}
+
+fn write_eventfd(fd: libc::c_int) -> io::Result<()> {
+    let value = 1_u64;
+    // SAFETY: eventfd reads exactly one u64 from live storage.
+    let result = unsafe { libc::write(fd, std::ptr::addr_of!(value).cast(), size_of::<u64>()) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    require_exact(
+        usize::try_from(result).map_err(|_| io::Error::other("eventfd write length invalid"))?,
+        size_of::<u64>(),
+        "eventfd write",
+    )
+}
 fn validate_request(tid: u32, address: u64, length: usize) -> io::Result<()> {
     if tid == 0 {
         return Err(io::Error::new(
@@ -178,6 +355,28 @@ mod tests {
     }
 
     #[test]
+    fn proc_mem_fallback_reads_and_writes_exact_memory() {
+        let source = 0x0102_0304_0506_0708_u64;
+        let mut destination = 0_u64;
+        let mut bytes = [0_u8; size_of::<u64>()];
+        read_exact_from_proc_mem(
+            std::process::id(),
+            std::ptr::addr_of!(source) as u64,
+            &mut bytes,
+        )
+        .expect("read through proc mem");
+        assert_eq!(u64::from_ne_bytes(bytes), source);
+
+        write_exact_to_proc_mem(
+            std::process::id(),
+            std::ptr::addr_of_mut!(destination) as u64,
+            &source.to_ne_bytes(),
+        )
+        .expect("write through proc mem");
+        assert_eq!(destination, source);
+    }
+
+    #[test]
     fn rejects_invalid_ranges_before_syscall() {
         let mut byte = [0_u8; 1];
         assert_eq!(
@@ -209,6 +408,4 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
     }
-
-    use std::mem::size_of;
 }

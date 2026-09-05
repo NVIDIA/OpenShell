@@ -179,20 +179,20 @@ jobs:
           tasks/scripts/verify-telemetry-compiled-out.sh present target/debug/openshell-gateway
           cargo build -p openshell-gateway --bin openshell-gateway --no-default-features --features defaults-without-telemetry
           tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway
-          cargo build -p openshell-sandbox --bin openshell-sandbox --no-default-features --features defaults-without-telemetry
-          tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-sandbox
+          cargo build -p openshell-supervisor --bin openshell-supervisor --no-default-features --features defaults-without-telemetry
+          tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-supervisor
 
       - name: Verify the defaults-without-telemetry feature alias tracks the default feature set
         run: tasks/scripts/verify-defaults-without-telemetry.sh
 
       - name: Verify system CA roots build mode compiles and excludes bundled Mozilla roots
         run: |
-          cargo check -p openshell-sandbox --all-targets --no-default-features --features system-ca-roots
-          if cargo tree -p openshell-sandbox -i webpki-roots --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-roots; then
+          cargo check -p openshell-supervisor --all-targets --no-default-features --features system-ca-roots
+          if cargo tree -p openshell-supervisor -i webpki-roots --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-roots; then
             echo "ERROR: webpki-roots found in system CA roots build" >&2
             exit 1
           fi
-          if cargo tree -p openshell-sandbox -i webpki-root-certs --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-root-certs; then
+          if cargo tree -p openshell-supervisor -i webpki-root-certs --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-root-certs; then
             echo "ERROR: webpki-root-certs found in system CA roots build" >&2
             exit 1
           fi

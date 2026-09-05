@@ -9,6 +9,51 @@ use std::fs;
 use std::io;
 use std::os::fd::RawFd;
 
+/// Snapshot socket inodes installed in process descriptor tables other than
+/// `excluded_pid`.
+///
+/// Inaccessible or concurrently disappearing entries are
+/// skipped. Callers use this only to reclaim bounded mediation metadata; a
+/// later operation on an unregistered descriptor fails closed.
+pub fn installed_socket_inodes_excluding(
+    excluded_pid: u32,
+) -> io::Result<std::collections::BTreeSet<u64>> {
+    let mut inodes = std::collections::BTreeSet::new();
+    for process in fs::read_dir("/proc")? {
+        let Ok(process) = process else { continue };
+        let Some(name) = process.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        if pid == excluded_pid {
+            continue;
+        }
+        let Ok(descriptors) = fs::read_dir(process.path().join("fd")) else {
+            continue;
+        };
+        for descriptor in descriptors.flatten() {
+            let Ok(target) = fs::read_link(descriptor.path()) else {
+                continue;
+            };
+            let Some(target) = target.to_str() else {
+                continue;
+            };
+            let Some(digits) = target
+                .strip_prefix("socket:[")
+                .and_then(|value| value.strip_suffix(']'))
+            else {
+                continue;
+            };
+            if let Ok(inode) = digits.parse::<u64>() {
+                inodes.insert(inode);
+            }
+        }
+    }
+    Ok(inodes)
+}
+
 /// Return the socket inode currently installed at `fd` in `tid`'s descriptor
 /// table.
 ///
@@ -84,6 +129,37 @@ mod tests {
                 .expect_err("regular descriptor")
                 .kind(),
             io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn installed_socket_snapshot_can_exclude_the_broker() {
+        let mut pair = [-1; 2];
+        // SAFETY: pair points to storage for exactly two returned descriptors.
+        let result = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                pair.as_mut_ptr(),
+            )
+        };
+        assert_eq!(result, 0, "socketpair: {}", io::Error::last_os_error());
+        // SAFETY: successful socketpair returned two independently owned FDs.
+        let left = unsafe { OwnedFd::from_raw_fd(pair[0]) };
+        // SAFETY: successful socketpair returned two independently owned FDs.
+        let _right = unsafe { OwnedFd::from_raw_fd(pair[1]) };
+        let inode = socket_inode(std::process::id(), left.as_raw_fd()).unwrap();
+
+        assert!(
+            installed_socket_inodes_excluding(u32::MAX)
+                .unwrap()
+                .contains(&inode)
+        );
+        assert!(
+            !installed_socket_inodes_excluding(std::process::id())
+                .unwrap()
+                .contains(&inode)
         );
     }
 }

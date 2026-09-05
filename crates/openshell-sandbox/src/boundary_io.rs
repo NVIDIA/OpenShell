@@ -1,27 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The in-pod [`BoundaryPortForward`] interface (RFC 0012 runtime contract).
-//!
-//! This is the live in-boundary port-forward for the in-pod placement. It lives
-//! in this crate on purpose: the SSH server and supervisor session that consume
-//! it are here, and so is the primitive it wraps
-//! ([`connect_in_netns`](crate::ssh::connect_in_netns)). The interface trait
-//! lives in the lower `openshell-isolation-interface` crate, so this crate
-//! depends on the trait (process -> interface -> core, acyclic) and the SSH server drives a
-//! `&dyn BoundaryPortForward` without depending on the backend.
-//!
-//! The SSH server and supervisor session are wired to this through the
-//! `RunningBoundary::port_forward()` accessor: swapping in a kernel-separated
-//! backend swaps this implementation (where `connect` tunnels into the guest)
-//! and touches no consumer code.
+//! Sandbox-local [`BoundaryPortForward`] implementation.
 
 use async_trait::async_trait;
 use openshell_isolation_interface::contract::{
     BackendError, BoundaryDuplexStream, BoundaryPortForward, LoopbackTarget,
 };
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -181,36 +167,28 @@ impl RegisteredProcessGroup {
     }
 }
 
-/// In-pod loopback port-forward: connects to a loopback target from inside the
-/// workload's network namespace via [`connect_in_netns`](crate::ssh::connect_in_netns).
-pub struct NetnsPortForward {
-    /// File descriptor of the boundary's network namespace, or `None` to
-    /// connect from the supervisor's own namespace.
-    netns_fd: Option<Arc<OwnedFd>>,
+/// Loopback port-forward owned by the sandbox process.
+pub struct LocalPortForward {
     runtime: Option<Arc<BoundaryRuntimeState>>,
 }
 
-impl NetnsPortForward {
+impl LocalPortForward {
     #[must_use]
-    pub fn new(netns_fd: Option<Arc<OwnedFd>>, runtime: Option<Arc<BoundaryRuntimeState>>) -> Self {
-        Self { netns_fd, runtime }
+    pub fn new(runtime: Option<Arc<BoundaryRuntimeState>>) -> Self {
+        Self { runtime }
     }
 }
 
 #[async_trait]
-impl BoundaryPortForward for NetnsPortForward {
+impl BoundaryPortForward for LocalPortForward {
     async fn connect(&self, target: LoopbackTarget) -> Result<BoundaryDuplexStream, BackendError> {
         if let Some(runtime) = &self.runtime {
             runtime.ensure_active()?;
         }
         let addr = std::net::SocketAddr::new(target.host(), target.port());
-        let addr_string = addr.to_string();
-        let stream = crate::ssh::connect_in_netns(
-            &addr_string,
-            self.netns_fd.as_deref().map(AsRawFd::as_raw_fd),
-        )
-        .await
-        .map_err(|e| BackendError::Process(format!("port-forward connect to {addr}: {e}")))?;
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[addr])
+            .await
+            .map_err(|e| BackendError::Process(format!("port-forward connect to {addr}: {e}")))?;
         if let Some(runtime) = &self.runtime {
             runtime.ensure_active()?;
         }
@@ -225,9 +203,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Stands in for the SSH server's port-forward path: connect through the
-    /// interface, write, read the echo. With `netns_fd: None` the connect happens in
-    /// the supervisor's namespace, so this exercises the real primitive without
-    /// requiring a network namespace.
+    /// interface, write, and read the echo.
     #[tokio::test]
     async fn port_forward_connects_and_round_trips() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -239,7 +215,7 @@ mod tests {
             sock.write_all(&buf).await.unwrap();
         });
 
-        let pf = NetnsPortForward::new(None, None);
+        let pf = LocalPortForward::new(None);
         let target =
             LoopbackTarget::new(Ipv4Addr::LOCALHOST.into(), addr.port()).expect("loopback target");
         let mut conn = pf.connect(target).await.expect("connect through interface");
@@ -261,7 +237,7 @@ mod tests {
         tokio::spawn(async move {
             let _ = listener.accept().await;
         });
-        let pf = NetnsPortForward::new(None, None);
+        let pf = LocalPortForward::new(None);
         let target = LoopbackTarget::new(Ipv4Addr::LOCALHOST.into(), addr.port()).unwrap();
         assert!(forward_one(&pf, target).await);
     }
@@ -269,7 +245,7 @@ mod tests {
     #[tokio::test]
     async fn port_forward_rejects_after_boundary_end() {
         let runtime = BoundaryRuntimeState::new();
-        let pf = NetnsPortForward::new(None, Some(runtime.clone()));
+        let pf = LocalPortForward::new(Some(runtime.clone()));
         runtime.deactivate();
         let target = LoopbackTarget::new(Ipv4Addr::LOCALHOST.into(), 1).unwrap();
         assert!(matches!(
@@ -280,14 +256,11 @@ mod tests {
 
     #[tokio::test]
     async fn failed_port_forward_keeps_boundary_active() {
-        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
         let runtime = BoundaryRuntimeState::new();
-        let pf = NetnsPortForward::new(None, Some(runtime.clone()));
-        let target = LoopbackTarget::new(Ipv4Addr::LOCALHOST.into(), port).unwrap();
+        let pf = LocalPortForward::new(Some(runtime.clone()));
+        // Port zero is never a connectable TCP destination. Reserving an ephemeral
+        // port and dropping its listener races other parallel tests that may bind it.
+        let target = LoopbackTarget::new(Ipv4Addr::LOCALHOST.into(), 0).unwrap();
         assert!(matches!(
             pf.connect(target).await,
             Err(BackendError::Process(_))
@@ -313,5 +286,26 @@ mod tests {
 
         runtime.unregister_process_group(pid, &second_terminal);
         assert_eq!(runtime.registered_process_group_count(), 0);
+    }
+
+    #[test]
+    fn canonical_process_completion_does_not_end_boundary_runtime() {
+        let runtime = BoundaryRuntimeState::new_exclusive_pid_namespace();
+        let terminal = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        runtime
+            .register_process_group(42, terminal.clone(), Arc::new(Mutex::new(())))
+            .expect("register canonical process");
+
+        runtime.unregister_process_group(42, &terminal);
+
+        runtime
+            .ensure_active()
+            .expect("canonical completion must preserve exec and forwarding");
+        assert_eq!(runtime.registered_process_group_count(), 0);
+        runtime.deactivate();
+        assert!(matches!(
+            runtime.ensure_active(),
+            Err(BackendError::Terminated(_))
+        ));
     }
 }

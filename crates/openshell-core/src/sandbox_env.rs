@@ -134,6 +134,13 @@ pub const TELEMETRY_ENABLED: &str = "OPENSHELL_TELEMETRY_ENABLED";
 /// `"sidecar"`; the default combined supervisor path omits it.
 pub const SUPERVISOR_TOPOLOGY: &str = "OPENSHELL_SUPERVISOR_TOPOLOGY";
 
+/// The isolation backend admitted by the deployment configuration (RFC 0012).
+///
+/// Delivered on a channel separate from the topology descriptor so descriptor
+/// verification against the admitted backend is not self-referential. Required
+/// whenever a topology descriptor is supplied.
+pub const ADMITTED_ISOLATION_BACKEND: &str = "OPENSHELL_ADMITTED_ISOLATION_BACKEND";
+
 /// Network enforcement backend selected by the compute driver.
 pub const NETWORK_ENFORCEMENT_MODE: &str = "OPENSHELL_NETWORK_ENFORCEMENT_MODE";
 
@@ -165,6 +172,17 @@ pub const GATEWAY_TLS_SERVER_NAME: &str = "OPENSHELL_GATEWAY_TLS_SERVER_NAME";
 /// Directory where the network supervisor writes the proxy CA files consumed
 /// by workload child processes.
 pub const PROXY_TLS_DIR: &str = "OPENSHELL_PROXY_TLS_DIR";
+
+/// Optional path to a durable PEM-encoded interception CA certificate.
+/// Must be configured together with [`PROXY_CA_KEY`].
+pub const PROXY_CA_CERT: &str = "OPENSHELL_PROXY_CA_CERT";
+
+/// Optional path to the private key for [`PROXY_CA_CERT`].
+/// Must be configured together with the certificate path.
+pub const PROXY_CA_KEY: &str = "OPENSHELL_PROXY_CA_KEY";
+
+/// Whether the control-owned SSH Unix socket is shared across trusted UIDs.
+pub const SSH_SOCKET_SHARED: &str = "OPENSHELL_SSH_SOCKET_SHARED";
 
 /// Path to the CA certificate for mTLS communication with the gateway.
 pub const TLS_CA: &str = "OPENSHELL_TLS_CA";

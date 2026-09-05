@@ -109,10 +109,10 @@ components_for_target() {
       echo "gateway"
       ;;
     sandbox|supervisor|supervisor-output)
-      echo "supervisor"
+      echo "sandbox supervisor"
       ;;
     all)
-      echo "gateway supervisor"
+      echo "gateway sandbox supervisor"
       ;;
     *)
       usage
@@ -128,9 +128,14 @@ resolve_component() {
       binary=openshell-gateway
       target_libc=gnu
       ;;
-    supervisor)
+    sandbox)
       crate=openshell-sandbox
       binary=openshell-sandbox
+      target_libc=$(supervisor_libc)
+      ;;
+    supervisor)
+      crate=openshell-supervisor
+      binary=openshell-supervisor
       target_libc=$(supervisor_libc)
       ;;
     *)
@@ -260,7 +265,7 @@ build_component_for_arch() {
   binary_path="${ROOT}/target/${target}/release/${binary}"
   if [[ "$component" == "gateway" ]]; then
     "$SCRIPT_DIR/verify-glibc-symbols.sh" 2.28 "$binary_path"
-  elif [[ "$component" == "supervisor" ]]; then
+  else
     "$SCRIPT_DIR/verify-static-binary.sh" "$binary_path"
   fi
 

@@ -8,7 +8,10 @@ use landlock::{
     Ruleset, RulesetAttr, RulesetCreatedAttr,
 };
 use miette::{IntoDiagnostic, Result};
-use openshell_core::policy::{LandlockCompatibility, SandboxPolicy};
+use openshell_core::policy::{
+    FilesystemPolicy, LandlockCompatibility, LandlockPolicy, NetworkPolicy, ProcessPolicy,
+    SandboxPolicy,
+};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use tracing::debug;
@@ -115,8 +118,8 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
 
 /// Phase 1 for already-unprivileged workloads.
 ///
-/// Kubernetes sidecar mode starts the process supervisor as the sandbox UID, so
-/// Landlock path FDs are opened as the same UID that will run the workload.
+/// The sandbox boundary starts as the workload UID, so Landlock path FDs are
+/// opened as the same UID that will run the workload.
 /// Paths this UID cannot open are already unavailable to the workload; omit
 /// them from the allowlist and let the resulting ruleset deny everything else.
 pub fn prepare_current_user(
@@ -124,6 +127,52 @@ pub fn prepare_current_user(
     workdir: Option<&str>,
 ) -> Result<Option<PreparedRuleset>> {
     prepare_with_path_open_mode(policy, workdir, PathOpenMode::CurrentUser)
+}
+
+/// Build the mandatory same-UID self-protection baseline.
+///
+/// Landlock is allow-list only. Granting `/` would also grant the protected
+/// `/.openshell` subtree, so enumerate the root's children and omit that one
+/// hierarchy. Entries the final UID cannot open are already inaccessible and
+/// are safely omitted by [`PathOpenMode::CurrentUser`].
+pub fn prepare_capability_free_baseline() -> Result<PreparedRuleset> {
+    let read_write = capability_free_baseline_paths(Path::new("/"))?;
+    if read_write.is_empty() {
+        return Err(miette::miette!(
+            "capability-free Landlock baseline found no usable root entries"
+        ));
+    }
+
+    let policy = SandboxPolicy {
+        version: 0,
+        filesystem: FilesystemPolicy {
+            read_only: Vec::new(),
+            read_write,
+            include_workdir: false,
+        },
+        network: NetworkPolicy::default(),
+        landlock: LandlockPolicy {
+            compatibility: LandlockCompatibility::HardRequirement,
+        },
+        process: ProcessPolicy::default(),
+    };
+    prepare_with_path_open_mode(&policy, None, PathOpenMode::CurrentUser)?.ok_or_else(|| {
+        miette::miette!("capability-free Landlock baseline unexpectedly produced no ruleset")
+    })
+}
+
+fn capability_free_baseline_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    const PRIVATE_ROOT: &str = ".openshell";
+
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(root).into_diagnostic()? {
+        let entry = entry.into_diagnostic()?;
+        if entry.file_name() != PRIVATE_ROOT {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    Ok(paths)
 }
 
 fn prepare_with_path_open_mode(
@@ -488,7 +537,7 @@ fn compat_level(level: &LandlockCompatibility) -> CompatLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::policy::{FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy};
+    use openshell_core::policy::{FilesystemPolicy, LandlockPolicy};
 
     fn hard_requirement_policy(read_only: Vec<PathBuf>, read_write: Vec<PathBuf>) -> SandboxPolicy {
         SandboxPolicy {
@@ -521,6 +570,22 @@ mod tests {
         if let Err(err) = result {
             panic!("hard_requirement should accept mixed directory and device paths: {err}");
         }
+    }
+
+    #[test]
+    fn capability_free_baseline_omits_only_private_root() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["bin", "etc", "sandbox", ".openshell"] {
+            std::fs::create_dir(root.path().join(name)).unwrap();
+        }
+
+        let paths = capability_free_baseline_paths(root.path()).unwrap();
+        assert_eq!(
+            paths,
+            ["bin", "etc", "sandbox"]
+                .map(|name| root.path().join(name))
+                .to_vec()
+        );
     }
     fn tailored_access(path: &Path, requested_access: BitFlags<AccessFs>) -> BitFlags<AccessFs> {
         let path_fd = PathFd::new(path).unwrap();
