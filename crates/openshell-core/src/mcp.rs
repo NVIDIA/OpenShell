@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenShell-owned MCP protocol revisions and immutable batch-shape metadata.
+//! `OpenShell`-owned MCP protocol revisions and immutable batch-shape metadata.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -13,6 +13,15 @@ use crate::proto::{McpOptions, ProviderProfile};
 ///
 /// The bound is distinct from the separately enforced request-body byte limit.
 pub const MAX_MCP_LEGACY_BATCH_MESSAGES: usize = 64;
+
+/// Return whether a policy protocol name denotes MCP.
+///
+/// Protocol names are case-insensitive throughout policy validation and
+/// execution, so every MCP-specific projection must use the same predicate.
+#[must_use]
+pub fn is_mcp_protocol(protocol: &str) -> bool {
+    protocol.trim().eq_ignore_ascii_case("mcp")
+}
 
 /// Stable MCP protocol revisions accepted by `OpenShell` policy configuration.
 ///
@@ -46,7 +55,7 @@ pub const DEFAULT_MCP_PROTOCOL_VERSION: McpProtocolVersion = McpProtocolVersion:
 /// original evidence. MCP-shaped data on non-MCP endpoints is also untouched.
 pub fn normalize_provider_profile_mcp_fields(profile: &mut ProviderProfile) {
     for endpoint in &mut profile.endpoints {
-        if !endpoint.protocol.eq_ignore_ascii_case("mcp") {
+        if !is_mcp_protocol(&endpoint.protocol) {
             continue;
         }
 
