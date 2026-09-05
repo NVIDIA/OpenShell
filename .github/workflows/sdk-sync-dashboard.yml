@@ -1,0 +1,149 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: SDK Proto Sync
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+env:
+  MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+permissions:
+  actions: read
+  contents: read
+  packages: read
+  issues: write
+
+concurrency:
+  group: sdk-proto-sync
+  cancel-in-progress: true
+
+jobs:
+  load_config:
+    name: Load SDK configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.config.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: config
+        run: echo "matrix=$(jq -c '.include' tasks/sdk-sync-config.json)" >> "$GITHUB_OUTPUT"
+
+  sdk_sync_check:
+    name: Sync Check (${{ matrix.sdk.name }})
+    needs: load_config
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: ${{ fromJSON(needs.load_config.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install tools
+        run: mise install --locked
+      - name: Check proto drift and build
+        env:
+          SDK_NAME: ${{ matrix.sdk.name }}
+          DRIFT_TASK: ${{ matrix.sdk.drift_task }}
+          BUILD_CHECK_TASK: ${{ matrix.sdk.build_check_task }}
+        run: |
+          mkdir -p report
+          mise run "$DRIFT_TASK" > report/drift.json 2> report/drift.stderr || true
+          if ! jq -e 'has("synced") and (.synced | type == "boolean")' report/drift.json >/dev/null 2>&1; then
+            jq -n --arg sdk "$SDK_NAME" '{sdk:$sdk, has_drift:"error", build_failed:"false"}' > report/status.json
+            exit 0
+          fi
+          SYNCED=$(jq -r '.synced' report/drift.json)
+          if [ "$SYNCED" = "true" ]; then
+            jq -n --arg sdk "$SDK_NAME" '{sdk:$sdk, has_drift:"false", build_failed:"false"}' > report/status.json
+            exit 0
+          fi
+          if mise run "$BUILD_CHECK_TASK" > report/build.json 2> report/build.stderr; then
+            BUILD_FAILED=false
+          else
+            BUILD_FAILED=true
+          fi
+          jq -n --arg sdk "$SDK_NAME" --arg build_failed "$BUILD_FAILED" \
+            '{sdk:$sdk, has_drift:"true", build_failed:$build_failed}' > report/status.json
+      - name: Upload SDK report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sdk-sync-${{ matrix.sdk.name }}
+          path: report/
+          if-no-files-found: error
+          retention-days: 1
+
+  issue_management:
+    name: Manage Drift Issue (${{ matrix.sdk.name }})
+    needs: [load_config, sdk_sync_check]
+    if: always() && needs.load_config.result == 'success' && needs.sdk_sync_check.result == 'success'
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 5
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: ${{ fromJSON(needs.load_config.outputs.matrix) }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sdk-sync-${{ matrix.sdk.name }}
+          path: report
+      - name: Read SDK status
+        id: status
+        run: |
+          echo "has_drift=$(jq -r '.has_drift' report/status.json)" >> "$GITHUB_OUTPUT"
+          echo "build_failed=$(jq -r '.build_failed' report/status.json)" >> "$GITHUB_OUTPUT"
+      - name: Warn on drift detection error
+        if: steps.status.outputs.has_drift == 'error'
+        run: |
+          echo "::error::Drift detection failed for ${{ matrix.sdk.name }} SDK"
+          cat report/drift.stderr
+          exit 1
+      - if: steps.status.outputs.has_drift == 'true' && steps.status.outputs.build_failed == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install tools
+        if: steps.status.outputs.has_drift == 'true' && steps.status.outputs.build_failed == 'true'
+        run: mise install --locked
+      - name: Create or update drift issue
+        if: steps.status.outputs.has_drift == 'true' && steps.status.outputs.build_failed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RESULT=$(uv run python tasks/scripts/sdk_sync.py manage-issue \
+            --drift-report "$(cat report/drift.json)" \
+            --build-report "$(cat report/build.json)" \
+            --sdk "${{ matrix.sdk.name }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --label "${{ matrix.sdk.label }}")
+          echo "$RESULT" | jq .
+          ACTION=$(echo "$RESULT" | jq -r '.action // "unknown"')
+          if [ "$ACTION" = "error" ] || [ "$ACTION" = "unknown" ]; then
+            echo "::error::Issue management for ${{ matrix.sdk.name }} failed: $ACTION"
+            exit 1
+          fi
+      - name: Close resolved drift issue
+        if: steps.status.outputs.has_drift == 'false' || (steps.status.outputs.has_drift == 'true' && steps.status.outputs.build_failed == 'false')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE=$(gh issue list --repo "$GITHUB_REPOSITORY" --label "${{ matrix.sdk.label }}" --state open --json number --jq '.[0].number')
+          if [ -n "$ISSUE" ]; then
+            gh issue close "$ISSUE" --repo "$GITHUB_REPOSITORY" --comment "SDK builds and tests pass after proto regeneration. Closing automatically."
+            echo "Closed issue #$ISSUE"
+          fi
