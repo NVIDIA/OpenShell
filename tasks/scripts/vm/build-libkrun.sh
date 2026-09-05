@@ -5,7 +5,7 @@
 # Build libkrun and libkrunfw from source on Linux.
 #
 # This script builds libkrun (VMM) and libkrunfw (kernel firmware) from source
-# with OpenShell's custom kernel configuration for bridge/netfilter support.
+# with OpenShell's custom kernel configuration for sandbox enforcement.
 #
 # In addition to the platform's native .so artifacts, this script exports
 # kernel.c and ABI_VERSION metadata so that other platforms (e.g. macOS) can
@@ -212,7 +212,14 @@ if [ -f openshell.kconfig ]; then
 
   # Verify that the key options were actually applied.
   all_ok=true
-  for opt in CONFIG_BRIDGE CONFIG_NETFILTER CONFIG_NF_NAT; do
+  for opt in \
+    CONFIG_BRIDGE \
+    CONFIG_NETFILTER \
+    CONFIG_NF_NAT \
+    CONFIG_SECURITY \
+    CONFIG_SECURITY_LANDLOCK \
+    CONFIG_SECCOMP \
+    CONFIG_SECCOMP_FILTER; do
     val="$(grep "^${opt}=" "${KERNEL_SOURCES}/.config" 2>/dev/null || true)"
     if [ -n "$val" ]; then
       echo "    ${opt}: ${val#*=}"

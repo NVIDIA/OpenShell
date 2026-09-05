@@ -11,15 +11,18 @@ runtime/
     openshell.kconfig
 ```
 
-`openshell-driver-vm` embeds libkrun, libkrunfw, gvproxy, umoci for guest-side
-OCI image unpacking, and the bundled `openshell-sandbox` supervisor.
+`openshell-driver-vm` embeds libkrun, libkrunfw, umoci for guest-side OCI image
+unpacking, and the portable capability-free `openshell-sandbox` role.
+VMs do not attach a guest NIC. The boundary carries control, mediated network,
+and DNS streams over the authenticated vsock channel.
 
 ## Why
 
-The stock `libkrunfw` kernel does not include the bridge, netfilter,
-conntrack, cgroup, seccomp, and Landlock features the sandbox supervisor needs
-inside each microVM. `kernel/openshell.kconfig` extends the libkrunfw kernel so
-VM sandboxes can run the same supervisor enforcement path as other backends.
+The stock `libkrunfw` kernel does not include every cgroup, seccomp, and
+Landlock feature the sandbox needs inside each microVM.
+`kernel/openshell.kconfig` extends the libkrunfw kernel so VM sandboxes retain
+guest-local process, network-syscall, and filesystem enforcement while the
+supervisor runs on the host.
 
 ## Build Scripts
 
@@ -27,7 +30,7 @@ VM sandboxes can run the same supervisor enforcement path as other backends.
 |---|---|---|
 | `tasks/scripts/vm/build-libkrun.sh` | Linux | Builds libkrunfw and libkrun from source with the custom kernel config |
 | `tasks/scripts/vm/build-libkrun-macos.sh` | macOS | Builds portable libkrunfw and libkrun from a prebuilt `kernel.c` |
-| `tasks/scripts/vm/package-vm-runtime.sh` | Any | Packages `vm-runtime-<platform>.tar.zst` with libraries, gvproxy, umoci, and provenance |
+| `tasks/scripts/vm/package-vm-runtime.sh` | Any | Packages `vm-runtime-<platform>.tar.zst` with libraries, umoci, and provenance |
 | `tasks/scripts/vm/download-kernel-runtime.sh` | Any | Downloads runtime tarballs from the `vm-runtime` release and stages compressed files |
 
 ## Local Flow
@@ -36,12 +39,12 @@ VM sandboxes can run the same supervisor enforcement path as other backends.
 # Download the current pre-built runtime and stage compressed artifacts
 mise run vm:setup
 
-# Build the bundled guest supervisor
+# Build the portable Linux guest sandbox and trusted helper runtime (requires Docker Buildx)
 mise run vm:supervisor
 
-# Build the gateway and VM driver with embedded runtime artifacts
+# Build the gateway, native host supervisor, and VM driver
 OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=$PWD/target/vm-runtime-compressed \
-  cargo build -p openshell-gateway -p openshell-driver-vm
+  cargo build -p openshell-gateway -p openshell-supervisor -p openshell-driver-vm
 ```
 
 Use `FROM_SOURCE=1 mise run vm:setup` to build the runtime from source instead
@@ -62,7 +65,7 @@ publish the driver binary next to `openshell-gateway`.
 ## Provenance
 
 `package-vm-runtime.sh` writes `provenance.json` into each runtime tarball with
-the platform, libkrunfw commit, kernel version, gvproxy and umoci versions,
+the platform, libkrunfw commit, kernel version, and umoci version,
 GitHub SHA, and build time. The driver logs this metadata when it extracts and
 loads a runtime bundle.
 

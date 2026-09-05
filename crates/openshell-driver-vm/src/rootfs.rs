@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::fs::File;
 #[cfg(test)]
@@ -8,9 +9,14 @@ use std::io::BufWriter;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const SUPERVISOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-sandbox.zst"));
+const SANDBOX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-sandbox.zst"));
+const SUPERVISOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-supervisor.zst"));
+const SUPERVISOR_RUNTIME: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/openshell-runtime.tar.zst"));
 const UMOCI: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/umoci.zst"));
 const ROOTFS_VARIANT_MARKER: &str = ".openshell-rootfs-variant";
 const SANDBOX_GUEST_INIT_PATH: &str = "/srv/openshell-vm-sandbox-init.sh";
@@ -18,6 +24,7 @@ const SANDBOX_SUPERVISOR_PATH: &str = openshell_core::driver_utils::SUPERVISOR_C
 const SANDBOX_UMOCI_PATH: &str = openshell_core::container_paths::VM_UMOCI_PATH;
 const SANDBOX_OWNER_NORMALIZED_MARKER: &str =
     openshell_core::container_paths::VM_SANDBOX_OWNER_NORMALIZED_MARKER;
+const SANDBOX_SUPERVISOR_RUNTIME_PATH: &str = "/opt/openshell/bin/openshell-runtime";
 const ROOTFS_IMAGE_MIN_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 const ROOTFS_IMAGE_MIN_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
 const EXT4_IMAGE_MIN_HEADROOM_BYTES: u64 = 16 * 1024 * 1024;
@@ -25,6 +32,149 @@ static INJECTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub const fn sandbox_guest_init_path() -> &'static str {
     SANDBOX_GUEST_INIT_PATH
+}
+
+/// Identity of every embedded artifact materialized into a bootstrap rootfs.
+///
+/// Including this in the image-cache key makes local, uncommitted guest-sandbox
+/// changes invalidate the cache even when the `OpenShell` version is unchanged.
+pub fn sandbox_guest_runtime_identity() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(SANDBOX);
+    hasher.update(SUPERVISOR_RUNTIME);
+    hasher.update(UMOCI);
+    hasher.update(include_bytes!("../scripts/openshell-vm-sandbox-init.sh"));
+    format!("{:x}", hasher.finalize())
+}
+
+/// Materialize the supervisor embedded in the VM driver for host-side use.
+#[cfg(target_os = "linux")]
+pub fn extract_host_supervisor(path: &Path) -> Result<(), String> {
+    if SANDBOX.is_empty() {
+        return Err(
+            "host supervisor is not embedded; run `mise run vm:supervisor` and rebuild openshell-driver-vm"
+                .to_string(),
+        );
+    }
+    let supervisor = embedded_host_supervisor()?;
+    install_host_supervisor_atomically(path, &supervisor)?;
+    validate_host_supervisor(path)
+}
+
+#[cfg(target_os = "linux")]
+pub fn validate_host_supervisor(path: &Path) -> Result<(), String> {
+    validate_host_supervisor_digest(path, embedded_host_supervisor_digest()?)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_host_supervisor_digest(path: &Path, expected: [u8; 32]) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect cached host supervisor {}: {error}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "cached host supervisor is not a regular file: {}",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(format!(
+                "cached host supervisor is not executable: {}",
+                path.display()
+            ));
+        }
+    }
+    let actual = sha256_reader(
+        File::open(path)
+            .map_err(|error| format!("open cached host supervisor {}: {error}", path.display()))?,
+    )
+    .map_err(|error| format!("hash cached host supervisor {}: {error}", path.display()))?;
+    if actual != expected {
+        return Err(format!(
+            "cached host supervisor content does not match embedded runtime: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn embedded_host_supervisor() -> Result<Vec<u8>, String> {
+    zstd::decode_all(Cursor::new(SUPERVISOR))
+        .map_err(|error| format!("decompress host supervisor: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+fn embedded_host_supervisor_digest() -> Result<[u8; 32], String> {
+    static DIGEST: OnceLock<Result<[u8; 32], String>> = OnceLock::new();
+    DIGEST
+        .get_or_init(|| embedded_host_supervisor().map(|bytes| sha256_bytes(&bytes)))
+        .clone()
+}
+
+#[cfg(target_os = "linux")]
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+#[cfg(target_os = "linux")]
+fn sha256_reader(mut reader: impl Read) -> std::io::Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+#[cfg(target_os = "linux")]
+fn install_host_supervisor_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| format!("host supervisor path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).map_err(|error| format!("create {}: {error}", parent.display()))?;
+    let temporary = parent.join(format!(
+        ".openshell-sandbox.tmp-{}-{}",
+        std::process::id(),
+        INJECTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o755);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| format!("create {}: {error}", temporary.display()))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("write {}: {error}", temporary.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("sync {}: {error}", temporary.display()))?;
+        fs::rename(&temporary, path).map_err(|error| {
+            format!(
+                "commit cached host supervisor {} to {}: {error}",
+                temporary.display(),
+                path.display()
+            )
+        })?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync host supervisor cache {}: {error}", parent.display()))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[allow(clippy::similar_names)]
@@ -196,6 +346,41 @@ pub fn set_rootfs_image_file_mode(
         image_path,
         &format!("set_inode_field {quoted_guest_path} mode 0{regular_file_mode:o}"),
     )
+}
+
+/// Replay the ext4 journal and repair automatically correctable filesystem
+/// state before the driver mutates a preserved guest disk offline.
+pub fn recover_rootfs_image(image_path: &Path) -> Result<(), String> {
+    let mut failures = Vec::new();
+    let mut unavailable = Vec::new();
+
+    for candidate in e2fs_tool_candidates("e2fsck") {
+        let label = candidate.display().to_string();
+        match Command::new(&candidate)
+            .arg("-p")
+            .arg("-f")
+            .arg(image_path)
+            .output()
+        {
+            Ok(output) if matches!(output.status.code(), Some(0..=2)) => return Ok(()),
+            Ok(output) => failures.push(format!(
+                "{label} failed with status {}\nstdout: {}\nstderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                unavailable.push(format!("{label} not found"));
+            }
+            Err(error) => failures.push(format!("run {label}: {error}")),
+        }
+    }
+
+    Err(if failures.is_empty() {
+        unavailable.join("\n")
+    } else {
+        failures.join("\n")
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -376,6 +561,8 @@ fn prepare_sandbox_rootfs(rootfs: &Path, sandbox_uid: u32, sandbox_gid: u32) -> 
     }
 
     ensure_supervisor_binary(rootfs)?;
+    ensure_supervisor_runtime(rootfs)?;
+    ensure_guest_init_ip(rootfs)?;
     ensure_umoci_binary(rootfs)?;
 
     let opt_dir = rootfs.join("opt/openshell");
@@ -392,9 +579,55 @@ fn prepare_sandbox_rootfs(rootfs: &Path, sandbox_uid: u32, sandbox_gid: u32) -> 
     Ok(())
 }
 
+fn ensure_guest_init_ip(rootfs: &Path) -> Result<(), String> {
+    const IP_PATHS: [&str; 4] = ["sbin/ip", "usr/sbin/ip", "bin/ip", "usr/bin/ip"];
+    if IP_PATHS.iter().any(|path| rootfs.join(path).is_file()) {
+        return Ok(());
+    }
+
+    // Guest init runs before the sandbox can enter its trusted helper
+    // runtime. Images such as stock Ubuntu do not ship iproute2, so install a
+    // driver-owned launcher that executes the embedded musl helper explicitly.
+    // The helper and loader are both materialized from the trusted runtime,
+    // never from the workload image.
+    let path = rootfs.join("usr/sbin/ip");
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("guest ip launcher path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).map_err(|error| format!("create {}: {error}", parent.display()))?;
+    fs::write(
+        &path,
+        r#"#!/bin/sh
+set -eu
+runtime=/opt/openshell/bin/openshell-runtime
+for loader in "$runtime"/lib/ld-musl-*.so.1; do
+    if [ -x "$loader" ]; then
+        for helper in "$runtime"/sbin/ip "$runtime"/usr/sbin/ip "$runtime"/bin/ip "$runtime"/usr/bin/ip; do
+            if [ -x "$helper" ]; then
+                exec "$loader" --library-path "$runtime/lib:$runtime/usr/lib" "$helper" "$@"
+            fi
+        done
+    fi
+done
+echo "trusted OpenShell ip helper is unavailable" >&2
+exit 127
+"#,
+    )
+    .map_err(|error| format!("write {}: {error}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .map_err(|error| format!("chmod {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
 pub fn validate_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
     require_rootfs_path(rootfs, SANDBOX_GUEST_INIT_PATH)?;
     require_rootfs_path(rootfs, SANDBOX_SUPERVISOR_PATH)?;
+    validate_supervisor_runtime(rootfs)?;
     require_rootfs_path(rootfs, SANDBOX_UMOCI_PATH)?;
     require_any_rootfs_path(rootfs, &["/bin/bash"])?;
     require_any_rootfs_path(rootfs, &["/bin/mount", "/usr/bin/mount"])?;
@@ -795,20 +1028,20 @@ fn ensure_sandbox_guest_user(
     let etc_dir = rootfs.join("etc");
     fs::create_dir_all(&etc_dir).map_err(|e| format!("create {}: {e}", etc_dir.display()))?;
 
-    ensure_line_in_file(
+    replace_or_append_line(
         &etc_dir.join("group"),
         &format!("sandbox:x:{sandbox_gid}:"),
         |line| line.starts_with("sandbox:"),
     )?;
-    ensure_line_in_file(&etc_dir.join("gshadow"), "sandbox:!::", |line| {
+    replace_or_append_line(&etc_dir.join("gshadow"), "sandbox:!::", |line| {
         line.starts_with("sandbox:")
     })?;
-    ensure_line_in_file(
+    replace_or_append_line(
         &etc_dir.join("passwd"),
         &format!("sandbox:x:{sandbox_uid}:{sandbox_gid}:OpenShell Sandbox:/sandbox:/bin/bash"),
         |line| line.starts_with("sandbox:"),
     )?;
-    ensure_line_in_file(
+    replace_or_append_line(
         &etc_dir.join("shadow"),
         "sandbox:!:20123:0:99999:7:::",
         |line| line.starts_with("sandbox:"),
@@ -817,28 +1050,36 @@ fn ensure_sandbox_guest_user(
     Ok(())
 }
 
-fn ensure_line_in_file(
+fn replace_or_append_line(
     path: &Path,
     line: &str,
-    exists: impl Fn(&str) -> bool,
+    matches: impl Fn(&str) -> bool,
 ) -> Result<(), String> {
-    let mut contents = if path.exists() {
+    let contents = if path.exists() {
         fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?
     } else {
         String::new()
     };
-
-    if contents.lines().any(exists) {
-        return Ok(());
+    let mut output = String::with_capacity(contents.len().max(line.len() + 1));
+    let mut replaced = false;
+    for existing in contents.lines() {
+        if matches(existing) {
+            if replaced {
+                continue;
+            }
+            output.push_str(line);
+            replaced = true;
+        } else {
+            output.push_str(existing);
+        }
+        output.push('\n');
+    }
+    if !replaced {
+        output.push_str(line);
+        output.push('\n');
     }
 
-    if !contents.is_empty() && !contents.ends_with('\n') {
-        contents.push('\n');
-    }
-    contents.push_str(line);
-    contents.push('\n');
-
-    fs::write(path, contents).map_err(|e| format!("write {}: {e}", path.display()))
+    fs::write(path, output).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 fn ensure_supervisor_binary(rootfs: &Path) -> Result<(), String> {
@@ -855,9 +1096,9 @@ fn ensure_supervisor_binary(rootfs: &Path) -> Result<(), String> {
             fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
         }
 
-        let supervisor = zstd::decode_all(Cursor::new(SUPERVISOR))
-            .map_err(|e| format!("decompress supervisor: {e}"))?;
-        fs::write(&path, supervisor).map_err(|e| format!("write {}: {e}", path.display()))?;
+        let sandbox = zstd::decode_all(Cursor::new(SANDBOX))
+            .map_err(|e| format!("decompress sandbox: {e}"))?;
+        fs::write(&path, sandbox).map_err(|e| format!("write {}: {e}", path.display()))?;
     }
 
     #[cfg(unix)]
@@ -869,6 +1110,81 @@ fn ensure_supervisor_binary(rootfs: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn ensure_supervisor_runtime(rootfs: &Path) -> Result<(), String> {
+    if SUPERVISOR_RUNTIME.is_empty() {
+        return validate_supervisor_runtime(rootfs).map_err(|_| {
+            "trusted supervisor helper runtime not embedded. Build openshell-driver-vm with OPENSHELL_VM_RUNTIME_COMPRESSED_DIR set and run `mise run vm:supervisor` first"
+                .to_string()
+        });
+    }
+
+    install_supervisor_runtime_archive(rootfs, SUPERVISOR_RUNTIME)
+}
+
+fn install_supervisor_runtime_archive(rootfs: &Path, archive_bytes: &[u8]) -> Result<(), String> {
+    let destination = rootfs.join("opt/openshell/bin");
+    fs::create_dir_all(&destination)
+        .map_err(|e| format!("create {}: {e}", destination.display()))?;
+    let runtime = rootfs.join(SANDBOX_SUPERVISOR_RUNTIME_PATH.trim_start_matches('/'));
+    match fs::symlink_metadata(&runtime) {
+        Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(&runtime)
+            .map_err(|e| format!("remove untrusted runtime {}: {e}", runtime.display()))?,
+        Ok(_) => fs::remove_file(&runtime)
+            .map_err(|e| format!("remove untrusted runtime {}: {e}", runtime.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("inspect runtime {}: {error}", runtime.display())),
+    }
+    let decoder = zstd::Decoder::new(Cursor::new(archive_bytes))
+        .map_err(|e| format!("decompress supervisor runtime: {e}"))?;
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive
+        .entries()
+        .map_err(|e| format!("open supervisor runtime archive: {e}"))?
+    {
+        let mut entry = entry.map_err(|e| format!("read supervisor runtime archive: {e}"))?;
+        let kind = entry.header().entry_type();
+        if !kind.is_file() && !kind.is_dir() {
+            return Err(
+                "supervisor runtime archive contains a non-materialized link or special file"
+                    .to_string(),
+            );
+        }
+        if !entry
+            .unpack_in(&destination)
+            .map_err(|e| format!("extract supervisor runtime archive: {e}"))?
+        {
+            return Err("supervisor runtime archive contains a path outside its root".to_string());
+        }
+    }
+    validate_supervisor_runtime(rootfs)
+}
+
+fn validate_supervisor_runtime(rootfs: &Path) -> Result<(), String> {
+    let runtime = rootfs.join(SANDBOX_SUPERVISOR_RUNTIME_PATH.trim_start_matches('/'));
+    let has_ip = ["sbin/ip", "usr/sbin/ip", "bin/ip", "usr/bin/ip"]
+        .iter()
+        .any(|path| runtime.join(path).is_file());
+    let has_loader = fs::read_dir(runtime.join("lib"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("ld-musl-") && name.ends_with(".so.1"))
+        });
+    if has_ip && has_loader {
+        Ok(())
+    } else {
+        Err(format!(
+            "trusted supervisor helper runtime '{}' is incomplete",
+            runtime.display()
+        ))
+    }
 }
 
 fn ensure_umoci_binary(rootfs: &Path) -> Result<(), String> {
@@ -944,9 +1260,51 @@ fn remove_rootfs_path(rootfs: &Path, relative: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_supervisor_cache_rejects_wrong_content_and_installs_atomically() {
+        let directory = tempfile::tempdir().expect("cache directory");
+        let destination = directory.path().join("openshell-sandbox");
+        fs::write(&destination, b"stale executable").expect("write stale cache");
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))
+            .expect("make stale cache executable");
+        let expected = sha256_bytes(b"trusted supervisor");
+
+        assert!(validate_host_supervisor_digest(&destination, expected).is_err());
+        install_host_supervisor_atomically(&destination, b"trusted supervisor")
+            .expect("atomically replace cache");
+        validate_host_supervisor_digest(&destination, expected).expect("validate installed cache");
+        assert_eq!(fs::read(&destination).unwrap(), b"trusted supervisor");
+        assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+    }
+
+    #[test]
+    fn guest_init_gets_driver_owned_ip_launcher_when_image_omits_iproute2() {
+        let rootfs = tempfile::tempdir().expect("create rootfs");
+        ensure_guest_init_ip(rootfs.path()).expect("install guest ip launcher");
+
+        let launcher = rootfs.path().join("usr/sbin/ip");
+        let contents = fs::read_to_string(&launcher).expect("read guest ip launcher");
+        assert!(contents.contains("/opt/openshell/bin/openshell-runtime"));
+        assert!(contents.contains("ld-musl-"));
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(launcher).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
 
     #[test]
     fn prepare_sandbox_rootfs_rewrites_guest_layout() {
@@ -959,10 +1317,10 @@ mod tests {
         write_fake_runtime_binaries(&rootfs);
         fs::write(
             rootfs.join("etc/passwd"),
-            "root:x:0:0:root:/root:/bin/bash\n",
+            "root:x:0:0:root:/root:/bin/bash\nsandbox:x:998:997:Sandbox:/sandbox:/bin/sh\n",
         )
         .expect("write passwd");
-        fs::write(rootfs.join("etc/group"), "root:x:0:\n").expect("write group");
+        fs::write(rootfs.join("etc/group"), "root:x:0:\nsandbox:x:997:\n").expect("write group");
         fs::write(rootfs.join("etc/hosts"), "127.0.0.1 localhost\n").expect("write hosts");
         fs::create_dir_all(rootfs.join("bin")).expect("create bin");
         fs::create_dir_all(rootfs.join("sbin")).expect("create sbin");
@@ -979,6 +1337,24 @@ mod tests {
 
         assert!(rootfs.join("srv/openshell-vm-sandbox-init.sh").is_file());
         assert!(rootfs.join("opt/openshell/bin/umoci").is_file());
+        validate_supervisor_runtime(&rootfs).expect("trusted helper runtime remains complete");
+        let init_script = fs::read_to_string(rootfs.join("srv/openshell-vm-sandbox-init.sh"))
+            .expect("read guest init");
+        assert!(
+            init_script.contains(
+                "launch-capability-free \"$_sandbox_uid\" \"$_sandbox_gid\" \"$_sandbox_bootstrap_guest\""
+            )
+        );
+        assert!(init_script.contains("OPENSHELL_VM_SANDBOX_BOOTSTRAP"));
+        assert!(
+            init_script
+                .contains("chown \"${_sandbox_uid}:${_sandbox_gid}\" \"$_sandbox_state_dir\"")
+        );
+        assert!(init_script.contains("chmod 0700 \"$_sandbox_state_dir\""));
+        assert!(!init_script.contains("--topology-backend-name=in-pod"));
+        assert!(!init_script.contains("@ISOLATION_INTERFACE_VERSION@"));
+        assert!(!init_script.contains("8.8.8.8"));
+        assert!(!init_script.contains("VM_NET_"));
         assert!(rootfs.join("sandbox").is_dir());
         assert!(rootfs.join("image-cache").is_dir());
         assert!(rootfs.join("lower").is_dir());
@@ -990,24 +1366,69 @@ mod tests {
                 .next()
                 .is_none()
         );
-        assert!(
-            fs::read_to_string(rootfs.join("etc/passwd"))
-                .expect("read passwd")
-                .contains(&format!(
-                    "sandbox:x:{uid}:{uid}:OpenShell Sandbox:/sandbox:/bin/bash"
-                ))
-        );
-        assert!(
-            fs::read_to_string(rootfs.join("etc/group"))
-                .expect("read group")
-                .contains(&format!("sandbox:x:{uid}:"))
-        );
+        let passwd = fs::read_to_string(rootfs.join("etc/passwd")).expect("read passwd");
+        assert!(passwd.contains(&format!(
+            "sandbox:x:{uid}:{uid}:OpenShell Sandbox:/sandbox:/bin/bash"
+        )));
+        assert!(!passwd.contains("sandbox:x:998:997:"));
+        let group = fs::read_to_string(rootfs.join("etc/group")).expect("read group");
+        assert!(group.contains(&format!("sandbox:x:{uid}:")));
+        assert!(!group.contains("sandbox:x:997:"));
         assert_eq!(
             fs::read_to_string(rootfs.join("etc/hosts")).expect("read hosts"),
             "127.0.0.1 localhost\n"
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn supervisor_runtime_archive_materializes_below_the_trusted_path() {
+        let dir = unique_temp_dir();
+        let rootfs = dir.join("rootfs");
+        let untrusted_runtime = rootfs.join("opt/openshell/bin/openshell-runtime");
+        fs::create_dir_all(untrusted_runtime.join("usr/sbin")).expect("create untrusted runtime");
+        fs::write(untrusted_runtime.join("usr/sbin/ip"), b"untrusted")
+            .expect("write untrusted helper");
+        fs::write(untrusted_runtime.join("untrusted-extra"), b"untrusted")
+            .expect("write untrusted extra file");
+        let mut tar_bytes = Vec::new();
+        {
+            let mut archive = tar::Builder::new(&mut tar_bytes);
+            for (path, bytes, mode) in [
+                ("openshell-runtime/usr/sbin/ip", b"ip".as_slice(), 0o755),
+                (
+                    "openshell-runtime/lib/ld-musl-test.so.1",
+                    b"loader".as_slice(),
+                    0o755,
+                ),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(mode);
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_cksum();
+                archive
+                    .append_data(&mut header, path, bytes)
+                    .expect("append runtime entry");
+            }
+            archive.finish().expect("finish runtime archive");
+        }
+        let compressed = zstd::encode_all(Cursor::new(tar_bytes), 1).expect("compress runtime");
+
+        install_supervisor_runtime_archive(&rootfs, &compressed).expect("install runtime");
+        validate_supervisor_runtime(&rootfs).expect("validate runtime");
+        assert_eq!(
+            fs::read(rootfs.join("opt/openshell/bin/openshell-runtime/usr/sbin/ip"))
+                .expect("read installed helper"),
+            b"ip"
+        );
+        assert!(
+            !rootfs
+                .join("opt/openshell/bin/openshell-runtime/untrusted-extra")
+                .exists(),
+            "embedded runtime replacement must discard bootstrap-image helpers"
+        );
     }
 
     #[test]
@@ -1096,6 +1517,21 @@ mod tests {
         let mut tail = [0_u8; 4];
         dest_file.read_exact(&mut tail).expect("read tail");
         assert_eq!(&tail, b"tail");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_rootfs_image_accepts_clean_ext4_image() {
+        let dir = unique_temp_dir();
+        let source = dir.join("source");
+        let image = dir.join("overlay.ext4");
+        fs::create_dir_all(source.join("upper")).expect("create source upperdir");
+        fs::create_dir_all(source.join("work")).expect("create source workdir");
+        create_ext4_image_from_dir_with_size(&source, &image, 64 * 1024 * 1024)
+            .expect("create ext4 image");
+
+        recover_rootfs_image(&image).expect("recover clean ext4 image");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1230,6 +1666,12 @@ mod tests {
     }
 
     fn write_fake_runtime_binaries(rootfs: &Path) {
+        let helper_runtime = rootfs.join("opt/openshell/bin/openshell-runtime");
+        fs::create_dir_all(helper_runtime.join("usr/sbin")).expect("create helper bin directory");
+        fs::create_dir_all(helper_runtime.join("lib")).expect("create helper lib directory");
+        fs::write(helper_runtime.join("usr/sbin/ip"), b"ip").expect("write ip helper");
+        fs::write(helper_runtime.join("lib/ld-musl-test.so.1"), b"loader")
+            .expect("write helper loader");
         fs::write(
             rootfs.join("opt/openshell/bin/openshell-sandbox"),
             b"sandbox",
