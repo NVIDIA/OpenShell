@@ -72,7 +72,7 @@ use std::fs;
 use std::future::Future;
 
 use crate::isolation::VmBoundarySpec;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -101,6 +101,7 @@ const MAX_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY: usize = 16;
 const REGISTRY_REQUEST_MAX_ATTEMPTS: usize = 4;
 const REGISTRY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const REGISTRY_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+const VM_CONSOLE_DIAGNOSTIC_BYTES: u64 = 8 * 1024;
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -3518,7 +3519,7 @@ impl VmDriver {
                         .get(&sandbox_id)
                         .map(|record| record.state_dir.clone())
                 };
-                if let Some(state_dir) = state_dir {
+                if let Some(ref state_dir) = state_dir {
                     let marker = state_dir.join(MAIN_PROCESS_EXITED_FILE);
                     if !tokio::fs::try_exists(&marker).await.unwrap_or(false)
                         && let Err(error) =
@@ -3539,10 +3540,20 @@ impl VmDriver {
                         let _ = terminate_vm_process(&mut process.child).await;
                     }
                 }
-                let message = status.code().map_or_else(
+                let mut message = status.code().map_or_else(
                     || format!("{component} process exited"),
                     |code| format!("{component} process exited with status {code}"),
                 );
+                if component == "VM"
+                    && let Some(state_dir) = state_dir.as_deref()
+                    && let Some(console) = read_vm_console_tail(
+                        &state_dir.join("rootfs-console.log"),
+                        VM_CONSOLE_DIAGNOSTIC_BYTES,
+                    )
+                {
+                    write!(message, "; guest console tail:\n{console}")
+                        .expect("writing to String cannot fail");
+                }
                 if let Some(snapshot) = self
                     .set_snapshot_condition(
                         &sandbox_id,
@@ -3641,6 +3652,21 @@ impl VmDriver {
         attach_vm_progress_metadata(&mut event);
         self.publish_platform_event(sandbox_id.to_string(), event);
     }
+}
+
+fn read_vm_console_tail(path: &Path, limit: u64) -> Option<String> {
+    if limit == 0 {
+        return None;
+    }
+    let mut file = fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(length.saturating_sub(limit)))
+        .ok()?;
+    let mut bytes = Vec::with_capacity(usize::try_from(length.min(limit)).ok()?);
+    file.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.trim_matches(['\0', '\n', '\r']);
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 fn configure_main_exit_marker(command: &mut Command, state_dir: &Path) {
@@ -5968,6 +5994,23 @@ mod tests {
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    #[test]
+    fn vm_console_diagnostic_is_bounded_to_the_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let console = directory.path().join("rootfs-console.log");
+        fs::write(&console, b"discard-this\nFATAL: sandbox startup failed\n").unwrap();
+
+        assert_eq!(
+            read_vm_console_tail(&console, 30).as_deref(),
+            Some("FATAL: sandbox startup failed")
+        );
+        assert_eq!(read_vm_console_tail(&console, 0), None);
+        assert_eq!(
+            read_vm_console_tail(&directory.path().join("missing"), 30),
+            None
+        );
+    }
 
     #[test]
     fn registry_throttling_errors_are_retryable() {
