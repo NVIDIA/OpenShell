@@ -28,8 +28,6 @@ const SECCOMP_DATA_ARGS_OFFSET: u32 = 16;
 #[cfg(target_arch = "x86_64")]
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
-const SECCOMP_FILTER_OPERATION: u32 = 1;
-const PR_SET_SECCOMP_OPERATION: u32 = 22;
 const CLOSE_RANGE_UNSHARE_FLAG: u32 = 1 << 1;
 const F_SETOWN_COMMAND: u32 = 8;
 const F_SETSIG_COMMAND: u32 = 10;
@@ -181,18 +179,9 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
         append_argument_nonzero_deny(&mut instructions, syscall, 0)?;
     }
 
-    append_argument_equal_deny(
-        &mut instructions,
-        libc::SYS_seccomp,
-        0,
-        SECCOMP_FILTER_OPERATION,
-    )?;
-    append_argument_equal_deny(
-        &mut instructions,
-        libc::SYS_prctl,
-        0,
-        PR_SET_SECCOMP_OPERATION,
-    )?;
+    // The ordinary workload filter is installed after this program and owns
+    // the final ban on further seccomp installation. Blocking it here would
+    // prevent the sandbox from completing the prepared filter stack.
     append_argument_masked_deny(
         &mut instructions,
         libc::SYS_close_range,
@@ -389,18 +378,6 @@ mod tests {
                 || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
             {
                 unsafe { libc::_exit(5) };
-            }
-            if unsafe {
-                libc::syscall(
-                    libc::SYS_seccomp,
-                    SECCOMP_SET_MODE_FILTER,
-                    0,
-                    std::ptr::null::<libc::sock_fprog>(),
-                )
-            } != -1
-                || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
-            {
-                unsafe { libc::_exit(6) };
             }
             if unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_SETOWN, sandbox_tgid) } != -1
                 || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
