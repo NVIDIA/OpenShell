@@ -22,20 +22,39 @@ struct SandboxState {
     phase: String,
 }
 
-/// Certify sandbox state and workspace continuity across host-side actions.
-pub const SANDBOX_CONTINUITY_SCENARIO: Scenario = Scenario {
-    name: "sandbox-continuity",
-    description: "Verify sandbox state and workspace continuity across planned host actions.",
-    requires_plan: true,
-    run: run_sandbox_continuity,
-    validate_plan_run: Some(validate_plan_run),
-};
+struct SandboxContinuityScenario;
 
-fn run_sandbox_continuity<'a>(
-    runner: &'a mut OpenShellRunner,
-    plan_run: &'a PlanRun,
-) -> ScenarioFuture<'a> {
-    Box::pin(async move { run_sandbox_continuity_inner(runner, plan_run).await })
+/// Certify sandbox state and workspace continuity across host-side actions.
+pub static SANDBOX_CONTINUITY_SCENARIO: &dyn Scenario = &SandboxContinuityScenario;
+
+impl Scenario for SandboxContinuityScenario {
+    fn name(&self) -> &'static str {
+        "sandbox-continuity"
+    }
+
+    fn description(&self) -> &'static str {
+        "Verify sandbox state and workspace continuity across planned host actions."
+    }
+
+    fn requires_plan(&self) -> bool {
+        true
+    }
+
+    fn validate_plan_run(&self, plan_run: &PlanRun) -> Result<(), String> {
+        validate_plan_run(plan_run)
+    }
+
+    fn run<'a>(
+        &self,
+        runner: &'a mut OpenShellRunner,
+        plan_run: &'a PlanRun,
+    ) -> ScenarioFuture<'a> {
+        let validation = self.validate_plan_run(plan_run);
+        Box::pin(async move {
+            validation?;
+            run_sandbox_continuity_inner(runner, plan_run).await
+        })
+    }
 }
 
 fn validate_plan_run(plan_run: &PlanRun) -> Result<(), String> {

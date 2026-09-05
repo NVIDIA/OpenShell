@@ -25,41 +25,83 @@ use tokio::time::sleep;
 use self::executor::{CliExecutionError, CliExecutor, ProcessCli};
 
 pub use plan::{ConformancePlan, HostAction, PlanDiagnostics, PlanRun, WorkloadExpectation};
-pub use scenarios::{SANDBOX_CONTINUITY_SCENARIO, SMOKE_SCENARIO};
-
-/// An installed conformance scenario.
-#[derive(Debug)]
-pub struct Scenario {
-    pub name: &'static str,
-    pub description: &'static str,
-    requires_plan: bool,
-    run: for<'a> fn(&'a mut OpenShellRunner, &'a PlanRun) -> ScenarioFuture<'a>,
-    validate_plan_run: Option<PlanRunValidator>,
-}
+pub use scenarios::{SANDBOX_CONTINUITY_SCENARIO, SANDBOX_LIFECYCLE_SCENARIO, SMOKE_SCENARIO};
 
 pub type ScenarioFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
-type PlanRunValidator = fn(&PlanRun) -> Result<(), String>;
 
-impl Scenario {
-    pub async fn run(
-        &self,
-        runner: &mut OpenShellRunner,
-        plan_run: &PlanRun,
-    ) -> Result<(), String> {
-        self.validate_plan_run(plan_run)?;
-        (self.run)(runner, plan_run).await
-    }
+/// A reusable `OpenShell` conformance contract.
+pub trait Scenario: Send + Sync {
+    /// Stable command-line name for this scenario.
+    fn name(&self) -> &'static str;
 
-    pub fn validate_plan_run(&self, plan_run: &PlanRun) -> Result<(), String> {
-        self.validate_plan_run.map_or_else(
-            || default_validate_plan_run(plan_run),
-            |validate| validate(plan_run),
-        )
-    }
+    /// Human-readable summary for scenario discovery.
+    fn description(&self) -> &'static str;
 
     /// Whether this scenario may run only through an explicit target plan.
-    pub fn requires_plan(&self) -> bool {
-        self.requires_plan
+    fn requires_plan(&self) -> bool {
+        false
+    }
+
+    /// Whether this scenario is selected when no scenario names are supplied.
+    fn runs_by_default(&self) -> bool {
+        !self.requires_plan()
+    }
+
+    /// Validates target-supplied inputs before the scenario starts.
+    fn validate_plan_run(&self, plan_run: &PlanRun) -> Result<(), String> {
+        default_validate_plan_run(plan_run)
+    }
+
+    /// Execute this scenario with a suite-owned runner and target-supplied plan input.
+    fn run<'a>(&self, runner: &'a mut OpenShellRunner, plan_run: &'a PlanRun)
+    -> ScenarioFuture<'a>;
+}
+
+/// A scenario that executes a fixed sequence of child scenarios.
+pub struct ScenarioCollection {
+    name: &'static str,
+    description: &'static str,
+    scenarios: &'static [&'static dyn Scenario],
+}
+
+impl ScenarioCollection {
+    #[must_use]
+    pub const fn new(
+        name: &'static str,
+        description: &'static str,
+        scenarios: &'static [&'static dyn Scenario],
+    ) -> Self {
+        Self {
+            name,
+            description,
+            scenarios,
+        }
+    }
+}
+
+impl Scenario for ScenarioCollection {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn description(&self) -> &'static str {
+        self.description
+    }
+
+    fn run<'a>(
+        &self,
+        runner: &'a mut OpenShellRunner,
+        plan_run: &'a PlanRun,
+    ) -> ScenarioFuture<'a> {
+        let validation = self.validate_plan_run(plan_run);
+        let scenarios = self.scenarios;
+        Box::pin(async move {
+            validation?;
+            for scenario in scenarios {
+                scenario.run(runner, plan_run).await?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -73,23 +115,31 @@ fn default_validate_plan_run(plan_run: &PlanRun) -> Result<(), String> {
     Ok(())
 }
 
-const SCENARIOS: &[Scenario] = &[SMOKE_SCENARIO, SANDBOX_CONTINUITY_SCENARIO];
+const SCENARIOS: &[&dyn Scenario] = &[
+    SMOKE_SCENARIO,
+    SANDBOX_LIFECYCLE_SCENARIO,
+    SANDBOX_CONTINUITY_SCENARIO,
+];
 
 /// Returns every scenario compiled into this distribution.
-pub fn scenarios() -> &'static [Scenario] {
+pub fn scenarios() -> &'static [&'static dyn Scenario] {
     SCENARIOS
 }
 
-/// Finds a scenario by its stable command-line name.
-pub fn scenario(name: &str) -> Option<&'static Scenario> {
-    scenarios().iter().find(|candidate| candidate.name == name)
+/// Finds a publicly selectable scenario by its stable command-line name.
+pub fn scenario(name: &str) -> Option<&'static dyn Scenario> {
+    scenarios()
+        .iter()
+        .copied()
+        .find(|candidate| candidate.name() == name)
 }
 
 /// Returns scenarios that need no host-level disruption capability.
-pub fn default_scenarios() -> impl Iterator<Item = &'static Scenario> {
+pub fn default_scenarios() -> impl Iterator<Item = &'static dyn Scenario> {
     scenarios()
         .iter()
-        .filter(|scenario| !scenario.requires_plan)
+        .copied()
+        .filter(|scenario| scenario.runs_by_default())
 }
 
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(120);
