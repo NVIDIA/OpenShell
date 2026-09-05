@@ -99,14 +99,60 @@ pub fn log_sandbox_readiness(policy: &SandboxPolicy, workdir: Option<&str>) {
     let total_paths = read_only.len() + read_write.len();
 
     if total_paths == 0 {
-        openshell_ocsf::ocsf_emit!(
-            openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                .severity(openshell_ocsf::SeverityId::Informational)
-                .status(openshell_ocsf::StatusId::Success)
-                .state(openshell_ocsf::StateId::Other, "skipped")
-                .message("Landlock filesystem sandbox skipped: no paths configured".to_string())
-                .build()
-        );
+        if matches!(
+            policy.landlock.compatibility,
+            openshell_core::policy::LandlockCompatibility::HardRequirement
+        ) {
+            // hard_requirement with no paths is fatal (see `landlock::prepare`).
+            // Emit a failure state so operators don't see a misleading "skipped"
+            // success event immediately before startup aborts.
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                    .severity(openshell_ocsf::SeverityId::High)
+                    .status(openshell_ocsf::StatusId::Failure)
+                    .state(openshell_ocsf::StateId::Other, "invalid")
+                    .message(
+                        "Landlock hard_requirement but no filesystem paths configured; \
+                         sandbox startup will abort"
+                            .to_string(),
+                    )
+                    .build()
+            );
+            // Dual-emit a security finding for the unsafe policy (per OCSF
+            // guidance: pair the domain event with a DetectionFinding).
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(openshell_ocsf::ActivityId::Open)
+                    .severity(openshell_ocsf::SeverityId::High)
+                    .confidence(openshell_ocsf::ConfidenceId::High)
+                    .is_alert(true)
+                    .finding_info(
+                        openshell_ocsf::FindingInfo::new(
+                            "landlock-hard-requirement-no-paths",
+                            "Landlock Hard Requirement Without Paths",
+                        )
+                        .with_desc(
+                            "landlock.compatibility is hard_requirement but no filesystem \
+                             paths are configured; sandbox startup will abort.",
+                        ),
+                    )
+                    .message(
+                        "Landlock hard_requirement with no filesystem paths configured".to_string(),
+                    )
+                    .build()
+            );
+        } else {
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                    .severity(openshell_ocsf::SeverityId::Informational)
+                    .status(openshell_ocsf::StatusId::Success)
+                    .state(openshell_ocsf::StateId::Other, "skipped")
+                    .message(
+                        "Landlock filesystem sandbox skipped: no paths configured".to_string(),
+                    )
+                    .build()
+            );
+        }
         return;
     }
 
