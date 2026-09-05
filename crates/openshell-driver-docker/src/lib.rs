@@ -12,9 +12,9 @@ use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
     ContainerCreateBody, ContainerState, ContainerStateStatusEnum, ContainerSummary,
-    ContainerSummaryStateEnum, CreateImageInfo, DeviceRequest, HostConfig, Mount,
-    MountTmpfsOptions, MountTypeEnum, MountVolumeOptions, NetworkCreateRequest, ProgressDetail,
-    SystemInfo, VolumeCreateRequest,
+    ContainerSummaryStateEnum, CreateImageInfo, DeviceRequest, HealthConfig, HealthStatusEnum,
+    HostConfig, Mount, MountTmpfsOptions, MountTypeEnum, MountVolumeOptions, NetworkCreateRequest,
+    ProgressDetail, SystemInfo, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -82,6 +82,10 @@ use url::Url;
 const WATCH_BUFFER: usize = 128;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const WATCH_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const SUPERVISOR_READY_TIMEOUT: Duration = Duration::from_secs(90);
+const SUPERVISOR_HEALTH_INTERVAL_NS: i64 = 250_000_000;
+const SUPERVISOR_HEALTH_TIMEOUT_NS: i64 = 2_000_000_000;
+const SUPERVISOR_HEALTH_START_PERIOD_NS: i64 = 60_000_000_000;
 
 const SANDBOX_BINARY_PATH: &str = "/.openshell/runtime/openshell-sandbox";
 const SUPERVISOR_IMAGE_CONTROL_BINARY_PATH: &str = "/openshell-supervisor";
@@ -1106,6 +1110,9 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<Option<DriverSandbox>, Status> {
+        if let Some(pending) = self.pending_snapshot(sandbox_id, sandbox_name).await {
+            return Ok(Some(pending));
+        }
         let container = self
             .find_managed_container_summary(sandbox_id, sandbox_name)
             .await?;
@@ -1116,7 +1123,7 @@ impl DockerComputeDriver {
             return Ok(Some(sandbox));
         }
 
-        Ok(self.pending_snapshot(sandbox_id, sandbox_name).await)
+        Ok(None)
     }
 
     async fn current_snapshots(&self) -> Result<Vec<DriverSandbox>, Status> {
@@ -1161,10 +1168,14 @@ impl DockerComputeDriver {
             self.apply_runtime_failure(&mut sandbox).await;
             container_sandboxes.push(sandbox);
         }
-        let mut by_id = self.pending_snapshot_map().await;
-        for sandbox in container_sandboxes {
-            by_id.insert(sandbox.id.clone(), sandbox);
-        }
+        let mut by_id = container_sandboxes
+            .into_iter()
+            .map(|sandbox| (sandbox.id.clone(), sandbox))
+            .collect::<HashMap<_, _>>();
+        // Provisioning state is authoritative until the supervisor has
+        // attached to both the sandbox and gateway. A running workload
+        // container alone is not a usable sandbox.
+        by_id.extend(self.pending_snapshot_map().await);
         let mut sandboxes = by_id.into_values().collect::<Vec<_>>();
         sandboxes.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(sandboxes)
@@ -1232,6 +1243,16 @@ impl DockerComputeDriver {
         match Box::pin(self.provision_sandbox_inner(&sandbox)).await {
             Ok(()) => {
                 self.clear_pending_sandbox(&sandbox.id).await;
+                if let Err(error) = self
+                    .publish_container_snapshot(&sandbox.id, &sandbox.name)
+                    .await
+                {
+                    warn!(
+                        sandbox_id = %sandbox.id,
+                        %error,
+                        "Failed to publish Docker sandbox snapshot after provisioning"
+                    );
+                }
             }
             Err(failure) => {
                 self.fail_pending_sandbox(&sandbox, &failure).await;
@@ -1521,17 +1542,6 @@ impl DockerComputeDriver {
             format!("Started Docker container \"{container_name}\""),
             HashMap::from([("container_name".to_string(), container_name)]),
         );
-        if let Err(err) = self
-            .publish_container_snapshot(&sandbox.id, &sandbox.name)
-            .await
-        {
-            warn!(
-                sandbox_id = %sandbox.id,
-                error = %err,
-                "Failed to publish Docker sandbox snapshot after start"
-            );
-        }
-
         span_status.finish(Ok(()))
     }
 
@@ -2256,6 +2266,10 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<(), Status> {
+        if let Some(pending) = self.pending_snapshot(sandbox_id, sandbox_name).await {
+            self.publish_sandbox_snapshot(pending);
+            return Ok(());
+        }
         if let Some(summary) = self
             .find_managed_container_summary(sandbox_id, sandbox_name)
             .await?
@@ -4344,6 +4358,20 @@ async fn spawn_docker_control_process(
         ]),
         env: Some(environment),
         labels: Some(labels),
+        healthcheck: Some(HealthConfig {
+            test: Some(vec![
+                "CMD".to_string(),
+                SUPERVISOR_IMAGE_CONTROL_BINARY_PATH.to_string(),
+                "health".to_string(),
+                "--socket".to_string(),
+                SUPERVISOR_HEALTH_SOCKET_PATH.to_string(),
+            ]),
+            interval: Some(SUPERVISOR_HEALTH_INTERVAL_NS),
+            timeout: Some(SUPERVISOR_HEALTH_TIMEOUT_NS),
+            retries: Some(3),
+            start_period: Some(SUPERVISOR_HEALTH_START_PERIOD_NS),
+            start_interval: Some(SUPERVISOR_HEALTH_INTERVAL_NS),
+        }),
         host_config: Some(HostConfig {
             network_mode: Some(config.network_name.clone()),
             mounts: Some(vec![Mount {
@@ -4421,11 +4449,12 @@ async fn spawn_docker_control_process(
     let sandbox_id = sandbox.id.clone();
     let (shutdown, mut shutdown_requested) = oneshot::channel();
     let supervisor_id = created.id;
-    let docker = failure_context.docker.clone();
+    let monitored_supervisor_id = supervisor_id.clone();
+    let monitored_docker = failure_context.docker.clone();
     let task = tokio::spawn(async move {
         let wait = async {
-            let mut stream = docker.wait_container(
-                &supervisor_id,
+            let mut stream = monitored_docker.wait_container(
+                &monitored_supervisor_id,
                 None::<bollard::query_parameters::WaitContainerOptions>,
             );
             stream.next().await
@@ -4433,12 +4462,12 @@ async fn spawn_docker_control_process(
         tokio::select! {
             biased;
             _ = &mut shutdown_requested => {
-                let _ = docker.stop_container(
-                    &supervisor_id,
+                let _ = monitored_docker.stop_container(
+                    &monitored_supervisor_id,
                     Some(StopContainerOptionsBuilder::default().t(5).build()),
                 ).await;
-                let _ = docker.remove_container(
-                    &supervisor_id,
+                let _ = monitored_docker.remove_container(
+                    &monitored_supervisor_id,
                     Some(RemoveContainerOptionsBuilder::default().force(true).build()),
                 ).await;
             }
@@ -4454,17 +4483,19 @@ async fn spawn_docker_control_process(
                     }
                     None => "Docker supervisor wait stream ended unexpectedly".to_string(),
                 };
-                let log_tail = docker_container_log_tail(&docker, &supervisor_id).await;
+                let log_tail =
+                    docker_container_log_tail(&monitored_docker, &monitored_supervisor_id).await;
                 if !log_tail.is_empty() {
                     write!(message, "; log tail: {log_tail}").ok();
                 }
                 let sandbox_log_tail =
-                    docker_container_log_tail(&docker, &failure_context.container_id).await;
+                    docker_container_log_tail(&monitored_docker, &failure_context.container_id)
+                        .await;
                 if !sandbox_log_tail.is_empty() {
                     write!(message, "; sandbox log tail: {sandbox_log_tail}").ok();
                 }
-                let _ = docker.remove_container(
-                    &supervisor_id,
+                let _ = monitored_docker.remove_container(
+                    &monitored_supervisor_id,
                     Some(RemoveContainerOptionsBuilder::default().force(true).build()),
                 ).await;
                 handle_docker_runtime_failure(
@@ -4476,10 +4507,69 @@ async fn spawn_docker_control_process(
             },
         }
     });
-    Ok(DockerControlProcess {
+    let process = DockerControlProcess {
         shutdown: Some(shutdown),
         task,
-    })
+    };
+    if let Err(error) = wait_for_docker_supervisor_ready(docker, &supervisor_id).await {
+        stop_docker_control_process(process).await;
+        return Err(error);
+    }
+    Ok(process)
+}
+
+async fn wait_for_docker_supervisor_ready(
+    docker: &Docker,
+    supervisor_id: &str,
+) -> Result<(), Status> {
+    let wait = async {
+        loop {
+            let inspected = docker
+                .inspect_container(supervisor_id, None)
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("inspect Docker supervisor container: {error}"))
+                })?;
+            let state = inspected.state.unwrap_or_default();
+            match state.health.and_then(|health| health.status) {
+                Some(HealthStatusEnum::HEALTHY) => return Ok(()),
+                Some(HealthStatusEnum::UNHEALTHY) => {
+                    let log_tail = docker_container_log_tail(docker, supervisor_id).await;
+                    return Err(Status::unavailable(format!(
+                        "Docker supervisor failed its readiness check{}",
+                        format_log_tail(&log_tail)
+                    )));
+                }
+                _ if state.running == Some(false) => {
+                    let log_tail = docker_container_log_tail(docker, supervisor_id).await;
+                    return Err(Status::unavailable(format!(
+                        "Docker supervisor exited before becoming ready{}",
+                        format_log_tail(&log_tail)
+                    )));
+                }
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    };
+
+    if let Ok(result) = tokio::time::timeout(SUPERVISOR_READY_TIMEOUT, wait).await {
+        result
+    } else {
+        let log_tail = docker_container_log_tail(docker, supervisor_id).await;
+        Err(Status::deadline_exceeded(format!(
+            "Docker supervisor did not become ready within {} seconds{}",
+            SUPERVISOR_READY_TIMEOUT.as_secs(),
+            format_log_tail(&log_tail)
+        )))
+    }
+}
+
+fn format_log_tail(log_tail: &str) -> String {
+    if log_tail.is_empty() {
+        String::new()
+    } else {
+        format!("; log tail: {log_tail}")
+    }
 }
 
 async fn docker_container_log_tail(docker: &Docker, container_id: &str) -> String {
