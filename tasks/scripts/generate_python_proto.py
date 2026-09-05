@@ -9,7 +9,6 @@ import sys
 from pathlib import Path
 
 PROTO_FILES = [
-    "proto/inference.proto",
     "proto/openshell.proto",
     "proto/datamodel.proto",
     "proto/options.proto",
@@ -17,22 +16,6 @@ PROTO_FILES = [
 ]
 
 LINE_REWRITES = {
-    "python/openshell/_proto/inference_pb2.py": [
-        (
-            r"^import datamodel_pb2 as datamodel__pb2$",
-            "from . import datamodel_pb2 as datamodel__pb2",
-        ),
-        (
-            r"^import options_pb2 as options__pb2$",
-            "from . import options_pb2 as options__pb2",
-        ),
-    ],
-    "python/openshell/_proto/inference_pb2_grpc.py": [
-        (
-            r"^import inference_pb2 as inference__pb2$",
-            "from . import inference_pb2 as inference__pb2",
-        ),
-    ],
     "python/openshell/_proto/openshell_pb2_grpc.py": [
         (
             r"^import openshell_pb2 as openshell__pb2$",

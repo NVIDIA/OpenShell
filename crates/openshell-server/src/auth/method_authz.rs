@@ -139,9 +139,6 @@ mod tests {
             "/openshell.v1.OpenShell/ConnectSupervisor"
         ));
         assert!(!is_user_callable("/openshell.v1.OpenShell/RelayStream"));
-        assert!(!is_user_callable(
-            "/openshell.inference.v1.Inference/GetInferenceBundle"
-        ));
         // Unauthenticated methods are not "user callable" — they're
         // intercepted before principal evaluation.
         assert!(!is_user_callable("/openshell.v1.OpenShell/Health"));

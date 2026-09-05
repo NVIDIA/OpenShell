@@ -11,6 +11,11 @@ persisted sandbox spec environment map.
 
 from __future__ import annotations
 
+import json
+import socket
+import subprocess
+import sys
+import textwrap
 import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
@@ -70,6 +75,7 @@ def provider(
     name: str,
     provider_type: str,
     credentials: dict[str, str],
+    profile_workspace: str = "",
 ) -> Iterator[str]:
     """Create a provider for the duration of the block, then delete it."""
     _delete_provider(stub, name)
@@ -79,6 +85,7 @@ def provider(
                 metadata=datamodel_pb2.ObjectMeta(name=name),
                 type=provider_type,
                 credentials=credentials,
+                profile_workspace=profile_workspace,
             )
         )
     )
@@ -97,6 +104,196 @@ def _delete_provider(stub: object, name: str) -> None:
             pass
         else:
             raise
+
+
+def _delete_provider_profile(stub: object, profile_id: str) -> None:
+    """Delete a provider profile, ignoring not-found errors."""
+    try:
+        stub.DeleteProviderProfile(
+            openshell_pb2.DeleteProviderProfileRequest(
+                id=profile_id,
+                workspace="default",
+            )
+        )
+    except grpc.RpcError as exc:
+        if hasattr(exc, "code") and exc.code() == grpc.StatusCode.NOT_FOUND:
+            pass
+        else:
+            raise
+
+
+@contextmanager
+def imported_provider_profile(
+    stub: object,
+    *,
+    profile: openshell_pb2.ProviderProfile,
+    source: str,
+) -> Iterator[str]:
+    """Import a workspace-scoped provider profile for the duration of the block."""
+    _delete_provider_profile(stub, profile.id)
+    response = stub.ImportProviderProfiles(
+        openshell_pb2.ImportProviderProfilesRequest(
+            profiles=[
+                openshell_pb2.ProviderProfileImportItem(
+                    profile=profile,
+                    source=source,
+                )
+            ],
+            workspace="default",
+        )
+    )
+    assert response.imported, f"profile import failed: {response.diagnostics!r}"
+    try:
+        yield profile.id
+    finally:
+        _delete_provider_profile(stub, profile.id)
+
+
+def _native_inference_profile(
+    *,
+    profile_id: str,
+    env_var: str,
+    port: int,
+    rules: list[sandbox_pb2.L7Rule],
+    auth_style: str = "bearer",
+    header_name: str = "authorization",
+) -> openshell_pb2.ProviderProfile:
+    return openshell_pb2.ProviderProfile(
+        id=profile_id,
+        display_name=f"{profile_id} display",
+        description="E2E imported inference profile fixture",
+        category=openshell_pb2.PROVIDER_PROFILE_CATEGORY_INFERENCE,
+        inference_capable=True,
+        credentials=[
+            openshell_pb2.ProviderProfileCredential(
+                name="api_key",
+                description="API key",
+                env_vars=[env_var],
+                required=True,
+                auth_style=auth_style,
+                header_name=header_name,
+            )
+        ],
+        endpoints=[
+            sandbox_pb2.NetworkEndpoint(
+                host="host.openshell.internal",
+                port=port,
+                protocol="rest",
+                tls="none",
+                enforcement="enforce",
+                rules=rules,
+                allowed_ips=[
+                    "10.0.0.0/8",
+                    "172.16.0.0/12",
+                    "192.168.0.0/16",
+                    "fc00::/7",
+                ],
+            )
+        ],
+        binaries=[
+            sandbox_pb2.NetworkBinary(path="/usr/bin/python*"),
+            sandbox_pb2.NetworkBinary(path="/usr/local/bin/python*"),
+            sandbox_pb2.NetworkBinary(path="/sandbox/.uv/python/**/python*"),
+        ],
+    )
+
+
+@contextmanager
+def native_endpoint_server() -> Iterator[int]:
+    """Start a small host-side HTTP fixture that echoes auth and request data."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+
+    script = textwrap.dedent(
+        """
+        import json
+        import sys
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        PORT = int(sys.argv[1])
+
+        class Handler(BaseHTTPRequestHandler):
+            def _reply(self):
+                content_length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(content_length) if content_length else b""
+                payload = {
+                    "method": self.command,
+                    "path": self.path,
+                    "authorization": self.headers.get("Authorization"),
+                    "x_api_key": self.headers.get("x-api-key"),
+                    "body": body.decode("utf-8"),
+                }
+                encoded = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def do_GET(self):
+                self._reply()
+
+            def do_POST(self):
+                self._reply()
+
+            def log_message(self, fmt, *args):
+                pass
+
+        ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+        """
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script, str(port)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            stdout, stderr = proc.communicate(timeout=5)
+            raise RuntimeError(
+                "native endpoint fixture exited early: "
+                f"stdout={stdout!r} stderr={stderr!r}"
+            )
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                break
+        except OSError:
+            time.sleep(0.2)
+    else:
+        proc.kill()
+        stdout, stderr = proc.communicate(timeout=5)
+        raise RuntimeError(
+            "native endpoint fixture did not become ready: "
+            f"stdout={stdout!r} stderr={stderr!r}"
+        )
+
+    try:
+        yield port
+    finally:
+        proc.kill()
+        proc.communicate(timeout=5)
+
+
+def _proxy_connect():
+    """Return a closure that sends a raw CONNECT and returns the status line."""
+
+    def fn(host, port):
+        import socket
+
+        conn = socket.create_connection(("10.200.0.1", 3128), timeout=10)
+        try:
+            conn.sendall(
+                f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}\r\n\r\n".encode()
+            )
+            return conn.recv(256).decode("latin1")
+        finally:
+            conn.close()
+
+    return fn
 
 
 # ===========================================================================
@@ -326,6 +523,193 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
                 except grpc.RpcError as exc:
                     if exc.code() != grpc.StatusCode.NOT_FOUND:
                         raise
+
+
+def test_imported_openai_profile_allows_native_endpoint_with_attached_provider(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    """Imported fixture profiles should support native OpenAI-style access."""
+    stub = sandbox_client._stub
+    profile_id = f"e2e-native-openai-{int(time.time() * 1000)}"
+    provider_name = f"{profile_id}-provider"
+    secret = "sk-native-openai-secret"
+
+    profile = _native_inference_profile(
+        profile_id=profile_id,
+        env_var="OPENAI_API_KEY",
+        port=0,
+        rules=[
+            sandbox_pb2.L7Rule(
+                allow=sandbox_pb2.L7Allow(
+                    method="POST",
+                    path="/v1/chat/completions",
+                )
+            )
+        ],
+    )
+
+    def call_native_openai(host: str, port: int) -> str:
+        import json
+        import os
+        import urllib.error
+        import urllib.request
+
+        body = json.dumps(
+            {
+                "model": "fixture-openai-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+        ).encode()
+        request = urllib.request.Request(
+            f"http://{host}:{port}/v1/chat/completions",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.read().decode()
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(
+                f"native OpenAI request failed with {exc.code}: "
+                f"{exc.read().decode(errors='replace')}"
+            ) from exc
+
+    with native_endpoint_server() as port:
+        profile.endpoints[0].port = port
+        with imported_provider_profile(
+            stub,
+            profile=profile,
+            source=f"{profile_id}.yaml",
+        ):
+            with provider(
+                stub,
+                name=provider_name,
+                provider_type=profile_id,
+                credentials={"OPENAI_API_KEY": secret},
+                profile_workspace="default",
+            ) as attached_provider:
+                spec = datamodel_pb2.SandboxSpec(
+                    policy=_default_policy(),
+                    providers=[attached_provider],
+                )
+                with sandbox(spec=spec, delete_on_exit=True) as sb:
+                    result = sb.exec_python(
+                        call_native_openai,
+                        args=("host.openshell.internal", port),
+                        timeout_seconds=60,
+                    )
+                    assert result.exit_code == 0, result.stderr
+                    payload = json.loads(result.stdout)
+                    body = json.loads(payload["body"])
+                    assert payload["method"] == "POST"
+                    assert payload["path"] == "/v1/chat/completions"
+                    assert payload["authorization"] == f"Bearer {secret}"
+                    assert body["model"] == "fixture-openai-model"
+
+
+def test_imported_anthropic_profile_uses_native_endpoint_and_inference_local_is_not_privileged(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    """Attached imported profiles should not resurrect `inference.local` routing."""
+    stub = sandbox_client._stub
+    profile_id = f"e2e-native-anthropic-{int(time.time() * 1000)}"
+    provider_name = f"{profile_id}-provider"
+    secret = "sk-native-anthropic-secret"
+
+    profile = _native_inference_profile(
+        profile_id=profile_id,
+        env_var="ANTHROPIC_API_KEY",
+        port=0,
+        rules=[
+            sandbox_pb2.L7Rule(
+                allow=sandbox_pb2.L7Allow(
+                    method="POST",
+                    path="/v1/messages",
+                )
+            )
+        ],
+        auth_style="header",
+        header_name="x-api-key",
+    )
+
+    def call_native_anthropic(host: str, port: int) -> str:
+        import json
+        import os
+        import urllib.error
+        import urllib.request
+
+        body = json.dumps(
+            {
+                "model": "fixture-anthropic-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+        ).encode()
+        request = urllib.request.Request(
+            f"http://{host}:{port}/v1/messages",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.read().decode()
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(
+                f"native Anthropic request failed with {exc.code}: "
+                f"{exc.read().decode(errors='replace')}"
+            ) from exc
+
+    with native_endpoint_server() as port:
+        profile.endpoints[0].port = port
+        with imported_provider_profile(
+            stub,
+            profile=profile,
+            source=f"{profile_id}.yaml",
+        ):
+            with provider(
+                stub,
+                name=provider_name,
+                provider_type=profile_id,
+                credentials={"ANTHROPIC_API_KEY": secret},
+                profile_workspace="default",
+            ) as attached_provider:
+                spec = datamodel_pb2.SandboxSpec(
+                    policy=_default_policy(),
+                    providers=[attached_provider],
+                )
+                with sandbox(spec=spec, delete_on_exit=True) as sb:
+                    native_result = sb.exec_python(
+                        call_native_anthropic,
+                        args=("host.openshell.internal", port),
+                        timeout_seconds=60,
+                    )
+                    assert native_result.exit_code == 0, native_result.stderr
+                    payload = json.loads(native_result.stdout)
+                    body = json.loads(payload["body"])
+                    assert payload["method"] == "POST"
+                    assert payload["path"] == "/v1/messages"
+                    assert payload["x_api_key"] == secret
+                    assert body["model"] == "fixture-anthropic-model"
+
+                    denied = sb.exec_python(
+                        _proxy_connect(),
+                        args=("inference.local", 443),
+                        timeout_seconds=30,
+                    )
+                    assert denied.exit_code == 0, denied.stderr
+                    status = denied.stdout.strip()
+                    assert status.startswith("HTTP/1.1 "), status
+                    assert " 200 " not in status, status
 
 
 # ===========================================================================

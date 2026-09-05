@@ -121,20 +121,14 @@ middleware. A passed binary logical message still advances the active
 middleware session sequence and emits coverage telemetry, so a later text RPC
 can contain a valid sequence gap.
 
-## Inference and Upstream Proxying
+## Network and Upstream Proxying
 
 | Path | Current bound | Terminal behavior |
 |---|---:|---|
-| `inference.local` request parse buffer | 10 MiB | Return `413` for an oversized request. |
-| Chunked inference request | 10 MiB and 4,096 chunks | Reject an invalid or over-limit request. |
-| Streaming inference response | 32 MiB and 120 s chunk idle | Truncate the stream and attempt a safe SSE error. |
 | Corporate proxy CONNECT response headers | 8 KiB | Fail the tunnel. |
 | Corporate proxy CONNECT handshake | 30 s total | Fail the tunnel; validated-address attempts share the aggregate budget. |
 | Token-grant HTTP request | 30 s request and connect | Fail credential resolution. |
 | Response-derived token cache TTL | 5 min default; 1 h response cap; 30 s expiry margin | A positive profile `cache_ttl_seconds` override replaces the response-derived calculation. |
-
-Streaming response byte limits are integrity-relevant. Protocols whose clients
-require one complete buffered object do not use the truncating SSE path.
 
 ## Sandbox-Local Surfaces
 

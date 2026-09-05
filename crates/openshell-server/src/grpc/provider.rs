@@ -44,7 +44,7 @@ const GATEWAY_SPIFFE_WORKLOAD_API_SOCKET: &str = "OPENSHELL_GATEWAY_SPIFFE_WORKL
 
 /// Redact credential values from a provider before returning it in a gRPC
 /// response.  Key names are preserved so callers can display credential counts
-/// and key listings.  Internal server paths (inference routing, sandbox env
+/// and key listings. Internal server paths (sandbox env
 /// injection) read credentials from the store directly and are unaffected.
 fn redact_provider_credentials(mut provider: Provider) -> Provider {
     for value in provider.credentials.values_mut() {
@@ -2293,8 +2293,7 @@ fn provider_credential_not_expired(provider: &Provider, key: &str, now_ms: i64) 
 }
 
 fn is_non_injectable_provider_credential(provider: &Provider, key: &str) -> bool {
-    openshell_core::inference::normalize_inference_provider_type(&provider.r#type)
-        == Some("google-vertex-ai")
+    normalize_provider_type(&provider.r#type) == Some("google-vertex-ai")
         && key == "GOOGLE_SERVICE_ACCOUNT_KEY"
 }
 
@@ -2974,6 +2973,9 @@ pub(super) fn get_provider_type_profile_for_scope(
     catalog.get_type_profile_for_scope(id, profile_workspace)
 }
 
+/// Prevent a legacy alternate-upstream provider from binding its credential to
+/// the built-in public vendor endpoint. Alternate endpoints must be expressed
+/// by an explicitly imported endpoint-bearing profile.
 pub(super) fn provider_profile_endpoints_are_active(
     profile: &ProviderTypeProfile,
     provider: &Provider,
@@ -2981,24 +2983,24 @@ pub(super) fn provider_profile_endpoints_are_active(
     if profile.source != "builtin" {
         return true;
     }
-    let Some(inference_profile) = openshell_core::inference::profile_for(&profile.id) else {
-        return true;
-    };
-    if !matches!(inference_profile.provider_type, "openai" | "anthropic") {
-        return true;
-    }
 
-    let configured_base_url = inference_profile
-        .base_url_config_keys
-        .iter()
-        .find_map(|key| provider.config.get(*key))
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty());
-    configured_base_url.is_none_or(|configured| {
-        configured
-            .trim_end_matches('/')
-            .eq_ignore_ascii_case(inference_profile.default_base_url.trim_end_matches('/'))
-    })
+    let (base_url_key, default_base_url) = match profile.id.as_str() {
+        "openai" => ("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        "anthropic" => ("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1"),
+        _ => return true,
+    };
+
+    provider
+        .config
+        .get(base_url_key)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none_or(|configured| {
+            configured
+                .trim_end_matches('/')
+                .eq_ignore_ascii_case(default_base_url.trim_end_matches('/'))
+        })
 }
 
 #[cfg(test)]

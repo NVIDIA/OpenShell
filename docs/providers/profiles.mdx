@@ -55,11 +55,11 @@ supply that boundary by default. For an endpointless profile, a sandbox policy
 endpoint can name the attached provider instance explicitly. The proxy checks
 the resulting association before it substitutes the real value.
 
-The built-in `openai` and `anthropic` profiles use their public vendor
-endpoints. Configuring an alternate base URL makes those providers route-only:
-OpenShell withholds their static credentials and fixed-vendor policy from
-direct sandbox traffic while gateway inference routing continues to use the
-configured upstream.
+The built-in `openai` and `anthropic` profiles bind credentials to their public
+vendor endpoints. To use a proxy or compatible API at another host, import a
+custom profile that declares that host and attach a provider created from that
+profile. OpenShell never broadens a built-in profile's credential boundary from
+a base URL environment variable alone.
 
 A request can use a static credential only when all of these checks pass:
 
@@ -204,16 +204,15 @@ The following provider profile design items are not part of the current behavior
 | Binary-scoped credential injection | Provider profile binaries affect policy composition but do not yet restrict placeholder resolution by calling binary. Static and dynamic credentials are endpoint-scoped. |
 | Credential verification on create | `openshell provider create` does not yet probe provider verification endpoints or expose `--no-verify`. |
 | Automatic credential scope extraction | OpenShell does not yet inspect upstream provider responses to discover credential scopes. |
-| Inference mounting from attached providers | `inference_capable` is profile metadata. Attaching an inference-capable provider does not yet create `inference.local` routes. |
-| Multi-provider inference routing | Path-based routing such as `inference.local/openai/...` and `inference.local/anthropic/...` is not yet wired to provider profiles. |
 | Policy prover integration | OpenShell does not yet run the policy prover automatically on sandbox startup or block startup based on prover findings. |
 | Refresh telemetry as OCSF events | Credential refresh logs are secret-safe gateway logs. OCSF refresh events and metrics are future work. |
 
-Use [Inference Routing](/sandboxes/inference-routing) for the current `inference.local` model.
+Use [Provider-backed Inference](/sandboxes/inference-routing) to attach an
+inference provider and call its native endpoint.
 
 ## Provider Profiles
 
-A provider profile defines a provider type. It contains metadata, credential declarations, endpoint policy, binary policy, inference metadata, and optional credential refresh metadata.
+A provider profile defines a provider type. It contains metadata, credential declarations, endpoint policy, binary policy, an informational provider category, and optional credential refresh metadata.
 
 List available profiles:
 
@@ -439,7 +438,10 @@ environment value under the actual environment variable key.
 
 `binaries` contains the executable paths allowed to reach the profile endpoints when the profile contributes policy to a sandbox.
 
-`inference_capable` marks profiles that are intended to participate in inference workflows. It does not currently mount or configure `inference.local`.
+`inference_capable` is informational metadata that marks profiles intended for
+model and inference APIs. It does not grant access, select a model, configure a
+client, or change routing. The sandbox must attach a provider instance, and the
+workload calls the profile-authorized native endpoint.
 
 ### Refresh Metadata
 

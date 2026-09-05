@@ -26,13 +26,11 @@ if TYPE_CHECKING:
 
 from openshell._proto import (
     datamodel_pb2,
-    inference_pb2,
-    inference_pb2_grpc,
     openshell_pb2,
     openshell_pb2_grpc,
 )
 
-from .helpers import extract_sub, get_token, grpc_channel, stub_with_token
+from .helpers import extract_sub, get_token, stub_with_token
 
 WS = "e2e-authz-test"
 
@@ -500,28 +498,6 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
                 metadata=m,
             ),
         ),
-        # ── Inference domain ──
-        (
-            "SetInferenceRoute",
-            lambda _s, m: _inference_stub().SetInferenceRoute(
-                inference_pb2.SetInferenceRouteRequest(
-                    provider_name="nonexistent", workspace=WS
-                ),
-                metadata=m,
-            ),
-        ),
-        (
-            "GetInferenceRoute",
-            lambda _s, m: _inference_stub().GetInferenceRoute(
-                inference_pb2.GetInferenceRouteRequest(workspace=WS), metadata=m
-            ),
-        ),
-        (
-            "DeleteInferenceRoute",
-            lambda _s, m: _inference_stub().DeleteInferenceRoute(
-                inference_pb2.DeleteInferenceRouteRequest(workspace=WS), metadata=m
-            ),
-        ),
     ]
 
 
@@ -598,16 +574,6 @@ def _global_policy_read_rpcs() -> list[tuple[str, Callable]]:
             ),
         ),
     ]
-
-
-_cached_inference_stub: inference_pb2_grpc.InferenceStub | None = None
-
-
-def _inference_stub() -> inference_pb2_grpc.InferenceStub:
-    global _cached_inference_stub
-    if _cached_inference_stub is None:
-        _cached_inference_stub = inference_pb2_grpc.InferenceStub(grpc_channel())
-    return _cached_inference_stub
 
 
 # ── Test class ───────────────────────────────────────────────────────────

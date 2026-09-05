@@ -24,6 +24,16 @@ pub use profiles::{
     strategy_output_env_key, strategy_output_spec, strategy_primary_env_key, validate_profile_set,
 };
 
+pub const VERTEX_AI_PROJECT_ID_KEY: &str = "VERTEX_AI_PROJECT_ID";
+pub const VERTEX_AI_REGION_KEY: &str = "VERTEX_AI_REGION";
+pub const VERTEX_AI_CONFIG_KEY_NAMES: &[&str] = &[
+    VERTEX_AI_PROJECT_ID_KEY,
+    VERTEX_AI_REGION_KEY,
+    "GOOGLE_VERTEX_AI_BASE_URL",
+    "VERTEX_AI_BASE_URL",
+    "VERTEX_AI_PUBLISHER",
+];
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("unsupported provider type: {0}")]
@@ -128,13 +138,16 @@ impl ProviderRegistry {
 
 #[must_use]
 pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
-    // Inference provider aliases are canonicalized in openshell-core so that
-    // openshell-server and openshell-providers agree on the same mapping.
-    if let Some(canonical) = openshell_core::inference::normalize_inference_provider_type(input) {
-        return Some(canonical);
-    }
     let normalized = input.trim().to_ascii_lowercase();
     match normalized.as_str() {
+        "openai" => Some("openai"),
+        "anthropic" => Some("anthropic"),
+        "nvidia" => Some("nvidia"),
+        "deepinfra" => Some("deepinfra"),
+        "aws-bedrock" => Some("aws-bedrock"),
+        "google-vertex-ai" | "vertex" | "vertex-ai" | "google-vertex" | "gcp-vertex" => {
+            Some("google-vertex-ai")
+        }
         "claude" | "claude-code" | "claude_code" => Some("claude-code"),
         "codex" => Some("codex"),
         "copilot" => Some("copilot"),
@@ -169,16 +182,18 @@ mod tests {
         assert_eq!(normalize_provider_type("openai"), Some("openai"));
         assert_eq!(normalize_provider_type("anthropic"), Some("anthropic"));
         assert_eq!(normalize_provider_type("nvidia"), Some("nvidia"));
+        assert_eq!(normalize_provider_type("deepinfra"), Some("deepinfra"));
+        assert_eq!(normalize_provider_type("aws-bedrock"), Some("aws-bedrock"));
         assert_eq!(normalize_provider_type("copilot"), Some("copilot"));
-        assert_eq!(
-            normalize_provider_type("google-vertex-ai"),
-            Some("google-vertex-ai")
-        );
-        assert_eq!(normalize_provider_type("vertex"), Some("google-vertex-ai"));
-        assert_eq!(
-            normalize_provider_type("vertex-ai"),
-            Some("google-vertex-ai")
-        );
+        for alias in [
+            "google-vertex-ai",
+            "vertex",
+            "vertex-ai",
+            "google-vertex",
+            "gcp-vertex",
+        ] {
+            assert_eq!(normalize_provider_type(alias), Some("google-vertex-ai"));
+        }
         assert_eq!(normalize_provider_type("unknown"), None);
     }
 

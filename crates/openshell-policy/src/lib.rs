@@ -1245,7 +1245,7 @@ pub const LEGACY_CONTAINER_POLICY_PATH: &str = "/etc/navigator/policy.yaml";
 /// This policy grants filesystem access to standard system paths, leaves
 /// process identity selection to the compute runtime, enables Landlock in
 /// best-effort mode, and **blocks all network access** (no network policies,
-/// no inference routing).
+/// and no provider-derived endpoint access).
 pub fn restrictive_default_policy() -> SandboxPolicy {
     SandboxPolicy {
         version: 1,

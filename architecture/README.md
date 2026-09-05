@@ -7,7 +7,7 @@ the **Supervisor**.
 
 The CLI, SDK, and TUI provide user-facing access. The gateway is the
 authenticated control plane: it owns API access, durable state, policy and
-settings delivery, provider and inference configuration, and relay
+settings delivery, provider configuration and attachments, and relay
 coordination. The supervisor runs inside every sandbox workload and is the local
 security boundary. It launches the agent as a restricted child process and
 enforces policy where process identity, filesystem access, network egress, and
@@ -50,7 +50,6 @@ flowchart TB
     subgraph DP["Sandbox Data Plane"]
         SUP["Supervisor"]
         PROXY["Policy proxy"]
-        ROUTER["Inference router"]
         POLICY["OPA policy engine"]
         AGENT["Restricted agent process"]
     end
@@ -81,8 +80,7 @@ flowchart TB
     AGENT -->|"all ordinary egress"| PROXY
     PROXY -->|"evaluate"| POLICY
     PROXY -->|"allowed traffic"| EXT["External services"]
-    PROXY -->|"inference.local"| ROUTER
-    ROUTER -->|"managed inference"| MODEL["Inference backends"]
+    PROXY -->|"profile-authorized traffic"| MODEL["Model providers"]
 ```
 
 ## Core Boundaries
@@ -90,14 +88,13 @@ flowchart TB
 | Component | Boundary |
 |---|---|
 | CLI, SDK, TUI | User-facing management surfaces. They talk to the gateway and do not need to know which infrastructure drivers are active. |
-| Gateway | Authenticated control plane, API server, durable state, policy and settings delivery, provider and inference config, supervisor session ownership, and relay coordination. |
+| Gateway | Authenticated control plane, API server, durable state, policy and settings delivery, provider config, supervisor session ownership, and relay coordination. |
 | Compute subsystem | Sandbox lifecycle semantics: creation, deletion, watching, reconciliation, and state transitions. Platform provisioning details belong to the compute driver. |
 | Credentials subsystem | Logical provider and credential resolution. Secret storage and platform-native credential access belong to credentials drivers. |
 | Control-plane identity | Authentication and authorization for users, operators, and API clients. External identity verification belongs to identity drivers. |
 | Sandbox identity | Workload identity for supervisors and sandbox-to-sandbox authorization. Identity issuance or verification belongs to sandbox identity drivers. |
 | Supervisor | Sandbox-local security boundary. It prepares isolation, fetches config, injects credentials, runs relay endpoints, starts the proxy, and launches restricted agent processes. |
-| Policy proxy | Mandatory egress path for agent traffic. It enforces destination, binary identity, SSRF, TLS/L7, credential injection, and inference interception rules. |
-| Inference router | Sandbox-local forwarding for `https://inference.local` to configured model backends. |
+| Policy proxy | Mandatory egress path for agent traffic. It enforces destination, binary identity, SSRF, TLS/L7, and endpoint-bound provider credential injection. |
 
 ## Integrating with the Ecosystem
 
@@ -109,14 +106,14 @@ platforms that already provide them.
 
 The gateway owns OpenShell control-plane semantics: sandbox state, lifecycle
 ordering, policy and settings resolution, credential mapping, authorization,
-inference configuration, and relay coordination. Drivers translate those
-semantics into platform-native operations. They should stay thin, preserve
+and relay coordination. Drivers translate those semantics into platform-native
+operations. They should stay thin, preserve
 native behavior by default, and report platform lifecycle events back through
 the shared contracts.
 
 The supervisor owns OpenShell sandbox semantics. Filesystem policy, process
-privilege reduction, network proxying, inference interception, credential
-injection, security logging, and gateway relay behavior should remain
+privilege reduction, network proxying, endpoint-bound credential injection,
+security logging, and gateway relay behavior should remain
 consistent across runtimes.
 
 This keeps OpenShell usable in local single-player setups, Kubernetes
@@ -128,7 +125,7 @@ ecosystem.
 
 The gateway and sandbox split control-plane authority from runtime enforcement.
 The gateway owns durable platform state: sandboxes, policy revisions, runtime
-settings, provider records, inference configuration, session records, and
+settings, provider records and profiles, session records, and
 authorization decisions. A sandbox owns the local execution boundary: process
 identity, filesystem access, network egress, credential injection, local logs,
 and the agent child process.
@@ -150,8 +147,8 @@ sandbox configuration API for later revisions. The Windows MXC driver reports
 its own readiness and does not expose interactive connect or governed egress.
 
 The gateway delivers desired state; the sandbox applies it locally. Policy,
-settings, credentials, and inference routes flow from the gateway to the
-supervisor. The supervisor validates and applies what can change at runtime,
+settings, provider attachments, and credential bindings flow from the gateway
+to the supervisor. The supervisor validates and applies what can change at runtime,
 keeps last-known-good config when refresh fails, and leaves static isolation
 controls in place until the sandbox is recreated.
 
@@ -170,7 +167,7 @@ that crate's `README.md`.
 | Document | Purpose |
 |---|---|
 | [Gateway](gateway.md) | Gateway control plane, auth, APIs, persistence, settings, and relay coordination. |
-| [Sandbox](sandbox.md) | Sandbox supervisor, child process isolation, proxy, credentials, inference, connect, and logs. |
+| [Sandbox](sandbox.md) | Sandbox supervisor, child process isolation, proxy, provider credentials, connect, and logs. |
 | [Sandbox Limits](sandbox-limits.md) | Sandbox supervisor and egress safety ceilings, ownership rules, current enforcement, and known gaps. |
 | [Security Policy](security-policy.md) | Policy model, enforcement layers, policy updates, policy advisor, and security logging. |
 | [Compute Runtimes](compute-runtimes.md) | Docker, Podman, Kubernetes, VM, sandbox images, and runtime-specific responsibilities. |

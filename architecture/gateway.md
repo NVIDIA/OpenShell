@@ -2,17 +2,16 @@
 
 The gateway is the OpenShell control plane. It exposes the API used by the CLI,
 SDK, and TUI; persists platform state; manages provider credentials and
-inference configuration; and asks compute runtimes to create or delete sandbox
-workloads.
+attachments; and asks compute runtimes to create or delete sandbox workloads.
 
 ## Responsibilities
 
 - Authenticate clients and sandbox callbacks.
 - Serve gRPC APIs for sandbox lifecycle, provider management, policy updates,
-  settings, inference configuration, logs, watch streams, and relay forwarding.
+  settings, logs, watch streams, and relay forwarding.
 - Serve HTTP endpoints for health, WebSocket tunnels, and edge-auth flows.
 - Persist domain objects in SQLite or Postgres.
-- Resolve provider credentials and inference bundles for sandbox supervisors.
+- Resolve endpoint-bound provider environments for sandbox supervisors.
 - Coordinate supervisor relay sessions for connect, exec, file sync, and
   service forwarding.
 - Persist the canonical main-process instance ID and normalized exit code on
@@ -62,7 +61,7 @@ authorization boundary. When the primary listener does not cover the address,
 the gateway adds a callback-only listener. Additional callback listeners accept
 only gRPC methods classified as sandbox-callable by the gateway's generated
 authorization metadata. They reject user and administrator APIs, health,
-reflection, non-callback inference APIs, and HTTP routes before normal request
+reflection, and HTTP routes before normal request
 authentication. The operator-configured primary listener retains the full
 multiplexed API surface.
 
@@ -277,7 +276,6 @@ The gateway API is organized around platform objects and operational streams:
 | Sandbox lifecycle | Create, list, delete, watch, exec, SSH session bootstrap, ForwardTcp service forwarding. |
 | Providers | Store provider records, discover credentials, resolve runtime environment. |
 | Policy and settings | Get effective sandbox config, update sandbox policy, manage global settings. |
-| Inference | Set gateway-level model/provider config and resolve sandbox route bundles. |
 | Observability | Push sandbox logs, stream sandbox status and logs to clients. |
 
 Domain objects use shared metadata: stable server-generated IDs, human-readable
@@ -299,7 +297,7 @@ The storage schema is intentionally narrow:
 | Column | Purpose |
 |---|---|
 | `id` | Stable gateway-generated object ID and primary key. |
-| `object_type` | Logical resource kind, such as `sandbox`, `provider`, `ssh_session`, `inference_route`, `sandbox_policy`, or `draft_policy_chunk`. |
+| `object_type` | Logical resource kind, such as `sandbox`, `provider`, `provider_profile`, `ssh_session`, `sandbox_policy`, or `draft_policy_chunk`. |
 | `name` | Human-readable name, unique within an object type when present. |
 | `scope` | Optional owner or namespace for scoped/versioned records, such as a sandbox ID for policy revisions. |
 | `version` | Optional monotonically increasing version for scoped records. |
@@ -346,9 +344,9 @@ not readable by other local users on shared hosts. The same restriction is
 reapplied to the `<db>-wal` and `<db>-shm` sidecars (created by SQLite's
 default WAL journal mode), which mirror the same sensitive contents.
 
-Persisted state includes sandboxes, providers, provider credential refresh
-state, SSH sessions, policy revisions, settings, inference configuration, and
-deployment records, and reusable sandbox workload templates. Provider refresh
+Persisted state includes sandboxes, providers, provider profiles, provider
+credential refresh state, SSH sessions, policy revisions, settings, deployment
+records, and reusable sandbox workload templates. Provider refresh
 state is stored as a separate object scoped to the provider instance through
 `objects.scope`. Its non-secret configuration remains inline, while refresh
 tokens, client secrets, private keys, and other secret source material are
@@ -464,7 +462,6 @@ coverage:
 | Sandbox | `MustCreate` | `update_message_cas` | `list_messages` |
 | Provider | `MustCreate` | `update_message_cas` | `list_messages` |
 | ProviderProfile | `MustCreate` | `MatchResourceVersion` | `list_messages` |
-| InferenceRoute | `MustCreate` | `update_message_cas` | `list_messages` |
 | SandboxPolicy | scoped versioning | scoped versioning | scoped query |
 | Settings | `Mutex`-guarded | `Mutex`-guarded | single-row |
 
@@ -526,69 +523,25 @@ configuration, valid endpoint-bound static credentials from other attached
 providers, and the dynamic credential snapshot. Provider environment revisions
 include profile endpoint and binding changes.
 
-## Inference Resolution
+## Provider Environment Resolution
 
-Cluster inference routes store only `provider_name`, `model_id`, and optional
-timeout. The gateway resolves endpoint URLs, protocols, credentials, auth
-style, and route-shaping metadata from the provider record when supervisors call
-`GetInferenceBundle`. Supported provider types for cluster inference are
-`openai`, `anthropic`, `nvidia`, `deepinfra`, and `google-vertex-ai`.
+The gateway resolves only the providers attached to a sandbox. It combines each
+provider instance with its profile, returns non-secret configuration, and marks
+credentials with the profile's host, port, and path boundaries. The supervisor
+uses those bindings when it replaces credential placeholders in policy-allowed
+requests.
 
-The bundle carries enough information for sandbox-local routers to construct
-upstream URLs without re-deriving provider-specific routing logic. Each resolved
-route may include:
-
-| Field | Meaning |
-|---|---|
-| `model_in_path` | When true, the model identifier is part of the upstream URL path, not only the request body. |
-| `request_path_override` | Path override or suffix. With `model_in_path=false`, replaces the protocol-derived path; with `model_in_path=true`, appended after the model ID. |
-
-For standard providers these fields stay unset and the sandbox router uses default
-protocol paths. Vertex AI is model-aware: the gateway constructs the base URL
-from provider config (`VERTEX_AI_PROJECT_ID`, `VERTEX_AI_REGION`, optional
-`VERTEX_AI_PUBLISHER`) and emits route-shaping metadata so the sandbox router
-stays provider-agnostic.
-
-Host selection follows the configured region:
-
-| Region value | Vertex host |
-|---|---|
-| `global` | `aiplatform.googleapis.com` |
-| `us` or `eu` | `aiplatform.{region}.rep.googleapis.com` |
-| Any other (e.g. `us-central1`) | `{region}-aiplatform.googleapis.com` |
-
-Route shaping by publisher:
-
-- **Anthropic (Claude)** — `model_in_path=true`, base path under
-  `publishers/anthropic/models`, protocol `anthropic_messages` only. The gateway
-  resolves `request_path_override=:rawPredict`; the sandbox router keeps
-  `:rawPredict` for buffered requests and upgrades to `:streamRawPredict` only
-  for streaming proxy calls.
-- **All other models** (Gemini, third-party, unknown) — OpenAI-compatible
-  `.../endpoints/openapi` base with `request_path_override=/chat/completions`;
-  protocol `openai_chat_completions`.
-
-Callers may supply `GOOGLE_VERTEX_AI_BASE_URL` or `VERTEX_AI_BASE_URL` only for
-non-Anthropic routes. Anthropic base URL overrides are rejected because they
-cannot safely preserve model-path shaping and `anthropic_version` body
-adaptation. Overrides still pin `request_path_override=/chat/completions` and
-must use `https` with an official Vertex AI hostname (`aiplatform.googleapis.com`,
-`aiplatform.{us,eu}.rep.googleapis.com`, or `{region}-aiplatform.googleapis.com`).
-
-Header passthrough is protocol-dependent. Vertex Claude rawPredict routes strip
-client `anthropic-beta` headers; `anthropic-version` is not forwarded because
-the sandbox router injects `anthropic_version` into the request body for Vertex
-rawPredict. Non-Anthropic Vertex routes do not inherit Anthropic passthrough
-headers.
+Model selection, API protocol, request and response shapes, streaming behavior,
+and endpoint URL construction remain responsibilities of the workload's native
+client. The gateway does not parse or transform model API requests.
 
 For `google-vertex-ai` providers created with CLI `--from-gcloud-adc`, the CLI
 calls gateway `ConfigureProviderRefresh` with OAuth2 refresh material from gcloud
 ADC, then `RotateProviderCredential` to mint the first access token before
 reporting success. ADC-backed providers mint into `GOOGLE_VERTEX_AI_TOKEN`. A
 successful create therefore yields an immediately usable provider; failures roll
-back the provider record. Service-account JSON and private keys are gateway-side
-refresh bootstrap material only; sandbox runtime inference receives minted
-access tokens, not raw service-account material.
+back the provider record. Service-account JSON and private keys remain gateway-side
+refresh bootstrap material; sandboxes receive minted access tokens instead.
 
 ## Supervisor Relay
 

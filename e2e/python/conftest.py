@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import grpc
 import pytest
 
-from openshell import InferenceRouteClient, Sandbox, SandboxClient, WorkspaceClient
+from openshell import Sandbox, SandboxClient, WorkspaceClient
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -99,11 +99,6 @@ def sandbox(cluster_name: str | None) -> Callable[..., Sandbox]:
         )
 
     return _create
-
-
-@pytest.fixture(scope="session")
-def inference_client(sandbox_client: SandboxClient) -> InferenceRouteClient:
-    return InferenceRouteClient.from_sandbox_client(sandbox_client)
 
 
 @pytest.fixture(scope="session")

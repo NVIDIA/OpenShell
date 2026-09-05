@@ -143,7 +143,7 @@ the gateway. If the primary listener covers that address, the gateway reuses
 it and sandbox JWT authentication restricts the supervisor to its callback RPC
 allowlist. If the primary listener is not reachable through that address, the
 gateway creates an additional callback-only listener. Use the primary endpoint
-for CLI, administrator, health, reflection, inference-route management, and
+for CLI, administrator, health, reflection, provider management, and
 HTTP requests. A `PermissionDenied` response from an additional callback-only
 listener is expected for those requests. Do not broaden the primary listener
 to `0.0.0.0` solely to make sandbox callbacks reachable.

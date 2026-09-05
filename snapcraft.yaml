@@ -9,7 +9,7 @@ description: |
   OpenShell provides safe, sandboxed runtimes for autonomous AI agents.
   It offers a CLI for managing gateways, sandboxes, and providers with
   policy-enforced egress routing, credential proxying, and privacy-aware
-  LLM inference routing.
+  profile-backed model-provider access.
 
   The OpenShell snap ships a CLI (`openshell`), a terminal UI
   (`openshell.term`), and a managed gateway daemon (`openshell.gateway`).

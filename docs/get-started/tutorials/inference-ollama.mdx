@@ -4,54 +4,35 @@
 title: "Run Local Inference with Ollama"
 sidebar-title: "Inference with Ollama"
 slug: "get-started/tutorials/inference-ollama"
-description: "Run local and cloud models inside an OpenShell sandbox using the Ollama community sandbox, or route sandbox requests to a host-level Ollama server."
-keywords: "Generative AI, Cybersecurity, Tutorial, Inference Routing, Ollama, Local Inference, Sandbox"
+description: "Run Ollama inside a community sandbox or attach a profile for a host-level Ollama server."
+keywords: "Generative AI, Cybersecurity, Tutorial, Ollama, Local Inference, Sandbox, Provider Profile"
 ---
 
-This tutorial covers two ways of running Ollama with OpenShell:
+This tutorial covers two Ollama deployments:
 
-1. Ollama sandbox. This is the recommended way to run Ollama. A self-contained sandbox with Ollama, Claude Code, and Codex pre-installed. One command starts it.
-2. Host-level Ollama. This is an alternative way to run Ollama. Run Ollama on the gateway host and route sandbox inference to it. Use this option when you want a single Ollama instance shared across multiple sandboxes.
-
-After completing this tutorial, you know how to:
-
-- Launch the Ollama community sandbox for a batteries-included experience.
-- Use `ollama launch` to start coding agents inside a sandbox.
-- Expose a host-level Ollama server to sandboxes through `inference.local`.
+1. The self-contained Ollama community sandbox. This is the recommended path.
+2. A host-level Ollama service shared by explicitly authorized sandboxes.
 
 ## Prerequisites
 
-- A working OpenShell installation. Complete the [Quickstart](/get-started/quickstart) before proceeding.
+Complete the [Quickstart](/get-started/quickstart) before proceeding.
 
-## Option A: Ollama Community Sandbox (Recommended)
+## Option A: Ollama Community Sandbox
 
-The Ollama community sandbox bundles Ollama, Claude Code, OpenCode, and Codex into a single image. Ollama starts automatically when the sandbox launches.
-
-<Steps toc={true}>
-
-### Create the Sandbox
+The community image bundles Ollama and supported coding agents:
 
 ```shell
 openshell sandbox create --from ollama
 ```
 
-This pulls the community sandbox image, applies the bundled policy, and drops you into a shell with Ollama running.
-
-### Chat with a Model
-
-Chat with a local model
+Inside the sandbox, run a local or cloud model:
 
 ```shell
 ollama run qwen3.5
-```
-
-Or a cloud model
-
-```shell
 ollama run kimi-k2.5:cloud
 ```
 
-Or use `ollama launch` to start a coding agent with Ollama as the model backend:
+Or launch a coding agent against Ollama:
 
 ```shell
 ollama launch claude
@@ -59,153 +40,107 @@ ollama launch codex
 ollama launch opencode
 ```
 
-For CI/CD and automated workflows, `ollama launch` supports a headless mode:
+For an automated workflow:
 
 ```shell
 ollama launch claude --yes --model qwen3.5
 ```
 
-</Steps>
+Useful starter models include `qwen3.5:0.8b` for smoke tests and `qwen3.5`
+for coding and tool use. Check the
+[Ollama model library](https://ollama.com/library) for current model details.
 
-### Model Recommendations
-
-| Use case | Model | Notes |
-|---|---|---|
-| Smoke test | `qwen3.5:0.8b` | Fast, lightweight, good for verifying setup |
-| Coding and reasoning | `qwen3.5` | Strong tool calling support for agentic workflows |
-| Complex tasks | `nemotron-3-super` | 122B parameter model, needs 48GB+ VRAM |
-| No local GPU | `qwen3.5:cloud` | Runs on Ollama's cloud infrastructure, no `ollama pull` required |
-
-<Note>
-Cloud models use the `:cloud` tag suffix and do not require local hardware.
-
-```shell
-openshell sandbox create --from ollama
-```
-
-</Note>
-
-### Tool Calling
-
-Agentic workflows (Claude Code, Codex, OpenCode) rely on tool calling. The following models have reliable tool calling support: Qwen 3.5, Nemotron-3-Super, GLM-5, and Kimi-K2.5. Check the [Ollama model library](https://ollama.com/library) for the latest models.
-
-### Updating Ollama
-
-To update Ollama inside a running sandbox:
-
-```shell
-update-ollama
-```
-
-Or auto-update on every sandbox start:
+Update the bundled Ollama installation with `update-ollama`, or request an
+update at sandbox start:
 
 ```shell
 openshell sandbox create --from ollama -e OLLAMA_UPDATE=1
 ```
 
-## Option B: Host-Level Ollama
+## Option B: Host-level Ollama
 
-Use this approach when you want a single Ollama instance on the gateway host, shared across multiple sandboxes through `inference.local`.
+Use this path when Ollama runs on the same machine as the OpenShell gateway and
+selected sandboxes should share it.
 
-<Note>
-This approach uses Ollama because it is easy to install and run locally, but you can substitute other inference engines such as vLLM, SGLang, TRT-LLM, and NVIDIA NIM by changing the startup command, base URL, and model name.
-
-</Note>
-
-<Steps toc={true}>
-
-### Install and Start Ollama
-
-Install [Ollama](https://ollama.com/) on the gateway host:
+### Start Ollama on a Reachable Address
 
 ```shell
 curl -fsSL https://ollama.com/install.sh | sh
-```
-
-Start Ollama on all interfaces so it is reachable from sandboxes:
-
-```shell
 OLLAMA_HOST=0.0.0.0:11434 ollama serve
 ```
 
-<Tip>
-If you see `Error: listen tcp 0.0.0.0:11434: bind: address already in use`, Ollama is already running as a system service. Stop it first:
+In another terminal, pull a model:
 
 ```shell
-systemctl stop ollama
-OLLAMA_HOST=0.0.0.0:11434 ollama serve
+ollama pull qwen3.5:0.8b
 ```
 
-</Tip>
+### Import an Endpoint-bearing Profile
 
-### Pull a Model
+Save this as `ollama-openai.yaml`:
 
-In a second terminal, pull a model:
+```yaml
+id: ollama-openai
+display_name: Ollama
+description: Host-level Ollama OpenAI-compatible API
+category: inference
+inference_capable: true
+credentials: []
+endpoints:
+  - host: host.openshell.internal
+    port: 11434
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries:
+  - /usr/bin/curl
+  - /usr/local/bin/curl
+  - /usr/bin/python3
+  - /usr/local/bin/python
+  - /sandbox/.uv/python/**
+  - /sandbox/.venv/**
+```
 
 ```shell
-ollama run qwen3.5:0.8b
+openshell provider profile lint -f ollama-openai.yaml
+openshell provider profile import -f ollama-openai.yaml
+openshell provider create --name ollama --type ollama-openai
 ```
 
-Type `/bye` to exit the interactive session. The model stays loaded.
+The provider has no secret because this Ollama server does not authenticate.
+Its attachment still carries the endpoint and binary policy.
 
-### Create a Provider
-
-Create an OpenAI-compatible provider pointing at the host Ollama:
+### Attach and Verify
 
 ```shell
-openshell provider create \
-    --name ollama \
-    --type openai \
-    --credential OPENAI_API_KEY=empty \
-    --config OPENAI_BASE_URL=http://host.openshell.internal:11434/v1
+openshell sandbox create \
+  --name ollama-client \
+  --provider ollama \
+  -- \
+  curl http://host.openshell.internal:11434/v1/chat/completions \
+    --json '{
+      "model":"qwen3.5:0.8b",
+      "messages":[{"role":"user","content":"hello"}],
+      "max_tokens":10
+    }'
 ```
 
-OpenShell injects `host.openshell.internal` so sandboxes and the gateway can reach the host machine. You can also use the host's LAN IP.
-
-### Set Inference Routing
-
-```shell
-openshell inference set --provider ollama --model qwen3.5:0.8b
-```
-
-Confirm:
-
-```shell
-openshell inference get
-```
-
-### Verify from a Sandbox
-
-```shell
-openshell sandbox create -- \
-    curl https://inference.local/v1/chat/completions \
-    --json '{"messages":[{"role":"user","content":"hello"}],"max_tokens":10}'
-```
-
-The response should be JSON from the model.
-
-</Steps>
+For an OpenAI SDK client, set its base URL to
+`http://host.openshell.internal:11434/v1`, use any non-empty API key value the
+SDK accepts, and select the real Ollama model in the request.
 
 ## Troubleshooting
 
-Common issues and fixes:
-
-- **Ollama not reachable from sandbox:** Ollama must be bound to `0.0.0.0`, not `127.0.0.1`. This applies to host-level Ollama only; the community sandbox handles this automatically.
-- **`OPENAI_BASE_URL` wrong:** Use `http://host.openshell.internal:11434/v1`, not `localhost` or `127.0.0.1`.
-- **Model not found:** Run `ollama ps` to confirm the model is loaded. Run `ollama pull <model>` if needed.
-- **HTTPS instead of HTTP:** Code inside sandboxes must call `https://inference.local`, not `http://`.
-- **AMD GPU driver issues:** Ollama v0.18+ requires ROCm 7 drivers for AMD GPUs. Update your drivers if you see GPU detection failures.
-
-Useful commands:
-
-```shell
-openshell status
-openshell inference get
-openshell provider get ollama
-```
+- Bind host-level Ollama to `0.0.0.0`, not `127.0.0.1`.
+- Use `host.openshell.internal`, not `localhost`, from a sandbox.
+- Confirm attachment with `openshell sandbox provider list ollama-client`.
+- Inspect the effective policy with `openshell policy get ollama-client --full`.
+- Run `ollama ps` and `ollama pull <model>` when the model is unavailable.
+- If the gateway is remote, the hostname refers to the remote gateway host,
+  not your laptop. Use a shared service address or tunnel instead.
 
 ## Next Steps
 
-- To learn more about managed inference, refer to [Inference Routing](/sandboxes/inference-routing).
-- To configure a different self-hosted backend, refer to [Inference Routing](/sandboxes/inference-routing#configure-inference-routing).
-- To learn how sandbox containers are selected, refer to [Sandboxes](/sandboxes/manage-sandboxes#custom-containers).
+- [Provider-backed Inference](/sandboxes/inference-routing)
+- [Profiles](/providers/profiles)
+- [Customize Sandbox Policies](/sandboxes/policies)

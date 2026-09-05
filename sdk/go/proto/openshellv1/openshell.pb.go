@@ -8923,7 +8923,7 @@ type UpdateConfigRequest struct {
 	// The new policy to apply.
 	//
 	// Sandbox scope (`global=false`):
-	//   - only network_policies and inference fields may differ from create-time
+	//   - only network_policies may differ from create-time
 	//     policy; static fields must match version 1.
 	//
 	// Global scope (`global=true`):

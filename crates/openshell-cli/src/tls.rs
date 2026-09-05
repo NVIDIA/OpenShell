@@ -4,7 +4,6 @@
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::net::set_tcp_nodelay_best_effort;
-use openshell_core::proto::inference_client::InferenceClient;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use rustls::{
     RootCertStore,
@@ -26,8 +25,6 @@ use url::{Host, Url};
 
 /// Concrete gRPC client type used by all commands.
 pub type GrpcClient = OpenShellClient<InterceptedService<Channel, EdgeAuthInterceptor>>;
-/// Concrete inference client type.
-pub type GrpcInferenceClient = InferenceClient<InterceptedService<Channel, EdgeAuthInterceptor>>;
 
 #[derive(Clone, Debug, Default)]
 pub struct TlsOptions {
@@ -464,12 +461,6 @@ pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
 
 fn interceptor_from_tls(tls: &TlsOptions) -> Result<EdgeAuthInterceptor> {
     EdgeAuthInterceptor::new(tls.oidc_token.as_deref(), tls.edge_token.as_deref())
-}
-
-pub async fn grpc_inference_client(server: &str, tls: &TlsOptions) -> Result<GrpcInferenceClient> {
-    let channel = build_channel(server, tls).await?;
-    let interceptor = interceptor_from_tls(tls)?;
-    Ok(InferenceClient::with_interceptor(channel, interceptor))
 }
 
 #[cfg(test)]

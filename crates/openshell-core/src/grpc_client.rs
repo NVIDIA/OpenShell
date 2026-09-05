@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! gRPC client for fetching sandbox policy, provider environment, and inference
-//! route bundles from `OpenShell` server.
+//! gRPC client for fetching sandbox policy and provider environment from the
+//! `OpenShell` server.
 //!
 //! Every request carries a sandbox bearer credential in the `Authorization`
 //! header. The token is resolved at startup from one of three sources:
@@ -24,11 +24,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::proto::{
     DenialSummary, ExchangeProviderSubjectTokenRequest, GetDraftPolicyRequest,
-    GetInferenceBundleRequest, GetInferenceBundleResponse, GetSandboxConfigRequest,
-    GetSandboxProviderEnvironmentRequest, IssueSandboxTokenRequest, NetworkActivitySummary,
-    PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest, ReportPolicyStatusRequest,
-    SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
-    UpdateConfigRequest, inference_client::InferenceClient, open_shell_client::OpenShellClient,
+    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, IssueSandboxTokenRequest,
+    NetworkActivitySummary, PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
+    ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest,
+    SubmitPolicyAnalysisResponse, UpdateConfigRequest, open_shell_client::OpenShellClient,
 };
 use crate::sandbox_env;
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -681,12 +680,6 @@ async fn connect(endpoint: &str) -> Result<OpenShellClient<AuthedChannel>> {
     Ok(OpenShellClient::new(channel))
 }
 
-/// Connect to the inference service.
-async fn connect_inference(endpoint: &str) -> Result<InferenceClient<AuthedChannel>> {
-    let channel = connect_channel(endpoint).await?;
-    Ok(InferenceClient::new(channel))
-}
-
 /// Fetch sandbox policy from `OpenShell` server via gRPC.
 ///
 /// Returns `Ok(Some(policy))` when the server has a policy configured,
@@ -1221,18 +1214,4 @@ impl CachedOpenShellClient {
 
         Ok(())
     }
-}
-
-/// Fetch the resolved inference route bundle from the server.
-pub async fn fetch_inference_bundle(endpoint: &str) -> Result<GetInferenceBundleResponse> {
-    debug!(endpoint = %endpoint, "Fetching inference route bundle");
-
-    let mut client = connect_inference(endpoint).await?;
-
-    let response = client
-        .get_inference_bundle(GetInferenceBundleRequest {})
-        .await
-        .into_diagnostic()?;
-
-    Ok(response.into_inner())
 }
