@@ -539,12 +539,12 @@ enum Commands {
 
         /// Filter by log source: "gateway", "sandbox", or "all" (default).
         /// Can be specified multiple times: --source gateway --source sandbox
-        #[arg(long, default_value = "all")]
-        source: Vec<String>,
+        #[arg(long, value_enum, ignore_case = true, default_value = "all")]
+        source: Vec<LogSource>,
 
-        /// Minimum log level to display: error, warn, info (default), debug, trace.
-        #[arg(long, default_value = "")]
-        level: String,
+        /// Minimum log level to display: error, warn, info, debug, trace.
+        #[arg(long, value_enum, ignore_case = true)]
+        level: Option<LogLevel>,
     },
 
     /// Manage sandbox policy.
@@ -751,6 +751,61 @@ fn normalize_completion_script(output: Vec<u8>, executable: &std::path::Path) ->
     let script = String::from_utf8(output)
         .map_err(|e| miette::miette!("generated completions were not valid UTF-8: {e}"))?;
     Ok(script.replace(executable.to_string_lossy().as_ref(), "openshell"))
+}
+
+/// Log source accepted by `openshell logs --source`.
+///
+/// The server matches sources by exact string, so an unrecognized value
+/// silently filters every line out. Restricting the flag to known values makes
+/// a typo an argument error instead of an empty result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum LogSource {
+    Gateway,
+    Sandbox,
+    All,
+}
+
+impl LogSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Gateway => "gateway",
+            Self::Sandbox => "sandbox",
+            Self::All => "all",
+        }
+    }
+}
+
+/// Minimum severity accepted by `openshell logs --level`.
+///
+/// The server ranks an unrecognized level below every real one, so a typo
+/// silently disables the filter and returns all levels. Restricting the flag to
+/// known values makes that a visible argument error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    /// Accepted because the gateway ranks OCSF alongside INFO, so this has
+    /// always worked as a threshold. Hidden rather than advertised: it selects
+    /// exactly the same lines as `info`, and offering two spellings for one
+    /// threshold in `--help` would suggest a distinction that does not exist.
+    #[value(hide = true)]
+    Ocsf,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Ocsf => "ocsf",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -2794,14 +2849,19 @@ async fn run_async() -> Result<()> {
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name);
             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+            let sources = source
+                .iter()
+                .map(|value| value.as_str().to_string())
+                .collect::<Vec<_>>();
+            let level = level.map_or("", LogLevel::as_str);
             run::sandbox_logs(
                 &ctx.endpoint,
                 &name,
                 n,
                 tail,
                 since.as_deref(),
-                &source,
-                &level,
+                &sources,
+                level,
                 &cli.workspace,
                 &tls,
             )
@@ -4484,6 +4544,70 @@ mod tests {
 
         assert_eq!(from.get_value_hint(), ValueHint::AnyPath);
         assert_eq!(dest.get_value_hint(), ValueHint::AnyPath);
+    }
+
+    #[test]
+    fn logs_level_accepts_known_values_any_case() {
+        for value in [
+            "error", "warn", "info", "debug", "trace", "ERROR", "Warn", "ocsf", "OCSF",
+        ] {
+            Cli::try_parse_from(["openshell", "logs", "sb", "--level", value])
+                .unwrap_or_else(|err| panic!("--level {value} should parse: {err}"));
+        }
+    }
+
+    #[test]
+    fn logs_source_accepts_known_values_any_case() {
+        for value in ["gateway", "sandbox", "all", "Gateway", "SANDBOX"] {
+            Cli::try_parse_from(["openshell", "logs", "sb", "--source", value])
+                .unwrap_or_else(|err| panic!("--source {value} should parse: {err}"));
+        }
+    }
+
+    /// The server ranks an unrecognized level below every real one, so a typo
+    /// used to disable the filter and return all levels instead of erroring.
+    #[test]
+    fn logs_level_rejects_unknown_values() {
+        for value in ["warning", "critical", "wanr", ""] {
+            Cli::try_parse_from(["openshell", "logs", "sb", "--level", value])
+                .expect_err(&format!("--level {value} should be rejected"));
+        }
+    }
+
+    /// The server matches sources by exact string, so a typo used to filter
+    /// every line out and return nothing instead of erroring.
+    #[test]
+    fn logs_source_rejects_unknown_values() {
+        Cli::try_parse_from(["openshell", "logs", "sb", "--source", "gatewy"])
+            .expect_err("--source gatewy should be rejected");
+    }
+
+    #[test]
+    fn logs_source_accepts_repeated_known_values() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "logs",
+            "sb",
+            "--source",
+            "gateway",
+            "--source",
+            "sandbox",
+        ])
+        .expect("repeated --source should parse");
+        let Some(Commands::Logs { source, .. }) = cli.command else {
+            panic!("expected logs command");
+        };
+        assert_eq!(source, vec![LogSource::Gateway, LogSource::Sandbox]);
+    }
+
+    #[test]
+    fn logs_defaults_to_all_sources_and_no_level_filter() {
+        let cli = Cli::try_parse_from(["openshell", "logs", "sb"]).expect("logs should parse");
+        let Some(Commands::Logs { source, level, .. }) = cli.command else {
+            panic!("expected logs command");
+        };
+        assert_eq!(source, vec![LogSource::All]);
+        assert_eq!(level, None);
     }
 
     #[test]
