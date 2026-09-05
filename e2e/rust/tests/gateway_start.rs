@@ -26,12 +26,21 @@ const STOPPED_READY_MARKER: &str = "gateway-start-stopped-ready";
 const START_FILE: &str = "/sandbox/gateway-start-state";
 const SANDBOX_NAMESPACE_LABEL: &str = "openshell.ai/sandbox-namespace";
 const SANDBOX_NAME_LABEL: &str = "openshell.ai/sandbox-name";
+const SANDBOX_ROLE_LABEL_FILTER: &str = "label=openshell.ai/isolation-role=sandbox";
 
 fn sandbox_container_id(namespace: &str, sandbox_name: &str) -> Result<String, String> {
     let namespace_filter = format!("label={SANDBOX_NAMESPACE_LABEL}={namespace}");
     let sandbox_name_filter = format!("label={SANDBOX_NAME_LABEL}={sandbox_name}");
     let output = Command::new("docker")
-        .args(["ps", "-aq", "--filter", MANAGED_BY_LABEL_FILTER, "--filter"])
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            MANAGED_BY_LABEL_FILTER,
+            "--filter",
+            SANDBOX_ROLE_LABEL_FILTER,
+            "--filter",
+        ])
         .arg(namespace_filter)
         .args(["--filter"])
         .arg(sandbox_name_filter)
