@@ -32,5 +32,6 @@ CONFIG_POSIX_MQUEUE_SYSCTL=y
 # Capability-free sandbox enforcement.
 CONFIG_SECURITY=y
 CONFIG_SECURITY_LANDLOCK=y
+CONFIG_LSM="landlock,lockdown,yama,loadpin,safesetid,ipe,bpf"
 CONFIG_SECCOMP=y
 CONFIG_SECCOMP_FILTER=y
