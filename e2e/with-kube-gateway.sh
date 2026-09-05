@@ -13,8 +13,20 @@
 #       Create a local k3d cluster via tasks/scripts/helm-k3s-local.sh, install
 #       the chart, port-forward, and tear the cluster down on exit.
 #
-# Helm e2e currently uses plaintext gateway traffic (ci/values-skaffold.yaml).
-# The certgen hook still runs so the gateway has sandbox JWT signing keys.
+# On vanilla Kubernetes, Helm e2e talks to the gateway in plaintext over
+# `kubectl port-forward` (ci/values-skaffold.yaml). The certgen hook still runs
+# so the gateway has sandbox JWT signing keys.
+#
+# On OpenShift, that port-forward is too slow for `sandbox connect`. That command
+# opens an SSH session to the gateway, and SSH needs many small back-and-forth
+# messages to set up. Each one has to travel through the port-forward tunnel, so
+# the connection never finishes and the test times out. To avoid this, on
+# OpenShift the harness reaches the gateway through a normal network path: a
+# passthrough OpenShift Route, secured with mandatory mTLS
+# (ci/values-openshift-e2e.yaml).
+#
+# Every OpenShift-specific branch below is gated on OPENSHIFT_DETECTED, so the
+# vanilla-Kubernetes path stays exactly the same.
 #
 # Set OPENSHELL_E2E_KUBE_EXTRA_VALUES to one or more colon-separated Helm values
 # files, relative to the repository root or absolute, to layer additional chart
@@ -94,6 +106,13 @@ VAULT_CHART_VERSION="${OPENSHELL_E2E_OPENBAO_CHART_VERSION:-0.28.3}"
 VAULT_DEV_ROOT_TOKEN="${OPENSHELL_E2E_VAULT_DEV_ROOT_TOKEN:-root}"
 CORPORATE_PROXY_FIXTURE_DEPLOYED=0
 CORPORATE_PROXY_FIXTURE_SECRET="openshell-e2e-proxy-auth"
+OPENSHIFT_DETECTED=0
+OPENSHIFT_SANDBOX_SCC_GRANTED=0
+OPENSHIFT_POSTGRES_SCC_GRANTED=0
+OPENSHIFT_ROUTE_HOST=""
+# Temp dir holding the client mTLS material extracted from openshell-client-tls
+# for the OpenShift Route transport. Removed by cleanup().
+OPENSHIFT_PKI_DIR="${WORKDIR}/openshift-pki"
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -134,6 +153,16 @@ deploy_postgres_fixture() {
     kctl create namespace "${NAMESPACE}"
   fi
 
+  if [ "${OPENSHIFT_DETECTED}" = "1" ]; then
+    echo "Granting anyuid SCC to ${EXTERNAL_PG_FIXTURE_SERVICE} for OpenShift..."
+    oc adm policy add-scc-to-user anyuid \
+      --context "${KUBE_CONTEXT}" \
+      -z "${EXTERNAL_PG_FIXTURE_SERVICE}" -n "${NAMESPACE}"
+    # Record the grant before applying the fixture so cleanup revokes it even if
+    # the apply below fails and EXTERNAL_PG_FIXTURE_DEPLOYED is never set.
+    OPENSHIFT_POSTGRES_SCC_GRANTED=1
+  fi
+
   kctl -n "${NAMESPACE}" apply -f "${EXTERNAL_PG_FIXTURE_MANIFEST}"
   EXTERNAL_PG_FIXTURE_DEPLOYED=1
   EXTERNAL_PG_FIXTURE_SECRET="${secret_name}"
@@ -157,6 +186,14 @@ cleanup_postgres_fixture() {
     --ignore-not-found >/dev/null 2>&1 || true
   kctl -n "${NAMESPACE}" delete secret "${secret_name}" \
     --ignore-not-found >/dev/null 2>&1 || true
+
+  if [ "${OPENSHIFT_POSTGRES_SCC_GRANTED}" = "1" ]; then
+    oc adm policy remove-scc-from-user anyuid \
+      --context "${KUBE_CONTEXT}" \
+      -z "${EXTERNAL_PG_FIXTURE_SERVICE}" -n "${NAMESPACE}" \
+      2>/dev/null || true
+    OPENSHIFT_POSTGRES_SCC_GRANTED=0
+  fi
 
   EXTERNAL_PG_FIXTURE_DEPLOYED=0
   EXTERNAL_PG_FIXTURE_SECRET=""
@@ -242,7 +279,8 @@ cleanup() {
     fi
   fi
 
-  if [ "${EXTERNAL_PG_FIXTURE_DEPLOYED}" = "1" ]; then
+  if [ "${EXTERNAL_PG_FIXTURE_DEPLOYED}" = "1" ] \
+     || [ "${OPENSHIFT_POSTGRES_SCC_GRANTED}" = "1" ]; then
     cleanup_postgres_fixture "${EXTERNAL_PG_FIXTURE_SECRET}"
   fi
 
@@ -253,6 +291,20 @@ cleanup() {
   if [ "${CORPORATE_PROXY_FIXTURE_DEPLOYED}" = "1" ]; then
     kctl -n "${NAMESPACE}" delete secret "${CORPORATE_PROXY_FIXTURE_SECRET}" \
       --ignore-not-found >/dev/null 2>&1 || true
+  fi
+
+  if [ "${OPENSHIFT_SANDBOX_SCC_GRANTED}" = "1" ]; then
+    oc adm policy remove-scc-from-user privileged \
+      --context "${KUBE_CONTEXT}" \
+      -z openshell-sandbox -n "${NAMESPACE}" \
+      2>/dev/null || true
+    OPENSHIFT_SANDBOX_SCC_GRANTED=0
+  fi
+
+  # Remove the extracted client mTLS material (also covered by the WORKDIR sweep
+  # below, but drop the private key promptly and explicitly).
+  if [ -n "${OPENSHIFT_PKI_DIR}" ]; then
+    rm -rf "${OPENSHIFT_PKI_DIR}" 2>/dev/null || true
   fi
 
   # Sweep managed-mode and operator-mode workspace namespaces before
@@ -327,6 +379,15 @@ scenario_cleanup_release() {
     -l "app.kubernetes.io/instance=${RELEASE_NAME}" --wait=false 2>/dev/null || true
 }
 
+scenario_record_failure() {
+  local scenario_label="$1"
+  local reason="$2"
+  DB_FAILED=$((DB_FAILED + 1))
+  DB_SCENARIOS_SUMMARY+=("FAIL  ${scenario_label}: ${reason}")
+  scenario_stop_portforward
+  scenario_cleanup_release
+}
+
 scenario_deploy_external_pg() {
   echo "==> Deploying standalone PostgreSQL as external database..."
   deploy_postgres_fixture my-pg-credentials
@@ -363,83 +424,32 @@ run_scenario() {
     --wait --timeout 5m
   HELM_INSTALLED=1
 
-  LOCAL_PORT="$(e2e_pick_port)"
-  echo "Starting kubectl port-forward svc/openshell ${LOCAL_PORT}:8080..."
-  kctl -n "${NAMESPACE}" port-forward "svc/openshell" \
-    "${LOCAL_PORT}:8080" >"${PORTFORWARD_LOG}" 2>&1 &
-  PORTFORWARD_PID=$!
-
-  local elapsed=0 pf_timeout=30
-  while [ "${elapsed}" -lt "${pf_timeout}" ]; do
-    if ! kill -0 "${PORTFORWARD_PID}" 2>/dev/null; then
-      echo "ERROR: kubectl port-forward exited before becoming reachable" >&2
-      cat "${PORTFORWARD_LOG}" >&2 || true
-      DB_FAILED=$((DB_FAILED + 1))
-      DB_SCENARIOS_SUMMARY+=("FAIL  ${scenario_label}: port-forward died")
-      scenario_stop_portforward
-      scenario_cleanup_release
+  if [ "${OPENSHIFT_DETECTED}" = "1" ]; then
+    # OpenShift: reach the gateway over the passthrough Route with mTLS instead
+    # of port-forward (which stalls the SSH-relay connect suites).
+    if ! openshift_register_route_gateway; then
+      scenario_record_failure "${scenario_label}" "Route/mTLS setup failed"
       return
     fi
-    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${LOCAL_PORT}"; then
-      break
-    fi
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
-  if [ "${elapsed}" -ge "${pf_timeout}" ]; then
-    echo "ERROR: port-forward did not accept TCP within ${pf_timeout}s" >&2
-    cat "${PORTFORWARD_LOG}" >&2 || true
-    DB_FAILED=$((DB_FAILED + 1))
-    DB_SCENARIOS_SUMMARY+=("FAIL  ${scenario_label}: port-forward timeout")
-    scenario_stop_portforward
-    scenario_cleanup_release
-    return
-  fi
-
-  HEALTH_LOCAL_PORT="$(e2e_pick_port)"
-  local workload_ref
-  workload_ref="$(kube_workload_ref "${RELEASE_NAME}")"
-  echo "Starting kubectl port-forward ${workload_ref} ${HEALTH_LOCAL_PORT}:health..."
-  kctl -n "${NAMESPACE}" port-forward "${workload_ref}" \
-    "${HEALTH_LOCAL_PORT}:health" >"${PORTFORWARD_HEALTH_LOG}" 2>&1 &
-  PORTFORWARD_HEALTH_PID=$!
-
-  elapsed=0
-  while [ "${elapsed}" -lt "${pf_timeout}" ]; do
-    if ! kill -0 "${PORTFORWARD_HEALTH_PID}" 2>/dev/null; then
-      echo "ERROR: kubectl health port-forward exited before becoming reachable" >&2
-      cat "${PORTFORWARD_HEALTH_LOG}" >&2 || true
-      DB_FAILED=$((DB_FAILED + 1))
-      DB_SCENARIOS_SUMMARY+=("FAIL  ${scenario_label}: health port-forward died")
-      scenario_stop_portforward
-      scenario_cleanup_release
+  else
+    # Vanilla Kubernetes: reach the gateway in plaintext over port-forward.
+    if ! start_grpc_portforward; then
+      scenario_record_failure "${scenario_label}" "port-forward failed"
       return
     fi
-    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${HEALTH_LOCAL_PORT}/healthz"; then
-      break
-    fi
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
-  if [ "${elapsed}" -ge "${pf_timeout}" ]; then
-    echo "ERROR: health port-forward did not accept TCP within ${pf_timeout}s" >&2
-    cat "${PORTFORWARD_HEALTH_LOG}" >&2 || true
-    DB_FAILED=$((DB_FAILED + 1))
-    DB_SCENARIOS_SUMMARY+=("FAIL  ${scenario_label}: health port-forward timeout")
-    scenario_stop_portforward
-    scenario_cleanup_release
-    return
+    GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
+    GATEWAY_ENDPOINT="http://127.0.0.1:${LOCAL_PORT}"
+    e2e_register_plaintext_gateway \
+      "${XDG_CONFIG_HOME}" \
+      "${GATEWAY_NAME}" \
+      "${GATEWAY_ENDPOINT}" \
+      "${LOCAL_PORT}"
   fi
 
-  export OPENSHELL_E2E_HEALTH_PORT="${HEALTH_LOCAL_PORT}"
-
-  GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
-  GATEWAY_ENDPOINT="http://127.0.0.1:${LOCAL_PORT}"
-  e2e_register_plaintext_gateway \
-    "${XDG_CONFIG_HOME}" \
-    "${GATEWAY_NAME}" \
-    "${GATEWAY_ENDPOINT}" \
-    "${LOCAL_PORT}"
+  if ! start_health_portforward; then
+    scenario_record_failure "${scenario_label}" "health port-forward failed"
+    return
+  fi
 
   export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
   export OPENSHELL_E2E_DRIVER="kubernetes"
@@ -491,6 +501,148 @@ configure_fixture_container_engine() {
       ;;
   esac
   export CONTAINER_ENGINE="${selected_engine}"
+}
+
+# OpenShift only: extract the client mTLS material, wait for the passthrough
+# Route to serve mTLS, assert that a certless caller is rejected at the TLS
+# handshake, and register an mTLS CLI gateway pointing at the Route.
+#
+# Sets GATEWAY_NAME and GATEWAY_ENDPOINT on success. Returns non-zero on failure
+# (unreachable Route or a certless request that was NOT rejected — a security
+# hole). Reads OPENSHIFT_ROUTE_HOST and OPENSHIFT_PKI_DIR.
+openshift_register_route_gateway() {
+  local pki_dir="${OPENSHIFT_PKI_DIR}"
+
+  rm -rf "${pki_dir}"
+  mkdir -p "${pki_dir}/client"
+
+  echo "Extracting client mTLS material from secret openshell-client-tls..."
+  kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+    -o jsonpath='{.data.ca\.crt}' | base64 -d >"${pki_dir}/ca.crt"
+  kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+    -o jsonpath='{.data.tls\.crt}' | base64 -d >"${pki_dir}/client/tls.crt"
+  kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+    -o jsonpath='{.data.tls\.key}' | base64 -d >"${pki_dir}/client/tls.key"
+
+  # Wait until an mTLS request to the Route completes the TLS handshake. Helm
+  # --wait already made the gateway pod Ready; this only covers the short window
+  # while the OpenShift router loads the new Route.
+  echo "Waiting for Route https://${OPENSHIFT_ROUTE_HOST} to serve mTLS..."
+  local elapsed=0 timeout=180
+  while [ "${elapsed}" -lt "${timeout}" ]; do
+    if curl -s --max-time 10 -o /dev/null \
+         --cacert "${pki_dir}/ca.crt" \
+         --cert "${pki_dir}/client/tls.crt" \
+         --key "${pki_dir}/client/tls.key" \
+         "https://${OPENSHIFT_ROUTE_HOST}/"; then
+      break
+    fi
+    sleep 3
+    elapsed=$((elapsed + 3))
+  done
+  if [ "${elapsed}" -ge "${timeout}" ]; then
+    echo "ERROR: Route ${OPENSHIFT_ROUTE_HOST} did not serve mTLS within ${timeout}s" >&2
+    return 1
+  fi
+
+  # Security gate: a caller with no client certificate MUST be rejected during
+  # the TLS handshake (clientCaSecretName set + no OIDC => mTLS mandatory).
+  #
+  # Validate the server cert with --cacert (no -k) and inspect curl's exit code
+  # so an unrelated TLS/DNS/timeout failure is not silently accepted as "certless
+  # rejected". Only a handshake abort by the server (no client cert presented)
+  # counts as the expected rejection.
+  local certless_rc=0
+  curl -s --max-time 10 -o /dev/null \
+    --cacert "${pki_dir}/ca.crt" \
+    "https://${OPENSHIFT_ROUTE_HOST}/" || certless_rc=$?
+  case "${certless_rc}" in
+    0)
+      echo "ERROR: SECURITY HOLE — gateway accepted a certless request over the Route" >&2
+      return 1
+      ;;
+    35 | 56)
+      # 35 CURLE_SSL_CONNECT_ERROR / 56 CURLE_RECV_ERROR: the server aborted the
+      # TLS handshake because no client certificate was presented — the expected
+      # mTLS rejection.
+      echo "OK: Route reachable over mTLS; certless request rejected at TLS (curl ${certless_rc})."
+      ;;
+    *)
+      echo "ERROR: certless probe to ${OPENSHIFT_ROUTE_HOST} failed with curl exit ${certless_rc}, not a TLS client-auth rejection; cannot confirm mTLS is enforced" >&2
+      return 1
+      ;;
+  esac
+
+  GATEWAY_NAME="openshell-e2e-openshift"
+  GATEWAY_ENDPOINT="https://${OPENSHIFT_ROUTE_HOST}"
+  e2e_register_mtls_gateway \
+    "${XDG_CONFIG_HOME}" \
+    "${GATEWAY_NAME}" \
+    "${GATEWAY_ENDPOINT}" \
+    "$(e2e_endpoint_port "${GATEWAY_ENDPOINT}")" \
+    "${pki_dir}"
+}
+
+# Start `kubectl port-forward svc/openshell` for the gRPC endpoint and wait for
+# it to accept TCP. Sets LOCAL_PORT and PORTFORWARD_PID. Prints the port-forward
+# log and returns non-zero on failure. Used for the vanilla-Kubernetes transport
+# (the OpenShift transport uses openshift_register_route_gateway instead).
+start_grpc_portforward() {
+  LOCAL_PORT="$(e2e_pick_port)"
+  echo "Starting kubectl port-forward svc/openshell ${LOCAL_PORT}:8080..."
+  kctl -n "${NAMESPACE}" port-forward "svc/openshell" \
+    "${LOCAL_PORT}:8080" >"${PORTFORWARD_LOG}" 2>&1 &
+  PORTFORWARD_PID=$!
+
+  local elapsed=0 timeout=30
+  while [ "${elapsed}" -lt "${timeout}" ]; do
+    if ! kill -0 "${PORTFORWARD_PID}" 2>/dev/null; then
+      echo "ERROR: kubectl port-forward exited before becoming reachable" >&2
+      cat "${PORTFORWARD_LOG}" >&2 || true
+      return 1
+    fi
+    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${LOCAL_PORT}"; then
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  echo "ERROR: port-forward did not accept TCP within ${timeout}s" >&2
+  cat "${PORTFORWARD_LOG}" >&2 || true
+  return 1
+}
+
+# Start `kubectl port-forward` for the health endpoint and wait for /healthz.
+# Sets HEALTH_LOCAL_PORT and PORTFORWARD_HEALTH_PID and exports
+# OPENSHELL_E2E_HEALTH_PORT. Used on both cluster types: the OpenShift Route
+# targets grpc only, and the health endpoint is not the SSH path so port-forward
+# is fine for it. Prints the log and returns non-zero on failure.
+start_health_portforward() {
+  HEALTH_LOCAL_PORT="$(e2e_pick_port)"
+  local workload_ref
+  workload_ref="$(kube_workload_ref "${RELEASE_NAME}")"
+  echo "Starting kubectl port-forward ${workload_ref} ${HEALTH_LOCAL_PORT}:health..."
+  kctl -n "${NAMESPACE}" port-forward "${workload_ref}" \
+    "${HEALTH_LOCAL_PORT}:health" >"${PORTFORWARD_HEALTH_LOG}" 2>&1 &
+  PORTFORWARD_HEALTH_PID=$!
+
+  local elapsed=0 timeout=30
+  while [ "${elapsed}" -lt "${timeout}" ]; do
+    if ! kill -0 "${PORTFORWARD_HEALTH_PID}" 2>/dev/null; then
+      echo "ERROR: kubectl health port-forward exited before becoming reachable" >&2
+      cat "${PORTFORWARD_HEALTH_LOG}" >&2 || true
+      return 1
+    fi
+    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${HEALTH_LOCAL_PORT}/healthz"; then
+      export OPENSHELL_E2E_HEALTH_PORT="${HEALTH_LOCAL_PORT}"
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  echo "ERROR: health port-forward did not accept TCP within ${timeout}s" >&2
+  cat "${PORTFORWARD_HEALTH_LOG}" >&2 || true
+  return 1
 }
 
 require_cmd helm
@@ -738,6 +890,41 @@ if [ -n "${HOST_GATEWAY_IP}" ]; then
 fi
 
 helm_values_args=(--values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml")
+if kctl api-resources --api-group=route.openshift.io --no-headers 2>/dev/null | grep -q .; then
+  OPENSHIFT_DETECTED=1
+  echo "OpenShift detected — applying SCC-compatible security context overrides."
+  helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-openshift-scc.yaml")
+
+  if ! command -v oc >/dev/null 2>&1; then
+    echo "ERROR: oc CLI is required for OpenShift SCC management but was not found." >&2
+    exit 2
+  fi
+
+  kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
+
+  echo "Granting privileged SCC to openshell-sandbox in namespace ${NAMESPACE}..."
+  oc adm policy add-scc-to-user privileged \
+    --context "${KUBE_CONTEXT}" \
+    -z openshell-sandbox -n "${NAMESPACE}"
+  OPENSHIFT_SANDBOX_SCC_GRANTED=1
+
+  # Drive the gateway through a passthrough Route with mTLS instead of
+  # port-forward. The Route host is deterministic: OpenShift serves any name
+  # under the cluster ingress (apps) domain via the router's wildcard, so we
+  # bake "<release>-<namespace>.<apps-domain>" into the server cert SANs before
+  # the Route exists.
+  APPS_DOMAIN="$(kctl get ingresses.config/cluster -o jsonpath='{.spec.domain}')"
+  if [ -z "${APPS_DOMAIN}" ]; then
+    echo "ERROR: could not resolve the OpenShift cluster ingress domain." >&2
+    exit 2
+  fi
+  OPENSHIFT_ROUTE_HOST="${RELEASE_NAME}-${NAMESPACE}.${APPS_DOMAIN}"
+  echo "Using OpenShift Route host ${OPENSHIFT_ROUTE_HOST}."
+
+  helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-openshift-e2e.yaml")
+  helm_extra_args+=(--set "openshiftRoute.host=${OPENSHIFT_ROUTE_HOST}")
+  helm_extra_args+=(--set "pkiInitJob.serverDnsNames[0]=${OPENSHIFT_ROUTE_HOST}")
+fi
 if [ "${OPENSHELL_E2E_KUBE_CORPORATE_PROXY:-0}" = "1" ]; then
   if [ -z "${HOST_GATEWAY_IP}" ]; then
     echo "ERROR: corporate proxy e2e requires a host gateway IP for host.openshell.internal" >&2
@@ -866,68 +1053,23 @@ else
       --docker-password=e2e-password
   fi
 
-  LOCAL_PORT="$(e2e_pick_port)"
-  echo "Starting kubectl port-forward svc/openshell ${LOCAL_PORT}:8080..."
-  kctl -n "${NAMESPACE}" port-forward "svc/openshell" \
-    "${LOCAL_PORT}:8080" >"${PORTFORWARD_LOG}" 2>&1 &
-  PORTFORWARD_PID=$!
-
-  elapsed=0
-  timeout=30
-  while [ "${elapsed}" -lt "${timeout}" ]; do
-    if ! kill -0 "${PORTFORWARD_PID}" 2>/dev/null; then
-      echo "ERROR: kubectl port-forward exited before becoming reachable" >&2
-      cat "${PORTFORWARD_LOG}" >&2 || true
-      exit 1
-    fi
-    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${LOCAL_PORT}"; then
-      break
-    fi
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
-  if [ "${elapsed}" -ge "${timeout}" ]; then
-    echo "ERROR: port-forward did not accept TCP within ${timeout}s" >&2
-    cat "${PORTFORWARD_LOG}" >&2 || true
-    exit 1
+  if [ "${OPENSHIFT_DETECTED}" = "1" ]; then
+    # OpenShift: reach the gateway over the passthrough Route with mTLS so the
+    # SSH-relay `sandbox connect` suites work (port-forward stalls them).
+    openshift_register_route_gateway || exit 1
+  else
+    # Vanilla Kubernetes: reach the gateway in plaintext over port-forward.
+    start_grpc_portforward || exit 1
+    GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
+    GATEWAY_ENDPOINT="http://127.0.0.1:${LOCAL_PORT}"
+    e2e_register_plaintext_gateway \
+      "${XDG_CONFIG_HOME}" \
+      "${GATEWAY_NAME}" \
+      "${GATEWAY_ENDPOINT}" \
+      "${LOCAL_PORT}"
   fi
 
-  HEALTH_LOCAL_PORT="$(e2e_pick_port)"
-  WORKLOAD_REF="$(kube_workload_ref "${RELEASE_NAME}")"
-  echo "Starting kubectl port-forward ${WORKLOAD_REF} ${HEALTH_LOCAL_PORT}:health..."
-  kctl -n "${NAMESPACE}" port-forward "${WORKLOAD_REF}" \
-    "${HEALTH_LOCAL_PORT}:health" >"${PORTFORWARD_HEALTH_LOG}" 2>&1 &
-  PORTFORWARD_HEALTH_PID=$!
-
-  elapsed=0
-  timeout=30
-  while [ "${elapsed}" -lt "${timeout}" ]; do
-    if ! kill -0 "${PORTFORWARD_HEALTH_PID}" 2>/dev/null; then
-      echo "ERROR: kubectl health port-forward exited before becoming reachable" >&2
-      cat "${PORTFORWARD_HEALTH_LOG}" >&2 || true
-      exit 1
-    fi
-    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${HEALTH_LOCAL_PORT}/healthz"; then
-      break
-    fi
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
-  if [ "${elapsed}" -ge "${timeout}" ]; then
-    echo "ERROR: health port-forward did not accept TCP within ${timeout}s" >&2
-    cat "${PORTFORWARD_HEALTH_LOG}" >&2 || true
-    exit 1
-  fi
-
-  export OPENSHELL_E2E_HEALTH_PORT="${HEALTH_LOCAL_PORT}"
-
-  GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
-  GATEWAY_ENDPOINT="http://127.0.0.1:${LOCAL_PORT}"
-  e2e_register_plaintext_gateway \
-    "${XDG_CONFIG_HOME}" \
-    "${GATEWAY_NAME}" \
-    "${GATEWAY_ENDPOINT}" \
-    "${LOCAL_PORT}"
+  start_health_portforward || exit 1
 
   export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
   export OPENSHELL_E2E_DRIVER="kubernetes"
