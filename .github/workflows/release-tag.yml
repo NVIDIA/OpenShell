@@ -310,9 +310,7 @@ jobs:
     uses: ./.github/workflows/snap-package.yml
     with:
       checkout-ref: ${{ inputs.tag || github.ref }}
-      upload-channel: ${{ needs.compute-versions.outputs.is_prerelease == 'true' && 'latest/edge' || 'latest/stable' }}
-      github-environment: ${{ needs.compute-versions.outputs.is_prerelease == 'true' && 'latest/edge' || 'latest/stable' }}
-      publish: ${{ needs.compute-versions.outputs.is_prerelease != 'true' }}
+      upload-channel: ${{ needs.compute-versions.outputs.is_prerelease != 'true' && 'latest/stable' || '' }}
     secrets:
       publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 

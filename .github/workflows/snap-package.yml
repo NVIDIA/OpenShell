@@ -10,22 +10,14 @@ on:
         required: true
         type: string
       upload-channel:
-        required: true
-        type: string
-        description: "Snap Store channel to upload to (e.g., latest/edge, latest/candidate, latest/stable)"
-      github-environment:
-        required: true
-        type: string
-        description: "GitHub deployment environment for approval gates (e.g., latest/edge, latest/stable)"
-      publish:
         required: false
-        type: boolean
-        default: true
-        description: "Whether to upload the built snap to the Snap Store"
+        type: string
+        default: ""
+        description: "Snap Store channel to upload to (e.g., latest/edge, latest/candidate, latest/stable)"
 
     secrets:
       publish-credentials:
-        required: true
+        required: false
         description: "Snap Store credentials (SNAPCRAFT_STORE_CREDENTIALS)"
 
 permissions:
@@ -47,141 +39,14 @@ jobs:
           - arch: arm64
             rust_arch: aarch64
             runner: linux-arm64-cpu8
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    environment: ${{ inputs.github-environment }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.checkout-ref }}
-          fetch-depth: 0
-
-      - name: Install snapd
-        run: |
-          set -euo pipefail
-          if ! command -v snapd >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y snapd
-          fi
-          sudo systemctl enable --now snapd.socket
-          sudo systemctl start snapd
-          sudo snap wait system seed.loaded
-
-      - name: Install LXD
-        run: |
-          set -euo pipefail
-          sudo snap install lxd
-          sudo usermod -aG lxd "$USER"
-          sudo lxd waitready
-          sudo lxd init --auto
-          sudo iptables -P FORWARD ACCEPT
-          sudo chgrp lxd /var/snap/lxd/common/lxd/unix.socket
-          sudo chmod 660 /var/snap/lxd/common/lxd/unix.socket
-
-      - name: Install snapcraft
-        run: |
-          set -euo pipefail
-          sudo snap install snapcraft --classic
-
-      - name: Download prebuilt CLI binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: openshell-${{ matrix.rust_arch }}-unknown-linux-musl
-          path: prebuilt/cli
-
-      - name: Download prebuilt gateway binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: openshell-gateway-${{ matrix.rust_arch }}-unknown-linux-gnu
-          path: prebuilt/gateway
-
-      - name: Download prebuilt sandbox binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: openshell-sandbox-${{ matrix.rust_arch }}-unknown-linux-musl
-          path: prebuilt/sandbox
-
-      - name: Configure prebuilt binaries
-        run: |
-          set -euo pipefail
-          chmod +x prebuilt/cli/openshell
-          chmod +x prebuilt/gateway/openshell-gateway
-          chmod +x prebuilt/sandbox/openshell-sandbox
-          ls -laR prebuilt/
-
-      - name: Prepare snap build directory
-        run: |
-          set -euo pipefail
-          mkdir -p snap/prebuilt
-
-          cp prebuilt/cli/openshell snap/prebuilt/openshell
-          cp prebuilt/gateway/openshell-gateway snap/prebuilt/openshell-gateway
-          cp prebuilt/sandbox/openshell-sandbox snap/prebuilt/openshell-sandbox
-
-          cp tasks/scripts/snap-gateway-wrapper.sh snap/prebuilt/openshell-gateway-wrapper
-          cp LICENSE snap/prebuilt/
-          cp README.md snap/prebuilt/
-
-          mkdir -p snap/prebuilt/meta/gui
-          cp snap/local/term.desktop snap/prebuilt/meta/gui/term.desktop
-          cp snap/local/icon.png snap/prebuilt/meta/gui/icon.png
-
-          python3 tasks/scripts/release.py get-version --snap > snap/prebuilt/version
-
-      - name: Build snap
-        run: |
-          set -euo pipefail
-          runtime_dir="/run/user/$(id -u)"
-          sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$runtime_dir"
-          export XDG_RUNTIME_DIR="$runtime_dir"
-          sg lxd -c "XDG_RUNTIME_DIR=${runtime_dir} snapcraft pack -v"
-
-      - name: Upload snapcraft logs on failure
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: snapcraft-logs
-          path: "~/.local/state/snapcraft/log/snapcraft-*.log"
-          retention-days: 7
-
-      - name: Capture snap filename
-        id: capture
-        run: |
-          set -euo pipefail
-          SNAP_FILE=$(ls -1 *.snap 2>/dev/null | head -1)
-          if [ -z "$SNAP_FILE" ]; then
-            echo "ERROR: No .snap file found after snapcraft pack"
-            exit 1
-          fi
-          echo "snap-file=${SNAP_FILE}" >> $GITHUB_OUTPUT
-          echo "Built snap: ${SNAP_FILE}"
-
-      - name: Upload snap artifact (${{ matrix.arch }})
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: snap-linux-${{ matrix.arch }}
-          path: |
-            ${{ steps.capture.outputs.snap-file }}
-            *.comp
-          retention-days: 5
-
-      - name: Upload snap to Snap Store
-        if: inputs.publish
-        env:
-          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.publish-credentials }}
-          INPUTS_UPLOAD_CHANNEL: ${{ inputs.upload-channel }}
-        run: |
-          set -euo pipefail
-          SNAP_FILE="${{ steps.capture.outputs.snap-file }}"
-          SNAP_NAME="${SNAP_FILE%.snap}"
-          SNAP_NAME="${SNAP_NAME%%_*}"
-
-          COMPONENT_ARGS=()
-          shopt -s nullglob
-          for comp in "${SNAP_NAME}"+*.comp; do
-            echo "Adding component: $comp"
-            COMPONENT_ARGS+=(--component "$comp")
-          done
-
-          echo "Uploading $SNAP_FILE to ${INPUTS_UPLOAD_CHANNEL}"
-          snapcraft upload --release "${INPUTS_UPLOAD_CHANNEL}" "$SNAP_FILE" "${COMPONENT_ARGS[@]}"
+    uses: ./.github/workflows/build-snap.yml
+    with:
+      checkout-ref: ${{ inputs.checkout-ref }}
+      arch: ${{ matrix.arch }}
+      runner: ${{ matrix.runner }}
+      cli-artifact-name: openshell-${{ matrix.rust_arch }}-unknown-linux-musl
+      gateway-artifact-name: openshell-gateway-${{ matrix.rust_arch }}-unknown-linux-gnu
+      supervisor-artifact-name: openshell-sandbox-${{ matrix.rust_arch }}-unknown-linux-musl
+      upload-channel: ${{ inputs.upload-channel }}
+    secrets:
+      publish-credentials: ${{ secrets.publish-credentials }}

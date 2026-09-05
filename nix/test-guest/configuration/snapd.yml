@@ -23,8 +23,18 @@
     - name: Install snapd
       ansible.builtin.apt:
         name: snapd
-        state: present
+        state: latest
         install_recommends: false
+
+    - name: Report installed and candidate snapd packages
+      ansible.builtin.command:
+        cmd: apt-cache policy snapd
+      register: snapd_package_policy
+      changed_when: false
+
+    - name: Display installed and candidate snapd packages
+      ansible.builtin.debug:
+        var: snapd_package_policy.stdout_lines
 
     - name: Start snapd socket activation
       ansible.builtin.systemd_service:
@@ -36,3 +46,13 @@
       ansible.builtin.command:
         cmd: snap wait system seed.loaded
       changed_when: false
+
+    - name: Query running snapd version
+      ansible.builtin.command:
+        cmd: snap version
+      register: snapd_version
+      changed_when: false
+
+    - name: Display running snapd version
+      ansible.builtin.debug:
+        var: snapd_version.stdout_lines

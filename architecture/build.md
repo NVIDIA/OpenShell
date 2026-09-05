@@ -263,6 +263,12 @@ restart, while the scenario remains responsible for black-box sandbox
 continuity checks. The plan exposes opaque executable paths and timeouts rather
 than driver or package-manager configuration; target setup owns those details.
 
+The conformance workflow also builds a branch Snap for an Ubuntu QEMU guest.
+The guest installs snapd and Docker Snap, installs the unsigned candidate,
+connects its required interfaces, registers the local gateway, and verifies
+`openshell status`. Sandbox smoke conformance remains separate from this
+package-installation check.
+
 ## Python Wheel Packaging
 
 The generated protobuf/gRPC stubs under `python/openshell/_proto/` are gitignored
