@@ -509,6 +509,11 @@ validate its config. The effective sandbox config contains only the registered
 services required by that policy; supervisors invoke those services directly on
 the request path.
 
+The effective sandbox config also carries the supervisor-wide HTTP response
+whole-body timeout. The gateway reads this static value from
+`[openshell.supervisor]`, defaults it to 120 seconds, and distributes it as
+milliseconds. A zero value from an older gateway maps to the same default.
+
 Provider credential expiry is enforced during gateway-to-sandbox credential
 resolution and again by the sandbox placeholder resolver. This keeps expired
 credentials from resolving even when a running sandbox still has retained

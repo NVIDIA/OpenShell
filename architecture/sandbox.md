@@ -187,6 +187,16 @@ middleware registry validates implementation-owned config. The generic
 registry and chain runner live in `openshell-supervisor-middleware`; first-party
 implementations live in `openshell-supervisor-middleware-builtins`.
 
+The same selected chain can inspect the matching final HTTP response before it
+returns to the workload. Response stages select header-only, whole-body, or
+streaming mode independently. The relay preserves upstream framing for a
+header-only chain and owns normalized downstream framing only when body bytes
+can change. Whole-body stages delay commitment and share one non-resetting,
+supervisor-wide accumulation deadline. Body stages receive a final body result
+and then one trailer exchange; trailer mutations can only change or remove
+existing, non-protected names. Intentional blocks return the canonical 403
+before commitment and abort delivery without injected bytes after commitment.
+
 The supervisor installs policy and middleware registry changes as one runtime
 generation and preserves the last-known-good generation if preparation fails.
 Policy-only updates reuse the connected registry, so an external middleware

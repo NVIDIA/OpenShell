@@ -75,6 +75,9 @@ pub const VERSION: &str = match option_env!("OPENSHELL_GIT_VERSION") {
     None => env!("CARGO_PKG_VERSION"),
 };
 
+/// Default wall-clock bound for HTTP response whole-body middleware buffering.
+pub const DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT_MS: u64 = 120_000;
+
 #[cfg(test)]
 #[path = "../build_version.rs"]
 mod build_version;

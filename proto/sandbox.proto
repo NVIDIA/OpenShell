@@ -398,6 +398,10 @@ message GetSandboxConfigResponse {
   // False also covers older gateways that do not advertise this capability;
   // supervisors preserve their legacy unauthenticated connection behavior.
   bool extension_authentication_enabled = 12;
+  // Supervisor-wide wall-clock limit for accumulating and processing a response
+  // through whole-body middleware. Zero means the supervisor default for
+  // compatibility with older gateways.
+  uint64 http_response_whole_body_timeout_ms = 13;
 }
 
 // Connection details for one operator-registered supervisor middleware service.

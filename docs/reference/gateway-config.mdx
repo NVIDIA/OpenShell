@@ -131,6 +131,9 @@ provider_profile_sources = [
 
 # Operator-run supervisor middleware. The gRPC endpoint must be reachable from
 # both the gateway and sandbox supervisors.
+[openshell.supervisor]
+http_response_whole_body_timeout = "120s"
+
 [[openshell.supervisor.middleware]]
 name = "local-content-guard"
 grpc_endpoint = "https://host.openshell.internal:50051"
@@ -290,6 +293,11 @@ The gateway flushes buffered spans during shutdown, so spans from in-flight requ
 Register operator-run supervisor middleware services with one or more `[[openshell.supervisor.middleware]]` entries. Registration is static and operator-owned; changing it requires restarting the gateway.
 
 ```toml
+[openshell.supervisor]
+# One non-resetting wall-clock limit for response accumulation and whole-body
+# middleware barriers. Accepts a positive integer followed by ms, s, or m.
+http_response_whole_body_timeout = "120s"
+
 [[openshell.supervisor.middleware]]
 name = "local-content-guard"
 grpc_endpoint = "https://host.openshell.internal:50051"
@@ -299,13 +307,15 @@ max_payload_bytes = 262144
 timeout = "500ms"
 ```
 
-Each service implements the supervisor middleware gRPC contract and exposes bindings through `Describe`. Policies reference the operator-owned registration `name`, attaching the complete middleware and all of its bindings. Bindings are identified by operation and phase. A manifest may expose at most one binding for each operation and phase pair. V1 supports `HttpRequest/pre_credentials` and `WebSocketMessage/pre_credentials`, so a service can inspect HTTP, WebSocket, or both. Registration names must be unique, and operator-run registrations cannot claim the reserved `openshell/` namespace. The service-reported manifest name is diagnostic metadata and does not need to match the registration name.
+Each service implements the supervisor middleware gRPC contract and exposes bindings through `Describe`. Policies reference the operator-owned registration `name`, attaching the complete middleware and all of its bindings. Bindings are identified by operation and phase. A manifest may expose at most one binding for each operation and phase pair. V1 supports `HttpRequest/pre_credentials`, `HttpResponse/pre_return`, and `WebSocketMessage/pre_credentials`. Registration names must be unique, and operator-run registrations cannot claim the reserved `openshell/` namespace. The service-reported manifest name is diagnostic metadata and does not need to match the registration name.
 
 The gateway connects to every registered service and validates `Describe` before it starts. The service must therefore be running before the gateway. Policy creation and full policy updates call `ValidateConfig`; an unavailable service or invalid middleware configuration rejects the policy before persistence.
 
-`max_payload_bytes` is the shared operator limit for inspectable logical payloads across every binding exposed by the service. It caps HTTP request and replacement bodies as well as complete WebSocket text messages and replacements. The value must be greater than zero, no larger than each binding's advertised `max_payload_bytes` capability, and no larger than the 4 MiB platform maximum. OpenShell rejects oversized values instead of silently clamping them. Binary WebSocket messages are not exposed to V1 middleware, so this field does not limit binary pass-through. Middleware gRPC servers should allow messages of at least 4 MiB plus 293 KiB so a maximum-size payload and its protobuf envelope fit on the transport.
+`max_payload_bytes` is the shared operator limit for inspectable logical payloads across every binding exposed by the service. It caps HTTP request and response units, replacement bodies, and complete WebSocket text messages and replacements. Whole-response inspection uses it as the stage's total body limit. Streaming response inspection applies it to each self-contained unit, with a platform maximum of 64 KiB per input unit. The value must be greater than zero, no larger than each binding's advertised `max_payload_bytes` capability, and no larger than the 4 MiB platform maximum. OpenShell rejects oversized values instead of silently clamping them. Binary WebSocket messages are not exposed to V1 middleware, so this field does not limit binary pass-through. Middleware gRPC servers should allow messages of at least 4 MiB plus 293 KiB so a maximum-size payload and its protobuf envelope fit on the transport.
 
-`timeout` is the operator-configured service-wide RPC timeout. It accepts the same compact duration syntax as gateway interceptors: an integer followed by `ms` or `s`, such as `500ms` or `2s`. Values must be between `10ms` and `30s`, inclusive. Omit the field to use the 500 ms platform default. A binding may advertise a shorter `timeout` in the `Describe` manifest, but it cannot extend the operator-configured deadline; OpenShell uses the smaller value. OpenShell validates both levels before accepting the service. The operator-configured service timeout applies to `Describe` and `ValidateConfig`. The effective binding timeout applies only to `EvaluateHttpRequest`, WebSocket preflight, and each WebSocket message. An accepted WebSocket stream has no connection-wide RPC deadline.
+`timeout` is the operator-configured service-wide RPC timeout. It accepts the same compact duration syntax as gateway interceptors: an integer followed by `ms` or `s`, such as `500ms` or `2s`. Values must be between `10ms` and `30s`, inclusive. Omit the field to use the 500 ms platform default. A binding may advertise a shorter `timeout` in the `Describe` manifest, but it cannot extend the operator-configured deadline; OpenShell uses the smaller value. OpenShell validates both levels before accepting the service. The operator-configured service timeout applies to `Describe` and `ValidateConfig`. The effective binding timeout applies to HTTP request evaluation, HTTP response preflight and unit exchanges, WebSocket preflight, and each WebSocket message. Accepted streaming protocols have no connection-wide RPC deadline.
+
+`http_response_whole_body_timeout` is a supervisor-wide safety bound, not a middleware RPC timeout. It defaults to `120s` and accepts a positive integer followed by `ms`, `s`, or `m`. The timer starts after ordered response preflight selects a `WHOLE_BODY_BYTES` stage and before OpenShell reads the first response body byte. It does not reset as chunks arrive. It ends after the normalized body reaches end of stream and every whole-body barrier produces output. On expiry, each active whole-body stage follows its configured `on_error` policy: fail-open releases OpenShell-owned bytes through later stages, while fail-closed returns the canonical pre-commit 502 response. Changing this field requires restarting the gateway.
 
 The service `grpc_endpoint` supports plaintext `http://` and TLS `https://`. HTTPS uses the platform trust store unless `tls_ca_cert_path` names a certificate-only PEM bundle. OpenShell rejects bundles containing private keys, loads the certificates at gateway startup, and distributes only public certificates to sandbox supervisors; normal TLS hostname verification still applies. `audience` sets the exact audience for gateway-minted service tokens and defaults to `urn:openshell:extension:middleware:<name>`. After authenticated `Describe` succeeds, OpenShell treats a non-empty manifest `expected_audience` as a consistency assertion and refuses to start when it differs from the configured audience. A strict verifier may reject an incorrect audience before returning the manifest.
 

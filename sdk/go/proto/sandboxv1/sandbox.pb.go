@@ -1837,6 +1837,10 @@ type GetSandboxConfigResponse struct {
 	// False also covers older gateways that do not advertise this capability;
 	// supervisors preserve their legacy unauthenticated connection behavior.
 	ExtensionAuthenticationEnabled bool `protobuf:"varint,12,opt,name=extension_authentication_enabled,json=extensionAuthenticationEnabled,proto3" json:"extension_authentication_enabled,omitempty"`
+	// Supervisor-wide wall-clock limit for accumulating and processing a response
+	// through whole-body middleware. Zero means the supervisor default for
+	// compatibility with older gateways.
+	HttpResponseWholeBodyTimeoutMs uint64 `protobuf:"varint,13,opt,name=http_response_whole_body_timeout_ms,json=httpResponseWholeBodyTimeoutMs,proto3" json:"http_response_whole_body_timeout_ms,omitempty"`
 	unknownFields                  protoimpl.UnknownFields
 	sizeCache                      protoimpl.SizeCache
 }
@@ -1953,6 +1957,13 @@ func (x *GetSandboxConfigResponse) GetExtensionAuthenticationEnabled() bool {
 		return x.ExtensionAuthenticationEnabled
 	}
 	return false
+}
+
+func (x *GetSandboxConfigResponse) GetHttpResponseWholeBodyTimeoutMs() uint64 {
+	if x != nil {
+		return x.HttpResponseWholeBodyTimeoutMs
+	}
+	return 0
 }
 
 // Connection details for one operator-registered supervisor middleware service.
@@ -2220,7 +2231,7 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x05value\"\x86\x01\n" +
 	"\x10EffectiveSetting\x128\n" +
 	"\x05value\x18\x01 \x01(\v2\".openshell.sandbox.v1.SettingValueR\x05value\x128\n" +
-	"\x05scope\x18\x02 \x01(\x0e2\".openshell.sandbox.v1.SettingScopeR\x05scope\"\xd1\x06\n" +
+	"\x05scope\x18\x02 \x01(\x0e2\".openshell.sandbox.v1.SettingScopeR\x05scope\"\x9e\a\n" +
 	"\x18GetSandboxConfigResponse\x12;\n" +
 	"\x06policy\x18\x01 \x01(\v2#.openshell.sandbox.v1.SandboxPolicyR\x06policy\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\rR\aversion\x12\x1f\n" +
@@ -2235,7 +2246,8 @@ const file_sandbox_proto_rawDesc = "" +
 	"\tworkspace\x18\n" +
 	" \x01(\tR\tworkspace\x12C\n" +
 	"\x1epolicy_validation_failure_mode\x18\v \x01(\tR\x1bpolicyValidationFailureMode\x12H\n" +
-	" extension_authentication_enabled\x18\f \x01(\bR\x1eextensionAuthenticationEnabled\x1ac\n" +
+	" extension_authentication_enabled\x18\f \x01(\bR\x1eextensionAuthenticationEnabled\x12K\n" +
+	"#http_response_whole_body_timeout_ms\x18\r \x01(\x04R\x1ehttpResponseWholeBodyTimeoutMs\x1ac\n" +
 	"\rSettingsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
 	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\x99\x02\n" +

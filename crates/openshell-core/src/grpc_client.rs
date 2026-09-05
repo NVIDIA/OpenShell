@@ -943,6 +943,8 @@ pub struct SettingsPollResult {
     pub policy_validation_failure_mode: crate::PolicyValidationFailureMode,
     /// Whether the gateway can mint authenticated extension credentials.
     pub extension_authentication_enabled: bool,
+    /// Supervisor-wide response whole-body accumulation timeout.
+    pub http_response_whole_body_timeout_ms: u64,
 }
 
 fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> SettingsPollResult {
@@ -963,6 +965,11 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
             .parse()
             .unwrap_or_default(),
         extension_authentication_enabled: inner.extension_authentication_enabled,
+        http_response_whole_body_timeout_ms: if inner.http_response_whole_body_timeout_ms == 0 {
+            crate::DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT_MS
+        } else {
+            inner.http_response_whole_body_timeout_ms
+        },
     }
 }
 
@@ -981,6 +988,15 @@ mod settings_poll_tests {
         assert_eq!(
             result.policy_validation_failure_mode,
             PolicyValidationFailureMode::RetainLastValid
+        );
+    }
+
+    #[test]
+    fn zero_whole_body_timeout_uses_compatibility_default() {
+        let result = settings_poll_result(GetSandboxConfigResponse::default());
+        assert_eq!(
+            result.http_response_whole_body_timeout_ms,
+            crate::DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT_MS
         );
     }
 

@@ -2380,6 +2380,9 @@ async fn load_policy(
             openshell_core::grpc_client::fetch_settings_snapshot(endpoint, id)
         })
         .await?;
+        openshell_supervisor_network::set_http_response_whole_body_timeout(Duration::from_millis(
+            snapshot.http_response_whole_body_timeout_ms,
+        ));
 
         let mut proto_policy = if let Some(p) = snapshot.policy.clone() {
             p
@@ -3781,6 +3784,9 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
     // reconciled below instead of being recorded as already applied.
     match client.poll_settings(&ctx.sandbox_id).await {
         Ok(result) => {
+            openshell_supervisor_network::set_http_response_whole_body_timeout(
+                Duration::from_millis(result.http_response_whole_body_timeout_ms),
+            );
             let _ = ctx.workspace_tx.send(client.workspace());
             match initial_poll_disposition(&ctx.loaded_policy_origin, &result) {
                 InitialPollDisposition::Acknowledge(candidate) => {
@@ -3866,6 +3872,10 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 }
             }
         };
+
+        openshell_supervisor_network::set_http_response_whole_body_timeout(Duration::from_millis(
+            result.http_response_whole_body_timeout_ms,
+        ));
 
         // Reuse installed per-service credentials, rotating only when one is
         // missing or due. Rotation happens on the existing gateway channel and
@@ -4963,6 +4973,8 @@ network_policies:
             workspace: String::new(),
             policy_validation_failure_mode: PolicyValidationFailureMode::default(),
             extension_authentication_enabled: false,
+            http_response_whole_body_timeout_ms:
+                openshell_core::DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT_MS,
         }
     }
 
