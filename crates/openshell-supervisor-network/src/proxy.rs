@@ -10,9 +10,9 @@ mod relay;
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
-use crate::policy_dns::ResolvedEndpointStore;
 #[cfg(target_os = "linux")]
-use crate::policy_dns::{MappingLookupError, PolicyEndpointId};
+use crate::policy_dns::PolicyEndpointId;
+use crate::policy_dns::{MappingLookupError, ResolvedEndpointStore};
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
 use crate::upstream_proxy::{self, UpstreamProxyConfig};
 use miette::{IntoDiagnostic, Result};
