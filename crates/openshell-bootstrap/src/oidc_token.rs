@@ -124,6 +124,21 @@ pub fn is_token_expired(bundle: &OidcTokenBundle) -> bool {
     now + 30 >= expires_at
 }
 
+/// Check whether the stored access token has actually expired.
+///
+/// Unlike [`is_token_expired`], this does not include the 30-second refresh
+/// window. Tokens without expiry metadata are treated as valid.
+pub fn is_token_actually_expired(bundle: &OidcTokenBundle) -> bool {
+    let Some(expires_at) = bundle.expires_at else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now >= expires_at
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +176,30 @@ mod tests {
             assert!(load_oidc_token("../escape").is_none());
             assert!(remove_oidc_token("../escape").is_err());
         });
+    }
+
+    #[test]
+    fn expiry_checks_distinguish_refresh_window_from_actual_expiry() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let bundle = OidcTokenBundle {
+            access_token: "token".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 10),
+            issuer: "https://issuer.example.com".to_string(),
+            client_id: "openshell-cli".to_string(),
+        };
+
+        assert!(is_token_expired(&bundle));
+        assert!(!is_token_actually_expired(&bundle));
+
+        let expired = OidcTokenBundle {
+            expires_at: Some(now.saturating_sub(1)),
+            ..bundle
+        };
+        assert!(is_token_actually_expired(&expired));
     }
 
     #[test]
