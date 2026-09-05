@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
-use miette::{IntoDiagnostic as _, Result, WrapErr as _};
+#[cfg(target_os = "linux")]
+use miette::WrapErr as _;
+use miette::{IntoDiagnostic as _, Result};
 use openshell_core::policy::SandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_isolation_interface::contract::{BoundaryExec, BoundaryPortForward};
