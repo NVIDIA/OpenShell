@@ -67,6 +67,9 @@ pip-delete-this-directory.txt
 coverage.out
 coverage/
 htmlcov/
+
+# Trivy scan reports (tasks/scripts/trivy-scan-*.sh)
+/reports/
 .tox/
 .nox/
 .coverage
