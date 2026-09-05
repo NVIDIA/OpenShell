@@ -3830,7 +3830,11 @@ fn docker_sandbox_bundle_archive(
     append_docker_archive_directory(
         &mut archive,
         ".openshell/channel/sandbox",
-        0o700,
+        // The sandbox owns this directory so it can consume bootstrap files
+        // and create the control socket. The separate non-root supervisor
+        // needs execute-only traversal to that known socket path; mutual TLS
+        // authenticates the endpoint and the files beneath remain 0600.
+        0o711,
         identity.uid,
         identity.gid,
     )?;
@@ -4453,6 +4457,11 @@ async fn spawn_docker_control_process(
                 let log_tail = docker_container_log_tail(&docker, &supervisor_id).await;
                 if !log_tail.is_empty() {
                     write!(message, "; log tail: {log_tail}").ok();
+                }
+                let sandbox_log_tail =
+                    docker_container_log_tail(&docker, &failure_context.container_id).await;
+                if !sandbox_log_tail.is_empty() {
+                    write!(message, "; sandbox log tail: {sandbox_log_tail}").ok();
                 }
                 let _ = docker.remove_container(
                     &supervisor_id,
