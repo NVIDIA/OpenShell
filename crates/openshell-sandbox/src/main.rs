@@ -24,8 +24,11 @@ use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 const BOOTSTRAP_SUBCOMMAND: &str = "bootstrap";
 const SEED_WORKSPACE_SUBCOMMAND: &str = "seed-workspace";
+#[cfg(target_os = "linux")]
 const BOOTSTRAP_INPUT_ROOT: &str = "/.openshell/bootstrap-input";
+#[cfg(target_os = "linux")]
 const SANDBOX_RUNTIME_ROOT: &str = "/.openshell/runtime";
+#[cfg(target_os = "linux")]
 const SANDBOX_STATE_ROOT: &str = "/.openshell/state";
 
 const VALIDATE_WORKSPACE_SUBCOMMAND: &str = "validate-workspace";
@@ -1506,6 +1509,7 @@ fn run_capability_probe() -> Result<()> {
     ))
 }
 
+#[cfg(target_os = "linux")]
 fn proc_status_hex(status: &str, field: &str) -> Result<u64> {
     let value = status
         .lines()
@@ -1560,6 +1564,7 @@ fn copy_self(dest: &str) -> Result<()> {
 /// memory-backed volumes. The projected Secret remains mounted only in this
 /// trusted init container; the long-lived sandbox consumes and unlinks the
 /// staged configuration before it starts workload code.
+#[cfg(target_os = "linux")]
 fn stage_kubernetes_bootstrap() -> Result<()> {
     stage_kubernetes_bootstrap_at(
         Path::new(BOOTSTRAP_INPUT_ROOT),
@@ -1583,6 +1588,7 @@ fn run_kubernetes_bootstrap() -> Result<()> {
     ))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn stage_kubernetes_bootstrap_at(source: &Path, runtime: &Path, state: &Path) -> Result<()> {
     use std::fs::{self, OpenOptions};
     use std::os::unix::fs::PermissionsExt as _;
@@ -1639,6 +1645,7 @@ fn stage_kubernetes_bootstrap_at(source: &Path, runtime: &Path, state: &Path) ->
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn copy_projected_secret_file(
     source_root: &Path,
     name: &str,
@@ -1656,6 +1663,7 @@ fn copy_projected_secret_file(
     copy_regular_file(&canonical_source, destination, mode)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn copy_regular_file(source: &Path, destination: &Path, mode: u32) -> Result<()> {
     use std::fs::{self, OpenOptions};
     use std::io::{Read as _, Write as _};
