@@ -4071,6 +4071,7 @@ dependencies = [
 name = "openshell-driver-vm"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "bollard",
  "clap",
  "flate2",
@@ -4083,6 +4084,7 @@ dependencies = [
  "oci-client",
  "openshell-core",
  "openshell-driver-podman",
+ "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
  "openshell-policy",
@@ -4092,6 +4094,7 @@ dependencies = [
  "polling",
  "prost",
  "prost-types",
+ "rand 0.9.4",
  "rustix 1.1.4",
  "serde",
  "serde_json",

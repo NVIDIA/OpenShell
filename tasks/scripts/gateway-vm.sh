@@ -209,7 +209,7 @@ check_supervisor_cross_toolchain() {
   fi
   local missing=0
   if ! command -v cargo-zigbuild >/dev/null 2>&1; then
-    echo "ERROR: cargo-zigbuild not found (required to cross-compile the guest supervisor)." >&2
+    echo "ERROR: cargo-zigbuild not found (required to cross-compile the guest sandbox)." >&2
     echo "       Install: cargo install --locked cargo-zigbuild && brew install zig" >&2
     missing=1
   fi
@@ -287,16 +287,15 @@ VM_DRIVER_STATE_DIR="${OPENSHELL_VM_DRIVER_STATE_DIR:-${VM_DRIVER_STATE_DIR_DEFA
 
 DISABLE_TLS="$(normalize_bool "${OPENSHELL_DISABLE_TLS:-true}")"
 
-# Build prerequisites: VM runtime artifacts + bundled supervisor.
+# Build prerequisites: VM runtime artifacts + bundled sandbox/supervisor.
 if [ ! -d "${COMPRESSED_DIR}" ] \
     || ! find "${COMPRESSED_DIR}" -maxdepth 1 -name 'libkrun*.zst' | grep -q . \
-    || [ ! -f "${COMPRESSED_DIR}/gvproxy.zst" ] \
     || [ ! -f "${COMPRESSED_DIR}/umoci.zst" ]; then
   echo "==> Preparing embedded VM runtime (mise run vm:setup)"
   mise run vm:setup
 fi
 
-if [ ! -f "${COMPRESSED_DIR}/openshell-sandbox.zst" ]; then
+if [ ! -f "${COMPRESSED_DIR}/openshell-sandbox.zst" ] || [ ! -f "${COMPRESSED_DIR}/openshell-supervisor.zst" ]; then
   check_supervisor_cross_toolchain
   echo "==> Building bundled VM supervisor (mise run vm:supervisor)"
   mise run vm:supervisor
@@ -309,9 +308,9 @@ if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
   CARGO_BUILD_JOBS_ARG=(-j "${CARGO_BUILD_JOBS}")
 fi
 
-echo "==> Building openshell-gateway and openshell-driver-vm"
+echo "==> Building openshell-gateway, openshell-driver-vm, and native control supervisor"
 cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-  -p openshell-gateway -p openshell-driver-vm
+  -p openshell-gateway -p openshell-driver-vm -p openshell-supervisor
 
 if [ "$(uname -s)" = "Darwin" ]; then
   echo "==> Codesigning openshell-driver-vm (Hypervisor entitlement)"
