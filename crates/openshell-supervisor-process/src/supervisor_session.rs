@@ -30,7 +30,7 @@ use openshell_ocsf::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use openshell_core::grpc_client;
 use openshell_core::net::set_tcp_nodelay_best_effort;
@@ -274,6 +274,10 @@ fn map_session_stream_message<T>(
 ///
 /// The task runs for the lifetime of the sandbox process, reconnecting with
 /// exponential backoff on failures.
+///
+/// `otel_rx` is an optional channel for receiving OTEL export messages from
+/// the relay forwarder. The session drains this channel and forwards the
+/// messages to the gateway.
 pub fn spawn(
     endpoint: String,
     sandbox_id: String,
@@ -282,6 +286,7 @@ pub fn spawn(
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     instance_id: String,
+    otel_rx: Option<mpsc::Receiver<SupervisorMessage>>,
 ) -> tokio::task::JoinHandle<()> {
     let config = SessionConfig {
         endpoint,
@@ -291,6 +296,7 @@ pub fn spawn(
         expected_ssh_peer_pid,
         terminating,
         instance_id,
+        otel_rx,
     };
     tokio::spawn(run_session_loop(config))
 }
@@ -303,16 +309,18 @@ struct SessionConfig {
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     instance_id: String,
+    otel_rx: Option<mpsc::Receiver<SupervisorMessage>>,
 }
 
-async fn run_session_loop(config: SessionConfig) {
+async fn run_session_loop(mut config: SessionConfig) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
+    let mut otel_rx = config.otel_rx.take();
 
     loop {
         attempt += 1;
 
-        match run_single_session(&config).await {
+        match run_single_session(&config, &mut otel_rx).await {
             Ok(()) => {
                 let event = session_closed_event(
                     openshell_ocsf::ctx::ctx(),
@@ -339,6 +347,7 @@ async fn run_session_loop(config: SessionConfig) {
 
 async fn run_single_session(
     config: &SessionConfig,
+    otel_rx: &mut Option<mpsc::Receiver<SupervisorMessage>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
@@ -358,6 +367,7 @@ async fn run_single_session(
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
             sandbox_id: config.sandbox_id.clone(),
             instance_id: config.instance_id.clone(),
+            capabilities: vec!["otel_export".to_string()],
         })),
     })
     .await
@@ -384,6 +394,16 @@ async fn run_single_session(
         _ => return Err("expected SessionAccepted or SessionRejected".into()),
     };
 
+    let otel_confirmed = accepted.capabilities.iter().any(|c| c == "otel_export");
+    if otel_confirmed {
+        info!("gateway confirmed otel_export capability; OTLP drain active");
+    } else {
+        debug!(
+            "gateway did not confirm otel_export; \
+             OTLP forwarding disabled for this session"
+        );
+    }
+
     let heartbeat_secs = accepted.heartbeat_interval_secs.max(5);
     let event = session_established_event(
         openshell_ocsf::ctx::ctx(),
@@ -392,7 +412,8 @@ async fn run_single_session(
         heartbeat_secs,
     );
     ocsf_emit!(event);
-    // Main loop: receive gateway messages + send heartbeats.
+
+    // Main loop: receive gateway messages + send heartbeats + drain OTEL exports.
     let mut heartbeat_interval =
         tokio::time::interval(Duration::from_secs(u64::from(heartbeat_secs)));
     heartbeat_interval.tick().await; // skip immediate tick
@@ -430,6 +451,18 @@ async fn run_single_session(
                 };
                 if tx.send(hb).await.is_err() {
                     return Err("outbound channel closed".into());
+                }
+            }
+            otel_msg = async {
+                match otel_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if otel_confirmed => {
+                if let Some(msg) = otel_msg {
+                    if tx.try_send(msg).is_err() {
+                        debug!("OTEL relay: session channel full or closed, dropping message");
+                    }
                 }
             }
         }

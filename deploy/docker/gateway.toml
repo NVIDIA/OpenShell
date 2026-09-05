@@ -49,3 +49,10 @@ sandbox_namespace = "openshell"
 # The gateway must be published on port 8080 on the Docker host so that
 # host.openshell.internal:8080 resolves to the gateway container.
 grpc_endpoint     = "http://host.openshell.internal:8080"
+
+# Uncomment to enable the OTLP telemetry relay. The supervisor collects
+# traces from sandbox agents and forwards them through the gateway to the
+# configured collector endpoint (gRPC, typically port 4317).
+# [openshell.gateway.otlp]
+# endpoint      = "http://host.docker.internal:4317"
+# service_name  = "openshell-gateway-dev"

@@ -5,7 +5,7 @@
 
 mod driver;
 mod grpc;
-mod propagation;
+pub mod propagation;
 
 pub use driver::{
     BoxGrpcStream, ComputeDriverTracing, DriverTracingConfig, DriverTracingHandle,

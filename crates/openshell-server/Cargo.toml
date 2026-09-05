@@ -73,6 +73,7 @@ tracing-subscriber = { workspace = true }
 # OpenTelemetry (OTLP trace export, opt-in via [openshell.gateway.otlp])
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
+opentelemetry-proto = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 
 # Metrics

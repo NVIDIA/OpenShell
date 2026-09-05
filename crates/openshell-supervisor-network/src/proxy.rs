@@ -4547,6 +4547,7 @@ fn rewrite_forward_request(
     // Rebuild headers, stripping hop-by-hop and adding proxy headers
     let mut output = Vec::with_capacity(header_end + 128);
     let mut has_via = false;
+    let mut has_traceparent = false;
 
     for (i, line) in lines.iter().enumerate() {
         if i == 0 {
@@ -4608,6 +4609,9 @@ fn rewrite_forward_request(
         if field_name == "via" {
             has_via = true;
         }
+        if field_name == "traceparent" {
+            has_traceparent = true;
+        }
     }
 
     // Generate the only Host field from the absolute request-target authority.
@@ -4624,6 +4628,15 @@ fn rewrite_forward_request(
     }
     if !has_via {
         output.extend_from_slice(b"Via: 1.1 openshell-sandbox\r\n");
+    }
+    if !has_traceparent {
+        let mut headers = http::HeaderMap::new();
+        openshell_otel::propagation::inject_traceparent_if_missing(&mut headers);
+        if let Some(value) = headers.get("traceparent") {
+            output.extend_from_slice(b"traceparent: ");
+            output.extend_from_slice(value.as_bytes());
+            output.extend_from_slice(b"\r\n");
+        }
     }
 
     // End of headers

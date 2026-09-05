@@ -1222,6 +1222,12 @@ fn apply_child_env(
         for (key, value) in child_env::proxy_env_vars(url) {
             cmd.env(key, value);
         }
+        for (key, value) in child_env::otel_env_vars(
+            openshell_core::sandbox_env::OTLP_RECEIVER_ENDPOINT,
+            "http/protobuf",
+        ) {
+            cmd.env(key, value);
+        }
     }
 
     if let Some((ca_cert_path, combined_bundle_path)) = ca_file_paths {

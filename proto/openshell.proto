@@ -2358,6 +2358,26 @@ message GetSandboxLogsResponse {
 // Supervisor session messages
 // ---------------------------------------------------------------------------
 
+// OpenTelemetry export data forwarded from supervisor to gateway.
+// Contains agent trace spans and/or OCSF events from a single sandbox.
+message OtelExportData {
+  // Source sandbox identifier.
+  string sandbox_id = 1;
+
+  // The OTLP signal being forwarded. Each variant carries the serialized
+  // OTLP Export*ServiceRequest in protobuf encoding, pre-enriched with
+  // sandbox resource attributes.
+  oneof signal {
+    bytes trace_data = 2;
+    // bytes metrics_data = 4;  // future
+    // bytes logs_data = 5;     // future
+  }
+
+  // Serialized OCSF events (each entry is a JSON-encoded OCSF event).
+  // Empty when only OTLP signal data is being forwarded.
+  repeated bytes ocsf_events = 3;
+}
+
 // Envelope for supervisor-to-gateway messages on the ConnectSupervisor stream.
 message SupervisorMessage {
   oneof payload {
@@ -2365,6 +2385,7 @@ message SupervisorMessage {
     SupervisorHeartbeat heartbeat = 2;
     RelayOpenResult relay_open_result = 3;
     RelayClose relay_close = 4;
+    OtelExportData otel_export = 5;
   }
 }
 
@@ -2385,6 +2406,8 @@ message SupervisorHello {
   string sandbox_id = 1;
   // Supervisor instance ID (e.g. boot id or process epoch).
   string instance_id = 2;
+  // Capabilities this supervisor supports (e.g. "otel_export").
+  repeated string capabilities = 3;
 }
 
 // Gateway accepts the supervisor session.
@@ -2393,6 +2416,8 @@ message SessionAccepted {
   string session_id = 1;
   // Recommended heartbeat interval in seconds.
   uint32 heartbeat_interval_secs = 2;
+  // Capabilities confirmed by the gateway (subset of what supervisor advertised).
+  repeated string capabilities = 3;
 }
 
 // Gateway rejects the supervisor session.

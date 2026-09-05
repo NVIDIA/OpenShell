@@ -462,6 +462,84 @@ Sandbox logs are emitted locally and can also be pushed back to the gateway.
 Security-relevant sandbox behavior uses OCSF structured events; internal
 diagnostics use ordinary tracing.
 
+## Telemetry Relay
+
+The supervisor can relay OpenTelemetry trace data and OCSF events from agent
+processes to the gateway over the session protocol. This gives OTel-instrumented
+agents (LangChain, CrewAI, etc.) a zero-configuration path to an external
+collector without requiring direct egress from the sandbox.
+
+### Data Flow
+
+```
+Agent process --> OTLP HTTP (127.0.0.1:4318) --> Supervisor receiver
+  --> Enrichment (sandbox resource attributes)
+  --> Bounded buffer (4096 slots, shared traces + OCSF)
+  --> Forwarder --> Session channel (OtelExportData message)
+  --> Gateway --> Dedicated SpanExporter --> External OTLP collector
+```
+
+### Receiver Binding
+
+The OTLP HTTP receiver binds to `127.0.0.1:4318` only when the relay is
+active (the gateway has `[openshell.gateway.otlp]` configured and confirms
+the `otel_export` capability). When OTLP is not configured, no port is
+bound and no receiver runs.
+
+The bind address depends on the supervisor topology. In all current
+topologies, the process supervisor runs co-located with the agent workload,
+so `127.0.0.1` is reachable from the agent. For Docker/Podman drivers
+where the supervisor creates a network namespace, the bind happens inside
+the namespace via `bind_tcp_in_netns()`. For Kubernetes and VM drivers,
+the supervisor and agent share the same network namespace, so a direct
+bind suffices. The receiver accepts both `application/x-protobuf` and
+`application/json` content types.
+
+Future topologies where the process supervisor moves out of the workload
+pod would require the bind address and the `OTEL_EXPORTER_OTLP_ENDPOINT`
+env var to reflect the supervisor's reachable address from the agent's
+perspective (e.g., a service IP or pod IP).
+
+### Span Enrichment
+
+Forwarded spans are enriched with sandbox resource attributes:
+`openshell.sandbox.id`, `openshell.workspace.id`, `openshell.sandbox.policy`,
+`openshell.sandbox.user`, `openshell.sandbox.image`, `openshell.sandbox.driver`.
+The `openshell.telemetry.source` attribute (fixed value `"agent"`) is always
+injected regardless of the enrichment toggle so collectors can filter agent
+spans from gateway infrastructure spans. Enrichment can be disabled for
+pass-through forwarding.
+
+### Activation and Capability Negotiation
+
+The relay is opt-in. It starts only when the gateway has `[openshell.gateway.otlp]`
+configured. The supervisor advertises `"otel_export"` in
+`SupervisorHello.capabilities`. The gateway confirms via `SessionAccepted.capabilities`.
+The supervisor gates `OtelExportData` sending on this confirmation. When the
+relay is active, the supervisor sets `OTEL_EXPORTER_OTLP_ENDPOINT` and
+`OTEL_EXPORTER_OTLP_PROTOCOL` in agent child processes via `child_env.rs`.
+
+### Non-Interference
+
+The buffer uses `try_send` (non-blocking) on the session channel. When the
+buffer reaches capacity, the oldest entries are dropped and a counter records
+each drop. A queue depth gauge tracks buffer pressure. This ensures telemetry
+cannot block or degrade sandbox control operations.
+
+### OCSF Event Relay
+
+OCSF events generated inside the sandbox (e.g., network deny events) can also
+be forwarded through the same transport. A per-sandbox token bucket rate limiter
+controls the OCSF event rate, with configurable rate and drop counter.
+
+### Gateway-Side Handling
+
+The gateway receives `OtelExportData` messages and exports trace data through a
+dedicated `OtelRelayExporter` that connects directly to the configured OTLP
+collector. This bypasses the gateway's own `SdkTracerProvider` to preserve the
+supervisor-enriched resource attributes. OCSF events are emitted via
+`tracing::info!` on the `ocsf_relay` target.
+
 ## Policy Proposals
 
 When an L4 CONNECT is denied, the proxy emits a `DenialEvent`. The denial
