@@ -84,6 +84,11 @@ const WATCH_BUFFER: usize = 128;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const WATCH_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SUPERVISOR_READY_TIMEOUT: Duration = Duration::from_secs(90);
+// The gateway closes a supervisor session as soon as it commits a sandbox to
+// Stopping, just before the compute-driver StopSandbox RPC arrives. Give that
+// request a bounded opportunity to mark the control exit intentional before
+// publishing a fail-closed runtime error.
+const SUPERVISOR_INTENTIONAL_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const SUPERVISOR_HEALTH_INTERVAL_NS: i64 = 250_000_000;
 const SUPERVISOR_HEALTH_TIMEOUT_NS: i64 = 2_000_000_000;
 const SUPERVISOR_HEALTH_START_PERIOD_NS: i64 = 60_000_000_000;
@@ -1647,7 +1652,7 @@ impl DockerComputeDriver {
                 )
                 .await
                 .or_else(|error| {
-                    if is_not_found_error(&error) {
+                    if is_not_found_error(&error) || is_removal_in_progress_error(&error) {
                         Ok(())
                     } else {
                         Err(error)
@@ -4483,6 +4488,21 @@ async fn spawn_docker_control_process(
                     ).await;
                     return;
                 }
+                if matches!(
+                    tokio::time::timeout(
+                        SUPERVISOR_INTENTIONAL_SHUTDOWN_GRACE,
+                        &mut shutdown_requested,
+                    )
+                    .await,
+                    Ok(Ok(())),
+                ) || monitored_shutdown.load(Ordering::Acquire)
+                {
+                    let _ = monitored_docker.remove_container(
+                        &monitored_supervisor_id,
+                        Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+                    ).await;
+                    return;
+                }
                 let mut message = match result {
                     Some(Ok(status)) => {
                     warn!(%sandbox_id, status = status.status_code, "Docker supervisor container exited unexpectedly");
@@ -5887,6 +5907,16 @@ fn is_conflict_error(err: &BollardError) -> bool {
             status_code: 409,
             ..
         }
+    )
+}
+
+fn is_removal_in_progress_error(err: &BollardError) -> bool {
+    matches!(
+        err,
+        BollardError::DockerResponseServerError {
+            status_code: 409,
+            message,
+        } if message.contains("removal of container") && message.contains("is already in progress")
     )
 }
 

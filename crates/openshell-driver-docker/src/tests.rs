@@ -3325,3 +3325,18 @@ fn docker_oom_kill_stays_terminal_despite_137() {
     apply_docker_exit_classification(&mut sandbox, &state);
     assert_eq!(ready_reason(&sandbox), CONDITION_EXITED);
 }
+
+#[test]
+fn concurrent_container_removal_is_idempotent() {
+    let removing = BollardError::DockerResponseServerError {
+        status_code: 409,
+        message: "removal of container abc123 is already in progress".to_string(),
+    };
+    let other_conflict = BollardError::DockerResponseServerError {
+        status_code: 409,
+        message: "container abc123 is running".to_string(),
+    };
+
+    assert!(is_removal_in_progress_error(&removing));
+    assert!(!is_removal_in_progress_error(&other_conflict));
+}
