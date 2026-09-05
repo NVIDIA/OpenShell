@@ -367,31 +367,10 @@ impl PodmanComputeDriver {
             }
         }
 
-        // Validate TLS configuration before connecting.  Partial configs
-        // (e.g. CA set but cert/key missing) are rejected early so operators
-        // get a clear error instead of a silent fallback to plaintext HTTP.
-        config.validate_tls_config()?;
-        config.validate_runtime_limits()?;
-        config.validate_host_gateway_ip()?;
-        config.validate_proxy_config()?;
-        config.validate_app_armor_profile()?;
-        if let Some(socket) = config.provider_spiffe_workload_api_socket.as_deref() {
-            let raw = socket.to_str().ok_or_else(|| {
-                PodmanApiError::InvalidInput(
-                    "provider_spiffe_workload_api_socket must be valid UTF-8".to_string(),
-                )
-            })?;
-            // Preserve Podman's established pass-through support for an
-            // explicitly configured container-reachable Workload API TCP
-            // endpoint. The Workload API client validates its endpoint grammar
-            // when it connects.
-            if !raw.starts_with("tcp:") {
-                openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)
-                    .map_err(PodmanApiError::InvalidInput)?;
-            }
-        }
-        config.canonicalize_userns()?;
-        config.validate_userns_mappings()?;
+        // Validate and normalize configuration before connecting. Partial TLS
+        // and invalid resource, proxy, SPIFFE, AppArmor, or userns settings
+        // fail before the runtime is contacted.
+        config.validate_configuration()?;
 
         let client = PodmanClient::new(socket_path);
 

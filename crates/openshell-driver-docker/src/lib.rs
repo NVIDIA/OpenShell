@@ -191,6 +191,34 @@ pub struct DockerComputeConfig {
     pub app_armor_profile: Option<AppArmorProfile>,
 }
 
+impl DockerComputeConfig {
+    /// Validate startup configuration without connecting to Docker.
+    pub fn validate_configuration(&self, gateway_bind_address: SocketAddr) -> CoreResult<()> {
+        if let Some(socket_path) = self.socket_path.as_deref()
+            && socket_path.to_str().is_none()
+        {
+            return Err(Error::config(format!(
+                "Docker socket path is not valid UTF-8: {}",
+                socket_path.display()
+            )));
+        }
+        validate_sandbox_pids_limit(self.sandbox_pids_limit)?;
+        validate_image_pull_policy(self.image_pull_policy)?;
+        self.upstream_proxy.validate().map_err(Error::config)?;
+        if let Some(socket) = self.provider_spiffe_workload_api_socket.as_deref() {
+            openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)
+                .map_err(Error::config)?;
+        }
+        parse_optional_host_gateway_ip(&self.host_gateway_ip)?;
+        if gateway_bind_address.port() == 0 {
+            return Err(Error::config(
+                "docker compute driver requires a fixed non-zero gateway bind port",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for DockerComputeConfig {
     fn default() -> Self {
         Self {
@@ -508,6 +536,7 @@ impl DockerComputeDriver {
         gateway_log_level: &str,
         docker_config: &DockerComputeConfig,
     ) -> CoreResult<Self> {
+        docker_config.validate_configuration(gateway_bind_address)?;
         let socket_path = docker_config
             .socket_path
             .clone()
@@ -536,24 +565,9 @@ impl DockerComputeDriver {
             .is_some_and(|dirs| !dirs.is_empty());
         let cdi_gpu_inventory = docker_cdi_gpu_inventory(&info);
         let allow_all_default_gpu = docker_info_reports_wsl2(&info);
-        validate_sandbox_pids_limit(docker_config.sandbox_pids_limit)?;
-        validate_image_pull_policy(docker_config.image_pull_policy)?;
-        docker_config
-            .upstream_proxy
-            .validate()
-            .map_err(Error::config)?;
         validate_docker_proxy_auth_file(&docker_config.upstream_proxy)?;
-        if let Some(socket) = docker_config.provider_spiffe_workload_api_socket.as_deref() {
-            openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)
-                .map_err(Error::config)?;
-        }
         validate_docker_app_armor_profile(docker_config.app_armor_profile.as_ref(), &info)?;
         let gateway_port = gateway_bind_address.port();
-        if gateway_port == 0 {
-            return Err(Error::config(
-                "docker compute driver requires a fixed non-zero gateway bind port",
-            ));
-        }
         let network_name = docker_network_name(docker_config);
         let bridge_gateway_ip = ensure_bridge_network(&docker, &network_name).await?;
         let host_gateway_ip = parse_optional_host_gateway_ip(&docker_config.host_gateway_ip)?;

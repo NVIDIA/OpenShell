@@ -297,6 +297,20 @@ release. Look for failed installs, unexpected values, missing namespace, wrong
 image tag, TLS settings that do not match the registered endpoint, and
 scheduling failures.
 
+The chart mounts the `gateway.toml` ConfigMap key directly at
+`/etc/openshell/gateway.toml` as a read-only `subPath` file. This avoids the
+atomic-writer symlink exposed by a ConfigMap directory mount because the gateway
+rejects symlinked configuration. A checksum pod-template annotation rolls the
+workload when the ConfigMap changes. If config preflight reports a symlink or
+nonregular path, inspect the rendered mount and confirm the workload rolled to
+the current chart revision:
+
+```bash
+kubectl -n openshell get deployment,statefulset -o yaml | rg -n 'gateway-config|mountPath|subPath|checksum/gateway-config'
+kubectl -n openshell rollout status <deployment-or-statefulset>/openshell
+kubectl -n openshell logs <gateway-pod> -c openshell-gateway --tail=200
+```
+
 `server.telemetryEnabled` renders `OPENSHELL_TELEMETRY_ENABLED` on the gateway
 pod, and the gateway propagates the effective value to sandbox supervisors.
 
@@ -749,13 +763,16 @@ When handing results back to the user, include:
 For a Debian, Ubuntu, or Snap gateway that stops before certificate generation or
 daemon startup, validate the selected configuration without starting the service:
 
-    openshell-gateway config preflight [--path PATH]
+```shell
+openshell-gateway config preflight [--path PATH | -- GATEWAY_ARGS...]
+```
 
-Without a path, preflight validates a nonempty OPENSHELL_GATEWAY_CONFIG or an
+Without a path, preflight validates a nonempty `OPENSHELL_GATEWAY_CONFIG` or an
 auto-discovered XDG config; no config succeeds. An explicit missing path, legacy
-schema-v1 file, malformed TOML, symlink, or nonregular file fails before the
-gateway ExecStart. It also applies read-only effective-config checks for rate
-limits, TLS, interceptors, and supervisor middleware. Preflight preserves every
-failed file. Do not advise users to
-delete or rewrite it automatically; back it up and follow the manual schema-v2
-migration in the Gateway Configuration reference.
+schema-v1 file, malformed TOML, symlink, or nonregular file fails before gateway
+startup. It also applies read-only effective-config checks for driver selection
+and configuration, sockets, rate limits, TLS, interceptors, and supervisor
+middleware. Arguments after `--` validate the effective daemon invocation,
+including its command-line overrides. Preflight preserves every failed file. Do
+not advise users to delete or rewrite it automatically; back it up and follow the
+manual schema-v2 migration in the Gateway Configuration reference.

@@ -64,15 +64,15 @@ if [ "$expect_config_path" = true ] || { [ "$config_seen" = true ] && [ -z "$cli
 fi
 
 if [ "$config_seen" = true ]; then
-    "${SNAP}/bin/openshell-gateway" config preflight "--path=$cli_config"
+    "${SNAP}/bin/openshell-gateway" config preflight -- "$@"
     exec "${SNAP}/bin/openshell-gateway" "$@"
 elif [ -n "${OPENSHELL_GATEWAY_CONFIG:-}" ]; then
-    "${SNAP}/bin/openshell-gateway" config preflight
+    "${SNAP}/bin/openshell-gateway" config preflight -- "$@"
     exec "${SNAP}/bin/openshell-gateway" "$@"
 elif [ -e "$CANONICAL_CONFIG_FILE" ] || [ -L "$CANONICAL_CONFIG_FILE" ]; then
-    "${SNAP}/bin/openshell-gateway" config preflight --path "$CANONICAL_CONFIG_FILE"
+    "${SNAP}/bin/openshell-gateway" config preflight -- --config "$CANONICAL_CONFIG_FILE" "$@"
     exec "${SNAP}/bin/openshell-gateway" --config "$CANONICAL_CONFIG_FILE" "$@"
 else
-    "${SNAP}/bin/openshell-gateway" config preflight
+    "${SNAP}/bin/openshell-gateway" config preflight -- "$@"
     exec "${SNAP}/bin/openshell-gateway" "$@"
 fi

@@ -7,6 +7,8 @@ use clap::parser::ValueSource;
 use clap::{ArgAction, ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::config::{DEFAULT_GATEWAY_NAME, DEFAULT_SERVER_PORT};
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use tracing::{error, info, warn};
@@ -54,11 +56,15 @@ enum ConfigCommand {
     Preflight(ConfigPreflightArgs),
 }
 
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args, Debug, Default)]
 struct ConfigPreflightArgs {
     /// Explicit configuration path. Overrides `OPENSHELL_GATEWAY_CONFIG` and XDG discovery.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "gateway_args")]
     path: Option<PathBuf>,
+
+    /// Gateway daemon arguments to replay after `--`.
+    #[arg(last = true, allow_hyphen_values = true, value_name = "GATEWAY_ARGS")]
+    gateway_args: Vec<OsString>,
 }
 
 #[derive(clap::Args, Clone, Debug)]
@@ -257,7 +263,9 @@ pub async fn run_cli_with_compute_drivers(compute_drivers: ComputeDriverRegistry
     match cli.command {
         Some(Commands::GenerateCerts(args)) => certgen::run(args).await,
         Some(Commands::Config(args)) => match args.command {
-            ConfigCommand::Preflight(args) => run_config_preflight(args, cli.run, &matches),
+            ConfigCommand::Preflight(args) => {
+                run_config_preflight_with_drivers(args, cli.run, &matches, &compute_drivers)
+            }
         },
         None => Box::pin(run_from_args(cli.run, matches, compute_drivers)).await,
     }
@@ -660,30 +668,127 @@ fn parse_compute_driver(value: &str) -> std::result::Result<String, String> {
     openshell_core::config::normalize_compute_driver_name(value)
 }
 
+#[cfg(test)]
 fn run_config_preflight(
     args: ConfigPreflightArgs,
-    mut run: RunArgs,
+    run: RunArgs,
     matches: &ArgMatches,
 ) -> Result<()> {
-    let path = if let Some(path) = args.path {
-        Some(path)
+    run_config_preflight_with_drivers(args, run, matches, &ComputeDriverRegistry::new())
+}
+
+fn run_config_preflight_with_drivers(
+    args: ConfigPreflightArgs,
+    run: RunArgs,
+    matches: &ArgMatches,
+    compute_drivers: &ComputeDriverRegistry,
+) -> Result<()> {
+    if args.gateway_args.is_empty() {
+        return run_effective_config_preflight(args.path, run, matches, compute_drivers);
+    }
+
+    let replay_matches = match command().try_get_matches_from(
+        std::iter::once(OsString::from("openshell-gateway")).chain(args.gateway_args),
+    ) {
+        Ok(matches) => matches,
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(miette::miette!("{error}")),
+    };
+    let replay =
+        Cli::from_arg_matches(&replay_matches).map_err(|error| miette::miette!("{error}"))?;
+    if replay.command.is_some() {
+        // A valid non-daemon action does not consume gateway startup
+        // configuration. Let the immediately following invocation perform it.
+        return Ok(());
+    }
+    run_effective_config_preflight(None, replay.run, &replay_matches, compute_drivers)
+}
+
+fn run_effective_config_preflight(
+    path_override: Option<PathBuf>,
+    mut run: RunArgs,
+    matches: &ArgMatches,
+    compute_drivers: &ComputeDriverRegistry,
+) -> Result<()> {
+    let path = if path_override.is_some() {
+        path_override
     } else {
         resolve_config_path(&run)?
     };
-    let Some(path) = path else {
-        return Ok(());
-    };
-    let file = config_file::preflight(&path).map_err(|error| miette::miette!("{error}"))?;
-    merge_file_into_args(&mut run, &file.openshell.gateway, matches);
-    validate_preflight_semantics(&run, matches, &file)
-        .map_err(|_| config_file::ConfigPreflightError::invalid_current(&path))
-        .map_err(|error| miette::miette!("{error}"))
+    let file = path
+        .as_ref()
+        .map(|path| config_file::preflight(path).map_err(|error| miette::miette!("{error}")))
+        .transpose()?;
+    if let Some(file) = file.as_ref() {
+        merge_file_into_args(&mut run, &file.openshell.gateway, matches);
+    }
+
+    let validation = (|| {
+        // These argument relationships are shared with daemon startup and
+        // remain transport-free. In particular, the deprecated selector must
+        // fail here exactly when the immediately following daemon invocation
+        // would fail.
+        resolve_legacy_driver_selector_env(&mut run)?;
+        normalize_compute_driver_socket_args(&mut run)?;
+
+        let selection = run
+            .compute_driver
+            .as_deref()
+            .map(|driver| compute_drivers.select(Some(driver)))
+            .transpose()
+            .map_err(|error| miette::miette!("{error}"))?;
+        let selected_registration = selection
+            .as_ref()
+            .and_then(|selection| compute_drivers.get(selection.name()));
+        let empty_file = ConfigFile::default();
+        let semantic_file = file.as_ref().unwrap_or(&empty_file);
+        validate_preflight_semantics(&run, matches, semantic_file, selected_registration)?;
+
+        if let Some(selection) = selection.as_ref() {
+            let mut endpoint_overrides = BTreeMap::new();
+            if let Some(socket) = run.compute_driver_socket.clone() {
+                endpoint_overrides.insert(selection.name().to_string(), socket);
+            }
+            crate::validate_compute_driver_config(
+                compute_drivers,
+                selection.name(),
+                run.name.trim(),
+                SocketAddr::new(run.bind_address, run.port),
+                &run.log_level,
+                crate::compute::driver_config::DriverStartupContext {
+                    file: file.as_ref(),
+                    guest_tls: None,
+                    gateway_port: run.port,
+                    gateway_tls_enabled: !run.disable_tls,
+                    endpoint_overrides: &endpoint_overrides,
+                },
+            )?;
+        }
+        Ok(())
+    })();
+
+    match (validation, path.as_ref()) {
+        (Ok(()), _) => Ok(()),
+        (Err(_), Some(path)) => Err(miette::miette!(
+            "{}",
+            config_file::ConfigPreflightError::invalid_current(path)
+        )),
+        (Err(error), None) => Err(error),
+    }
 }
 
 fn validate_preflight_semantics(
     args: &RunArgs,
     matches: &ArgMatches,
     file: &ConfigFile,
+    selected_registration: Option<&crate::ComputeDriverRegistration>,
 ) -> Result<()> {
     let gateway = &file.openshell.gateway;
     validate_grpc_rate_limit_args(
@@ -694,7 +799,8 @@ fn validate_preflight_semantics(
         .map_err(|error| miette::miette!("invalid gateway guest TLS configuration: {error}"))?;
 
     let has_client_ca = args.tls_client_ca.is_some();
-    let mtls_auth_enabled = resolve_mtls_auth_enabled(args, matches, Some(file), None);
+    let mtls_auth_enabled =
+        resolve_mtls_auth_enabled(args, matches, Some(file), selected_registration);
     if args.disable_tls && has_client_ca {
         return Err(miette::miette!(
             "--disable-tls and --tls-client-ca are mutually exclusive"
@@ -706,6 +812,13 @@ fn validate_preflight_semantics(
     if mtls_auth_enabled && !has_client_ca {
         return Err(miette::miette!(
             "mTLS user authentication requires --tls-client-ca"
+        ));
+    }
+    if mtls_auth_enabled
+        && selected_registration.is_some_and(|registration| !registration.supports_mtls_user_auth())
+    {
+        return Err(miette::miette!(
+            "mTLS user authentication is not supported with the selected compute driver"
         ));
     }
     if !args.disable_tls && args.tls_cert.is_some() != args.tls_key.is_some() {
@@ -1047,11 +1160,40 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::ComputeDriverFactory for TestFactory {
+        fn validate_config(
+            &self,
+            _context: crate::ComputeDriverConfigContext<'_>,
+        ) -> openshell_core::Result<()> {
+            Ok(())
+        }
+
         async fn build(
             &self,
             _context: crate::ComputeDriverBuildContext<'_>,
         ) -> openshell_core::Result<crate::ComputeDriverInstance> {
             unreachable!("CLI metadata tests do not build drivers")
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct RejectingValidationFactory;
+
+    #[async_trait::async_trait]
+    impl crate::ComputeDriverFactory for RejectingValidationFactory {
+        fn validate_config(
+            &self,
+            _context: crate::ComputeDriverConfigContext<'_>,
+        ) -> openshell_core::Result<()> {
+            Err(openshell_core::Error::config(
+                "selected driver validation hook invoked",
+            ))
+        }
+
+        async fn build(
+            &self,
+            _context: crate::ComputeDriverBuildContext<'_>,
+        ) -> openshell_core::Result<crate::ComputeDriverInstance> {
+            unreachable!("preflight must not build the selected driver")
         }
     }
 
@@ -1553,6 +1695,189 @@ mod tests {
     }
 
     #[test]
+    fn config_preflight_path_and_daemon_replay_are_mutually_exclusive() {
+        let error = command()
+            .try_get_matches_from([
+                "openshell-gateway",
+                "config",
+                "preflight",
+                "--path",
+                "/tmp/gateway.toml",
+                "--",
+                "--disable-tls",
+            ])
+            .expect_err("manual path and daemon replay must be mutually exclusive");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn config_preflight_replay_validates_effective_daemon_flags() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let _config_home =
+            EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
+        let _config = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+        let _legacy = EnvVarGuard::remove("OPENSHELL_DRIVERS");
+        let _requests = EnvVarGuard::remove("OPENSHELL_GRPC_RATE_LIMIT_REQUESTS");
+        let _window = EnvVarGuard::remove("OPENSHELL_GRPC_RATE_LIMIT_WINDOW_SECONDS");
+        let (run, matches) = parse_with_args(&["openshell-gateway"]);
+
+        let error = super::run_config_preflight(
+            super::ConfigPreflightArgs {
+                gateway_args: ["--grpc-rate-limit-requests", "10"]
+                    .map(std::ffi::OsString::from)
+                    .to_vec(),
+                ..Default::default()
+            },
+            run.clone(),
+            &matches,
+        )
+        .expect_err("unpaired replayed rate limit must fail preflight");
+        assert!(error.to_string().contains("requires both"));
+
+        super::run_config_preflight(
+            super::ConfigPreflightArgs {
+                gateway_args: [
+                    "--grpc-rate-limit-requests",
+                    "10",
+                    "--grpc-rate-limit-window-seconds",
+                    "60",
+                ]
+                .map(std::ffi::OsString::from)
+                .to_vec(),
+                ..Default::default()
+            },
+            run,
+            &matches,
+        )
+        .expect("paired replayed rate limit must pass preflight");
+    }
+
+    #[test]
+    fn config_preflight_matches_driver_selector_and_registry_semantics() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let _config_home =
+            EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
+        let _config_env = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+        let _canonical = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER");
+        let _legacy = EnvVarGuard::set("OPENSHELL_DRIVERS", "podman,docker");
+        let (run, matches) = parse_with_args(&["openshell-gateway"]);
+        let registry = test_registry("podman", true, true);
+
+        let error = super::run_config_preflight_with_drivers(
+            super::ConfigPreflightArgs::default(),
+            run,
+            &matches,
+            &registry,
+        )
+        .expect_err("plural legacy selector must fail preflight as it fails startup");
+        assert!(error.to_string().contains("exactly one non-empty"));
+    }
+
+    #[test]
+    fn config_preflight_validates_selected_driver_without_building_it() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let _config_home =
+            EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
+        let _config = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+        let _canonical = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER");
+        let _legacy = EnvVarGuard::remove("OPENSHELL_DRIVERS");
+        let (run, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--compute-driver",
+            "local",
+            "--disable-tls",
+        ]);
+        let mut registry = crate::ComputeDriverRegistry::new();
+        registry
+            .install(
+                crate::ComputeDriverRegistration::new(
+                    "local",
+                    100,
+                    None,
+                    RejectingValidationFactory,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let error = super::run_config_preflight_with_drivers(
+            super::ConfigPreflightArgs::default(),
+            run,
+            &matches,
+            &registry,
+        )
+        .expect_err("selected driver validation hook must run");
+        assert!(error.to_string().contains("validation hook invoked"));
+    }
+
+    #[test]
+    fn config_preflight_applies_selected_driver_mtls_capability() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let _config_home =
+            EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
+        let _config = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+        let _legacy = EnvVarGuard::remove("OPENSHELL_DRIVERS");
+        let (run, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--compute-driver",
+            "shared",
+            "--tls-cert",
+            "/tls/server.pem",
+            "--tls-key",
+            "/tls/server-key.pem",
+            "--tls-client-ca",
+            "/tls/ca.pem",
+            "--enable-mtls-auth",
+            "true",
+        ]);
+        let registry = test_registry("shared", false, false);
+
+        let error = super::run_config_preflight_with_drivers(
+            super::ConfigPreflightArgs::default(),
+            run,
+            &matches,
+            &registry,
+        )
+        .expect_err("selected shared driver must reject mTLS user authentication");
+        assert!(error.to_string().contains("not supported"));
+    }
+
+    #[test]
+    fn config_preflight_validates_explicit_remote_driver_endpoint() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let _config_home =
+            EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
+        let _config = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+        let _legacy = EnvVarGuard::remove("OPENSHELL_DRIVERS");
+        let (run, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--compute-driver",
+            "remote",
+            "--disable-tls",
+        ]);
+
+        let error =
+            super::run_config_preflight(super::ConfigPreflightArgs::default(), run, &matches)
+                .expect_err("remote driver without socket_path must fail preflight");
+        assert!(error.to_string().contains("requires socket_path"));
+    }
+
+    #[test]
     fn config_preflight_validates_explicit_path_without_creating_state() {
         let _lock = ENV_LOCK
             .lock()
@@ -1567,7 +1892,10 @@ mod tests {
         let (run, matches) = parse_with_args(&["openshell-gateway"]);
 
         super::run_config_preflight(
-            super::ConfigPreflightArgs { path: Some(config) },
+            super::ConfigPreflightArgs {
+                path: Some(config),
+                ..Default::default()
+            },
             run,
             &matches,
         )
@@ -1593,7 +1921,7 @@ mod tests {
         let (run, matches) = parse_with_args(&["openshell-gateway"]);
 
         let error = super::run_config_preflight(
-            super::ConfigPreflightArgs { path: None },
+            super::ConfigPreflightArgs::default(),
             run.clone(),
             &matches,
         )
@@ -1603,6 +1931,7 @@ mod tests {
         super::run_config_preflight(
             super::ConfigPreflightArgs {
                 path: Some(current),
+                ..Default::default()
             },
             run,
             &matches,
@@ -1621,17 +1950,14 @@ mod tests {
             EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
         let (run, matches) = parse_with_args(&["openshell-gateway"]);
 
-        super::run_config_preflight(
-            super::ConfigPreflightArgs { path: None },
-            run.clone(),
-            &matches,
-        )
-        .expect("absent auto-discovered config is optional");
+        super::run_config_preflight(super::ConfigPreflightArgs::default(), run.clone(), &matches)
+            .expect("absent auto-discovered config is optional");
 
         let missing = config_home.path().join("missing.toml");
         let error = super::run_config_preflight(
             super::ConfigPreflightArgs {
                 path: Some(missing.clone()),
+                ..Default::default()
             },
             run,
             &matches,
@@ -1649,6 +1975,10 @@ mod tests {
         let _config_env = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
         let dir = tempfile::tempdir().unwrap();
         let cases = [
+            (
+                "driver-selector",
+                "[openshell]\nversion = 2\n[openshell.gateway]\ncompute_driver = 'secret-driver-marker'\ndisable_tls = true\n",
+            ),
             (
                 "rate-limit",
                 "[openshell]\nversion = 2\n[openshell.gateway]\nname = 'secret-semantic-marker'\ngrpc_rate_limit_requests = 10\n",
@@ -1679,6 +2009,7 @@ mod tests {
             let result = super::run_config_preflight(
                 super::ConfigPreflightArgs {
                     path: Some(path.clone()),
+                    ..Default::default()
                 },
                 run,
                 &matches,
@@ -1688,8 +2019,8 @@ mod tests {
             };
             assert!(error.to_string().contains("category=malformed"), "{name}");
             assert!(error.to_string().contains("detected_version=2"), "{name}");
-            assert!(!error.to_string().contains("secret-semantic-marker"));
-            assert!(!format!("{error:?}").contains("secret-semantic-marker"));
+            assert!(!error.to_string().contains("secret-"));
+            assert!(!format!("{error:?}").contains("secret-"));
             assert_eq!(std::fs::read(&path).unwrap(), before, "{name}");
         }
     }
@@ -1712,6 +2043,7 @@ mod tests {
         super::run_config_preflight(
             super::ConfigPreflightArgs {
                 path: Some(partial_external),
+                ..Default::default()
             },
             run,
             &matches,
@@ -1727,7 +2059,10 @@ mod tests {
         let _key = EnvVarGuard::remove("OPENSHELL_TLS_KEY");
         let (run, matches) = parse_with_args(&["openshell-gateway"]);
         let error = super::run_config_preflight(
-            super::ConfigPreflightArgs { path: Some(config) },
+            super::ConfigPreflightArgs {
+                path: Some(config),
+                ..Default::default()
+            },
             run,
             &matches,
         )
@@ -1751,7 +2086,10 @@ mod tests {
         let (run, matches) = parse_with_args(&["openshell-gateway"]);
 
         super::run_config_preflight(
-            super::ConfigPreflightArgs { path: Some(path) },
+            super::ConfigPreflightArgs {
+                path: Some(path),
+                ..Default::default()
+            },
             run,
             &matches,
         )

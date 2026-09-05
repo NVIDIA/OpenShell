@@ -87,8 +87,12 @@ spec:
         - name: openshell-data
           mountPath: /var/openshell
         {{- end }}
+        # ConfigMap directory mounts expose keys through atomic-writer symlinks,
+        # while the gateway intentionally rejects symlinked configuration.
+        # The checksum annotation above rolls pods when this subPath changes.
         - name: gateway-config
-          mountPath: /etc/openshell
+          mountPath: /etc/openshell/gateway.toml
+          subPath: gateway.toml
           readOnly: true
         - name: sandbox-jwt
           mountPath: /etc/openshell-jwt

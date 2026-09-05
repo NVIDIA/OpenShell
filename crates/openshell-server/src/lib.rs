@@ -1060,6 +1060,10 @@ pub enum ComputeDriverInstance {
 /// Factory for a compute driver linked into a gateway binary.
 #[async_trait::async_trait]
 pub trait ComputeDriverFactory: Send + Sync {
+    /// Validate selected-driver configuration without starting a driver,
+    /// connecting a transport, or modifying runtime state.
+    fn validate_config(&self, context: ComputeDriverConfigContext<'_>) -> Result<()>;
+
     async fn build(&self, context: ComputeDriverBuildContext<'_>) -> Result<ComputeDriverInstance>;
 }
 
@@ -1285,20 +1289,25 @@ impl ComputeDriverRegistry {
     }
 }
 
-pub struct ComputeDriverBuildContext<'a> {
-    driver_name: String,
+/// Read-only inputs available while validating a selected compute driver.
+///
+/// This context deliberately exposes no shutdown handle, runtime store, or
+/// transport client. Implementations must remain deterministic and must not
+/// start processes, connect sockets, or modify state.
+#[derive(Clone, Copy)]
+pub struct ComputeDriverConfigContext<'a> {
+    driver_name: &'a str,
     gateway_name: &'a str,
     gateway_bind_address: SocketAddr,
     gateway_log_level: &'a str,
     driver_startup: compute::driver_config::DriverStartupContext<'a>,
-    shutdown_rx: watch::Receiver<bool>,
     inherited_config_keys: &'static [&'static str],
 }
 
-impl ComputeDriverBuildContext<'_> {
+impl ComputeDriverConfigContext<'_> {
     #[must_use]
     pub fn driver_name(&self) -> &str {
-        &self.driver_name
+        self.driver_name
     }
 
     #[must_use]
@@ -1326,10 +1335,65 @@ impl ComputeDriverBuildContext<'_> {
         self.driver_startup.gateway_tls_enabled
     }
 
+    /// Deserialize the selected driver's merged TOML table.
+    pub fn driver_config<T>(&self) -> Result<T>
+    where
+        T: Default + serde::de::DeserializeOwned,
+    {
+        compute::driver_config::driver_config_from_context(
+            self.driver_startup,
+            self.driver_name,
+            self.inherited_config_keys,
+        )
+    }
+}
+
+pub struct ComputeDriverBuildContext<'a> {
+    config: ComputeDriverConfigContext<'a>,
+    shutdown_rx: watch::Receiver<bool>,
+}
+
+impl ComputeDriverBuildContext<'_> {
+    #[must_use]
+    pub fn config_context(&self) -> ComputeDriverConfigContext<'_> {
+        self.config
+    }
+
+    #[must_use]
+    pub fn driver_name(&self) -> &str {
+        self.config.driver_name()
+    }
+
+    #[must_use]
+    pub fn gateway_name(&self) -> &str {
+        self.config.gateway_name()
+    }
+
+    #[must_use]
+    pub fn gateway_bind_address(&self) -> SocketAddr {
+        self.config.gateway_bind_address()
+    }
+
+    #[must_use]
+    pub fn gateway_log_level(&self) -> &str {
+        self.config.gateway_log_level()
+    }
+
+    #[must_use]
+    pub fn gateway_port(&self) -> u16 {
+        self.config.gateway_port()
+    }
+
+    #[must_use]
+    pub fn gateway_tls_enabled(&self) -> bool {
+        self.config.gateway_tls_enabled()
+    }
+
     /// Gateway client credentials that a local driver may mount into guests.
     #[must_use]
     pub fn guest_tls_paths(&self) -> Option<(&Path, &Path, &Path)> {
-        self.driver_startup
+        self.config
+            .driver_startup
             .guest_tls
             .map(compute::driver_config::GuestTlsPaths::as_paths)
     }
@@ -1339,11 +1403,7 @@ impl ComputeDriverBuildContext<'_> {
     where
         T: Default + serde::de::DeserializeOwned,
     {
-        compute::driver_config::driver_config_from_context(
-            self.driver_startup,
-            &self.driver_name,
-            self.inherited_config_keys,
-        )
+        self.config.driver_config()
     }
 
     #[must_use]
@@ -1353,7 +1413,8 @@ impl ComputeDriverBuildContext<'_> {
 
     #[must_use]
     pub fn otlp_config(&self) -> Option<&config_file::OtlpConfig> {
-        self.driver_startup
+        self.config
+            .driver_startup
             .file
             .and_then(|file| file.openshell.gateway.otlp.as_ref())
     }
@@ -1372,7 +1433,14 @@ async fn build_compute_runtime(
     supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<ComputeRuntime> {
-    let driver = resolve_configured_compute_driver(registry, selection.name(), driver_startup)?;
+    let driver = validate_compute_driver_config(
+        registry,
+        selection.name(),
+        &config.name,
+        config.bind_address,
+        &config.log_level,
+        driver_startup,
+    )?;
     let telemetry_compute_driver = driver.telemetry_compute_driver(registry);
     info!(driver = %driver.name(), "Using compute driver");
     if config
@@ -1389,13 +1457,15 @@ async fn build_compute_runtime(
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
             let build_context = ComputeDriverBuildContext {
-                driver_name: registration.name.clone(),
-                gateway_name: &config.name,
-                gateway_bind_address: config.bind_address,
-                gateway_log_level: &config.log_level,
-                driver_startup,
+                config: ComputeDriverConfigContext {
+                    driver_name: &registration.name,
+                    gateway_name: &config.name,
+                    gateway_bind_address: config.bind_address,
+                    gateway_log_level: &config.log_level,
+                    driver_startup,
+                    inherited_config_keys: registration.inherited_config_keys,
+                },
                 shutdown_rx,
-                inherited_config_keys: registration.inherited_config_keys,
             };
             let instance = registration.factory.build(build_context).await?;
             match instance {
@@ -1500,6 +1570,36 @@ fn configured_compute_driver(
 ) -> Result<ConfiguredComputeDriver> {
     let selection = registry.select(config.compute_driver.as_deref())?;
     resolve_configured_compute_driver(registry, selection.name(), driver_startup)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_compute_driver_config(
+    registry: &ComputeDriverRegistry,
+    driver_name: &str,
+    gateway_name: &str,
+    gateway_bind_address: SocketAddr,
+    gateway_log_level: &str,
+    driver_startup: compute::driver_config::DriverStartupContext<'_>,
+) -> Result<ConfiguredComputeDriver> {
+    let driver = resolve_configured_compute_driver(registry, driver_name, driver_startup)?;
+    match &driver {
+        ConfiguredComputeDriver::Registered(registration) => {
+            registration
+                .factory
+                .validate_config(ComputeDriverConfigContext {
+                    driver_name: &registration.name,
+                    gateway_name,
+                    gateway_bind_address,
+                    gateway_log_level,
+                    driver_startup,
+                    inherited_config_keys: registration.inherited_config_keys,
+                })?;
+        }
+        ConfiguredComputeDriver::Remote { name } => {
+            compute::driver_config::remote_driver_config_from_context(driver_startup, name)?;
+        }
+    }
+    Ok(driver)
 }
 
 fn resolve_configured_compute_driver(
@@ -1783,6 +1883,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl super::ComputeDriverFactory for TestComputeDriverFactory {
+        fn validate_config(
+            &self,
+            _context: super::ComputeDriverConfigContext<'_>,
+        ) -> openshell_core::Result<()> {
+            Ok(())
+        }
+
         async fn build(
             &self,
             _context: super::ComputeDriverBuildContext<'_>,

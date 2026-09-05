@@ -497,22 +497,7 @@ impl KubernetesComputeDriver {
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Self, KubernetesDriverError> {
         config
-            .validate_workspace_mode()
-            .map_err(KubernetesDriverError::Precondition)?;
-        config
-            .validate_provider_spiffe_workload_api_socket_path()
-            .map_err(KubernetesDriverError::Precondition)?;
-        config
-            .validate_sandbox_identity_config()
-            .map_err(KubernetesDriverError::Precondition)?;
-        config
-            .validate_proxy_uid()
-            .map_err(KubernetesDriverError::Precondition)?;
-        config
-            .validate_image_pull_policies()
-            .map_err(KubernetesDriverError::Precondition)?;
-        config
-            .validate_upstream_proxy_config()
+            .validate_configuration()
             .map_err(KubernetesDriverError::Precondition)?;
         let base_config = match kube::Config::incluster() {
             Ok(c) => c,

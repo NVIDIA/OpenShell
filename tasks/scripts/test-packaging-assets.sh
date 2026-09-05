@@ -71,7 +71,7 @@ assert_contains "$snap_wrapper" "if [ -n \"\${OPENSHELL_GATEWAY_CONFIG:-}\" ]; t
 assert_contains \
   "$snap_wrapper" \
   "elif [ -e \"\$CANONICAL_CONFIG_FILE\" ] || [ -L \"\$CANONICAL_CONFIG_FILE\" ]; then"
-assert_contains "$snap_wrapper" "config preflight --path \"\$CANONICAL_CONFIG_FILE\""
+assert_contains "$snap_wrapper" "config preflight -- --config \"\$CANONICAL_CONFIG_FILE\" \"\$@\""
 assert_not_contains "$snap_wrapper" "[ -f \"\$CANONICAL_CONFIG_FILE\" ]"
 bash "$ROOT/tasks/scripts/test-snap-gateway-wrapper.sh" "$snap_wrapper"
 if ! awk '/config preflight/ { seen = 1 } /generate-certs/ { exit !seen }' "$service"; then

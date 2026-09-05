@@ -221,6 +221,30 @@ pub fn parse_id_map_entry(
 }
 
 impl PodmanComputeConfig {
+    /// Validate and normalize startup configuration without connecting to Podman.
+    pub fn validate_configuration(&mut self) -> Result<(), crate::client::PodmanApiError> {
+        self.validate_tls_config()?;
+        self.validate_runtime_limits()?;
+        self.validate_host_gateway_ip()?;
+        self.validate_proxy_config()?;
+        self.validate_app_armor_profile()?;
+        if let Some(socket) = self.provider_spiffe_workload_api_socket.as_deref() {
+            let raw = socket.to_str().ok_or_else(|| {
+                crate::client::PodmanApiError::InvalidInput(
+                    "provider_spiffe_workload_api_socket must be valid UTF-8".to_string(),
+                )
+            })?;
+            // Preserve pass-through support for an explicitly configured
+            // container-reachable Workload API TCP endpoint.
+            if !raw.starts_with("tcp:") {
+                openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)
+                    .map_err(crate::client::PodmanApiError::InvalidInput)?;
+            }
+        }
+        self.canonicalize_userns()?;
+        self.validate_userns_mappings()
+    }
+
     /// Returns `true` when all three TLS paths are configured.
     #[must_use]
     pub fn tls_enabled(&self) -> bool {

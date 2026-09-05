@@ -170,9 +170,13 @@ Check the selected file before restarting a service:
 openshell-gateway config preflight --path ~/.config/openshell/gateway.toml
 ```
 
-Without --path, preflight checks a nonempty OPENSHELL_GATEWAY_CONFIG or an
-auto-discovered XDG config; no config is also a successful result. Debian keeps
-its bare service invocation and gateway.env semantics. Snap gives a nonempty
-OPENSHELL_GATEWAY_CONFIG precedence over SNAP_COMMON/gateway.toml.
+Without `--path`, preflight checks a nonempty `OPENSHELL_GATEWAY_CONFIG` or an
+auto-discovered XDG config; no config is also a successful result. It applies
+read-only startup validation to the effective selector, registered compute driver,
+driver configuration, socket, rate limits, TLS, interceptors, and middleware.
+Wrappers can pass daemon arguments after `--` to validate the exact startup
+invocation. Debian keeps its bare service invocation and `gateway.env` semantics.
+Snap replays its effective daemon arguments through preflight and gives a nonempty
+`OPENSHELL_GATEWAY_CONFIG` precedence over `SNAP_COMMON/gateway.toml`.
 See [Gateway Configuration](/reference/gateway-config#gateway-config-preflight)
 for preflight details and manual schema-v1 migration steps.

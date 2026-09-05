@@ -70,6 +70,13 @@ struct UnsupportedWindowsFactory {
 #[cfg(all(target_os = "windows", feature = "in-tree-compute-drivers"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for UnsupportedWindowsFactory {
+    fn validate_config(
+        &self,
+        _context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<()> {
+        Err(unsupported_windows_compute_driver(self.name))
+    }
+
     async fn build(
         &self,
         _context: openshell_server::ComputeDriverBuildContext<'_>,
@@ -90,6 +97,14 @@ struct MxcFactory;
 #[cfg(all(target_os = "windows", feature = "in-tree-compute-drivers"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for MxcFactory {
+    fn validate_config(
+        &self,
+        context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<()> {
+        let _: openshell_driver_mxc::MxcComputeConfig = context.driver_config()?;
+        Ok(())
+    }
+
     async fn build(
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
@@ -161,18 +176,20 @@ struct KubernetesFactory;
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for KubernetesFactory {
+    fn validate_config(
+        &self,
+        context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<()> {
+        kubernetes_config(context)?
+            .validate_configuration()
+            .map_err(openshell_core::Error::config)
+    }
+
     async fn build(
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
-        let mut config: openshell_driver_kubernetes::KubernetesComputeConfig =
-            context.driver_config()?;
-        if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
-            config.workspace_default_storage_size = size;
-        }
-        if let Ok(storage_class) = std::env::var("OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS") {
-            config.workspace_storage_class = storage_class;
-        }
+        let config = kubernetes_config(context.config_context())?;
         let driver = openshell_driver_kubernetes::KubernetesComputeDriver::new(
             config,
             context.shutdown_receiver(),
@@ -187,12 +204,35 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
 }
 
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+fn kubernetes_config(
+    context: openshell_server::ComputeDriverConfigContext<'_>,
+) -> openshell_core::Result<openshell_driver_kubernetes::KubernetesComputeConfig> {
+    let mut config: openshell_driver_kubernetes::KubernetesComputeConfig =
+        context.driver_config()?;
+    if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
+        config.workspace_default_storage_size = size;
+    }
+    if let Ok(storage_class) = std::env::var("OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS") {
+        config.workspace_storage_class = storage_class;
+    }
+    Ok(config)
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 #[derive(Clone, Copy)]
 struct DockerFactory;
 
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for DockerFactory {
+    fn validate_config(
+        &self,
+        context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<()> {
+        let config: openshell_driver_docker::DockerComputeConfig = context.driver_config()?;
+        config.validate_configuration(context.gateway_bind_address())
+    }
+
     async fn build(
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
@@ -226,22 +266,21 @@ struct PodmanFactory;
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for PodmanFactory {
+    fn validate_config(
+        &self,
+        context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<()> {
+        podman_config(context)?
+            .validate_configuration()
+            .map_err(|error| openshell_core::Error::config(error.to_string()))
+    }
+
     async fn build(
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
-        let mut config: openshell_driver_podman::PodmanComputeConfig = context.driver_config()?;
+        let mut config = podman_config(context.config_context())?;
         require_guest_tls_for_local_driver(&context, "podman")?;
-        config.gateway_port = context.gateway_port();
-        if let Ok(path) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
-            config.socket_path = Some(path.into());
-        }
-        if let Ok(ip) = std::env::var("OPENSHELL_PODMAN_HOST_GATEWAY_IP") {
-            config.host_gateway_ip = ip;
-        }
-        if let Ok(mode) = std::env::var("OPENSHELL_PODMAN_USERNS") {
-            config.userns = Some(mode);
-        }
         apply_guest_tls(
             &mut config.guest_tls_ca,
             &mut config.guest_tls_cert,
@@ -259,21 +298,52 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
 }
 
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+fn podman_config(
+    context: openshell_server::ComputeDriverConfigContext<'_>,
+) -> openshell_core::Result<openshell_driver_podman::PodmanComputeConfig> {
+    let mut config: openshell_driver_podman::PodmanComputeConfig = context.driver_config()?;
+    config.gateway_port = context.gateway_port();
+    if let Ok(path) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
+        config.socket_path = Some(path.into());
+    }
+    if let Ok(ip) = std::env::var("OPENSHELL_PODMAN_HOST_GATEWAY_IP") {
+        config.host_gateway_ip = ip;
+    }
+    if let Ok(mode) = std::env::var("OPENSHELL_PODMAN_USERNS") {
+        config.userns = Some(mode);
+    }
+    Ok(config)
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 #[derive(Clone, Copy)]
 struct VmFactory;
 
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for VmFactory {
+    fn validate_config(
+        &self,
+        context: openshell_server::ComputeDriverConfigContext<'_>,
+    ) -> openshell_core::Result<()> {
+        let mut config = vm_config(context)?;
+        if config.grpc_endpoint.trim().is_empty() {
+            let scheme = if context.gateway_tls_enabled() {
+                "https"
+            } else {
+                "http"
+            };
+            config.grpc_endpoint = format!("{scheme}://127.0.0.1:{}", context.gateway_port());
+        }
+        config.validate_configuration()
+    }
+
     async fn build(
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
-        let mut config: vm::VmComputeConfig = context.driver_config()?;
+        let mut config = vm_config(context.config_context())?;
         require_guest_tls_for_local_driver(&context, "vm")?;
-        if config.state_dir.as_os_str().is_empty() {
-            config.state_dir = vm::VmComputeConfig::default_state_dir();
-        }
         if config.grpc_endpoint.trim().is_empty()
             && (!context.gateway_tls_enabled() || context.guest_tls_paths().is_some())
         {
@@ -301,6 +371,17 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
             endpoint,
         ))
     }
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+fn vm_config(
+    context: openshell_server::ComputeDriverConfigContext<'_>,
+) -> openshell_core::Result<vm::VmComputeConfig> {
+    let mut config: vm::VmComputeConfig = context.driver_config()?;
+    if config.state_dir.as_os_str().is_empty() {
+        config.state_dir = vm::VmComputeConfig::default_state_dir();
+    }
+    Ok(config)
 }
 
 #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]

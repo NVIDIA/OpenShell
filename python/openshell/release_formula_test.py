@@ -241,8 +241,8 @@ def test_schema_v2_debian_and_snap_preflight_wiring() -> None:
         in wrapper
     )
     assert wrapper.count('"${SNAP}/bin/openshell-gateway" config preflight') == 4
-    assert 'config preflight "--path=$cli_config"' in wrapper
-    assert 'config preflight --path "$CANONICAL_CONFIG_FILE"' in wrapper
+    assert 'config preflight -- "$@"' in wrapper
+    assert 'config preflight -- --config "$CANONICAL_CONFIG_FILE" "$@"' in wrapper
     assert (
         'exec "${SNAP}/bin/openshell-gateway" --config "$CANONICAL_CONFIG_FILE" "$@"'
         in wrapper

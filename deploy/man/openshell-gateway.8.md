@@ -14,7 +14,7 @@ openshell-gateway - OpenShell gateway server daemon
 
 **openshell-gateway** \[*OPTIONS*\]
 
-**openshell-gateway** **config preflight** [**--path** *PATH*]
+**openshell-gateway** **config preflight** [**--path** *PATH* | **--** *GATEWAY_ARGS*...]
 
 # DESCRIPTION
 
@@ -116,23 +116,29 @@ configured in the TOML file passed with **--config**.
 
 Validate a gateway configuration before starting the daemon:
 
-    openshell-gateway config preflight [--path PATH]
+    openshell-gateway config preflight [--path PATH | -- GATEWAY_ARGS...]
 
 With no path, preflight validates a nonempty OPENSHELL_GATEWAY_CONFIG. If that
 variable is unset, it optionally validates an auto-discovered XDG config. The
 absence of either config succeeds. An explicit missing path, legacy schema-v1
 file, invalid TOML, symlink, or nonregular file fails with a nonzero status.
 Preflight merges file and environment values and applies read-only startup checks
-for rate-limit, TLS, interceptor, and middleware relationships. Preflight never
-changes the file and reports that failed input was preserved.
+for selector and socket normalization, registered compute-driver configuration,
+rate limits, TLS and mTLS, interceptors, and middleware. It does not construct a
+compute driver or connect to a transport. Preflight never changes the file and
+reports that failed input was preserved.
+
+Arguments after **--** replace **--path** mode and are parsed as the exact gateway
+daemon invocation. Package wrappers use this form so command-line overrides are
+validated before the same arguments reach startup.
 
 The Debian and Ubuntu systemd user unit runs preflight before certificate
 generation, while retaining its EnvironmentFile and bare ExecStart behavior. The
-Snap wrapper first validates a nonempty OPENSHELL_GATEWAY_CONFIG. Otherwise it
-validates the canonical SNAP_COMMON/gateway.toml path whenever it exists or is a
-symlink. A broken symlink fails preflight before the gateway is started. Correct
-or manually migrate an operator-owned v1 file, then run preflight again before
-restarting the service.
+Snap wrapper replays its effective daemon arguments through preflight. It first
+uses a nonempty OPENSHELL_GATEWAY_CONFIG. Otherwise it passes the canonical
+SNAP_COMMON/gateway.toml path whenever it exists or is a symlink. A broken symlink
+fails preflight before the gateway is started. Correct or manually migrate an
+operator-owned v1 file, then run preflight again before restarting the service.
 
 # SYSTEMD INTEGRATION
 

@@ -45,6 +45,23 @@ tests:
       - exists:
           path: spec.template.metadata.annotations["checksum/gateway-config"]
 
+  - it: mounts gateway.toml as a regular read-only subPath file
+    template: templates/statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: gateway-config
+            mountPath: /etc/openshell/gateway.toml
+            subPath: gateway.toml
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: gateway-config
+            configMap:
+              name: openshell-config
+
   - it: renders a StatefulSet by default
     template: templates/statefulset.yaml
     asserts:
@@ -646,6 +663,13 @@ tests:
       - equal:
           path: spec.template.spec.containers[0].name
           value: openshell-gateway
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: gateway-config
+            mountPath: /etc/openshell/gateway.toml
+            subPath: gateway.toml
+            readOnly: true
       - notContains:
           path: spec.template.spec.containers[0].volumeMounts
           content:
