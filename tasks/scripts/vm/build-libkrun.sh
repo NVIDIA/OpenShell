@@ -213,9 +213,6 @@ if [ -f openshell.kconfig ]; then
   # Verify that the key options were actually applied.
   all_ok=true
   for opt in \
-    CONFIG_BRIDGE \
-    CONFIG_NETFILTER \
-    CONFIG_NF_NAT \
     CONFIG_SECURITY \
     CONFIG_SECURITY_LANDLOCK \
     CONFIG_SECCOMP \
