@@ -1320,6 +1320,10 @@ mod linux {
             provider_env_revision: u64,
             provider_env: std::collections::HashMap<String, String>,
         ) -> Response {
+            let spec = match resolve_agent_spec(spec) {
+                Ok(spec) => spec,
+                Err(error) => return guest_error("failed", error),
+            };
             let mut state = lock(&self.state);
             let requested = StartedAgent {
                 sandbox_id: sandbox_id.clone(),
@@ -1669,6 +1673,24 @@ mod linux {
         ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     }
 
+    fn resolve_agent_spec(mut spec: AgentSpecWire) -> Result<AgentSpecWire, String> {
+        if !spec.program.is_empty() {
+            return Ok(spec);
+        }
+        if !spec.args.is_empty() {
+            return Err("default agent command cannot include arguments".to_string());
+        }
+        let shell = openshell_core::shell::detect_login_shell();
+        if !openshell_core::shell::is_executable(&shell) {
+            return Err(format!(
+                "sandbox image does not provide an executable login shell at {shell}"
+            ));
+        }
+        spec.program = shell;
+        spec.args = vec!["-l".to_string()];
+        Ok(spec)
+    }
+
     impl ManagedProcess {
         fn spawn(
             runtime: &tokio::runtime::Handle,
@@ -1684,9 +1706,7 @@ mod linux {
                 provider_env,
                 ca_file_paths,
             } = launch;
-            if spec.program.is_empty() {
-                return Err("agent program must not be empty".to_string());
-            }
+            debug_assert!(!spec.program.is_empty());
             let boundary_runtime = BoundaryRuntimeState::new_exclusive_pid_namespace();
             let entrypoint_pid = Arc::new(AtomicU32::new(0));
             let provider_credentials = ProviderCredentialState::from_child_env_snapshot(
@@ -2376,6 +2396,23 @@ mod linux {
                     .is_some()
             );
             assert_eq!(ledger.entries.len(), MAX_REPLAY_LEDGER_ENTRIES);
+        }
+
+        #[test]
+        fn scratch_agent_command_resolves_inside_the_workload_filesystem() {
+            let resolved = resolve_agent_spec(AgentSpecWire {
+                program: String::new(),
+                args: Vec::new(),
+                workdir: Some("/sandbox".to_string()),
+                timeout_secs: 0,
+                interactive: true,
+            })
+            .expect("resolve scratch command");
+
+            assert!(openshell_core::shell::is_executable(&resolved.program));
+            assert_eq!(resolved.args, vec!["-l".to_string()]);
+            assert_eq!(resolved.workdir.as_deref(), Some("/sandbox"));
+            assert!(resolved.interactive);
         }
 
         fn placeholder_server_tls() -> BoundaryServerTls {
