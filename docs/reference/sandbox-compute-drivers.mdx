@@ -228,7 +228,7 @@ OpenShell rejects mount `source`, `target`, and Docker volume `subpath` values
 with surrounding whitespace. OpenShell also rejects mount targets that replace
 the workspace root or container root, or contain or are contained by the
 configured SSH socket or reserved `/opt/openshell`, `/etc/openshell`,
-`/etc/openshell-tls`, `/run/openshell`, `/run/openshell-sidecar`, and network
+`/etc/openshell-tls`, `/run/openshell`, and network
 namespace roots. These checks do not make host bind mounts safe.
 
 ## Podman Driver
@@ -407,19 +407,16 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `[managed_ssh_ingress]` | `networkPolicy.enabled` | In managed mode, create an SSH ingress policy in every workspace namespace. Helm configures the gateway namespace and pod selector automatically. Operator mode leaves namespace policy management to the platform operator. |
 | `grpc_endpoint` | `server.grpcEndpoint` | Set the gateway callback endpoint reachable from sandbox pods. |
 | `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Mount sandbox client TLS materials from a Kubernetes secret. |
-| `supervisor_image` | `supervisor.image.repository` / `supervisor.image.tag` | Override the supervisor image that provides the `openshell-sandbox` binary. The default repository with an empty tag uses the version-pinned image built into the gateway. Changing the repository uses the effective gateway image tag, while setting a tag pins that version explicitly. |
+| `supervisor_image` | `supervisor.image.repository` / `supervisor.image.tag` | Override the trusted runtime image that provides the `openshell-sandbox` and `openshell-supervisor` binaries. The default repository with an empty tag uses the version pinned into the gateway. |
 | `supervisor_image_pull_policy` | `supervisor.image.pullPolicy` | Set the Kubernetes image pull policy for the supervisor image. |
-| `supervisor_sideload_method` | `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect from cluster version. Set to `image-volume` to mount the supervisor OCI image directly as a volume (requires Kubernetes 1.33+ with the ImageVolume feature gate; GA in 1.36), or `init-container` to copy it through an init container on older clusters. |
-| `topology` | `supervisor.topology` | Set `combined` for the default single supervisor path, or `sidecar` to move pod-level network enforcement and the gateway session into a dedicated sidecar. |
+| `proxy_pod.network_policy_enforced` | `supervisor.proxyPod.networkPolicyEnforced` | Acknowledge that the cluster CNI enforces ingress and egress `NetworkPolicy` in sandbox namespaces. This must be `true`. |
+| `proxy_pod.boundary_port` | `supervisor.proxyPod.boundaryPort` | Set the non-privileged TLS port used between the paired supervisor and sandbox Pods. |
 | `https_proxy` | `upstreamProxy.url` | Set the operator-owned `http://host:port` corporate forward proxy used for policy-approved TLS CONNECT egress. |
 | `no_proxy` | `upstreamProxy.noProxy` | Set destinations that bypass only the corporate proxy. OpenShell policy evaluation still applies. |
-| `proxy_auth_secret_name` | `upstreamProxy.authSecret.name` | Set the existing Secret name in the sandbox namespace that contains the proxy credential. Requires `sidecar` topology. |
-| `proxy_auth_secret_key` | `upstreamProxy.authSecret.key` | Set the Secret key containing the `user:pass` credential. Requires `sidecar` topology. |
+| `proxy_auth_secret_name` | `upstreamProxy.authSecret.name` | Set the existing Secret name in the sandbox namespace that contains the proxy credential. The Secret mounts only in the supervisor Pod. |
+| `proxy_auth_secret_key` | `upstreamProxy.authSecret.key` | Set the Secret key containing the `user:pass` credential. |
 | `proxy_auth_allow_insecure` | `upstreamProxy.authAllowInsecure` | Set `true` to acknowledge that Basic authentication to an HTTP proxy is cleartext. Required with a proxy credential Secret. |
 | `proxy_connect_by_hostname` | `upstreamProxy.connectByHostname` | Send hostnames rather than validated IPs in CONNECT requests. Use only when proxy ACLs require hostname targets. |
-| `sidecar.proxy_uid` | `supervisor.sidecar.proxyUid` | Dedicated UID of at least `1000` used by the relaxed sidecar when process/binary-aware network policy is disabled. It must not match the workload UID. The default binary-aware sidecar runs as UID 0. The network init container exempts the effective sidecar UID from proxy redirection. |
-| `sidecar.process_binary_aware_network_policy` | `supervisor.sidecar.processBinaryAwareNetworkPolicy` | Keep process/binary-aware network policy enabled in `sidecar` topology. The default runs the sidecar as UID 0 with `SYS_PTRACE` and `DAC_READ_SEARCH`. Set false to run as `proxy_uid`, drop both capabilities, and enforce endpoint/L7 policy without matching `policy.binaries`. |
-| `app_armor_profile` | `server.appArmorProfile` | Set the sandbox agent container's AppArmor profile. Helm defaults this to `Unconfined` so AppArmor-enabled nodes do not block supervisor network namespace setup. Set the Helm value to an empty string to omit the field, or use `RuntimeDefault` or `Localhost/<profile-name>` for operator-managed profiles. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
 | `workspace_storage_class` | `server.workspaceStorageClass` | Set the `StorageClass` for the workspace PVC. Empty (default) omits `storageClassName` and uses the cluster's default `StorageClass`. Set this on clusters with no default `StorageClass`, otherwise the workspace PVC stays `Pending` and the sandbox never starts. |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
@@ -431,30 +428,15 @@ remain limited to the explicitly configured TLS and image-pull Secret names.
 The driver creates copies only in gateway-owned managed namespaces. Do not
 reuse the gateway ServiceAccount for unrelated workloads.
 
-In `combined` topology, the agent container carries the Linux capabilities
-needed by the supervisor for network namespace setup, Landlock filesystem
-policy, process privilege changes, and network policy enforcement. In `sidecar`
-topology, the agent container runs as the resolved sandbox UID/GID with no added
-Linux capabilities. A root init container performs the nftables setup, and the
-long-running binary-aware sidecar runs as UID 0, drops default capabilities,
-and adds `SYS_PTRACE` plus `DAC_READ_SEARCH` for workload process identity
-resolution through shared `/proc`. The
-`sidecar.process_binary_aware_network_policy = false` setting runs it as the
-configured non-root `proxy_uid`, removes both capabilities, and relaxes network
-policy to endpoint/L7 matching only. The
-network sidecar owns gateway authentication and writes local policy/provider
-state to the process supervisor over a local control socket, so the agent
-container does not mount the sandbox bootstrap token or client TLS secret in
-the default sidecar path. The provider environment is refreshed by the network
-sidecar after settings polls and streamed to the process supervisor so future
-child processes can see updated provider env without gateway access in the
-agent container.
-Sidecar mode keeps gateway session and SSH behavior. The process supervisor
-applies Landlock filesystem policy and child seccomp filters where supported,
-but it does not perform root-to-sandbox privilege dropping or supervisor
-identity mount isolation. Network policy still runs in the sidecar, and sidecar
-pods set `shareProcessNamespace: true` so the network sidecar can resolve
-process/binary identity through `/proc/<entrypoint-pid>`.
+The Kubernetes driver always uses a capability-free proxy-pod topology. The
+workload Pod runs `openshell-sandbox` as the same non-root UID/GID as the agent
+and requests no added Linux capabilities. A separate Deployment runs
+`openshell-supervisor`, authenticates to the gateway with a sandbox JWT, and
+owns upstream connections. Both containers disable privilege escalation, drop
+all capabilities, and use `RuntimeDefault` seccomp. The sandbox adds a nested
+seccomp user-notification filter and Landlock restrictions before it launches
+the agent. An empty-egress `NetworkPolicy` is the mandatory outer fence for the
+workload Pod.
 
 The Kubernetes driver creates namespaced `agents.x-k8s.io` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. It detects the served Sandbox API at runtime, caches the selected API version for the gateway process, and uses `v1beta1` when available before falling back to `v1alpha1`, so supported Agent Sandbox installations work without version-specific operator configuration. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
 

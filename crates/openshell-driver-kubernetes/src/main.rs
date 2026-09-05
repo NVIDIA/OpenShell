@@ -11,10 +11,9 @@ use tracing::info;
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_kubernetes::{
-    AppArmorProfile, ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID,
-    DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig, KubernetesComputeDriver,
-    KubernetesSidecarConfig, ManagedSshIngressConfig, SupervisorSideloadMethod, SupervisorTopology,
-    WorkspaceMode,
+    ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
+    KubernetesComputeConfig, KubernetesComputeDriver, KubernetesProxyPodConfig,
+    ManagedSshIngressConfig, WorkspaceMode,
 };
 
 #[derive(Parser, Debug)]
@@ -118,29 +117,17 @@ struct Args {
 
     #[arg(
         long,
-        env = "OPENSHELL_SUPERVISOR_SIDELOAD_METHOD",
-        default_value = "image-volume"
+        env = "OPENSHELL_K8S_PROXY_POD_NETWORK_POLICY_ENFORCED",
+        default_value_t = false
     )]
-    supervisor_sideload_method: SupervisorSideloadMethod,
-
-    #[arg(long, env = "OPENSHELL_K8S_TOPOLOGY", default_value = "combined")]
-    topology: SupervisorTopology,
+    proxy_pod_network_policy_enforced: bool,
 
     #[arg(
-        long = "sidecar-proxy-uid",
-        alias = "proxy-uid",
-        env = "OPENSHELL_K8S_SIDECAR_PROXY_UID",
-        default_value_t = DEFAULT_PROXY_UID
+        long,
+        env = "OPENSHELL_K8S_PROXY_POD_BOUNDARY_PORT",
+        default_value_t = 5500
     )]
-    sidecar_proxy_uid: u32,
-
-    #[arg(
-        long = "sidecar-process-binary-aware-network-policy",
-        env = "OPENSHELL_K8S_SIDECAR_PROCESS_BINARY_AWARE_NETWORK_POLICY",
-        default_value_t = true,
-        action = ArgAction::Set
-    )]
-    sidecar_process_binary_aware_network_policy: bool,
+    proxy_pod_boundary_port: u16,
 
     /// Corporate HTTP forward proxy for policy-approved TLS CONNECT egress.
     #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY")]
@@ -168,9 +155,6 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
-
-    #[arg(long, env = "OPENSHELL_K8S_APP_ARMOR_PROFILE")]
-    app_armor_profile: Option<AppArmorProfile>,
 
     /// Lifetime (seconds) of the projected `ServiceAccount` token
     /// kubelet writes into each sandbox pod for the `IssueSandboxToken`
@@ -259,12 +243,9 @@ async fn main() -> Result<()> {
                 .supervisor_image
                 .unwrap_or_else(openshell_core::config::default_supervisor_image),
             supervisor_image_pull_policy: args.supervisor_image_pull_policy.unwrap_or_default(),
-            supervisor_sideload_method: args.supervisor_sideload_method,
-            topology: args.topology,
-            sidecar: KubernetesSidecarConfig {
-                proxy_uid: args.sidecar_proxy_uid,
-                process_binary_aware_network_policy: args
-                    .sidecar_process_binary_aware_network_policy,
+            proxy_pod: KubernetesProxyPodConfig {
+                network_policy_enforced: args.proxy_pod_network_policy_enforced,
+                boundary_port: args.proxy_pod_boundary_port,
             },
             https_proxy: args.https_proxy,
             no_proxy: args.no_proxy,
@@ -277,7 +258,6 @@ async fn main() -> Result<()> {
             client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
             host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
             enable_user_namespaces: args.enable_user_namespaces,
-            app_armor_profile: args.app_armor_profile,
             workspace_default_storage_size: std::env::var(
                 "OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE",
             )

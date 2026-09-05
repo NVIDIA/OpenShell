@@ -45,9 +45,43 @@ not a tenant isolation boundary.
 ## Runtime Model
 
 The gateway stores platform state and delegates sandbox workload creation to
-this driver. Kubernetes owns scheduling and pod lifecycle. The
-`openshell-sandbox` supervisor inside each workload owns agent isolation,
-credential injection, policy polling, logs, and the gateway relay.
+this driver. Kubernetes owns scheduling and pod lifecycle. The driver always
+uses the proxy-pod topology. The workload Pod runs `openshell-sandbox`, while a
+separate Deployment runs `openshell-supervisor`.
+
+The sandbox owns the agent process, applies Landlock and child seccomp filters,
+identifies the binary behind each network syscall, and relays mediated streams
+to the supervisor. The supervisor authenticates to the gateway with a JWT,
+loads policy and provider state, performs destination and L7 authorization, and
+opens upstream connections. The workload receives no gateway credential,
+provider identity socket, or corporate-proxy credential.
+
+Both Pods run as the namespace-resolved non-root UID/GID with
+`allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`, and the runtime
+default seccomp profile. The sandbox installs a nested seccomp user-notification
+filter without requesting a capability in the Pod spec. Startup fails closed
+when the runtime blocks the required seccomp or Landlock operations.
+
+The driver creates an empty-egress `NetworkPolicy` before it releases the
+workload Pod. A second rule permits only the paired supervisor Pod to reach the
+sandbox TLS port. The supervisor has normal egress for gateway, DNS, and
+policy-approved upstream connections. Set
+`proxy_pod.network_policy_enforced = true` only after verifying that the cluster
+CNI enforces ingress and egress `NetworkPolicy` for sandbox namespaces.
+
+Each sandbox generation uses two immutable bootstrap Secrets. A trusted init
+container stages the sandbox bootstrap into memory, and the sandbox removes it
+before starting untrusted code. The other Secret is mounted only by the
+supervisor. The TLS channel binds the namespace, Sandbox CR, workload Pod,
+supervisor Deployment, and egress policy identities. Stop deletes the workload
+Pod and scales the supervisor to zero. Start rotates both Secrets and the
+supervisor Deployment before creating a new workload Pod. Delete retains the
+egress fence until workload deletion is confirmed.
+
+Kubernetes policies are additive, and the API does not attest that the CNI
+enforces them. Keep sandbox namespaces administrative: untrusted principals
+must not create permissive policies, create Pods, read bootstrap Secrets, or
+spoof the pair labels.
 
 ## Sandbox Resource
 
@@ -95,71 +129,31 @@ mount attaches an existing PVC under `/sandbox`, which skips the default PVC.
 
 ## Credentials, TLS, and Relay
 
-The driver injects gateway callback configuration, sandbox identity, TLS client
-material, and the supervisor SSH socket path into the workload. Driver-owned
-values must override image-provided environment variables.
+Both Pods set `automountServiceAccountToken: false`. The supervisor receives an
+explicit audience-bound projected token for the one-shot `IssueSandboxToken`
+exchange. The driver verifies that token and the gateway returns the
+sandbox-scoped JWT used by the supervisor session. The sandbox Pod receives
+neither token.
 
-Sandbox pods run as `service_account_name` and keep
-`automountServiceAccountToken: false`. The only Kubernetes token exposed to the
-supervisor is an explicit, audience-bound projected token mounted at
-`/var/run/secrets/openshell/token` for the one-shot `IssueSandboxToken`
-bootstrap exchange. The Kubernetes driver authenticates that token through the
-compute-driver protocol using its own `service_account_name` and workspace-mode
-namespace policy; the gateway receives only the verified sandbox ID.
+The gateway uses the supervisor relay for connect, exec, logs, and file sync.
+Sandbox Pods do not need direct external ingress for SSH.
 
-The gateway uses the supervisor relay for connect, exec, and file sync. Sandbox
-pods do not need direct external ingress for SSH.
-
-The driver forwards the canonical main-process specification to the process
-supervisor and sets pod `restartPolicy: Never`. Main-process environment
-overrides stay local to that child; the sidecar bootstrap retains the unmodified
-provider environment used by later exec, editor, and SFTP sessions.
+The driver sends the canonical main-process specification only to the
+supervisor. The supervisor passes admitted launch state over the protected
+channel. Provider environment updates apply to future exec sessions.
 
 ## Container Security Context
 
-The default `combined` supervisor topology grants the sandbox agent container
-the Linux capabilities the supervisor needs for namespace setup and process,
-filesystem, and network policy enforcement.
+The sandbox, trusted bootstrap init container, and supervisor request no added
+Linux capability. They run as the same numeric non-root identity, disable
+privilege escalation, drop all capabilities, and inherit `RuntimeDefault`
+seccomp. The sandbox and agent must use the same complete UID, GID, and
+supplementary-group identity because the capability-free sandbox cannot change
+credentials after launch and must inspect its same-identity descendants.
 
-The `sidecar` supervisor topology moves pod-level network setup into a root init
-container. In the default process/binary-aware mode, the long-lived network
-sidecar runs as UID 0 with `allowPrivilegeEscalation: false`, drops default
-Linux capabilities, and adds only `SYS_PTRACE` plus `DAC_READ_SEARCH` for
-cross-UID workload `/proc` inspection. The agent container also runs as the
-resolved sandbox UID/GID with `allowPrivilegeEscalation: false` and
-`capabilities.drop: ["ALL"]`.
-Set `sidecar.process_binary_aware_network_policy = false` to run the network
-sidecar as the configured non-root `sidecar.proxy_uid`, omit the extra `/proc`
-inspection capabilities, and enforce endpoint/L7 network policy without
-matching `policy.binaries`.
-In this mode OpenShell preserves gateway session and SSH behavior, but the
-process supervisor does not perform root-to-sandbox privilege dropping or
-supervisor identity mount isolation. It still applies Landlock filesystem policy
-and child seccomp filters where the kernel/runtime supports them. Network
-endpoint and L7 policy remain enforced by the network sidecar, and
-sidecar pods use a shared process namespace so the network sidecar can resolve
-process/binary identity through `/proc/<entrypoint-pid>`.
-
-Sidecar mode keeps gateway credentials in the network sidecar. The agent
-container does not mount the projected service-account token used for sandbox
-token bootstrap, does not mount the sandbox client TLS secret, and does not get
-gateway callback environment variables. The process supervisor receives policy
-and provider environment state from the sidecar over a local control socket in
-the shared sidecar state volume. The sidecar accepts only the pre-workload
-process-supervisor connection, authenticates its UID/GID/PID with peer
-credentials, and removes the listener afterward. SSH relays use a Linux
-abstract socket whose peer PID must match that authenticated supervisor. Both
-supervisors exit if the control connection closes, coupling their container
-restart lifecycle before a new authoritative client can be established.
-
-The driver can request a Kubernetes AppArmor profile through
-`app_armor_profile`.
-
-Supported values are `Unconfined`, `RuntimeDefault`, and
-`Localhost/<profile-name>`. An empty or unset value omits
-`securityContext.appArmorProfile`. Helm deployments default sandbox agent
-containers to `Unconfined` because runtime/default AppArmor profiles can block
-the supervisor's network namespace mount setup on AppArmor-enabled nodes.
+The workload Pod does not share host network, PID, IPC, or process namespaces.
+The driver uses a scheduling gate to inspect the admitted Pod and bind its UID
+into the bootstrap claims before kubelet starts it.
 
 ## GPU Support
 

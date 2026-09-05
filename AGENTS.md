@@ -38,7 +38,8 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-conformance/` | CLI conformance library | Reusable driver-agnostic scenarios and command runner |
 | `crates/openshell-conformance-cli/` | Conformance CLI | Distributable `list` and `run` entrypoint for gateway conformance |
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
-| `crates/openshell-sandbox/` | Sandbox runtime | Container supervision, policy-enforced egress routing |
+| `crates/openshell-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
+| `crates/openshell-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
 | `crates/openshell-binary-identity/` | Binary identity | Shared trusted procfs executable identity resolution for isolation backends |
 | `crates/openshell-isolation-interface/` | Isolation backend interface | RFC 0012 `IsolationBackend` trait + types; the supervisor-facing runtime contract for the boundary |
 | `crates/openshell-policy/` | Policy engine | Filesystem, network, process, and inference constraints |
@@ -59,7 +60,6 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-driver-db-credstore/` | Database credential driver | In-process `CredentialDriver` backend for gateway database credential storage |
 | `crates/openshell-driver-kubernetes/` | Kubernetes compute driver | In-process `ComputeDriver` backend for K8s sandbox pods |
 | `crates/openshell-driver-docker/` | Docker compute driver | In-process `ComputeDriver` backend for local Docker sandbox containers |
-| `crates/openshell-driver-mxc/` | MXC compute driver | Windows in-process `ComputeDriver` backend for MXC sandbox execution |
 | `crates/openshell-driver-podman/` | Podman compute driver | In-process `ComputeDriver` backend for local Podman sandbox containers |
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
 | `crates/openshell-driver-mxc/` | Microsoft MXC compute driver | In-process Windows AppContainer and isolation-session compute backend |

@@ -22,76 +22,38 @@ pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME: &str = "default";
 /// Default storage size for the workspace PVC.
 pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 
-/// Default non-root UID for relaxed Kubernetes network supervisor sidecars.
-pub const DEFAULT_PROXY_UID: u32 = 1337;
-
-/// How the supervisor binary is delivered into sandbox pods.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SupervisorSideloadMethod {
-    /// Mount the supervisor OCI image directly as a read-only volume
-    /// (requires Kubernetes >= v1.33 with the `ImageVolume` feature gate,
-    /// or >= v1.36 where it is GA).
-    #[default]
-    ImageVolume,
-    /// Copy the binary via an init container and emptyDir volume.
-    /// Works on all Kubernetes versions.
-    InitContainer,
+/// Driver-owned requirements for the cross-pod RFC 0012 topology.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesProxyPodConfig {
+    /// Explicit operator assertion that the cluster CNI enforces
+    /// `networking.k8s.io/v1` `NetworkPolicy` for the sandbox namespaces.
+    pub network_policy_enforced: bool,
+    /// TCP port exposed by the workload boundary to its paired control pod.
+    pub boundary_port: u16,
 }
 
-impl std::fmt::Display for SupervisorSideloadMethod {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ImageVolume => f.write_str("image-volume"),
-            Self::InitContainer => f.write_str("init-container"),
+impl Default for KubernetesProxyPodConfig {
+    fn default() -> Self {
+        Self {
+            network_policy_enforced: false,
+            boundary_port: 5500,
         }
     }
 }
 
-impl FromStr for SupervisorSideloadMethod {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "image-volume" => Ok(Self::ImageVolume),
-            "init-container" => Ok(Self::InitContainer),
-            other => Err(format!(
-                "unknown supervisor sideload method '{other}'; expected 'image-volume' or 'init-container'"
-            )),
+impl KubernetesProxyPodConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.network_policy_enforced {
+            return Err(
+                "proxy-pod topology requires proxy_pod.network_policy_enforced = true after the operator has verified CNI NetworkPolicy enforcement"
+                    .to_string(),
+            );
         }
-    }
-}
-
-/// How the supervisor is arranged inside Kubernetes sandbox pods.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SupervisorTopology {
-    /// Run networking and process supervision in the agent container.
-    #[default]
-    Combined,
-    /// Run network supervision in a privileged sidecar and process supervision
-    /// as a low-capability wrapper in the agent container.
-    Sidecar,
-}
-
-impl std::fmt::Display for SupervisorTopology {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Combined => f.write_str("combined"),
-            Self::Sidecar => f.write_str("sidecar"),
+        if self.boundary_port < 1024 {
+            return Err("proxy_pod.boundary_port must be at least 1024".to_string());
         }
-    }
-}
-
-impl FromStr for SupervisorTopology {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "combined" => Ok(Self::Combined),
-            "sidecar" => Ok(Self::Sidecar),
-            other => Err(format!("unknown topology '{other}'")),
-        }
+        Ok(())
     }
 }
 
@@ -137,138 +99,6 @@ impl FromStr for WorkspaceMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct KubernetesSidecarConfig {
-    /// UID used by relaxed long-running network sidecars in `sidecar`
-    /// topology. The network init container installs nftables rules that
-    /// exempt this UID, so it must not match the sandbox workload UID.
-    /// Strict process/binary-aware sidecars run as UID 0 so Kubernetes grants
-    /// the requested `/proc` inspection capabilities into the effective set.
-    pub proxy_uid: u32,
-    /// Require process/binary-aware network policy enforcement in sidecar
-    /// topology. When disabled, the network sidecar runs as `proxy_uid`,
-    /// drops the extra `/proc` inspection permissions, and evaluates
-    /// endpoint/L7 policy without matching `policy.binaries`.
-    pub process_binary_aware_network_policy: bool,
-}
-
-impl Default for KubernetesSidecarConfig {
-    fn default() -> Self {
-        Self {
-            proxy_uid: DEFAULT_PROXY_UID,
-            process_binary_aware_network_policy: true,
-        }
-    }
-}
-
-impl KubernetesSidecarConfig {
-    pub fn validate_proxy_uid(&self) -> Result<(), String> {
-        if !(openshell_policy::MIN_SANDBOX_PROXY_UID..=openshell_policy::MAX_SANDBOX_UID)
-            .contains(&self.proxy_uid)
-        {
-            return Err(format!(
-                "sidecar.proxy_uid must be in range [{}, {}]",
-                openshell_policy::MIN_SANDBOX_PROXY_UID,
-                openshell_policy::MAX_SANDBOX_UID,
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Kubernetes `AppArmor` profile requested for the sandbox agent container.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AppArmorProfile {
-    RuntimeDefault,
-    Unconfined,
-    Localhost(String),
-}
-
-impl AppArmorProfile {
-    #[must_use]
-    pub fn to_k8s_type(&self) -> &'static str {
-        match self {
-            Self::RuntimeDefault => "RuntimeDefault",
-            Self::Unconfined => "Unconfined",
-            Self::Localhost(_) => "Localhost",
-        }
-    }
-
-    #[must_use]
-    pub fn localhost_profile(&self) -> Option<&str> {
-        match self {
-            Self::Localhost(profile) => Some(profile),
-            Self::RuntimeDefault | Self::Unconfined => None,
-        }
-    }
-}
-
-impl std::fmt::Display for AppArmorProfile {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::RuntimeDefault => f.write_str("RuntimeDefault"),
-            Self::Unconfined => f.write_str("Unconfined"),
-            Self::Localhost(profile) => write!(f, "Localhost/{profile}"),
-        }
-    }
-}
-
-impl FromStr for AppArmorProfile {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "RuntimeDefault" => Ok(Self::RuntimeDefault),
-            "Unconfined" => Ok(Self::Unconfined),
-            other => match other.strip_prefix("Localhost/") {
-                Some("") => Err(
-                    "invalid AppArmor profile 'Localhost/'; expected non-empty profile name"
-                        .to_string(),
-                ),
-                Some(profile) => Ok(Self::Localhost(profile.to_string())),
-                None => Err(format!(
-                    "unknown AppArmor profile '{other}'; expected 'RuntimeDefault', 'Unconfined', or 'Localhost/<profile-name>'"
-                )),
-            },
-        }
-    }
-}
-
-impl Serialize for AppArmorProfile {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for AppArmorProfile {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::from_str(&value).map_err(serde::de::Error::custom)
-    }
-}
-
-fn deserialize_optional_app_armor_profile<'de, D>(
-    deserializer: D,
-) -> Result<Option<AppArmorProfile>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<String>::deserialize(deserializer)?;
-    match value.as_deref() {
-        None | Some("") => Ok(None),
-        Some(value) => AppArmorProfile::from_str(value)
-            .map(Some)
-            .map_err(serde::de::Error::custom),
-    }
-}
-
 fn deserialize_provider_spiffe_workload_api_socket_path<'de, D>(
     deserializer: D,
 ) -> Result<String, D::Error>
@@ -302,8 +132,9 @@ pub struct KubernetesComputeConfig {
     /// operator mode. Hot-reloaded on change. Delivered via `ConfigMap` volume mount.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_namespace_file: Option<String>,
-    /// Kubernetes `ServiceAccount` assigned to sandbox pods and accepted by
-    /// the driver's `TokenReview` bootstrap authenticator.
+    /// Kubernetes `ServiceAccount` assigned to both topology Pods. Automatic
+    /// token mounting is disabled; only the supervisor receives an explicit
+    /// audience-bound projected token accepted by the bootstrap authenticator.
     pub service_account_name: String,
     pub default_image: String,
     pub image_pull_policy: String,
@@ -313,19 +144,14 @@ pub struct KubernetesComputeConfig {
     /// `NetworkPolicy` in each managed workspace namespace that permits TCP 2222
     /// only from gateway pods matching this peer.
     pub managed_ssh_ingress: ManagedSshIngressConfig,
-    /// Image that provides the `openshell-sandbox` supervisor binary.
-    /// Mounted directly as an image volume, or copied via an init container,
-    /// depending on `supervisor_sideload_method`.
+    /// Image that provides the trusted `openshell-sandbox` bootstrap binary
+    /// and the separate `openshell-supervisor` control binary.
     pub supervisor_image: String,
     /// Kubernetes `imagePullPolicy` for the supervisor image.
     /// Empty string delegates to the Kubernetes default.
     pub supervisor_image_pull_policy: String,
-    /// How the supervisor binary is delivered into sandbox pods.
-    pub supervisor_sideload_method: SupervisorSideloadMethod,
-    /// How the supervisor is arranged for Kubernetes sandbox pods.
-    pub topology: SupervisorTopology,
-    /// Sidecar-only settings used when `topology = "sidecar"`.
-    pub sidecar: KubernetesSidecarConfig,
+    /// Cross-pod sandbox/supervisor settings.
+    pub proxy_pod: KubernetesProxyPodConfig,
     /// Corporate HTTP forward proxy used by the network supervisor for
     /// policy-approved TLS CONNECT egress.
     pub https_proxy: Option<String>,
@@ -350,14 +176,6 @@ pub struct KubernetesComputeConfig {
     pub client_tls_secret_name: String,
     pub host_gateway_ip: String,
     pub enable_user_namespaces: bool,
-    /// Kubernetes `AppArmor` profile requested for the sandbox agent container.
-    /// Empty/None omits the `appArmorProfile` field from sandbox pod specs.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_optional_app_armor_profile"
-    )]
-    pub app_armor_profile: Option<AppArmorProfile>,
     pub workspace_default_storage_size: String,
     /// Kubernetes `StorageClass` name for the default workspace PVC.
     /// Empty string (default) = omit `storageClassName`, using the cluster's
@@ -386,13 +204,10 @@ pub struct KubernetesComputeConfig {
         deserialize_with = "deserialize_provider_spiffe_workload_api_socket_path"
     )]
     pub provider_spiffe_workload_api_socket_path: String,
-    /// UID used for privilege-drop operations and workspace init container
-    /// ownership. The supervisor container always runs as UID 0 (root) to
-    /// create network namespaces and configure Landlock/seccomp; the
-    /// `sandbox_uid` is injected as the `SANDBOX_UID` environment variable so
-    /// the supervisor knows which UID to drop to for child processes.
+    /// Exact UID shared by `openshell-sandbox`, its agent children, the trusted
+    /// workspace/bootstrap init containers, and `openshell-supervisor`.
     /// When empty, the driver auto-detects from `OpenShift` SCC annotations on
-    /// the target namespace; if those are also absent, falls back to `1000`.
+    /// the target namespace; if those are also absent, falls back to `10001`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_uid: Option<u32>,
     /// GID used alongside `sandbox_uid` for PVC init container operations.
@@ -419,7 +234,7 @@ pub const MAX_SA_TOKEN_TTL_SECS: i64 = 86_400;
 
 /// Default sandbox UID used when neither config nor `OpenShift` SCC annotations
 /// provide a resolved value.
-pub(crate) const DEFAULT_SANDBOX_UID: u32 = 1000;
+pub(crate) const DEFAULT_SANDBOX_UID: u32 = 10001;
 
 /// The annotation key for the `OpenShift` `ServiceAccount` UID range.
 /// Format: `<start>/<size>` (e.g. `1000000000/10000`).
@@ -448,9 +263,7 @@ impl Default for KubernetesComputeConfig {
             managed_ssh_ingress: ManagedSshIngressConfig::default(),
             supervisor_image: config::default_supervisor_image(),
             supervisor_image_pull_policy: String::new(),
-            supervisor_sideload_method: SupervisorSideloadMethod::default(),
-            topology: SupervisorTopology::default(),
-            sidecar: KubernetesSidecarConfig::default(),
+            proxy_pod: KubernetesProxyPodConfig::default(),
             https_proxy: None,
             no_proxy: None,
             proxy_auth_secret_name: None,
@@ -462,7 +275,6 @@ impl Default for KubernetesComputeConfig {
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
             enable_user_namespaces: false,
-            app_armor_profile: None,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
             workspace_storage_class: String::new(),
             default_runtime_class_name: String::new(),
@@ -503,7 +315,7 @@ impl KubernetesComputeConfig {
     }
 
     pub fn validate_proxy_uid(&self) -> Result<(), String> {
-        self.sidecar.validate_proxy_uid()
+        self.proxy_pod.validate()
     }
 
     /// Validate the operator-owned corporate upstream proxy configuration.
@@ -578,12 +390,6 @@ impl KubernetesComputeConfig {
                 if self.proxy_auth_allow_insecure != Some(true) {
                     return Err("proxy credentials use cleartext Basic auth over the connection to the http:// proxy; set proxy_auth_allow_insecure = true to accept that exposure, or remove the credential Secret".to_string());
                 }
-                if self.topology == SupervisorTopology::Combined {
-                    return Err(
-                        "proxy credential Secrets require topology = \"sidecar\"; combined topology shares the credential mount with the workload and fsGroup can make it readable by the sandbox user"
-                            .to_string(),
-                    );
-                }
             }
             _ => {
                 return Err(
@@ -608,7 +414,7 @@ impl KubernetesComputeConfig {
     /// 2. `OpenShift` SCC namespace annotations (`sa.scc.uid-range`,
     ///    `sa.scc.supplemental-groups`) — passed in as the optional
     ///    `namespace_annotations` map
-    /// 3. Fallback defaults: UID=`1000`, GID=UID
+    /// 3. Fallback defaults: UID=`10001`, GID=UID
     pub fn resolve_sandbox_uid(
         &self,
         namespace_annotations: Option<&BTreeMap<String, String>>,
@@ -910,40 +716,16 @@ mod tests {
     }
 
     #[test]
-    fn default_topology_is_combined() {
-        let cfg = KubernetesComputeConfig::default();
-        assert_eq!(cfg.topology, SupervisorTopology::Combined);
-        assert_eq!(cfg.topology.to_string(), "combined");
-    }
+    fn proxy_pod_requires_network_policy_enforcement_acknowledgement() {
+        let mut cfg = KubernetesComputeConfig::default();
+        assert!(
+            cfg.validate_proxy_uid()
+                .unwrap_err()
+                .contains("network_policy_enforced")
+        );
 
-    #[test]
-    fn default_proxy_uid_is_dedicated_non_root_uid() {
-        let cfg = KubernetesComputeConfig::default();
-        assert_eq!(cfg.sidecar.proxy_uid, DEFAULT_PROXY_UID);
-    }
-
-    #[test]
-    fn default_sidecar_requires_process_binary_aware_network_policy() {
-        let cfg = KubernetesComputeConfig::default();
-        assert!(cfg.sidecar.process_binary_aware_network_policy);
-    }
-
-    #[test]
-    fn serde_override_topology_sidecar() {
-        let json = serde_json::json!({
-            "topology": "sidecar"
-        });
-        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.topology, SupervisorTopology::Sidecar);
-    }
-
-    #[test]
-    fn serde_override_topology_combined() {
-        let json = serde_json::json!({
-            "topology": "combined"
-        });
-        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.topology, SupervisorTopology::Combined);
+        cfg.proxy_pod.network_policy_enforced = true;
+        cfg.validate_proxy_uid().unwrap();
     }
 
     #[test]
@@ -955,51 +737,6 @@ mod tests {
         });
         let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
         assert!(err.to_string().contains("unknown field"));
-    }
-
-    #[test]
-    fn serde_override_sidecar_process_binary_aware_network_policy_nested() {
-        let json = serde_json::json!({
-            "sidecar": {
-                "process_binary_aware_network_policy": false
-            }
-        });
-        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert!(!cfg.sidecar.process_binary_aware_network_policy);
-    }
-
-    #[test]
-    fn serde_override_sidecar_proxy_uid_nested() {
-        let json = serde_json::json!({
-            "sidecar": {
-                "proxy_uid": 2000
-            }
-        });
-        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.sidecar.proxy_uid, 2000);
-        cfg.validate_proxy_uid().unwrap();
-    }
-
-    #[test]
-    fn validate_proxy_uid_rejects_privileged_uid() {
-        let cfg = KubernetesComputeConfig {
-            sidecar: KubernetesSidecarConfig {
-                proxy_uid: 999,
-                ..KubernetesSidecarConfig::default()
-            },
-            ..KubernetesComputeConfig::default()
-        };
-        let err = cfg.validate_proxy_uid().unwrap_err();
-        assert!(err.contains("proxy_uid"));
-    }
-
-    #[test]
-    fn serde_rejects_invalid_topology() {
-        let json = serde_json::json!({
-            "topology": "unsupported"
-        });
-        let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
-        assert!(err.to_string().contains("unknown variant"));
     }
 
     #[test]
@@ -1087,53 +824,6 @@ mod tests {
     }
 
     #[test]
-    fn default_app_armor_profile_is_none() {
-        let cfg = KubernetesComputeConfig::default();
-        assert!(cfg.app_armor_profile.is_none());
-    }
-
-    #[test]
-    fn serde_override_app_armor_profile_unconfined() {
-        let json = serde_json::json!({
-            "app_armor_profile": "Unconfined"
-        });
-        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.app_armor_profile, Some(AppArmorProfile::Unconfined));
-    }
-
-    #[test]
-    fn serde_override_app_armor_profile_runtime_default() {
-        let json = serde_json::json!({
-            "app_armor_profile": "RuntimeDefault"
-        });
-        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.app_armor_profile, Some(AppArmorProfile::RuntimeDefault));
-    }
-
-    #[test]
-    fn serde_override_app_armor_profile_localhost() {
-        let json = serde_json::json!({
-            "app_armor_profile": "Localhost/openshell-supervisor"
-        });
-        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(
-            cfg.app_armor_profile,
-            Some(AppArmorProfile::Localhost(
-                "openshell-supervisor".to_string()
-            ))
-        );
-    }
-
-    #[test]
-    fn serde_empty_app_armor_profile_disables_field() {
-        let json = serde_json::json!({
-            "app_armor_profile": ""
-        });
-        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.app_armor_profile, None);
-    }
-
-    #[test]
     fn serde_accepts_absolute_provider_spiffe_socket_path() {
         let json = serde_json::json!({
             "provider_spiffe_workload_api_socket_path": "/spiffe-workload-api/spire-agent.sock"
@@ -1160,15 +850,6 @@ mod tests {
                 "unexpected error for {socket_path}: {err}"
             );
         }
-    }
-
-    #[test]
-    fn serde_rejects_invalid_app_armor_profile() {
-        let json = serde_json::json!({
-            "app_armor_profile": "runtime/default"
-        });
-        let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
-        assert!(err.to_string().contains("unknown AppArmor profile"));
     }
 
     #[test]
@@ -1377,7 +1058,6 @@ mod tests {
     #[test]
     fn upstream_proxy_config_accepts_secret_credentials_with_acknowledgement() {
         let cfg = KubernetesComputeConfig {
-            topology: SupervisorTopology::Sidecar,
             https_proxy: Some("http://proxy.corp.example:8080".to_string()),
             proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
             proxy_auth_secret_key: Some("credentials".to_string()),
@@ -1388,10 +1068,9 @@ mod tests {
     }
 
     #[test]
-    fn toml_deserializes_sidecar_upstream_proxy_settings() {
+    fn toml_deserializes_upstream_proxy_settings() {
         let cfg: KubernetesComputeConfig = toml::from_str(
             r#"
-                topology = "sidecar"
                 https_proxy = "http://proxy.corp.example:8080"
                 no_proxy = ".svc.cluster.local,10.96.0.0/12"
                 proxy_auth_secret_name = "corporate-proxy-auth"
@@ -1513,7 +1192,6 @@ mod tests {
             "bad key".to_string(), // whitespace is outside the allowed charset
         ] {
             let cfg = KubernetesComputeConfig {
-                topology: SupervisorTopology::Sidecar,
                 https_proxy: Some("http://proxy.corp.example:8080".to_string()),
                 proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
                 proxy_auth_secret_key: Some(key.clone()),
@@ -1531,7 +1209,6 @@ mod tests {
     #[test]
     fn upstream_proxy_config_accepts_max_length_secret_key() {
         let cfg = KubernetesComputeConfig {
-            topology: SupervisorTopology::Sidecar,
             https_proxy: Some("http://proxy.corp.example:8080".to_string()),
             proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
             proxy_auth_secret_key: Some("a".repeat(253)),
@@ -1539,20 +1216,6 @@ mod tests {
             ..KubernetesComputeConfig::default()
         };
         assert!(cfg.validate_upstream_proxy_config().is_ok());
-    }
-
-    #[test]
-    fn upstream_proxy_config_rejects_credentials_in_combined_topology() {
-        let cfg = KubernetesComputeConfig {
-            topology: SupervisorTopology::Combined,
-            https_proxy: Some("http://proxy.corp.example:8080".to_string()),
-            proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
-            proxy_auth_secret_key: Some("credentials".to_string()),
-            proxy_auth_allow_insecure: Some(true),
-            ..KubernetesComputeConfig::default()
-        };
-        let err = cfg.validate_upstream_proxy_config().unwrap_err();
-        assert!(err.contains("topology = \"sidecar\""), "{err}");
     }
 
     #[test]
