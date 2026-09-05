@@ -150,6 +150,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_gateway_restart_plan() {
+        let plan = ConformancePlan::parse(include_str!(
+            "../../../nix/test-guest/conformance-plans/gateway-restart.toml"
+        ))
+        .expect("gateway restart plan must remain valid");
+
+        assert_eq!(plan.runs.len(), 2);
+        assert_eq!(plan.runs[1].scenario, "sandbox-continuity");
+        assert_eq!(plan.runs[1].actions[0].name, "gateway-restart");
+    }
+
+    #[test]
     fn parses_plan_diagnostics() {
         let plan = ConformancePlan::parse(
             r#"
