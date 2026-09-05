@@ -70,6 +70,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -260,6 +261,7 @@ pub struct DockerComputeDriver {
 
 struct DockerControlProcess {
     shutdown: Option<oneshot::Sender<()>>,
+    intentional_shutdown: Arc<AtomicBool>,
     task: JoinHandle<()>,
 }
 
@@ -4448,6 +4450,8 @@ async fn spawn_docker_control_process(
     }
     let sandbox_id = sandbox.id.clone();
     let (shutdown, mut shutdown_requested) = oneshot::channel();
+    let intentional_shutdown = Arc::new(AtomicBool::new(false));
+    let monitored_shutdown = intentional_shutdown.clone();
     let supervisor_id = created.id;
     let monitored_supervisor_id = supervisor_id.clone();
     let monitored_docker = failure_context.docker.clone();
@@ -4472,6 +4476,13 @@ async fn spawn_docker_control_process(
                 ).await;
             }
             result = wait => {
+                if monitored_shutdown.load(Ordering::Acquire) {
+                    let _ = monitored_docker.remove_container(
+                        &monitored_supervisor_id,
+                        Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+                    ).await;
+                    return;
+                }
                 let mut message = match result {
                     Some(Ok(status)) => {
                     warn!(%sandbox_id, status = status.status_code, "Docker supervisor container exited unexpectedly");
@@ -4498,6 +4509,13 @@ async fn spawn_docker_control_process(
                     &monitored_supervisor_id,
                     Some(RemoveContainerOptionsBuilder::default().force(true).build()),
                 ).await;
+                // The gateway can close the supervisor session as soon as it
+                // commits Stopping. Re-check after collecting diagnostics so
+                // an overlapping driver stop cannot be published as an
+                // unexpected control failure.
+                if monitored_shutdown.load(Ordering::Acquire) {
+                    return;
+                }
                 handle_docker_runtime_failure(
                     failure_context,
                     "ControlSupervisorExited",
@@ -4509,6 +4527,7 @@ async fn spawn_docker_control_process(
     });
     let process = DockerControlProcess {
         shutdown: Some(shutdown),
+        intentional_shutdown,
         task,
     };
     if let Err(error) = wait_for_docker_supervisor_ready(docker, &supervisor_id).await {
@@ -4664,6 +4683,7 @@ async fn handle_docker_runtime_failure(
 }
 
 async fn stop_docker_control_process(mut process: DockerControlProcess) {
+    process.intentional_shutdown.store(true, Ordering::Release);
     if let Some(shutdown) = process.shutdown.take() {
         let _ = shutdown.send(());
     }
