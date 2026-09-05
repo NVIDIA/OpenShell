@@ -31,6 +31,7 @@ pub mod inference;
 pub mod jwt;
 pub mod local_api_socket;
 pub mod mcp;
+pub mod mcp_route_status;
 pub mod metadata;
 pub mod middleware;
 pub mod net;
