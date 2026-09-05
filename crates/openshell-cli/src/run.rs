@@ -71,6 +71,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use tonic::{Code, Status};
 
+const PROVISIONAL_CONTAINER_EXIT_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(5);
+
 // Re-export SSH functions for backward compatibility
 pub use crate::ssh::{Editor, print_ssh_config};
 pub use crate::ssh::{
@@ -250,6 +252,19 @@ fn has_main_process_result(sandbox: &Sandbox) -> bool {
             condition.r#type == "Ready"
                 && condition.status.eq_ignore_ascii_case("false")
                 && condition.reason == "MainProcessFailed"
+        })
+}
+
+fn is_provisional_container_exit(sandbox: &Sandbox) -> bool {
+    let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+    phase == SandboxPhase::Error
+        && sandbox.status.as_ref().is_some_and(|status| {
+            status.exit_code.is_none()
+                && status.conditions.iter().any(|condition| {
+                    condition.r#type == "Ready"
+                        && condition.status.eq_ignore_ascii_case("false")
+                        && condition.reason == "ContainerExited"
+                })
         })
 }
 
@@ -763,6 +778,12 @@ pub async fn sandbox_create(
             .unwrap_or(300),
     );
     let mut provisioning_idle_deadline = Instant::now() + provision_timeout;
+    // The compute driver can publish ContainerExited while the supervisor's
+    // authoritative canonical-process result is waiting for the same gateway
+    // state lock. Keep watching briefly so the provisional error cannot race
+    // ephemeral cleanup, but retain a deadline for containers that exit before
+    // the supervisor can report a result.
+    let mut provisional_container_exit_deadline: Option<Instant> = None;
     // Track whether we saw the gateway become ready (from log messages).
     let mut saw_gateway_ready = false;
 
@@ -771,8 +792,15 @@ pub async fn sandbox_create(
         // longer than the default timeout pulling and preparing large images,
         // but only recognized progress events extend the idle deadline. Logs
         // and generic status churn must not keep a stuck sandbox alive forever.
-        let remaining = provisioning_idle_deadline.saturating_duration_since(Instant::now());
+        let now = Instant::now();
+        let mut remaining = provisioning_idle_deadline.saturating_duration_since(now);
+        if let Some(deadline) = provisional_container_exit_deadline {
+            remaining = remaining.min(deadline.saturating_duration_since(now));
+        }
         if remaining.is_zero() {
+            if provisional_container_exit_deadline.is_some() {
+                break;
+            }
             let timeout_message = provisioning_timeout_message(
                 provision_timeout.as_secs(),
                 resource_requirements.as_ref(),
@@ -792,6 +820,7 @@ pub async fn sandbox_create(
         let item = match maybe_item {
             Ok(Some(item)) => item,
             Ok(None) => break, // stream ended
+            Err(_elapsed) if provisional_container_exit_deadline.is_some() => break,
             Err(_elapsed) => {
                 // Timeout fired — the stream was idle for too long.
                 let timeout_message = provisioning_timeout_message(
@@ -847,6 +876,12 @@ pub async fn sandbox_create(
                             last_error_reason =
                                 format!("{}: {}", condition.reason, condition.message);
                         }
+                    }
+                    if is_provisional_container_exit(&s) {
+                        provisional_container_exit_deadline.get_or_insert_with(|| {
+                            Instant::now() + PROVISIONAL_CONTAINER_EXIT_RECONCILIATION_TIMEOUT
+                        });
+                        continue;
                     }
                     break;
                 }
