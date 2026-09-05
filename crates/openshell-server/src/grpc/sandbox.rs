@@ -3056,6 +3056,210 @@ mod tests {
         );
     }
 
+    /// Seed `n` log lines onto the log bus; cursors run 1..=n.
+    fn seed_log_lines(state: &ServerState, sandbox_id: &str, n: usize) {
+        for i in 0..n {
+            state
+                .tracing_log_bus
+                .publish_external(openshell_core::proto::SandboxLogLine {
+                    sandbox_id: sandbox_id.to_string(),
+                    timestamp_ms: i as i64,
+                    level: "INFO".to_string(),
+                    target: "test".to_string(),
+                    message: format!("line {i}"),
+                    source: "gateway".to_string(),
+                    ..Default::default()
+                });
+        }
+    }
+
+    fn seed_platform_event(state: &ServerState, sandbox_id: &str, reason: &str) {
+        state.tracing_log_bus.platform_event_bus.publish(
+            sandbox_id,
+            SandboxStreamEvent {
+                payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Event(
+                    openshell_core::proto::PlatformEvent {
+                        timestamp_ms: 0,
+                        source: "test".to_string(),
+                        r#type: "Normal".to_string(),
+                        reason: reason.to_string(),
+                        message: reason.to_string(),
+                        metadata: HashMap::new(),
+                    },
+                )),
+                cursor: 0,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_replays_only_events_after_cursor() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("resumed", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        // Cursors 1,2,3.
+        seed_log_lines(&state, &id, 3);
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                resume_after_cursor: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        // Snapshot first (status re-read, cursor 0).
+        let snap = stream.next().await.unwrap().unwrap();
+        assert_eq!(snap.cursor, 0, "first event should be the status snapshot");
+
+        // Then only cursors 2 and 3; cursor 1 already seen by the client.
+        let a = stream.next().await.unwrap().unwrap();
+        let b = stream.next().await.unwrap().unwrap();
+        assert_eq!(a.cursor, 2);
+        assert_eq!(b.cursor, 3);
+    }
+
+    #[tokio::test]
+    async fn resume_merges_log_and_platform_events_in_cursor_order() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("merged", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        // Interleave across the shared allocator: log=1, platform=2, log=3, platform=4.
+        seed_log_lines(&state, &id, 1); // cursor 1
+        seed_platform_event(&state, &id, "e2"); // cursor 2
+        state
+            .tracing_log_bus
+            .publish_external(openshell_core::proto::SandboxLogLine {
+                sandbox_id: id.clone(),
+                timestamp_ms: 3,
+                level: "INFO".to_string(),
+                target: "test".to_string(),
+                message: "line 3".to_string(),
+                source: "gateway".to_string(),
+                ..Default::default()
+            }); // cursor 3
+        seed_platform_event(&state, &id, "e4"); // cursor 4
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                follow_events: true,
+                resume_after_cursor: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        let snap = stream.next().await.unwrap().unwrap();
+        assert_eq!(snap.cursor, 0);
+
+        // Merged from both buses, ascending by shared cursor: 2,3,4.
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            got.push(stream.next().await.unwrap().unwrap().cursor);
+        }
+        assert_eq!(got, vec![2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn resume_at_latest_cursor_suppresses_duplicates() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("nodup", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        // Cursors 1,2,3; client already saw through 3.
+        seed_log_lines(&state, &id, 3);
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                resume_after_cursor: 3,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        let snap = stream.next().await.unwrap().unwrap();
+        assert_eq!(snap.cursor, 0);
+
+        // No resumable events remain; the live loop yields nothing promptly.
+        let next = tokio::time::timeout(std::time::Duration::from_millis(200), stream.next()).await;
+        assert!(
+            next.is_err(),
+            "expected no further events after resume at latest cursor, got {next:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_from_trimmed_cursor_terminates_out_of_range() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("gap", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        // Exceed the 2000-line tail so the earliest cursors are trimmed.
+        seed_log_lines(&state, &id, 2005);
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                // Cursor 2 was trimmed; this is an unrecoverable gap.
+                resume_after_cursor: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        // Snapshot still arrives first (fresh state), then the terminal gap status.
+        let snap = stream.next().await.unwrap().unwrap();
+        assert_eq!(snap.cursor, 0);
+
+        let err = stream
+            .next()
+            .await
+            .unwrap()
+            .expect_err("trimmed cursor must terminate the stream");
+        assert_eq!(err.code(), tonic::Code::OutOfRange, "{err:?}");
+        assert!(
+            err.message().contains('2'),
+            "gap status should report the requested cursor: {}",
+            err.message()
+        );
+
+        // Stream ends after the terminal status.
+        assert!(stream.next().await.is_none());
+    }
+
     #[tokio::test]
     async fn delete_handler_ends_telemetry_for_the_resolved_sandbox_id() {
         let state = test_server_state().await;
