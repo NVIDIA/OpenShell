@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OTLP telemetry relay for the sandbox supervisor.
+//! OTLP relay for the sandbox supervisor.
 //!
 //! Receives OTLP trace data from agent processes over HTTP, enriches spans
 //! with sandbox resource attributes, buffers them in a bounded channel, and
@@ -19,13 +19,13 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use openshell_core::proto::SupervisorMessage;
-use openshell_core::proto::TelemetryData;
+use openshell_core::proto::{OtelExportData, otel_export_data};
 use openshell_core::proto::supervisor_message;
 
 use buffer::{TelemetryReceiver, TelemetrySender};
 
 /// Rate-limited OCSF relay sink that implements token bucket rate limiting
-/// and sends accepted events through the telemetry buffer as OCSF bytes.
+/// and sends accepted events through the OTEL buffer as OCSF bytes.
 pub struct RateLimitedOcsfSink {
     buf_tx: TelemetrySender,
     tokens: std::sync::atomic::AtomicU32,
@@ -98,7 +98,7 @@ impl openshell_ocsf::OcsfRelaySink for RateLimitedOcsfSink {
     }
 }
 
-/// Configuration for the telemetry relay.
+/// Configuration for the OTEL relay.
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
     pub enabled: bool,
@@ -129,42 +129,42 @@ pub struct SandboxMetadata {
     pub driver: String,
 }
 
-/// Handle returned by [`TelemetryRelay::start`] for lifecycle management.
+/// Handle returned by [`OtelRelay::start`] for lifecycle management.
 pub struct RelayHandle {
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
     forwarder_handle: tokio::task::JoinHandle<()>,
     receiver_handle: tokio::task::JoinHandle<()>,
     session_drop_counter: Arc<AtomicU64>,
-    pub telemetry_tx: TelemetrySender,
+    pub otel_tx: TelemetrySender,
 }
 
 impl RelayHandle {
     /// Gracefully shut down the relay: stop the HTTP receiver, then drain
-    /// remaining buffered telemetry through the forwarder.
+    /// remaining buffered data through the forwarder.
     pub async fn shutdown(self) {
-        let metrics = self.telemetry_tx.metrics().clone();
+        let metrics = self.otel_tx.metrics().clone();
         let _ = self.shutdown_tx.send(());
         let _ = self.receiver_handle.await;
-        drop(self.telemetry_tx);
+        drop(self.otel_tx);
         let _ = self.forwarder_handle.await;
         info!(
             buffer_drops = metrics.drops(),
             queue_depth = metrics.depth(),
             session_drops = self.session_drop_counter.load(Ordering::Relaxed),
-            "telemetry relay shut down"
+            "OTEL relay shut down"
         );
     }
 }
 
-/// The telemetry relay manages receive, enrich, buffer, and forward.
-pub struct TelemetryRelay {
+/// The OTEL relay manages receive, enrich, buffer, and forward.
+pub struct OtelRelay {
     config: RelayConfig,
     metadata: SandboxMetadata,
     session_tx: mpsc::Sender<SupervisorMessage>,
     sandbox_id: String,
 }
 
-impl TelemetryRelay {
+impl OtelRelay {
     pub fn new(
         config: RelayConfig,
         metadata: SandboxMetadata,
@@ -203,7 +203,7 @@ impl TelemetryRelay {
         info!(
             buffer_capacity = self.config.buffer_capacity,
             enrichment = self.config.enrichment_enabled,
-            "telemetry relay started (pre-bound listener)"
+            "OTEL relay started (pre-bound listener)"
         );
 
         RelayHandle {
@@ -211,7 +211,7 @@ impl TelemetryRelay {
             forwarder_handle,
             receiver_handle,
             session_drop_counter,
-            telemetry_tx: buf_tx,
+            otel_tx: buf_tx,
         }
     }
 
@@ -244,7 +244,7 @@ impl TelemetryRelay {
             bind = %bind_addr,
             buffer_capacity = self.config.buffer_capacity,
             enrichment = self.config.enrichment_enabled,
-            "telemetry relay started"
+            "OTEL relay started"
         );
 
         Ok(RelayHandle {
@@ -252,7 +252,7 @@ impl TelemetryRelay {
             forwarder_handle,
             receiver_handle,
             session_drop_counter,
-            telemetry_tx: buf_tx,
+            otel_tx: buf_tx,
         })
     }
 }
@@ -264,7 +264,7 @@ pub enum StartError {
     Bind(std::io::Error),
 }
 
-/// Spawn the forwarder task that drains the buffer and sends `TelemetryData`
+/// Spawn the forwarder task that drains the buffer and sends `OtelExportData`
 /// via the session channel using `try_send` (non-blocking).
 fn spawn_forwarder(
     mut buf_rx: TelemetryReceiver,
@@ -276,16 +276,16 @@ fn spawn_forwarder(
         while let Some(item) = buf_rx.recv().await {
             let msg = match item {
                 buffer::TelemetryItem::Trace(data) => SupervisorMessage {
-                    payload: Some(supervisor_message::Payload::Telemetry(TelemetryData {
+                    payload: Some(supervisor_message::Payload::OtelExport(OtelExportData {
                         sandbox_id: sandbox_id.clone(),
-                        trace_data: data,
+                        signal: Some(otel_export_data::Signal::TraceData(data)),
                         ocsf_events: Vec::new(),
                     })),
                 },
                 buffer::TelemetryItem::Ocsf(data) => SupervisorMessage {
-                    payload: Some(supervisor_message::Payload::Telemetry(TelemetryData {
+                    payload: Some(supervisor_message::Payload::OtelExport(OtelExportData {
                         sandbox_id: sandbox_id.clone(),
-                        trace_data: Vec::new(),
+                        signal: None,
                         ocsf_events: vec![data],
                     })),
                 },
@@ -343,7 +343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwarder_constructs_telemetry_data_messages() {
+    async fn forwarder_constructs_otel_export_messages() {
         let (buf_tx, buf_rx) = buffer::new_telemetry_buffer(64);
         let (session_tx, mut session_rx) = mpsc::channel::<SupervisorMessage>(64);
         let drop_counter = Arc::new(AtomicU64::new(0));
@@ -355,21 +355,24 @@ mod tests {
         let handle = spawn_forwarder(buf_rx, session_tx, "sb-test".into(), drop_counter);
 
         let msg1 = session_rx.recv().await.unwrap();
-        if let Some(supervisor_message::Payload::Telemetry(tel)) = msg1.payload {
-            assert_eq!(tel.sandbox_id, "sb-test");
-            assert_eq!(tel.trace_data, vec![1, 2, 3]);
-            assert!(tel.ocsf_events.is_empty());
+        if let Some(supervisor_message::Payload::OtelExport(otel)) = msg1.payload {
+            assert_eq!(otel.sandbox_id, "sb-test");
+            assert_eq!(
+                otel.signal,
+                Some(otel_export_data::Signal::TraceData(vec![1, 2, 3]))
+            );
+            assert!(otel.ocsf_events.is_empty());
         } else {
-            panic!("expected Telemetry payload for trace");
+            panic!("expected OtelExport payload for trace");
         }
 
         let msg2 = session_rx.recv().await.unwrap();
-        if let Some(supervisor_message::Payload::Telemetry(tel)) = msg2.payload {
-            assert_eq!(tel.sandbox_id, "sb-test");
-            assert!(tel.trace_data.is_empty());
-            assert_eq!(tel.ocsf_events, vec![vec![4, 5, 6]]);
+        if let Some(supervisor_message::Payload::OtelExport(otel)) = msg2.payload {
+            assert_eq!(otel.sandbox_id, "sb-test");
+            assert_eq!(otel.signal, None);
+            assert_eq!(otel.ocsf_events, vec![vec![4, 5, 6]]);
         } else {
-            panic!("expected Telemetry payload for OCSF");
+            panic!("expected OtelExport payload for OCSF");
         }
 
         handle.await.unwrap();

@@ -90,7 +90,7 @@ pub async fn run_process(
         tokio::sync::mpsc::UnboundedSender<DenialEvent>,
     >,
     #[cfg(target_os = "linux")] bypass_activity_tx: Option<ActivitySender>,
-    telemetry_rx: Option<tokio::sync::mpsc::Receiver<openshell_core::proto::SupervisorMessage>>,
+    otel_rx: Option<tokio::sync::mpsc::Receiver<openshell_core::proto::SupervisorMessage>>,
 ) -> Result<i32> {
     // Platform drivers with a resolved numeric UID/GID retain the legacy
     // account-file update. OCI-image identity leaves those environment values
@@ -379,7 +379,7 @@ pub async fn run_process(
             None,
             Arc::clone(&supervisor_terminating),
             main_instance_id.clone(),
-            telemetry_rx,
+            otel_rx,
         );
         info!("supervisor session task spawned");
         Some(task)

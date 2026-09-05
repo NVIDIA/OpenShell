@@ -38,7 +38,7 @@ mod service_routing;
 mod ssh_sessions;
 pub mod supervisor_session;
 mod telemetry;
-pub(crate) mod telemetry_relay;
+pub(crate) mod otel_relay;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 mod tls;
@@ -345,7 +345,7 @@ pub struct ServerState {
 
     /// Dedicated OTLP exporter for relayed telemetry from supervisors.
     /// `None` when the gateway has no OTLP endpoint configured.
-    pub telemetry_relay_exporter: Option<Arc<telemetry_relay::TelemetryRelayExporter>>,
+    pub otel_relay_exporter: Option<Arc<otel_relay::OtelRelayExporter>>,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -433,7 +433,7 @@ impl ServerState {
             provider_profile_sources:
                 provider_profile_sources::ProviderProfileSources::with_default_sources(),
             admin_role,
-            telemetry_relay_exporter: None,
+            otel_relay_exporter: None,
         }
     }
 }
@@ -667,8 +667,8 @@ pub(crate) async fn run_server(
     state.middleware_registry = middleware_registry;
     state.gateway_interceptors = gateway_interceptors;
     state.provider_profile_sources = provider_profile_sources;
-    state.telemetry_relay_exporter =
-        telemetry_relay::try_create_exporter(config_file.as_ref()).await;
+    state.otel_relay_exporter =
+        otel_relay::try_create_exporter(config_file.as_ref()).await;
     state.sandbox_jwt_issuer = sandbox_jwt_issuer.clone();
     state.sandbox_jwt_authenticator = sandbox_jwt_authenticator;
     if let Some(issuer) = sandbox_jwt_issuer {

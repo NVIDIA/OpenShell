@@ -18,11 +18,11 @@ use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::Trac
 
 /// Exporter that forwards raw protobuf-encoded trace data to an OTLP collector.
 #[derive(Debug, Clone)]
-pub struct TelemetryRelayExporter {
+pub struct OtelRelayExporter {
     client: TraceServiceClient<Channel>,
 }
 
-impl TelemetryRelayExporter {
+impl OtelRelayExporter {
     /// Connect to the OTLP collector at the given gRPC endpoint.
     pub async fn connect(endpoint: &str) -> Result<Self, ConnectError> {
         let channel = Channel::from_shared(endpoint.to_string())
@@ -69,25 +69,25 @@ pub enum ConnectError {
 /// Create a relay exporter from the gateway's OTLP config, if configured.
 pub async fn try_create_exporter(
     config_file: Option<&crate::config_file::ConfigFile>,
-) -> Option<Arc<TelemetryRelayExporter>> {
+) -> Option<Arc<OtelRelayExporter>> {
     let Some(cf) = config_file else {
-        debug!("no config file; telemetry relay disabled");
+        debug!("no config file; OTEL relay disabled");
         return None;
     };
     let Some(otlp) = cf.openshell.gateway.otlp.as_ref() else {
-        debug!("no [openshell.gateway.otlp] section in config; telemetry relay disabled");
+        debug!("no [openshell.gateway.otlp] section in config; OTEL relay disabled");
         return None;
     };
-    match TelemetryRelayExporter::connect(&otlp.endpoint).await {
+    match OtelRelayExporter::connect(&otlp.endpoint).await {
         Ok(exporter) => {
-            info!(endpoint = %otlp.endpoint, "telemetry relay exporter connected");
+            info!(endpoint = %otlp.endpoint, "OTEL relay exporter connected");
             Some(Arc::new(exporter))
         }
         Err(e) => {
             tracing::warn!(
                 endpoint = %otlp.endpoint,
                 error = %e,
-                "failed to connect telemetry relay exporter; relay disabled"
+                "failed to connect OTEL relay exporter; relay disabled"
             );
             None
         }

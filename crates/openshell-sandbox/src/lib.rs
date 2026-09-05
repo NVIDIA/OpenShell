@@ -853,7 +853,7 @@ pub async fn run_sandbox(
     tokio::pin!(proxy_exited);
 
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let mut telemetry_relay_handle: Option<openshell_supervisor_network::otlp::RelayHandle> = None;
+    let mut otel_relay_handle: Option<openshell_supervisor_network::otlp::RelayHandle> = None;
 
     let exit_code = if process_enabled {
         let ca_file_paths = networking
@@ -955,18 +955,18 @@ pub async fn run_sandbox(
             None
         };
 
-        // Telemetry relay: bind OTLP receiver for all Linux topologies.
+        // OTEL relay: bind OTLP receiver for all Linux topologies.
         // All current topologies keep the process supervisor co-located with
         // the agent, so 127.0.0.1 is reachable from agent processes. Future
         // topologies that move the supervisor out of the workload pod would
         // need to derive the bind address from the topology (e.g., pod IP
         // via downward API) and update OTEL_EXPORTER_OTLP_ENDPOINT to match.
-        let telemetry_rx = {
+        let otel_rx = {
             #[cfg(target_os = "linux")]
             {
                 let otlp_addr = openshell_core::sandbox_env::OTLP_RECEIVER_ADDR;
 
-                let (telemetry_session_tx, telemetry_session_rx) =
+                let (otel_session_tx, otel_session_rx) =
                     tokio::sync::mpsc::channel::<openshell_core::proto::SupervisorMessage>(64);
 
                 let relay_config = openshell_supervisor_network::otlp::RelayConfig::default();
@@ -981,10 +981,10 @@ pub async fn run_sandbox(
                     driver: std::env::var(openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY)
                         .unwrap_or_else(|_| "container".to_string()),
                 };
-                let relay = openshell_supervisor_network::otlp::TelemetryRelay::new(
+                let relay = openshell_supervisor_network::otlp::OtelRelay::new(
                     relay_config,
                     metadata,
-                    telemetry_session_tx,
+                    otel_session_tx,
                 );
 
                 let bind_addr: std::net::SocketAddr = otlp_addr.parse().unwrap();
@@ -993,29 +993,29 @@ pub async fn run_sandbox(
                     match ns.bind_tcp_in_netns(otlp_addr).await {
                         Ok(listener) => {
                             let handle = relay.start_with_listener(listener);
-                            tracing::info!(bind = %bind_addr, "telemetry relay started (netns)");
-                            telemetry_relay_handle = Some(handle);
+                            tracing::info!(bind = %bind_addr, "OTEL relay started (netns)");
+                            otel_relay_handle = Some(handle);
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "telemetry relay failed to bind in netns; continuing without relay");
+                            tracing::warn!(error = %e, "OTEL relay failed to bind in netns; continuing without relay");
                         }
                     }
                 } else {
                     match relay.start(bind_addr).await {
                         Ok(handle) => {
-                            tracing::info!(bind = %bind_addr, "telemetry relay started");
-                            telemetry_relay_handle = Some(handle);
+                            tracing::info!(bind = %bind_addr, "OTEL relay started");
+                            otel_relay_handle = Some(handle);
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "telemetry relay failed to start; continuing without relay");
+                            tracing::warn!(error = %e, "OTEL relay failed to start; continuing without relay");
                         }
                     }
                 }
-                Some(telemetry_session_rx)
+                Some(otel_session_rx)
             }
             #[cfg(not(target_os = "linux"))]
             {
-                debug!("telemetry relay not available on this platform");
+                debug!("OTEL relay not available on this platform");
                 None
             }
         };
@@ -1048,7 +1048,7 @@ pub async fn run_sandbox(
             bypass_denial_tx,
             #[cfg(target_os = "linux")]
             bypass_activity_tx,
-            telemetry_rx,
+            otel_rx,
         );
 
         if let Some(control_closed) = process_control_closed.as_mut() {
@@ -1208,9 +1208,9 @@ pub async fn run_sandbox(
         }
     };
 
-    // Drain telemetry relay before tearing down networking so short-lived
+    // Drain OTEL relay before tearing down networking so short-lived
     // agents don't lose their final spans.
-    if let Some(handle) = telemetry_relay_handle {
+    if let Some(handle) = otel_relay_handle {
         handle.shutdown().await;
     }
 

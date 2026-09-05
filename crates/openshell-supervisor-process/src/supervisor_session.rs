@@ -275,7 +275,7 @@ fn map_session_stream_message<T>(
 /// The task runs for the lifetime of the sandbox process, reconnecting with
 /// exponential backoff on failures.
 ///
-/// `telemetry_rx` is an optional channel for receiving telemetry messages from
+/// `otel_rx` is an optional channel for receiving OTEL export messages from
 /// the relay forwarder. The session drains this channel and forwards the
 /// messages to the gateway.
 pub fn spawn(
@@ -286,7 +286,7 @@ pub fn spawn(
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     instance_id: String,
-    telemetry_rx: Option<mpsc::Receiver<SupervisorMessage>>,
+    otel_rx: Option<mpsc::Receiver<SupervisorMessage>>,
 ) -> tokio::task::JoinHandle<()> {
     let config = SessionConfig {
         endpoint,
@@ -296,7 +296,7 @@ pub fn spawn(
         expected_ssh_peer_pid,
         terminating,
         instance_id,
-        telemetry_rx,
+        otel_rx,
     };
     tokio::spawn(run_session_loop(config))
 }
@@ -309,18 +309,18 @@ struct SessionConfig {
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     instance_id: String,
-    telemetry_rx: Option<mpsc::Receiver<SupervisorMessage>>,
+    otel_rx: Option<mpsc::Receiver<SupervisorMessage>>,
 }
 
 async fn run_session_loop(mut config: SessionConfig) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
-    let mut telemetry_rx = config.telemetry_rx.take();
+    let mut otel_rx = config.otel_rx.take();
 
     loop {
         attempt += 1;
 
-        match run_single_session(&config, &mut telemetry_rx).await {
+        match run_single_session(&config, &mut otel_rx).await {
             Ok(()) => {
                 let event = session_closed_event(
                     openshell_ocsf::ctx::ctx(),
@@ -347,7 +347,7 @@ async fn run_session_loop(mut config: SessionConfig) {
 
 async fn run_single_session(
     config: &SessionConfig,
-    telemetry_rx: &mut Option<mpsc::Receiver<SupervisorMessage>>,
+    otel_rx: &mut Option<mpsc::Receiver<SupervisorMessage>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
@@ -367,7 +367,7 @@ async fn run_single_session(
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
             sandbox_id: config.sandbox_id.clone(),
             instance_id: config.instance_id.clone(),
-            capabilities: vec!["telemetry_relay".to_string()],
+            capabilities: vec!["otel_export".to_string()],
         })),
     })
     .await
@@ -394,12 +394,12 @@ async fn run_single_session(
         _ => return Err("expected SessionAccepted or SessionRejected".into()),
     };
 
-    let telemetry_confirmed = accepted.capabilities.iter().any(|c| c == "telemetry_relay");
-    if telemetry_confirmed {
-        info!("gateway confirmed telemetry_relay capability; OTLP drain active");
+    let otel_confirmed = accepted.capabilities.iter().any(|c| c == "otel_export");
+    if otel_confirmed {
+        info!("gateway confirmed otel_export capability; OTLP drain active");
     } else {
         debug!(
-            "gateway did not confirm telemetry_relay; \
+            "gateway did not confirm otel_export; \
              OTLP forwarding disabled for this session"
         );
     }
@@ -413,7 +413,7 @@ async fn run_single_session(
     );
     ocsf_emit!(event);
 
-    // Main loop: receive gateway messages + send heartbeats + drain telemetry.
+    // Main loop: receive gateway messages + send heartbeats + drain OTEL exports.
     let mut heartbeat_interval =
         tokio::time::interval(Duration::from_secs(u64::from(heartbeat_secs)));
     heartbeat_interval.tick().await; // skip immediate tick
@@ -453,15 +453,15 @@ async fn run_single_session(
                     return Err("outbound channel closed".into());
                 }
             }
-            telemetry_msg = async {
-                match telemetry_rx.as_mut() {
+            otel_msg = async {
+                match otel_rx.as_mut() {
                     Some(rx) => rx.recv().await,
                     None => std::future::pending().await,
                 }
-            }, if telemetry_confirmed => {
-                if let Some(msg) = telemetry_msg {
+            }, if otel_confirmed => {
+                if let Some(msg) = otel_msg {
                     if tx.try_send(msg).is_err() {
-                        debug!("telemetry: session channel full or closed, dropping message");
+                        debug!("OTEL relay: session channel full or closed, dropping message");
                     }
                 }
             }

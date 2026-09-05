@@ -1020,8 +1020,8 @@ fn handle_supervisor_message(
                 "supervisor session: relay closed by supervisor"
             );
         }
-        Some(supervisor_message::Payload::Telemetry(telemetry)) => {
-            handle_telemetry_data(state, sandbox_id, session_id, telemetry);
+        Some(supervisor_message::Payload::OtelExport(otel_data)) => {
+            handle_otel_export(state, sandbox_id, session_id, otel_data);
         }
         _ => {
             debug!(
@@ -1038,13 +1038,13 @@ fn confirm_capabilities(advertised: &[String], state: &Arc<ServerState>) -> Vec<
     let mut confirmed = Vec::new();
     for cap in advertised {
         match cap.as_str() {
-            "telemetry_relay" if state.telemetry_relay_exporter.is_some() => {
+            "otel_export" if state.otel_relay_exporter.is_some() => {
                 confirmed.push(cap.clone());
             }
-            "telemetry_relay" => {
+            "otel_export" => {
                 debug!(
-                    capability = "telemetry_relay",
-                    "supervisor advertised telemetry_relay but gateway has no \
+                    capability = "otel_export",
+                    "supervisor advertised otel_export but gateway has no \
                      [openshell.gateway.otlp] config; capability not confirmed"
                 );
             }
@@ -1059,49 +1059,55 @@ fn confirm_capabilities(advertised: &[String], state: &Arc<ServerState>) -> Vec<
     confirmed
 }
 
-/// Handle incoming telemetry data from the supervisor: forward trace data to
+/// Handle incoming OTEL export data from the supervisor: forward trace data to
 /// the configured OTLP collector and dispatch OCSF events to the log sink.
-fn handle_telemetry_data(
+fn handle_otel_export(
     state: &Arc<ServerState>,
     sandbox_id: &str,
     session_id: &str,
-    telemetry: openshell_core::proto::TelemetryData,
+    otel_data: openshell_core::proto::OtelExportData,
 ) {
-    if !telemetry.trace_data.is_empty()
-        && let Some(relay_exporter) = state.telemetry_relay_exporter.as_ref()
+    if let Some(openshell_core::proto::otel_export_data::Signal::TraceData(trace_data)) =
+        otel_data.signal
     {
-        let exporter = relay_exporter.clone();
-        let trace_data = telemetry.trace_data;
-        let sandbox_id = sandbox_id.to_string();
-        tokio::spawn(async move {
-            match tokio::time::timeout(Duration::from_secs(10), exporter.export_raw(trace_data))
-                .await
-            {
-                Ok(Err(e)) => {
-                    debug!(
-                        sandbox_id = %sandbox_id,
-                        error = %e,
-                        "telemetry relay: failed to export trace data"
-                    );
-                }
-                Err(_) => {
-                    debug!(
-                        sandbox_id = %sandbox_id,
-                        "telemetry relay: export timed out"
-                    );
-                }
-                Ok(Ok(())) => {}
+        if !trace_data.is_empty() {
+            if let Some(relay_exporter) = state.otel_relay_exporter.as_ref() {
+                let exporter = relay_exporter.clone();
+                let sandbox_id = sandbox_id.to_string();
+                tokio::spawn(async move {
+                    match tokio::time::timeout(
+                        Duration::from_secs(10),
+                        exporter.export_raw(trace_data),
+                    )
+                    .await
+                    {
+                        Ok(Err(e)) => {
+                            debug!(
+                                sandbox_id = %sandbox_id,
+                                error = %e,
+                                "OTEL relay: failed to export trace data"
+                            );
+                        }
+                        Err(_) => {
+                            debug!(
+                                sandbox_id = %sandbox_id,
+                                "OTEL relay: export timed out"
+                            );
+                        }
+                        Ok(Ok(())) => {}
+                    }
+                });
             }
-        });
+        }
     }
 
     const MAX_OCSF_EVENT_SIZE: usize = 256 * 1024;
-    for ocsf_event in &telemetry.ocsf_events {
+    for ocsf_event in &otel_data.ocsf_events {
         if ocsf_event.len() > MAX_OCSF_EVENT_SIZE {
             debug!(
                 sandbox_id = %sandbox_id,
                 size = ocsf_event.len(),
-                "telemetry relay: OCSF event too large, skipping"
+                "OTEL relay: OCSF event too large, skipping"
             );
             continue;
         }
@@ -1109,7 +1115,7 @@ fn handle_telemetry_data(
             if serde_json::from_str::<serde_json::Value>(json_str).is_err() {
                 debug!(
                     sandbox_id = %sandbox_id,
-                    "telemetry relay: OCSF event is not valid JSON, skipping"
+                    "OTEL relay: OCSF event is not valid JSON, skipping"
                 );
                 continue;
             }

@@ -475,7 +475,7 @@ collector without requiring direct egress from the sandbox.
 Agent process --> OTLP HTTP (127.0.0.1:4318) --> Supervisor receiver
   --> Enrichment (sandbox resource attributes)
   --> Bounded buffer (4096 slots, shared traces + OCSF)
-  --> Forwarder --> Session channel (TelemetryData message)
+  --> Forwarder --> Session channel (OtelExportData message)
   --> Gateway --> Dedicated SpanExporter --> External OTLP collector
 ```
 
@@ -483,7 +483,7 @@ Agent process --> OTLP HTTP (127.0.0.1:4318) --> Supervisor receiver
 
 The OTLP HTTP receiver binds to `127.0.0.1:4318` only when the relay is
 active (the gateway has `[openshell.gateway.otlp]` configured and confirms
-the `telemetry_relay` capability). When OTLP is not configured, no port is
+the `otel_export` capability). When OTLP is not configured, no port is
 bound and no receiver runs.
 
 The bind address depends on the supervisor topology. In all current
@@ -513,9 +513,9 @@ pass-through forwarding.
 ### Activation and Capability Negotiation
 
 The relay is opt-in. It starts only when the gateway has `[openshell.gateway.otlp]`
-configured. The supervisor advertises `"telemetry_relay"` in
+configured. The supervisor advertises `"otel_export"` in
 `SupervisorHello.capabilities`. The gateway confirms via `SessionAccepted.capabilities`.
-The supervisor gates `TelemetryData` sending on this confirmation. When the
+The supervisor gates `OtelExportData` sending on this confirmation. When the
 relay is active, the supervisor sets `OTEL_EXPORTER_OTLP_ENDPOINT` and
 `OTEL_EXPORTER_OTLP_PROTOCOL` in agent child processes via `child_env.rs`.
 
@@ -534,8 +534,8 @@ controls the OCSF event rate, with configurable rate and drop counter.
 
 ### Gateway-Side Handling
 
-The gateway receives `TelemetryData` messages and exports trace data through a
-dedicated `TelemetryRelayExporter` that connects directly to the configured OTLP
+The gateway receives `OtelExportData` messages and exports trace data through a
+dedicated `OtelRelayExporter` that connects directly to the configured OTLP
 collector. This bypasses the gateway's own `SdkTracerProvider` to preserve the
 supervisor-enriched resource attributes. OCSF events are emitted via
 `tracing::info!` on the `ocsf_relay` target.
