@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate as TlsCertificate, Identity, Server, ServerTlsConfig};
 use tonic::{Response, Status};
@@ -54,6 +54,9 @@ struct SandboxState {
     vm_slow_progress_before_ready: Arc<AtomicBool>,
     vm_log_churn_before_ready: Arc<AtomicBool>,
     terminal_before_relay: Arc<AtomicBool>,
+    terminal_after_provisional_container_exit: Arc<AtomicBool>,
+    provisional_container_exit_without_result: Arc<AtomicBool>,
+    provisional_container_exit_sent: Arc<Notify>,
     ssh_session_failures_remaining: Arc<AtomicUsize>,
     ssh_session_requests: Arc<AtomicUsize>,
     global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
@@ -561,6 +564,16 @@ impl OpenShell for TestOpenShell {
             .load(Ordering::SeqCst);
         let vm_log_churn_before_ready = self.state.vm_log_churn_before_ready.load(Ordering::SeqCst);
         let terminal_before_relay = self.state.terminal_before_relay.load(Ordering::SeqCst);
+        let terminal_after_provisional_container_exit = self
+            .state
+            .terminal_after_provisional_container_exit
+            .load(Ordering::SeqCst);
+        let provisional_container_exit_without_result = self
+            .state
+            .provisional_container_exit_without_result
+            .load(Ordering::SeqCst);
+        let provisional_container_exit_sent =
+            Arc::clone(&self.state.provisional_container_exit_sent);
 
         tokio::spawn(async move {
             let mut provisioning = Sandbox {
@@ -604,11 +617,44 @@ impl OpenShell for TestOpenShell {
             });
             completed.set_phase(SandboxPhase::Completed as i32);
 
+            let mut provisional_container_exit = error.clone();
+            if let Some(ready) = provisional_container_exit
+                .status
+                .as_mut()
+                .and_then(|status| status.conditions.first_mut())
+            {
+                ready.reason = "ContainerExited".to_string();
+                ready.message = "Sandbox container exited".to_string();
+            }
+
             let _ = tx
                 .send(Ok(SandboxStreamEvent {
                     payload: Some(sandbox_stream_event::Payload::Sandbox(provisioning)),
                 }))
                 .await;
+            if terminal_after_provisional_container_exit
+                || provisional_container_exit_without_result
+            {
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Sandbox(
+                            provisional_container_exit,
+                        )),
+                    }))
+                    .await;
+                provisional_container_exit_sent.notify_waiters();
+                if provisional_container_exit_without_result {
+                    std::future::pending::<()>().await;
+                    return;
+                }
+                tokio::task::yield_now().await;
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Sandbox(completed)),
+                    }))
+                    .await;
+                return;
+            }
             if vm_error_after_started {
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
@@ -2182,6 +2228,109 @@ async fn sandbox_create_retries_terminal_attachment_until_relay_registers() {
             .load(Ordering::SeqCst),
         2
     );
+}
+
+#[tokio::test]
+async fn sandbox_create_waits_for_main_result_after_provisional_container_exit() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .terminal_after_provisional_container_exit
+        .store(true, Ordering::SeqCst);
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    let exit_code = run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("fast-ephemeral-command"),
+            keep: false,
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("a provisional container exit must yield to the canonical main-process result");
+
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        deleted_names(&server).await,
+        vec![vec!["fast-ephemeral-command".to_string()]]
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_bounds_provisional_container_exit_reconciliation() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .provisional_container_exit_without_result
+        .store(true, Ordering::SeqCst);
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    let provisional_container_exit_sent = server
+        .openshell
+        .state
+        .provisional_container_exit_sent
+        .notified();
+    tokio::pin!(provisional_container_exit_sent);
+    let command = ["echo".into(), "OK".into()];
+    let create = run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("missing-main-result"),
+            command: &command,
+            ..test_config()
+        },
+        "default",
+        &tls,
+    );
+    tokio::pin!(create);
+
+    tokio::select! {
+        () = &mut provisional_container_exit_sent => {}
+        result = &mut create => panic!("sandbox create returned before the provisional exit was observed: {result:?}"),
+    }
+    let reconciliation_started = Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(10), &mut create)
+        .await
+        .expect("provisional container exit reconciliation must remain bounded");
+    let reconciliation_elapsed = reconciliation_started.elapsed();
+
+    let err = result
+        .expect_err("a missing canonical main-process result must retain the container exit error");
+
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("sandbox entered error phase while provisioning"),
+        "unexpected error: {rendered}"
+    );
+    assert!(
+        rendered.contains("ContainerExited: Sandbox container exited"),
+        "unexpected error: {rendered}"
+    );
+    assert!(
+        !rendered.contains("timed out"),
+        "unexpected error: {rendered}"
+    );
+    assert!(
+        reconciliation_elapsed >= Duration::from_secs(5),
+        "provisional container exit returned before reconciliation: {reconciliation_elapsed:?}"
+    );
+    assert!(deleted_names(&server).await.is_empty());
 }
 
 #[tokio::test]
