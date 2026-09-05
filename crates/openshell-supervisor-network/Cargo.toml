@@ -13,10 +13,16 @@ rust-version.workspace = true
 [dependencies]
 openshell-core = { path = "../openshell-core", features = ["oauth"] }
 openshell-ocsf = { path = "../openshell-ocsf" }
+openshell-otel = { path = "../openshell-otel" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-router = { path = "../openshell-router" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
 
+hyper = { workspace = true }
+hyper-util = { version = "0.1", features = ["tokio", "http1"] }
+http-body-util = "0.1"
+opentelemetry-proto = { workspace = true }
+prost = { workspace = true }
 apollo-parser = { workspace = true }
 aws-sigv4 = { version = "1", features = ["sign-http", "http1"] }
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }

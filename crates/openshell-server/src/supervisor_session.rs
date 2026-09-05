@@ -769,11 +769,15 @@ pub async fn handle_connect_supervisor(
         );
     }
 
-    // Step 3: Send SessionAccepted.
+    // Step 3: Determine confirmed capabilities.
+    let confirmed_capabilities = confirm_capabilities(&hello.capabilities, state);
+
+    // Step 4: Send SessionAccepted.
     let accepted = GatewayMessage {
         payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
             session_id: session_id.clone(),
             heartbeat_interval_secs: HEARTBEAT_INTERVAL_SECS,
+            capabilities: confirmed_capabilities,
         })),
     };
     if tx.send(accepted).await.is_err() {
@@ -1016,11 +1020,66 @@ fn handle_supervisor_message(
                 "supervisor session: relay closed by supervisor"
             );
         }
+        Some(supervisor_message::Payload::Telemetry(telemetry)) => {
+            handle_telemetry_data(state, sandbox_id, session_id, telemetry);
+        }
         _ => {
-            warn!(
+            debug!(
                 sandbox_id = %sandbox_id,
                 session_id = %session_id,
-                "supervisor session: unexpected message type"
+                "supervisor session: unknown message type (future extension)"
+            );
+        }
+    }
+}
+
+/// Check which advertised capabilities the gateway can confirm.
+fn confirm_capabilities(advertised: &[String], state: &Arc<ServerState>) -> Vec<String> {
+    let mut confirmed = Vec::new();
+    for cap in advertised {
+        match cap.as_str() {
+            "telemetry_relay" if state.telemetry_relay_exporter.is_some() => {
+                confirmed.push(cap.clone());
+            }
+            _ => {}
+        }
+    }
+    confirmed
+}
+
+/// Handle incoming telemetry data from the supervisor: forward trace data to
+/// the configured OTLP collector and dispatch OCSF events to the log sink.
+fn handle_telemetry_data(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    session_id: &str,
+    telemetry: openshell_core::proto::TelemetryData,
+) {
+    if !telemetry.trace_data.is_empty()
+        && let Some(relay_exporter) = state.telemetry_relay_exporter.as_ref()
+    {
+        let exporter = relay_exporter.clone();
+        let trace_data = telemetry.trace_data;
+        let sandbox_id = sandbox_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = exporter.export_raw(trace_data).await {
+                debug!(
+                    sandbox_id = %sandbox_id,
+                    error = %e,
+                    "telemetry relay: failed to export trace data"
+                );
+            }
+        });
+    }
+
+    for ocsf_event in &telemetry.ocsf_events {
+        if let Ok(json_str) = std::str::from_utf8(ocsf_event) {
+            info!(
+                target: "ocsf_relay",
+                sandbox_id = %sandbox_id,
+                session_id = %session_id,
+                "{}",
+                json_str
             );
         }
     }

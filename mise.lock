@@ -134,6 +134,18 @@ checksum = "sha256:b8514ed7552e148b0a032114f745118dcb801791adafafeaf9935e4bfb0ed
 url = "https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-pc-windows-msvc.zip"
 url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/452060720"
 
+[[tools."github:mozilla/sccache"]]
+version = "0.16.0"
+backend = "github:mozilla/sccache"
+
+[tools."github:mozilla/sccache".options]
+asset_pattern = "sccache-v*x86_64*linux*.tar.gz"
+
+[tools."github:mozilla/sccache"."platforms.linux-x64"]
+checksum = "sha256:aec995a83ad3dff3d14b6314e08858b7b73d35ca85a5bcf3d3a9ec07dee35588"
+url = "https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/452060682"
+
 [[tools."github:rust-cross/cargo-zigbuild"]]
 version = "0.22.3"
 backend = "github:rust-cross/cargo-zigbuild"
@@ -399,15 +411,19 @@ backend = "aqua:GoogleContainerTools/skaffold"
 "vars.version_prefix" = "v"
 
 [tools.skaffold."platforms.linux-arm64"]
+checksum = "sha256:0062e1ff61f35200168454fa5a836306dd30b51acf30999d5d8836770d70ad2f"
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-linux-arm64"
 
 [tools.skaffold."platforms.linux-x64"]
+checksum = "sha256:de75d5697d4a14d6a5e87105671ef9a30990270ab14ad301913f8f8d41a1ecca"
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-linux-amd64"
 
 [tools.skaffold."platforms.macos-arm64"]
+checksum = "sha256:73478a431c17674d2f75d2c6e2fcbf35aa019de4ad6027e5573cc0f581767fbc"
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-darwin-arm64"
 
 [tools.skaffold."platforms.windows-x64"]
+checksum = "sha256:a257da2988782b4c1971bb58b9c7bb52176f8a0b587b6520dec0064f271fa416"
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-windows-amd64.exe"
 
 [[tools.uv]]

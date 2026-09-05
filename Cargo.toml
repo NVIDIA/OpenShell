@@ -66,6 +66,7 @@ tracing-appender = "0.2"
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "trace", "with-serde"] }
 tracing-opentelemetry = { version = "0.33", default-features = false, features = ["tracing-log"] }
 
 # Metrics

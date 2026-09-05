@@ -235,6 +235,18 @@ pub const SANDBOX_GID: &str = "OPENSHELL_SANDBOX_GID";
 /// OCI only for the former contract.
 pub const OCI_IMAGE_USER: &str = "OPENSHELL_OCI_IMAGE_USER";
 
+/// Standard OpenTelemetry environment variable for the OTLP exporter endpoint.
+///
+/// Set conditionally by the telemetry relay when the gateway has an OTLP
+/// endpoint configured. Points agent SDKs at the supervisor's local OTLP
+/// HTTP receiver.
+pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+
+/// Standard OpenTelemetry environment variable for the OTLP exporter protocol.
+///
+/// Set to `http/protobuf` when the telemetry relay is active.
+pub const OTEL_EXPORTER_OTLP_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
+
 // The corporate upstream-proxy configuration deliberately has no reserved
 // environment variables: it travels on the supervisor's argv
 // (`--upstream-proxy` and friends), which a sandbox image cannot forge the

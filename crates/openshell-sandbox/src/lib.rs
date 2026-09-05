@@ -852,6 +852,9 @@ pub async fn run_sandbox(
     };
     tokio::pin!(proxy_exited);
 
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut telemetry_relay_handle: Option<openshell_supervisor_network::otlp::RelayHandle> = None;
+
     let exit_code = if process_enabled {
         let ca_file_paths = networking
             .as_ref()
@@ -952,6 +955,66 @@ pub async fn run_sandbox(
             None
         };
 
+        // Telemetry relay: bind OTLP receiver on 127.0.0.1:4318 for all
+        // Linux topologies. For Docker/Podman with a netns, bind inside the
+        // namespace. For K8s/VM (shared namespace), bind directly.
+        let telemetry_rx = {
+            #[cfg(target_os = "linux")]
+            {
+                let (telemetry_session_tx, telemetry_session_rx) =
+                    tokio::sync::mpsc::channel::<openshell_core::proto::SupervisorMessage>(64);
+
+                let relay_config = openshell_supervisor_network::otlp::RelayConfig::default();
+                let metadata = openshell_supervisor_network::otlp::SandboxMetadata {
+                    sandbox_id: sandbox_id.clone().unwrap_or_default(),
+                    workspace_id: workspace_rx.borrow().clone(),
+                    policy: sandbox_name_for_agg.clone().unwrap_or_default(),
+                    user: resolved_process_identity
+                        .uid()
+                        .map_or_else(String::new, |uid| uid.to_string()),
+                    image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
+                    driver: std::env::var(openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY)
+                        .unwrap_or_else(|_| "container".to_string()),
+                };
+                let relay = openshell_supervisor_network::otlp::TelemetryRelay::new(
+                    relay_config,
+                    metadata,
+                    telemetry_session_tx,
+                );
+
+                let localhost_addr: std::net::SocketAddr = "127.0.0.1:4318".parse().unwrap();
+
+                if let Some(ns) = netns.as_ref() {
+                    match ns.bind_tcp_in_netns("127.0.0.1:4318").await {
+                        Ok(listener) => {
+                            let handle = relay.start_with_listener(listener);
+                            tracing::info!(bind = %localhost_addr, "telemetry relay started (netns)");
+                            telemetry_relay_handle = Some(handle);
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "telemetry relay failed to bind in netns; continuing without relay");
+                        }
+                    }
+                } else {
+                    match relay.start(localhost_addr).await {
+                        Ok(handle) => {
+                            tracing::info!(bind = %localhost_addr, "telemetry relay started");
+                            telemetry_relay_handle = Some(handle);
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "telemetry relay failed to start; continuing without relay");
+                        }
+                    }
+                }
+                Some(telemetry_session_rx)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                debug!("telemetry relay not available on this platform");
+                None
+            }
+        };
+
         let process = openshell_supervisor_process::run::run_process(
             program,
             args,
@@ -980,6 +1043,7 @@ pub async fn run_sandbox(
             bypass_denial_tx,
             #[cfg(target_os = "linux")]
             bypass_activity_tx,
+            telemetry_rx,
         );
 
         if let Some(control_closed) = process_control_closed.as_mut() {
@@ -1138,6 +1202,12 @@ pub async fn run_sandbox(
             }
         }
     };
+
+    // Drain telemetry relay before tearing down networking so short-lived
+    // agents don't lose their final spans.
+    if let Some(handle) = telemetry_relay_handle {
+        handle.shutdown().await;
+    }
 
     // Drop networking explicitly so the proxy + bypass monitor RAII
     // handles tear down before we return.
@@ -1456,6 +1526,7 @@ fn spawn_sidecar_entrypoint_handler(
                     Some(supervisor_pid),
                     Arc::clone(&terminating),
                     started.instance_id.clone(),
+                    None,
                 ));
                 session_started = true;
                 info!("sidecar supervisor session task spawned");

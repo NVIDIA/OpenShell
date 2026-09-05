@@ -1222,6 +1222,9 @@ fn apply_child_env(
         for (key, value) in child_env::proxy_env_vars(url) {
             cmd.env(key, value);
         }
+        for (key, value) in child_env::otel_env_vars("http://127.0.0.1:4318", "http/protobuf") {
+            cmd.env(key, value);
+        }
     }
 
     if let Some((ca_cert_path, combined_bundle_path)) = ca_file_paths {

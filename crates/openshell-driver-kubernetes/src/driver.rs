@@ -4341,6 +4341,16 @@ fn build_env_list(
         tls_enabled,
         provider_spiffe_socket_path,
     );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT,
+        "http://127.0.0.1:4318",
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_PROTOCOL,
+        "http/protobuf",
+    );
     env
 }
 

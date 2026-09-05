@@ -64,5 +64,6 @@ pub use builders::{
 
 // --- Tracing layers ---
 pub use tracing_layers::{
-    OCSF_TARGET, OcsfJsonlLayer, OcsfShorthandLayer, clone_current_event, emit_ocsf_event,
+    OCSF_TARGET, OcsfJsonlLayer, OcsfRelayLayer, OcsfRelaySink, OcsfShorthandLayer,
+    clone_current_event, emit_ocsf_event,
 };

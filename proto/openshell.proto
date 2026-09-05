@@ -2358,6 +2358,22 @@ message GetSandboxLogsResponse {
 // Supervisor session messages
 // ---------------------------------------------------------------------------
 
+// Telemetry data forwarded from supervisor to gateway.
+// Contains agent trace spans and/or OCSF events from a single sandbox.
+message TelemetryData {
+  // Source sandbox identifier.
+  string sandbox_id = 1;
+
+  // Serialized OTLP ExportTraceServiceRequest (protobuf encoding).
+  // Contains pre-enriched spans with sandbox resource attributes.
+  // Empty when only OCSF events are being forwarded.
+  bytes trace_data = 2;
+
+  // Serialized OCSF events (each entry is a JSON-encoded OCSF event).
+  // Empty when only trace data is being forwarded.
+  repeated bytes ocsf_events = 3;
+}
+
 // Envelope for supervisor-to-gateway messages on the ConnectSupervisor stream.
 message SupervisorMessage {
   oneof payload {
@@ -2365,6 +2381,7 @@ message SupervisorMessage {
     SupervisorHeartbeat heartbeat = 2;
     RelayOpenResult relay_open_result = 3;
     RelayClose relay_close = 4;
+    TelemetryData telemetry = 5;
   }
 }
 
@@ -2385,6 +2402,8 @@ message SupervisorHello {
   string sandbox_id = 1;
   // Supervisor instance ID (e.g. boot id or process epoch).
   string instance_id = 2;
+  // Capabilities this supervisor supports (e.g. "telemetry_relay").
+  repeated string capabilities = 3;
 }
 
 // Gateway accepts the supervisor session.
@@ -2393,6 +2412,8 @@ message SessionAccepted {
   string session_id = 1;
   // Recommended heartbeat interval in seconds.
   uint32 heartbeat_interval_secs = 2;
+  // Capabilities confirmed by the gateway (subset of what supervisor advertised).
+  repeated string capabilities = 3;
 }
 
 // Gateway rejects the supervisor session.

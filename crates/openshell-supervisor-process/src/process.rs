@@ -829,6 +829,13 @@ impl ProcessHandle {
             }
         }
 
+        // Set OTEL env vars so agent SDKs export to the supervisor's OTLP receiver
+        if netns_fd.is_some() {
+            for (key, value) in child_env::otel_env_vars("http://127.0.0.1:4318", "http/protobuf") {
+                cmd.env(key, value);
+            }
+        }
+
         // Probe Landlock availability and emit OCSF logs from the parent
         // process where the tracing subscriber is functional. The child's
         // pre_exec context cannot reliably emit structured logs.
