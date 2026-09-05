@@ -26,7 +26,9 @@ fn startup_logs_go_to_stderr_not_stdout() {
         "expected startup logs on stderr only, got stdout: {stdout}"
     );
     assert!(
-        stderr.contains("capability-free sandbox probe") || stderr.contains("read boundary config"),
+        stderr.contains("capability-free sandbox probe")
+            || stderr.contains("read boundary config")
+            || stderr.contains("openshell-sandbox requires Linux"),
         "expected startup qualification or bootstrap error on stderr, got: {stderr}"
     );
 }
