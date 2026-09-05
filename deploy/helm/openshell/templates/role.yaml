@@ -33,14 +33,29 @@ rules:
       - watch
   # Per-sandbox identity: TokenReview authenticates the projected token from
   # the configured sandbox service account, then the gateway resolves the
-  # returned pod name and UID to the pod's `openshell.ai/sandbox-id`
-  # annotation. patch is intentionally NOT granted — the annotation is set
-  # once at pod create and must remain immutable for the lifetime of the
-  # sandbox.
+  # returned pod name and UID to its immutable sandbox labels. PATCH is used
+  # only to remove the driver-owned bootstrap scheduling gate after the
+  # immutable bootstrap material has been created.
   - apiGroups:
       - ""
     resources:
       - pods
     verbs:
       - get
+      - patch
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "delete", "get", "list", "patch", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "delete", "get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "delete", "get", "list"]
 {{- end }}

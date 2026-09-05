@@ -20,17 +20,23 @@ tests:
             resources: ["networkpolicies"]
             verbs: ["get", "create", "patch", "update"]
 
-  - it: omits managed NetworkPolicy permissions when isolation is disabled
+  - it: preserves proxy-pod fence permissions when gateway isolation is disabled
     set:
       server.drivers.kubernetes.workspaceMode: managed
       networkPolicy.enabled: false
     asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["networking.k8s.io"]
+            resources: ["networkpolicies"]
+            verbs: ["create", "delete", "get", "list"]
       - notContains:
           path: rules
           content:
             apiGroups: ["networking.k8s.io"]
             resources: ["networkpolicies"]
-          any: true
+            verbs: ["get", "create", "patch", "update"]
 
   - it: grants broad secret access when credential driver is enabled (operator)
     set:
@@ -57,17 +63,23 @@ tests:
             resourceNames: ["custom-client-tls"]
             verbs: ["get", "patch"]
 
-  - it: omits operator secret access when TLS and credential storage are disabled
+  - it: limits operator bootstrap secret access to create when TLS and credential storage are disabled
     set:
       server.drivers.kubernetes.workspaceMode: operator
       server.disableTls: true
     asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create"]
       - notContains:
           path: rules
           content:
             apiGroups: [""]
             resources: ["secrets"]
-          any: true
+            verbs: ["get", "create", "patch", "delete"]
 
   - it: restricts managed copies to TLS and configured image-pull secrets
     set:
@@ -122,3 +134,37 @@ tests:
             apiGroups: [""]
             resources: ["secrets"]
           any: true
+
+  - it: grants managed proxy-pod companion permissions
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["apps"]
+            resources: ["deployments"]
+            verbs: ["create", "delete", "get", "list", "patch", "watch"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create"]
+
+  - it: grants operator proxy-pod companion permissions
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["apps"]
+            resources: ["deployments"]
+            verbs: ["create", "delete", "get", "list", "patch", "watch"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create"]

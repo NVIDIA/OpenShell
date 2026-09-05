@@ -7,6 +7,7 @@
 //! is dropped, replacing the `trap cleanup EXIT` pattern from the bash tests.
 
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,6 +31,23 @@ fn extract_sandbox_name(output: &str) -> Option<String> {
 /// base image), so 600s accommodates extraction + workspace-init + pod
 /// startup.
 const SANDBOX_READY_TIMEOUT: Duration = Duration::from_secs(600);
+
+static NEXT_SANDBOX_NAME: AtomicU64 = AtomicU64::new(1);
+
+fn has_explicit_sandbox_name(args: &[&str]) -> bool {
+    args.iter()
+        .any(|arg| *arg == "--name" || arg.starts_with("--name="))
+}
+
+fn add_unique_name_if_missing(command: &mut tokio::process::Command, args: &[&str]) {
+    if !has_explicit_sandbox_name(args) {
+        command.arg("--name").arg(format!(
+            "e2e-{}-{}",
+            std::process::id(),
+            NEXT_SANDBOX_NAME.fetch_add(1, Ordering::Relaxed)
+        ));
+    }
+}
 
 /// RAII guard that deletes a sandbox on drop.
 ///
@@ -92,6 +110,7 @@ impl SandboxGuard {
 
         let mut cmd = openshell_cmd();
         cmd.arg("sandbox").arg("create").arg("--detach");
+        add_unique_name_if_missing(&mut cmd, create_args);
         for arg in create_args {
             cmd.arg(arg);
         }
@@ -166,10 +185,9 @@ impl SandboxGuard {
     /// which lets tests control competing and reconnecting clients directly.
     pub async fn create_detached_main(command: &[&str]) -> Result<Self, String> {
         let mut cmd = openshell_cmd();
-        cmd.arg("sandbox")
-            .arg("create")
-            .arg("--detach")
-            .arg("--")
+        cmd.arg("sandbox").arg("create").arg("--detach");
+        add_unique_name_if_missing(&mut cmd, &[]);
+        cmd.arg("--")
             .args(command)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -216,6 +234,7 @@ impl SandboxGuard {
     ) -> Result<Self, String> {
         let mut create_cmd = openshell_cmd();
         create_cmd.arg("sandbox").arg("create").arg("--detach");
+        add_unique_name_if_missing(&mut create_cmd, create_args);
         for arg in create_args {
             create_cmd.arg(arg);
         }
@@ -354,6 +373,7 @@ impl SandboxGuard {
     ) -> Result<Self, String> {
         let mut cmd = openshell_cmd();
         cmd.arg("sandbox").arg("create").arg("--detach");
+        add_unique_name_if_missing(&mut cmd, &[]);
         for (local, dest) in uploads {
             cmd.arg("--upload").arg(format!("{local}:{dest}"));
         }
@@ -678,5 +698,17 @@ impl Drop for SandboxGuard {
                 let _ = cmd.status().await;
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_explicit_sandbox_name;
+
+    #[test]
+    fn detects_explicit_sandbox_names() {
+        assert!(has_explicit_sandbox_name(&["--name", "example"]));
+        assert!(has_explicit_sandbox_name(&["--name=example"]));
+        assert!(!has_explicit_sandbox_name(&["--policy", "policy.yaml"]));
     }
 }
