@@ -65,6 +65,21 @@ port_is_in_use() {
   (echo >/dev/tcp/127.0.0.1/"${port}") >/dev/null 2>&1
 }
 
+append_local_otlp_config_if_available() {
+  local config_path=$1
+  if ! port_is_in_use 4317; then
+    echo "OTLP collector not detected on 127.0.0.1:4317; trace export disabled."
+    return
+  fi
+
+  cat >>"${config_path}" <<'EOF'
+
+[openshell.gateway.otlp]
+endpoint = "http://127.0.0.1:4317"
+EOF
+  echo "OTLP trace export enabled for http://127.0.0.1:4317."
+}
+
 register_gateway_metadata() {
   local name=$1
   local endpoint=$2
@@ -120,6 +135,25 @@ SUPERVISOR_TARGET="$(linux_target_triple "${DAEMON_ARCH}")"
 SUPERVISOR_OUT_DIR="${STATE_DIR}/supervisor/${DAEMON_ARCH}"
 SUPERVISOR_BIN="${SUPERVISOR_OUT_DIR}/openshell-sandbox"
 
+install_supervisor_binary() {
+  local source=$1
+  local staged
+
+  # A running sandbox may execute a bind-mounted copy of SUPERVISOR_BIN.
+  # Replacing its directory entry keeps that old inode alive for the running
+  # container without truncating it, while new containers see this build.
+  mkdir -p "${SUPERVISOR_OUT_DIR}"
+  staged="$(mktemp "${SUPERVISOR_OUT_DIR}/.openshell-sandbox.XXXXXX")"
+  if ! cp "${source}" "${staged}" || ! chmod 0755 "${staged}"; then
+    rm -f -- "${staged}"
+    return 1
+  fi
+  if ! mv -f -- "${staged}" "${SUPERVISOR_BIN}"; then
+    rm -f -- "${staged}"
+    return 1
+  fi
+}
+
 CARGO_BUILD_JOBS_ARG=()
 if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
   CARGO_BUILD_JOBS_ARG=(-j "${CARGO_BUILD_JOBS}")
@@ -127,7 +161,7 @@ fi
 
 echo "Building openshell-gateway..."
 cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-  -p openshell-server --bin openshell-gateway
+  -p openshell-gateway --bin openshell-gateway
 
 TLS_DIR="${STATE_DIR}/tls"
 echo "Generating local gateway credentials..."
@@ -143,8 +177,8 @@ if [[ "${HOST_OS}" == "Linux" && "${HOST_ARCH}" == "${DAEMON_ARCH}" ]]; then
   rustup target add "${SUPERVISOR_TARGET}" >/dev/null 2>&1 || true
   cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
     -p openshell-sandbox --target "${SUPERVISOR_TARGET}"
-  mkdir -p "${SUPERVISOR_OUT_DIR}"
-  cp "${ROOT}/target/${SUPERVISOR_TARGET}/debug/openshell-sandbox" "${SUPERVISOR_BIN}"
+  install_supervisor_binary \
+    "${ROOT}/target/${SUPERVISOR_TARGET}/debug/openshell-sandbox"
 else
   # Cross-compile through the prebuilt-binary staging helper, then use the
   # supervisor stage to extract just the openshell-sandbox binary.
@@ -153,17 +187,25 @@ else
   # container-engine helper to docker — otherwise it auto-detects podman
   # whenever the binary happens to be on PATH.
   mkdir -p "${SUPERVISOR_OUT_DIR}"
-  CONTAINER_ENGINE=docker \
-  DOCKER_PLATFORM="linux/${DAEMON_ARCH}" \
-  DOCKER_OUTPUT="type=local,dest=${SUPERVISOR_OUT_DIR}" \
-    bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor-output
+  SUPERVISOR_BUILD_DIR="$(mktemp -d "${SUPERVISOR_OUT_DIR}/.build.XXXXXX")"
+  if ! CONTAINER_ENGINE=docker \
+    DOCKER_PLATFORM="linux/${DAEMON_ARCH}" \
+    DOCKER_OUTPUT="type=local,dest=${SUPERVISOR_BUILD_DIR}" \
+      bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor-output; then
+    rm -rf -- "${SUPERVISOR_BUILD_DIR}"
+    exit 1
+  fi
+  if ! install_supervisor_binary "${SUPERVISOR_BUILD_DIR}/openshell-sandbox"; then
+    rm -rf -- "${SUPERVISOR_BUILD_DIR}"
+    exit 1
+  fi
+  rm -rf -- "${SUPERVISOR_BUILD_DIR}"
 fi
 
 if [[ ! -f "${SUPERVISOR_BIN}" ]]; then
   echo "ERROR: expected supervisor binary at ${SUPERVISOR_BIN}" >&2
   exit 1
 fi
-chmod +x "${SUPERVISOR_BIN}"
 
 mkdir -p "${STATE_DIR}"
 CONFIG_PATH="${STATE_DIR}/gateway.toml"
@@ -172,6 +214,7 @@ cat >"${CONFIG_PATH}" <<EOF
 version = 1
 
 [openshell.gateway]
+name = "${GATEWAY_NAME}"
 compute_drivers = ["docker"]
 disable_tls = true
 
@@ -183,7 +226,6 @@ signing_key_path = "${TLS_DIR}/jwt/signing.pem"
 public_key_path = "${TLS_DIR}/jwt/public.pem"
 kid_path = "${TLS_DIR}/jwt/kid"
 gateway_id = "${GATEWAY_NAME}"
-ttl_secs = 3600
 
 [openshell.drivers.docker]
 default_image = "${SANDBOX_IMAGE}"
@@ -192,6 +234,8 @@ sandbox_namespace = "${SANDBOX_NAMESPACE}"
 grpc_endpoint = "${GRPC_ENDPOINT}"
 supervisor_bin = "${SUPERVISOR_BIN}"
 EOF
+
+append_local_otlp_config_if_available "${CONFIG_PATH}"
 
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"

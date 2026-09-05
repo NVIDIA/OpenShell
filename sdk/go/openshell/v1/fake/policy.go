@@ -71,7 +71,7 @@ func (c *fakePolicyClient) GetDraft(_ context.Context, _, _ string, _ ...v1.GetD
 }
 
 // ApproveDraftChunk returns Unimplemented.
-func (c *fakePolicyClient) ApproveDraftChunk(_ context.Context, _, _, _ string) (*types.ApproveResult, error) {
+func (c *fakePolicyClient) ApproveDraftChunk(_ context.Context, _, _, _, _ string) (*types.ApproveResult, error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}

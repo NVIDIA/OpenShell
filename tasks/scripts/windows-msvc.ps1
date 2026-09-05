@@ -583,7 +583,7 @@ function Assert-GatewayExcludesUnsupportedDriverCrates([string] $RustTarget) {
     $logName = "build-$RustTarget-driver-tree.log"
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo tree -p openshell-server --target $RustTarget --prefix none" `
+        -CargoArgs "cargo tree -p openshell-gateway --target $RustTarget --prefix none" `
         -LogName $logName
 
     $logPath = Join-Path $LogDir $logName
@@ -643,7 +643,7 @@ function Invoke-UnsupportedContractTests([string] $RustTarget) {
     foreach ($test in $tests) {
         Invoke-VsCargo `
             -RustTarget $RustTarget `
-            -CargoArgs "cargo test -p openshell-server --target $RustTarget $test $Z3ServerFeatures" `
+            -CargoArgs "cargo test -p openshell-gateway --target $RustTarget $test $Z3ServerFeatures" `
             -LogName "test-$RustTarget-unsupported-$test.log"
     }
 }

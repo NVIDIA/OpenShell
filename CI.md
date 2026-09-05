@@ -14,17 +14,70 @@ Merge queue validation is a second integration gate for `main`. After a PR has p
 
 Three opt-in labels enable the long-running E2E suites:
 
-- `test:e2e` runs the standard Docker, rootless Podman, Kubernetes, and VM E2E
-  suites in `Branch E2E Checks`
+- `test:e2e` runs the Docker, rootless Podman, Kubernetes, and VM E2E suites
+  with both managed and standalone compute drivers in `Branch E2E Checks`
 - `test:e2e-gpu` runs GPU E2E in `Branch E2E Checks`
 - `test:e2e-kubernetes` runs Kubernetes E2E with the HA Helm overlay
   (`replicaCount: 2` and bundled PostgreSQL) and the credential-driver suite
   (Kubernetes Secrets plus Vault) in `Branch E2E Checks`
 
-When multiple labels are present, `Branch E2E Checks` builds the shared gateway and supervisor images once, builds one CLI artifact per runner architecture, builds the Linux VM driver artifact once, and fans out all enabled suites in parallel. Docker, Podman, GPU, Rust, Python, MCP, and VM E2E jobs reuse the matching prebuilt gateway and CLI binaries instead of compiling additional debug binaries in each job; Kubernetes E2E consumes the gateway image directly and reuses the prebuilt CLI. VM E2E also reuses the prebuilt VM driver artifact and falls back to local VM-driver/runtime preparation for local runs or workflow invocations that omit the artifact.
+When multiple labels are present, `Branch E2E Checks` builds each generic multi-architecture artifact set once and fans out enabled suites in parallel. Runtime-specific reusable workflows define the Docker, Podman, VM, and Kubernetes lanes. Composite actions own the replaceable Podman, KVM, kind, and mise setup. Each lane depends only on the artifact categories it consumes: VM does not wait for container-driver artifacts or supervisor images, and GPU does not wait for the gateway image. Docker, Podman, GPU, Rust, Python, MCP, and VM E2E reuse matching prebuilt gateway and CLI binaries instead of compiling debug binaries in test jobs. Standalone-driver lanes additionally reuse driver-free gateway and compute-driver artifacts. Kubernetes managed-driver lanes consume published gateway and supervisor images, while the standalone-driver lane composes its gateway image from prebuilt binaries.
 The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated from separate suite result jobs inside that workflow. `test:e2e-kubernetes` is optional while Kubernetes HA and credential-driver behavior are under active iteration: failures are visible in the workflow run but do not publish a required CI gate status.
 
 The GitHub ruleset should require the `OpenShell / ...` statuses published by `Required CI Gates`, not the push-triggered workflow jobs directly.
+
+## Informational security reports
+
+Security workflow compute runs directly on GitHub-hosted runners instead of
+NVIDIA self-hosted runners. The PR-oriented workflows receive no secrets and run
+on fork pull requests without waiting for copy-pr-bot. Codex Security release
+qualification is the exception: it runs only for maintainer-created
+pre-release tags and receives a scoped NVIDIA Inference API key for the scan
+step. Scanner jobs request `security-events: write` to publish SARIF to Code
+Scanning. GitHub permits Code Scanning uploads from `pull_request` runs even
+when fork and Dependabot contexts receive a read-only `GITHUB_TOKEN`, so those
+scanners upload results directly:
+
+- `Workflow Security Reports` runs Actionlint and Zizmor. Actionlint reports
+  workflow syntax and expression findings. Zizmor reports only High severity,
+  its maximum level. Nix provides both scanners. They publish SARIF to Code
+  Scanning and retain report artifacts.
+- `Dependency Review` compares the base and head dependency graphs and reports
+  newly introduced vulnerabilities with a High-or-higher policy. It runs in
+  warn-only mode. A preflight turns an unavailable GitHub Dependency Graph into
+  a warning, so the workflow remains neutral until the repository feature is
+  available.
+- `CodeQL` analyzes product Rust code, examples, and the Go, Python, and
+  TypeScript SDKs. Rust `cfg(test)` blocks, Rust integration-test targets, and
+  E2E test code are excluded. It runs nightly on `main`, remains manually
+  dispatchable for diagnostics, uploads results to Code Scanning, and retains
+  workflow artifacts.
+- `Codex Security Release Qualification` analyzes each `vX.Y.Z-pre.N`
+  candidate against the previous stable release. Every candidate in a release
+  train therefore rescans the cumulative stable-to-candidate diff. It calls
+  `https://inference-api.nvidia.com/v1` with
+  `openai/openai/gpt-5.6-sol` at medium reasoning effort. The
+  `CODEX_SECURITY_API_KEY` secret must contain an API key authorized for that
+  NVIDIA endpoint. Results are uploaded against the candidate commit on `main`
+  under a category shared by the train, for example
+  `codex-security/v0.1.1`, so later candidates replace earlier analyses. The
+  slash-qualified NVIDIA model identifier prevents Codex Security 0.1.24 from
+  enforcing `--max-cost`, so the workflow relies on its timeout, serialized
+  concurrency, and the inference account's spend controls. Raw reports are not
+  retained as workflow artifacts. Pre-release creation and stable-promotion
+  enforcement remain part of RFC 0014 and are not implemented by this workflow.
+
+Findings do not fail these workflows. Tool startup, configuration, build, and
+analysis failures still fail so a broken scanner cannot appear healthy. The
+PR-oriented reports also run on merge groups; CodeQL is not a PR or merge-queue
+check. None of these reports are required statuses or gate merges.
+
+Run the workflow-definition scanners locally with:
+
+```shell
+nix develop --command actionlint -shellcheck= -pyflakes=
+nix develop --command zizmor --offline --persona=regular --min-severity=high --no-exit-codes .
+```
 
 ## Commit signing
 
@@ -137,11 +190,20 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 |---|---|
 | `.github/workflows/branch-checks.yml` | Required non-E2E checks. Triggers on `push: pull-request/[0-9]+` for PR mirrors and `merge_group` for queued merges. |
 | `.github/workflows/branch-e2e.yml` | Standard, GPU, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels; merge groups run core and GPU E2E. |
+| `.github/workflows/build-{cli,gateway,sandbox}-binaries.yml` | Independent target matrices used by branch and release workflows without creating skipped jobs. |
+| `.github/workflows/package-release-binaries.yml` | Packages raw build artifacts into release tarballs without rebuilding them. |
+| `.github/workflows/e2e-docker-test.yml`, `e2e-podman-test.yml`, `e2e-vm-test.yml`, `e2e-kubernetes-test.yml` | Reusable runtime lanes called directly by branch and release workflows. Callers select suites and declare only the artifacts each runtime consumes. |
+| `.github/actions/setup-e2e-*` | Shared artifact, Podman, KVM, and kind setup used by the runtime lanes. |
 | `.github/workflows/helm-lint.yml` | Helm chart validation. PR mirror pushes skip lint jobs unless Helm inputs changed; merge groups always validate Helm because they represent the final integration state. |
+| `.github/actions/setup-nix/action.yml` | Installs Nix and configures the OpenShell Cachix cache, using read-only cache access when no authentication token is available. |
 | `.github/actions/pr-gate/action.yml` | Composite action that resolves PR metadata and verifies the required label is set for PR mirror pushes. Non-push events are allowed through. |
 | `.github/actions/pr-merge-base/action.yml` | Composite action that resolves and fetches the merge-base commit for `pull-request/<N>` push workflows. |
 | `.github/workflows/required-ci-gates.yml` | Posts required PR-head and merge-group statuses for gated CI workflows. This is what branch protection and merge queue should require. |
 | `.github/workflows/e2e-label-help.yml` | When a `test:e2e*` label is applied, posts a PR comment telling the maintainer the next manual step (re-run an existing workflow run, or `/ok to test <SHA>` to refresh the mirror). |
+| `.github/workflows/workflow-security.yml` | Runs informational Actionlint and High-severity Zizmor reports on GitHub-hosted runners. |
+| `.github/workflows/dependency-review.yml` | Reports dependency changes when GitHub Dependency Graph is available; otherwise publishes a neutral warning. |
+| `.github/workflows/codeql.yml` | Runs nightly informational CodeQL analysis on `main` for Rust and the Go, Python, and TypeScript SDKs and retains SARIF artifacts. |
+| `.github/workflows/codex-security.yml` | Scans the cumulative diff from the previous stable release to each pre-release candidate and publishes train-scoped SARIF on `main`. |
 
 ## Release workflows
 
@@ -150,7 +212,7 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | File | Role |
 |---|---|
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway/supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
-| `.github/workflows/release-tag.yml` | Publishes a tagged public release. |
+| `.github/workflows/release-tag.yml` | Publishes a tagged stable release. Its automatic tag trigger excludes `-pre.*`; manual dispatch remains maintainer-controlled. |
 | `.github/workflows/release-canary.yml` | Smoke-tests published artifacts on `macos`, `ubuntu`, `fedora`, and `kubernetes` (kind + Helm) runners. Triggers automatically when `Release Dev` succeeds, and via `workflow_dispatch` on any branch (`gh workflow run release-canary.yml --ref <branch>`). The `kubernetes` job pins to `0.0.0-dev` artifacts; the other jobs install the latest tagged release via `install.sh`. See the `test-release-canary` skill for the manual-dispatch playbook and local kind reproduction. |
 
 ## Required status contexts
@@ -163,3 +225,6 @@ Require these statuses in the branch ruleset for PR and merge-queue CI:
 - `OpenShell / Helm Lint`
 
 Do not require the underlying workflow jobs directly. PR workflow jobs only appear after copy-pr-bot mirrors trusted code, and merge-group workflow jobs run on temporary queue branches. The stable `OpenShell / ...` contexts prove the expected workflow completed for the commit that GitHub is about to merge.
+
+Do not add the informational Actionlint, Zizmor, Dependency Review, or CodeQL
+jobs to the required status list while they remain in observation mode.

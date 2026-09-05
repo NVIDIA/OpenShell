@@ -97,6 +97,13 @@ raw relay by default. A `protocol: rest` endpoint can opt in to
 after an allowed `101` upgrade; server-to-client traffic and all other upgraded
 protocols remain raw passthrough.
 
+A `protocol: tcp` hostname is a connection-routing constraint, not an
+application-authority boundary. Transparent capture validates the approved DNS
+name, pinned destination address, port, and calling binary before opening the
+stream, but it does not inspect TLS SNI, HTTP `Host`, or another protocol-level
+destination. Compatible shared infrastructure can therefore let a client
+select another tenant, virtual host, or service behind the approved front door.
+
 ## Credentialed Endpoints
 
 OpenShell keeps provider credentials on paths it can inspect or rewrite by
@@ -216,10 +223,22 @@ through the proposal loop instead of treating the denial as terminal.
 
 1. **Submit.** Both proposers POST through the same `SubmitPolicyAnalysis`
    path. Each chunk is persisted with its `analysis_mode` for audit provenance.
-2. **Validate.** The gateway runs the prover (`openshell-prover`) on every
-   chunk regardless of mode. The prover builds a Z3 model from the merged
-   policy plus the sandbox's attached-provider credential set, then computes
-   the delta of findings between the current baseline and the merged policy.
+   Agent-authored chunks cannot request `protocol: tcp` or `tls: skip`; the
+   sandbox-local API rejects those transport choices for immediate feedback,
+   and the gateway repeats the check before persistence.
+   Omitted-protocol endpoints remain available through the explicit proxy with
+   default TLS termination and HTTP authority checks. Administrators can still
+   author native TCP and raw TLS policy directly.
+2. **Build and validate the candidate.** The gateway first canonicalizes a
+   mechanistic proposal against the live effective policy. If an endpoint is
+   already governed by an inspected or provider-owned contract, the candidate
+   preserves that contract and adds only the proposed sandbox binary. Provider
+   rules are immutable inputs; the sandbox contribution is stored as an
+   overlay. The gateway then performs the same merge, policy validation,
+   provider composition, credential preflight, and prover evaluation that the
+   candidate would encounter when applied. Each chunk stores the resulting
+   effective candidate, its hashes, any application error, and a review token
+   derived from the candidate and its non-secret live inputs.
 3. **Auto-approval gate (proposer-agnostic, opt-in).** Auto-approval fires
    only when *all three* conditions hold: (a) `proposal_approval_mode`
    resolves to `"auto"` — gateway scope wins, sandbox scope is the
@@ -227,13 +246,12 @@ through the proposal loop instead of treating the denial as terminal.
    (`prover: no new findings`); and (c) the security notes recomputed from
    the chunk's current proposed rule are empty (see
    [Security-notes gate](#security-notes-gate)). Before merging, the gateway
-   reloads the stored chunk and reruns both checks on its current rule. This is
-   important after edits and mechanistic deduplication: the stored rule, not a
-   duplicate incoming payload or stale persisted analysis, controls the
-   decision. The recalculated prover verdict is decision-local rather than
-   persisted, so `validation_result` reads can still show the submit-time
-   verdict after an edit or deduplication. Decode, prover, or merge failures
-   leave the chunk pending. The audit event uses `CONFIG:APPROVED` and carries
+   reloads the stored chunk and recomputes its candidate from live policy,
+   provider, and credential inputs. If the review token is unchanged, the
+   gateway reuses the persisted prover result. If it changed, the gateway
+   persists the refreshed candidate and requires a fresh review instead of
+   applying it. Decode, prover, merge, provider-composition, or credential
+   failures leave the chunk pending with an application error. The audit event uses `CONFIG:APPROVED` and carries
    `auto=true`, `source=<mode>`, `prover_delta=empty`, and
    `resolved_from=<gateway|sandbox>` as unmapped fields, with message text
    `"auto-approved: no new prover findings"` — never `safe`. The opt-in gate
@@ -258,6 +276,26 @@ through the proposal loop instead of treating the denial as terminal.
    would leave the governance ledger disagreeing with the still-enforced
    policy.
 6. **Escalation.** Anything else lands in `pending` for human review.
+
+After any successful policy write, pending chunks already covered by the new
+live effective policy are rejected as redundant. This keeps the review inbox
+aligned with what the sandbox currently enforces.
+
+Endpoint and binary advisor markers are provenance, not authorization or
+connection metadata. Provider- or user-authored declarations carry explicit
+provenance; `policy.local` declarations carry advisor provenance. A difference
+in endpoint provenance alone is compatible during effective-policy ambiguity
+validation. When identical endpoint or binary identities merge, an explicit
+declaration dominates an advisor declaration. Proposal coverage likewise
+ignores provenance so an approved overlay converges when an existing explicit
+declaration already supplies the same identity.
+
+This compatibility does not weaken SSRF classification. Exact-host trust
+requires one matching rule to contain both an exact explicit endpoint and an
+explicit binary identity. An advisor-only endpoint or binary cannot assemble
+that trust from unrelated rules. A provider rule may independently establish
+trust for its own explicit endpoint and binary pair, but an advisor overlay
+does not broaden that pair to a different binary.
 
 ### Security-notes gate
 

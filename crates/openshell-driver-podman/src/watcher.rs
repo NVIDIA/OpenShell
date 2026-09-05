@@ -26,8 +26,9 @@ use tracing::{debug, info, warn};
 // Condition reason constants shared across event-building paths.
 const CONDITION_RUNNING: &str = "ContainerRunning";
 const CONDITION_STARTING: &str = "ContainerStarting";
-const CONDITION_EXITED: &str = "ContainerExited";
-const CONDITION_STOPPED: &str = "ContainerStopped";
+use openshell_core::driver_utils::{
+    CONDITION_EXITED, CONDITION_RUNTIME_RESTART, CONDITION_STOPPED,
+};
 
 pub type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, ComputeDriverError>> + Send>>;
@@ -121,15 +122,12 @@ fn deleted_event(sandbox_id: String) -> WatchSandboxesEvent {
 /// drops (daemon restart, socket error, or clean shutdown), the stream
 /// terminates with a final error item and stops producing events.
 ///
-/// Callers are responsible for reconnecting by calling [`start_watch`] again.
-/// The server's `ComputeRuntime::watch_loop` in `openshell-server` provides
-/// this behaviour with a 2-second backoff: when the stream terminates with an
-/// error, `watch_loop` sleeps and then calls `watch_sandboxes()` again, which
-/// ultimately calls `start_watch()` again and re-syncs state.
+/// Callers are responsible for reconnecting by calling [`start_watch`] again
+/// and re-synchronizing state.
 ///
 /// **Do not add reconnection logic inside this function.**  A local reconnect
-/// would race with `watch_loop`'s retry and produce duplicate initial-sync
-/// events that corrupt the server's sandbox index.
+/// would race with the consumer's retry and produce duplicate initial-sync
+/// events.
 pub async fn start_watch(
     client: PodmanClient,
     lifecycle_event_fences: LifecycleEventFences,
@@ -445,15 +443,29 @@ fn condition_from_state(state: &ContainerState) -> DriverCondition {
         },
         "created" => ("False", "ContainerCreated", String::new()),
         "exited" | "stopped" => {
-            let msg = if state.oom_killed {
-                "Container was killed by the OOM killer".to_string()
+            // Exit codes 137 (128+SIGKILL) and 143 (128+SIGTERM) mean the
+            // container was terminated by an external signal rather than
+            // exiting on its own — the signature of a machine/daemon restart
+            // killing running containers. Those are recoverable at gateway
+            // startup; ordinary application exits (0, non-zero, faults) are not.
+            let (reason, msg) = if state.oom_killed {
+                (
+                    "OOMKilled",
+                    "Container was killed by the OOM killer".to_string(),
+                )
+            } else if matches!(state.exit_code, 137 | 143) {
+                (
+                    CONDITION_RUNTIME_RESTART,
+                    format!(
+                        "Container terminated by signal (exit code {})",
+                        state.exit_code
+                    ),
+                )
             } else {
-                format!("Container exited with code {}", state.exit_code)
-            };
-            let reason = if state.oom_killed {
-                "OOMKilled"
-            } else {
-                CONDITION_EXITED
+                (
+                    CONDITION_EXITED,
+                    format!("Container exited with code {}", state.exit_code),
+                )
             };
             ("False", reason, msg)
         }
@@ -598,6 +610,32 @@ mod tests {
         assert_eq!(cond.status, "False");
         assert_eq!(cond.reason, "ContainerExited");
         assert!(cond.message.contains("code 1"));
+    }
+
+    #[test]
+    fn condition_signal_kill_is_runtime_restart() {
+        // 137 (128+SIGKILL) and 143 (128+SIGTERM) are external terminations —
+        // the signature of a machine/daemon restart. They classify as
+        // recoverable `ContainerRuntimeRestart`, distinct from an ordinary
+        // application exit.
+        for exit_code in [137, 143] {
+            let state = ContainerState {
+                status: "exited".to_string(),
+                running: false,
+                exit_code,
+                oom_killed: false,
+                health: None,
+                started_at: None,
+                finished_at: Some("2026-04-14T12:30:00Z".to_string()),
+            };
+            let cond = condition_from_state(&state);
+            assert_eq!(cond.status, "False");
+            assert_eq!(
+                cond.reason, "ContainerRuntimeRestart",
+                "exit code {exit_code} should classify as runtime restart"
+            );
+            assert!(cond.message.contains(&format!("code {exit_code}")));
+        }
     }
 
     #[test]

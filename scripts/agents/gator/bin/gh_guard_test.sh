@@ -111,8 +111,15 @@ run_review_case() {
 
 ## PR Review Status
 
-Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`' \
-        --arg payload 'Gator payload: `4`' \
+The review is ready for author follow-up.
+
+<details>
+<summary>Gator metadata</summary>
+
+- Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`' \
+        --arg payload '- Gator payload: `5`
+
+</details>' \
         --arg inline_body '> **gator-agent**
 
 **Warning:** Keep this validation bound to the accepted value.' \
@@ -142,7 +149,7 @@ same_sha_body='> **gator-agent**
 ## PR Review Status
 
 Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`
-Gator payload: `4`'
+Gator payload: `5`'
 
 run_case "blocks duplicate marked comment" \
     "$same_sha_body" \
@@ -169,7 +176,7 @@ run_case "allows first versioned review disposition" \
 ## PR Review Status
 
 Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`
-Gator payload: `4`' \
+Gator payload: `5`' \
     0
 
 run_case "allows unmarked comment" \
@@ -224,7 +231,7 @@ Gator is blocked from completing the required independent re-review for current 
 ## PR Review Status
 
 Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`
-Gator payload: `4`' \
+Gator payload: `5`' \
     0
 
 draft_blocked_body='> **gator-agent**
@@ -244,7 +251,7 @@ run_case "ignores draft blocker after PR is ready" \
 ## PR Review Status
 
 Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`
-Gator payload: `4`' \
+Gator payload: `5`' \
     0 \
     false
 

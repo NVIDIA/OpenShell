@@ -1,14 +1,14 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Refresh Microsoft Graph Credentials with Providers v2"
+title: "Refresh Microsoft Graph Credentials with a Provider Profile"
 sidebar-title: "Microsoft Graph Provider Refresh"
 slug: "get-started/tutorials/microsoft-graph-provider-refresh"
-description: "Configure a Providers v2 Microsoft Graph profile with gateway-managed OAuth2 refresh-token rotation."
+description: "Configure a Microsoft Graph provider profile with gateway-managed OAuth2 refresh-token rotation."
 keywords: "Generative AI, Cybersecurity, Tutorial, Providers, Microsoft Graph, OAuth2, Credential Refresh, Sandbox"
 ---
 
-Use Providers v2 to keep Microsoft Graph access tokens short lived while sandboxes receive a stable `MS_GRAPH_ACCESS_TOKEN` placeholder. OpenShell stores the non-injectable refresh material at the gateway, refreshes the Microsoft Graph access token before it expires, updates the provider record, and injects the current credential into newly launched sandbox processes.
+Use a provider profile to keep Microsoft Graph access tokens short lived while sandboxes receive a stable `MS_GRAPH_ACCESS_TOKEN` placeholder. OpenShell stores the non-injectable refresh material at the gateway, refreshes the Microsoft Graph access token before it expires, updates the provider record, and injects the current credential into newly launched sandbox processes.
 
 After completing this tutorial, you have:
 
@@ -42,14 +42,6 @@ Do not commit access tokens, refresh tokens, or local `.env` files. The commands
 </Warning>
 
 <Steps toc={true}>
-
-## Enable Providers v2
-
-Enable provider profile policy composition on the active gateway:
-
-```shell
-openshell settings set --global --key providers_v2_enabled --value true --yes
-```
 
 ## Create a Microsoft Graph Provider Profile
 

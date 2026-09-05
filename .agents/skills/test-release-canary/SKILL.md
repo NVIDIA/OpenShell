@@ -1,6 +1,8 @@
 ---
 name: test-release-canary
 description: Manually dispatch and iterate on the Release Canary workflow that smoke-tests published OpenShell artifacts (install.sh on macOS/Ubuntu/Fedora, Helm chart on kind) after each Release Dev publish. Use when changing `.github/workflows/release-canary.yml`, validating a release before tagging, debugging a canary failure, or reproducing a canary job locally. Trigger keywords - release canary, release-canary, canary failed, canary dispatch, test release canary, post-release smoke, install.sh canary, helm chart canary, kind canary, dispatch canary.
+metadata:
+  internal: true
 ---
 
 # Test Release Canary
@@ -14,6 +16,7 @@ The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests the arti
 | `macos` | `macos-latest-xlarge` | `install.sh` resolves the Homebrew formula, brew installs the cask, and `openshell status` reaches the brew-services–backed local gateway with the VM driver. |
 | `ubuntu` | `ubuntu-latest` | `install.sh` installs the Debian package, the post-install systemd user service starts, and `openshell status` reaches the local gateway with the Docker driver. |
 | `fedora` | `fedora:latest` container | `install.sh` installs the RPM packages, the local gateway starts under Podman, and `openshell status` succeeds. |
+| `ubuntu-snap` | `ubuntu-latest` | Downloads the Snap artifact from Release Dev, installs it with `--dangerous`, connects the required interfaces, and waits up to 30 seconds for the recovered local gateway. |
 | `kubernetes` | `ubuntu-latest` + kind | `helm install oci://ghcr.io/nvidia/openshell/helm-chart --version 0.0.0-dev` succeeds in a kind cluster, the gateway pod becomes Ready, port-forward exposes 8080, and the released CLI registers the in-cluster gateway and runs `openshell status` against it. |
 
 All canary jobs disable anonymous OpenShell telemetry. Host package jobs inject
@@ -41,7 +44,7 @@ on:
 ```
 
 - **Automatic.** Every successful `Release Dev` run (on `main` or a manual dispatch of Release Dev) fires the canary. Each job gates on `github.event.workflow_run.conclusion == 'success'` so a failed Release Dev does not run the canary.
-- **Manual.** `workflow_dispatch` lets you run the canary on demand against any branch's workflow definition.
+- **Manual.** `workflow_dispatch` lets you run the canary on demand against any branch's workflow definition. To include `ubuntu-snap`, supply `release-dev-run-id` for a successful Release Dev run whose Snap artifact should be tested; without it, that job is skipped because no artifact is available.
 
 When dispatched manually, `github.event.workflow_run.head_sha` is empty and the workflow falls back to `github.sha` (the branch tip) for the `install.sh` URL.
 
@@ -51,6 +54,13 @@ Run the canary as-is on the current branch:
 
 ```shell
 gh workflow run release-canary.yml --ref "$(git branch --show-current)"
+```
+
+To exercise the Ubuntu Snap job, pass the successful Release Dev run ID:
+
+```shell
+gh workflow run release-canary.yml --ref "$(git branch --show-current)" \
+  -f release-dev-run-id=<release-dev-run-id>
 ```
 
 Watch the run that starts:
@@ -89,6 +99,8 @@ The `kubernetes` job can be reproduced on any machine with Docker and `mise inst
 ```shell
 kind create cluster --name release-canary-local
 
+bash e2e/support/install-agent-sandbox.sh
+
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --version 0.0.0-dev \
   --namespace openshell --create-namespace \
@@ -120,6 +132,7 @@ Loopback registration auto-derives the gateway name to `openshell` if `--name` i
 |---|---|---|
 | `macos`/`ubuntu`/`fedora` job fails on `install.sh` | Latest tagged release missing an asset, checksum mismatch, or `install.sh` regression on this branch. | Job log around the `curl … install.sh \| sh` step. |
 | `macos`/`ubuntu`/`fedora` job fails on `openshell status` | Local gateway service did not start (systemd/brew/podman). Often a driver issue. | Service logs in the job log; `OPENSHELL_DRIVERS` env in the "Ensure …" step. |
+| `ubuntu-snap` fails after interface connection | The gateway did not recover after Docker became available, or did not become reachable within the 30-second bound. | Failure diagnostics dump Snap service/connection/change state, gateway and snapd journals, Snap logs, and port 17670 listeners. |
 | `kubernetes` job fails on `helm install --wait` | Chart did not deploy in 5 min — usually image pull failure or readiness probe failing. | "Diagnostics on failure" step dumps `helm status`, manifest, pod describe, pod logs. |
 | `kubernetes` job fails on `kubectl wait` | Gateway pod stuck `CrashLoopBackOff` or `ImagePullBackOff`. | Diagnostics dump; check `:dev` image existence at `ghcr.io/nvidia/openshell/gateway`. |
 | `kubernetes` job fails on `openshell gateway add` or `status` | Port-forward not reachable, or CLI/gateway proto mismatch. | `port-forward.log` and `openshell gateway list` in the diagnostics dump. |

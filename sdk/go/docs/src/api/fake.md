@@ -61,6 +61,13 @@ client.AddSandbox("default", &types.Sandbox{
     Status: types.SandboxStatus{Phase: types.SandboxReady},
 })
 
+client.AddSandboxTemplate("default", &types.SandboxWorkloadTemplate{
+    Name: "gpu-kata",
+    Spec: types.SandboxWorkloadTemplateSpec{
+        Workload: &types.SandboxWorkloadConfig{Image: "python:3.12"},
+    },
+})
+
 client.AddProvider("default", &types.Provider{
     Name: "my-provider",
     Spec: types.ProviderSpec{Type: "docker"},
@@ -78,11 +85,13 @@ insertion does not affect the stored object.
 
 ## Sub-Client Coverage
 
-The fake client implements every interface in `v1.ClientInterface`:
+The fake client implements every stable accessor in `v1.ClientInterface` plus
+additive concrete-client accessors such as `SandboxTemplates()`:
 
 | Accessor | Interface | Behavior |
 |----------|-----------|----------|
 | `Sandboxes()` | `SandboxInterface` | Full CRUD, Watch, WaitReady |
+| `SandboxTemplates()` | `SandboxTemplateInterface` | Full CRUD |
 | `Providers()` | `ProviderInterface` | Full CRUD, Ensure |
 | `Workspaces()` | `WorkspaceInterface` | Full CRUD, Members |
 | `Health()` | `HealthInterface` | Configurable result |

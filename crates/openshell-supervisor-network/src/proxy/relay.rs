@@ -45,6 +45,7 @@ pub(super) fn http_context(
     activity_tx: Option<ActivitySender>,
     dynamic_credentials: Option<DynamicCredentials>,
     agent_proposals: openshell_core::proposals::AgentProposals,
+    workspace: String,
 ) -> L7EvalContext {
     // Provider-backed credentials must be acquired from the live state for
     // each request after middleware/token-grant awaits. Keep only the legacy
@@ -87,6 +88,7 @@ pub(super) fn http_context(
             .as_ref()
             .map(|_| crate::l7::token_grant_injection::default_resolver()),
         agent_proposals,
+        workspace,
     }
 }
 
@@ -134,7 +136,7 @@ pub(super) fn prepare_http_relay<'a>(
     decision: &EgressDecision,
     request: &'a L7EvalContext,
 ) -> Option<RelayContext<'a>> {
-    if let Err(error) = validate_route_generation(route, decision.l4_policy_generation) {
+    if let Err(error) = validate_route_generation(route, decision.policy_generation) {
         emit_l7_tunnel_close_after_policy_change(
             &decision.intent.destination.host,
             decision.intent.destination.port,
@@ -144,7 +146,7 @@ pub(super) fn prepare_http_relay<'a>(
     }
 
     let policy = if let Some(route) = route.filter(|route| !route.configs.is_empty()) {
-        let evaluator = match pin_l7_evaluator(opa_engine, decision.l4_policy_generation) {
+        let evaluator = match pin_l7_evaluator(opa_engine, decision.policy_generation) {
             Ok(evaluator) => evaluator,
             Err(error) => {
                 emit_l7_tunnel_close_after_policy_change(
@@ -165,18 +167,17 @@ pub(super) fn prepare_http_relay<'a>(
             evaluator: Box::new(evaluator),
         }
     } else {
-        let generation_guard =
-            match pin_policy_generation(opa_engine, decision.l4_policy_generation) {
-                Ok(guard) => guard,
-                Err(error) => {
-                    emit_l7_tunnel_close_after_policy_change(
-                        &decision.intent.destination.host,
-                        decision.intent.destination.port,
-                        error,
-                    );
-                    return None;
-                }
-            };
+        let generation_guard = match pin_policy_generation(opa_engine, decision.policy_generation) {
+            Ok(guard) => guard,
+            Err(error) => {
+                emit_l7_tunnel_close_after_policy_change(
+                    &decision.intent.destination.host,
+                    decision.intent.destination.port,
+                    error,
+                );
+                return None;
+            }
+        };
         PreparedHttpPolicy::Passthrough { generation_guard }
     };
 
@@ -195,7 +196,7 @@ pub(super) fn prepare_raw_relay(
     opa_engine: &OpaEngine,
     decision: &EgressDecision,
 ) -> Option<PolicyGenerationGuard> {
-    if let Err(error) = validate_route_generation(route, decision.l4_policy_generation) {
+    if let Err(error) = validate_route_generation(route, decision.policy_generation) {
         emit_l7_tunnel_close_after_policy_change(
             &decision.intent.destination.host,
             decision.intent.destination.port,
@@ -204,7 +205,7 @@ pub(super) fn prepare_raw_relay(
         return None;
     }
 
-    match pin_policy_generation(opa_engine, decision.l4_policy_generation) {
+    match pin_policy_generation(opa_engine, decision.policy_generation) {
         Ok(guard) => Some(guard),
         Err(error) => {
             emit_l7_tunnel_close_after_policy_change(
@@ -324,13 +325,13 @@ mod tests {
     const POLICY_REGO: &str = include_str!("../../data/sandbox-policy.rego");
     const EMPTY_POLICY_DATA: &str = "network_policies: {}\n";
 
-    fn decision(l4_policy_generation: u64) -> EgressDecision {
+    fn decision(policy_generation: u64) -> EgressDecision {
         EgressDecision {
             intent: EgressIntent::connect("example.com".to_string(), 80),
             action: NetworkAction::Allow {
                 matched_policy: Some("test".to_string()),
             },
-            l4_policy_generation,
+            policy_generation,
             identity: ProcessIdentityEvidence::Available,
             endpoint: EndpointDecision::default(),
             binary: None,
@@ -356,6 +357,7 @@ mod tests {
             dynamic_credentials: None,
             token_grant_resolver: None,
             agent_proposals: openshell_core::proposals::AgentProposals::default(),
+            workspace: String::new(),
         }
     }
 
@@ -373,7 +375,7 @@ mod tests {
 
         assert_eq!(
             generation_guard.captured_generation(),
-            decision.l4_policy_generation
+            decision.policy_generation
         );
     }
 

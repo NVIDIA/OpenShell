@@ -37,14 +37,18 @@ fn test_sandbox() -> DriverSandbox {
             log_level: "debug".to_string(),
             environment: HashMap::from([("SPEC_ENV".to_string(), "spec".to_string())]),
             template: Some(DriverSandboxTemplate {
-                image: "ghcr.io/nvidia/openshell/sandbox:dev".to_string(),
+                image: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string(),
                 agent_socket_path: String::new(),
                 labels: HashMap::new(),
                 environment: HashMap::from([("TEMPLATE_ENV".to_string(), "template".to_string())]),
                 ..Default::default()
             }),
+            policy: None,
             resource_requirements: None,
             sandbox_token: String::new(),
+            command: Vec::new(),
+            tty: false,
+            await_main_process_attachment: false,
         }),
         status: None,
         workspace: String::new(),
@@ -162,6 +166,597 @@ fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDr
         )),
         lifecycle_event_fences: DockerLifecycleEventFences::default(),
     }
+}
+
+type TestDriverClient =
+    openshell_core::proto::compute::v1::compute_driver_client::ComputeDriverClient<
+        tonic::transport::Channel,
+    >;
+
+fn request_with_traceparent<T>(message: T) -> Request<T> {
+    let mut request = Request::new(message);
+    request.metadata_mut().insert(
+        "traceparent",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+            .parse()
+            .unwrap(),
+    );
+    request
+}
+
+async fn standalone_traced_client() -> (
+    TestDriverClient,
+    tokio::sync::oneshot::Sender<()>,
+    JoinHandle<Result<(), tonic::transport::Error>>,
+) {
+    use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = ComputeDriverService::new(test_driver_with_config(runtime_config()));
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .layer(openshell_otel::compute_driver_rpc_layer())
+            .add_service(ComputeDriverServer::new(service))
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+    });
+    let client = TestDriverClient::connect(format!("http://{address}"))
+        .await
+        .unwrap();
+    (client, shutdown, server)
+}
+
+#[tokio::test]
+async fn tracing_standalone_rpc_layer_propagates_context_and_records_errors() {
+    use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
+    let exporter = InMemorySpanExporterBuilder::new().build();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::registry().with(otel_tracing::TRACING.layer(&provider)),
+    );
+    let _dispatch = tracing::dispatcher::set_default(&dispatch);
+    let (mut client, shutdown, server) = standalone_traced_client().await;
+
+    client
+        .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {}))
+        .await
+        .expect("capabilities should succeed");
+    client
+        .validate_sandbox_create(request_with_traceparent(ValidateSandboxCreateRequest {
+            sandbox: None,
+        }))
+        .await
+        .expect_err("missing sandbox should fail");
+    drop(client);
+    shutdown.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("standalone test server should stop")
+        .expect("standalone test server should not panic")
+        .expect("standalone test server should stop cleanly");
+    provider.force_flush().unwrap();
+
+    let spans = exporter.get_finished_spans().unwrap();
+    let capabilities = spans
+        .iter()
+        .find(|span| span.name == "openshell.compute.v1.ComputeDriver/GetCapabilities")
+        .expect("capabilities RPC span");
+    assert_eq!(
+        capabilities.span_context.trace_id().to_string(),
+        "4bf92f3577b34da6a3ce929d0e0e4736"
+    );
+    assert_eq!(capabilities.parent_span_id.to_string(), "00f067aa0ba902b7");
+    assert!(capabilities.attributes.iter().any(|attribute| {
+        attribute.key.as_str() == "rpc.method"
+            && attribute.value.to_string() == "openshell.compute.v1.ComputeDriver/GetCapabilities"
+    }));
+    assert!(
+        capabilities
+            .attributes
+            .iter()
+            .all(|attribute| attribute.key.as_str() != "rpc.service"),
+        "the current RPC semantic conventions integrate the service into rpc.method"
+    );
+    let failed = spans
+        .iter()
+        .find(|span| span.name == "openshell.compute.v1.ComputeDriver/ValidateSandboxCreate")
+        .expect("failed RPC span");
+    assert!(matches!(
+        failed.status,
+        opentelemetry::trace::Status::Error { .. }
+    ));
+    provider.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn tracing_in_process_service_preserves_the_driver_rpc_server_boundary() {
+    use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+    use tracing::{Instrument as _, instrument::WithSubscriber as _};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
+    let gateway_exporter = InMemorySpanExporterBuilder::new().build();
+    let gateway_provider = SdkTracerProvider::builder()
+        .with_simple_exporter(gateway_exporter.clone())
+        .build();
+    let driver_exporter = InMemorySpanExporterBuilder::new().build();
+    let driver_provider = SdkTracerProvider::builder()
+        .with_simple_exporter(driver_exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry()
+        .with(openshell_otel::layer_excluding_target_prefixes(
+            &gateway_provider,
+            "gateway-test",
+            otel_tracing::TRACING.in_process_targets(),
+        ))
+        .with(otel_tracing::TRACING.in_process_layer(&driver_provider));
+    let service = ComputeDriverService::new_in_process(test_driver_with_config(runtime_config()));
+
+    async {
+        let gateway_span = tracing::info_span!(
+            target: "openshell_server::compute",
+            "driver",
+            otel.name = "openshell.compute.v1.ComputeDriver/GetCapabilities",
+            otel.kind = "client"
+        );
+        ComputeDriver::get_capabilities(&service, Request::new(GetCapabilitiesRequest {}))
+            .instrument(gateway_span)
+            .await?;
+
+        let unrelated = tracing::info_span!(
+            target: "openshell_driver_kubernetes::compute",
+            "kubernetes.operation"
+        );
+        drop(unrelated.enter());
+        drop(unrelated);
+        let selected_backend = tracing::info_span!(
+            target: "openshell_driver_docker::compute",
+            "docker.operation"
+        );
+        drop(selected_backend.enter());
+        drop(selected_backend);
+        Ok::<_, Status>(())
+    }
+    .with_subscriber(subscriber)
+    .await
+    .expect("capabilities should succeed");
+    async {
+        let gateway_span = tracing::info_span!(
+            target: "openshell_server::compute",
+            "driver",
+            otel.name = "openshell.compute.v1.ComputeDriver/ValidateSandboxCreate",
+            otel.kind = "client"
+        );
+        ComputeDriver::validate_sandbox_create(
+            &service,
+            Request::new(ValidateSandboxCreateRequest { sandbox: None }),
+        )
+        .instrument(gateway_span)
+        .await
+    }
+    .with_subscriber(
+        tracing_subscriber::registry()
+            .with(openshell_otel::layer_excluding_target_prefixes(
+                &gateway_provider,
+                "gateway-test",
+                otel_tracing::TRACING.in_process_targets(),
+            ))
+            .with(otel_tracing::TRACING.in_process_layer(&driver_provider)),
+    )
+    .await
+    .expect_err("missing sandbox should fail");
+    gateway_provider.force_flush().unwrap();
+    driver_provider.force_flush().unwrap();
+
+    let gateway_spans = gateway_exporter.get_finished_spans().unwrap();
+    let driver_spans = driver_exporter.get_finished_spans().unwrap();
+    let client = gateway_spans
+        .iter()
+        .find(|span| span.name == "openshell.compute.v1.ComputeDriver/GetCapabilities")
+        .unwrap();
+    let server = driver_spans
+        .iter()
+        .find(|span| span.name == "openshell.compute.v1.ComputeDriver/GetCapabilities")
+        .expect("in-process server span");
+    assert_eq!(
+        server.span_context.trace_id(),
+        client.span_context.trace_id()
+    );
+    assert_eq!(server.parent_span_id, client.span_context.span_id());
+    assert_eq!(server.span_kind, opentelemetry::trace::SpanKind::Server);
+    assert!(server.attributes.iter().any(|attribute| {
+        attribute.key.as_str() == "rpc.method"
+            && attribute.value.to_string() == "openshell.compute.v1.ComputeDriver/GetCapabilities"
+    }));
+    assert!(
+        server
+            .attributes
+            .iter()
+            .all(|attribute| attribute.key.as_str() != "rpc.service"),
+        "the current RPC semantic conventions integrate the service into rpc.method"
+    );
+    assert!(server.attributes.iter().any(|attribute| {
+        attribute.key.as_str() == "rpc.response.status_code" && attribute.value.to_string() == "OK"
+    }));
+    assert!(
+        gateway_spans
+            .iter()
+            .any(|span| span.name == "kubernetes.operation"),
+        "unrelated driver targets must remain gateway spans"
+    );
+    assert!(
+        driver_spans
+            .iter()
+            .all(|span| span.name != "kubernetes.operation"),
+        "the Docker provider must not claim unrelated driver spans"
+    );
+    assert!(
+        gateway_spans
+            .iter()
+            .all(|span| span.name != "docker.operation"),
+        "the gateway provider must not claim the selected driver's backend spans"
+    );
+    assert!(
+        driver_spans
+            .iter()
+            .any(|span| span.name == "docker.operation"),
+        "the Docker provider must export backend spans from the selected driver"
+    );
+    let failed = driver_spans
+        .iter()
+        .find(|span| span.name == "openshell.compute.v1.ComputeDriver/ValidateSandboxCreate")
+        .expect("failed in-process server span");
+    assert!(matches!(
+        failed.status,
+        opentelemetry::trace::Status::Error { .. }
+    ));
+    assert!(failed.attributes.iter().any(|attribute| {
+        attribute.key.as_str() == "rpc.response.status_code"
+            && attribute.value.to_string() == "INVALID_ARGUMENT"
+    }));
+    gateway_provider.shutdown().unwrap();
+    driver_provider.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn tracing_lifecycle_rpc_failures_export_docker_operation_spans() {
+    use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
+    let exporter = InMemorySpanExporterBuilder::new().build();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry().with(otel_tracing::TRACING.layer(&provider));
+    let driver = test_driver_with_config(runtime_config());
+
+    async {
+        ComputeDriver::create_sandbox(
+            &driver,
+            Request::new(CreateSandboxRequest { sandbox: None }),
+        )
+        .await
+        .expect_err("missing sandbox should fail");
+        ComputeDriver::start_sandbox(&driver, Request::new(StartSandboxRequest::default()))
+            .await
+            .expect_err("missing start identifier should fail");
+        ComputeDriver::stop_sandbox(&driver, Request::new(StopSandboxRequest::default()))
+            .await
+            .expect_err("missing stop identifier should fail");
+        ComputeDriver::delete_sandbox(&driver, Request::new(DeleteSandboxRequest::default()))
+            .await
+            .expect_err("missing delete identifier should fail");
+    }
+    .with_subscriber(subscriber)
+    .await;
+    provider.force_flush().unwrap();
+
+    let spans = exporter.get_finished_spans().unwrap();
+    for name in [
+        "docker.schedule_sandbox",
+        "docker.start_sandbox",
+        "docker.stop_sandbox",
+        "docker.delete_sandbox",
+    ] {
+        let span = spans
+            .iter()
+            .find(|span| span.name == name)
+            .unwrap_or_else(|| panic!("{name} should be exported"));
+        assert!(
+            matches!(span.status, opentelemetry::trace::Status::Error { .. }),
+            "{name} should record the failed operation"
+        );
+    }
+    provider.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn tracing_direct_start_exports_a_docker_start_span() {
+    use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
+    let exporter = InMemorySpanExporterBuilder::new().build();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry().with(otel_tracing::TRACING.layer(&provider));
+    let driver = test_driver_with_config(runtime_config());
+
+    DockerComputeDriver::start_sandbox(&driver, "", "")
+        .with_subscriber(subscriber)
+        .await
+        .expect_err("missing identifier should fail");
+    provider.force_flush().unwrap();
+
+    let spans = exporter.get_finished_spans().unwrap();
+    let span = spans
+        .iter()
+        .find(|span| span.name == "docker.start_sandbox")
+        .expect("direct startup operation should export docker.start_sandbox");
+    assert!(matches!(
+        span.status,
+        opentelemetry::trace::Status::Error { .. }
+    ));
+    provider.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn tracing_image_preparation_failure_exports_nested_failed_spans() {
+    use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+    use tracing::{Instrument as _, instrument::WithSubscriber as _};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
+    let exporter = InMemorySpanExporterBuilder::new().build();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry().with(otel_tracing::TRACING.layer(&provider));
+    let mut config = runtime_config();
+    config.image_pull_policy = "unsupported".to_string();
+    let driver = test_driver_with_config(config);
+
+    async {
+        driver
+            .provision_sandbox_inner(&test_sandbox())
+            .instrument(tracing::info_span!(
+                "docker.provision",
+                otel.status_code = tracing::field::Empty
+            ))
+            .await
+    }
+    .with_subscriber(subscriber)
+    .await
+    .expect_err("unsupported image pull policy should fail provisioning");
+    provider.force_flush().unwrap();
+
+    let spans = exporter.get_finished_spans().unwrap();
+    let provision = spans
+        .iter()
+        .find(|span| span.name == "docker.provision")
+        .expect("provisioning span should be exported");
+    assert!(matches!(
+        provision.status,
+        opentelemetry::trace::Status::Error { .. }
+    ));
+    let prepare_image = spans
+        .iter()
+        .find(|span| span.name == "docker.prepare_image")
+        .expect("image preparation span should be exported");
+    assert_eq!(
+        prepare_image.parent_span_id,
+        provision.span_context.span_id()
+    );
+    assert!(matches!(
+        prepare_image.status,
+        opentelemetry::trace::Status::Error { .. }
+    ));
+    provider.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn background_provisioning_does_not_extend_the_scheduling_span_lifetime() {
+    use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+    use tracing::Instrument as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
+    let exporter = InMemorySpanExporterBuilder::new().build();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry().with(otel_tracing::TRACING.layer(&provider));
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _dispatch = tracing::dispatcher::set_default(&dispatch);
+
+    let scheduling = tracing::info_span!("docker.schedule_sandbox");
+    let entered = scheduling.enter();
+    let sandbox = test_sandbox();
+    let provisioning = provisioning_span(&scheduling.context(), &sandbox, "test-image");
+    let task = tokio::spawn(futures::future::pending::<()>().instrument(provisioning));
+    drop(entered);
+    drop(scheduling);
+    provider.force_flush().unwrap();
+
+    let spans = exporter.get_finished_spans().unwrap();
+    assert!(
+        spans
+            .iter()
+            .any(|span| span.name == "docker.schedule_sandbox"),
+        "the scheduling span should finish while background provisioning is pending"
+    );
+    assert!(
+        spans.iter().all(|span| span.name != "docker.provision"),
+        "the provisioning span should remain open with the background task"
+    );
+
+    task.abort();
+    task.await
+        .expect_err("the pending task should be cancelled");
+    provider.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn tracing_in_process_stream_span_lives_until_stream_failure() {
+    use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
+    let exporter = InMemorySpanExporterBuilder::new().build();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber =
+        tracing_subscriber::registry().with(otel_tracing::TRACING.in_process_layer(&provider));
+
+    async {
+        let span = tracing::info_span!(
+            target: otel_tracing::TRACING.in_process_target(),
+            "driver_rpc",
+            otel.name = "openshell.compute.v1.ComputeDriver/WatchSandboxes",
+            otel.kind = "server",
+            otel.status_code = tracing::field::Empty,
+            rpc.response.status_code = tracing::field::Empty,
+        );
+        let inner: WatchStream = Box::pin(futures::stream::iter([Err(Status::internal(
+            "watch failed",
+        ))]));
+        let mut stream = TracedWatchStream::new(inner, span);
+
+        provider.force_flush().unwrap();
+        assert!(
+            exporter.get_finished_spans().unwrap().is_empty(),
+            "server span must remain open while the response stream is alive"
+        );
+        stream
+            .next()
+            .await
+            .expect("stream item")
+            .expect_err("stream should fail");
+        drop(stream);
+    }
+    .with_subscriber(subscriber)
+    .await;
+    provider.force_flush().unwrap();
+
+    let spans = exporter.get_finished_spans().unwrap();
+    let span = spans
+        .iter()
+        .find(|span| span.name == "openshell.compute.v1.ComputeDriver/WatchSandboxes")
+        .expect("watch server span should be exported when the stream ends");
+    assert!(matches!(
+        span.status,
+        opentelemetry::trace::Status::Error { .. }
+    ));
+    provider.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn tracing_in_process_stream_records_ok_when_stream_completes() {
+    use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
+    let exporter = InMemorySpanExporterBuilder::new().build();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber =
+        tracing_subscriber::registry().with(otel_tracing::TRACING.in_process_layer(&provider));
+
+    async {
+        let span = tracing::info_span!(
+            target: otel_tracing::TRACING.in_process_target(),
+            "driver_rpc",
+            otel.name = "openshell.compute.v1.ComputeDriver/WatchSandboxes",
+            otel.kind = "server",
+            otel.status_code = tracing::field::Empty,
+            rpc.response.status_code = tracing::field::Empty,
+        );
+        let inner: WatchStream = Box::pin(futures::stream::empty());
+        let mut stream = TracedWatchStream::new(inner, span);
+
+        assert!(stream.next().await.is_none());
+        drop(stream);
+    }
+    .with_subscriber(subscriber)
+    .await;
+    provider.force_flush().unwrap();
+
+    let spans = exporter.get_finished_spans().unwrap();
+    let span = spans
+        .iter()
+        .find(|span| span.name == "openshell.compute.v1.ComputeDriver/WatchSandboxes")
+        .expect("watch server span should be exported when the stream completes");
+    assert!(span.attributes.iter().any(|attribute| {
+        attribute.key.as_str() == "rpc.response.status_code" && attribute.value.to_string() == "OK"
+    }));
+    provider.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn tracing_in_process_stream_leaves_status_unset_when_dropped() {
+    use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
+    let exporter = InMemorySpanExporterBuilder::new().build();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber =
+        tracing_subscriber::registry().with(otel_tracing::TRACING.in_process_layer(&provider));
+
+    async {
+        let span = tracing::info_span!(
+            target: otel_tracing::TRACING.in_process_target(),
+            "driver_rpc",
+            otel.name = "openshell.compute.v1.ComputeDriver/WatchSandboxes",
+            otel.kind = "server",
+            otel.status_code = tracing::field::Empty,
+            rpc.response.status_code = tracing::field::Empty,
+        );
+        let inner: WatchStream = Box::pin(futures::stream::pending());
+        let stream = TracedWatchStream::new(inner, span);
+
+        drop(stream);
+    }
+    .with_subscriber(subscriber)
+    .await;
+    provider.force_flush().unwrap();
+
+    let spans = exporter.get_finished_spans().unwrap();
+    let span = spans
+        .iter()
+        .find(|span| span.name == "openshell.compute.v1.ComputeDriver/WatchSandboxes")
+        .expect("watch server span should be exported when the stream is dropped");
+    assert!(matches!(span.status, opentelemetry::trace::Status::Unset));
+    assert!(
+        span.attributes
+            .iter()
+            .all(|attribute| attribute.key.as_str() != "rpc.response.status_code")
+    );
+    provider.shutdown().unwrap();
 }
 
 #[tokio::test]
@@ -618,7 +1213,40 @@ fn build_environment_sets_docker_tls_paths() {
     assert!(env.contains(&format!("OPENSHELL_TLS_KEY={TLS_KEY_MOUNT_PATH}")));
     assert!(env.contains(&"TEMPLATE_ENV=template".to_string()));
     assert!(env.contains(&"SPEC_ENV=spec".to_string()));
-    assert!(env.contains(&"OPENSHELL_SANDBOX_COMMAND=sleep infinity".to_string()));
+    assert!(env.contains(&format!(
+        "{}={}",
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
+        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY
+    )));
+    let encoded = env
+        .iter()
+        .find_map(|entry| {
+            entry
+                .strip_prefix("OPENSHELL_MAIN_PROCESS_SPEC=")
+                .map(str::to_string)
+        })
+        .expect("main-process transport");
+    let main = openshell_core::sandbox_env::MainProcessConfig::decode(&encoded).unwrap();
+    // An omitted command is forwarded empty; the supervisor resolves the default
+    // login shell against the sandbox image at startup.
+    assert!(main.command.is_empty());
+    assert!(main.tty);
+}
+
+#[test]
+fn build_environment_keeps_network_capabilities_driver_controlled() {
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().environment.insert(
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+        "spoofed".to_string(),
+    );
+    let env = build_environment(&sandbox, &runtime_config());
+    assert!(env.contains(&format!(
+        "{}={}",
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
+        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY
+    )));
+    assert!(!env.iter().any(|entry| entry.ends_with("=spoofed")));
 }
 
 #[test]
@@ -2613,4 +3241,89 @@ fn lifecycle_fence_rejects_polled_exit_from_before_restart() {
 
     fences.remove("sandbox-1");
     assert!(fences.previous_exit("sandbox-1").is_none());
+}
+
+fn exited_sandbox_with_ready_reason(reason: &str) -> DriverSandbox {
+    DriverSandbox {
+        id: "sbx-exit".to_string(),
+        name: "demo".to_string(),
+        namespace: String::new(),
+        spec: None,
+        status: Some(DriverSandboxStatus {
+            sandbox_name: "demo".to_string(),
+            instance_id: "container-1".to_string(),
+            agent_fd: String::new(),
+            sandbox_fd: String::new(),
+            conditions: vec![DriverCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: reason.to_string(),
+                message: "Container exited".to_string(),
+                last_transition_time: String::new(),
+            }],
+            deleting: false,
+        }),
+        workspace: String::new(),
+    }
+}
+
+fn ready_reason(sandbox: &DriverSandbox) -> &str {
+    sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.conditions.iter().find(|c| c.r#type == "Ready"))
+        .map(|c| c.reason.as_str())
+        .expect("Ready condition present")
+}
+
+#[test]
+fn docker_signal_kill_reclassified_as_runtime_restart() {
+    // 137 (128+SIGKILL) and 143 (128+SIGTERM) mark an external termination —
+    // the signature of a machine/daemon restart — and become recoverable
+    // `ContainerRuntimeRestart`.
+    for exit_code in [137, 143] {
+        let mut sandbox = exited_sandbox_with_ready_reason(CONDITION_EXITED);
+        let state = ContainerState {
+            status: Some(ContainerStateStatusEnum::EXITED),
+            oom_killed: Some(false),
+            exit_code: Some(exit_code),
+            ..Default::default()
+        };
+        apply_docker_exit_classification(&mut sandbox, &state);
+        assert_eq!(
+            ready_reason(&sandbox),
+            CONDITION_RUNTIME_RESTART,
+            "exit code {exit_code} should reclassify as runtime restart"
+        );
+    }
+}
+
+#[test]
+fn docker_ordinary_exit_stays_terminal() {
+    // An application exit (non-zero error code) stays `ContainerExited` so its
+    // failure signal survives instead of being relaunched on startup.
+    let mut sandbox = exited_sandbox_with_ready_reason(CONDITION_EXITED);
+    let state = ContainerState {
+        status: Some(ContainerStateStatusEnum::EXITED),
+        oom_killed: Some(false),
+        exit_code: Some(1),
+        ..Default::default()
+    };
+    apply_docker_exit_classification(&mut sandbox, &state);
+    assert_eq!(ready_reason(&sandbox), CONDITION_EXITED);
+}
+
+#[test]
+fn docker_oom_kill_stays_terminal_despite_137() {
+    // An OOM kill reports exit 137 but must NOT be treated as a recoverable
+    // restart — it is a genuine failure and stays terminal.
+    let mut sandbox = exited_sandbox_with_ready_reason(CONDITION_EXITED);
+    let state = ContainerState {
+        status: Some(ContainerStateStatusEnum::EXITED),
+        oom_killed: Some(true),
+        exit_code: Some(137),
+        ..Default::default()
+    };
+    apply_docker_exit_classification(&mut sandbox, &state);
+    assert_eq!(ready_reason(&sandbox), CONDITION_EXITED);
 }

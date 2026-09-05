@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use openshell_core::GatewayProviderProfileSourceConfig;
+use openshell_core::mcp::normalize_provider_profile_mcp_fields;
 use openshell_core::proto::{ProviderProfile, StoredProviderProfile};
 use openshell_gateway_interceptors::{
     GatewayInterceptorProfileSource, GatewayInterceptorRuntime,
@@ -15,7 +16,7 @@ use openshell_gateway_interceptors::{
 };
 use openshell_providers::{
     ProfileValidationDiagnostic, ProviderTypeProfile, builtin_profiles, normalize_profile_id,
-    validate_profile_set,
+    normalize_provider_type, validate_profile_set,
 };
 use prost::Message as _;
 use sha2::{Digest, Sha256};
@@ -136,7 +137,8 @@ impl ProviderProfileSource for UserProviderProfileSource {
             let resource_version = stored_profile_resource_version(&stored);
             hasher.update(resource_version.to_le_bytes());
             if let Some(profile) = stored.profile {
-                let profile = profile_response_payload(profile, resource_version);
+                let mut profile = profile_response_payload(profile, resource_version);
+                normalize_provider_profile_mcp_fields(&mut profile);
                 hasher.update(profile.encode_to_vec());
                 profiles.push(ScopedSnapshotProfile {
                     scope: ProfileScope::Platform,
@@ -156,7 +158,8 @@ impl ProviderProfileSource for UserProviderProfileSource {
                 let resource_version = stored_profile_resource_version(&stored);
                 hasher.update(resource_version.to_le_bytes());
                 if let Some(profile) = stored.profile {
-                    let profile = profile_response_payload(profile, resource_version);
+                    let mut profile = profile_response_payload(profile, resource_version);
+                    normalize_provider_profile_mcp_fields(&mut profile);
                     hasher.update(profile.encode_to_vec());
                     profiles.push(ScopedSnapshotProfile {
                         scope: ProfileScope::Workspace,
@@ -238,6 +241,7 @@ struct ScopedProfileEntry {
 struct EffectiveProfileEntry {
     effective: ScopedProfileEntry,
     platform_fallback: Option<ScopedProfileEntry>,
+    static_fallback: Option<ScopedProfileEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -415,6 +419,9 @@ impl EffectiveProviderProfileCatalog {
             if let Some(fallback) = &entry.platform_fallback {
                 result.push((fallback.scope, fallback.response.clone()));
             }
+            if let Some(fallback) = &entry.static_fallback {
+                result.push((fallback.scope, fallback.response.clone()));
+            }
         }
         result
     }
@@ -427,6 +434,7 @@ impl EffectiveProviderProfileCatalog {
             .map(|entry| entry.effective.response.clone())
     }
 
+    #[cfg(test)]
     pub(crate) fn get_type_profile(&self, id: &str) -> Option<ProviderTypeProfile> {
         let id = normalize_profile_id(id)?;
         self.profiles
@@ -448,6 +456,22 @@ impl EffectiveProviderProfileCatalog {
         id: &str,
         profile_workspace: &str,
     ) -> Option<&ScopedProfileEntry> {
+        if let Some(entry) = self.exact_scoped_type_profile_for_scope(id, profile_workspace) {
+            return Some(entry);
+        }
+
+        let alias = normalize_provider_type(id)?;
+        if normalize_profile_id(id).as_deref() == Some(alias) {
+            return None;
+        }
+        self.exact_scoped_type_profile_for_scope(alias, profile_workspace)
+    }
+
+    fn exact_scoped_type_profile_for_scope(
+        &self,
+        id: &str,
+        profile_workspace: &str,
+    ) -> Option<&ScopedProfileEntry> {
         let id = normalize_profile_id(id)?;
         let entry = self.profiles.get(&id)?;
 
@@ -459,7 +483,7 @@ impl EffectiveProviderProfileCatalog {
             match &entry.platform_fallback {
                 Some(fallback) => Some(fallback),
                 None if entry.effective.scope == ProfileScope::Platform => Some(&entry.effective),
-                None => None,
+                None => entry.static_fallback.as_ref(),
             }
         } else {
             Some(&entry.effective)
@@ -470,8 +494,14 @@ impl EffectiveProviderProfileCatalog {
         let id = normalize_profile_id(id)?;
         self.profiles
             .get(&id)
-            .filter(|entry| !entry.effective.user_managed)
-            .map(|entry| entry.effective.source_id.clone())
+            .and_then(|entry| {
+                if entry.effective.user_managed {
+                    entry.static_fallback.as_ref()
+                } else {
+                    Some(&entry.effective)
+                }
+            })
+            .map(|entry| entry.source_id.clone())
     }
 
     pub(crate) fn hash_type_profile_revision_for_scope(
@@ -537,12 +567,14 @@ fn build_effective_profiles(
                 "duplicate provider profile source id '{source_id}'"
             )));
         }
-        let source_revision = snapshot.revision.trim();
-        if source_revision.is_empty() {
+        let source_revision = snapshot.revision;
+        if source_revision.trim().is_empty() {
             return Err(Status::failed_precondition(format!(
                 "provider profile source '{source_id}' returned an empty revision"
             )));
         }
+        // Revisions are opaque source-owned identities. Whitespace only is
+        // invalid, but a nonblank revision must otherwise remain byte-exact.
         if snapshot.profiles.is_empty() && !snapshot.allow_empty {
             return Err(Status::failed_precondition(format!(
                 "provider profile source '{source_id}' returned no profiles"
@@ -608,13 +640,20 @@ fn build_effective_profiles(
             let mut response = scoped_profile.profile;
             response.source = source_id.to_string();
             response.scope = scope_to_string(scoped_profile.scope).to_string();
+            let profile = ProviderTypeProfile::from_proto(&response);
+
+            // Conversion and source normalization preserve unsupported and
+            // duplicate MCP revisions, so validation above cannot have
+            // malformed evidence repaired into an accepted profile. Normalize
+            // the valid response shape only after that check succeeds.
+            normalize_provider_profile_mcp_fields(&mut response);
 
             let new_entry = ScopedProfileEntry {
                 source_id: source_id.to_string(),
-                source_revision: source_revision.to_string(),
+                source_revision: source_revision.clone(),
                 user_managed: snapshot.user_managed,
                 scope: scoped_profile.scope,
-                profile: ProviderTypeProfile::from_proto(&response),
+                profile,
                 response,
             };
 
@@ -623,6 +662,19 @@ fn build_effective_profiles(
                 let new_scope = new_entry.scope;
 
                 match (existing_scope, new_scope) {
+                    (ProfileScope::Static, _)
+                        if existing.effective.source_id == BUILTIN_SOURCE_ID
+                            && new_entry.user_managed =>
+                    {
+                        let fallback = std::mem::replace(&mut existing.effective, new_entry);
+                        existing.static_fallback = Some(fallback);
+                    }
+                    (_, ProfileScope::Static)
+                        if new_entry.source_id == BUILTIN_SOURCE_ID
+                            && existing.effective.user_managed =>
+                    {
+                        existing.static_fallback = Some(new_entry);
+                    }
                     (ProfileScope::Static, _) | (_, ProfileScope::Static) => {
                         let location = if existing.effective.source_id == source_id {
                             format!("within source '{source_id}'")
@@ -656,6 +708,7 @@ fn build_effective_profiles(
                     EffectiveProfileEntry {
                         effective: new_entry,
                         platform_fallback: None,
+                        static_fallback: None,
                     },
                 );
             }
@@ -699,6 +752,9 @@ fn format_diagnostic(diagnostic: ProfileValidationDiagnostic) -> String {
 
 fn profile_snapshot_revision(profiles: &[ProviderProfile]) -> String {
     let mut profiles = profiles.to_vec();
+    profiles
+        .iter_mut()
+        .for_each(normalize_provider_profile_mcp_fields);
     profiles.sort_by(|left, right| left.id.cmp(&right.id));
     let mut hasher = Sha256::new();
     hasher.update(b"openshell-provider-profile-snapshot-v1");
@@ -708,7 +764,7 @@ fn profile_snapshot_revision(profiles: &[ProviderProfile]) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
-#[expect(dead_code)]
+#[cfg(test)]
 pub fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfile {
     use crate::persistence::current_time_ms;
     let now_ms = current_time_ms();
@@ -907,6 +963,191 @@ mod tests {
         profile.to_proto()
     }
 
+    fn profile_with_mcp_versions(id: &str, versions: &[&str]) -> ProviderProfile {
+        let mut profile = profile(id);
+        profile
+            .endpoints
+            .push(openshell_core::proto::NetworkEndpoint {
+                host: "mcp.example.com".to_string(),
+                port: 443,
+                protocol: "mcp".to_string(),
+                mcp: Some(openshell_core::proto::McpOptions {
+                    versions: versions
+                        .iter()
+                        .map(|version| (*version).to_string())
+                        .collect(),
+                    ..Default::default()
+                }),
+                rules: vec![openshell_core::proto::L7Rule {
+                    allow: Some(openshell_core::proto::L7Allow {
+                        method: "tools/list".to_string(),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            });
+        profile
+    }
+
+    fn profile_without_mcp_options(id: &str) -> ProviderProfile {
+        let mut profile = profile(id);
+        profile
+            .endpoints
+            .push(openshell_core::proto::NetworkEndpoint {
+                host: "mcp.example.com".to_string(),
+                port: 443,
+                protocol: "mcp".to_string(),
+                mcp: None,
+                rules: vec![openshell_core::proto::L7Rule {
+                    allow: Some(openshell_core::proto::L7Allow {
+                        method: "tools/list".to_string(),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            });
+        profile
+    }
+
+    fn mcp_versions(profile: &ProviderProfile) -> &[String] {
+        profile
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.protocol == "mcp")
+            .and_then(|endpoint| endpoint.mcp.as_ref())
+            .map(|mcp| mcp.versions.as_slice())
+            .expect("canonical provider profile MCP options")
+    }
+
+    #[test]
+    fn equivalent_mcp_version_order_produces_identical_source_profile_fingerprints() {
+        let catalog = |versions: &[&str]| {
+            build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+                source_id: "external/test".to_string(),
+                revision: "same-revision".to_string(),
+                profiles: vec![ScopedSnapshotProfile {
+                    scope: ProfileScope::Static,
+                    profile: profile_with_mcp_versions("versioned-profile", versions),
+                }],
+                user_managed: false,
+                allow_empty: false,
+            }])
+            .expect("valid source profile")
+        };
+        let canonical = catalog(&["2025-03-26", "2025-11-25"]);
+        let reordered = catalog(&["2025-11-25", "2025-03-26"]);
+
+        let mut canonical_hash = Sha256::new();
+        canonical.hash_type_profile_revision_for_scope(
+            "versioned-profile",
+            "",
+            &mut canonical_hash,
+        );
+        let mut reordered_hash = Sha256::new();
+        reordered.hash_type_profile_revision_for_scope(
+            "versioned-profile",
+            "",
+            &mut reordered_hash,
+        );
+
+        assert_eq!(canonical_hash.finalize(), reordered_hash.finalize());
+        assert_eq!(
+            canonical.get_profile("versioned-profile"),
+            reordered.get_profile("versioned-profile")
+        );
+    }
+
+    #[test]
+    fn defaulted_mcp_versions_produce_identical_source_profile_fingerprints() {
+        let catalog = |profile| {
+            build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+                source_id: "external/test".to_string(),
+                revision: "same-revision".to_string(),
+                profiles: vec![ScopedSnapshotProfile {
+                    scope: ProfileScope::Static,
+                    profile,
+                }],
+                user_managed: false,
+                allow_empty: false,
+            }])
+            .expect("valid source profile")
+        };
+        let omitted_profile = profile_without_mcp_options("versioned-profile");
+        let empty_profile = profile_with_mcp_versions("versioned-profile", &[]);
+        let explicit_profile = profile_with_mcp_versions("versioned-profile", &["2025-11-25"]);
+        assert_eq!(
+            profile_snapshot_revision(std::slice::from_ref(&omitted_profile)),
+            profile_snapshot_revision(std::slice::from_ref(&explicit_profile))
+        );
+        assert_eq!(
+            profile_snapshot_revision(std::slice::from_ref(&empty_profile)),
+            profile_snapshot_revision(std::slice::from_ref(&explicit_profile))
+        );
+
+        let omitted = catalog(omitted_profile);
+        let empty = catalog(empty_profile);
+        let explicit = catalog(explicit_profile);
+
+        let fingerprint = |catalog: &EffectiveProviderProfileCatalog| {
+            let mut hash = Sha256::new();
+            catalog.hash_type_profile_revision_for_scope("versioned-profile", "", &mut hash);
+            hash.finalize()
+        };
+        assert_eq!(fingerprint(&omitted), fingerprint(&explicit));
+        assert_eq!(fingerprint(&empty), fingerprint(&explicit));
+
+        let explicit_profile = explicit
+            .get_profile("versioned-profile")
+            .expect("explicit provider profile");
+        assert_eq!(mcp_versions(&explicit_profile), &["2025-11-25".to_string()]);
+        assert_eq!(
+            omitted.get_profile("versioned-profile"),
+            Some(explicit_profile.clone())
+        );
+        assert_eq!(
+            empty.get_profile("versioned-profile"),
+            Some(explicit_profile)
+        );
+    }
+
+    #[test]
+    fn mcp_profile_normalization_preserves_malformed_explicit_evidence() {
+        let mut malformed = profile_with_mcp_versions(
+            "malformed-version-profile",
+            &["latest", "2025-11-25", "2025-11-25"],
+        );
+        malformed.description = "unrelated source-owned field".to_string();
+        let original = malformed.clone();
+
+        normalize_provider_profile_mcp_fields(&mut malformed);
+
+        assert_eq!(malformed, original);
+        assert_ne!(
+            profile_snapshot_revision(std::slice::from_ref(&malformed)),
+            profile_snapshot_revision(&[profile_with_mcp_versions(
+                "malformed-version-profile",
+                &["2025-11-25"],
+            )])
+        );
+        let error = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: "external/test".to_string(),
+            revision: "malformed".to_string(),
+            profiles: vec![ScopedSnapshotProfile {
+                scope: ProfileScope::Static,
+                profile: malformed,
+            }],
+            user_managed: false,
+            allow_empty: false,
+        }])
+        .expect_err("malformed explicit revisions must remain invalid");
+        assert!(
+            error
+                .message()
+                .contains("duplicate MCP protocol version '2025-11-25'"),
+            "validation must reject the preserved duplicate before the later unsupported alias: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn captured_catalog_is_immutable_and_each_source_is_fetched_once() {
         let mut revision_a = profile("moving-profile");
@@ -975,6 +1216,49 @@ mod tests {
         .unwrap_err();
 
         assert!(err.message().contains("returned an empty revision"));
+    }
+
+    #[test]
+    fn nonblank_source_revisions_remain_opaque_and_whitespace_sensitive() {
+        let catalog = |revision: &str| {
+            build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+                source_id: "source-a".to_string(),
+                revision: revision.to_string(),
+                profiles: vec![scoped(ProfileScope::Static, "github")],
+                user_managed: false,
+                allow_empty: false,
+            }])
+            .expect("nonblank source revision")
+        };
+        let plain = catalog("opaque");
+        let padded = catalog(" opaque ");
+
+        assert_ne!(plain.revision(), padded.revision());
+        assert_eq!(
+            plain
+                .profiles
+                .get("github")
+                .expect("plain profile")
+                .effective
+                .source_revision,
+            "opaque"
+        );
+        assert_eq!(
+            padded
+                .profiles
+                .get("github")
+                .expect("padded profile")
+                .effective
+                .source_revision,
+            " opaque "
+        );
+
+        let profile_hash = |catalog: &EffectiveProviderProfileCatalog| {
+            let mut hasher = Sha256::new();
+            catalog.hash_type_profile_revision_for_scope("github", "", &mut hasher);
+            hasher.finalize()
+        };
+        assert_ne!(profile_hash(&plain), profile_hash(&padded));
     }
 
     #[test]
@@ -1505,28 +1789,46 @@ mod tests {
     }
 
     #[test]
-    fn same_id_static_vs_user_still_errors() {
-        let err = build_effective_profiles(vec![
+    fn user_managed_profiles_shadow_new_builtins_in_scope() {
+        let catalog = build_effective_profiles(vec![
             CollectedProviderProfileSnapshot {
                 source_id: "builtin".to_string(),
                 revision: "v1".to_string(),
-                profiles: vec![scoped(ProfileScope::Static, "openai")],
+                profiles: vec![
+                    scoped(ProfileScope::Static, "openai"),
+                    scoped(ProfileScope::Static, "anthropic"),
+                ],
                 user_managed: false,
                 allow_empty: false,
             },
             CollectedProviderProfileSnapshot {
                 source_id: "user".to_string(),
                 revision: "v1".to_string(),
-                profiles: vec![scoped(ProfileScope::Platform, "openai")],
+                profiles: vec![
+                    scoped(ProfileScope::Platform, "openai"),
+                    scoped(ProfileScope::Workspace, "anthropic"),
+                ],
                 user_managed: true,
                 allow_empty: true,
             },
         ])
-        .unwrap_err();
+        .unwrap();
 
-        assert!(
-            err.message()
-                .contains("duplicate provider profile id 'openai'")
+        let openai = catalog
+            .get_type_profile_for_scope("openai", "default")
+            .expect("platform override");
+        assert_eq!(openai.source, "user");
+        let anthropic = catalog
+            .get_type_profile_for_scope("anthropic", "default")
+            .expect("workspace override");
+        assert_eq!(anthropic.source, "user");
+        let platform_anthropic = catalog
+            .get_type_profile_for_scope("anthropic", "")
+            .expect("built-in fallback outside workspace scope");
+        assert_eq!(platform_anthropic.source, "builtin");
+        assert_eq!(
+            catalog.static_source_for_profile("openai").as_deref(),
+            Some("builtin")
         );
     }
 
@@ -1791,5 +2093,71 @@ mod tests {
         let result = catalog.get_type_profile_for_scope("anthropic", "default");
         assert!(result.is_some());
         assert_eq!(result.unwrap().display_name, "Workspace Anthropic");
+    }
+
+    #[test]
+    fn exact_alias_shaped_profile_wins_before_builtin_alias_fallback() {
+        let mut builtin = profile("github");
+        builtin.display_name = "Built-in GitHub".to_string();
+        let mut custom = profile("gh");
+        custom.display_name = "Enterprise GitHub".to_string();
+
+        let catalog = build_effective_profiles(vec![
+            CollectedProviderProfileSnapshot {
+                source_id: "builtin".to_string(),
+                revision: "builtin-v1".to_string(),
+                profiles: vec![ScopedSnapshotProfile {
+                    scope: ProfileScope::Static,
+                    profile: builtin,
+                }],
+                user_managed: false,
+                allow_empty: false,
+            },
+            CollectedProviderProfileSnapshot {
+                source_id: "user".to_string(),
+                revision: "user-v1".to_string(),
+                profiles: vec![ScopedSnapshotProfile {
+                    scope: ProfileScope::Workspace,
+                    profile: custom,
+                }],
+                user_managed: true,
+                allow_empty: true,
+            },
+        ])
+        .unwrap();
+
+        let exact = catalog
+            .get_type_profile_for_scope("gh", "default")
+            .expect("exact custom profile");
+        assert_eq!(exact.id, "gh");
+        assert_eq!(exact.display_name, "Enterprise GitHub");
+
+        let builtin = catalog
+            .get_type_profile_for_scope("github", "default")
+            .expect("built-in profile");
+        assert_eq!(builtin.id, "github");
+    }
+
+    #[test]
+    fn custom_profile_can_reuse_default_id_when_builtin_source_is_not_loaded() {
+        let mut custom = profile("github");
+        custom.display_name = "Private GitHub".to_string();
+        let catalog = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: "user".to_string(),
+            revision: "user-v1".to_string(),
+            profiles: vec![ScopedSnapshotProfile {
+                scope: ProfileScope::Workspace,
+                profile: custom,
+            }],
+            user_managed: true,
+            allow_empty: true,
+        }])
+        .unwrap();
+
+        let resolved = catalog
+            .get_type_profile_for_scope("github", "default")
+            .expect("custom profile reusing unloaded default ID");
+        assert_eq!(resolved.id, "github");
+        assert_eq!(resolved.display_name, "Private GitHub");
     }
 }

@@ -158,25 +158,49 @@ checksum = "sha256:675804464634cf068dc206e9fafc1bd4557ffcc0b1638a1ff246d899b776f
 url = "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.22.3/cargo-zigbuild-x86_64-pc-windows-msvc.zip"
 url_api = "https://api.github.com/repos/rust-cross/cargo-zigbuild/releases/assets/405676944"
 
+[[tools."github:rust-secure-code/cargo-auditable"]]
+version = "0.7.5"
+backend = "github:rust-secure-code/cargo-auditable"
+
+[tools."github:rust-secure-code/cargo-auditable"."platforms.linux-arm64"]
+checksum = "sha256:6d364879b516fa914f98504e551faddedf35b71543b4331a6d26e4e217778cfa"
+url = "https://github.com/rust-secure-code/cargo-auditable/releases/download/v0.7.5/cargo-auditable-aarch64-unknown-linux-gnu.tar.xz"
+url_api = "https://api.github.com/repos/rust-secure-code/cargo-auditable/releases/assets/426566627"
+
+[tools."github:rust-secure-code/cargo-auditable"."platforms.linux-x64"]
+checksum = "sha256:322eda09f24e5dba97371c6c2c6949569c411ddf893852e88135cc5b51d5a719"
+url = "https://github.com/rust-secure-code/cargo-auditable/releases/download/v0.7.5/cargo-auditable-x86_64-unknown-linux-gnu.tar.xz"
+url_api = "https://api.github.com/repos/rust-secure-code/cargo-auditable/releases/assets/426566663"
+
+[tools."github:rust-secure-code/cargo-auditable"."platforms.macos-arm64"]
+checksum = "sha256:92720fff2be27492ca7b216510a27e88a835b526e9e94e46bc36b502ba17d8f0"
+url = "https://github.com/rust-secure-code/cargo-auditable/releases/download/v0.7.5/cargo-auditable-aarch64-apple-darwin.tar.xz"
+url_api = "https://api.github.com/repos/rust-secure-code/cargo-auditable/releases/assets/426566625"
+
+[tools."github:rust-secure-code/cargo-auditable"."platforms.windows-x64"]
+checksum = "sha256:83a7d5955c7ac96ede5d896ac9ede5f7ecce9ece0e95d9e47acd766b09e2ef1b"
+url = "https://github.com/rust-secure-code/cargo-auditable/releases/download/v0.7.5/cargo-auditable-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/rust-secure-code/cargo-auditable/releases/assets/426566657"
+
 [[tools.go]]
-version = "1.26.5"
+version = "1.26.7"
 backend = "core:go"
 
 [tools.go."platforms.linux-arm64"]
-checksum = "sha256:fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49"
-url = "https://dl.google.com/go/go1.26.5.linux-arm64.tar.gz"
+checksum = "sha256:5a4ec883379d51ee9ce1040d5e87f8d35e20387574dd8c947feb01eabc3c1b37"
+url = "https://dl.google.com/go/go1.26.7.linux-arm64.tar.gz"
 
 [tools.go."platforms.linux-x64"]
-checksum = "sha256:5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053"
-url = "https://dl.google.com/go/go1.26.5.linux-amd64.tar.gz"
+checksum = "sha256:ffb5f8de10c62550dfddab66b36b57030721e0a44a3218e9e1181d7b59f121ca"
+url = "https://dl.google.com/go/go1.26.7.linux-amd64.tar.gz"
 
 [tools.go."platforms.macos-arm64"]
-checksum = "sha256:efb87ff28af9a188d0536ef5d42e63dd52ba8263cd7344a993cc48dd11dedb6a"
-url = "https://dl.google.com/go/go1.26.5.darwin-arm64.tar.gz"
+checksum = "sha256:020a1e8224811be75163e920bc77e0926a1390a6aeea19bdcf23f74b9d749f6d"
+url = "https://dl.google.com/go/go1.26.7.darwin-arm64.tar.gz"
 
 [tools.go."platforms.windows-x64"]
-checksum = "sha256:97e6b2a833b6d89f9ff17d25419ac0a7e3b482a044e9ab18cdef834bd834fd38"
-url = "https://dl.google.com/go/go1.26.5.windows-amd64.zip"
+checksum = "sha256:f4f534a486e4bc3387fa18f08208f2f854b7aaea8a08f2a2d829a914a05abb11"
+url = "https://dl.google.com/go/go1.26.7.windows-amd64.zip"
 
 [[tools."go:github.com/golangci/golangci-lint/v2/cmd/golangci-lint"]]
 version = "2.12.2"
@@ -413,6 +437,34 @@ checksum = "sha256:4c1d55501869b3330d4aabf45ad6024ce2367e0f3af83344395702d272c22
 url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-x86_64-pc-windows-msvc.zip"
 url_api = "https://api.github.com/repos/astral-sh/uv/releases/assets/377491992"
 provenance = "github-attestations"
+
+[[tools.yq]]
+version = "4.53.6"
+backend = "aqua:mikefarah/yq"
+
+[tools.yq."platforms.linux-arm64"]
+checksum = "sha256:88a1016bc1d657375a35864e4f44b6f333df8ff97b559f51bba0adcb2169df09"
+url = "https://github.com/mikefarah/yq/releases/download/v4.53.6/yq_linux_arm64"
+url_api = "https://api.github.com/repos/mikefarah/yq/releases/assets/522028007"
+provenance = "cosign"
+
+[tools.yq."platforms.linux-x64"]
+checksum = "sha256:c5f056448f973ae7d39b5401949648a78f2dc1947d6a8eb65be60d5c504b9385"
+url = "https://github.com/mikefarah/yq/releases/download/v4.53.6/yq_linux_amd64"
+url_api = "https://api.github.com/repos/mikefarah/yq/releases/assets/522028022"
+provenance = "cosign"
+
+[tools.yq."platforms.macos-arm64"]
+checksum = "sha256:cceb0b8d71ea5294334121f8429f33f92b920e7217d904a2f9f35443968ac424"
+url = "https://github.com/mikefarah/yq/releases/download/v4.53.6/yq_darwin_arm64"
+url_api = "https://api.github.com/repos/mikefarah/yq/releases/assets/522028033"
+provenance = "cosign"
+
+[tools.yq."platforms.windows-x64"]
+checksum = "sha256:ece3dd8bb50d39f93610506273ea262feb91e5c486bbddbb10abf91b2a6c0f14"
+url = "https://github.com/mikefarah/yq/releases/download/v4.53.6/yq_windows_amd64.exe"
+url_api = "https://api.github.com/repos/mikefarah/yq/releases/assets/522027974"
+provenance = "cosign"
 
 [[tools.zig]]
 version = "0.14.1"

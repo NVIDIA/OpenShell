@@ -9,3 +9,7 @@ import openshell
 def test_version() -> None:
     """Test that version is defined."""
     assert openshell.__version__
+
+
+def test_sandbox_template_client_exported() -> None:
+    assert openshell.SandboxTemplateClient

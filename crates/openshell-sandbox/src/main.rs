@@ -111,8 +111,9 @@ impl std::str::FromStr for Mode {
 #[command(about = "Process sandbox and monitor", long_about = None)]
 struct Args {
     /// Command to execute in the sandbox.
-    /// Can also be provided via `OPENSHELL_SANDBOX_COMMAND` environment variable.
-    /// Defaults to `/bin/bash` if neither is provided.
+    /// Defaults to a login shell if neither this nor the driver specification is
+    /// provided: `/bin/bash -l` when available, otherwise a shell detected in the
+    /// sandbox image (e.g. `/bin/sh` on Alpine).
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
 
@@ -230,6 +231,12 @@ struct Args {
     /// (for proxies whose ACLs filter on hostnames).
     #[arg(long)]
     upstream_proxy_connect_by_hostname: bool,
+
+    /// Path to a PEM CA bundle trusted for the corporate proxy: the TLS
+    /// handshake with an `https://` proxy and, for TLS-intercepting proxies,
+    /// re-signed upstream certificates and the sandbox trust bundle.
+    #[arg(long)]
+    upstream_proxy_ca_bundle: Option<String>,
 }
 
 /// Internal one-shot command used by the privileged supervisor to validate an
@@ -472,16 +479,23 @@ fn run_network_init(
 
 #[cfg(target_os = "linux")]
 fn validate_network_init_ids(proxy_user_id: u32, proxy_primary_group_id: u32) -> Result<()> {
-    if proxy_user_id != 0 && proxy_user_id < openshell_policy::MIN_SANDBOX_UID {
+    if proxy_user_id != 0
+        && !(openshell_policy::MIN_SANDBOX_PROXY_UID..=openshell_policy::MAX_SANDBOX_UID)
+            .contains(&proxy_user_id)
+    {
         return Err(miette::miette!(
-            "--proxy-uid must be 0 or at least {}",
-            openshell_policy::MIN_SANDBOX_UID
+            "--proxy-uid must be 0 or in range [{}, {}]",
+            openshell_policy::MIN_SANDBOX_PROXY_UID,
+            openshell_policy::MAX_SANDBOX_UID,
         ));
     }
-    if proxy_primary_group_id < openshell_policy::MIN_SANDBOX_UID {
+    if !(openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID)
+        .contains(&proxy_primary_group_id)
+    {
         return Err(miette::miette!(
-            "--proxy-gid must be at least {}",
-            openshell_policy::MIN_SANDBOX_UID
+            "--proxy-gid must be in range [{}, {}]",
+            openshell_policy::MIN_SANDBOX_UID,
+            openshell_policy::MAX_SANDBOX_UID,
         ));
     }
     Ok(())
@@ -588,6 +602,7 @@ fn main() -> Result<()> {
         // `ocsf_json_enabled` setting changes. The JSONL layer checks it
         // on each event and short-circuits when false.
         let ocsf_enabled = Arc::new(AtomicBool::new(false));
+        let ocsf_schema_version = Arc::new(std::sync::Mutex::new(String::new()));
 
         // Keep guards alive for the entire process. When a guard is dropped the
         // non-blocking writer flushes remaining logs.
@@ -606,7 +621,9 @@ fn main() -> Result<()> {
                 .ok()
                 .map(|roller| {
                     let (writer, guard) = tracing_appender::non_blocking(roller);
-                    let layer = OcsfJsonlLayer::new(writer).with_enabled_flag(ocsf_enabled.clone());
+                    let layer = OcsfJsonlLayer::new(writer)
+                        .with_enabled_flag(ocsf_enabled.clone())
+                        .with_target_version(ocsf_schema_version.clone());
                     (layer, guard)
                 });
             let (jsonl_layer, jsonl_guard) = match jsonl_logging {
@@ -643,15 +660,34 @@ fn main() -> Result<()> {
             (None, None)
         };
 
-        // Get command - either from CLI args, environment variable, or default to /bin/bash
-        let command = if !args.command.is_empty() {
-            args.command
-        } else if let Ok(c) = std::env::var(openshell_core::sandbox_env::SANDBOX_COMMAND) {
-            // Simple shell-like splitting on whitespace
-            c.split_whitespace().map(String::from).collect()
+        // Resolve an exact canonical process. Explicit offline/test argv wins;
+        // drivers otherwise provide a versioned JSON transport so argument
+        // boundaries are never reconstructed with shell parsing.
+        let workdir = args.workdir.clone();
+        let (command, interactive, await_main_process_attachment) = if !args.command.is_empty() {
+            (args.command, args.interactive, false)
+        } else if let Ok(json) = std::env::var(openshell_core::sandbox_env::MAIN_PROCESS_SPEC) {
+            let config = openshell_core::sandbox_env::MainProcessConfig::decode(&json)
+                .map_err(|error| miette::miette!("{error}"))?;
+            (
+                config.command,
+                config.tty,
+                config.await_main_process_attachment,
+            )
         } else {
-            vec!["/bin/bash".to_string()]
+            let config = openshell_core::sandbox_env::MainProcessConfig::scratch();
+            (
+                config.command,
+                config.tty,
+                config.await_main_process_attachment,
+            )
         };
+
+        // An omitted command (the gateway leaves the default empty rather than
+        // baking a shell it cannot verify) is resolved to a login shell here, in
+        // the supervisor, so it matches the sandbox image: bash when present,
+        // otherwise /bin/sh (e.g. Alpine). An explicit command is used verbatim.
+        let command = resolve_default_command(command);
 
         info!(command = ?command, "Starting sandbox");
         // Note: "Starting sandbox" stays as plain info!() since the OCSF context
@@ -664,13 +700,15 @@ fn main() -> Result<()> {
             proxy_auth_file: args.upstream_proxy_auth_file,
             proxy_auth_allow_insecure: args.upstream_proxy_auth_allow_insecure,
             proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname,
+            proxy_ca_bundle: args.upstream_proxy_ca_bundle,
         };
 
         run_sandbox(
             command,
-            args.workdir,
+            workdir,
             args.timeout,
-            args.interactive,
+            interactive,
+            await_main_process_attachment,
             args.sandbox_id,
             args.sandbox,
             args.openshell_endpoint,
@@ -681,6 +719,7 @@ fn main() -> Result<()> {
             args.health_port,
             args.inference_routes,
             ocsf_enabled,
+            ocsf_schema_version,
             args.mode.network,
             args.mode.process,
             upstream_proxy_args,
@@ -689,6 +728,20 @@ fn main() -> Result<()> {
     })?;
 
     std::process::exit(exit_code);
+}
+
+/// Resolve an omitted canonical command to a login shell that exists in this
+/// sandbox image. Empty means "use the default": the gateway leaves an omitted
+/// command empty rather than persisting a shell it cannot verify, so the
+/// supervisor picks one here against the real sandbox filesystem (bash when
+/// present, otherwise `/bin/sh`). An explicit command is returned unchanged.
+fn resolve_default_command(command: Vec<String>) -> Vec<String> {
+    if !command.is_empty() {
+        return command;
+    }
+    let shell = openshell_core::shell::detect_login_shell();
+    info!(shell = %shell, "no command specified; resolved default login shell");
+    vec![shell, "-l".to_string()]
 }
 
 #[cfg(test)]
@@ -806,17 +859,23 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn network_init_accepts_root_proxy_uid_for_binary_aware_sidecar() {
-        validate_network_init_ids(0, openshell_policy::MIN_SANDBOX_UID).unwrap();
+        validate_network_init_ids(0, 30).unwrap();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn network_init_still_rejects_low_non_root_proxy_ids() {
+    fn network_init_still_rejects_low_non_root_proxy_uid_and_root_gid() {
         let uid_err =
             validate_network_init_ids(999, openshell_policy::MIN_SANDBOX_UID).unwrap_err();
         assert!(uid_err.to_string().contains("--proxy-uid"));
 
-        let gid_err = validate_network_init_ids(0, 999).unwrap_err();
+        let gid_err = validate_network_init_ids(0, 0).unwrap_err();
         assert!(gid_err.to_string().contains("--proxy-gid"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_init_accepts_non_root_system_proxy_group() {
+        validate_network_init_ids(openshell_policy::MIN_SANDBOX_PROXY_UID, 30).unwrap();
     }
 }

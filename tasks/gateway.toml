@@ -5,7 +5,7 @@
 
 ["build:gateway"]
 description = "Build the standalone openshell-gateway binary"
-run = "cargo build -p openshell-server --bin openshell-gateway"
+run = "cargo build -p openshell-gateway --bin openshell-gateway"
 hide = true
 
 ["gateway"]
@@ -15,6 +15,10 @@ run = "bash tasks/scripts/gateway.sh"
 ["gateway:docker"]
 description = "Run a standalone gateway with the bundled Docker compute driver"
 run = "bash tasks/scripts/gateway-docker.sh"
+
+["gateway:podman"]
+description = "Run a standalone gateway with the bundled Podman compute driver"
+run = "bash tasks/scripts/gateway-podman.sh"
 
 ["gateway:vm"]
 description = "Run a standalone gateway with the bundled VM compute driver"

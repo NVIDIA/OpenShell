@@ -6,7 +6,6 @@ use futures::Stream;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
-use openshell_driver_vm::otel_tracing::compute_driver_rpc_layer;
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
 use openshell_driver_vm::{VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, procguard, run_vm};
@@ -18,8 +17,6 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::info;
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::prelude::*;
 
 #[derive(Parser, Debug)]
 #[command(name = "openshell-driver-vm")]
@@ -91,6 +88,9 @@ struct Args {
     #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
 
+    #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
+    gateway_name: Option<String>,
+
     #[arg(long, env = "OPENSHELL_GRPC_ENDPOINT")]
     openshell_endpoint: Option<String>,
 
@@ -143,6 +143,30 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_SANDBOX_GID")]
     sandbox_gid: Option<u32>,
 
+    // Corporate forward proxy for sandbox egress. Operator-owned: these reach
+    // the guest supervisor on its argv, which the sandbox image and the
+    // user-supplied environment cannot influence.
+    #[arg(long, env = "OPENSHELL_VM_HTTPS_PROXY")]
+    https_proxy: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_VM_NO_PROXY")]
+    no_proxy: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_VM_PROXY_AUTH_FILE")]
+    proxy_auth_file: Option<String>,
+
+    // Value-taking rather than a presence flag so an explicit `false` in
+    // `[openshell.drivers.vm]` survives the gateway -> driver hop and still
+    // trips the "acknowledgement without a credential" check.
+    #[arg(long, env = "OPENSHELL_VM_PROXY_AUTH_ALLOW_INSECURE")]
+    proxy_auth_allow_insecure: Option<bool>,
+
+    #[arg(long, env = "OPENSHELL_VM_PROXY_CONNECT_BY_HOSTNAME")]
+    proxy_connect_by_hostname: Option<bool>,
+
+    #[arg(long, env = "OPENSHELL_VM_PROXY_CA_BUNDLE")]
+    proxy_ca_bundle: Option<String>,
+
     #[arg(long, hide = true)]
     vm_backend: Option<String>,
 
@@ -186,22 +210,15 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let (tracer_provider, setup_error) =
-        openshell_driver_vm::otel_tracing::provider_for(args.otlp_endpoint.as_deref());
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)))
-        .with(tracing_subscriber::fmt::layer())
-        .with(
-            tracer_provider
-                .as_ref()
-                .map(openshell_driver_vm::otel_tracing::layer),
-        )
-        .init();
-    if let Some(error) = setup_error {
-        tracing::error!(%error, "OTLP exporting could not be started");
-    } else if let Some(endpoint) = &args.otlp_endpoint {
-        info!(endpoint, "OTLP exporting enabled");
-    }
+    let _tracing = openshell_otel::install_driver_tracing(
+        openshell_driver_vm::otel_tracing::TRACING,
+        openshell_otel::DriverTracingConfig {
+            endpoint: args.otlp_endpoint.as_deref(),
+            gateway_name: args.gateway_name.as_deref(),
+            service_version: VERSION,
+            log_level: &args.log_level,
+        },
+    );
 
     let listen_mode = compute_driver_listen_mode(&args).map_err(|err| miette::miette!("{err}"))?;
 
@@ -238,11 +255,17 @@ async fn main() -> Result<()> {
         gpu_vcpus: args.gpu_vcpus,
         sandbox_uid: args.sandbox_uid,
         sandbox_gid: args.sandbox_gid,
+        https_proxy: args.https_proxy.clone(),
+        no_proxy: args.no_proxy.clone(),
+        proxy_auth_file: args.proxy_auth_file.clone(),
+        proxy_auth_allow_insecure: args.proxy_auth_allow_insecure,
+        proxy_connect_by_hostname: args.proxy_connect_by_hostname,
+        proxy_ca_bundle: args.proxy_ca_bundle.clone(),
     })
     .await
     .map_err(|err| miette::miette!("{err}"))?;
 
-    let result = match listen_mode {
+    match listen_mode {
         ComputeDriverListenMode::Unix {
             socket_path,
             expected_peer_pid,
@@ -253,7 +276,7 @@ async fn main() -> Result<()> {
             let listener = UnixListener::bind(&socket_path).into_diagnostic()?;
             restrict_socket_permissions(&socket_path).map_err(|err| miette::miette!("{err}"))?;
             let result = tonic::transport::Server::builder()
-                .layer(compute_driver_rpc_layer())
+                .layer(openshell_otel::compute_driver_rpc_layer())
                 .add_service(ComputeDriverServer::new(driver))
                 .serve_with_incoming_shutdown(
                     AuthenticatedUnixIncoming::new(listener, expected_peer_pid),
@@ -267,19 +290,13 @@ async fn main() -> Result<()> {
         ComputeDriverListenMode::Tcp(bind_address) => {
             info!(address = %bind_address, "Starting unauthenticated dev vm compute driver");
             tonic::transport::Server::builder()
-                .layer(compute_driver_rpc_layer())
+                .layer(openshell_otel::compute_driver_rpc_layer())
                 .add_service(ComputeDriverServer::new(driver))
                 .serve_with_shutdown(bind_address, shutdown_signal())
                 .await
                 .into_diagnostic()
         }
-    };
-    if let Some(provider) = &tracer_provider
-        && let Err(error) = provider.shutdown()
-    {
-        tracing::warn!(%error, "OTLP tracer provider shutdown failed");
     }
-    result
 }
 
 async fn shutdown_signal() {
@@ -616,6 +633,63 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn corporate_proxy_flags_parse_into_driver_settings() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--openshell-endpoint",
+            "https://host.openshell.internal:17670",
+            "--https-proxy",
+            "http://proxy.corp.com:8080",
+            "--no-proxy",
+            "10.0.0.0/8,.svc.cluster.local",
+            "--proxy-auth-file",
+            "/etc/openshell/secrets/proxy-auth",
+            "--proxy-auth-allow-insecure",
+            "true",
+            "--proxy-connect-by-hostname",
+            "false",
+            "--proxy-ca-bundle",
+            "/etc/openshell/tls/proxy-ca.pem",
+        ]);
+
+        assert_eq!(
+            args.https_proxy.as_deref(),
+            Some("http://proxy.corp.com:8080")
+        );
+        assert_eq!(
+            args.no_proxy.as_deref(),
+            Some("10.0.0.0/8,.svc.cluster.local")
+        );
+        assert_eq!(
+            args.proxy_auth_file.as_deref(),
+            Some("/etc/openshell/secrets/proxy-auth")
+        );
+        assert_eq!(args.proxy_auth_allow_insecure, Some(true));
+        // Value-taking rather than a presence flag, so the gateway can
+        // forward an explicit `false` from `[openshell.drivers.vm]`.
+        assert_eq!(args.proxy_connect_by_hostname, Some(false));
+        assert_eq!(
+            args.proxy_ca_bundle.as_deref(),
+            Some("/etc/openshell/tls/proxy-ca.pem")
+        );
+    }
+
+    #[test]
+    fn corporate_proxy_settings_default_to_unset() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--openshell-endpoint",
+            "https://host.openshell.internal:17670",
+        ]);
+        assert!(args.https_proxy.is_none());
+        assert!(args.no_proxy.is_none());
+        assert!(args.proxy_auth_file.is_none());
+        assert!(args.proxy_auth_allow_insecure.is_none());
+        assert!(args.proxy_connect_by_hostname.is_none());
+        assert!(args.proxy_ca_bundle.is_none());
+    }
+
+    #[test]
     fn peer_authorization_accepts_matching_uid_and_pid() {
         authorize_peer_credentials(
             PeerCredentials {
@@ -691,11 +765,13 @@ mod tests {
     }
 
     #[test]
-    fn accepts_gateway_otlp_endpoint() {
+    fn accepts_gateway_otlp_configuration() {
         let args = Args::try_parse_from([
             "openshell-driver-vm",
             "--otlp-endpoint",
             "http://127.0.0.1:4317",
+            "--gateway-name",
+            "production-us-west",
         ]);
         assert!(
             args.is_ok(),

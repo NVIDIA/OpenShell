@@ -161,9 +161,8 @@ async fn operator_sandbox_in_labeled_namespace() {
 
     // Poll until the gateway's namespace watcher discovers the labeled namespace
     // and sandbox creation succeeds (up to 30s).
-    let mut sandbox_out = String::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
+    let sandbox_out = loop {
         let (ok, out) = run_cli(&[
             "sandbox",
             "create",
@@ -177,14 +176,13 @@ async fn operator_sandbox_in_labeled_namespace() {
         ])
         .await;
         if ok {
-            sandbox_out = out;
-            break;
+            break out;
         }
         if tokio::time::Instant::now() >= deadline {
             panic!("sandbox create did not succeed within 30s: {out}");
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
-    }
+    };
     assert!(
         sandbox_out.contains("operator-ok"),
         "sandbox output missing expected string: {sandbox_out}"

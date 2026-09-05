@@ -1,6 +1,8 @@
 ---
 name: create-github-issue
 description: Create GitHub issues using the gh CLI. Use when the user wants to create a new issue, report a bug, request a feature, or create a task in GitHub. Trigger keywords - create issue, new issue, file bug, report bug, feature request, github issue.
+metadata:
+  internal: true
 ---
 
 # Create GitHub Issue
@@ -123,7 +125,7 @@ EOF
 
 GitHub built-in issue types (`Bug`, `Feature`, `Task`) should come from the matching issue template when possible, or be set manually afterward. Do not try to emulate them through labels.
 
-Creating an issue does not accept it or queue agent work. Agents never apply `state:accepted`, the `roadmap` label, add issues to the roadmap project, or apply `agent:plan-requested` or `agent:implementation-requested`. Community issues proceed through `triage-issue`; a human accepts technically validated work with `state:accepted` or roadmap placement. The request labels queue work for unattended agents; a user may instead direct an agent to a specific issue.
+Creating an issue does not accept it or queue agent work. Agents never apply `state:accepted`, the `roadmap` label, add issues to the roadmap project, or apply `agent:plan-requested` or `agent:implementation-requested`. Community issues proceed through `triage-issue`; a human accepts technically validated work with `state:accepted` or roadmap placement. The request labels queue work for unattended agents. A user may instead direct an agent to a specific issue; the agent warns about missing expected workflow labels and continues with the requested phase without changing them.
 
 ## Useful Options
 

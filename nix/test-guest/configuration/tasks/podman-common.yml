@@ -1,0 +1,13 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Refresh Ubuntu package metadata
+  ansible.builtin.apt:
+    update_cache: true
+  when: ansible_facts.distribution == "Ubuntu"
+
+- name: Install Podman
+  ansible.builtin.package:
+    name: podman
+    state: present

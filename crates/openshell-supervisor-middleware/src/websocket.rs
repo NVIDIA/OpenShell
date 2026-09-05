@@ -12,11 +12,12 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use openshell_core::proto::{
-    Decision, HttpRequestTarget, RequestContext, SupervisorMiddlewarePhase, WebSocketMessage,
+    Decision, HttpRequestTarget, MiddlewareSessionEnd, MiddlewareSessionEndReason,
+    MiddlewareSessionProtocolError, RequestContext, SupervisorMiddlewarePhase, WebSocketMessage,
     WebSocketMessageResult, WebSocketPreflight, WebSocketPreflightAction,
-    WebSocketPreflightDecision, WebSocketSessionEnd, WebSocketSessionEndReason,
-    WebSocketSessionEvent, WebSocketSessionStart, web_socket_message, web_socket_message_result,
-    web_socket_session_event, web_socket_session_event_result,
+    WebSocketPreflightDecision, WebSocketProtocolError, WebSocketSessionEvent,
+    WebSocketSessionStart, middleware_session_protocol_error, web_socket_message,
+    web_socket_message_result, web_socket_session_event, web_socket_session_event_result,
 };
 
 use super::{
@@ -30,6 +31,7 @@ use super::{
 };
 
 const STREAM_CHANNEL_CAPACITY: usize = 4;
+const SESSION_END_TIMEOUT: Duration = Duration::from_millis(10);
 const MAX_REQUESTED_SUBPROTOCOLS: usize = 32;
 const MAX_SUBPROTOCOL_BYTES: usize = 4 * 1024;
 const MAX_SELECTED_SUBPROTOCOL_BYTES: usize = 256;
@@ -38,6 +40,8 @@ pub struct WebSocketPreflightInput {
     pub session_id: String,
     pub request_id: String,
     pub sandbox_id: String,
+    pub sandbox_name: String,
+    pub workspace: String,
     pub scheme: String,
     pub host: String,
     pub port: u16,
@@ -104,7 +108,7 @@ pub struct WebSocketPreflightResult {
     pub allowed: bool,
     /// Typed terminal reason when preflight denied the upgrade. `None` means
     /// the request may continue, including voluntary skip and fail-open.
-    pub terminal_reason: Option<WebSocketSessionEndReason>,
+    pub terminal_reason: Option<MiddlewareSessionEndReason>,
     pub reason: String,
     pub denial: Option<MiddlewareDenial>,
     pub session: Option<WebSocketSession>,
@@ -120,7 +124,7 @@ pub struct WebSocketPreflightResult {
 pub struct WebSocketSessionStartOutcome {
     pub allowed: bool,
     /// Typed terminal reason when session start cannot continue.
-    pub terminal_reason: Option<WebSocketSessionEndReason>,
+    pub terminal_reason: Option<MiddlewareSessionEndReason>,
     pub reason: String,
     pub invocations: Vec<WebSocketInvocation>,
 }
@@ -143,6 +147,42 @@ struct WebSocketStageTransport {
     responses: super::WebSocketResponseStream,
 }
 
+impl WebSocketStageTransport {
+    async fn end(self, reason: MiddlewareSessionEndReason) {
+        let _ = tokio::time::timeout(SESSION_END_TIMEOUT, self.end_inner(reason)).await;
+    }
+
+    async fn end_inner(self, reason: MiddlewareSessionEndReason) {
+        if self.sender.send(session_end_request(reason)).await.is_err() {
+            return;
+        }
+        self.drain().await;
+    }
+
+    async fn drain(self) {
+        let Self {
+            sender,
+            mut responses,
+        } = self;
+        // Keep the response handle alive while half-closing the request stream.
+        // Dropping both handles together schedules an HTTP/2 CANCEL, which may
+        // discard the buffered session_end before the middleware receives it.
+        drop(sender);
+        while responses.next().await.is_some() {}
+    }
+
+    fn end_now(self, reason: MiddlewareSessionEndReason) {
+        if self.sender.try_send(session_end_request(reason)).is_err() {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            drop(runtime.spawn(async move {
+                let _ = tokio::time::timeout(SESSION_END_TIMEOUT, self.drain()).await;
+            }));
+        }
+    }
+}
+
 struct WebSocketStage {
     entry: DescribedChainEntry,
     transport: Option<WebSocketStageTransport>,
@@ -154,16 +194,13 @@ impl WebSocketStage {
     }
 
     async fn disable(&mut self) {
-        self.end(WebSocketSessionEndReason::MiddlewareFailure).await;
+        self.end(MiddlewareSessionEndReason::MiddlewareFailure)
+            .await;
     }
 
-    async fn end(&mut self, reason: WebSocketSessionEndReason) {
+    async fn end(&mut self, reason: MiddlewareSessionEndReason) {
         if let Some(transport) = self.transport.take() {
-            let _ = tokio::time::timeout(
-                Duration::from_millis(10),
-                transport.sender.send(session_end_request(reason)),
-            )
-            .await;
+            transport.end(reason).await;
         }
     }
 }
@@ -293,10 +330,10 @@ impl ChainRunner {
         }
 
         if let Some(denial) = denial {
-            end_stages(&mut stages, WebSocketSessionEndReason::MiddlewareDenial).await;
+            end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareDenial).await;
             return Ok(WebSocketPreflightResult {
                 allowed: false,
-                terminal_reason: Some(WebSocketSessionEndReason::MiddlewareDenial),
+                terminal_reason: Some(MiddlewareSessionEndReason::MiddlewareDenial),
                 reason: middleware_denial_reason(
                     &denial.config_name,
                     denial.reason_code.as_deref(),
@@ -313,10 +350,10 @@ impl ChainRunner {
         }
 
         if let Some(reason) = fail_closed_reason {
-            end_stages(&mut stages, WebSocketSessionEndReason::MiddlewareFailure).await;
+            end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure).await;
             return Ok(WebSocketPreflightResult {
                 allowed: false,
-                terminal_reason: Some(WebSocketSessionEndReason::MiddlewareFailure),
+                terminal_reason: Some(MiddlewareSessionEndReason::MiddlewareFailure),
                 reason,
                 denial: None,
                 session: None,
@@ -399,7 +436,7 @@ fn session_capacity_exhausted(
         .collect();
     WebSocketPreflightResult {
         allowed: !fail_closed,
-        terminal_reason: fail_closed.then_some(WebSocketSessionEndReason::MiddlewareFailure),
+        terminal_reason: fail_closed.then_some(MiddlewareSessionEndReason::MiddlewareFailure),
         reason: if fail_closed {
             format!("middleware_failed: {reason}")
         } else {
@@ -442,7 +479,7 @@ impl WebSocketSession {
         if selected_subprotocol.len() > MAX_SELECTED_SUBPROTOCOL_BYTES {
             return WebSocketSessionStartOutcome {
                 allowed: false,
-                terminal_reason: Some(WebSocketSessionEndReason::MiddlewareFailure),
+                terminal_reason: Some(MiddlewareSessionEndReason::MiddlewareFailure),
                 reason: "middleware_failed: selected_subprotocol_over_capacity".to_string(),
                 invocations: Vec::new(),
             };
@@ -478,7 +515,7 @@ impl WebSocketSession {
             allowed: fail_closed.is_none(),
             terminal_reason: fail_closed
                 .as_ref()
-                .map(|_| WebSocketSessionEndReason::MiddlewareFailure),
+                .map(|_| MiddlewareSessionEndReason::MiddlewareFailure),
             reason: fail_closed.unwrap_or_default(),
             invocations,
         }
@@ -802,7 +839,7 @@ impl WebSocketSession {
         }
     }
 
-    pub async fn end(mut self, reason: WebSocketSessionEndReason) {
+    pub async fn end(mut self, reason: MiddlewareSessionEndReason) {
         end_stages(&mut self.stages, reason).await;
         self.reconcile_lifecycle();
     }
@@ -810,7 +847,7 @@ impl WebSocketSession {
 
 impl Drop for WebSocketSession {
     fn drop(&mut self) {
-        end_stages_now(&mut self.stages, WebSocketSessionEndReason::Cancellation);
+        end_stages_now(&mut self.stages, MiddlewareSessionEndReason::Cancellation);
         self.reconcile_lifecycle();
     }
 }
@@ -920,6 +957,8 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
         context: Some(RequestContext {
             request_id: input.request_id,
             sandbox_id: input.sandbox_id,
+            sandbox_name: input.sandbox_name,
+            workspace: input.workspace,
             originating_process: None,
         }),
         target: Some(HttpRequestTarget {
@@ -961,25 +1000,25 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
         Err(_) => return OpenStage::Failed(entry, "middleware_timeout".into()),
     };
     let Some(response) = response else {
-        let _ = sender.try_send(session_end_request(
-            WebSocketSessionEndReason::MiddlewareFailure,
-        ));
+        WebSocketStageTransport { sender, responses }
+            .end(MiddlewareSessionEndReason::MiddlewareFailure)
+            .await;
         return OpenStage::Failed(entry, "missing_preflight_decision".into());
     };
     let Some(web_socket_session_event_result::Result::PreflightDecision(decision)) =
         response.result
     else {
-        let _ = sender.try_send(session_end_request(
-            WebSocketSessionEndReason::MiddlewareFailure,
-        ));
+        WebSocketStageTransport { sender, responses }
+            .end(MiddlewareSessionEndReason::MiddlewareFailure)
+            .await;
         return OpenStage::Failed(entry, "invalid_preflight_decision".into());
     };
     let decision = match validate_preflight_decision(decision) {
         Ok(decision) => decision,
         Err(reason) => {
-            let _ = sender.try_send(session_end_request(
-                WebSocketSessionEndReason::MiddlewareFailure,
-            ));
+            WebSocketStageTransport { sender, responses }
+                .end(MiddlewareSessionEndReason::MiddlewareFailure)
+                .await;
             return OpenStage::Failed(entry, reason.into());
         }
     };
@@ -1011,7 +1050,9 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
         WebSocketPreflightAction::Skip => {
             let outcome =
                 preflight_stage_outcome(&entry, WebSocketInvocationOutcome::Skip, decision);
-            let _ = sender.try_send(session_end_request(WebSocketSessionEndReason::StageSkipped));
+            WebSocketStageTransport { sender, responses }
+                .end(MiddlewareSessionEndReason::StageSkipped)
+                .await;
             OpenStage::Skip(outcome)
         }
         WebSocketPreflightAction::Unspecified => {
@@ -1295,25 +1336,33 @@ fn failure_invocation(
     }
 }
 
-async fn end_stages(stages: &mut [WebSocketStage], reason: WebSocketSessionEndReason) {
+async fn end_stages(stages: &mut [WebSocketStage], reason: MiddlewareSessionEndReason) {
     for stage in stages {
         stage.end(reason).await;
     }
 }
 
-fn end_stages_now(stages: &mut [WebSocketStage], reason: WebSocketSessionEndReason) {
+fn end_stages_now(stages: &mut [WebSocketStage], reason: MiddlewareSessionEndReason) {
     for stage in stages {
         if let Some(transport) = stage.transport.take() {
-            let _ = transport.sender.try_send(session_end_request(reason));
+            transport.end_now(reason);
         }
     }
 }
 
-fn session_end_request(reason: WebSocketSessionEndReason) -> WebSocketSessionEvent {
+fn session_end_request(reason: MiddlewareSessionEndReason) -> WebSocketSessionEvent {
+    let protocol_error = (reason == MiddlewareSessionEndReason::ProtocolError).then_some({
+        MiddlewareSessionProtocolError {
+            domain: Some(middleware_session_protocol_error::Domain::WebSocket(
+                WebSocketProtocolError {},
+            )),
+        }
+    });
     WebSocketSessionEvent {
         event: Some(web_socket_session_event::Event::SessionEnd(
-            WebSocketSessionEnd {
+            MiddlewareSessionEnd {
                 reason: reason as i32,
+                protocol_error,
             },
         )),
     }
@@ -1322,6 +1371,30 @@ fn session_end_request(reason: WebSocketSessionEndReason) -> WebSocketSessionEve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_end_refines_only_protocol_errors() {
+        let protocol_event = session_end_request(MiddlewareSessionEndReason::ProtocolError);
+        let Some(web_socket_session_event::Event::SessionEnd(protocol_end)) = protocol_event.event
+        else {
+            panic!("expected session end");
+        };
+        assert_eq!(
+            MiddlewareSessionEndReason::try_from(protocol_end.reason),
+            Ok(MiddlewareSessionEndReason::ProtocolError)
+        );
+        assert!(matches!(
+            protocol_end.protocol_error.and_then(|detail| detail.domain),
+            Some(middleware_session_protocol_error::Domain::WebSocket(_))
+        ));
+
+        let normal_event = session_end_request(MiddlewareSessionEndReason::Normal);
+        let Some(web_socket_session_event::Event::SessionEnd(normal_end)) = normal_event.event
+        else {
+            panic!("expected session end");
+        };
+        assert!(normal_end.protocol_error.is_none());
+    }
 
     #[test]
     fn protobuf_rejects_invalid_utf8_text_payload() {
@@ -1397,8 +1470,8 @@ mod tests {
             panic!("disabled stage must receive session end");
         };
         assert_eq!(
-            WebSocketSessionEndReason::try_from(end.reason),
-            Ok(WebSocketSessionEndReason::MiddlewareFailure)
+            MiddlewareSessionEndReason::try_from(end.reason),
+            Ok(MiddlewareSessionEndReason::MiddlewareFailure)
         );
         assert!(
             requests.try_recv().is_err(),

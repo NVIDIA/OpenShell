@@ -5,6 +5,16 @@
 //!
 //! This crate provides process sandboxing and monitoring capabilities.
 
+// `defaults-without-telemetry` is an alias for the default feature set minus
+// `telemetry`, not a switch that turns telemetry off. Cargo cannot subtract a
+// default feature, so adding it on top of the defaults would otherwise produce
+// a telemetry-on build that reads as telemetry-free. Fail the build instead.
+#[cfg(all(feature = "telemetry", feature = "defaults-without-telemetry"))]
+compile_error!(
+    "features `telemetry` and `defaults-without-telemetry` are mutually exclusive; \
+     build a telemetry-free supervisor with `--no-default-features --features defaults-without-telemetry`"
+);
+
 mod activity_aggregator;
 mod denial_aggregator;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -16,6 +26,7 @@ mod sidecar_control;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
@@ -62,6 +73,7 @@ use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPol
 use openshell_core::proposals::AgentProposals;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_supervisor_network::opa::OpaEngine;
+use openshell_supervisor_network::proxy::ProxyHandle;
 use openshell_supervisor_process::process::ProcessEnforcementMode;
 pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
 use openshell_supervisor_process::skills;
@@ -73,6 +85,15 @@ const SIDECAR_NETWORK_ENFORCEMENT_MODE: &str = "sidecar-nftables";
 const SIDECAR_TLS_DIR: &str = openshell_core::container_paths::SIDECAR_TLS_DIR;
 const SIDECAR_CA_CERT: &str = "openshell-ca.pem";
 const SIDECAR_CA_BUNDLE: &str = "ca-bundle.pem";
+
+#[cfg(any(test, target_os = "linux"))]
+fn has_network_runtime_capability(capabilities: Option<&str>, required: &str) -> bool {
+    capabilities.is_some_and(|capabilities| {
+        capabilities
+            .split(',')
+            .any(|capability| capability.trim() == required)
+    })
+}
 const SIDECAR_PROCESS_PROXY_ADDR: &str = "127.0.0.1:3128";
 const SIDECAR_READY_TIMEOUT_SECS: u64 = 120;
 
@@ -83,6 +104,7 @@ const SIDECAR_READY_TIMEOUT_SECS: u64 = 120;
 /// Returns an error if the command fails to start or encounters a fatal error.
 #[allow(
     clippy::too_many_arguments,
+    clippy::implicit_hasher,
     clippy::similar_names,
     clippy::fn_params_excessive_bools
 )]
@@ -91,6 +113,7 @@ pub async fn run_sandbox(
     workdir: Option<String>,
     timeout_secs: u64,
     interactive: bool,
+    await_main_process_attachment: bool,
     sandbox_id: Option<String>,
     sandbox: Option<String>,
     openshell_endpoint: Option<String>,
@@ -101,6 +124,7 @@ pub async fn run_sandbox(
     _health_port: u16,
     inference_routes: Option<String>,
     ocsf_enabled: Arc<AtomicBool>,
+    ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     network_enabled: bool,
     process_enabled: bool,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
@@ -340,6 +364,10 @@ pub async fn run_sandbox(
         report_credential_gating_unavailable();
     }
 
+    // Canonical-process overrides are deliberately applied only to the main
+    // child. Keep the provider snapshot pristine because Kubernetes forwards
+    // it to the process sidecar for later exec/editor/SFTP children.
+
     // Shared agent-proposals feature flag. Seed from the same initial settings
     // snapshot that produced the policy so networking and process setup agree
     // before the poll loop starts reconciling later changes.
@@ -348,6 +376,10 @@ pub async fn run_sandbox(
     let process_control_writer = process_control_connection
         .as_ref()
         .map(|connection| connection.writer.clone());
+    let process_exit_ack = Arc::new(tokio::sync::Mutex::new(None));
+    let initial_provider_env_generation = sidecar_bootstrap
+        .as_ref()
+        .map_or(0, |bootstrap| bootstrap.provider_env_generation);
     let mut process_control_closed = None;
     if let Some(connection) = process_control_connection {
         process_control_closed = Some(connection.closed);
@@ -355,6 +387,8 @@ pub async fn run_sandbox(
             connection.updates,
             provider_credentials.clone(),
             agent_proposals.clone(),
+            Arc::clone(&process_exit_ack),
+            initial_provider_env_generation,
         );
     }
 
@@ -374,6 +408,87 @@ pub async fn run_sandbox(
         None
     };
 
+    #[cfg(target_os = "linux")]
+    let transparent_tcp_requested = opa_engine
+        .as_ref()
+        .map(|engine| engine.policy_dns_eligibility_snapshot())
+        .transpose()?
+        .is_some_and(|snapshot| !snapshot.endpoints.is_empty());
+    #[cfg(target_os = "linux")]
+    let runtime_capabilities =
+        std::env::var(openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES).ok();
+    #[cfg(target_os = "linux")]
+    let transparent_tcp_capable = has_network_runtime_capability(
+        runtime_capabilities.as_deref(),
+        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let transparent_tcp_capable = false;
+    #[cfg(target_os = "linux")]
+    let transparent_runtime = if transparent_tcp_requested {
+        if !transparent_tcp_capable {
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .state(StateId::Disabled, "unsupported_runtime")
+                    .message(
+                        "Policy DNS and transparent TCP unavailable: runtime capability is missing"
+                    )
+                    .build()
+            );
+            return Err(miette::miette!(
+                "policy contains protocol: tcp endpoints, but the selected runtime does not advertise policy DNS and transparent TCP support"
+            ));
+        }
+        if sidecar_network_enforcement {
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .state(StateId::Disabled, "unsupported_topology")
+                    .message("Policy DNS and transparent TCP unavailable: sidecar topology is unsupported")
+                    .build()
+            );
+            return Err(miette::miette!(
+                "policy DNS and transparent TCP are not yet supported by the sidecar topology"
+            ));
+        }
+        let namespace = netns.as_ref().ok_or_else(|| {
+            miette::miette!("policy DNS and transparent TCP require a workload network namespace")
+        })?;
+        let listeners = namespace
+            .bind_transparent_tcp_listeners()
+            .await
+            .into_diagnostic()
+            .wrap_err("failed to bind transparent TCP listeners")?;
+        let (dns_udp, dns_tcp) = namespace
+            .bind_policy_dns_sockets()
+            .await
+            .into_diagnostic()
+            .wrap_err("failed to bind policy DNS listeners")?;
+        let proxy_port = policy
+            .network
+            .proxy
+            .as_ref()
+            .and_then(|proxy| proxy.http_addr)
+            .map_or(3128, |address| address.port());
+        let runtime = openshell_supervisor_network::run::TransparentRuntimeSetup::new(
+            listeners,
+            dns_udp,
+            dns_tcp,
+            sandbox_id.as_deref(),
+        )?;
+        let (ipv4_cidr, ipv6_cidr) = runtime.synthetic_cidrs();
+        namespace.install_transparent_tcp_rules(proxy_port, &ipv4_cidr, &ipv6_cidr)?;
+        Some(runtime)
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    let transparent_tcp_substrate_ready = transparent_runtime.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let transparent_tcp_substrate_ready = false;
     // The denial channel is owned by the orchestrator: the proxy (in the
     // networking leaf) and the bypass monitor (in the process leaf) both
     // produce DenialEvents that the denial aggregator (orchestrator-side)
@@ -413,7 +528,7 @@ pub async fn run_sandbox(
     // API read the current value so proposals target the correct workspace.
     let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
 
-    let networking = if network_enabled {
+    let mut networking = if network_enabled {
         #[cfg(target_os = "linux")]
         let proxy_bind_ip = netns
             .as_ref()
@@ -439,6 +554,8 @@ pub async fn run_sandbox(
                 agent_proposals.clone(),
                 workspace_rx.clone(),
                 &upstream_proxy_args,
+                #[cfg(target_os = "linux")]
+                transparent_runtime,
             )
             .await?,
         )
@@ -470,6 +587,7 @@ pub async fn run_sandbox(
             sidecar_control::BootstrapData {
                 policy_proto: proto.clone(),
                 provider_env_revision: provider_credentials.snapshot().revision,
+                provider_env_generation: 0,
                 provider_child_env: provider_env.clone(),
                 agent_proposals_enabled: agent_proposals.enabled(),
                 proxy_ca_cert_path: ca_paths.as_ref().map(|paths| paths.0.clone()),
@@ -505,12 +623,15 @@ pub async fn run_sandbox(
         sidecar_control_task = Some(connection_task);
         spawn_sidecar_entrypoint_handler(
             entrypoint_rx,
-            entrypoint_pid.clone(),
-            opa_engine.clone(),
-            retained_proto.clone(),
-            openshell_endpoint.clone(),
-            sandbox_id.clone(),
-            std::path::PathBuf::from(trusted_ssh_socket_path),
+            SidecarEntrypointHandler {
+                entrypoint_pid: entrypoint_pid.clone(),
+                opa_engine: opa_engine.clone(),
+                retained_proto: retained_proto.clone(),
+                openshell_endpoint: openshell_endpoint.clone(),
+                sandbox_id: sandbox_id.clone(),
+                trusted_ssh_socket_path: std::path::PathBuf::from(trusted_ssh_socket_path),
+                control_publisher: sidecar_control_publisher.clone(),
+            },
         );
     }
 
@@ -624,6 +745,7 @@ pub async fn run_sandbox(
         let poll_endpoint = endpoint.to_string();
         let poll_engine = engine.clone();
         let poll_ocsf_enabled = ocsf_enabled.clone();
+        let poll_ocsf_schema_version = ocsf_schema_version.clone();
         let poll_pid = entrypoint_pid.clone();
         let poll_provider_credentials = provider_credentials.clone();
         let poll_policy_local = networking.as_ref().map(|n| n.policy_local_ctx.clone());
@@ -639,6 +761,7 @@ pub async fn run_sandbox(
             entrypoint_pid: poll_pid,
             interval_secs: poll_interval_secs,
             ocsf_enabled: poll_ocsf_enabled,
+            ocsf_schema_version: poll_ocsf_schema_version,
             provider_credentials: poll_provider_credentials,
             policy_local_ctx: poll_policy_local,
             agent_proposals: agent_proposals.clone(),
@@ -648,6 +771,10 @@ pub async fn run_sandbox(
             extension_credentials: extension_credentials.clone(),
             extension_authentication_enabled: initial_extension_authentication_enabled,
             middleware_connector: default_middleware_connector(),
+            transparent_tcp: TransparentTcpReloadState {
+                capable: transparent_tcp_capable,
+                substrate_ready: transparent_tcp_substrate_ready,
+            },
         };
 
         tokio::spawn(async move {
@@ -704,12 +831,26 @@ pub async fn run_sandbox(
     }
 
     let process_policy = process_policy_for_topology(&policy, sidecar_network_enforcement)?;
+    let main_env = provider_env.clone();
     let sidecar_bootstrap_ca_file_paths = sidecar_bootstrap.as_ref().and_then(|bootstrap| {
         bootstrap
             .proxy_ca_cert_path
             .clone()
             .zip(bootstrap.proxy_ca_bundle_path.clone())
     });
+
+    let proxy_exited: Pin<Box<dyn Future<Output = ()> + Send>> = if let Some(rx) = networking
+        .as_mut()
+        .and_then(|n| n.proxy.as_mut())
+        .and_then(ProxyHandle::take_exit_receiver)
+    {
+        Box::pin(async {
+            let _ = rx.await;
+        })
+    } else {
+        Box::pin(std::future::pending())
+    };
+    tokio::pin!(proxy_exited);
 
     let exit_code = if process_enabled {
         let ca_file_paths = networking
@@ -725,14 +866,30 @@ pub async fn run_sandbox(
                 }
             });
 
+        let (ssh_exit_tx, ssh_exit_rx) = if ssh_socket_path.is_some() {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let ssh_exited: Pin<Box<dyn Future<Output = ()> + Send>> = if let Some(rx) = ssh_exit_rx {
+            Box::pin(async {
+                let _ = rx.await;
+            })
+        } else {
+            Box::pin(std::future::pending())
+        };
+        tokio::pin!(ssh_exited);
+
         let entrypoint_started_tx =
             if process_uses_sidecar_control && let Some(writer) = process_control_writer.clone() {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 tokio::spawn(async move {
                     match rx.await {
-                        Ok(pid) => {
+                        Ok((pid, instance_id)) => {
                             if let Err(err) =
-                                sidecar_control::send_entrypoint_started(&writer, pid).await
+                                sidecar_control::send_entrypoint_started(&writer, pid, instance_id)
+                                    .await
                             {
                                 warn!(error = %err, "Failed to send sidecar entrypoint event");
                             }
@@ -746,6 +903,54 @@ pub async fn run_sandbox(
             } else {
                 None
             };
+        let sidecar_exit_tx = if process_uses_sidecar_control
+            && let Some(writer) = process_control_writer.clone()
+        {
+            let exit_ack = Arc::clone(&process_exit_ack);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<
+                openshell_supervisor_process::run::SidecarExitReport,
+            >(1);
+            tokio::spawn(async move {
+                while let Some(report) = rx.recv().await {
+                    match report {
+                        openshell_supervisor_process::run::SidecarExitReport::Exited {
+                            instance_id,
+                            exit_code,
+                            ack,
+                        } => {
+                            let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
+                            *exit_ack.lock().await = Some((instance_id.clone(), durable_tx));
+                            let result = match sidecar_control::send_main_process_exited(
+                                &writer,
+                                instance_id,
+                                exit_code,
+                            )
+                            .await
+                            {
+                                Ok(()) => durable_rx.await.map_err(|_| {
+                                    "sidecar durable exit acknowledgement closed".to_string()
+                                }),
+                                Err(error) => Err(error.to_string()),
+                            };
+                            let _ = ack.send(result);
+                        }
+                        openshell_supervisor_process::run::SidecarExitReport::Finalized {
+                            instance_id,
+                            ack,
+                        } => {
+                            let result =
+                                sidecar_control::send_main_process_finalized(&writer, instance_id)
+                                    .await
+                                    .map_err(|error| error.to_string());
+                            let _ = ack.send(result);
+                        }
+                    }
+                }
+            });
+            Some(tx)
+        } else {
+            None
+        };
 
         let process = openshell_supervisor_process::run::run_process(
             program,
@@ -753,17 +958,20 @@ pub async fn run_sandbox(
             workspace,
             timeout_secs,
             interactive,
+            await_main_process_attachment,
             sandbox_id.as_deref(),
             openshell_endpoint.as_deref(),
             ssh_socket_path,
             sidecar_network_enforcement,
+            ssh_exit_tx,
             &process_policy,
             resolved_process_identity,
             process_enforcement_mode,
             entrypoint_pid,
             entrypoint_started_tx,
+            sidecar_exit_tx,
             provider_credentials,
-            provider_env,
+            main_env,
             ca_file_paths,
             agent_proposals.clone(),
             #[cfg(target_os = "linux")]
@@ -792,9 +1000,71 @@ pub async fn run_sandbox(
                         "authoritative network-sidecar control channel closed"
                     ));
                 }
+                () = &mut proxy_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Proxy accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "proxy accept loop exited unexpectedly"
+                    ));
+                }
+                () = &mut ssh_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "SSH accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "SSH accept loop exited unexpectedly"
+                    ));
+                }
             }
         } else {
-            process.await?
+            tokio::select! {
+                result = process => result?,
+                () = &mut proxy_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Proxy accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "proxy accept loop exited unexpectedly"
+                    ));
+                }
+                () = &mut ssh_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "SSH accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "SSH accept loop exited unexpectedly"
+                    ));
+                }
+            }
         }
     } else {
         // Network-only sidecar mode: keep the proxy and its background
@@ -810,15 +1080,62 @@ pub async fn run_sandbox(
                     warn!(?result, "Authoritative sidecar control channel exited; restarting sidecar");
                     1
                 }
+                () = &mut proxy_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Proxy accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "proxy accept loop exited unexpectedly"
+                    ));
+                }
             }
         } else {
-            wait_for_shutdown_signal().await;
-            0
+            tokio::select! {
+                () = wait_for_shutdown_signal() => 0,
+                () = &mut proxy_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Proxy accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "proxy accept loop exited unexpectedly"
+                    ));
+                }
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
-            wait_for_shutdown_signal().await;
-            0
+            tokio::select! {
+                () = wait_for_shutdown_signal() => 0,
+                () = &mut proxy_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Proxy accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "proxy accept loop exited unexpectedly"
+                    ));
+                }
+            }
         }
     };
 
@@ -908,6 +1225,9 @@ type LoadedPolicyBundle = (
     LoadedPolicyOrigin,
 );
 
+type MainProcessExitAckWaiter =
+    Arc<tokio::sync::Mutex<Option<(String, tokio::sync::oneshot::Sender<()>)>>>;
+
 fn load_policy_from_sidecar_bootstrap(
     bootstrap: &sidecar_control::BootstrapData,
 ) -> Result<LoadedPolicyBundle> {
@@ -930,25 +1250,30 @@ fn spawn_sidecar_control_update_watcher(
     mut updates: tokio::sync::mpsc::UnboundedReceiver<sidecar_control::ControlUpdate>,
     provider_credentials: ProviderCredentialState,
     agent_proposals: AgentProposals,
+    exit_ack: MainProcessExitAckWaiter,
+    mut provider_env_generation: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(update) = updates.recv().await {
             match update {
                 sidecar_control::ControlUpdate::ProviderEnv {
                     revision,
+                    generation,
                     provider_child_env,
                 } => {
-                    if revision <= provider_credentials.snapshot().revision {
+                    if generation <= provider_env_generation {
                         continue;
                     }
                     let env_count = provider_credentials
                         .install_child_env_snapshot(revision, provider_child_env);
+                    provider_env_generation = generation;
                     ocsf_emit!(
                         ConfigStateChangeBuilder::new(ocsf_ctx())
                             .severity(SeverityId::Informational)
                             .status(StatusId::Success)
                             .state(StateId::Enabled, "loaded")
                             .unmapped("provider_env_revision", serde_json::json!(revision))
+                            .unmapped("provider_env_generation", serde_json::json!(generation))
                             .message(format!(
                                 "Sidecar provider environment refreshed [revision:{revision} env_count:{env_count}]"
                             ))
@@ -980,26 +1305,108 @@ fn spawn_sidecar_control_update_watcher(
                         skills::install_static_skills,
                     );
                 }
+                sidecar_control::ControlUpdate::MainProcessExitAck { instance_id } => {
+                    let mut waiter = exit_ack.lock().await;
+                    if waiter
+                        .as_ref()
+                        .is_some_and(|(expected, _)| expected == &instance_id)
+                        && let Some((_, ack)) = waiter.take()
+                    {
+                        let _ = ack.send(());
+                    }
+                }
             }
         }
     })
 }
 
 #[cfg(target_os = "linux")]
-fn spawn_sidecar_entrypoint_handler(
-    mut entrypoint_rx: tokio::sync::mpsc::Receiver<sidecar_control::EntrypointStarted>,
+struct SidecarEntrypointHandler {
     entrypoint_pid: Arc<AtomicU32>,
     opa_engine: Option<Arc<OpaEngine>>,
     retained_proto: Option<openshell_core::proto::SandboxPolicy>,
     openshell_endpoint: Option<String>,
     sandbox_id: Option<String>,
     trusted_ssh_socket_path: std::path::PathBuf,
+    control_publisher: Option<sidecar_control::Publisher>,
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_sidecar_entrypoint_handler(
+    mut entrypoint_rx: tokio::sync::mpsc::Receiver<sidecar_control::EntrypointStarted>,
+    handler: SidecarEntrypointHandler,
 ) {
     tokio::spawn(async move {
+        let SidecarEntrypointHandler {
+            entrypoint_pid,
+            opa_engine,
+            retained_proto,
+            openshell_endpoint,
+            sandbox_id,
+            trusted_ssh_socket_path,
+            control_publisher,
+        } = handler;
         let mut session_started = false;
+        let mut session_task: Option<tokio::task::JoinHandle<()>> = None;
         let mut trusted_supervisor_pid = None;
         let terminating = Arc::new(AtomicBool::new(false));
         while let Some(started) = entrypoint_rx.recv().await {
+            if started.finalized {
+                if let (Some(endpoint), Some(id)) =
+                    (openshell_endpoint.as_ref(), sandbox_id.as_ref())
+                {
+                    let mut delay = Duration::from_millis(250);
+                    loop {
+                        match openshell_supervisor_process::supervisor_session::finalize_main_process_exit(
+                            endpoint,
+                            id,
+                            &started.instance_id,
+                        )
+                        .await
+                        {
+                            Ok(()) => break,
+                            Err(error) => {
+                                warn!(%error, "sidecar main-process finalization failed; retrying");
+                                tokio::time::sleep(delay).await;
+                                delay = (delay * 2).min(Duration::from_secs(2));
+                            }
+                        }
+                    }
+                }
+                terminating.store(true, Ordering::Release);
+                if let Some(task) = session_task.take() {
+                    task.abort();
+                }
+                break;
+            }
+            if let Some(exit_code) = started.exit_code {
+                if let (Some(endpoint), Some(id)) =
+                    (openshell_endpoint.as_ref(), sandbox_id.as_ref())
+                {
+                    let mut delay = Duration::from_millis(250);
+                    loop {
+                        match openshell_supervisor_process::supervisor_session::report_main_process_exit(
+                            endpoint,
+                            id,
+                            &started.instance_id,
+                            exit_code,
+                        )
+                        .await
+                        {
+                            Ok(()) => break,
+                            Err(error) => {
+                                warn!(%error, "sidecar main-process exit report failed; retrying");
+                                tokio::time::sleep(delay).await;
+                                delay = (delay * 2).min(Duration::from_secs(2));
+                            }
+                        }
+                    }
+                    if let Some(publisher) = control_publisher.as_ref() {
+                        publisher.publish_main_process_exit_ack(started.instance_id.clone());
+                    }
+                }
+                continue;
+            }
             entrypoint_pid.store(started.pid, Ordering::Release);
             if started.start_session {
                 info!(
@@ -1041,14 +1448,15 @@ fn spawn_sidecar_entrypoint_handler(
                     );
                     continue;
                 };
-                openshell_supervisor_process::supervisor_session::spawn(
+                session_task = Some(openshell_supervisor_process::supervisor_session::spawn(
                     endpoint.clone(),
                     id.clone(),
                     trusted_ssh_socket_path.clone(),
                     None,
                     Some(supervisor_pid),
                     Arc::clone(&terminating),
-                );
+                    started.instance_id.clone(),
+                ));
                 session_started = true;
                 info!("sidecar supervisor session task spawned");
             }
@@ -1537,6 +1945,7 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
 mod baseline_tests {
     use super::*;
     use openshell_core::policy::{FilesystemPolicy, LandlockPolicy, ProcessPolicy};
+    use std::path::PathBuf;
 
     #[test]
     fn proc_not_in_both_read_only_and_read_write_when_gpu_present() {
@@ -1768,7 +2177,7 @@ mod baseline_tests {
         let mut policy = SandboxPolicy {
             version: 1,
             filesystem: FilesystemPolicy {
-                read_only: vec![std::path::PathBuf::from("/tmp")],
+                read_only: vec![PathBuf::from("/tmp")],
                 read_write: vec![],
                 include_workdir: false,
             },
@@ -1783,17 +2192,14 @@ mod baseline_tests {
         enrich_sandbox_baseline_paths(&mut policy);
 
         assert!(
-            policy
-                .filesystem
-                .read_only
-                .contains(&std::path::PathBuf::from("/tmp")),
+            policy.filesystem.read_only.contains(&PathBuf::from("/tmp")),
             "explicit read_only baseline path should be preserved"
         );
         assert!(
             !policy
                 .filesystem
                 .read_write
-                .contains(&std::path::PathBuf::from("/tmp")),
+                .contains(&PathBuf::from("/tmp")),
             "baseline enrichment must not promote explicit read_only /tmp to read_write"
         );
     }
@@ -2319,12 +2725,14 @@ enum MiddlewareRegistryStatus {
 #[derive(Debug)]
 enum GatewayRuntimeReloadError {
     PolicyValidation(miette::Report),
+    TransparentTcpPrerequisite(miette::Report),
     MiddlewareRegistry(miette::Report),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GatewayRuntimeFailureClass {
     PolicyValidation,
+    TransparentTcpPrerequisite,
     MiddlewareRegistry,
 }
 
@@ -2332,6 +2740,9 @@ impl GatewayRuntimeReloadError {
     fn class(&self) -> GatewayRuntimeFailureClass {
         match self {
             Self::PolicyValidation(_) => GatewayRuntimeFailureClass::PolicyValidation,
+            Self::TransparentTcpPrerequisite(_) => {
+                GatewayRuntimeFailureClass::TransparentTcpPrerequisite
+            }
             Self::MiddlewareRegistry(_) => GatewayRuntimeFailureClass::MiddlewareRegistry,
         }
     }
@@ -2354,21 +2765,46 @@ impl FailedRuntimeRevision {
     }
 }
 
+struct MiddlewareReloadContext<'a> {
+    desired_services: &'a [openshell_core::proto::SupervisorMiddlewareService],
+    authentication: &'a MiddlewareAuthentication,
+    registry_changed: bool,
+    connector: &'a MiddlewareConnector,
+}
+
 async fn reload_gateway_policy_runtime(
     engine: &OpaEngine,
     policy: Option<&openshell_core::proto::SandboxPolicy>,
     entrypoint_pid: u32,
-    desired_services: &[openshell_core::proto::SupervisorMiddlewareService],
-    middleware_authentication: &MiddlewareAuthentication,
-    middleware_registry_changed: bool,
-    middleware_connector: &MiddlewareConnector,
+    middleware: MiddlewareReloadContext<'_>,
+    transparent_tcp: TransparentTcpReloadState,
 ) -> std::result::Result<(), GatewayRuntimeReloadError> {
+    if let Some(policy) = policy
+        && policy_contains_explicit_tcp(policy)
+    {
+        if !transparent_tcp.capable {
+            return Err(GatewayRuntimeReloadError::TransparentTcpPrerequisite(
+                miette::miette!(
+                    "candidate policy introduces protocol: tcp, but the runtime does not advertise transparent TCP support; previous policy remains active"
+                ),
+            ));
+        }
+        if !transparent_tcp.substrate_ready {
+            return Err(GatewayRuntimeReloadError::TransparentTcpPrerequisite(
+                miette::miette!(
+                    "candidate policy introduces protocol: tcp, but this sandbox started without the transparent TCP substrate; recreate the sandbox to enable TCP; previous policy remains active"
+                ),
+            ));
+        }
+    }
     match policy {
-        Some(policy) if middleware_registry_changed => {
-            let registry =
-                middleware_connector(desired_services.to_vec(), middleware_authentication.clone())
-                    .await
-                    .map_err(GatewayRuntimeReloadError::MiddlewareRegistry)?;
+        Some(policy) if middleware.registry_changed => {
+            let registry = (middleware.connector)(
+                middleware.desired_services.to_vec(),
+                middleware.authentication.clone(),
+            )
+            .await
+            .map_err(GatewayRuntimeReloadError::MiddlewareRegistry)?;
             engine
                 .reload_policy_and_middleware_from_proto_with_pid(policy, entrypoint_pid, registry)
                 .map_err(GatewayRuntimeReloadError::PolicyValidation)
@@ -2383,6 +2819,20 @@ async fn reload_gateway_policy_runtime(
             miette::miette!("runtime reload requires a policy payload but none was returned"),
         )),
     }
+}
+
+fn policy_contains_explicit_tcp(policy: &openshell_core::proto::SandboxPolicy) -> bool {
+    policy.network_policies.values().any(|rule| {
+        rule.endpoints
+            .iter()
+            .any(|endpoint| endpoint.protocol.eq_ignore_ascii_case("tcp"))
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TransparentTcpReloadState {
+    capable: bool,
+    substrate_ready: bool,
 }
 
 /// True when the installed middleware registry no longer matches the desired
@@ -2892,6 +3342,7 @@ struct PolicyPollLoopContext {
     entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
     ocsf_enabled: Arc<AtomicBool>,
+    ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     provider_credentials: ProviderCredentialState,
     policy_local_ctx: Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>,
     agent_proposals: AgentProposals,
@@ -2901,13 +3352,15 @@ struct PolicyPollLoopContext {
     extension_credentials: openshell_extension_core::ExtensionCredentialStore,
     extension_authentication_enabled: bool,
     middleware_connector: MiddlewareConnector,
+    /// Immutable driver capability and startup substrate state.
+    transparent_tcp: TransparentTcpReloadState,
 }
 
 type MiddlewareConnector = Arc<
     dyn Fn(
             Vec<openshell_core::proto::SupervisorMiddlewareService>,
             MiddlewareAuthentication,
-        ) -> std::pin::Pin<
+        ) -> Pin<
             Box<
                 dyn std::future::Future<
                         Output = Result<openshell_supervisor_middleware::MiddlewareRegistry>,
@@ -3087,6 +3540,10 @@ enum GatewayRuntimeFailureDisposition {
     MiddlewareUnavailable {
         error: String,
     },
+    TransparentTcpExpansionRejected {
+        error: String,
+        active_generation: u64,
+    },
 }
 
 fn apply_gateway_runtime_reload_failure(
@@ -3108,12 +3565,42 @@ fn apply_gateway_runtime_reload_failure(
             )?;
             Ok(GatewayRuntimeFailureDisposition::PolicyRejected { error, disposition })
         }
+        GatewayRuntimeReloadError::TransparentTcpPrerequisite(error) => Ok(
+            GatewayRuntimeFailureDisposition::TransparentTcpExpansionRejected {
+                error: error.to_string(),
+                active_generation: engine.current_generation(),
+            },
+        ),
         GatewayRuntimeReloadError::MiddlewareRegistry(error) => {
             Ok(GatewayRuntimeFailureDisposition::MiddlewareUnavailable {
                 error: error.to_string(),
             })
         }
     }
+}
+
+fn emit_transparent_tcp_expansion_rejection(
+    version: u32,
+    policy_hash: &str,
+    active_generation: u64,
+    error: &str,
+) {
+    let message = format!(
+        "Transparent TCP policy expansion rejected; previous policy IS active [version:{version} active_generation:{active_generation} error:{error}]"
+    );
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::High)
+            .status(StatusId::Failure)
+            .state(StateId::Enabled, "retained_previous_policy")
+            .unmapped("candidate_version", serde_json::json!(version))
+            .unmapped("candidate_policy_hash", serde_json::json!(policy_hash))
+            .unmapped("previous_policy_active", serde_json::json!(true))
+            .unmapped("active_generation", serde_json::json!(active_generation))
+            .unmapped("validation_error", serde_json::json!(error))
+            .message(message)
+            .build()
+    );
 }
 
 fn apply_policy_validation_failure(
@@ -3298,6 +3785,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             match initial_poll_disposition(&ctx.loaded_policy_origin, &result) {
                 InitialPollDisposition::Acknowledge(candidate) => {
                     apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
                     apply_agent_proposals_enabled(
                         &ctx.agent_proposals,
                         agent_proposals_enabled_from_settings(&result.settings),
@@ -3325,6 +3813,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 InitialPollDisposition::Reconcile => pending_result = Some(result),
                 InitialPollDisposition::TrackOnly => {
                     apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
                     apply_agent_proposals_enabled(
                         &ctx.agent_proposals,
                         agent_proposals_enabled_from_settings(&result.settings),
@@ -3595,13 +4084,16 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 &ctx.opa_engine,
                 result.policy.as_ref(),
                 pid,
-                &result.supervisor_middleware_services,
-                &MiddlewareAuthentication {
-                    credentials: middleware_credentials.clone(),
-                    enabled: result.extension_authentication_enabled,
+                MiddlewareReloadContext {
+                    desired_services: &result.supervisor_middleware_services,
+                    authentication: &MiddlewareAuthentication {
+                        credentials: middleware_credentials.clone(),
+                        enabled: result.extension_authentication_enabled,
+                    },
+                    registry_changed: middleware_registry_changed,
+                    connector: &ctx.middleware_connector,
                 },
-                middleware_registry_changed,
-                &ctx.middleware_connector,
+                ctx.transparent_tcp,
             )
             .await;
 
@@ -3765,6 +4257,26 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                                     ))
                                     .build());
                             }
+                            GatewayRuntimeFailureDisposition::TransparentTcpExpansionRejected {
+                                error,
+                                active_generation,
+                            } => {
+                                emit_transparent_tcp_expansion_rejection(
+                                    result.version,
+                                    &result.policy_hash,
+                                    active_generation,
+                                    &error,
+                                );
+                                if policy_changed
+                                    && result.version > 0
+                                    && result.policy_source == PolicySource::Sandbox
+                                {
+                                    enqueue_policy_status(
+                                        &status_sender,
+                                        PolicyStatusUpdate::failed(result.version, error),
+                                    );
+                                }
+                            }
                         }
                     }
                     last_failed_runtime_revision = Some(failed_revision);
@@ -3790,6 +4302,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
 
         // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
         apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+        apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
 
         // Apply the agent-proposals feature toggle. On a false→true transition
         // we lazily install the skill so a sandbox that started with the flag
@@ -3840,6 +4353,37 @@ fn extract_bool_setting(
         .and_then(|sv| sv.value.as_ref())
         .and_then(|v| match v {
             setting_value::Value::BoolValue(b) => Some(*b),
+            _ => None,
+        })
+}
+
+fn apply_ocsf_schema_version_setting(
+    version: &std::sync::Mutex<String>,
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+) {
+    let new_version = extract_string_setting(settings, "ocsf_schema_version").unwrap_or_default();
+    if let Ok(mut current) = version.lock()
+        && *current != new_version
+    {
+        info!(
+            ocsf_schema_version = %new_version,
+            "OCSF schema version target changed"
+        );
+        *current = new_version;
+    }
+}
+
+fn extract_string_setting(
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+    key: &str,
+) -> Option<String> {
+    use openshell_core::proto::setting_value;
+    settings
+        .get(key)
+        .and_then(|es| es.value.as_ref())
+        .and_then(|sv| sv.value.as_ref())
+        .and_then(|v| match v {
+            setting_value::Value::StringValue(s) => Some(s.clone()),
             _ => None,
         })
 }
@@ -3968,6 +4512,21 @@ fn format_setting_value(es: &openshell_core::proto::EffectiveSetting) -> String 
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transparent_tcp_capability_requires_exact_driver_marker() {
+        let required = openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY;
+        assert!(!has_network_runtime_capability(None, required));
+        assert!(!has_network_runtime_capability(Some(""), required));
+        assert!(!has_network_runtime_capability(
+            Some("policy-dns-transparent-tcp-extra"),
+            required
+        ));
+        assert!(has_network_runtime_capability(
+            Some("other, policy-dns-transparent-tcp"),
+            required
+        ));
+    }
     use openshell_core::policy::{
         FilesystemPolicy, LandlockPolicy, NetworkMode, NetworkPolicy, ProcessPolicy, ProxyPolicy,
     };
@@ -4037,20 +4596,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sidecar_control_provider_env_update_installs_newer_revision() {
+    async fn sidecar_control_provider_env_update_orders_by_generation() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let provider_credentials = ProviderCredentialState::from_child_env_snapshot(
-            1,
+            u64::MAX,
             std::collections::HashMap::from([("TOKEN".to_string(), "old".to_string())]),
         );
+        let agent_proposals = AgentProposals::new(true);
         let handle = spawn_sidecar_control_update_watcher(
             rx,
             provider_credentials.clone(),
-            AgentProposals::default(),
+            agent_proposals.clone(),
+            Arc::new(tokio::sync::Mutex::new(None)),
+            10,
         );
 
         tx.send(sidecar_control::ControlUpdate::ProviderEnv {
-            revision: 2,
+            revision: 1,
+            generation: 11,
             provider_child_env: std::collections::HashMap::from([(
                 "TOKEN".to_string(),
                 "new".to_string(),
@@ -4058,6 +4621,62 @@ mod tests {
         })
         .unwrap();
 
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if provider_credentials.snapshot().revision == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = provider_credentials.snapshot();
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(
+            snapshot.child_env.get("TOKEN").map(String::as_str),
+            Some("new")
+        );
+
+        tx.send(sidecar_control::ControlUpdate::ProviderEnv {
+            revision: 2,
+            generation: 11,
+            provider_child_env: std::collections::HashMap::from([(
+                "TOKEN".to_string(),
+                "duplicate-generation".to_string(),
+            )]),
+        })
+        .unwrap();
+        tx.send(sidecar_control::ControlUpdate::AgentProposals {
+            enabled: false,
+            config_revision: 1,
+        })
+        .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while agent_proposals.enabled() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            provider_credentials
+                .snapshot()
+                .child_env
+                .get("TOKEN")
+                .map(String::as_str),
+            Some("new")
+        );
+
+        tx.send(sidecar_control::ControlUpdate::ProviderEnv {
+            revision: 2,
+            generation: 12,
+            provider_child_env: std::collections::HashMap::from([(
+                "TOKEN".to_string(),
+                "newest".to_string(),
+            )]),
+        })
+        .unwrap();
         timeout(Duration::from_secs(1), async {
             loop {
                 if provider_credentials.snapshot().revision == 2 {
@@ -4068,29 +4687,33 @@ mod tests {
         })
         .await
         .unwrap();
-        let snapshot = provider_credentials.snapshot();
-        assert_eq!(snapshot.revision, 2);
-        assert_eq!(
-            snapshot.child_env.get("TOKEN").map(String::as_str),
-            Some("new")
-        );
 
         tx.send(sidecar_control::ControlUpdate::ProviderEnv {
-            revision: 1,
+            revision: u64::MAX,
+            generation: 11,
             provider_child_env: std::collections::HashMap::from([(
                 "TOKEN".to_string(),
                 "stale".to_string(),
             )]),
         })
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tx.send(sidecar_control::ControlUpdate::AgentProposals {
+            enabled: true,
+            config_revision: 2,
+        })
+        .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while !agent_proposals.enabled() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = provider_credentials.snapshot();
+        assert_eq!(snapshot.revision, 2);
         assert_eq!(
-            provider_credentials
-                .snapshot()
-                .child_env
-                .get("TOKEN")
-                .map(String::as_str),
-            Some("new")
+            snapshot.child_env.get("TOKEN").map(String::as_str),
+            Some("newest")
         );
         handle.abort();
     }
@@ -4101,8 +4724,13 @@ mod tests {
         let provider_credentials =
             ProviderCredentialState::from_child_env_snapshot(0, std::collections::HashMap::new());
         let agent_proposals = AgentProposals::new(true);
-        let handle =
-            spawn_sidecar_control_update_watcher(rx, provider_credentials, agent_proposals.clone());
+        let handle = spawn_sidecar_control_update_watcher(
+            rx,
+            provider_credentials,
+            agent_proposals.clone(),
+            Arc::new(tokio::sync::Mutex::new(None)),
+            0,
+        );
 
         tx.send(sidecar_control::ControlUpdate::AgentProposals {
             enabled: false,
@@ -4299,6 +4927,24 @@ filesystem_policy:
         openshell_policy::restrictive_default_policy()
     }
 
+    fn proto_tcp_policy_fixture() -> openshell_core::proto::SandboxPolicy {
+        openshell_policy::parse_sandbox_policy(
+            r#"
+version: 1
+network_policies:
+  redis:
+    name: redis
+    endpoints:
+      - host: redis.example.com
+        port: 6379
+        protocol: tcp
+    binaries:
+      - path: /usr/bin/redis-cli
+"#,
+        )
+        .expect("parse TCP policy")
+    }
+
     fn settings_poll_result(
         policy: Option<openshell_core::proto::SandboxPolicy>,
         version: u32,
@@ -4437,6 +5083,7 @@ filesystem_policy:
             entrypoint_pid: Arc::new(AtomicU32::new(0)),
             interval_secs: 0,
             ocsf_enabled: Arc::new(AtomicBool::new(false)),
+            ocsf_schema_version: Arc::new(std::sync::Mutex::new(String::new())),
             provider_credentials: ProviderCredentialState::from_child_env_snapshot(
                 0,
                 std::collections::HashMap::new(),
@@ -4449,6 +5096,7 @@ filesystem_policy:
             extension_credentials: openshell_extension_core::ExtensionCredentialStore::new(),
             extension_authentication_enabled: false,
             middleware_connector,
+            transparent_tcp: TransparentTcpReloadState::default(),
         }
     }
 
@@ -4513,6 +5161,54 @@ filesystem_policy:
             0,
             "same-hash acknowledgement must not reload OPA"
         );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn poll_rejects_first_tcp_expansion_and_reports_previous_policy_active() {
+        let v1 = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let v2 = settings_poll_result(
+            Some(proto_tcp_policy_fixture()),
+            2,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let active_generation = engine.current_generation();
+        let loaded_revision = LoadedPolicyRevision::from_snapshot(&v1);
+        let mut ctx = policy_poll_test_context(
+            engine.clone(),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(loaded_revision),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        ctx.transparent_tcp = TransparentTcpReloadState {
+            capable: true,
+            substrate_ready: false,
+        };
+        let (client, polls, mut reports) = scripted_policy_gateway();
+        polls.send(v1).unwrap();
+
+        let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+        expect_policy_report(&mut reports, 1).await;
+        polls.send(v2).unwrap();
+        let report = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("TCP rejection report timed out")
+            .expect("policy reporter stopped");
+
+        assert_eq!(report.0, 2);
+        assert!(!report.1);
+        assert!(report.2.contains("recreate the sandbox"), "{}", report.2);
+        assert!(report.2.contains("previous policy remains active"));
+        assert_eq!(engine.current_generation(), active_generation);
+        assert!(engine.fail_closed_reason().is_none());
         handle.abort();
     }
 
@@ -4903,10 +5599,13 @@ filesystem_policy:
             &engine,
             Some(&proto_policy_fixture()),
             0,
-            &[unavailable_service],
-            &MiddlewareAuthentication::default(),
-            true,
-            &default_middleware_connector(),
+            MiddlewareReloadContext {
+                desired_services: &[unavailable_service],
+                authentication: &MiddlewareAuthentication::default(),
+                registry_changed: true,
+                connector: &default_middleware_connector(),
+            },
+            TransparentTcpReloadState::default(),
         )
         .await
         .expect_err("unavailable middleware must fail candidate preparation");
@@ -4925,6 +5624,74 @@ filesystem_policy:
         ));
         assert_eq!(engine.current_generation(), active_generation);
         assert!(engine.fail_closed_reason().is_none());
+    }
+
+    #[tokio::test]
+    async fn tcp_policy_reload_without_startup_substrate_is_rejected_and_keeps_previous_policy() {
+        let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");
+        let active_generation = engine.current_generation();
+
+        let failure = reload_gateway_policy_runtime(
+            &engine,
+            Some(&proto_tcp_policy_fixture()),
+            0,
+            MiddlewareReloadContext {
+                desired_services: &[],
+                authentication: &MiddlewareAuthentication::default(),
+                registry_changed: false,
+                connector: &default_middleware_connector(),
+            },
+            TransparentTcpReloadState {
+                capable: true,
+                substrate_ready: false,
+            },
+        )
+        .await
+        .expect_err("TCP expansion must require startup substrate");
+        let disposition = apply_gateway_runtime_reload_failure(
+            &engine,
+            failure,
+            PolicyValidationFailureMode::FailClosed,
+            true,
+            2,
+        )
+        .expect("runtime prerequisite failure handling must succeed");
+
+        assert!(matches!(
+            disposition,
+            GatewayRuntimeFailureDisposition::TransparentTcpExpansionRejected {
+                active_generation: generation,
+                ..
+            } if generation == active_generation
+        ));
+        assert_eq!(engine.current_generation(), active_generation);
+        assert!(engine.fail_closed_reason().is_none());
+    }
+
+    #[tokio::test]
+    async fn tcp_policy_reload_on_unsupported_runtime_is_rejected() {
+        let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");
+
+        let failure = reload_gateway_policy_runtime(
+            &engine,
+            Some(&proto_tcp_policy_fixture()),
+            0,
+            MiddlewareReloadContext {
+                desired_services: &[],
+                authentication: &MiddlewareAuthentication::default(),
+                registry_changed: false,
+                connector: &default_middleware_connector(),
+            },
+            TransparentTcpReloadState::default(),
+        )
+        .await
+        .expect_err("unsupported runtime must reject TCP expansion");
+
+        assert!(matches!(
+            failure,
+            GatewayRuntimeReloadError::TransparentTcpPrerequisite(_)
+        ));
+        assert_eq!(engine.current_generation(), 0);
     }
 
     #[test]
@@ -5495,11 +6262,21 @@ filesystem_policy:
             "fail_closed"
         );
         assert_eq!(config["unmapped"]["previous_policy_active"], false);
+        assert_eq!(
+            config["unmapped"]["validation_error"],
+            "conflicting tls metadata"
+        );
         assert!(
             config["message"]
                 .as_str()
                 .unwrap()
                 .contains("previous policy IS NOT active")
+        );
+        assert!(
+            config["message"]
+                .as_str()
+                .unwrap()
+                .contains("error:conflicting tls metadata")
         );
 
         let finding = finding.to_json().unwrap();

@@ -246,7 +246,6 @@ async fn assert_provider_placeholder_available_in_sandbox(
         sandbox_name,
         "--provider",
         provider_name,
-        "--no-keep",
         "--no-auto-providers",
         "--no-tty",
         "--",

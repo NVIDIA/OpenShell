@@ -3,12 +3,9 @@
 
 //! Selected compute-driver config construction.
 //!
-//! This module owns loading the selected driver config from TOML, applying
-//! driver-specific environment overrides, and applying gateway startup defaults.
-//! It does not acquire, connect to, or start compute drivers.
-
-#[cfg(not(target_os = "windows"))]
-pub mod builtin;
+//! This module owns loading the selected driver config from TOML and applying
+//! gateway startup defaults and endpoint overrides. It does not acquire,
+//! connect to, or start compute drivers.
 
 use crate::config_file;
 use crate::defaults::LocalTlsPaths;
@@ -22,6 +19,12 @@ pub struct GuestTlsPaths {
     ca: PathBuf,
     cert: PathBuf,
     key: PathBuf,
+}
+
+impl GuestTlsPaths {
+    pub(crate) fn as_paths(&self) -> (&std::path::Path, &std::path::Path, &std::path::Path) {
+        (&self.ca, &self.cert, &self.key)
+    }
 }
 
 impl From<&LocalTlsPaths> for GuestTlsPaths {
@@ -47,29 +50,43 @@ pub fn remote_driver_config_from_context(
     context: DriverStartupContext<'_>,
     name: &str,
 ) -> Result<RemoteDriverConfig> {
-    let mut cfg = driver_config_from_context(context, name)?;
+    let mut cfg = RemoteDriverConfig::default();
+    if let Some(file) = context.file {
+        let merged = config_file::driver_table(
+            name,
+            &file.openshell.gateway,
+            file.openshell.drivers.get(name),
+        );
+        if let Some(socket_path) = merged.get("socket_path").and_then(toml::Value::as_str) {
+            cfg.socket_path = PathBuf::from(socket_path);
+        }
+    }
     apply_remote_driver_overrides(&mut cfg, context, name);
     validate_remote_driver_config(&cfg, name)?;
     Ok(cfg)
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct RemoteDriverConfig {
     #[serde(default)]
     pub socket_path: PathBuf,
 }
 
-fn driver_config_from_context<T>(context: DriverStartupContext<'_>, driver_name: &str) -> Result<T>
+pub fn driver_config_from_context<T>(
+    context: DriverStartupContext<'_>,
+    driver_name: &str,
+    inherited_config_keys: &[&str],
+) -> Result<T>
 where
     T: Default + serde::de::DeserializeOwned,
 {
-    driver_config_from_file(context.file, driver_name)
+    driver_config_from_file(context.file, driver_name, inherited_config_keys)
 }
 
 fn driver_config_from_file<T>(
     file: Option<&config_file::ConfigFile>,
     driver_name: &str,
+    inherited_config_keys: &[&str],
 ) -> Result<T>
 where
     T: Default + serde::de::DeserializeOwned,
@@ -77,10 +94,11 @@ where
     let Some(file) = file else {
         return Ok(T::default());
     };
-    let merged = config_file::driver_table(
+    let merged = config_file::driver_table_with_inherited_keys(
         driver_name,
         &file.openshell.gateway,
         file.openshell.drivers.get(driver_name),
+        inherited_config_keys,
     );
     merged.try_into().map_err(|e| {
         Error::config(format!(
@@ -146,6 +164,29 @@ socket_path = "/run/openshell/kyma.sock"
             .expect("remote config");
 
         assert_eq!(cfg.socket_path, PathBuf::from("/run/openshell/kyma.sock"));
+    }
+
+    #[test]
+    fn remote_driver_config_ignores_in_process_driver_fields() {
+        let file: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.gateway]
+sandbox_namespace = "sandboxes"
+
+[openshell.drivers.kubernetes]
+socket_path = "/run/openshell/kubernetes.sock"
+workspace_mode = "shared"
+service_account_name = "sandbox-sa"
+"#,
+        )
+        .expect("valid config");
+
+        let cfg = remote_driver_config_from_context(test_context(Some(&file)), "kubernetes")
+            .expect("remote config");
+        assert_eq!(
+            cfg.socket_path,
+            PathBuf::from("/run/openshell/kubernetes.sock")
+        );
     }
 
     #[test]

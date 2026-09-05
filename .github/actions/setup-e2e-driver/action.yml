@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Setup E2E Driver
+description: Download an architecture-matched standalone compute driver for E2E tests
+
+inputs:
+  binary:
+    description: Compute driver binary name
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Download prebuilt ${{ inputs.binary }}
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: ${{ inputs.binary }}-${{ runner.arch == 'X64' && 'x86_64-unknown-linux-gnu' || 'aarch64-unknown-linux-gnu' }}
+        path: .e2e/prebuilt-driver
+
+    - name: Configure prebuilt ${{ inputs.binary }}
+      shell: bash
+      run: | # zizmor: ignore[github-env] validated filename under the trusted workspace path
+        if [[ ! "${INPUTS_BINARY}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+          echo "invalid driver binary name: ${INPUTS_BINARY}" >&2
+          exit 1
+        fi
+        driver="$GITHUB_WORKSPACE/.e2e/prebuilt-driver/${INPUTS_BINARY}"
+        chmod +x "$driver"
+        "$driver" --version
+        echo "OPENSHELL_EXTERNAL_DRIVER_BIN=$driver" >> "$GITHUB_ENV"
+      env:
+        INPUTS_BINARY: ${{ inputs.binary }}

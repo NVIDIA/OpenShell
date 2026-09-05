@@ -133,6 +133,10 @@ impl PolicyLocalContext {
         *self.current_policy.write().await = Some(policy);
     }
 
+    pub fn workspace(&self) -> String {
+        self.workspace_rx.borrow().clone()
+    }
+
     #[must_use]
     pub fn agent_proposals(&self) -> AgentProposals {
         self.agent_proposals.clone()
@@ -817,7 +821,8 @@ async fn fetch_chunk_or_404(
 /// next on the redraft loop — identity (`chunk_id`, `status`), the proposal
 /// it submitted (`rule_name`, `binary`), the two feedback signals
 /// (`rejection_reason` from the reviewer, `validation_result` from the
-/// gateway prover), and (on /wait) `policy_reloaded` so the agent can tell
+/// gateway prover, and `application_error` from complete candidate preflight),
+/// plus the review token/candidate hashes and (on /wait) `policy_reloaded` so the agent can tell
 /// "approved AND the new rule is loaded — safe to retry" from "approved
 /// but the supervisor hasn't reloaded yet — re-issue /wait or surface to
 /// user". Display-only proto fields (`hit_count`, `confidence`, `stage`,
@@ -834,6 +839,10 @@ fn chunk_state_payload(
         "binary": chunk.binary,
         "rejection_reason": chunk.rejection_reason,
         "validation_result": chunk.validation_result,
+        "application_error": chunk.application_error,
+        "review_token": chunk.review_token,
+        "current_effective_policy_hash": chunk.current_effective_policy_hash,
+        "candidate_effective_policy_hash": chunk.candidate_effective_policy_hash,
     });
     if timed_out {
         payload["timed_out"] = serde_json::json!(true);
@@ -1052,6 +1061,7 @@ fn policy_chunk_from_add_rule(
         binary,
         validation_result: String::new(),
         rejection_reason: String::new(),
+        ..Default::default()
     })
 }
 
@@ -1101,6 +1111,11 @@ fn network_endpoint_from_json(
 ) -> std::result::Result<NetworkEndpoint, String> {
     if endpoint.host.trim().is_empty() {
         return Err("endpoint.host is required".to_string());
+    }
+    if let Some(reason) =
+        openshell_policy::agent_authored_transport_rejection(&endpoint.protocol, &endpoint.tls)
+    {
+        return Err(reason.to_string());
     }
 
     let mut ports = endpoint.ports;
@@ -1430,6 +1445,7 @@ mod tests {
         assert_eq!(rule.endpoints[0].port, 443);
         assert_eq!(rule.endpoints[0].ports, vec![443]);
         assert_eq!(rule.endpoints[0].protocol, "rest");
+        assert!(rule.endpoints[0].advisor_proposed);
         #[allow(deprecated)]
         {
             assert!(rule.binaries[0].harness);
@@ -1471,6 +1487,47 @@ mod tests {
         let error = proposal_chunks_from_body(body).unwrap_err();
         assert!(error.contains("query strings"));
         assert!(!error.contains("secret"));
+    }
+
+    #[test]
+    fn proposal_chunks_from_body_rejects_native_tcp_and_tls_skip() {
+        for endpoint in [
+            r#"{"host":"db.example.com","port":5432,"protocol":"tcp"}"#,
+            r#"{"host":"api.example.com","port":443,"tls":"skip"}"#,
+        ] {
+            let body = format!(
+                r#"{{
+                    "operations": [{{
+                        "addRule": {{
+                            "ruleName": "raw_transport",
+                            "rule": {{"endpoints": [{endpoint}]}}
+                        }}
+                    }}]
+                }}"#
+            );
+
+            let error = proposal_chunks_from_body(body.as_bytes()).unwrap_err();
+            assert!(error.contains("administrator"), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn proposal_chunks_from_body_accepts_omitted_protocol_with_default_tls() {
+        let body = br#"{
+            "operations": [{
+                "addRule": {
+                    "ruleName": "explicit_proxy",
+                    "rule": {
+                        "endpoints": [{"host":"api.example.com","port":443}]
+                    }
+                }
+            }]
+        }"#;
+
+        let chunks = proposal_chunks_from_body(body).unwrap();
+        let endpoint = &chunks[0].proposed_rule.as_ref().unwrap().endpoints[0];
+        assert!(endpoint.protocol.is_empty());
+        assert!(endpoint.tls.is_empty());
     }
 
     #[test]
@@ -1794,6 +1851,10 @@ mod tests {
             binary: "/usr/bin/curl".to_string(),
             rejection_reason: "scope too broad".to_string(),
             validation_result: "no exfil paths".to_string(),
+            application_error: "candidate invalid: malformed GraphQL operation".to_string(),
+            review_token: "review-v1".to_string(),
+            current_effective_policy_hash: "current-hash".to_string(),
+            candidate_effective_policy_hash: "candidate-hash".to_string(),
             ..Default::default()
         };
         let pending = chunk_state_payload(&chunk, false, false);
@@ -1801,6 +1862,13 @@ mod tests {
         assert_eq!(pending["status"], "rejected");
         assert_eq!(pending["rejection_reason"], "scope too broad");
         assert_eq!(pending["validation_result"], "no exfil paths");
+        assert_eq!(
+            pending["application_error"],
+            "candidate invalid: malformed GraphQL operation"
+        );
+        assert_eq!(pending["review_token"], "review-v1");
+        assert_eq!(pending["current_effective_policy_hash"], "current-hash");
+        assert_eq!(pending["candidate_effective_policy_hash"], "candidate-hash");
         // timed_out and policy_reloaded only appear when relevant.
         assert!(pending.get("timed_out").is_none());
         assert!(

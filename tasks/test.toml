@@ -13,13 +13,14 @@ depends = [
   "test:install-sh",
   "test:build-env",
   "test:packaging-assets",
+  "test:codex-security-release-range",
   "test:docs-website",
 ]
 
 ["test:docs-website"]
 description = "Test the docs-website sync script"
-# --no-project skips the workspace (maturin) build; --with supplies pytest and
-# the script's runtime dep (PyYAML), which live outside the project env.
+# --no-project skips installing the OpenShell package; --with supplies pytest
+# and the script's runtime dependency (PyYAML), which lives outside the project env.
 run = "uv run --no-project --with pytest --with pyyaml pytest tasks/scripts/sync_docs_website_test.py"
 
 ["test:sbom"]
@@ -43,6 +44,11 @@ hide = true
 description = "Run static packaging asset tests"
 run = "tasks/scripts/test-packaging-assets.sh"
 run_windows = "echo Skipping test:packaging-assets: Linux service and RPM assets do not apply on Windows."
+hide = true
+
+["test:codex-security-release-range"]
+description = "Test Codex Security release-range resolution"
+run = "uv run --no-project --with pytest pytest -o \"python_files=*_test.py\" tasks/scripts/codex_security_range_test.py"
 hide = true
 
 [e2e]
@@ -82,8 +88,20 @@ hide = true
 
 ["e2e:rust"]
 description = "Run Rust CLI e2e tests against a Docker-backed gateway"
+depends = ["e2e:conformance:build"]
+run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-docker.sh"
+
+["e2e:conformance:build"]
+description = "Build the standalone CLI conformance binary"
+run = "if [ -z \"${OPENSHELL_CONFORMANCE_BIN:-}\" ]; then cargo build -p openshell-conformance-cli; fi"
+hide = true
+
+["e2e:cli-conformance"]
+description = "Build and run the standalone CLI conformance suite against the configured gateway"
+depends = ["e2e:conformance:build"]
 run = [
-  "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker",
+  "if [ -z \"${OPENSHELL_BIN:-}\" ]; then cargo build -p openshell-cli; fi",
+  "\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" run --openshell-bin \"${OPENSHELL_BIN:-$PWD/target/debug/openshell}\"",
 ]
 
 ["e2e:websocket-conformance"]
@@ -108,12 +126,19 @@ run = "e2e/with-docker-gateway.sh uv run pytest -o python_files='test_*.py *_tes
 
 ["e2e:podman"]
 description = "Run Rust CLI e2e tests against a Podman-backed gateway"
-run = "e2e/rust/e2e-podman.sh"
+depends = ["e2e:conformance:build"]
+run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-podman.sh"
 
 ["e2e:oidc-pkce"]
 description = "Run Linux browser PKCE and RBAC e2e tests against Keycloak and a Podman gateway"
 run = [
   "CONTAINER_RUNTIME=podman e2e/with-keycloak.sh env OPENSHELL_E2E_OIDC_GATEWAY=1 e2e/with-podman-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-oidc-pkce --test oidc_pkce",
+]
+
+["e2e:provider-refresh-keycloak"]
+description = "Run provider refresh recovery e2e against Keycloak and a Podman gateway"
+run = [
+  "CONTAINER_RUNTIME=podman e2e/with-keycloak.sh e2e/with-podman-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-provider-refresh-keycloak --test provider_refresh_keycloak -- --nocapture",
 ]
 
 ["e2e:oidc-pkce:docker"]
@@ -130,63 +155,98 @@ run = [
   "CONTAINER_RUNTIME=docker e2e/with-keycloak.sh env OPENSHELL_E2E_OIDC_GATEWAY=1 e2e/with-docker-gateway.sh uv run pytest -m 'not gpu' e2e/python/oidc",
 ]
 
-["e2e:podman:rootless"]
-description = "Run Rust CLI e2e tests against a rootless Podman-backed gateway"
-run = "e2e/rust/e2e-podman-rootless.sh"
-
 ["e2e:podman:gpu"]
 description = "Run GPU e2e against a standalone gateway with the Podman compute driver"
 env = { OPENSHELL_E2E_PODMAN_GPU = "1", OPENSHELL_E2E_PODMAN_TEST = "gpu", OPENSHELL_E2E_PODMAN_FEATURES = "e2e-podman-gpu" }
-run = "e2e/rust/e2e-podman.sh"
+depends = ["e2e:conformance:build"]
+run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-podman.sh"
 
 ["e2e:kubernetes"]
 description = "Run Rust CLI e2e tests against an OpenShell gateway deployed on Kubernetes via Helm (set OPENSHELL_E2E_KUBE_CONTEXT to reuse a cluster; otherwise creates a local k3d cluster when k3d is installed; set OPENSHELL_E2E_KUBE_TEST=<name> to scope to one test)"
-run = "e2e/rust/e2e-kubernetes.sh"
+depends = ["e2e:conformance:build"]
+run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh"
 
 ["e2e:kubernetes:v1alpha1"]
 description = "Run Kubernetes e2e against Agent Sandbox v1alpha1"
 env = { AGENT_SANDBOX_VERSION = "v0.4.6" }
-run = "e2e/rust/e2e-kubernetes.sh"
+depends = ["e2e:conformance:build"]
+run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh"
 
 ["e2e:kubernetes:agent-sandbox-versions"]
 description = "Run Kubernetes e2e against Agent Sandbox v1beta1 and v1alpha1"
+depends = ["e2e:conformance:build"]
 run = [
-  "e2e/rust/e2e-kubernetes.sh",
-  "AGENT_SANDBOX_VERSION=v0.4.6 e2e/rust/e2e-kubernetes.sh",
+  "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh",
+  "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" AGENT_SANDBOX_VERSION=v0.4.6 e2e/rust/e2e-kubernetes.sh",
 ]
 
 ["e2e:kubernetes:sidecar"]
 description = "Run Kubernetes e2e with the supervisor sidecar topology overlay"
 env = { OPENSHELL_E2E_KUBE_EXTRA_VALUES = "deploy/helm/openshell/ci/values-sidecar.yaml" }
-run = "e2e/rust/e2e-kubernetes.sh"
+depends = ["e2e:conformance:build"]
+run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh"
 
 ["e2e:kubernetes:db"]
 description = "Run Kubernetes e2e with all database backend scenarios (SQLite and external PostgreSQL with existingSecret)"
 env = { OPENSHELL_E2E_KUBE_DB_SCENARIOS = "1" }
-run = "e2e/rust/e2e-kubernetes.sh"
+depends = ["e2e:conformance:build"]
+run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh"
 
 ["e2e:kubernetes:credential-drivers"]
 description = "Run Kubernetes e2e for provider credential storage backed by Kubernetes Secrets and Vault"
 env = { OPENSHELL_E2E_CREDENTIAL_DRIVERS = "1", OPENSHELL_E2E_KUBE_TEST = "credential_drivers", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e,e2e-kubernetes,e2e-kubernetes-credential-drivers" }
-run = "e2e/rust/e2e-kubernetes.sh"
+depends = ["e2e:conformance:build"]
+run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh"
 
 ["e2e:kubernetes:workspace-managed"]
 description = "Run Kubernetes e2e with managed workspace mode (auto-created per-workspace namespaces)"
 env = { OPENSHELL_E2E_KUBE_EXTRA_VALUES = "deploy/helm/openshell/ci/values-workspace-managed.yaml", OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET = "e2e-regcred", OPENSHELL_E2E_KUBE_TEST = "workspace_namespace_managed", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e,e2e-kubernetes,e2e-kubernetes-workspace-managed" }
-run = "e2e/rust/e2e-kubernetes.sh"
+depends = ["e2e:conformance:build"]
+run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh"
 
 ["e2e:kubernetes:workspace-operator"]
 description = "Run Kubernetes e2e with operator workspace mode (pre-provisioned per-workspace namespaces)"
 env = { OPENSHELL_E2E_KUBE_EXTRA_VALUES = "deploy/helm/openshell/ci/values-workspace-operator.yaml", OPENSHELL_E2E_KUBE_TEST = "workspace_namespace_operator", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e,e2e-kubernetes,e2e-kubernetes-workspace-operator" }
-run = "e2e/rust/e2e-kubernetes.sh"
+depends = ["e2e:conformance:build"]
+run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh"
 
 ["e2e:vm"]
 description = "Start openshell-gateway with the VM compute driver and run VM e2e tests"
-run = "e2e/rust/e2e-vm.sh"
+depends = ["e2e:conformance:build"]
+run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-vm.sh"
+
+["e2e:gateway:no-compute-drivers"]
+description = "Build and launch-check openshell-gateway without compiled compute drivers"
+run = "bash e2e/no-compute-driver-gateway.sh"
+
+["e2e:docker:external-driver"]
+description = "Run Docker conformance with a driver-free gateway and external Docker driver binary"
+env = { OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER = "1", OPENSHELL_E2E_DOCKER_FEATURES = "" }
+depends = ["e2e:conformance:build"]
+run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-docker.sh"
+
+["e2e:podman:external-driver"]
+description = "Run Podman conformance with a driver-free gateway and external Podman driver binary"
+env = { OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER = "1", OPENSHELL_E2E_PODMAN_FEATURES = "" }
+depends = ["e2e:conformance:build"]
+run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-podman.sh"
+
+["e2e:vm:external-driver"]
+description = "Run VM E2E with a driver-free gateway and external VM driver binary"
+env = { OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER = "1" }
+depends = ["e2e:conformance:build"]
+run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-vm.sh"
+
+["e2e:kubernetes:external-driver"]
+description = "Run Kubernetes conformance with a driver-free gateway and external Kubernetes driver sidecar"
+env = { OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER = "1", OPENSHELL_E2E_KUBE_BUILD_IMAGES = "1", OPENSHELL_E2E_KUBERNETES_FEATURES = "" }
+depends = ["e2e:conformance:build"]
+run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh"
 
 ["e2e:docker"]
-description = "Run smoke e2e against a standalone gateway with the Docker compute driver"
-run = "e2e/rust/e2e-docker.sh"
+description = "Run Docker conformance and Rust e2e tests against a standalone gateway"
+depends = ["e2e:conformance:build"]
+run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-docker.sh"
 
 ["e2e:mechanistic-smoke"]
 description = "Run mechanistic L4 smoke against a Docker-backed gateway"
@@ -195,10 +255,18 @@ run = [
   "e2e/with-docker-gateway.sh bash -lc 'target/debug/openshell settings set --global --key agent_policy_proposals_enabled --value true --yes && OPENSHELL_BIN=$PWD/target/debug/openshell bash e2e/policy-advisor/mechanistic-smoke.sh'",
 ]
 
+["e2e:mechanistic-existing-endpoint"]
+description = "Run #2821 existing inspected-endpoint auto-approval regression"
+run = [
+  "cargo build -p openshell-cli",
+  "e2e/with-docker-gateway.sh bash -lc 'target/debug/openshell settings set --global --key agent_policy_proposals_enabled --value true --yes && OPENSHELL_BIN=$PWD/target/debug/openshell bash e2e/policy-advisor/existing-endpoint-auto-approve.sh'",
+]
+
 ["e2e:docker:gpu"]
 description = "Run GPU e2e against a standalone gateway with the Docker compute driver"
 env = { OPENSHELL_E2E_DOCKER_GPU = "1", OPENSHELL_E2E_DOCKER_TEST = "gpu", OPENSHELL_E2E_DOCKER_FEATURES = "e2e-docker-gpu" }
-run = "e2e/rust/e2e-docker.sh"
+depends = ["e2e:conformance:build"]
+run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-docker.sh"
 
 ["e2e:openshift"]
 description = "Run OpenShift database-backend integration scenarios against a live cluster (requires oc CLI authenticated to an OpenShift cluster)"

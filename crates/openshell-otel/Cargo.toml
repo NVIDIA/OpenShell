@@ -11,6 +11,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+futures = { workspace = true }
 http = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
@@ -23,6 +24,7 @@ tonic = { workspace = true }
 tower-http = { workspace = true }
 
 [dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true }
 
 [lints]

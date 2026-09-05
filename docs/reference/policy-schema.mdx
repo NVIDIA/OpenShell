@@ -124,9 +124,9 @@ Sets the OS-level identity for the agent process inside the sandbox.
 | `run_as_group` | string | No | Overrides the group name or GID selected by the compute driver. Docker and Podman fall back to the image's OCI `USER`. |
 
 **Validation constraint:** An explicit policy value must be `sandbox` or a
-numeric UID/GID in the allowed sandbox range. Docker and Podman may select
-other named identities or non-root system IDs only through OCI `USER`
-fallback. Root identities are always rejected.
+numeric UID/GID from `1` through `4294967294`. OpenShell rejects `0` as root
+and `4294967295` as the invalid identity sentinel. Docker and Podman may select
+other named identities through OCI `USER` fallback.
 
 Omission is preserved independently for each field. For example, setting only
 `run_as_user` keeps that explicit user while allowing the active driver to
@@ -162,16 +162,16 @@ Each endpoint defines a reachable destination and optional inspection rules.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `host` | string | Yes | Hostname or IP address. Supports a `*` wildcard inside the first DNS label only: `*.example.com`, `**.example.com`, and intra-label patterns like `*-aiplatform.googleapis.com` are accepted; bare `*`/`**`, TLD wildcards (`*.com`), and wildcards outside the first label are rejected at load time. |
+| `host` | string | Conditional | Hostname or IP address. Required for `protocol: tcp`; transparent TCP requires a valid DNS hostname and rejects literal IPs. A non-TCP proxy endpoint may omit `host` only when `allowed_ips` supplies the destination constraint. Supports a `*` wildcard inside the first DNS label only: `*.example.com`, `**.example.com`, and intra-label patterns like `*-aiplatform.googleapis.com` are accepted; bare `*`/`**`, TLD wildcards (`*.com`), and wildcards outside the first label are rejected at load time. Prefer exact hosts for `protocol: tcp`: a wildcard authorizes DNS queries for all matching names and can provide a DNS-label exfiltration channel. |
 | `port` | integer | Yes | TCP port number. |
 | `path` | string | No | Optional HTTP path glob used to select between L7 endpoints that share the same host and port. Empty means all paths. Use this when REST and GraphQL live under the same host, such as `/repos/**` and `/graphql`. |
-| `protocol` | string | No | Set to `rest` for HTTP method/path inspection, `websocket` for RFC 6455 upgrade and client text-message inspection, `graphql` for GraphQL-over-HTTP operation inspection, `mcp` for MCP Streamable HTTP request inspection, or `json-rpc` for generic JSON-RPC-over-HTTP method inspection. WebSocket endpoints can also use GraphQL operation rules for GraphQL-over-WebSocket traffic. Omit for TCP passthrough. Provider-credentialed endpoints require an inspected protocol unless `allow_uninspected_credentials` is explicitly set. |
+| `protocol` | string | No | Set to `tcp` with a valid DNS hostname to allow native TCP clients through policy DNS and transparent capture without payload inspection. Omit the field for L4 passthrough through an explicit proxy, including legacy hostless `allowed_ips` endpoints. Set to `rest` for HTTP method/path inspection, `websocket` for RFC 6455 upgrade and client text-message inspection, `graphql` for GraphQL-over-HTTP operation inspection, `mcp` for MCP Streamable HTTP request inspection, or `json-rpc` for generic JSON-RPC-over-HTTP method inspection. WebSocket endpoints can also use GraphQL operation rules for GraphQL-over-WebSocket traffic. Provider-credentialed endpoints require an inspected protocol unless `allow_uninspected_credentials` is explicitly set. |
 | `tls` | string | No | TLS handling mode. The proxy auto-detects TLS by peeking the first bytes of each connection and terminates it for inspected HTTPS traffic, so this field is optional in most cases. Set to `skip` to disable auto-detection for edge cases such as client-certificate mTLS or non-standard protocols. Provider-credentialed endpoints reject `tls: skip` unless `allow_uninspected_credentials` is explicitly set. The values `terminate` and `passthrough` are deprecated and log a warning; they are still accepted for backward compatibility but have no effect on behavior. |
 | `enforcement` | string | No | `enforce` actively blocks disallowed requests. `audit` logs violations but allows traffic through. |
 | `access` | string | No | Access preset. One of `read-only`, `read-write`, or `full`. Mutually exclusive with `rules`. Not valid on `protocol: mcp` or `protocol: json-rpc`; MCP uses explicit rules unless `mcp.allow_all_known_mcp_methods: true` enables the endpoint method profile, and JSON-RPC always uses explicit rules. |
 | `rules` | list of allow rule objects | No | Fine-grained protocol-specific allow rules. Mutually exclusive with `access`. |
 | `deny_rules` | list of deny rule objects | No | L7 deny rules that block specific requests even when allowed by `access` or `rules`. Deny rules take precedence over allow rules. |
-| `allowed_ips` | list of string | No | CIDR or IP allowlist for SSRF override. Exact user-declared hostname endpoints may resolve to RFC 1918 private addresses without this field, but wildcard, hostless, and policy-advisor-proposed endpoints still require `allowed_ips` for private resolved IPs. Entries overlapping loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), or unspecified (`0.0.0.0`) are rejected at load time. |
+| `allowed_ips` | list of string | No | CIDR or IP allowlist for SSRF override. Exact user-declared hostname endpoints may resolve to RFC 1918 private addresses without this field, but wildcard, hostless, and policy-advisor-proposed endpoints still require `allowed_ips` for private resolved IPs. A hostless allowlist is valid only for the legacy proxy path and cannot be combined with `protocol: tcp`. Entries overlapping loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), or unspecified (`0.0.0.0`) are rejected at load time. |
 | `allow_encoded_slash` | bool | No | When `true`, L7 request parsing preserves `%2F` inside path segments instead of rejecting it. Use this for registries and APIs such as npm scoped packages (`/@scope%2Fname`). Defaults to `false`. |
 | `websocket_credential_rewrite` | bool | No | When `true` on a `protocol: rest` or `protocol: websocket` endpoint, OpenShell rewrites credential placeholders in client-to-server WebSocket text messages after an allowed HTTP `101` upgrade. On provider-credentialed endpoints without `allow_uninspected_credentials`, OpenShell uses the parsed relay and rejects binary frames; text frames containing placeholders fail closed when rewrite is disabled. Defaults to `false`. |
 | `request_body_credential_rewrite` | bool | No | When `true` on a `protocol: rest` endpoint, OpenShell rewrites credential placeholders in UTF-8 `application/json`, `application/x-www-form-urlencoded`, and `text/*` request bodies before forwarding upstream. The proxy buffers at most 256 KiB and updates `Content-Length` after rewriting. For chunked requests, the limit counts framing, extensions, and trailers. When rewrite is disabled and the sandbox has provider credentials, ordinary bodies continue to stream, but a reserved credential placeholder is rejected before its marker reaches upstream, including for providers without endpoint profiles. Defaults to `false`. Mutually exclusive with `credential_signing`. |
@@ -184,7 +184,8 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `persisted_queries` | string | No | GraphQL hash-only behavior for `protocol: graphql` and GraphQL-over-WebSocket operation policy. Default is `deny`; use `allow_registered` only with `graphql_persisted_queries`. |
 | `graphql_persisted_queries` | map | No | Trusted GraphQL persisted-query registry keyed by hash or saved-query ID. Values contain `operation_type`, optional `operation_name`, and optional root `fields`. |
 | `graphql_max_body_bytes` | integer | No | Maximum GraphQL-over-HTTP request body bytes buffered for inspection. Defaults to `65536`. |
-| `mcp` | object | No | MCP endpoint options for `protocol: mcp`. MCP endpoints must set a concrete `host` and `port` or `ports`; `protocol: mcp` alone is invalid and is not treated as a wildcard endpoint. |
+| `mcp` | object | No | MCP endpoint options for `protocol: mcp`. Omit this key to use all MCP endpoint defaults, including the exact `2025-11-25` revision; `mcp: null` is invalid. The object is rejected on other protocols. Every MCP endpoint must still set a concrete `host` and `port` or `ports`; an entry containing only `protocol: mcp` is invalid and is not treated as a wildcard endpoint. |
+| `mcp.versions` | list of string | No | Nonempty allowlist of exact supported MCP core revisions: `2025-03-26`, `2025-06-18`, and `2025-11-25`. Omission resolves to the exact allowlist `["2025-11-25"]`; it never means latest or all known revisions. The key must be absent to use this default; `versions: null` and `versions: []` are invalid. Use an explicit nonempty list only for intentional compatibility or downgrade control. The exact floor is `2025-03-26`; this is a closed set, not a date range. Values must be unique and contain no extra whitespace. Moving aliases such as `draft` and `latest`, unknown dates, and named SEP overlays are not accepted. OpenShell stores the materialized list in semantic order. The sessionless `2026-07-28` revision is not accepted until its distinct per-request runtime contract is supported. This field declares compatibility but does not yet select request parsing or forwarding behavior. For an unsupported revision, omit `protocol` and `mcp` only when deliberate uninspected L4 passthrough is an acceptable weaker boundary. |
 | `mcp.max_body_bytes` | integer | No | Maximum MCP JSON-RPC-over-HTTP request body bytes buffered for inspection. Defaults to `65536`. |
 | `mcp.strict_tool_names` | bool | No | Defaults to `true`. Requires `tools/call` `params.name` values to match `^[A-Za-z0-9_.-]{1,128}$` before policy evaluation. Set to `false` only for compatibility with MCP servers that intentionally use non-recommended tool names. Wildcard `tool` matchers require this to remain enabled. |
 | `mcp.allow_all_known_mcp_methods` | bool | No | Defaults to `false`. When `true`, enables the endpoint MCP method profile: omitted `rules` allow all MCP-family methods and all tools before `deny_rules`, and omitted rule `method` uses that profile. When unset or `false`, explicit MCP method rules are required; rules with `tool` or `params.name` must set `method: tools/call`. |
@@ -193,10 +194,17 @@ Each endpoint defines a reachable destination and optional inspection rules.
 **Validation constraints:**
 
 - `access` and `rules` are mutually exclusive; setting both is rejected.
+- `protocol: tcp` requires a valid DNS hostname. Hostless `allowed_ips`, IP-literal hosts, trailing-dot names, and malformed DNS selectors are rejected with a policy-validation error.
+- `protocol: tcp` requires at least one port and rejects L7-only fields, including `path`, `enforcement`, `access`, `rules`, `deny_rules`, request rewriting and credential signing fields, and GraphQL, JSON-RPC, or MCP options.
+- A `protocol: tcp` hostname constrains connection routing, not application authority. OpenShell does not inspect TLS SNI, HTTP `Host`, or another protocol-level destination in the stream. Compatible shared infrastructure can therefore expose other tenants, virtual hosts, or services behind an allowed hostname.
+- A sandbox runtime must support policy DNS and transparent TCP capture before it can activate a policy containing `protocol: tcp`. Docker and Podman provide this runtime support.
+- Adding the first `protocol: tcp` endpoint to a running sandbox that started without one is rejected atomically because its DNS and capture substrate is startup infrastructure. Recreate the sandbox with a TCP endpoint. A sandbox that started with the substrate can remove and re-add TCP endpoints dynamically.
+- Policy-advisor agent proposals cannot request `protocol: tcp` or `tls: skip`. Add native TCP or raw TLS access through an administrator-authored policy. Agent proposals may omit `protocol` to use the explicit proxy with its default TLS termination and HTTP authority checks.
 - When `protocol` is set, at least one of `access` or `rules` is required for `rest`, `websocket`, `graphql`, and `sql`.
 - `mcp` and `json-rpc` reject `access` presets; use explicit `rules`.
 - `json-rpc` requires explicit `rules` with `allow.method`.
 - `mcp` requires `rules` unless `mcp.allow_all_known_mcp_methods: true`.
+- YAML defaulting requires the `mcp` or `mcp.versions` key to be absent. Explicit `mcp: null`, `versions: null`, and `versions: []` values are rejected. At protobuf ingress, an empty repeated `versions` field means omission and resolves to `["2025-11-25"]` because protobuf repeated fields do not preserve field presence.
 - `deny_rules` require `protocol`. For non-MCP protocols, `deny_rules` also require `rules` or `access` to define the base allow set. MCP `deny_rules` may omit both when `mcp.allow_all_known_mcp_methods: true` supplies the base allow set.
 - `rules: []` (empty list) is rejected; use `access: full` or remove `rules`.
 - Non-empty `rules` must contain at least one effective allow clause; rules where every entry lacks an allow are rejected as deny-all.
@@ -214,7 +222,7 @@ global policies that use this field. Network policy admission does not expand
 the credential boundary unless the endpoint explicitly supplies this binding.
 OpenShell rejects a request mismatch with HTTP 403 and
 `credential_endpoint_mismatch`. Refer to [Static Credential Endpoint
-Binding](/sandboxes/providers-v2#understand-static-credential-endpoint-binding).
+Binding](/providers/profiles#understand-static-credential-endpoint-binding).
 
 This example allows the sandbox to reach Google Cloud Storage and binds the
 static credentials from the attached `work-gcp` provider to that endpoint:
@@ -338,7 +346,7 @@ Do not combine `method`, `path`, or `query` with `operation_type`, `operation_na
 
 ##### MCP Allow And Deny Rules (`protocol: mcp`)
 
-MCP rules match sandbox-to-server MCP Streamable HTTP request bodies by MCP method and optional tool selectors. OpenShell parses the underlying JSON-RPC 2.0 envelope, validates known MCP request and notification params, and preserves unknown extension methods as policy-addressable literal method strings. Until OpenShell exposes explicit MCP version profiles, `mcp.allow_all_known_mcp_methods` defaults to `false`, so endpoints require explicit MCP method rules. Set `mcp.allow_all_known_mcp_methods: true` to enable the endpoint method profile; in that mode, rules can omit `method`, and tool selectors are normalized to `tools/call` internally. By default, `tools/call` `params.name` must match the MCP-recommended tool-name pattern `^[A-Za-z0-9_.-]{1,128}$`; configure `mcp.strict_tool_names: false` on the endpoint only to allow a server that intentionally uses names outside that pattern. Wildcard `tool` matchers require `mcp.strict_tool_names` to remain enabled. JSON-RPC responses and server-to-client MCP messages on response bodies or SSE streams are relayed but are not currently parsed for policy enforcement.
+MCP rules match sandbox-to-server MCP Streamable HTTP request bodies by MCP method and optional tool selectors. OpenShell parses the underlying JSON-RPC 2.0 envelope, validates known MCP request and notification params, and preserves unknown extension methods as policy-addressable literal method strings. An endpoint that omits `mcp.versions`, including one that omits the entire `mcp` object, immediately resolves to the exact `2025-11-25` allowlist. Canonical serialization and stored policy data contain that explicit materialized list, so adding another supported revision cannot widen the normalized policy. The schema validates and canonicalizes an explicit nonempty allowlist as an advanced compatibility or downgrade control, but it does not yet use the allowlist to select request parsing or forwarding behavior. Later runtime negotiation must select one server-confirmed revision from the allowlist and apply only that profile, never a union or fallback. `mcp.allow_all_known_mcp_methods` defaults to `false`, so endpoints require explicit MCP method rules. Set it to `true` to enable the endpoint method profile; in that mode, rules can omit `method`, and tool selectors are normalized to `tools/call` internally. By default, `tools/call` `params.name` must match the MCP-recommended tool-name pattern `^[A-Za-z0-9_.-]{1,128}$`; configure `mcp.strict_tool_names: false` on the endpoint only to allow a server that intentionally uses names outside that pattern. Wildcard `tool` matchers require `mcp.strict_tool_names` to remain enabled. JSON-RPC responses and server-to-client MCP messages on response bodies or SSE streams are relayed but are not currently parsed for policy enforcement.
 
 Use `rules` for MCP allow rules and `deny_rules` for MCP deny rules. Deny rules take precedence over allow rules. If an MCP endpoint sets `mcp.allow_all_known_mcp_methods: true` and omits `rules`, OpenShell allows all MCP-family methods and all tools, then applies any `deny_rules`. Otherwise, the endpoint must define explicit rules. A broad allow or deny rule whose method matcher includes `tools/call` cannot be combined with tool-specific allow rules because it would bypass or erase the tool filter; add `tool` or `params.name` to scope `tools/call`, or remove the tool-specific rules. In a batch request, one denied call denies the full batch.
 
@@ -377,6 +385,15 @@ endpoints:
       - method: tools/call
         tool: execute_code
 ```
+
+This example omits `mcp.versions`, so OpenShell materializes `["2025-11-25"]`. To authorize an intentional compatibility range for an older server, set an explicit nonempty allowlist:
+
+```yaml showLineNumbers={false}
+mcp:
+  versions: ["2025-03-26", "2025-11-25"]
+```
+
+OpenShell canonicalizes an explicit list in semantic order. Later runtime negotiation selects one allowed revision and applies only that profile; it does not combine the profiles.
 
 ##### JSON-RPC Allow Rule (`protocol: json-rpc`)
 

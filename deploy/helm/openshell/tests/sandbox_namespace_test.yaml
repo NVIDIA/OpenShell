@@ -75,3 +75,21 @@ tests:
           path: metadata.namespace
           value: other-ns
         documentIndex: 1
+
+  - it: omits workspace resources in gateway-only mode
+    set:
+      workspaceResources.enabled: false
+      networkPolicy.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+        template: templates/gateway-config.yaml
+      - hasDocuments:
+          count: 0
+        template: templates/networkpolicy.yaml
+      - hasDocuments:
+          count: 0
+        template: templates/role.yaml
+      - hasDocuments:
+          count: 0
+        template: templates/rolebinding.yaml

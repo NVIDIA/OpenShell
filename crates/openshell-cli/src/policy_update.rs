@@ -327,9 +327,14 @@ fn parse_add_endpoint_spec(spec: &str) -> Result<NetworkEndpoint> {
             "--add-endpoint access segment must be one of read-only, read-write, or full; got '{access}' in '{spec}'"
         ));
     }
-    if !protocol.is_empty() && !matches!(protocol, "rest" | "websocket" | "sql") {
+    if !protocol.is_empty() && !matches!(protocol, "tcp" | "rest" | "websocket" | "sql") {
         return Err(miette!(
-            "--add-endpoint protocol segment must be 'rest', 'websocket', or 'sql'; got '{protocol}' in '{spec}'"
+            "--add-endpoint protocol segment must be 'tcp', 'rest', 'websocket', or 'sql'; got '{protocol}' in '{spec}'"
+        ));
+    }
+    if protocol == "tcp" && (!access.is_empty() || !enforcement.is_empty()) {
+        return Err(miette!(
+            "--add-endpoint protocol 'tcp' does not support access or enforcement in '{spec}'"
         ));
     }
     if !enforcement.is_empty() && !matches!(enforcement, "enforce" | "audit") {
@@ -545,6 +550,26 @@ mod tests {
         assert_eq!(endpoint.protocol, "websocket");
         assert_eq!(endpoint.access, "read-write");
         assert_eq!(endpoint.enforcement, "enforce");
+    }
+
+    #[test]
+    fn parse_add_endpoint_accepts_explicit_tcp_protocol() {
+        let plan = build_policy_update_plan(
+            &["database.example.com:5432::tcp".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect("plan should build");
+
+        let PolicyMergeOp::AddRule { rule, .. } = &plan.preview_operations[0] else {
+            panic!("expected add-rule preview");
+        };
+        assert_eq!(rule.endpoints[0].protocol, "tcp");
+        assert!(rule.endpoints[0].access.is_empty());
     }
 
     #[test]
@@ -834,6 +859,26 @@ mod tests {
             error
                 .to_string()
                 .contains("cannot set enforcement without protocol")
+        );
+    }
+
+    #[test]
+    fn parse_add_endpoint_rejects_l7_fields_with_tcp() {
+        let error = build_policy_update_plan(
+            &["database.example.com:5432::tcp:enforce".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect_err("TCP must reject L7 enforcement");
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not support access or enforcement")
         );
     }
 

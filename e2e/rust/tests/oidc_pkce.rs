@@ -136,9 +136,7 @@ async fn user_can_create_sandbox() {
 }
 
 /// Workspace users must be able to create sandboxes with inferred-provider
-/// commands (e.g. `claude`). The CLI calls `GetGatewayConfig` to check
-/// `providers_v2_enabled` before sandbox creation; that RPC must not be
-/// gated to Platform Admin or the workspace-user flow breaks.
+/// commands (e.g. `claude`) without requiring Platform Admin access.
 #[tokio::test]
 async fn user_can_create_sandbox_with_inferred_provider_command() {
     const WORKSPACE: &str = "oidc-inferred-cmd";
@@ -148,10 +146,9 @@ async fn user_can_create_sandbox_with_inferred_provider_command() {
     let _lifecycle = SANDBOX_LIFECYCLE_LOCK.lock().await;
 
     // Use `claude` as the command so the CLI infers provider type
-    // `claude-code` and calls `GetGatewayConfig` to check
-    // `providers_v2_enabled`. The sandbox won't actually start (no
-    // provider credentials), but we only care that the
-    // `GetGatewayConfig` call itself succeeds for a workspace user.
+    // `claude-code`. The sandbox won't actually start (no provider
+    // credentials), but provider inference must remain available to a
+    // workspace user.
     let output = run_workspace_cli(
         &user,
         WORKSPACE,
@@ -277,9 +274,9 @@ async fn admin_can_manage_provider() {
             "--name",
             PROVIDER,
             "--type",
-            "generic",
+            "openai",
             "--credential",
-            "TOKEN=e2e-test-value",
+            "OPENAI_API_KEY=e2e-test-value",
         ],
         "create a provider",
     )
@@ -315,9 +312,9 @@ async fn user_cannot_create_provider() {
             "--name",
             "oidc-pkce-user-provider",
             "--type",
-            "generic",
+            "openai",
             "--credential",
-            "TOKEN=e2e-test-value",
+            "OPENAI_API_KEY=e2e-test-value",
         ],
     )
     .await;
@@ -341,9 +338,9 @@ async fn user_cannot_delete_provider() {
             "--name",
             PROVIDER,
             "--type",
-            "generic",
+            "openai",
             "--credential",
-            "TOKEN=e2e-test-value",
+            "OPENAI_API_KEY=e2e-test-value",
         ],
         "create the provider deletion target",
     )
@@ -536,9 +533,9 @@ async fn workspace_admin_can_create_provider() {
             "--name",
             PROVIDER,
             "--type",
-            "generic",
+            "openai",
             "--credential",
-            "TOKEN=e2e-test-value",
+            "OPENAI_API_KEY=e2e-test-value",
         ],
         "create a provider as workspace admin",
     )
@@ -570,9 +567,9 @@ async fn workspace_admin_can_delete_provider() {
             "--name",
             PROVIDER,
             "--type",
-            "generic",
+            "openai",
             "--credential",
-            "TOKEN=e2e-test-value",
+            "OPENAI_API_KEY=e2e-test-value",
         ],
         "create the provider deletion target",
     )
@@ -787,9 +784,9 @@ async fn workspace_admin_cannot_manage_another_workspace_providers() {
             "--name",
             "oidc-wsa-xprovider",
             "--type",
-            "generic",
+            "openai",
             "--credential",
-            "TOKEN=e2e-test-value",
+            "OPENAI_API_KEY=e2e-test-value",
         ],
     )
     .await;
@@ -1372,8 +1369,10 @@ async fn delete_workspace(admin: &LoginSession, workspace: &str) {
     }
 }
 
+// Keep RBAC fixtures running until cleanup so authorization checks do not also
+// exercise fast canonical-process completion. That lifecycle belongs to the
+// dedicated sandbox_lifecycle suite.
 async fn assert_can_create_sandbox(session: &LoginSession, workspace: &str, sandbox_name: &str) {
-    let marker = format!("{sandbox_name}-ready");
     let create = run_workspace_cli(
         session,
         workspace,
@@ -1383,9 +1382,10 @@ async fn assert_can_create_sandbox(session: &LoginSession, workspace: &str, sand
             "--name",
             sandbox_name,
             "--no-tty",
+            "--detach",
             "--",
-            "echo",
-            &marker,
+            "sleep",
+            "infinity",
         ],
     )
     .await;
@@ -1405,10 +1405,6 @@ async fn assert_can_create_sandbox(session: &LoginSession, workspace: &str, sand
     let cleanup = run_workspace_cli(session, workspace, &["sandbox", "delete", sandbox_name]).await;
 
     assert!(
-        create_output.contains(&marker),
-        "sandbox command output should contain {marker}:\n{create_output}"
-    );
-    assert!(
         list.status.success() && list_output.contains(sandbox_name),
         "created sandbox {sandbox_name} should appear in the sandbox list:\n{list_output}"
     );
@@ -1420,7 +1416,6 @@ async fn assert_can_create_sandbox(session: &LoginSession, workspace: &str, sand
 }
 
 async fn assert_can_delete_sandbox(session: &LoginSession, workspace: &str, sandbox_name: &str) {
-    let marker = format!("{sandbox_name}-ready");
     let create = run_workspace_cli(
         session,
         workspace,
@@ -1430,9 +1425,10 @@ async fn assert_can_delete_sandbox(session: &LoginSession, workspace: &str, sand
             "--name",
             sandbox_name,
             "--no-tty",
+            "--detach",
             "--",
-            "echo",
-            &marker,
+            "sleep",
+            "infinity",
         ],
     )
     .await;
@@ -1558,11 +1554,15 @@ fn assert_platform_admin_denial(output: &Output, action: &str) {
 
 fn assert_non_member_denial(output: &Output, action: &str) {
     let denied = combined_output(output);
+    let compact_denial: String = denied
+        .chars()
+        .filter(|character| !character.is_whitespace() && *character != '│')
+        .collect();
     assert!(
         !output.status.success()
-            && denied
+            && compact_denial
                 .to_ascii_lowercase()
-                .contains("not a member of workspace"),
+                .contains("notamemberofworkspace"),
         "non-member unexpectedly authorized to {action}, or denial omitted membership context:\n{denied}"
     );
 }

@@ -78,6 +78,20 @@ type PolicyChunk struct {
 	ValidationResult string
 	// RejectionReason is the operator-supplied text accompanying a rejection.
 	RejectionReason string
+	// ApplicationError is the complete-candidate preflight/application failure.
+	ApplicationError string
+	// ReviewToken binds an approval to the exact evaluated candidate.
+	ReviewToken                  string
+	CurrentEffectivePolicyHash   string
+	CandidateEffectivePolicyHash string
+	CurrentEffectivePolicy       *SandboxPolicy
+	CandidateEffectivePolicy     *SandboxPolicy
+}
+
+// DraftChunkApproval binds one bulk approval decision to a reviewed chunk.
+type DraftChunkApproval struct {
+	ChunkID     string
+	ReviewToken string
 }
 
 // DraftPolicy contains the full draft policy state returned by GetDraft.
@@ -266,6 +280,14 @@ func (c *getDraftConfig) StatusFilter() string {
 // approveAllConfig holds configuration for ApproveAllDraftChunks calls.
 type approveAllConfig struct {
 	includeSecurityFlagged bool
+	approvals              []DraftChunkApproval
+}
+
+// WithDraftApprovals supplies the exact reviewed chunk tokens for bulk approval.
+func WithDraftApprovals(approvals ...DraftChunkApproval) ApproveAllOption {
+	return func(c *approveAllConfig) {
+		c.approvals = append([]DraftChunkApproval(nil), approvals...)
+	}
 }
 
 // ApproveAllOption configures an ApproveAllDraftChunks call.
@@ -290,6 +312,11 @@ func ApplyApproveAllOptions(opts []ApproveAllOption) approveAllConfig { //nolint
 // IncludeSecurityFlagged returns whether security-flagged chunks are included.
 func (c *approveAllConfig) IncludeSecurityFlagged() bool {
 	return c.includeSecurityFlagged
+}
+
+// Approvals returns a copy of the configured token-bound approvals.
+func (c *approveAllConfig) Approvals() []DraftChunkApproval {
+	return append([]DraftChunkApproval(nil), c.approvals...)
 }
 
 // getStatusConfig holds configuration for GetStatus calls.

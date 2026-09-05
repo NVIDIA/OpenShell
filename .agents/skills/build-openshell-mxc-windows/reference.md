@@ -85,7 +85,7 @@ Windows is a build target only. These runtimes remain unsupported:
 
 Rules:
 
-- Keep config/library stubs where the gateway needs them.
+- Keep registration stubs in the gateway composition crate where the gateway needs them.
 - Return clear unsupported errors at runtime.
 - Do not build standalone Windows driver binaries.
 - Do not add Docker Desktop, WSL, Hyper-V, Podman machine, Podman Desktop, or
@@ -180,7 +180,7 @@ blocked dependency.
 ### Focused tests report many filtered-out tests
 
 This is expected for `windows:test:unsupported:x64`. Cargo runs one named test
-and filters the other `openshell-server` tests. Report these as filtered, not
+and filters the other `openshell-gateway` tests. Report these as filtered, not
 ignored.
 
 ## Reporting Counts

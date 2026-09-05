@@ -75,6 +75,15 @@ type ProfileCredentialRefreshOutput struct {
 	Credential string
 }
 
+// CredentialTokenGrantType describes which OAuth2 grant type to use for dynamic credentials.
+type CredentialTokenGrantType string
+
+// CredentialTokenGrantType values.
+const (
+	CredentialTokenGrantTypeClientCredentials CredentialTokenGrantType = "ClientCredentials"
+	CredentialTokenGrantTypeTokenExchange     CredentialTokenGrantType = "TokenExchange"
+)
+
 // CredentialTokenGrant configures dynamic credential acquisition via OAuth2 grant.
 type CredentialTokenGrant struct {
 	TokenEndpoint       string
@@ -84,6 +93,16 @@ type CredentialTokenGrant struct {
 	CacheTTLSeconds     int64
 	AudienceOverrides   []TokenGrantAudienceOverride
 	ClientAssertionType string
+	GrantType           CredentialTokenGrantType
+	SubjectToken        *TokenGrantSubjectToken
+	RequestedTokenType  string
+}
+
+// TokenGrantSubjectToken configures the subject token for token exchange grants.
+type TokenGrantSubjectToken struct {
+	Source           string
+	Credential       string
+	SubjectTokenType string
 }
 
 // TokenGrantAudienceOverride selects an endpoint-specific resource audience.

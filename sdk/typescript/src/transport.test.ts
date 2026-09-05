@@ -5,9 +5,9 @@
 // contract without a live gateway: only PEM bytes are validated, no handshake
 // is performed.
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { errorCode } from './errors.js';
-import { buildTransport } from './transport.js';
+import { authInterceptor, buildTransport } from './transport.js';
 
 const pem = (label: string) => Buffer.from(`-----BEGIN ${label}-----\ntest\n-----END ${label}-----\n`);
 
@@ -63,6 +63,12 @@ describe('buildTransport token exclusivity', () => {
     }
   });
 
+  it('rejects a renewable provider combined with another token', () => {
+    const oidcTokenProvider = { getToken: async () => 'token' };
+    const fn = () => buildTransport({ gateway: 'https://gw.local', oidcToken: 'a', oidcTokenProvider });
+    expect(fn).toThrow(/mutually exclusive/);
+  });
+
   it('rejects edge tokens that could inject cookies or headers', () => {
     for (const edgeToken of ['', 'jwt; other=value', 'jwt\r\nx-injected: yes', 'jwt with spaces']) {
       const fn = () => buildTransport({ gateway: 'https://gw.local', edgeToken });
@@ -79,6 +85,29 @@ describe('buildTransport token exclusivity', () => {
     expect(
       buildTransport({ gateway: 'https://gw.local', edgeToken: 'eyJhbGciOiJSUzI1NiJ9.payload_signature' }),
     ).toBeTruthy();
+  });
+});
+
+describe('renewable bearer interceptor', () => {
+  it('awaits the provider and attaches its current token to every request', async () => {
+    const signal = new AbortController().signal;
+    const getToken = vi.fn().mockResolvedValueOnce('token-1').mockResolvedValueOnce('token-2');
+    const seen: string[] = [];
+    const next = vi.fn(async (req: { header: Headers }) => {
+      seen.push(req.header.get('authorization') ?? '');
+      return {} as never;
+    });
+    const invoke = authInterceptor({
+      gateway: 'https://gw.local',
+      oidcTokenProvider: { getToken },
+    })(next as never);
+
+    await invoke({ header: new Headers(), signal } as never);
+    await invoke({ header: new Headers(), signal } as never);
+
+    expect(seen).toEqual(['Bearer token-1', 'Bearer token-2']);
+    expect(getToken).toHaveBeenNthCalledWith(1, signal);
+    expect(getToken).toHaveBeenNthCalledWith(2, signal);
   });
 });
 

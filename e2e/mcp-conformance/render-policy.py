@@ -10,7 +10,7 @@ rewritten) URL the client should connect to. Used both to seed the reusable
 client sandbox with a placeholder policy and to install the per-scenario policy
 in client-through-openshell.sh.
 
-Usage: render-policy.py <server-url> <policy-file> <policy-template>
+Usage: render-policy.py <server-url> <policy-file> <policy-template> <mcp-version>
 """
 
 import json
@@ -21,7 +21,18 @@ from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
-raw_url, policy_file, policy_template = sys.argv[1:4]
+if len(sys.argv) != 5:
+    raise SystemExit(
+        "usage: render-policy.py <server-url> <policy-file> "
+        "<policy-template> <mcp-version>"
+    )
+
+raw_url, policy_file, policy_template, mcp_version = sys.argv[1:5]
+# Keep this boundary check synchronized with McpProtocolVersion::ALL. The
+# renderer is standalone Python, so it cannot import the Rust registry.
+supported_mcp_versions = {"2025-03-26", "2025-06-18", "2025-11-25"}
+if mcp_version not in supported_mcp_versions:
+    raise SystemExit(f"unsupported MCP protocol version: {mcp_version!r}")
 parsed = urlparse(raw_url)
 
 if parsed.scheme not in ("http", "https"):
@@ -69,6 +80,7 @@ policy = template.substitute(
     host_spec=f"host: {json.dumps(target_host)}",
     port_spec=f"        port: {port}",
     path=json.dumps(path),
+    mcp_version=json.dumps(mcp_version),
 )
 Path(policy_file).write_text(policy, encoding="utf-8")
 

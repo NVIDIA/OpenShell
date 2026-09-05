@@ -173,20 +173,6 @@ cleanup() {
         fi
     fi
 
-    # Restore the providers_v2_enabled setting to what it was before this
-    # run. The demo opts in to v2 composition so provider profiles
-    # contribute to the effective policy; restore so the host's broader
-    # workflow isn't affected.
-    if [[ -n "${PRIOR_PROVIDERS_V2_FLAG:-}" ]]; then
-        if [[ "$PRIOR_PROVIDERS_V2_FLAG" == "(unset)" ]]; then
-            "$OPENSHELL_BIN" settings delete --global --key providers_v2_enabled --yes \
-                >/dev/null 2>&1 || true
-        else
-            "$OPENSHELL_BIN" settings set --global --key providers_v2_enabled \
-                --value "$PRIOR_PROVIDERS_V2_FLAG" --yes >/dev/null 2>&1 || true
-        fi
-    fi
-
     if [[ $status -eq 0 ]]; then
         rm -rf "$TMP_DIR"
     else
@@ -347,7 +333,7 @@ create_providers() {
 
     "$OPENSHELL_BIN" provider create \
         --name "$DEMO_CODEX_PROVIDER_NAME" \
-        --type generic \
+        --type codex \
         --credential CODEX_AUTH_ACCESS_TOKEN \
         --credential CODEX_AUTH_REFRESH_TOKEN \
         --credential CODEX_AUTH_ACCOUNT_ID >/dev/null
@@ -355,7 +341,7 @@ create_providers() {
     "$OPENSHELL_BIN" provider create \
         --name "$DEMO_GITHUB_PROVIDER_NAME" \
         --type github \
-        --credential DEMO_GITHUB_TOKEN >/dev/null
+        --credential "GITHUB_TOKEN=$DEMO_GITHUB_TOKEN" >/dev/null
 
     info "providers created (codex, github) — credentials injected as env vars only"
 }
@@ -631,19 +617,6 @@ enable_agent_proposals() {
         || fail "could not enable agent_policy_proposals_enabled globally"
 }
 
-enable_providers_v2() {
-    # Providers-v2 composition is behind a global flag. The demo opts in
-    # so provider profiles (codex, github) contribute to the effective
-    # policy via composition. Cleanup restores the prior value.
-    local prior
-    prior="$("$OPENSHELL_BIN" settings get --global --json 2>/dev/null \
-        | jq -r '.settings.providers_v2_enabled // empty | tostring | select(. == "true" or . == "false")')"
-    PRIOR_PROVIDERS_V2_FLAG="${prior:-(unset)}"
-    "$OPENSHELL_BIN" settings set --global \
-        --key providers_v2_enabled --value true --yes >/dev/null \
-        || fail "could not enable providers_v2_enabled globally"
-}
-
 main() {
     validate_env
 
@@ -653,7 +626,6 @@ main() {
     render_payload
     create_providers
     enable_agent_proposals
-    enable_providers_v2
 
     show_run_summary
 

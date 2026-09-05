@@ -317,6 +317,19 @@ The supervisor uses `nsenter --net=` rather than `ip netns exec` to avoid sysfs
 remount issues that arise under rootless Podman where real host
 `CAP_SYS_ADMIN` is unavailable.
 
+For a policy with explicit `protocol: tcp` endpoints, this same inner namespace
+also hosts policy DNS and transparent TCP capture. The supervisor answers only
+policy-eligible names with epoch-scoped synthetic addresses, redirects TCP to
+those synthetic ranges into its transparent listener, and leaves direct real-IP
+dials subject to the terminal bypass fence. The Podman driver advertises this
+substrate through its driver-owned runtime capability; sandbox image and policy
+environment values cannot opt into it independently.
+
+The container spec preserves Podman's resolver search domains and options.
+Policy DNS captures both UDP and TCP in the inner namespace, so it does not
+depend on libc honoring `use-vc` and does not change ordinary short-name
+resolution for sandboxes that do not use native TCP.
+
 A tmpfs is mounted at `/run/netns` in the container spec so the supervisor can
 create named network namespaces. In rootless Podman this directory does not
 exist on the host, so a private tmpfs gives the supervisor its own writable

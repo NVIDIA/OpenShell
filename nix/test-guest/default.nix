@@ -3,18 +3,23 @@
 
 # PROTOTYPE: Composable distro VMs for installing and exercising artifacts.
 
-{ pkgs }:
+{
+  pkgs,
+  qemuPkgs ? pkgs,
+  firmwarePkgs ? pkgs,
+}:
 
 let
   isAarch64 = pkgs.stdenv.hostPlatform.isAarch64;
   isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
   architecture = if isAarch64 then "aarch64" else "x86_64";
-  qemu = pkgs.qemu.override { hostCpuOnly = true; };
+  qemu = qemuPkgs.qemu.override { hostCpuOnly = true; };
   qemuBinary =
     if isAarch64 then "${qemu}/bin/qemu-system-aarch64" else "${qemu}/bin/qemu-system-x86_64";
 
   distros = {
-    ubuntu = import ./distros/ubuntu.nix { inherit pkgs architecture; };
+    ubuntu-24-04 = import ./distros/ubuntu-24-04.nix { inherit pkgs architecture; };
+    ubuntu-26-04 = import ./distros/ubuntu-26-04.nix { inherit pkgs architecture; };
     centos = import ./distros/centos.nix { inherit pkgs architecture; };
     fedora = import ./distros/fedora.nix { inherit pkgs architecture; };
     rocky = import ./distros/rocky.nix { inherit pkgs architecture; };
@@ -22,9 +27,26 @@ let
 
   configurations = {
     docker = ./configuration/docker.yml;
-    podman = ./configuration/podman.yml;
+    podman-rootless = ./configuration/podman-rootless.yml;
     selinux = ./configuration/selinux.yml;
+    snapd = ./configuration/snapd.yml;
   };
+
+  configurationTasks = [
+    "podman-common.yml"
+    "podman-rootless/fedora.yml"
+    "podman-rootless/shared.yml"
+    "podman-rootless/ubuntu.yml"
+  ];
+
+  provisionerRoles = [
+    "openshell-development"
+    "openshell-rpm"
+    "openshell-rpm-latest-release"
+    "gateway-rootless-podman"
+    "openshell-rpm-gateway-reinstall"
+    "openshell-rpm-gateway-upgrade"
+  ];
 
   mkDistroProfile =
     name: distro:
@@ -47,7 +69,18 @@ let
   );
 
   configurationCatalog = pkgs.linkFarm "openshell-test-guest-configurations" (
-    pkgs.lib.mapAttrsToList (name: path: { inherit name path; }) configurations
+    (pkgs.lib.mapAttrsToList (name: path: { inherit name path; }) configurations)
+    ++ (map (name: {
+      name = "tasks/${name}";
+      path = ./configuration/tasks/${name};
+    }) configurationTasks)
+  );
+
+  provisionerCatalog = pkgs.linkFarm "openshell-test-guest-provisioners" (
+    map (name: {
+      inherit name;
+      path = ./provisioners/roles/${name};
+    }) provisionerRoles
   );
 
   runtimeInputs = [
@@ -69,14 +102,15 @@ let
     export OPENSHELL_TEST_GUEST_RUNTIME=1
     export OPENSHELL_TEST_GUEST_DISTROS=${distroCatalog}
     export OPENSHELL_TEST_GUEST_CONFIGURATIONS=${configurationCatalog}
+    export OPENSHELL_TEST_GUEST_PROVISIONERS=${provisionerCatalog}
     export OPENSHELL_TEST_GUEST_CACHE_LIB=${./cache-lib.sh}
     export OPENSHELL_TEST_GUEST_CACHE_RUNNER=${./cache.sh}
     export OPENSHELL_TEST_GUEST_CACHE_SEAL=${./cache-seal.sh}
     export OPENSHELL_TEST_GUEST_RUNNER=${./run.sh}
     export TEST_GUEST_BASH=${pkgs.bash}/bin/bash
     export TEST_GUEST_QEMU=${qemuBinary}
-    export TEST_GUEST_FIRMWARE_CODE=${pkgs.OVMF.firmware}
-    export TEST_GUEST_FIRMWARE_VARS=${pkgs.OVMF.variables}
+    export TEST_GUEST_FIRMWARE_CODE=${firmwarePkgs.OVMF.firmware}
+    export TEST_GUEST_FIRMWARE_VARS=${firmwarePkgs.OVMF.variables}
     export TEST_GUEST_MACHINE=${if isAarch64 then "virt" else "q35"}
     export TEST_GUEST_ACCELERATOR=${if isDarwin then "hvf" else "kvm"}
     export TEST_GUEST_ARCHITECTURE=${architecture}

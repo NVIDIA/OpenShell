@@ -102,6 +102,14 @@ sandboxServiceAccount:
   # -- Existing service account name for sandbox pods when sandboxServiceAccount.create is false.
   name: ""
 
+# Namespace-scoped resources needed to run sandboxes. Disable this when the
+# gateway and workspace prerequisites are managed as separate Helm releases
+# using the openshell-workspace chart.
+workspaceResources:
+  # -- Create the sandbox ServiceAccount, Role, RoleBinding, and NetworkPolicy
+  # from this chart. Disable for a gateway-only release.
+  enabled: true
+
 # -- Extra annotations to add to the gateway pod.
 podAnnotations: {}
 # -- Extra labels to add to the gateway pod.
@@ -132,6 +140,16 @@ service:
   healthPort: 8081
   # -- Gateway metrics service port.
   metricsPort: 9090
+
+# Agent Sandbox is a cluster-scoped prerequisite for the Kubernetes compute
+# driver. OpenShell deliberately does not install its CRDs or controller.
+# Enable this check for live Helm installs to fail before creating gateway
+# resources when neither supported Sandbox API is served. Disable it for
+# offline `helm template` and lint workflows, which cannot discover APIs.
+agentSandbox:
+  preflight:
+    # -- Check the live cluster for a supported Agent Sandbox API before rendering gateway resources. Disable only for offline rendering and linting.
+    enabled: true
 
 # Pod restart behavior and health probe tuning.
 podLifecycle:
@@ -179,8 +197,18 @@ affinity: {}
 
 # Server configuration
 server:
+  # -- Operator-facing gateway name. Defaults to the chart fullname so all
+  # replicas in one installation share an identity. Set explicitly when one
+  # telemetry collector receives spans from multiple namespaces or clusters.
+  name: ""
   # -- Gateway log level.
   logLevel: info
+  # OpenTelemetry trace export over OTLP/gRPC. Leave endpoint empty to disable.
+  otlp:
+    # -- OTLP/gRPC collector endpoint, conventionally using port 4317.
+    endpoint: ""
+    # -- Gateway OpenTelemetry service name. Empty uses openshell-gateway.
+    serviceName: ""
   # -- Enable anonymous OpenShell telemetry from the gateway and the sandbox
   # supervisors it launches.
   telemetryEnabled: true
@@ -339,6 +367,7 @@ server:
     certSecretName: openshell-server-tls
     # -- K8s secret with ca.crt for client certificate verification (mTLS).
     # Set to "" to disable mTLS and run HTTPS-only (use OIDC for auth instead).
+    # Do not set to null; omit the key to use the default secret name above.
     clientCaSecretName: openshell-server-client-ca
     # -- K8s secret mounted into sandbox pods for mTLS to the server.
     clientTlsSecretName: openshell-client-tls
@@ -366,15 +395,15 @@ server:
     # (owner-read only). Override to 0440 or 0444 if the container UID
     # does not match the volume file owner.
     secretDefaultMode: ""
-  # Dynamic provider token grants. When SPIFFE is enabled here, sandbox
-  # supervisors mount the SPIFFE Workload API socket so provider profiles can
-  # exchange JWT-SVIDs for upstream access tokens. Supervisor-to-gateway
-  # authentication still uses gateway-minted sandbox JWTs.
+  # Dynamic provider token grants. When SPIFFE is enabled here, both the
+  # gateway and sandbox supervisors mount the SPIFFE Workload API socket so
+  # token-exchange profiles can use gateway- and sandbox-scoped JWT-SVIDs.
+  # Supervisor-to-gateway authentication still uses gateway-minted sandbox JWTs.
   providerTokenGrants:
     spiffe:
-      # -- Mount the SPIFFE Workload API socket into sandbox pods for dynamic provider token grants.
+      # -- Mount the SPIFFE Workload API socket into gateway and sandbox pods for dynamic provider token grants.
       enabled: false
-      # -- Path to the SPIFFE Workload API socket mounted into sandbox pods.
+      # -- Path to the SPIFFE Workload API socket mounted into gateway and sandbox pods.
       workloadApiSocketPath: /spiffe-workload-api/spire-agent.sock
   # OIDC (OpenID Connect) configuration for JWT-based authentication.
   # When issuer is set, the server validates Bearer tokens on gRPC requests.
@@ -384,7 +413,7 @@ server:
     # -- Expected audience claim for the API resource server.
     # This should match the server's --oidc-audience, NOT the CLI client ID.
     audience: "openshell-cli"
-    # -- JWKS key cache TTL in seconds.
+    # -- JWKS key cache TTL in seconds. Must be greater than zero.
     jwksTtl: 3600
     # -- Dot-separated path to the roles array in the JWT claims.
     # Keycloak: "realm_access.roles", Entra ID: "roles", Okta: "groups".

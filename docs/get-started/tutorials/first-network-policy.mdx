@@ -65,15 +65,16 @@ The request fails. By default, all outbound network traffic is denied. The sandb
 curl: (56) Received HTTP code 403 from proxy after CONNECT
 ```
 
-Exit the sandbox. Sandboxes are kept running by default, so you can reconnect later. Use `--no-keep` at creation time if you want the sandbox deleted after exit:
+Leave this sandbox shell open and switch to a second terminal on your host for the next steps. The remaining `openshell` commands (checking logs and applying the policy) run on your host, not inside the sandbox.
 
-```shell
-exit
-```
+<Note>
+Keep the interactive sandbox shell open for the rest of the tutorial. Exiting it stops the sandbox's main process, and with the default restart policy the sandbox is not reconnectable afterward. Add `--no-keep` at creation time if you want the sandbox deleted automatically when you exit.
+
+</Note>
 
 ## Check the Deny Log
 
-Every denied connection produces a structured log entry. Query the sandbox logs from your host to confirm the denial and inspect the reason.
+Every denied connection produces a structured log entry. In your second (host) terminal, query the sandbox logs to confirm the denial and inspect the reason.
 
 ```shell
 openshell logs demo --since 5m
@@ -135,13 +136,7 @@ This tutorial uses `curl` and `read-only` access to keep things simple. When bui
 
 ## Verify If GET Requests Are Allowed
 
-The policy is now active. Reconnect to the sandbox and retry the same request to confirm that read access works.
-
-```shell
-openshell sandbox connect demo
-```
-
-Retry the same request:
+The policy is now active. Return to your sandbox shell in the first terminal (it is still running) and retry the same request to confirm that read access works:
 
 ```shell
 curl -s https://api.github.com/zen
@@ -169,15 +164,9 @@ curl -s -X POST https://api.github.com/repos/octocat/hello-world/issues \
 
 The CONNECT request succeeded because `api.github.com` is allowed, but the L7 proxy inspected the HTTP method and returned `403`. `POST` is not in the `read-only` preset. An agent with this policy can read code from GitHub but cannot create issues, push commits, or modify anything.
 
-Exit the sandbox:
-
-```shell
-exit
-```
-
 ## Check the L7 Deny Log
 
-L7 denials are logged separately from connection-level denials. The log entry includes the exact HTTP method and path that the proxy rejected.
+L7 denials are logged separately from connection-level denials. The log entry includes the exact HTTP method and path that the proxy rejected. Run this from your second (host) terminal, leaving the sandbox shell open:
 
 ```shell
 openshell logs demo --level warn --since 5m

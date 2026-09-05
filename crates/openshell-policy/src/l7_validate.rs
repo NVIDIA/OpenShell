@@ -41,6 +41,72 @@ impl L7Protocol {
     }
 }
 
+/// Returns whether the authored protocol explicitly selects L4 TCP handling.
+///
+/// `tcp` is intentionally not an [`L7Protocol`]. It is the explicit spelling
+/// of the existing L4 behavior and does not enable request inspection.
+pub fn is_explicit_tcp_protocol(protocol: &str) -> bool {
+    protocol.eq_ignore_ascii_case("tcp")
+}
+
+/// Reject transport choices that an in-sandbox agent must not grant itself.
+///
+/// An omitted protocol remains allowed: it uses the established explicit
+/// proxy, which canonicalizes forward HTTP authorities and terminates TLS by
+/// default. Native transparent TCP and `tls: skip` bypass those application
+/// authority checks, so only an administrator may author them directly.
+pub fn agent_authored_transport_rejection(protocol: &str, tls: &str) -> Option<&'static str> {
+    if is_explicit_tcp_protocol(protocol) {
+        return Some(
+            "agent-authored proposals cannot request protocol tcp; ask an administrator to add native TCP access explicitly",
+        );
+    }
+    if tls.eq_ignore_ascii_case("skip") {
+        return Some(
+            "agent-authored proposals cannot request tls: skip; ask an administrator to add raw TLS access explicitly",
+        );
+    }
+    None
+}
+
+/// Reject additional L7-only fields represented outside
+/// [`L7EndpointFields`] by the runtime and provider-profile schemas.
+///
+/// Callers pass only authored fields with a non-default value. Keeping the
+/// diagnostic construction here ensures both activation paths use the same
+/// explicit-TCP contract.
+pub fn validate_explicit_tcp_additional_fields(
+    protocol: &str,
+    present_fields: &[&str],
+) -> Vec<String> {
+    if !is_explicit_tcp_protocol(protocol) || present_fields.is_empty() {
+        return Vec::new();
+    }
+
+    vec![format!(
+        "protocol tcp does not support L7-only fields: {}; remove those fields",
+        present_fields.join(", ")
+    )]
+}
+
+#[cfg(test)]
+mod agent_transport_tests {
+    use super::agent_authored_transport_rejection;
+
+    #[test]
+    fn omitted_protocol_with_default_tls_remains_available_to_agents() {
+        assert_eq!(agent_authored_transport_rejection("", ""), None);
+    }
+
+    #[test]
+    fn agent_cannot_request_native_tcp_or_skip_tls_inspection() {
+        assert!(agent_authored_transport_rejection("tcp", "").is_some());
+        assert!(agent_authored_transport_rejection("TCP", "terminate").is_some());
+        assert!(agent_authored_transport_rejection("", "skip").is_some());
+        assert!(agent_authored_transport_rejection("rest", "SKIP").is_some());
+    }
+}
+
 /// Fields extracted from an endpoint definition needed for L7 semantic
 /// validation. Both profile lint and the runtime validator construct this
 /// from their own data representation.
@@ -78,15 +144,25 @@ pub fn validate_l7_endpoint_semantics(ep: &L7EndpointFields<'_>) -> Vec<String> 
     let mut errors = Vec::new();
     let protocol = ep.protocol;
     let l7_protocol = L7Protocol::parse(protocol);
+    let explicit_tcp = is_explicit_tcp_protocol(protocol);
     let jsonrpc_family = l7_protocol.is_some_and(L7Protocol::is_jsonrpc_family);
     let is_mcp = matches!(l7_protocol, Some(L7Protocol::Mcp));
     let is_jsonrpc = matches!(l7_protocol, Some(L7Protocol::JsonRpc));
 
     // 1. Unknown protocol
-    if !protocol.is_empty() && l7_protocol.is_none() {
+    if !protocol.is_empty() && l7_protocol.is_none() && !explicit_tcp {
         errors.push(format!(
-            "unknown protocol '{protocol}' (expected rest, websocket, graphql, sql, json-rpc, or mcp)"
+            "unknown protocol '{protocol}' (expected tcp, rest, websocket, graphql, sql, json-rpc, or mcp)"
         ));
+    }
+
+    // Explicit TCP is an L4 marker, not an inspection protocol. Reject L7
+    // policy fields instead of silently ignoring them.
+    if explicit_tcp && (!ep.access.is_empty() || ep.has_rules || ep.has_deny_rules) {
+        errors.push(
+            "protocol tcp does not support access, rules, or deny_rules; remove those L7 fields"
+                .to_string(),
+        );
     }
 
     // 2. rules + access mutually exclusive
@@ -119,7 +195,7 @@ pub fn validate_l7_endpoint_semantics(ep: &L7EndpointFields<'_>) -> Vec<String> 
 
     // 5. Non-MCP, non-JSON-RPC protocol requires rules or access (JSON-RPC's
     // dedicated message is emitted by rule 4).
-    if !protocol.is_empty() && !is_mcp && !is_jsonrpc && !ep.has_rules && ep.access.is_empty() {
+    if l7_protocol.is_some() && !is_mcp && !is_jsonrpc && !ep.has_rules && ep.access.is_empty() {
         errors.push("protocol requires rules or access to define allowed traffic".to_string());
     }
 
@@ -141,7 +217,7 @@ pub fn validate_l7_endpoint_semantics(ep: &L7EndpointFields<'_>) -> Vec<String> 
     }
 
     // 8. deny_rules require protocol
-    if ep.has_deny_rules && protocol.is_empty() {
+    if ep.has_deny_rules && l7_protocol.is_none() {
         errors.push("deny_rules require protocol (L7 inspection must be enabled)".to_string());
     }
 
@@ -377,6 +453,51 @@ mod tests {
         };
         let errors = validate_l7_endpoint_semantics(&ep);
         assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn explicit_tcp_is_valid_without_l7_fields() {
+        let ep = L7EndpointFields {
+            protocol: "tcp",
+            access: "",
+            has_rules: false,
+            has_deny_rules: false,
+            rules_would_deny_all: false,
+            allow_all_known_mcp_methods: false,
+        };
+        let errors = validate_l7_endpoint_semantics(&ep);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+        assert!(is_explicit_tcp_protocol("TCP"));
+        assert_eq!(L7Protocol::parse("tcp"), None);
+    }
+
+    #[test]
+    fn explicit_tcp_rejects_l7_fields() {
+        let ep = L7EndpointFields {
+            protocol: "tcp",
+            access: "full",
+            has_rules: false,
+            has_deny_rules: false,
+            rules_would_deny_all: false,
+            allow_all_known_mcp_methods: false,
+        };
+        let errors = validate_l7_endpoint_semantics(&ep);
+        assert_eq!(
+            errors,
+            vec![
+                "protocol tcp does not support access, rules, or deny_rules; remove those L7 fields"
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_tcp_rejects_additional_l7_fields() {
+        let errors =
+            validate_explicit_tcp_additional_fields("tcp", &["enforcement", "credential_signing"]);
+
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("enforcement, credential_signing"));
+        assert!(validate_explicit_tcp_additional_fields("rest", &["enforcement"]).is_empty());
     }
 
     #[test]

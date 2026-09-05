@@ -25,7 +25,7 @@ node = "24.15.0"
 kubectl = { version = "1.36.1", version_prefix = "v" }
 uv = "0.10.12"
 protoc = "29.6"
-go = "1.26"
+go = "1.26.7"
 "go:github.com/golangci/golangci-lint/v2/cmd/golangci-lint" = "2.12"
 "go:google.golang.org/protobuf/cmd/protoc-gen-go" = "1.36.11"
 "go:google.golang.org/grpc/cmd/protoc-gen-go-grpc" = "1.6.2"
@@ -33,6 +33,7 @@ go = "1.26"
 buf = "1.72.0"
 helm = { version = "4.2.0", version_prefix = "v" }
 helm-docs = "1.14.2"
+yq = "4.53.6"
 skaffold = { version = "2.20.0", os = ["linux", "macos"], version_prefix = "v" }
 # Keep k3d out of Linux CI images until upstream ships a release rebuilt with
 # patched Go/container dependencies. Linux Kubernetes E2E uses kind or an
@@ -42,6 +43,7 @@ k3d = { version = "5.8.3", os = ["macos"] }
 "github:EmbarkStudios/cargo-about" = { version = "0.8.4", version_prefix = "" }
 "github:EmbarkStudios/cargo-deny" = { version = "0.20.2", version_prefix = "" }
 zig = "0.14.1"
+"github:rust-secure-code/cargo-auditable" = "0.7.5"
 "github:rust-cross/cargo-zigbuild" = "0.22.3"
 "npm:markdownlint-cli2" = "0.22.0"
 

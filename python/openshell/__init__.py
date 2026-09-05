@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from .sandbox import (
+    ClientCredentialsAuth,
     ExecChunk,
     ExecResult,
     InferenceRouteClient,
@@ -16,6 +17,8 @@ from .sandbox import (
     SandboxRef,
     SandboxSession,
     SandboxStatusRef,
+    SandboxTemplateClient,
+    SandboxWorkloadTemplateProvenanceRef,
     TlsConfig,
     WorkspaceClient,
     WorkspaceRef,
@@ -29,6 +32,7 @@ except Exception:
     __version__ = "0.0.0"
 
 __all__ = [
+    "ClientCredentialsAuth",
     "ExecChunk",
     "ExecResult",
     "InferenceRouteClient",
@@ -39,6 +43,8 @@ __all__ = [
     "SandboxRef",
     "SandboxSession",
     "SandboxStatusRef",
+    "SandboxTemplateClient",
+    "SandboxWorkloadTemplateProvenanceRef",
     "TlsConfig",
     "WorkspaceClient",
     "WorkspaceRef",

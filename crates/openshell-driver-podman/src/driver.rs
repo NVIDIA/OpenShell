@@ -33,8 +33,11 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{Instrument as _, debug, info, warn};
 use url::Url;
+
+const STOP_COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const STOP_COMPLETION_TIMEOUT_HEADROOM: Duration = Duration::from_secs(5);
 
 impl From<PodmanApiError> for ComputeDriverError {
     fn from(value: PodmanApiError) -> Self {
@@ -174,6 +177,41 @@ async fn create_sandbox_proxy_auth_secret(
     Ok(Some(secret_name))
 }
 
+/// Fail-closed readability check for the corporate proxy CA bundle.
+///
+/// When `proxy_ca_bundle` is configured the host PEM is bind-mounted read-only
+/// into the sandbox; verifying up front that it exists and is a non-empty
+/// regular file turns a missing path into a clear `proxy_ca_bundle` error at
+/// sandbox-create time instead of an opaque bind-mount failure. The supervisor
+/// independently validates the certificate content (fail-closed) at startup.
+async fn validate_sandbox_proxy_ca_bundle(
+    config: &PodmanComputeConfig,
+) -> Result<(), ComputeDriverError> {
+    let Some(path) = config.proxy_ca_bundle.as_deref() else {
+        return Ok(());
+    };
+    let path_owned = path.to_string();
+    let metadata = tokio::task::spawn_blocking(move || std::fs::metadata(&path_owned))
+        .await
+        .map_err(|e| ComputeDriverError::Message(format!("proxy_ca_bundle stat task failed: {e}")))?
+        .map_err(|err| {
+            ComputeDriverError::InvalidArgument(format!(
+                "proxy_ca_bundle '{path}' could not be read: {err}"
+            ))
+        })?;
+    if !metadata.is_file() {
+        return Err(ComputeDriverError::InvalidArgument(format!(
+            "proxy_ca_bundle '{path}' is not a regular file"
+        )));
+    }
+    if metadata.len() == 0 {
+        return Err(ComputeDriverError::InvalidArgument(format!(
+            "proxy_ca_bundle '{path}' is empty"
+        )));
+    }
+    Ok(())
+}
+
 async fn cleanup_sandbox_proxy_auth_secret(client: &PodmanClient, secret_name: &str) {
     if let Err(err) = client.remove_secret(secret_name).await {
         warn!(
@@ -273,11 +311,21 @@ fn podman_gpu_selection_error(err: CdiGpuSelectionError) -> ComputeDriverError {
     ComputeDriverError::Precondition(err.to_string())
 }
 
+/// Return the first responsive local Podman API socket.
+#[must_use]
+pub fn detect_socket() -> Option<PathBuf> {
+    crate::socket_discovery::detect_socket()
+}
+
+#[must_use]
+pub fn is_available() -> bool {
+    detect_socket().is_some()
+}
+
 /// Resolve the socket to connect to: explicit configuration wins, otherwise
 /// fall back to `detect`. Returns an error if neither resolves.
 ///
-/// Takes `detect` as a parameter (rather than calling
-/// [`openshell_core::config::detect_podman_socket`] directly) so tests can
+/// Takes `detect` as a parameter so tests can
 /// exercise the precedence deterministically, without touching real
 /// environment variables or the filesystem.
 fn resolve_socket_path(
@@ -299,10 +347,7 @@ impl PodmanComputeDriver {
         const MAX_PING_RETRIES: u32 = 5;
         const PING_RETRY_DELAY: Duration = Duration::from_secs(2);
 
-        let socket_path = resolve_socket_path(
-            config.socket_path.clone(),
-            openshell_core::config::detect_podman_socket,
-        )?;
+        let socket_path = resolve_socket_path(config.socket_path.clone(), detect_socket)?;
         config.socket_path = Some(socket_path.clone());
 
         if !socket_path.exists() {
@@ -464,11 +509,14 @@ impl PodmanComputeDriver {
 
     /// Report driver capabilities.
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, ComputeDriverError> {
-        Ok(openshell_core::driver_utils::build_capabilities_response(
-            "podman",
-            openshell_core::VERSION,
-            &self.config.default_image,
-        ))
+        Ok(GetCapabilitiesResponse {
+            driver_name: "podman".to_string(),
+            driver_version: openshell_core::VERSION.to_string(),
+            default_image: self.config.default_image.clone(),
+            gateway_manages_lifecycle: true,
+            supports_sandbox_authentication: false,
+            driver_reports_runtime_readiness: false,
+        })
     }
 
     /// Report the gateway exposure needed by Podman's standard local callback aliases.
@@ -679,7 +727,18 @@ impl PodmanComputeDriver {
     }
 
     /// Create a sandbox container.
+    #[tracing::instrument(
+        name = "podman.provision",
+        skip(self, sandbox),
+        fields(
+            otel.name = "podman.provision",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox.id,
+            sandbox.name = %sandbox.name,
+        )
+    )]
     pub async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), ComputeDriverError> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         if sandbox.name.is_empty() {
             return Err(ComputeDriverError::Precondition(
                 "sandbox name is required".into(),
@@ -706,84 +765,126 @@ impl PodmanComputeDriver {
             "Creating sandbox container"
         );
 
-        // 1a. Pull the supervisor image if needed. The supervisor binary
-        //     is shipped in a standalone OCI image and mounted into sandbox
-        //     containers via Podman's type=image mount. Refresh mutable tags
-        //     like latest/dev, but avoid registry checks for pinned images.
-        let supervisor_pull_policy = supervisor_image_pull_policy(&self.config.supervisor_image);
-        info!(
-            image = %self.config.supervisor_image,
-            policy = supervisor_pull_policy,
-            "Ensuring supervisor image"
-        );
-        self.client
-            .pull_image(&self.config.supervisor_image, supervisor_pull_policy)
-            .await
-            .map_err(ComputeDriverError::from)?;
+        let (image, immutable_image_id, image_user) = async {
+            let phase_status = openshell_otel::ErrorStatusGuard::current();
+            let result = async {
+                // The supervisor binary is shipped in a standalone OCI image and
+                // mounted into sandbox containers via Podman's type=image mount.
+                let supervisor_pull_policy =
+                    supervisor_image_pull_policy(&self.config.supervisor_image);
+                info!(
+                    image = %self.config.supervisor_image,
+                    policy = supervisor_pull_policy,
+                    "Ensuring supervisor image"
+                );
+                self.client
+                    .pull_image(&self.config.supervisor_image, supervisor_pull_policy)
+                    .await
+                    .map_err(ComputeDriverError::from)?;
 
-        // 1b. Pull the sandbox image if needed (Podman does not pull on create).
-        let image = container::resolve_image(sandbox, &self.config);
-        if image.is_empty() {
-            return Err(ComputeDriverError::Precondition(
-                "no sandbox image configured: set default_image in [openshell.drivers.podman] \
-                 or provide an image in the sandbox template"
-                    .to_string(),
-            ));
-        }
-        let pull_policy = self.config.image_pull_policy.as_str();
-        info!(image = %image, policy = %pull_policy, "Ensuring sandbox image");
-        self.client
-            .pull_image(image, pull_policy)
-            .await
-            .map_err(ComputeDriverError::from)?;
-        let inspected_image = self
-            .client
-            .inspect_image(image)
-            .await
-            .map_err(ComputeDriverError::from)?;
-        if inspected_image.id.is_empty() {
-            return Err(ComputeDriverError::Precondition(format!(
-                "podman image '{image}' inspection did not return an immutable image ID"
-            )));
-        }
-        let image_user = inspected_image
-            .config
-            .as_ref()
-            .map_or("", |config| config.user.as_str());
-
-        for image in
-            container::podman_driver_image_mount_sources(sandbox, self.config.enable_bind_mounts)
-                .map_err(ComputeDriverError::Precondition)?
-        {
-            info!(image = %image, policy = %pull_policy, "Ensuring image mount source");
-            self.client
-                .pull_image(&image, pull_policy)
-                .await
-                .map_err(ComputeDriverError::from)?;
-        }
-
-        // 2. Create workspace volume and per-sandbox token secret.
-        if let Err(e) = self.client.create_volume(&vol_name).await {
-            return Err(ComputeDriverError::from(e));
-        }
-        let token_secret_name = match create_sandbox_token_secret(&self.client, sandbox).await {
-            Ok(name) => name,
-            Err(e) => {
-                let _ = self.client.remove_volume(&vol_name).await;
-                return Err(e);
-            }
-        };
-        let proxy_auth_secret_name =
-            match create_sandbox_proxy_auth_secret(&self.client, &self.config, sandbox).await {
-                Ok(name) => name,
-                Err(e) => {
-                    let _ = self.client.remove_volume(&vol_name).await;
-                    if let Some(secret) = token_secret_name.as_deref() {
-                        cleanup_sandbox_token_secret(&self.client, secret).await;
-                    }
-                    return Err(e);
+                // Podman does not pull the sandbox image on container creation.
+                let image = container::resolve_image(sandbox, &self.config);
+                if image.is_empty() {
+                    return Err(ComputeDriverError::Precondition(
+                        "no sandbox image configured: set default_image in \
+                         [openshell.drivers.podman] or provide an image in the sandbox template"
+                            .to_string(),
+                    ));
                 }
-            };
+                let pull_policy = self.config.image_pull_policy.as_str();
+                info!(image = %image, policy = %pull_policy, "Ensuring sandbox image");
+                self.client
+                    .pull_image(image, pull_policy)
+                    .await
+                    .map_err(ComputeDriverError::from)?;
+                let inspected_image = self
+                    .client
+                    .inspect_image(image)
+                    .await
+                    .map_err(ComputeDriverError::from)?;
+                if inspected_image.id.is_empty() {
+                    return Err(ComputeDriverError::Precondition(format!(
+                        "podman image '{image}' inspection did not return an immutable image ID"
+                    )));
+                }
+                let image_user = inspected_image
+                    .config
+                    .as_ref()
+                    .map_or_else(String::new, |config| config.user.clone());
+
+                for mount_image in container::podman_driver_image_mount_sources(
+                    sandbox,
+                    self.config.enable_bind_mounts,
+                )
+                .map_err(ComputeDriverError::Precondition)?
+                {
+                    info!(image = %mount_image, policy = %pull_policy, "Ensuring image mount source");
+                    self.client
+                        .pull_image(&mount_image, pull_policy)
+                        .await
+                        .map_err(ComputeDriverError::from)?;
+                }
+
+                Ok((image.to_string(), inspected_image.id, image_user))
+            }
+            .await;
+            phase_status.finish(result)
+        }
+        .instrument(tracing::info_span!(
+            "podman.prepare_images",
+            otel.name = "podman.prepare_images",
+            otel.status_code = tracing::field::Empty,
+        ))
+        .await?;
+
+        // Fail closed on a missing/unreadable corporate proxy CA bundle before
+        // creating any resources, so the operator gets a clear error
+        // attributable to `proxy_ca_bundle` rather than an opaque bind-mount
+        // failure. The supervisor independently validates the certificate
+        // content at startup.
+        validate_sandbox_proxy_ca_bundle(&self.config).await?;
+
+        // Create workspace volume and per-sandbox token secret.
+        let (token_secret_name, proxy_auth_secret_name) = async {
+            let phase_status = openshell_otel::ErrorStatusGuard::current();
+            let result = async {
+                self.client
+                    .create_volume(&vol_name)
+                    .await
+                    .map_err(ComputeDriverError::from)?;
+                let token_secret_name =
+                    match create_sandbox_token_secret(&self.client, sandbox).await {
+                        Ok(name) => name,
+                        Err(e) => {
+                            let _ = self.client.remove_volume(&vol_name).await;
+                            return Err(e);
+                        }
+                    };
+                let proxy_auth_secret_name =
+                    match create_sandbox_proxy_auth_secret(&self.client, &self.config, sandbox)
+                        .await
+                    {
+                        Ok(name) => name,
+                        Err(e) => {
+                            let _ = self.client.remove_volume(&vol_name).await;
+                            if let Some(secret) = token_secret_name.as_deref() {
+                                cleanup_sandbox_token_secret(&self.client, secret).await;
+                            }
+                            return Err(e);
+                        }
+                    };
+                Ok((token_secret_name, proxy_auth_secret_name))
+            }
+            .await;
+            phase_status.finish(result)
+        }
+        .instrument(tracing::info_span!(
+            "podman.prepare_storage",
+            otel.name = "podman.prepare_storage",
+            otel.status_code = tracing::field::Empty,
+            volume.name = %vol_name,
+        ))
+        .await?;
 
         // Clean up the volume and both per-sandbox secrets on any failure past
         // this point.
@@ -797,41 +898,93 @@ impl PodmanComputeDriver {
             }
         };
 
-        // 3. Create container.
-        let gpu_devices = match self.resolve_gpu_cdi_devices(
-            validated.gpu_requirements,
-            &validated.driver_config,
-            CdiGpuDefaultSelector::next_device_ids,
-        ) {
-            Ok(devices) => devices,
-            Err(e) => {
-                cleanup_created().await;
-                return Err(e);
-            }
-        };
-        let supervisor_bin_path = if userns_needs_extraction(self.config.userns.as_deref()) {
-            match extract_supervisor_bin(&self.client, &self.config).await {
-                Ok(path) => Some(path),
-                Err(e) => {
-                    cleanup_created().await;
-                    return Err(e);
-                }
-            }
-        } else {
-            None
-        };
+        // Prepare and create the container.
+        let tls_secret_names = async {
+            let phase_status = openshell_otel::ErrorStatusGuard::current();
+            let result = async {
+                let gpu_devices = match self.resolve_gpu_cdi_devices(
+                    validated.gpu_requirements,
+                    &validated.driver_config,
+                    CdiGpuDefaultSelector::next_device_ids,
+                ) {
+                    Ok(devices) => devices,
+                    Err(e) => {
+                        cleanup_created().await;
+                        return Err(e);
+                    }
+                };
+                let supervisor_bin_path = if userns_needs_extraction(self.config.userns.as_deref())
+                {
+                    match extract_supervisor_bin(&self.client, &self.config).await {
+                        Ok(path) => Some(path),
+                        Err(e) => {
+                            cleanup_created().await;
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    None
+                };
 
-        let tls_secret_names =
-            if userns_remaps_uids(self.config.userns.as_deref()) && self.config.tls_enabled() {
-                let names = container::tls_secret_names(&sandbox.id);
-                if let Err(e) = create_tls_secrets(&self.client, &self.config, &names).await {
+                let tls_secret_names = if userns_remaps_uids(self.config.userns.as_deref())
+                    && self.config.tls_enabled()
+                {
+                    let names = container::tls_secret_names(&sandbox.id);
+                    if let Err(e) = create_tls_secrets(&self.client, &self.config, &names).await {
+                        cleanup_created().await;
+                        return Err(e);
+                    }
+                    Some(names)
+                } else {
+                    None
+                };
+
+                let cleanup_all = || async {
                     cleanup_created().await;
-                    return Err(e);
+                    if let Some(names) = &tls_secret_names {
+                        cleanup_tls_secrets(&self.client, names).await;
+                    }
+                };
+
+                let spec = match container::build_container_spec_for_image(
+                    sandbox,
+                    &self.config,
+                    token_secret_name.as_deref(),
+                    gpu_devices.as_deref(),
+                    &image,
+                    &immutable_image_id,
+                    &image_user,
+                    supervisor_bin_path.as_deref(),
+                    tls_secret_names.as_ref(),
+                ) {
+                    Ok(spec) => spec,
+                    Err(e) => {
+                        cleanup_all().await;
+                        return Err(e);
+                    }
+                };
+                match self.client.create_container(&spec).await {
+                    Ok(_) => Ok(tls_secret_names),
+                    Err(PodmanApiError::Conflict(_)) => {
+                        cleanup_all().await;
+                        Err(ComputeDriverError::AlreadyExists)
+                    }
+                    Err(e) => {
+                        cleanup_all().await;
+                        Err(ComputeDriverError::from(e))
+                    }
                 }
-                Some(names)
-            } else {
-                None
-            };
+            }
+            .await;
+            phase_status.finish(result)
+        }
+        .instrument(tracing::info_span!(
+            "podman.prepare_container",
+            otel.name = "podman.prepare_container",
+            otel.status_code = tracing::field::Empty,
+            container.name = %name,
+        ))
+        .await?;
 
         let cleanup_all = || async {
             cleanup_created().await;
@@ -840,37 +993,24 @@ impl PodmanComputeDriver {
             }
         };
 
-        let spec = match container::build_container_spec_for_image(
-            sandbox,
-            &self.config,
-            token_secret_name.as_deref(),
-            gpu_devices.as_deref(),
-            image,
-            &inspected_image.id,
-            image_user,
-            supervisor_bin_path.as_deref(),
-            tls_secret_names.as_ref(),
-        ) {
-            Ok(spec) => spec,
-            Err(e) => {
-                cleanup_all().await;
-                return Err(e);
-            }
-        };
-        match self.client.create_container(&spec).await {
-            Ok(_) => {}
-            Err(PodmanApiError::Conflict(_)) => {
-                cleanup_all().await;
-                return Err(ComputeDriverError::AlreadyExists);
-            }
-            Err(e) => {
-                cleanup_all().await;
-                return Err(ComputeDriverError::from(e));
-            }
+        // Start container.
+        let start_result = async {
+            let phase_status = openshell_otel::ErrorStatusGuard::current();
+            let result = self
+                .client
+                .start_container(&name)
+                .await
+                .map_err(ComputeDriverError::from);
+            phase_status.finish(result)
         }
-
-        // 5. Start container.
-        if let Err(e) = self.client.start_container(&name).await {
+        .instrument(tracing::info_span!(
+            "podman.start_container",
+            otel.name = "podman.start_container",
+            otel.status_code = tracing::field::Empty,
+            container.name = %name,
+        ))
+        .await;
+        if let Err(e) = start_result {
             warn!(
                 sandbox_name = %sandbox.name,
                 error = %e,
@@ -881,7 +1021,7 @@ impl PodmanComputeDriver {
                 .remove_container(&name, self.config.stop_timeout_secs)
                 .await;
             cleanup_all().await;
-            return Err(ComputeDriverError::from(e));
+            return Err(e);
         }
 
         info!(
@@ -890,7 +1030,7 @@ impl PodmanComputeDriver {
             "Sandbox container started"
         );
 
-        Ok(())
+        span_status.finish(Ok(()))
     }
 
     /// Find the Podman container ID for a sandbox by its sandbox ID using label lookup.
@@ -914,32 +1054,117 @@ impl PodmanComputeDriver {
         Ok(entries.into_iter().next())
     }
 
+    async fn wait_for_container_stopped(
+        &self,
+        sandbox_id: &str,
+        container_id: &str,
+    ) -> Result<Option<String>, ComputeDriverError> {
+        let timeout = Duration::from_secs(u64::from(self.config.stop_timeout_secs))
+            + STOP_COMPLETION_TIMEOUT_HEADROOM;
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let inspect = self
+                .client
+                .inspect_container(container_id)
+                .await
+                .map_err(ComputeDriverError::from)?;
+            if matches!(inspect.state.status.as_str(), "exited" | "stopped") {
+                return Ok(inspect.state.finished_at);
+            }
+
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(ComputeDriverError::Message(format!(
+                    "container {container_id} for sandbox {sandbox_id} did not finish stopping within {timeout:?} (last state: {})",
+                    inspect.state.status,
+                )));
+            }
+            tokio::time::sleep(STOP_COMPLETION_POLL_INTERVAL.min(deadline - now)).await;
+        }
+    }
+
     /// Stop a sandbox container without deleting it.
+    #[tracing::instrument(
+        name = "podman.stop_sandbox",
+        skip(self),
+        fields(
+            otel.name = "podman.stop_sandbox",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+        )
+    )]
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), ComputeDriverError> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         let container = self
             .find_container(sandbox_id)
             .await?
             .ok_or(ComputeDriverError::NotFound)?;
-        if container.state != "running" {
-            return Ok(());
-        }
         let container_id = container.id;
+        if container.state == "stopping" {
+            let result = async {
+                let finished_at = self
+                    .wait_for_container_stopped(sandbox_id, &container_id)
+                    .await?;
+                self.lifecycle_event_fences
+                    .record_previous_exit(sandbox_id, finished_at.as_deref());
+                Ok(())
+            }
+            .await;
+            return span_status.finish(result);
+        }
+        if container.state != "running" {
+            return span_status.finish(Ok(()));
+        }
         info!(sandbox_id = %sandbox_id, container = %container_id, "Stopping sandbox container");
 
-        self.client
-            .stop_container(&container_id, self.config.stop_timeout_secs)
-            .await
-            .map_err(ComputeDriverError::from)
+        let result = async {
+            self.client
+                .stop_container(&container_id, self.config.stop_timeout_secs)
+                .await
+                .map_err(ComputeDriverError::from)?;
+
+            // Podman can return from the stop request before inspect reports the
+            // container as exited. If start runs during that interval, the exit
+            // event from the previous run can arrive after the gateway has moved
+            // the same sandbox to Starting, causing it to regress to Error. Wait
+            // for the terminal container state before allowing a restart.
+            let finished_at = self
+                .wait_for_container_stopped(sandbox_id, &container_id)
+                .await?;
+
+            // Record the completed run before returning the stop RPC. The server
+            // may begin a restart as soon as this method returns, while Podman's
+            // stop/die event can still be queued. Recording the fence here keeps
+            // that delayed event from regressing the new run from Starting to
+            // Error. Keep the start-side recording as a fallback for restarts
+            // after a driver or gateway process restart.
+            self.lifecycle_event_fences
+                .record_previous_exit(sandbox_id, finished_at.as_deref());
+            Ok(())
+        }
+        .await;
+        span_status.finish(result)
     }
 
     /// Start a previously stopped sandbox container.
+    #[tracing::instrument(
+        name = "podman.start_sandbox",
+        skip(self),
+        fields(
+            otel.name = "podman.start_sandbox",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+        )
+    )]
     pub async fn start_sandbox(&self, sandbox_id: &str) -> Result<(), ComputeDriverError> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         let container = self
             .find_container(sandbox_id)
             .await?
             .ok_or(ComputeDriverError::NotFound)?;
         if container.state == "running" {
-            return Ok(());
+            return span_status.finish(Ok(()));
         }
         let container_id = container.id;
         info!(sandbox_id = %sandbox_id, container = %container_id, "Starting sandbox container");
@@ -956,14 +1181,26 @@ impl PodmanComputeDriver {
             .map_err(ComputeDriverError::from)?;
         self.lifecycle_event_fences
             .record_previous_exit(sandbox_id, previous.state.finished_at.as_deref());
-        self.client
+        let result = self
+            .client
             .start_container(&container_id)
             .await
-            .map_err(ComputeDriverError::from)
+            .map_err(ComputeDriverError::from);
+        span_status.finish(result)
     }
 
     /// Delete a sandbox container and its workspace volume.
+    #[tracing::instrument(
+        name = "podman.delete_sandbox",
+        skip(self),
+        fields(
+            otel.name = "podman.delete_sandbox",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+        )
+    )]
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, ComputeDriverError> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         if sandbox_id.is_empty() {
             return Err(ComputeDriverError::Precondition(
                 "sandbox id is required".into(),
@@ -985,7 +1222,7 @@ impl PodmanComputeDriver {
             .await;
             cleanup_tls_secrets(&self.client, &container::tls_secret_names(sandbox_id)).await;
             self.lifecycle_event_fences.remove(sandbox_id);
-            return Ok(false);
+            return span_status.finish(Ok(false));
         };
         info!(sandbox_id = %sandbox_id, container = %container_id, "Deleting sandbox container");
 
@@ -1021,7 +1258,7 @@ impl PodmanComputeDriver {
         cleanup_tls_secrets(&self.client, &container::tls_secret_names(sandbox_id)).await;
         self.lifecycle_event_fences.remove(sandbox_id);
 
-        Ok(container_existed)
+        span_status.finish(Ok(container_existed))
     }
 
     /// Check whether a sandbox container exists.
@@ -1437,6 +1674,10 @@ mod tests {
             vec![
                 StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"running"}]"#),
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"exited","Running":false,"FinishedAt":"2026-08-12T16:39:13Z"},"Config":{}}"#,
+                ),
             ],
         );
         test_driver(stop_socket.clone())
@@ -1452,6 +1693,12 @@ mod tests {
                 "POST {}",
                 api_path("/libpod/containers/ctr-1/stop?timeout=10")
             )
+        );
+        assert_eq!(
+            stop_requests
+                .lock()
+                .expect("request log lock should not be poisoned")[2],
+            format!("GET {}", api_path("/libpod/containers/ctr-1/json"))
         );
 
         let (start_socket, start_requests, start_handle) = spawn_podman_stub(
@@ -1485,6 +1732,288 @@ mod tests {
 
         let _ = fs::remove_file(stop_socket);
         let _ = fs::remove_file(start_socket);
+    }
+
+    #[tokio::test]
+    async fn stop_waits_for_the_container_to_leave_stopping_state() {
+        let (socket, requests, handle) = spawn_podman_stub(
+            "lifecycle-stop-wait",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"running"}]"#),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"stopping","Running":true},"Config":{}}"#,
+                ),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"exited","Running":false,"FinishedAt":"2026-08-12T16:39:13Z"},"Config":{}}"#,
+                ),
+            ],
+        );
+
+        test_driver(socket.clone())
+            .stop_sandbox("sandbox-1")
+            .await
+            .expect("stop should wait for the terminal container state");
+        handle.await.expect("stop stub should finish");
+
+        let requests = requests
+            .lock()
+            .expect("request log lock should not be poisoned");
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests[2],
+            format!("GET {}", api_path("/libpod/containers/ctr-1/json"))
+        );
+        assert_eq!(requests[3], requests[2]);
+
+        let _ = fs::remove_file(socket);
+    }
+
+    #[tokio::test]
+    async fn stop_retry_waits_for_an_existing_stopping_container() {
+        let (socket, requests, handle) = spawn_podman_stub(
+            "lifecycle-stop-retry",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"stopping"}]"#),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"exited","Running":false,"FinishedAt":"2026-08-12T16:39:13Z"},"Config":{}}"#,
+                ),
+            ],
+        );
+
+        test_driver(socket.clone())
+            .stop_sandbox("sandbox-1")
+            .await
+            .expect("stop retry should wait for the terminal container state");
+        handle.await.expect("stop retry stub should finish");
+
+        let requests = requests
+            .lock()
+            .expect("request log lock should not be poisoned");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1],
+            format!("GET {}", api_path("/libpod/containers/ctr-1/json"))
+        );
+
+        let _ = fs::remove_file(socket);
+    }
+
+    #[tokio::test]
+    async fn stop_sandbox_exports_a_podman_operation_span() {
+        use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
+        let (socket_path, _requests, handle) = spawn_podman_stub(
+            "trace-stop",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"running"}]"#),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"exited","Running":false,"FinishedAt":"2026-08-12T16:39:13Z"},"Config":{}}"#,
+                ),
+            ],
+        );
+        let exporter = InMemorySpanExporterBuilder::new().build();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber =
+            tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider));
+
+        test_driver(socket_path.clone())
+            .stop_sandbox("sandbox-1")
+            .with_subscriber(subscriber)
+            .await
+            .expect("stop should succeed");
+        handle.await.expect("stub should finish");
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let span = spans
+            .iter()
+            .find(|span| span.name == "podman.stop_sandbox")
+            .expect("stop operation should be exported");
+        assert_eq!(
+            span.attributes
+                .iter()
+                .find(|attribute| attribute.key.as_str() == "sandbox.id")
+                .map(|attribute| attribute.value.to_string())
+                .as_deref(),
+            Some("sandbox-1")
+        );
+        provider.shutdown().unwrap();
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_exports_nested_preparation_spans() {
+        use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
+        let (socket_path, _requests, handle) = spawn_podman_stub(
+            "trace-create",
+            vec![
+                StubResponse::new(StatusCode::OK, "{}"),
+                StubResponse::new(StatusCode::OK, "{}"),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"sha256:sandbox","Config":{"User":"1234:1235"}}"#,
+                ),
+                StubResponse::new(StatusCode::CREATED, "{}"),
+                StubResponse::new(StatusCode::CREATED, "{}"),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+            ],
+        );
+        let exporter = InMemorySpanExporterBuilder::new().build();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber =
+            tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider));
+
+        test_driver(socket_path.clone())
+            .create_sandbox(&plain_sandbox("sandbox-trace", "demo"))
+            .with_subscriber(subscriber)
+            .await
+            .expect("create should succeed");
+        handle.await.expect("stub should finish");
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let create = spans
+            .iter()
+            .find(|span| span.name == "podman.provision")
+            .expect("create operation should be exported");
+        for name in [
+            "podman.prepare_images",
+            "podman.prepare_storage",
+            "podman.prepare_container",
+            "podman.start_container",
+        ] {
+            let child = spans
+                .iter()
+                .find(|span| span.name == name)
+                .unwrap_or_else(|| panic!("{name} should be exported"));
+            assert_eq!(
+                child.parent_span_id,
+                create.span_context.span_id(),
+                "{name}"
+            );
+        }
+        provider.shutdown().unwrap();
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn prepare_images_span_covers_and_marks_sandbox_image_pull_failure() {
+        use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
+        let (socket_path, _requests, handle) = spawn_podman_stub(
+            "trace-image-failure",
+            vec![
+                StubResponse::new(StatusCode::OK, "{}"),
+                StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "pull failed"),
+            ],
+        );
+        let exporter = InMemorySpanExporterBuilder::new().build();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber =
+            tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider));
+
+        test_driver(socket_path.clone())
+            .create_sandbox(&plain_sandbox("sandbox-trace", "demo"))
+            .with_subscriber(subscriber)
+            .await
+            .expect_err("sandbox image pull should fail");
+        handle.await.expect("stub should finish");
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let phase = spans
+            .iter()
+            .find(|span| span.name == "podman.prepare_images")
+            .expect("image preparation should be exported");
+        assert!(matches!(
+            phase.status,
+            opentelemetry::trace::Status::Error { .. }
+        ));
+        provider.shutdown().unwrap();
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn start_and_delete_export_podman_operation_spans() {
+        use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
+        let exporter = InMemorySpanExporterBuilder::new().build();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber =
+            tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider));
+
+        let (start_socket, _requests, start_handle) = spawn_podman_stub(
+            "trace-start",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"stopped"}]"#),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"exited","Running":false,"FinishedAt":"2026-08-12T16:39:13Z"},"Config":{}}"#,
+                ),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+            ],
+        );
+        test_driver(start_socket.clone())
+            .start_sandbox("sandbox-1")
+            .with_subscriber(subscriber)
+            .await
+            .expect("start should succeed");
+        start_handle.await.expect("start stub should finish");
+
+        let (delete_socket, _requests, delete_handle) = spawn_podman_stub(
+            "trace-delete",
+            vec![
+                StubResponse::new(StatusCode::OK, "[]"),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+            ],
+        );
+        let subscriber =
+            tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider));
+        test_driver(delete_socket.clone())
+            .delete_sandbox("sandbox-1")
+            .with_subscriber(subscriber)
+            .await
+            .expect("delete should succeed");
+        delete_handle.await.expect("delete stub should finish");
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        assert!(spans.iter().any(|span| span.name == "podman.start_sandbox"));
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.name == "podman.delete_sandbox")
+        );
+        provider.shutdown().unwrap();
+        let _ = fs::remove_file(start_socket);
+        let _ = fs::remove_file(delete_socket);
     }
 
     #[test]

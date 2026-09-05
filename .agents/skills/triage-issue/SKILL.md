@@ -1,6 +1,8 @@
 ---
 name: triage-issue
 description: Assess, validate, and route community-filed issues for human disposition and roadmap placement. Takes a specific issue number or processes a confirmed batch of issues labeled state:triage-needed. Investigates reported behavior, separates objective findings from product decisions, and prepares validated issues for a human yes/no decision. Trigger keywords - triage issue, triage, assess issue, review incoming issue, triage issues.
+metadata:
+  internal: true
 ---
 
 # Triage Issue
@@ -25,9 +27,9 @@ Triage establishes technical validity; it does not decide whether valid work bel
 
 OpenShell has no `priority:*` labels. Sequencing comes from association with an item on the OpenShell Roadmap, and that association is a maintainer decision.
 
-`state:validated` means the factual assessment is complete and awaits human disposition. A human declines by closing the issue as not planned with a rationale, or accepts by applying `state:accepted`, placing the issue on the roadmap, or doing both as documented in `CONTRIBUTING.md`. Accepted work may remain human-owned. A maintainer can queue deeper agent investigation or planning with `agent:plan-requested`, or directly ask an agent to work on a specific issue.
+`state:validated` means the factual assessment is complete and awaits human disposition. A human declines by closing the issue as not planned with a rationale, or accepts by applying `state:accepted`, placing the issue on the roadmap, or doing both as documented in `CONTRIBUTING.md`. Accepted work may remain human-owned. A maintainer can queue deeper agent investigation or planning with `agent:plan-requested`, or a user can directly ask an agent to work on a specific issue.
 
-The optional `agent:*` workflow controls unattended queue pickup: `agent:plan-requested` queues planning, and `agent:implementation-requested` queues implementation after plan review. A direct user instruction separately authorizes the phase it requests and does not require either label.
+The optional `agent:*` workflow controls unattended queue pickup: `agent:plan-requested` queues planning, and `agent:implementation-requested` queues implementation after plan review. A direct user instruction separately authorizes the phase it requests. The agent warns about missing or incomplete expected lifecycle and workflow labels, then continues without changing them.
 
 ## Agent Comment Marker
 
@@ -153,9 +155,9 @@ Based on the sub-agent's analysis, also attempt to validate the report directly:
 
 - For bug reports: check the relevant code paths, look for the described failure mode
 - For feature requests: assess feasibility against the existing architecture
-- For gateway deployment or infrastructure issues: reference the `debug-openshell-cluster` skill's known failure patterns
-- For inference and provider-topology issues: reference the `debug-inference` skill's known failure patterns
-- For CLI/usage issues: reference the `openshell-cli` skill's command reference
+- For gateway deployment or infrastructure issues: reference the known failure patterns in `skills/debug-openshell-cluster/SKILL.md`
+- For inference and provider-topology issues: reference `skills/debug-inference/SKILL.md`
+- For CLI/usage issues: reference the workflows in `skills/openshell-cli/SKILL.md` and confirm installed syntax with `openshell --help`
 
 Record impact signals for the human decision: affected users and scope, regression status, workaround availability, severity evidence, and evidence quality. Do not convert those facts into a roadmap or sequencing recommendation.
 
@@ -209,14 +211,15 @@ Post a structured comment with the triage marker:
 > roadmap placement additionally records sequencing.
 > To queue investigation or planning for an unattended agent, also apply
 > `agent:plan-requested`. You can instead directly ask an agent to use
-> `create-spike` or `build-from-issue` on this issue. If no, close it as not
-> planned and record the rationale.
+> `create-spike` or `build-from-issue` on this issue; the agent will warn about
+> missing expected workflow labels and continue without changing them. If no,
+> close it as not planned and record the rationale.
+
 ```
 
 For other outcomes, replace the impact and decision sections with the exact information request, objective resolution, or safe routing guidance.
 
 Keep exactly one intake/triage state among `state:triage-needed`, `state:needs-info`, and `state:validated`. Remove `state:triage-needed` after every completed assessment. Never apply `state:accepted`, any `agent:*` label, or the `roadmap` label during triage. Never close a validated issue.
-
 ## Relationship to Other Skills
 
 ```

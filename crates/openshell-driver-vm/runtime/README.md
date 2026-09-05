@@ -41,7 +41,7 @@ mise run vm:supervisor
 
 # Build the gateway and VM driver with embedded runtime artifacts
 OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=$PWD/target/vm-runtime-compressed \
-  cargo build -p openshell-server -p openshell-driver-vm
+  cargo build -p openshell-gateway -p openshell-driver-vm
 ```
 
 Use `FROM_SOURCE=1 mise run vm:setup` to build the runtime from source instead

@@ -1,6 +1,8 @@
 ---
 name: sbom
 description: Generate and manage Software Bill of Materials (SBOMs) for the OpenShell project. Covers SBOM generation with Syft, license resolution via public registries, and CSV export for compliance review. Trigger keywords - SBOM, sbom, bill of materials, license audit, license resolution, generate sbom, sbom csv, dependency license, supply chain, license scan.
+metadata:
+  internal: true
 ---
 
 # SBOM Generation and License Resolution
@@ -9,14 +11,51 @@ Generate CycloneDX SBOMs, resolve missing licenses, and export to CSV for compli
 
 ## Overview
 
-The OpenShell SBOM tooling produces CycloneDX JSON SBOMs using Syft, resolves missing or hash-based licenses by querying public registries (crates.io, npm, PyPI), and exports the results to CSV for stakeholder review.
+The OpenShell SBOM tooling produces source-tree CycloneDX JSON SBOMs using Syft, resolves missing or hash-based licenses by querying public registries (crates.io, npm, PyPI), and exports the results to CSV for stakeholder review.
 
 SBOMs are **release artifacts only** -- they are generated on demand and not committed to the repository. Output lands in `deploy/sbom/output/` (gitignored).
+
+Pushed gateway and supervisor images carry an SPDX SBOM and minimal SLSA provenance as OCI attestations. Branch E2E, Release Dev, and Release Tag image binaries embed cargo-auditable metadata, so their image SBOMs include linked Rust crates.
 
 ## Prerequisites
 
 - `mise install` has been run (installs Syft and other tools)
 - The repository is checked out at the root
+
+## Inspecting an Image SBOM
+
+BuildKit uses its default Syft scanner and attaches one SPDX document per platform. Read one without pulling the image:
+
+```bash
+docker buildx imagetools inspect ghcr.io/nvidia/openshell/gateway:latest \
+  --format '{{ json (index .SBOM "linux/amd64").SPDX }}'
+```
+
+Validate the final attestation, requiring a Cargo package for an auditable image:
+
+```bash
+tasks/scripts/verify-image-sbom.sh ghcr.io/nvidia/openshell/gateway:latest --require-cargo
+```
+
+## Inspecting an Auditable Image Binary
+
+Opt into auditable metadata when staging a local image binary:
+
+```bash
+OPENSHELL_AUDITABLE=1 PREBUILT_ARCH=amd64 \
+  tasks/scripts/stage-prebuilt-binaries.sh gateway
+```
+
+Scan the staged binary rather than the source tree:
+
+```bash
+mise x -- syft \
+  "file:deploy/docker/.build/prebuilt-binaries/amd64/openshell-gateway" \
+  -o cyclonedx-json
+```
+
+This output is limited to packages Syft discovers from that binary. Use
+`mise run sbom` for the broader source-tree license-compliance inventory.
 
 ## Workflow 1: Full SBOM Generation (One Command)
 

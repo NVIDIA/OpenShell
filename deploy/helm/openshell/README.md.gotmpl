@@ -9,6 +9,14 @@ Edit README.md.gotmpl and values.yaml, then run `mise run helm:docs`.
 
 This chart deploys the OpenShell gateway into a Kubernetes cluster. It is published as an OCI artifact to GHCR at `oci://ghcr.io/nvidia/openshell/helm-chart`.
 
+By default, this chart also creates the namespace-scoped resources needed by
+sandboxes. For a shared-gateway deployment, install it with
+`workspaceResources.enabled=false`, then install the
+`deploy/helm/openshell-workspace` chart in every pre-provisioned workspace
+namespace. The gateway and workspace releases can then be upgraded and removed
+independently. Use Kubernetes `operator` workspace mode when one gateway serves
+multiple pre-provisioned workspace namespaces.
+
 ## Prerequisites
 
 The Kubernetes Agent Sandbox CRDs and controller must be installed on the cluster before deploying OpenShell. Install them with:
@@ -16,6 +24,13 @@ The Kubernetes Agent Sandbox CRDs and controller must be installed on the cluste
 ```shell
 kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/latest/download/manifest.yaml
 ```
+
+The chart does not install this cluster-scoped dependency. By default, it
+fails before creating gateway resources when the cluster serves neither
+supported Sandbox API (`agents.x-k8s.io/v1beta1` or
+`agents.x-k8s.io/v1alpha1`). Disable the check with
+`agentSandbox.preflight.enabled=false` for offline `helm template` rendering,
+where Helm cannot discover cluster APIs.
 
 ## Install on Kubernetes
 
@@ -139,14 +154,19 @@ JWT signing Secret.
 
 ## SPIFFE/SPIRE provider token grants
 
-Set `server.providerTokenGrants.spiffe.enabled=true` to let sandbox supervisors
-use SPIFFE JWT-SVIDs for dynamic provider token grants. The chart keeps
-supervisor-to-gateway authentication on gateway-minted sandbox JWTs and passes
-the SPIFFE Workload API socket path to the Kubernetes driver so sandbox pods can
-mount the SPIFFE CSI socket.
+Set `server.providerTokenGrants.spiffe.enabled=true` to let the gateway and
+sandbox supervisors use SPIFFE JWT-SVIDs for dynamic provider token grants. The
+chart keeps supervisor-to-gateway authentication on gateway-minted sandbox JWTs,
+mounts the SPIFFE CSI socket into the gateway pod, exports
+`OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`, and passes the socket path to
+the Kubernetes driver so sandbox pods can mount the same socket.
 
 For local development, uncomment the SPIRE Helm releases in `skaffold.yaml` and
 add `ci/values-spire.yaml` to the OpenShell release values files.
+
+The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the
+SPIFFE Workload API, so this path does not require access to the SPIRE OIDC
+discovery endpoint or its TLS CA.
 
 {{ template "chart.valuesSection" . }}
 {{ template "helm-docs.versionFooter" . }}

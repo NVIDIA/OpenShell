@@ -90,8 +90,8 @@ regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 
 # AWS SDK
-aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
-aws-sdk-sts = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+aws-sdk-sts = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 
 # WebSocket
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
@@ -105,7 +105,7 @@ rand = "0.9"
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 getrandom = "0.3"
 ring = "0.17"
-spiffe = { version = "0.15", default-features = false, features = ["workload-api-jwt", "tracing"] }
+spiffe = { version = "0.15", default-features = false, features = ["workload-api-jwt", "jwt-verify-rust-crypto", "tracing"] }
 
 # Filesystem embedding
 include_dir = "0.7"
@@ -116,6 +116,7 @@ glob = "0.3"
 # Utilities
 futures = "0.3"
 bytes = "1"
+hickory-proto = "0.26.1"
 pin-project-lite = "0.2"
 tokio-stream = "0.1"
 protoc-bin-vendored = "3.2.0"

@@ -28,6 +28,14 @@ import (
 //
 // The client secret is never included in error messages (FR-014).
 func ClientCredentials(ctx context.Context, opts ...LoginOption) (*oauth2.Token, error) {
+	cfg, err := resolveClientCredentialsConfig(opts...)
+	if err != nil {
+		return nil, err
+	}
+	return exchangeClientCredentials(ctx, cfg, false)
+}
+
+func resolveClientCredentialsConfig(opts ...LoginOption) (*loginConfig, error) {
 	cfg := &loginConfig{}
 	for _, opt := range opts {
 		opt(cfg)
@@ -50,14 +58,19 @@ func ClientCredentials(ctx context.Context, opts ...LoginOption) (*oauth2.Token,
 		if err != nil {
 			return nil, fmt.Errorf("failed to load gateway %q: %w", cfg.gateway, err)
 		}
-		if gwCfg.OIDCIssuer == "" || gwCfg.OIDCClientID == "" {
-			return nil, fmt.Errorf(
-				"%w: gateway %q has no OIDC configuration (missing oidc_issuer or oidc_client_id in metadata.json)",
-				ErrOIDCConfig, cfg.gateway,
-			)
+		if cfg.issuer == "" {
+			cfg.issuer = gwCfg.OIDCIssuer
 		}
-		cfg.issuer = gwCfg.OIDCIssuer
-		cfg.clientID = gwCfg.OIDCClientID
+		if cfg.clientID == "" {
+			cfg.clientID = gwCfg.OIDCClientID
+		}
+		if !cfg.audienceSet {
+			cfg.audience = gwCfg.OIDCAudience
+		}
+		if !cfg.scopesSet && gwCfg.OIDCScopes != "" {
+			cfg.scopes = strings.Fields(gwCfg.OIDCScopes)
+			cfg.scopesSet = true
+		}
 	}
 
 	// Validate required configuration.
@@ -67,11 +80,26 @@ func ClientCredentials(ctx context.Context, opts ...LoginOption) (*oauth2.Token,
 			ErrOIDCConfig,
 		)
 	}
-	if cfg.clientSecret == "" {
+	if cfg.clientSecret == "" && cfg.secretProvider == nil {
 		return nil, fmt.Errorf(
-			"%w: client secret is required (use WithClientSecret)",
+			"%w: client secret is required (use WithClientSecret or WithClientSecretProvider)",
 			ErrClientCredentials,
 		)
+	}
+	return cfg, nil
+}
+
+func exchangeClientCredentials(ctx context.Context, cfg *loginConfig, requirePositiveExpiry bool) (*oauth2.Token, error) {
+	secret := cfg.clientSecret
+	if cfg.secretProvider != nil {
+		value, err := cfg.secretProvider(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("%w: client secret provider failed", ErrClientCredentials)
+		}
+		secret = value
+	}
+	if secret == "" {
+		return nil, fmt.Errorf("%w: client secret must not be empty", ErrClientCredentials)
 	}
 
 	// Discover provider endpoints.
@@ -84,10 +112,13 @@ func ClientCredentials(ctx context.Context, opts ...LoginOption) (*oauth2.Token,
 	data := url.Values{
 		"grant_type":    {"client_credentials"},
 		"client_id":     {cfg.clientID},
-		"client_secret": {cfg.clientSecret},
+		"client_secret": {secret},
 	}
 	if len(cfg.scopes) > 0 {
 		data.Set("scope", strings.Join(cfg.scopes, " "))
+	}
+	if cfg.audience != "" {
+		data.Set("audience", cfg.audience)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, provider.TokenEndpoint, strings.NewReader(data.Encode()))
@@ -110,27 +141,25 @@ func ClientCredentials(ctx context.Context, opts ...LoginOption) (*oauth2.Token,
 	defer func() { _ = resp.Body.Close() }()
 
 	const maxResponseBytes = 1 << 20
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to read token response", ErrClientCredentials)
+	}
+	if len(body) > maxResponseBytes {
+		return nil, fmt.Errorf("%w: token response is too large", ErrClientCredentials)
 	}
 
 	var tokResp tokenResponse
 	if err := json.Unmarshal(body, &tokResp); err != nil {
 		return nil, fmt.Errorf("%w: invalid token response JSON", ErrClientCredentials)
 	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return nil, fmt.Errorf("%w: invalid token response JSON", ErrClientCredentials)
+	}
 
 	if resp.StatusCode != http.StatusOK || tokResp.Error != "" {
-		// FR-014: Never include the client secret in error messages.
-		// Only include the provider's error code and description.
-		msg := "client credentials exchange failed"
-		if tokResp.Error != "" {
-			msg = fmt.Sprintf("provider error: %s", tokResp.Error)
-			if tokResp.ErrorDesc != "" {
-				msg += ": " + tokResp.ErrorDesc
-			}
-		}
-		return nil, fmt.Errorf("%w: %s", ErrClientCredentials, msg)
+		return nil, fmt.Errorf("%w: provider rejected the exchange (HTTP %d)", ErrClientCredentials, resp.StatusCode)
 	}
 
 	if tokResp.AccessToken == "" {
@@ -142,9 +171,17 @@ func ClientCredentials(ctx context.Context, opts ...LoginOption) (*oauth2.Token,
 		RefreshToken: tokResp.RefreshToken,
 		TokenType:    tokResp.TokenType,
 	}
-	if tokResp.ExpiresIn > 0 {
-		tok.Expiry = time.Now().Add(time.Duration(tokResp.ExpiresIn) * time.Second)
+	_, expiresInPresent := fields["expires_in"]
+	if expiresInPresent && tokResp.ExpiresIn <= 0 {
+		return nil, fmt.Errorf("%w: token response requires a positive expires_in", ErrClientCredentials)
 	}
+	if !expiresInPresent {
+		if requirePositiveExpiry {
+			return nil, fmt.Errorf("%w: token response requires a positive expires_in", ErrClientCredentials)
+		}
+		return tok, nil
+	}
+	tok.Expiry = time.Now().Add(time.Duration(tokResp.ExpiresIn) * time.Second)
 
 	return tok, nil
 }

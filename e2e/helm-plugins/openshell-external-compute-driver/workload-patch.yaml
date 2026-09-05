@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: openshell
+spec:
+  template:
+    spec:
+      containers:
+        - name: openshell-gateway
+          volumeMounts:
+            - name: compute-driver-socket
+              mountPath: /var/run/openshell-compute
+        - name: kubernetes-compute-driver
+          image: replaced-by-kustomize
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/local/bin/openshell-driver-kubernetes
+          args:
+            - --bind-socket
+            - /var/run/openshell-compute/driver/driver.sock
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: compute-driver-socket
+              mountPath: /var/run/openshell-compute
+          resources: {}
+      volumes:
+        - name: compute-driver-socket
+          emptyDir: {}

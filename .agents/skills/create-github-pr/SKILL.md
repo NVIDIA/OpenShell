@@ -1,6 +1,8 @@
 ---
 name: create-github-pr
 description: Create GitHub pull requests using the gh CLI. Use when the user wants to create a new PR, submit code for review, or open a pull request. Trigger keywords - create PR, pull request, new PR, submit for review, code review.
+metadata:
+  internal: true
 ---
 
 # Create GitHub Pull Request

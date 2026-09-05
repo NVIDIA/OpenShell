@@ -71,6 +71,19 @@ Create the name of the service account assigned to sandbox pods
 {{- end }}
 
 {{/*
+Whether this chart owns workspace-scoped resources. Missing legacy values
+default to enabled so upgrades with --reuse-values preserve the old topology.
+*/}}
+{{- define "openshell.workspaceResourcesEnabled" -}}
+{{- $workspaceResources := .Values.workspaceResources | default dict -}}
+{{- $enabled := true -}}
+{{- if hasKey $workspaceResources "enabled" -}}
+{{- $enabled = get $workspaceResources "enabled" -}}
+{{- end -}}
+{{- if $enabled -}}true{{- end -}}
+{{- end }}
+
+{{/*
 Gateway image reference. Uses image.tag when set; falls back to .Chart.AppVersion
 so a released chart automatically pulls the matching image without extra overrides.
 */}}
@@ -82,6 +95,20 @@ so a released chart automatically pulls the matching image without extra overrid
 {{- define "openshell.defaultSupervisorRepository" -}}
 ghcr.io/nvidia/openshell/supervisor
 {{- end }}
+
+{{/*
+Whether the gateway listener should verify client certificates (mTLS).
+An explicit empty server.tls.clientCaSecretName disables client-CA wiring in
+both gateway.toml and the workload, overriding built-in PKI and cert-manager
+defaults.
+*/}}
+{{- define "openshell.gatewayClientCaEnabled" -}}
+{{- if .Values.server.disableTls -}}
+{{- else if eq .Values.server.tls.clientCaSecretName "" -}}
+{{- else if or .Values.server.tls.clientCaSecretName (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) -}}
+true
+{{- end -}}
+{{- end -}}
 
 {{/*
 Whether Helm must propagate a supervisor image override into gateway.toml.
@@ -260,5 +287,8 @@ Validate chart values that Helm would otherwise accept silently.
 {{- end -}}
 {{- if gt (len $credentialDrivers) 1 -}}
 {{- fail "only one external server.credentialDrivers backend can be enabled at a time." -}}
+{{- end -}}
+{{- if kindIs "invalid" .Values.server.tls.clientCaSecretName -}}
+{{- fail "server.tls.clientCaSecretName cannot be null; omit the key to use the chart default (openshell-server-client-ca), or set to \"\" to disable client certificate verification for HTTPS-only mode" -}}
 {{- end -}}
 {{- end }}

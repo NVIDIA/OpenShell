@@ -3,10 +3,10 @@
 
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
@@ -20,6 +20,10 @@ use openshell_driver_podman::{ComputeDriverService, PodmanComputeConfig, PodmanC
 #[command(name = "openshell-driver-podman")]
 #[command(version = VERSION)]
 struct Args {
+    /// Public compute-driver Unix socket used by an external gateway.
+    #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
+    bind_socket: Option<PathBuf>,
+
     #[arg(
         long,
         env = "OPENSHELL_COMPUTE_DRIVER_BIND",
@@ -29,6 +33,12 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_LOG_LEVEL", default_value = "info")]
     log_level: String,
+
+    #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
+    otlp_endpoint: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
+    gateway_name: Option<String>,
 
     /// Path to the Podman API Unix socket.
     #[arg(long, env = "OPENSHELL_PODMAN_SOCKET")]
@@ -134,6 +144,13 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME")]
     sandbox_proxy_connect_by_hostname: Option<bool>,
 
+    /// Path (on the gateway host) to a PEM CA bundle trusted for the corporate
+    /// proxy: the TLS handshake with an `https://` proxy and, for
+    /// TLS-intercepting proxies, re-signed upstream certificates. Bind-mounted
+    /// read-only into the sandbox. Only meaningful with `--sandbox-https-proxy`.
+    #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_CA_BUNDLE")]
+    sandbox_proxy_ca_bundle: Option<String>,
+
     /// User namespace mode for sandbox containers (e.g. `auto`).
     /// When unset, containers use the default user namespace.
     #[arg(long, env = "OPENSHELL_PODMAN_USERNS")]
@@ -148,16 +165,24 @@ struct Args {
     /// Each entry is `"container_id:host_id:size"`.
     #[arg(long = "gidmap")]
     gidmap: Vec<String>,
+
+    /// Allow sandbox requests to attach host bind mounts.
+    #[arg(long, env = "OPENSHELL_ENABLE_BIND_MOUNTS", default_value_t = false)]
+    enable_bind_mounts: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
-        )
-        .init();
+    let _tracing = openshell_otel::install_driver_tracing(
+        openshell_driver_podman::otel_tracing::TRACING,
+        openshell_otel::DriverTracingConfig {
+            endpoint: args.otlp_endpoint.as_deref(),
+            gateway_name: args.gateway_name.as_deref(),
+            service_version: VERSION,
+            log_level: &args.log_level,
+        },
+    );
 
     let driver = PodmanComputeDriver::new(PodmanComputeConfig {
         socket_path: args.podman_socket,
@@ -183,21 +208,105 @@ async fn main() -> Result<()> {
         proxy_auth_file: args.sandbox_proxy_auth_file,
         proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
         proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
+        proxy_ca_bundle: args.sandbox_proxy_ca_bundle,
         userns: args.userns,
         uidmap: args.uidmap,
         gidmap: args.gidmap,
+        enable_bind_mounts: args.enable_bind_mounts,
         ..PodmanComputeConfig::default()
     })
     .await
     .into_diagnostic()?;
 
-    info!(address = %args.bind_address, "Starting Podman compute driver");
-    tonic::transport::Server::builder()
-        .add_service(ComputeDriverServer::new(ComputeDriverService::new(driver)))
-        .serve_with_shutdown(args.bind_address, async {
-            tokio::signal::ctrl_c().await.ok();
-            info!("Received shutdown signal, draining in-flight requests");
-        })
-        .await
-        .into_diagnostic()
+    let service = ComputeDriverServer::new(ComputeDriverService::new(driver));
+    if let Some(socket_path) = args.bind_socket {
+        let listener = openshell_core::external_driver_socket::bind_private(&socket_path)
+            .map_err(|err| miette::miette!("{err}"))?;
+        let _cleanup =
+            openshell_core::external_driver_socket::SocketCleanup::new(socket_path.clone());
+        info!(socket = %socket_path.display(), "Starting Podman compute driver");
+        tonic::transport::Server::builder()
+            .layer(openshell_otel::compute_driver_rpc_layer())
+            .add_service(service)
+            .serve_with_incoming_shutdown(
+                openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
+                shutdown_signal(),
+            )
+            .await
+            .into_diagnostic()
+    } else {
+        info!(address = %args.bind_address, "Starting Podman compute driver");
+        tonic::transport::Server::builder()
+            .layer(openshell_otel::compute_driver_rpc_layer())
+            .add_service(service)
+            .serve_with_shutdown(args.bind_address, shutdown_signal())
+            .await
+            .into_diagnostic()
+    }
+}
+
+async fn select_shutdown_signal(
+    ctrl_c: impl Future<Output = ()>,
+    terminate: impl Future<Output = ()>,
+) {
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
+}
+
+async fn ctrl_c_signal() {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        tracing::warn!(%error, "Failed to install Ctrl-C signal handler");
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_signal() {
+    let Ok(mut signal) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    else {
+        tracing::warn!("Failed to install SIGTERM signal handler");
+        std::future::pending::<()>().await;
+        return;
+    };
+    let _ = signal.recv().await;
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    select_shutdown_signal(ctrl_c_signal(), terminate_signal()).await;
+
+    #[cfg(not(unix))]
+    ctrl_c_signal().await;
+
+    info!("Received shutdown signal, draining in-flight requests");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_completes_when_termination_signal_arrives() {
+        select_shutdown_signal(std::future::pending(), std::future::ready(())).await;
+    }
+
+    #[test]
+    fn accepts_gateway_otlp_configuration() {
+        let args = Args::try_parse_from([
+            "openshell-driver-podman",
+            "--otlp-endpoint",
+            "http://collector.internal:4317",
+            "--gateway-name",
+            "production-us-west",
+        ])
+        .expect("OTLP configuration should be accepted");
+
+        assert_eq!(
+            args.otlp_endpoint.as_deref(),
+            Some("http://collector.internal:4317")
+        );
+        assert_eq!(args.gateway_name.as_deref(), Some("production-us-west"));
+    }
 }

@@ -20,6 +20,8 @@ use std::time::Duration;
 use openshell_e2e::harness::binary::{openshell_bin, openshell_cmd};
 use openshell_e2e::harness::output::strip_ansi;
 
+const DURABLE_MAIN_SCRIPT: &str = r#"echo "$1"; exec sleep infinity"#;
+
 fn kube_context() -> String {
     std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE")
         .expect("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE must be set")
@@ -704,8 +706,12 @@ async fn managed_stop_waits_for_workspace_pod_to_disappear() {
         &ws,
         "--name",
         sandbox,
+        "--detach",
         "--",
-        "echo",
+        "sh",
+        "-c",
+        DURABLE_MAIN_SCRIPT,
+        "_",
         "ready",
     ])
     .await;

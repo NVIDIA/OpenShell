@@ -10,18 +10,23 @@ OpenShell is built agent-first. We design systems and use agents to implement th
 
 ## Skills
 
-Agent skills live in `.agents/skills/`. Your harness can discover and load them natively — do not rely on this file for a full inventory. The detailed skills table is in [CONTRIBUTING.md](CONTRIBUTING.md) (for humans).
+OpenShell has two skill collections:
+
+- `skills/` contains public, installable skills for using and operating OpenShell. These skills must work outside a source checkout and use installed CLI help plus published documentation as their sources of truth.
+- `.agents/skills/` contains internal contributor and maintainer workflows for developing OpenShell. Your repository-aware harness can discover and load them natively.
+
+Do not rely on this file for a full inventory. The detailed public and contributor skill tables are in [CONTRIBUTING.md](CONTRIBUTING.md) (for humans).
 
 ## Workflow Chains
 
 These pipelines connect skills into end-to-end workflows. Individual skill files don't describe these relationships.
 
 - **Community inflow:** `triage-issue` → human disposition and roadmap placement → `create-spike` when needed → `build-from-issue`
-  - Triage establishes facts and marks technically valid issues `state:validated`. A human signals that the project should pursue the work by applying `state:accepted` or placing the issue on the roadmap. The `agent:*` labels support unattended agents that scan for queued work: a human queues a plan with `agent:plan-requested`, the agent returns `agent:plan-ready`, and a human queues implementation with `agent:implementation-requested`. A direct user request to an agent authorizes the requested phase without those labels.
+  - Triage establishes facts and marks technically valid issues `state:validated`. A human signals that the project should pursue the work by applying `state:accepted` or placing the issue on the roadmap. The `agent:*` labels support unattended agents that scan for queued work: a human queues a plan with `agent:plan-requested`, the agent returns `agent:plan-ready`, and a human queues implementation with `agent:implementation-requested`. A direct user request to an agent authorizes the requested phase even when the expected lifecycle or workflow labels are missing or incomplete; the agent warns about the discrepancies and continues without changing the labels.
 - **Internal development:** `create-spike` → human disposition and roadmap placement → `build-from-issue`
-  - Spike explores feasibility and marks its issue `state:validated` when sufficient evidence exists. A human accepts it with `state:accepted` or roadmap placement, or declines it, and optionally queues it through the `agent:*` workflow or directs an agent to it.
+  - Spike explores feasibility and marks its issue `state:validated` when sufficient evidence exists. A human accepts it with `state:accepted` or roadmap placement, or declines it, and optionally queues it through the `agent:*` workflow or directs an agent to it. A direct request proceeds after warning about missing or incomplete expected labels.
 - **Security:** `review-security-issue` → `fix-security-issue`
-  - General build agents must not process `topic:security` issues. For unattended processing, a human queues specialized review with `agent:plan-requested`; review produces a severity assessment and remediation plan; a human queues remediation with `agent:implementation-requested`. Direct requests to the specialized skills do not require those labels.
+  - General build agents must not process `topic:security` issues. For unattended processing, a human queues specialized review with `agent:plan-requested`; review produces a severity assessment and remediation plan; a human queues remediation with `agent:implementation-requested`. On direct requests to the specialized skills, missing workflow labels produce a warning rather than blocking the requested phase.
 - **Policy iteration:** `openshell-cli` → `generate-sandbox-policy`
   - CLI manages the sandbox lifecycle; policy generation authors the YAML constraints.
 
@@ -30,16 +35,20 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | Path | Components | Purpose |
 |------|-----------|---------|
 | `crates/openshell-cli/` | CLI binary | User-facing command-line interface |
+| `crates/openshell-conformance/` | CLI conformance library | Reusable driver-agnostic scenarios and command runner |
+| `crates/openshell-conformance-cli/` | Conformance CLI | Distributable `list` and `run` entrypoint for gateway conformance |
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
 | `crates/openshell-sandbox/` | Sandbox runtime | Container supervision, policy-enforced egress routing |
 | `crates/openshell-policy/` | Policy engine | Filesystem, network, process, and inference constraints |
 | `crates/openshell-router/` | Privacy router | Privacy-aware LLM routing |
 | `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
 | `crates/openshell-gateway-interceptors/` | Gateway interceptors | Intercepts and transforms configured gRPC requests at the gateway routing boundary |
-| `crates/openshell-ocsf/` | OCSF logging | OCSF v1.7.0 event types, builders, shorthand/JSONL formatters, tracing layers |
+| `crates/openshell-ocsf/` | OCSF logging | OCSF v1.8.0 event types, builders, shorthand/JSONL formatters, tracing layers |
 | `crates/openshell-otel/` | OpenTelemetry support | Shared OTLP trace provider, resource, and tracing-layer construction |
+| `crates/openshell-otel-test-support/` | OpenTelemetry test support | Shared loopback OTLP collector fixture for tracing tests |
 | `crates/openshell-core/` | Shared core | Common types, configuration, error handling |
 | `crates/openshell-extension-core/` | Extension core | Shared extension identity, JWT claims, bearer-token rotation, and TLS transport primitives |
+| `crates/openshell-gateway/` | Gateway binary composition | Links selected first-party compute drivers into the backend-agnostic server registry |
 | `crates/openshell-sdk/` | Shared client SDK | Async Rust gateway client (gRPC transport, TLS, OIDC refresh, edge tunnel); consumed by CLI, TUI, and `@openshell/sdk` |
 | `crates/openshell-providers/` | Provider management | Credential provider backends |
 | `crates/openshell-tui/` | Terminal UI | Ratatui-based dashboard for monitoring |
@@ -48,8 +57,10 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-driver-db-credstore/` | Database credential driver | In-process `CredentialDriver` backend for gateway database credential storage |
 | `crates/openshell-driver-kubernetes/` | Kubernetes compute driver | In-process `ComputeDriver` backend for K8s sandbox pods |
 | `crates/openshell-driver-docker/` | Docker compute driver | In-process `ComputeDriver` backend for local Docker sandbox containers |
+| `crates/openshell-driver-mxc/` | MXC compute driver | Windows in-process `ComputeDriver` backend for MXC sandbox execution |
 | `crates/openshell-driver-podman/` | Podman compute driver | In-process `ComputeDriver` backend for local Podman sandbox containers |
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
+| `crates/openshell-driver-mxc/` | Microsoft MXC compute driver | In-process Windows AppContainer and isolation-session compute backend |
 | `crates/openshell-prover/` | Policy prover | Policy verification and proof generation |
 | `crates/openshell-server-macros/` | Server macros | Compile-time helpers for gateway RPC authorization |
 | `crates/openshell-supervisor-middleware/` | Middleware runtime | Generic middleware registry, remote service integration, and chain execution |
@@ -63,7 +74,8 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `deploy/` | Docker, Helm, K8s | Dockerfiles, Helm chart, manifests |
 | `docs/` | Published docs | MDX pages, navigation, and content assets |
 | `fern/` | Docs site config | Fern site config, components, and theme assets |
-| `.agents/skills/` | Agent skills | Workflow automation for development |
+| `skills/` | Public agent skills | Installable workflows for using and operating OpenShell |
+| `.agents/skills/` | Contributor agent skills | Repository-aware workflows for developing OpenShell |
 | `.agents/agents/` | Agent personas | Sub-agent definitions (e.g., reviewer, doc writer) |
 | `architecture/` | Architecture docs | Design decisions and component documentation |
 
@@ -79,7 +91,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 - **Bug reports and feature requests** must include a User Story, Problem Statement, Impact / Why This Matters, and Acceptance Criteria. The impact should explain the consequences of the current behavior, the current workaround, and why that workaround is insufficient. Bug reports additionally require reproduction steps and environment details and may include concise, redacted logs.
 - **Feature requests** must also include a Proposed Design and Alternatives Considered. The design should define the user-facing workflow and externally observable behavior while leaving internal implementation choices open. Agent investigation is optional.
 - **New features** must start as GitHub issues using the feature request template. Open an RFC only after an issue exists; maintainers decide when one is needed and assign RFC numbers from the issue.
-- **Issue triage** establishes technical validity and impact evidence. Agents never decide acceptance, apply `state:accepted`, place issues on the roadmap, or apply `agent:plan-requested` or `agent:implementation-requested`. Humans accept or decline validated work; `state:accepted` or roadmap placement records acceptance, and roadmap association additionally carries sequencing. The request labels queue work for unattended agents; an explicit user instruction can instead authorize an agent to plan or implement a specific issue. OpenShell has no `priority:*` labels.
+- **Issue triage** establishes technical validity and impact evidence. Agents never decide acceptance, apply `state:accepted`, place issues on the roadmap, or apply `agent:plan-requested` or `agent:implementation-requested`. Humans accept or decline validated work; `state:accepted` or roadmap placement records acceptance, and roadmap association additionally carries sequencing. Lifecycle and request labels gate unattended queue pickup. An explicit user instruction authorizes an agent to plan or implement the specified issue even when expected labels are missing or incomplete; the agent warns the user and continues without changing those labels. OpenShell has no `priority:*` labels.
 - **PRs** must follow the PR template structure: Summary, Related Issue, Changes, Testing, Checklist. Contributors should use their agent to investigate the current code and behavior for accepted issue-backed work, verify any diagnostics already on the issue, understand the change they submit, and report the resulting implementation and verification—not paste an earlier issue-filing diagnostic.
 - **PRs for features, user-visible behavior, public APIs, architecture, or multi-PR efforts** must link an accepted issue. Small docs fixes, mechanical maintenance, and obvious localized bug fixes may state why no issue is required.
 - **PRs from unvouched external contributors** are automatically closed. See the Vouch System section above.
@@ -234,7 +246,7 @@ ocsf_emit!(event);
 
 ## Cluster Infrastructure Changes
 
-- If you change gateway deployment infrastructure (e.g., Helm values/templates, gateway image packaging, or deploy logic in `openshell-cli`), update the `debug-openshell-cluster` skill in `.agents/skills/debug-openshell-cluster/SKILL.md` to reflect those changes.
+- If you change gateway deployment infrastructure (e.g., Helm values/templates, gateway image packaging, or deploy logic in `openshell-cli`), update the `debug-openshell-cluster` skill in `skills/debug-openshell-cluster/SKILL.md` to reflect those changes.
 
 ## Skill Maintenance
 
@@ -247,8 +259,8 @@ When behavior, commands, or development workflows change, review the related age
 - When changing gateway TOML fields, driver-specific config options, config defaults, or Helm rendering of `gateway.toml`, update `docs/reference/gateway-config.mdx` in the same branch.
 - `fern/` contains the Fern site config, components, preview workflow inputs, and publish settings.
 - Follow the docs style guide in [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx): active voice, minimal formatting, no filler introductions, `shell` fences for copyable commands, and no duplicate body H1.
-- Fern PR previews run through `.github/workflows/branch-docs.yml`, and production publish runs through the `publish-fern-docs` job in `.github/workflows/release-tag.yml`.
-- Use the `update-docs` skill to scan recent commits and draft doc updates.
+- Fern PR previews run through `.github/workflows/branch-docs.yml`, and production publish runs through the `publish-fern-docs` job in `.github/workflows/release-tag.yml` for stable release tags.
+- Use the `update-docs-from-commits` skill to scan recent commits and draft doc updates.
 
 ### Architecture Docs
 

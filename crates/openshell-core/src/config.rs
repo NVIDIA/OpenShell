@@ -6,13 +6,8 @@
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::fmt;
-#[cfg(unix)]
-use std::io::{Read, Write};
 use std::net::SocketAddr;
-#[cfg(unix)]
-use std::os::unix::fs::FileTypeExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -28,11 +23,11 @@ pub const DEFAULT_SSH_PORT: u16 = 2222;
 /// Default gateway server port.
 pub const DEFAULT_SERVER_PORT: u16 = 17670;
 
+/// Default operator-facing name for a gateway installation.
+pub const DEFAULT_GATEWAY_NAME: &str = "openshell";
+
 /// Default container stop timeout in seconds (SIGTERM → SIGKILL).
 pub const DEFAULT_STOP_TIMEOUT_SECS: u32 = 10;
-
-/// Default Docker bridge network name for local sandboxes.
-pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 
 /// Default domain used for browser-facing sandbox service URLs.
 pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
@@ -114,30 +109,8 @@ pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
 
 /// Default maximum number of processes (PIDs) allowed inside a sandbox container.
 ///
-/// Shared by the Docker and Podman drivers; override via driver config.
+/// Compute drivers may override this through backend configuration.
 pub const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
-
-/// Compute backends the gateway can orchestrate sandboxes through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ComputeDriverKind {
-    Kubernetes,
-    Vm,
-    Docker,
-    Podman,
-}
-
-impl ComputeDriverKind {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Kubernetes => "kubernetes",
-            Self::Vm => "vm",
-            Self::Docker => "docker",
-            Self::Podman => "podman",
-        }
-    }
-}
 
 /// Normalize a configured compute driver name.
 ///
@@ -160,249 +133,6 @@ pub fn normalize_compute_driver_name(value: &str) -> Result<String, String> {
     Ok(value.to_ascii_lowercase())
 }
 
-impl fmt::Display for ComputeDriverKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for ComputeDriverKind {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "kubernetes" => Ok(Self::Kubernetes),
-            "vm" => Ok(Self::Vm),
-            "docker" => Ok(Self::Docker),
-            "podman" => Ok(Self::Podman),
-            other => Err(format!(
-                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman"
-            )),
-        }
-    }
-}
-
-/// Auto-detect the appropriate compute driver based on the runtime environment.
-///
-/// Priority order: Kubernetes → Podman → Docker.
-/// VM is never auto-detected (requires explicit `--drivers vm`).
-///
-/// Returns the first driver where the environment check passes.
-/// Returns `None` if no compatible driver is found.
-pub fn detect_driver() -> Option<ComputeDriverKind> {
-    // Kubernetes: check for KUBERNETES_SERVICE_HOST env var (set inside pods)
-    if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
-        return Some(ComputeDriverKind::Kubernetes);
-    }
-
-    // Podman: check for a reachable local API socket.
-    if is_podman_available() {
-        return Some(ComputeDriverKind::Podman);
-    }
-
-    // Docker: check for a reachable local API socket.
-    if is_docker_available() {
-        return Some(ComputeDriverKind::Docker);
-    }
-
-    None
-}
-
-fn is_podman_available() -> bool {
-    detect_podman_socket().is_some()
-}
-
-/// Return the first responsive Podman API socket, or `None` if none respond.
-pub fn detect_podman_socket() -> Option<PathBuf> {
-    detect_podman_socket_from_candidates(&podman_socket_candidates())
-}
-
-fn detect_podman_socket_from_candidates(candidates: &[PathBuf]) -> Option<PathBuf> {
-    candidates
-        .iter()
-        .find(|path| podman_socket_responds(path))
-        .cloned()
-}
-
-fn podman_socket_candidates() -> Vec<PathBuf> {
-    let socket = std::env::var("OPENSHELL_PODMAN_SOCKET")
-        .ok()
-        .filter(|path| !path.trim().is_empty())
-        .map(PathBuf::from);
-    podman_socket_candidates_from_env(
-        socket,
-        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
-    )
-}
-
-fn podman_socket_candidates_from_env(
-    socket: Option<PathBuf>,
-    runtime_dir: Option<PathBuf>,
-    home: Option<PathBuf>,
-) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-
-    if let Some(path) = socket {
-        candidates.push(path);
-    }
-
-    if let Some(runtime_dir) = runtime_dir {
-        candidates.push(runtime_dir.join("podman/podman.sock"));
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        candidates.push(PathBuf::from(format!(
-            "/run/user/{}/podman/podman.sock",
-            current_uid()
-        )));
-    }
-
-    if let Some(home) = home {
-        candidates.push(home.join(".local/share/containers/podman/machine/podman.sock"));
-    }
-
-    candidates
-}
-
-fn is_docker_available() -> bool {
-    detect_docker_socket().is_some()
-}
-
-pub fn detect_docker_socket() -> Option<PathBuf> {
-    detect_docker_socket_from_candidates(&docker_socket_candidates())
-}
-
-fn detect_docker_socket_from_candidates(candidates: &[PathBuf]) -> Option<PathBuf> {
-    candidates
-        .iter()
-        .find(|path| docker_socket_responds(path))
-        .cloned()
-}
-
-fn docker_socket_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-
-    if let Ok(host) = std::env::var("DOCKER_HOST")
-        && let Some(path) = docker_host_unix_socket_path(&host)
-    {
-        candidates.push(path);
-    }
-
-    candidates.push(PathBuf::from("/var/run/docker.sock"));
-
-    if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(PathBuf::from(home).join(".docker/run/docker.sock"));
-    }
-
-    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        candidates.push(PathBuf::from(runtime_dir).join("docker.sock"));
-    }
-
-    candidates
-}
-
-fn docker_host_unix_socket_path(host: &str) -> Option<PathBuf> {
-    let path = host.trim().strip_prefix("unix://")?;
-    (!path.is_empty()).then(|| PathBuf::from(path))
-}
-
-#[cfg(unix)]
-fn is_unix_socket(path: &Path) -> bool {
-    path.metadata()
-        .is_ok_and(|metadata| metadata.file_type().is_socket())
-}
-
-#[cfg(unix)]
-fn podman_socket_responds(path: &Path) -> bool {
-    unix_socket_http_ping(path, |response| {
-        http_response_is_success(response) && contains_ascii(response, b"Libpod-Api-Version:")
-    })
-}
-
-#[cfg(unix)]
-fn docker_socket_responds(path: &Path) -> bool {
-    unix_socket_http_ping(path, |response| {
-        http_response_is_success(response)
-            && contains_ascii(response, b"Api-Version:")
-            && !contains_ascii(response, b"Libpod-Api-Version:")
-    })
-}
-
-#[cfg(unix)]
-fn unix_socket_http_ping(path: &Path, accepts_response: impl FnOnce(&[u8]) -> bool) -> bool {
-    const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
-    const PING_REQUEST: &[u8] =
-        b"GET /_ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-
-    if !is_unix_socket(path) {
-        return false;
-    }
-
-    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(path) else {
-        return false;
-    };
-    if stream.set_read_timeout(Some(PROBE_TIMEOUT)).is_err()
-        || stream.set_write_timeout(Some(PROBE_TIMEOUT)).is_err()
-        || stream.write_all(PING_REQUEST).is_err()
-    {
-        return false;
-    }
-
-    let mut response = [0_u8; 512];
-    let mut total = 0;
-    while total < response.len() {
-        let Ok(n) = stream.read(&mut response[total..]) else {
-            return false;
-        };
-        if n == 0 {
-            break;
-        }
-        total += n;
-        if contains_ascii(&response[..total], b"\r\n\r\n") {
-            break;
-        }
-    }
-    total > 0 && accepts_response(&response[..total])
-}
-
-#[cfg(unix)]
-fn http_response_is_success(response: &[u8]) -> bool {
-    response.starts_with(b"HTTP/1.1 200") || response.starts_with(b"HTTP/1.0 200")
-}
-
-#[cfg(unix)]
-fn contains_ascii(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle))
-}
-
-#[cfg(all(unix, test))]
-fn is_reachable_unix_socket(path: &Path) -> bool {
-    is_unix_socket(path) && std::os::unix::net::UnixStream::connect(path).is_ok()
-}
-
-#[cfg(all(unix, target_os = "linux"))]
-fn current_uid() -> u32 {
-    use std::os::unix::fs::MetadataExt;
-
-    std::fs::metadata("/proc/self").map_or(0, |metadata| metadata.uid())
-}
-
-#[cfg(not(unix))]
-fn podman_socket_responds(path: &Path) -> bool {
-    let _ = path;
-    false
-}
-
-#[cfg(not(unix))]
-fn docker_socket_responds(path: &Path) -> bool {
-    let _ = path;
-    false
-}
-
 /// Server configuration.
 ///
 /// Built programmatically in [`crate::Config::new`] and the gateway CLI from
@@ -412,6 +142,9 @@ fn docker_socket_responds(path: &Path) -> bool {
 /// `Deserialize` impls for that purpose).
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Operator-assigned name for this gateway installation.
+    pub name: String,
+
     /// Address to bind the server to.
     pub bind_address: SocketAddr,
 
@@ -785,8 +518,8 @@ pub struct GatewayJwtConfig {
     pub public_key_path: PathBuf,
     /// Path to the `kid` value (plain text, one line).
     pub kid_path: PathBuf,
-    /// Stable gateway identity embedded in `iss`/`aud`. Defaults to the
-    /// hostname-or-`openshell` placeholder if unset.
+    /// Stable gateway identity embedded in `iss`/`aud`. Defaults to
+    /// `openshell`.
     #[serde(default = "default_gateway_id")]
     pub gateway_id: String,
     /// Token lifetime in seconds. A value of 0 disables expiration and is
@@ -819,6 +552,7 @@ impl Config {
     /// Create a new config with optional TLS.
     pub fn new(tls: Option<TlsConfig>) -> Self {
         Self {
+            name: DEFAULT_GATEWAY_NAME.to_string(),
             bind_address: default_bind_address(),
             health_bind_address: None,
             metrics_bind_address: None,
@@ -844,6 +578,13 @@ impl Config {
             grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),
         }
+    }
+
+    /// Create a new configuration with the gateway installation name.
+    #[must_use]
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
     }
 
     /// Create a new configuration with the given bind address.
@@ -1084,48 +825,13 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
+        Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
         GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
         GatewayProviderProfileSourceConfig, PolicyValidationFailureMode,
-        detect_docker_socket_from_candidates, detect_driver, detect_podman_socket_from_candidates,
-        docker_host_unix_socket_path, docker_socket_responds, normalize_compute_driver_name,
-        podman_socket_candidates_from_env, podman_socket_responds,
+        normalize_compute_driver_name,
     };
-    #[cfg(unix)]
-    use super::{is_reachable_unix_socket, is_unix_socket};
-    #[cfg(unix)]
-    use std::io::{Read as _, Write as _};
     use std::net::SocketAddr;
-    #[cfg(unix)]
-    use std::os::unix::net::UnixListener;
-    use std::path::PathBuf;
     use std::time::Duration;
-
-    #[test]
-    fn compute_driver_kind_parses_supported_values() {
-        assert_eq!(
-            "kubernetes".parse::<ComputeDriverKind>().unwrap(),
-            ComputeDriverKind::Kubernetes
-        );
-        assert_eq!(
-            "vm".parse::<ComputeDriverKind>().unwrap(),
-            ComputeDriverKind::Vm
-        );
-        assert_eq!(
-            "podman".parse::<ComputeDriverKind>().unwrap(),
-            ComputeDriverKind::Podman
-        );
-        assert_eq!(
-            "docker".parse::<ComputeDriverKind>().unwrap(),
-            ComputeDriverKind::Docker
-        );
-    }
-
-    #[test]
-    fn compute_driver_kind_rejects_unknown_values() {
-        let err = "firecracker".parse::<ComputeDriverKind>().unwrap_err();
-        assert!(err.contains("unsupported compute driver 'firecracker'"));
-    }
 
     #[test]
     fn policy_validation_failure_mode_is_secure_by_default() {
@@ -1217,6 +923,15 @@ mod tests {
         .expect("gateway JWT config should deserialize with default ttl");
 
         assert_eq!(cfg.ttl_secs, 0);
+    }
+
+    #[test]
+    fn name_defaults_and_can_be_overridden() {
+        assert_eq!(Config::new(None).name, "openshell");
+        assert_eq!(
+            Config::new(None).with_name("production-us-west").name,
+            "production-us-west"
+        );
     }
 
     #[test]
@@ -1335,244 +1050,6 @@ mod tests {
         let addr: SocketAddr = "0.0.0.0:9090".parse().expect("valid address");
         let cfg = Config::new(None).with_health_bind_address(addr);
         assert_eq!(cfg.health_bind_address, Some(addr));
-    }
-
-    #[test]
-    fn detect_driver_returns_none_without_k8s_env_or_local_runtime() {
-        // When KUBERNETES_SERVICE_HOST is not set, no Docker binary/socket is
-        // available, and no Podman API socket is available, detect_driver
-        // should return None.
-        // This test may pass or fail depending on the test environment,
-        // but it documents the expected behavior.
-        let _ = detect_driver(); // Returns Some or None based on environment
-    }
-
-    #[test]
-    fn docker_host_unix_socket_path_parses_unix_hosts() {
-        assert_eq!(
-            docker_host_unix_socket_path("unix:///var/run/docker.sock"),
-            Some(PathBuf::from("/var/run/docker.sock"))
-        );
-        assert_eq!(docker_host_unix_socket_path("tcp://127.0.0.1:2375"), None);
-        assert_eq!(docker_host_unix_socket_path("unix://"), None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn is_unix_socket_detects_socket_files() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let socket_path = temp_dir.path().join("docker.sock");
-        let _listener = UnixListener::bind(&socket_path).expect("bind unix socket");
-
-        assert!(is_unix_socket(&socket_path));
-        assert!(is_reachable_unix_socket(&socket_path));
-
-        let regular_file = temp_dir.path().join("not-a-socket");
-        std::fs::write(&regular_file, b"not a socket").expect("write regular file");
-        assert!(!is_unix_socket(&regular_file));
-        assert!(!is_reachable_unix_socket(&regular_file));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "flaky under concurrent test execution"]
-    fn podman_socket_probe_accepts_successful_ping_response() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let socket_path = temp_dir.path().join("podman.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind podman socket");
-
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept podman probe");
-            let mut request = [0_u8; 128];
-            let n = stream.read(&mut request).expect("read podman probe");
-            assert!(request[..n].starts_with(b"GET /_ping HTTP/1.1\r\n"));
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nLibpod-Api-Version: 5.8.2\r\nContent-Length: 2\r\n\r\nOK",
-                )
-                .expect("write podman ping response");
-        });
-
-        assert!(podman_socket_responds(&socket_path));
-        handle.join().expect("probe server exits");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "flaky under concurrent test execution"]
-    fn podman_socket_probe_rejects_docker_ping_response() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let socket_path = temp_dir.path().join("podman.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind podman socket");
-
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept podman probe");
-            let mut request = [0_u8; 128];
-            let n = stream.read(&mut request).expect("read podman probe");
-            assert!(request[..n].starts_with(b"GET /_ping HTTP/1.1\r\n"));
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nServer: Docker/29.2.1\r\nContent-Length: 2\r\n\r\nOK",
-                )
-                .expect("write docker ping response");
-        });
-
-        assert!(!podman_socket_responds(&socket_path));
-        handle.join().expect("probe server exits");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "flaky under concurrent test execution"]
-    fn docker_socket_probe_accepts_successful_ping_response() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let socket_path = temp_dir.path().join("docker.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind docker socket");
-
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept docker probe");
-            let mut request = [0_u8; 128];
-            let n = stream.read(&mut request).expect("read docker probe");
-            assert!(request[..n].starts_with(b"GET /_ping HTTP/1.1\r\n"));
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nApi-Version: 1.51\r\nDocker-Experimental: false\r\nContent-Length: 2\r\n\r\nOK",
-                )
-                .expect("write docker ping response");
-        });
-
-        assert!(docker_socket_responds(&socket_path));
-        handle.join().expect("probe server exits");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "flaky under concurrent test execution"]
-    fn docker_socket_probe_rejects_podman_ping_response() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let socket_path = temp_dir.path().join("podman.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind podman socket");
-
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept docker probe");
-            let mut request = [0_u8; 128];
-            let n = stream.read(&mut request).expect("read docker probe");
-            assert!(request[..n].starts_with(b"GET /_ping HTTP/1.1\r\n"));
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nLibpod-Api-Version: 5.8.2\r\nContent-Length: 2\r\n\r\nOK",
-                )
-                .expect("write podman ping response");
-        });
-
-        assert!(!docker_socket_responds(&socket_path));
-        handle.join().expect("probe server exits");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn docker_socket_probe_rejects_inactive_socket() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let socket_path = temp_dir.path().join("docker.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind docker socket");
-        drop(listener);
-
-        assert!(is_unix_socket(&socket_path));
-        assert!(!docker_socket_responds(&socket_path));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "flaky under concurrent test execution"]
-    fn docker_socket_detection_returns_the_responsive_candidate() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let inactive_path = temp_dir.path().join("inactive.sock");
-        let inactive_listener = UnixListener::bind(&inactive_path).expect("bind inactive socket");
-        drop(inactive_listener);
-
-        let responsive_path = temp_dir.path().join("responsive.sock");
-        let listener = UnixListener::bind(&responsive_path).expect("bind responsive socket");
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept docker probe");
-            let mut request = [0_u8; 128];
-            let _ = stream.read(&mut request).expect("read docker probe");
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nApi-Version: 1.51\r\nContent-Length: 2\r\n\r\nOK")
-                .expect("write docker ping response");
-        });
-
-        assert_eq!(
-            detect_docker_socket_from_candidates(&[inactive_path, responsive_path.clone(),]),
-            Some(responsive_path)
-        );
-        handle.join().expect("probe server exits");
-    }
-
-    #[test]
-    fn podman_socket_candidates_include_env_runtime_and_home_paths() {
-        let candidates = podman_socket_candidates_from_env(
-            Some(PathBuf::from("/tmp/custom-podman.sock")),
-            Some(PathBuf::from("/tmp/runtime")),
-            Some(PathBuf::from("/tmp/home")),
-        );
-
-        assert!(candidates.contains(&PathBuf::from("/tmp/custom-podman.sock")));
-        assert!(candidates.contains(&PathBuf::from("/tmp/runtime/podman/podman.sock")));
-        assert!(candidates.contains(&PathBuf::from(
-            "/tmp/home/.local/share/containers/podman/machine/podman.sock"
-        )));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "flaky under concurrent test execution"]
-    fn podman_socket_detection_returns_the_responsive_candidate() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let inactive_path = temp_dir.path().join("inactive.sock");
-        let inactive_listener = UnixListener::bind(&inactive_path).expect("bind inactive socket");
-        drop(inactive_listener);
-
-        let responsive_path = temp_dir.path().join("responsive.sock");
-        let listener = UnixListener::bind(&responsive_path).expect("bind responsive socket");
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept podman probe");
-            let mut request = [0_u8; 128];
-            let _ = stream.read(&mut request).expect("read podman probe");
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nLibpod-Api-Version: 5.8.2\r\nContent-Length: 2\r\n\r\nOK",
-                )
-                .expect("write podman ping response");
-        });
-
-        assert_eq!(
-            detect_podman_socket_from_candidates(&[inactive_path, responsive_path.clone(),]),
-            Some(responsive_path)
-        );
-        handle.join().expect("probe server exits");
-    }
-
-    #[test]
-    #[allow(unsafe_code)] // std::env::set_var/remove_var require unsafe in Rust 2024
-    fn detect_driver_prefers_kubernetes_when_k8s_env_is_set() {
-        // Save the original env var
-        let original = std::env::var("KUBERNETES_SERVICE_HOST").ok();
-
-        // Set the env var
-        unsafe {
-            std::env::set_var("KUBERNETES_SERVICE_HOST", "127.0.0.1");
-        }
-
-        let result = detect_driver();
-        assert_eq!(result, Some(ComputeDriverKind::Kubernetes));
-
-        // Restore the original env var
-        unsafe {
-            match original {
-                Some(val) => std::env::set_var("KUBERNETES_SERVICE_HOST", val),
-                None => std::env::remove_var("KUBERNETES_SERVICE_HOST"),
-            }
-        }
     }
 
     #[test]

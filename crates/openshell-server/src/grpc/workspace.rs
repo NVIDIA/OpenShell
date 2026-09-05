@@ -14,9 +14,9 @@ use openshell_core::proto::{
     CreateWorkspaceResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse, GetWorkspaceRequest,
     GetWorkspaceResponse, InferenceRoute, ListWorkspaceMembersRequest,
     ListWorkspaceMembersResponse, ListWorkspacesRequest, ListWorkspacesResponse, Provider,
-    RemoveWorkspaceMemberRequest, RemoveWorkspaceMemberResponse, Sandbox, ServiceEndpoint,
-    SshSession, StoredProviderCredentialRefreshState, StoredProviderProfile, Workspace,
-    WorkspaceMember, WorkspaceRole,
+    RemoveWorkspaceMemberRequest, RemoveWorkspaceMemberResponse, Sandbox, SandboxWorkloadTemplate,
+    ServiceEndpoint, SshSession, StoredProviderCredentialRefreshState, StoredProviderProfile,
+    Workspace, WorkspaceMember, WorkspaceRole,
 };
 use prost::Message;
 use tonic::{Request, Response, Status};
@@ -375,6 +375,7 @@ pub(super) async fn handle_delete_workspace(
     let mut blocking = Vec::new();
     for (object_type, label) in [
         (Sandbox::object_type(), "sandbox"),
+        (SandboxWorkloadTemplate::object_type(), "sandbox template"),
         (Provider::object_type(), "provider"),
         (StoredProviderProfile::object_type(), "provider profile"),
         (ServiceEndpoint::object_type(), "service"),
@@ -811,6 +812,72 @@ mod tests {
             &state,
             Request::new(DeleteWorkspaceRequest {
                 name: "ephemeral".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(resp.deleted);
+    }
+
+    #[tokio::test]
+    async fn delete_workspace_blocked_by_sandbox_template() {
+        let state = test_server_state().await;
+
+        handle_create_workspace(
+            &state,
+            Request::new(CreateWorkspaceRequest {
+                name: "templated".to_string(),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let template = SandboxWorkloadTemplate {
+            metadata: Some(ObjectMeta {
+                id: "template-1".to_string(),
+                name: "gpu-kata".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                resource_version: 0,
+                workspace: "templated".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            spec: None,
+        };
+        state.store.put_message(&template).await.unwrap();
+
+        let err = handle_delete_workspace(
+            &state,
+            Request::new(DeleteWorkspaceRequest {
+                name: "templated".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message().contains("sandbox template"),
+            "error should name sandbox templates as blocking resources: {}",
+            err.message()
+        );
+
+        state
+            .store
+            .delete_by_name(
+                SandboxWorkloadTemplate::object_type(),
+                "templated",
+                "gpu-kata",
+            )
+            .await
+            .unwrap();
+
+        let resp = handle_delete_workspace(
+            &state,
+            Request::new(DeleteWorkspaceRequest {
+                name: "templated".to_string(),
             }),
         )
         .await

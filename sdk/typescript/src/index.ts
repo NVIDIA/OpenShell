@@ -3,11 +3,6 @@
 
 // Public API surface for @nvidia/openshell-sdk.
 //
-// OidcRefresher (single-flight OIDC refresh) is intentionally not yet exported.
-// It is the one piece of genuinely shared, cross-language behavior; it will be
-// added alongside a conformance suite that pins it byte-identical across the
-// TypeScript, Python, and Go SDKs.
-
 export type {
   ConnectOptions,
   EffectiveSettingView,
@@ -28,10 +23,20 @@ export type {
   ProviderChangeOptions,
   ProviderRef,
   SandboxConfig,
+  SandboxFromTemplateSpec,
   SandboxPhaseName,
   SandboxPolicy,
   SandboxRef,
+  SandboxResources,
+  SandboxServiceLevel,
   SandboxSpec,
+  SandboxStartup,
+  SandboxTemplateListOptions,
+  SandboxTemplateWorkspaceOptions,
+  SandboxWorkloadConfig,
+  SandboxWorkloadTemplate,
+  SandboxWorkloadTemplateProvenance,
+  SandboxWorkloadTemplateSpec,
   SetPolicyOptions,
   SettingScopeName,
   SettingValue,
@@ -39,6 +44,8 @@ export type {
   UpdateConfigResult,
   WaitOptions,
 } from './client.js';
-export { errorCode, OpenShellClient, SandboxClient } from './client.js';
+export { errorCode, OpenShellClient, SandboxClient, SandboxTemplateClient } from './client.js';
 export type { SdkErrorCode } from './errors.js';
 export { SdkError } from './errors.js';
+export type { ClientCredentialsOptions, OidcTokenProvider } from './oidc.js';
+export { clientCredentials } from './oidc.js';

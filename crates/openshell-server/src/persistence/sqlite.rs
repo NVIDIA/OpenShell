@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    DraftChunkRecord, ObjectRecord, PersistenceError, PersistenceResult, PolicyRecord,
-    WriteCondition, WriteResult, current_time_ms, map_db_error, map_migrate_error,
+    DraftChunkRecord, ObjectCursor, ObjectRecord, PersistenceError, PersistenceResult,
+    PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error, map_migrate_error,
 };
 use crate::policy_store::{
     AtomicPolicyRevisionWrite, draft_chunk_payload_from_record, draft_chunk_record_from_parts,
@@ -14,34 +14,56 @@ use openshell_core::SetResourceVersion;
 use openshell_core::paths::set_file_owner_only;
 use openshell_core::proto::Sandbox;
 use prost::Message;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Connection, Row, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePoolOptions};
+use sqlx::{Connection, QueryBuilder, Row, Sqlite, SqlitePool};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::Mutex;
 
 static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
+static IN_MEMORY_DB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-use super::{DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
+use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
 
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+    in_memory_keepalive: Option<Arc<Mutex<Option<SqliteConnection>>>>,
+}
+
+#[cfg(test)]
+pub(super) async fn replace_pool_connection(store: &SqliteStore) -> PersistenceResult<()> {
+    let connection = store.pool.acquire().await.map_err(|e| map_db_error(&e))?;
+    connection.close().await.map_err(|e| map_db_error(&e))
 }
 
 impl SqliteStore {
     /// Closes the connection pool.
     #[cfg(test)]
     pub(crate) async fn close_for_test(&self) {
-        self.pool.close().await;
+        self.close().await;
     }
 
     pub async fn connect(url: &str) -> PersistenceResult<Self> {
         let is_in_memory = url.contains(":memory:") || url.contains("mode=memory");
         let max_connections = if is_in_memory { 1 } else { 5 };
 
-        let options = SqliteConnectOptions::from_str(url)
+        let mut options = SqliteConnectOptions::from_str(url)
             .map_err(|e| map_db_error(&e))?
             .create_if_missing(true);
+
+        if is_in_memory {
+            if options.get_filename().as_os_str().is_empty()
+                || options.get_filename() == Path::new(":memory:")
+            {
+                let sequence = IN_MEMORY_DB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                options = options.filename(format!("file:openshell-in-memory-{sequence}"));
+            }
+            options = options.shared_cache(true);
+        }
 
         let mut pool_options = SqlitePoolOptions::new()
             .max_connections(max_connections)
@@ -55,6 +77,15 @@ impl SqliteStore {
         // so we can restrict the permissions after the database is connected.
         let db_path = (!is_in_memory).then(|| options.get_filename().to_path_buf());
 
+        let in_memory_keepalive = if is_in_memory {
+            let connection = SqliteConnection::connect_with(&options)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+            Some(Arc::new(Mutex::new(Some(connection))))
+        } else {
+            None
+        };
+
         let pool = pool_options
             .connect_with(options)
             .await
@@ -65,7 +96,10 @@ impl SqliteStore {
             restrict_db_file_permissions(&path)?;
         }
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            in_memory_keepalive,
+        })
     }
 
     pub async fn migrate(&self) -> PersistenceResult<()> {
@@ -88,6 +122,12 @@ impl SqliteStore {
     #[cfg(any(test, feature = "test-support"))]
     pub async fn close(&self) {
         self.pool.close().await;
+        if let Some(keepalive) = &self.in_memory_keepalive {
+            let connection = keepalive.lock().await.take();
+            if let Some(connection) = connection {
+                let _ = connection.close().await;
+            }
+        }
     }
 
     pub async fn put(
@@ -319,6 +359,105 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_scoped(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        scope: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> PersistenceResult<WriteResult> {
+        let now_ms = current_time_ms();
+
+        sqlx::query(
+            r#"
+INSERT INTO "objects" ("object_type", "id", "name", "workspace", "scope", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, 1)
+"#,
+        )
+        .bind(object_type)
+        .bind(id)
+        .bind(name)
+        .bind(workspace)
+        .bind(scope)
+        .bind(payload)
+        .bind(now_ms)
+        .bind(labels.unwrap_or("{}"))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        Ok(WriteResult {
+            resource_version: 1,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_if_workspace_count_below(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+        max_count: u64,
+    ) -> PersistenceResult<Option<WriteResult>> {
+        let now_ms = current_time_ms();
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_db_error(&e))?;
+
+        let row: (i64,) = sqlx::query_as(
+            r#"
+SELECT COUNT(*) FROM "objects"
+WHERE "object_type" = ?1 AND "workspace" = ?2
+"#,
+        )
+        .bind(object_type)
+        .bind(workspace)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        let count = u64::try_from(row.0).unwrap_or(0);
+        if count >= max_count {
+            tx.commit().await.map_err(|e| map_db_error(&e))?;
+            return Ok(None);
+        }
+
+        sqlx::query(
+            r#"
+INSERT INTO "objects" ("object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 1)
+"#,
+        )
+        .bind(object_type)
+        .bind(id)
+        .bind(name)
+        .bind(workspace)
+        .bind(payload)
+        .bind(now_ms)
+        .bind(labels.unwrap_or("{}"))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+
+        Ok(Some(WriteResult {
+            resource_version: 1,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        }))
+    }
+
     pub async fn get(
         &self,
         object_type: &str,
@@ -376,6 +515,27 @@ WHERE "object_type" = ?1 AND "id" = ?2
         .await
         .map_err(|e| map_db_error(&e))?;
         Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete_many(&self, object_type: &str, ids: &[String]) -> PersistenceResult<u64> {
+        let mut deleted = 0_u64;
+        for ids in ids.chunks(DELETE_MANY_BATCH_SIZE) {
+            let mut query = QueryBuilder::<Sqlite>::new("DELETE FROM objects WHERE object_type = ");
+            query.push_bind(object_type).push(" AND id IN (");
+            let mut separated = query.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated(")");
+
+            deleted += query
+                .build()
+                .execute(&self.pool)
+                .await
+                .map_err(|e| map_db_error(&e))?
+                .rows_affected();
+        }
+        Ok(deleted)
     }
 
     pub async fn count_in_workspace(
@@ -501,6 +661,77 @@ LIMIT ?2 OFFSET ?3
         .await
         .map_err(|e| map_db_error(&e))?;
 
+        Ok(rows.into_iter().map(row_to_object_record).collect())
+    }
+    pub async fn list_after(
+        &self,
+        object_type: &str,
+        workspace: &str,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        let rows = if let Some(cursor) = after {
+            sqlx::query(
+                r#"
+SELECT "object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version"
+FROM "objects"
+WHERE "object_type" = ?1 AND "workspace" = ?2
+  AND ("created_at_ms", "name", "id") > (?3, ?4, ?5)
+ORDER BY "created_at_ms" ASC, "name" ASC, "id" ASC
+LIMIT ?6
+"#,
+            )
+            .bind(object_type)
+            .bind(workspace)
+            .bind(cursor.created_at_ms)
+            .bind(&cursor.name)
+            .bind(&cursor.id)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+SELECT "object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version"
+FROM "objects"
+WHERE "object_type" = ?1 AND "workspace" = ?2
+ORDER BY "created_at_ms" ASC, "name" ASC, "id" ASC
+LIMIT ?3
+"#,
+            )
+            .bind(object_type)
+            .bind(workspace)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|e| map_db_error(&e))?;
+        Ok(rows.into_iter().map(row_to_object_record).collect())
+    }
+    pub async fn list_by_type_after(
+        &self,
+        object_type: &str,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        let rows = if let Some(cursor) = after {
+            sqlx::query(r#"
+SELECT "object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version"
+FROM "objects"
+WHERE "object_type" = ?1
+  AND ("created_at_ms", "name", "workspace", "id") > (?2, ?3, ?4, ?5)
+ORDER BY "created_at_ms" ASC, "name" ASC, "workspace" ASC, "id" ASC
+LIMIT ?6
+"#).bind(object_type).bind(cursor.created_at_ms).bind(&cursor.name).bind(&cursor.workspace).bind(&cursor.id).bind(i64::from(limit)).fetch_all(&self.pool).await
+        } else {
+            sqlx::query(r#"
+SELECT "object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version"
+FROM "objects"
+WHERE "object_type" = ?1
+ORDER BY "created_at_ms" ASC, "name" ASC, "workspace" ASC, "id" ASC
+LIMIT ?2
+"#).bind(object_type).bind(i64::from(limit)).fetch_all(&self.pool).await
+        }.map_err(|e| map_db_error(&e))?;
         Ok(rows.into_iter().map(row_to_object_record).collect())
     }
 
@@ -1196,6 +1427,28 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "status" = 'pending'
         .bind(id)
         .bind(payload)
         .bind(record.last_seen_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn update_draft_chunk_evaluation(
+        &self,
+        chunk: &DraftChunkRecord,
+    ) -> PersistenceResult<bool> {
+        let payload = draft_chunk_payload_from_record(chunk)?;
+        let result = sqlx::query(
+            r#"
+UPDATE "objects"
+SET "payload" = ?3, "updated_at_ms" = ?4
+WHERE "object_type" = ?1 AND "id" = ?2 AND "status" IN ('pending', 'rejected')
+"#,
+        )
+        .bind(DRAFT_CHUNK_OBJECT_TYPE)
+        .bind(&chunk.id)
+        .bind(payload)
+        .bind(chunk.last_seen_ms)
         .execute(&self.pool)
         .await
         .map_err(|e| map_db_error(&e))?;

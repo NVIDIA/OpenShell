@@ -66,7 +66,8 @@ spec:
         {{- end }}
         # Most gateway settings live in the ConfigMap-backed TOML file
         # mounted at /etc/openshell/gateway.toml. Secret-bearing settings use
-        # env vars that the TOML references by name.
+        # env vars that the TOML references by name. Some process-level
+        # settings consumed by libraries outside gateway code also remain here.
         {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
         # OIDC issuer custom-CA: rustls/reqwest read SSL_CERT_FILE for
         # outbound TLS verification. This is a process-level env var
@@ -77,6 +78,10 @@ spec:
         {{- end }}
         - name: OPENSHELL_TELEMETRY_ENABLED
           value: {{ .Values.server.telemetryEnabled | quote }}
+        {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
+        - name: OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET
+          value: {{ .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
+        {{- end }}
       volumeMounts:
         {{- if eq (include "openshell.workloadKind" .) "statefulset" }}
         - name: openshell-data
@@ -97,7 +102,7 @@ spec:
           mountPath: /etc/openshell-tls/server-external
           readOnly: true
         {{- end }}
-        {{- if or .Values.server.tls.clientCaSecretName (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
+        {{- if eq (include "openshell.gatewayClientCaEnabled" .) "true" }}
         - name: tls-client-ca
           mountPath: /etc/openshell-tls/client-ca
           readOnly: true
@@ -106,6 +111,11 @@ spec:
         {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
         - name: oidc-ca
           mountPath: /etc/openshell-tls/oidc-ca
+          readOnly: true
+        {{- end }}
+        {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
+        - name: spiffe-workload-api
+          mountPath: {{ dir .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
           readOnly: true
         {{- end }}
       ports:
@@ -162,7 +172,7 @@ spec:
       secret:
         secretName: {{ include "openshell.fullname" . }}-server-external-tls
     {{- end }}
-    {{- if or .Values.server.tls.clientCaSecretName (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
+    {{- if eq (include "openshell.gatewayClientCaEnabled" .) "true" }}
     - name: tls-client-ca
       secret:
         {{- if or (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
@@ -179,6 +189,12 @@ spec:
     - name: oidc-ca
       configMap:
         name: {{ .Values.server.oidc.caConfigMapName }}
+    {{- end }}
+    {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
+    - name: spiffe-workload-api
+      csi:
+        driver: csi.spiffe.io
+        readOnly: true
     {{- end }}
   {{- with .Values.nodeSelector }}
   nodeSelector:

@@ -65,6 +65,10 @@ endpoints:
     rules:
       - allow:
           operation_type: query
+      - allow:
+          operation_type: mutation
+          operation_name: ResolveGatorReviewThread
+          fields: [resolveReviewThread]
   - host: github.com
     port: 443
     protocol: rest

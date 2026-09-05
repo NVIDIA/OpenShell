@@ -104,16 +104,11 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, theme: &crate::theme::Theme) {
 
     frame.render_widget(Paragraph::new(content_lines), chunks[0]);
 
-    // -- Footer: version + ALPHA badge on line 1, prompt on line 2 --
+    // -- Footer: version on line 1, prompt on line 2 --
     let version = format!("v{}", openshell_core::VERSION);
-    let alpha_badge = "ALPHA";
 
     let footer = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled(version, t.accent),
-            Span::styled(" ", t.muted),
-            Span::styled(alpha_badge, t.title_bar),
-        ]),
+        Line::from(Span::styled(version, t.accent)),
         Line::from(Span::styled("press any key ░", t.muted)),
     ]);
 

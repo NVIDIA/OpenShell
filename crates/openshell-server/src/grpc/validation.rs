@@ -4,14 +4,13 @@
 //! Request validation helpers for the gRPC service.
 //!
 //! All functions in this module are pure — they take proto types or primitives
-//! and return `Result<(), Status>`.  No server state is required.
+//! and return validated values or `Status` errors. No server state is required.
 
 #![allow(clippy::result_large_err)] // Validation returns Result<_, Status>
 
-use openshell_core::ComputeDriverKind;
 use openshell_core::proto::{
     CredentialHandle, ExecSandboxRequest, Provider, SandboxPolicy as ProtoSandboxPolicy,
-    SandboxTemplate,
+    SandboxSpec, SandboxTemplate,
 };
 use prost::Message;
 use tonic::Status;
@@ -28,29 +27,16 @@ use super::{
 // Exec request validation
 // ---------------------------------------------------------------------------
 
-/// Preserve process-identity omission only for the local OCI-aware drivers.
-///
-/// Kubernetes, VM, and unknown/remote drivers retain the legacy persisted
-/// `sandbox:sandbox` defaults so existing policy hashes and live-update
-/// workflows do not change.
-pub(super) fn normalize_process_identity_for_driver(
-    policy: &mut ProtoSandboxPolicy,
-    driver_kind: Option<ComputeDriverKind>,
-) {
-    if !matches!(
-        driver_kind,
-        Some(ComputeDriverKind::Docker | ComputeDriverKind::Podman)
-    ) {
-        openshell_policy::ensure_sandbox_process_identity(policy);
-    }
-}
-
 /// Maximum number of arguments in the command array.
 pub(super) const MAX_EXEC_COMMAND_ARGS: usize = 1024;
 /// Maximum length of a single command argument or environment value (bytes).
 pub(super) const MAX_EXEC_ARG_LEN: usize = 32 * 1024; // 32 KiB
 /// Maximum length of the workdir field (bytes).
 pub(super) const MAX_EXEC_WORKDIR_LEN: usize = 4096;
+/// Maximum number of entries in the canonical main-process argv.
+pub(super) const MAX_MAIN_PROCESS_ARGS: usize = 256;
+/// Maximum aggregate byte size of the canonical main-process argv.
+pub(super) const MAX_MAIN_PROCESS_ARGV_SIZE: usize = 256 * 1024;
 
 /// Validate exec request size limits and field-specific character constraints.
 ///
@@ -164,26 +150,12 @@ pub(super) fn validate_dns1123_label(name: &str, field: &str) -> Result<(), Stat
 /// Validate field sizes on a `CreateSandboxRequest` before persisting.
 ///
 /// Returns `INVALID_ARGUMENT` on the first field that exceeds its limit.
-pub(super) fn validate_sandbox_spec(
-    name: &str,
-    spec: &openshell_core::proto::SandboxSpec,
-) -> Result<(), Status> {
+pub(super) fn validate_sandbox_spec(name: &str, spec: &SandboxSpec) -> Result<(), Status> {
     // --- request.name ---
-    if !name.is_empty() && name.len() > MAX_ROUTABLE_NAME_LEN {
-        return Err(Status::invalid_argument(format!(
-            "name exceeds maximum length ({} > {MAX_ROUTABLE_NAME_LEN})",
-            name.len()
-        )));
-    }
-    validate_dns1123_label(name, "name")?;
+    validate_sandbox_name(name)?;
 
     // --- spec.providers ---
-    if spec.providers.len() > MAX_PROVIDERS {
-        return Err(Status::invalid_argument(format!(
-            "providers list exceeds maximum ({} > {MAX_PROVIDERS})",
-            spec.providers.len()
-        )));
-    }
+    validate_sandbox_provider_count(spec)?;
 
     // --- spec.log_level ---
     if spec.log_level.len() > MAX_LOG_LEVEL_LEN {
@@ -212,7 +184,50 @@ pub(super) fn validate_sandbox_spec(
     // --- spec.resource_requirements.gpu ---
     validate_gpu_request_fields(spec)?;
 
+    if !spec.command.is_empty() {
+        validate_main_process_command(&spec.command)?;
+    }
+
     // --- spec.policy serialized size ---
+    validate_sandbox_policy_size(spec)?;
+
+    Ok(())
+}
+
+pub(super) fn validate_sandbox_governance_spec(
+    name: &str,
+    spec: &SandboxSpec,
+) -> Result<(), Status> {
+    validate_sandbox_name(name)?;
+    validate_sandbox_provider_count(spec)?;
+    if !spec.command.is_empty() {
+        validate_main_process_command(&spec.command)?;
+    }
+    validate_sandbox_policy_size(spec)?;
+    Ok(())
+}
+
+fn validate_sandbox_name(name: &str) -> Result<(), Status> {
+    if !name.is_empty() && name.len() > MAX_ROUTABLE_NAME_LEN {
+        return Err(Status::invalid_argument(format!(
+            "name exceeds maximum length ({} > {MAX_ROUTABLE_NAME_LEN})",
+            name.len()
+        )));
+    }
+    validate_dns1123_label(name, "name")
+}
+
+fn validate_sandbox_provider_count(spec: &SandboxSpec) -> Result<(), Status> {
+    if spec.providers.len() > MAX_PROVIDERS {
+        return Err(Status::invalid_argument(format!(
+            "providers list exceeds maximum ({} > {MAX_PROVIDERS})",
+            spec.providers.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_sandbox_policy_size(spec: &SandboxSpec) -> Result<(), Status> {
     if let Some(ref policy) = spec.policy {
         let size = policy.encoded_len();
         if size > MAX_POLICY_SIZE {
@@ -225,7 +240,36 @@ pub(super) fn validate_sandbox_spec(
     Ok(())
 }
 
-fn validate_gpu_request_fields(spec: &openshell_core::proto::SandboxSpec) -> Result<(), Status> {
+fn validate_main_process_command(command: &[String]) -> Result<(), Status> {
+    if command.len() > MAX_MAIN_PROCESS_ARGS {
+        return Err(Status::invalid_argument(format!(
+            "spec.command exceeds {MAX_MAIN_PROCESS_ARGS} argument limit"
+        )));
+    }
+    if command[0].is_empty() {
+        return Err(Status::invalid_argument(
+            "spec.command[0] must not be empty",
+        ));
+    }
+    let argv_size: usize = command.iter().map(String::len).sum();
+    if argv_size > MAX_MAIN_PROCESS_ARGV_SIZE {
+        return Err(Status::invalid_argument(format!(
+            "spec.command total size exceeds {MAX_MAIN_PROCESS_ARGV_SIZE} byte limit"
+        )));
+    }
+    for (index, argument) in command.iter().enumerate() {
+        if argument.len() > MAX_EXEC_ARG_LEN {
+            return Err(Status::invalid_argument(format!(
+                "spec.command[{index}] exceeds {MAX_EXEC_ARG_LEN} byte limit"
+            )));
+        }
+        reject_null_char(argument, &format!("spec.command[{index}]"))?;
+    }
+
+    Ok(())
+}
+
+fn validate_gpu_request_fields(spec: &SandboxSpec) -> Result<(), Status> {
     if openshell_core::gpu::sandbox_gpu_count(spec.resource_requirements.as_ref()) == Some(0) {
         return Err(Status::invalid_argument("gpu count must be greater than 0"));
     }
@@ -834,6 +878,19 @@ pub(super) fn validate_policy_safety(policy: &ProtoSandboxPolicy) -> Result<(), 
     Ok(())
 }
 
+/// Validate a policy and return the canonical value safe to hash and persist.
+///
+/// Validation runs before canonicalization so sorting cannot hide duplicate or
+/// unsupported MCP revisions. Callers must use the returned value because the
+/// input may carry an equivalent but noncanonical revision order.
+pub(super) fn validate_and_canonicalize_policy(
+    policy: ProtoSandboxPolicy,
+) -> Result<ProtoSandboxPolicy, Status> {
+    openshell_policy::validate_and_canonicalize_sandbox_policy(policy).map_err(|error| {
+        Status::invalid_argument(format!("policy contains unsafe content: {error}"))
+    })
+}
+
 /// Validate that user-authored policy does not use provider-derived rule keys.
 pub(super) fn validate_no_reserved_provider_policy_keys(
     policy: &ProtoSandboxPolicy,
@@ -1018,6 +1075,16 @@ mod tests {
     #[test]
     fn validate_sandbox_spec_accepts_empty_defaults() {
         assert!(validate_sandbox_spec("", &default_spec()).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_accepts_exact_main_process_argv() {
+        let spec = SandboxSpec {
+            command: vec!["/bin/sh".into(), "-c".into(), "printf 'a b'".into()],
+            tty: false,
+            ..Default::default()
+        };
+        validate_sandbox_spec("", &spec).unwrap();
     }
 
     #[test]
@@ -1852,44 +1919,6 @@ mod tests {
     }
 
     // ---- Policy safety ----
-
-    #[test]
-    fn process_identity_omission_is_driver_scoped() {
-        use openshell_core::proto::ProcessPolicy;
-
-        for driver in [ComputeDriverKind::Docker, ComputeDriverKind::Podman] {
-            let mut policy = ProtoSandboxPolicy {
-                process: Some(ProcessPolicy {
-                    run_as_user: "1234".into(),
-                    run_as_group: String::new(),
-                }),
-                ..Default::default()
-            };
-            normalize_process_identity_for_driver(&mut policy, Some(driver));
-            assert!(
-                policy.process.unwrap().run_as_group.is_empty(),
-                "{driver:?} must preserve omission"
-            );
-        }
-
-        for driver in [
-            Some(ComputeDriverKind::Kubernetes),
-            Some(ComputeDriverKind::Vm),
-            None,
-        ] {
-            let mut policy = ProtoSandboxPolicy {
-                process: Some(ProcessPolicy {
-                    run_as_user: "1234".into(),
-                    run_as_group: String::new(),
-                }),
-                ..Default::default()
-            };
-            normalize_process_identity_for_driver(&mut policy, driver);
-            let process = policy.process.unwrap();
-            assert_eq!(process.run_as_user, "1234");
-            assert_eq!(process.run_as_group, "sandbox");
-        }
-    }
 
     #[test]
     fn validate_policy_safety_rejects_root_user() {

@@ -853,6 +853,7 @@ dependencies = [
  "prost",
  "prost-types",
  "protoc-bin-vendored",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror",

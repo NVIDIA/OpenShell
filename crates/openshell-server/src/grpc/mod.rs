@@ -17,14 +17,17 @@ use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, ClearDraftChunksRequest,
     ClearDraftChunksResponse, ComputeDriverCapabilities, ComputeDriverInfo,
     ConfigureProviderRefreshRequest, ConfigureProviderRefreshResponse, CreateProviderRequest,
-    CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
-    CreateWorkspaceRequest, CreateWorkspaceResponse, DeleteProviderProfileRequest,
-    DeleteProviderProfileResponse, DeleteProviderRefreshRequest, DeleteProviderRefreshResponse,
-    DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DeleteServiceRequest, DeleteServiceResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse, EditDraftChunkRequest,
-    EditDraftChunkResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
-    ExposeServiceRequest, GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse,
+    CreateSandboxRequest, CreateSandboxTemplateRequest, CreateSshSessionRequest,
+    CreateSshSessionResponse, CreateWorkspaceRequest, CreateWorkspaceResponse,
+    DeleteProviderProfileRequest, DeleteProviderProfileResponse, DeleteProviderRefreshRequest,
+    DeleteProviderRefreshResponse, DeleteProviderRequest, DeleteProviderResponse,
+    DeleteSandboxRequest, DeleteSandboxResponse, DeleteSandboxTemplateRequest,
+    DeleteSandboxTemplateResponse, DeleteServiceRequest, DeleteServiceResponse,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DetachSandboxProviderRequest,
+    DetachSandboxProviderResponse, EditDraftChunkRequest, EditDraftChunkResponse,
+    ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
+    ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest, FinalizeMainProcessExitRequest,
+    FinalizeMainProcessExitResponse, GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse,
     GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetGatewayInfoRequest,
     GetGatewayInfoResponse, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
@@ -32,20 +35,22 @@ use openshell_core::proto::{
     GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
     GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
-    GetServiceRequest, GetWorkspaceRequest, GetWorkspaceResponse, HealthRequest, HealthResponse,
-    ImportProviderProfilesRequest, ImportProviderProfilesResponse, IssueSandboxTokenRequest,
-    IssueSandboxTokenResponse, LintProviderProfilesRequest, LintProviderProfilesResponse,
-    ListProviderProfilesRequest, ListProviderProfilesResponse, ListProvidersRequest,
-    ListProvidersResponse, ListSandboxPoliciesRequest, ListSandboxPoliciesResponse,
-    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
+    GetSandboxTemplateRequest, GetServiceRequest, GetWorkspaceRequest, GetWorkspaceResponse,
+    HealthRequest, HealthResponse, ImportProviderProfilesRequest, ImportProviderProfilesResponse,
+    IssueSandboxTokenRequest, IssueSandboxTokenResponse, LintProviderProfilesRequest,
+    LintProviderProfilesResponse, ListProviderProfilesRequest, ListProviderProfilesResponse,
+    ListProvidersRequest, ListProvidersResponse, ListSandboxPoliciesRequest,
+    ListSandboxPoliciesResponse, ListSandboxProvidersRequest, ListSandboxProvidersResponse,
+    ListSandboxTemplatesRequest, ListSandboxTemplatesResponse, ListSandboxesRequest,
     ListSandboxesResponse, ListServicesRequest, ListServicesResponse, ListWorkspaceMembersRequest,
     ListWorkspaceMembersResponse, ListWorkspacesRequest, ListWorkspacesResponse,
     ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
     RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RejectDraftChunkRequest,
     RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
-    RemoveWorkspaceMemberResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
-    RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
-    RotateProviderCredentialResponse, SandboxResponse, ServiceEndpointResponse, ServiceStatus,
+    RemoveWorkspaceMemberResponse, ReportMainProcessExitRequest, ReportMainProcessExitResponse,
+    ReportPolicyStatusRequest, ReportPolicyStatusResponse, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
+    SandboxResponse, SandboxTemplateResponse, ServiceEndpointResponse, ServiceStatus,
     StartSandboxRequest, StopSandboxRequest, SubmitPolicyAnalysisRequest,
     SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest,
     UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
@@ -296,6 +301,34 @@ impl OpenShell for OpenShellService {
         sandbox::handle_list_sandboxes(&self.state, request).await
     }
 
+    async fn create_sandbox_template(
+        &self,
+        request: Request<CreateSandboxTemplateRequest>,
+    ) -> Result<Response<SandboxTemplateResponse>, Status> {
+        sandbox::handle_create_sandbox_template(&self.state, request).await
+    }
+
+    async fn get_sandbox_template(
+        &self,
+        request: Request<GetSandboxTemplateRequest>,
+    ) -> Result<Response<SandboxTemplateResponse>, Status> {
+        sandbox::handle_get_sandbox_template(&self.state, request).await
+    }
+
+    async fn list_sandbox_templates(
+        &self,
+        request: Request<ListSandboxTemplatesRequest>,
+    ) -> Result<Response<ListSandboxTemplatesResponse>, Status> {
+        sandbox::handle_list_sandbox_templates(&self.state, request).await
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        request: Request<DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<DeleteSandboxTemplateResponse>, Status> {
+        sandbox::handle_delete_sandbox_template(&self.state, request).await
+    }
+
     async fn list_sandbox_providers(
         &self,
         request: Request<ListSandboxProvidersRequest>,
@@ -542,6 +575,13 @@ impl OpenShell for OpenShellService {
         policy::handle_get_sandbox_provider_environment(&self.state, request).await
     }
 
+    async fn exchange_provider_subject_token(
+        &self,
+        request: Request<ExchangeProviderSubjectTokenRequest>,
+    ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
+        provider::handle_exchange_provider_subject_token(&self.state, request).await
+    }
+
     async fn update_config(
         &self,
         request: Request<UpdateConfigRequest>,
@@ -677,6 +717,20 @@ impl OpenShell for OpenShellService {
         request: Request<tonic::Streaming<SupervisorMessage>>,
     ) -> Result<Response<Self::ConnectSupervisorStream>, Status> {
         crate::supervisor_session::handle_connect_supervisor(&self.state, request).await
+    }
+
+    async fn report_main_process_exit(
+        &self,
+        request: Request<ReportMainProcessExitRequest>,
+    ) -> Result<Response<ReportMainProcessExitResponse>, Status> {
+        crate::supervisor_session::handle_report_main_process_exit(&self.state, request).await
+    }
+
+    async fn finalize_main_process_exit(
+        &self,
+        request: Request<FinalizeMainProcessExitRequest>,
+    ) -> Result<Response<FinalizeMainProcessExitResponse>, Status> {
+        crate::supervisor_session::handle_finalize_main_process_exit(&self.state, request).await
     }
 
     type RelayStreamStream =
