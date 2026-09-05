@@ -1,5 +1,21 @@
-# Broad ownership — core team reviews everything
-* @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+# Broad ownership — disabled. This rule matched every pull request and
+# requested review from the whole codeowners team plus three individuals,
+# notifying all of them regardless of what the change touched. Reviewers
+# opt in manually until area/topic labeling and per-area maintainer
+# rosters replace it with targeted routing. Do not restore as-is.
+# * @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
 
 # Vouch list — maintainers only (bot commits bypass, but manual edits need review)
 .github/VOUCHED.td @NVIDIA/openshell-codeowners
+
+# Approval machinery — these files decide who can merge. MAINTAINERS.md is the
+# approver list itself; the workflow and helper below evaluate it and publish
+# "OpenShell / Core Approval". A change to any of them silently redefines who
+# can approve anything, so each keeps an explicit owner after the wildcard above
+# was disabled. Scoped to these paths on purpose — owning all of .github/ would
+# reintroduce the fan-out this file just removed.
+/MAINTAINERS.md @NVIDIA/openshell-codeowners
+/.github/CODEOWNERS @NVIDIA/openshell-codeowners
+/.github/workflows/core-approval.yml @NVIDIA/openshell-codeowners
+/.github/zizmor.yml @NVIDIA/openshell-codeowners
+/tasks/scripts/core_approval.py @NVIDIA/openshell-codeowners
