@@ -1192,7 +1192,7 @@ impl Default for PtyRequest {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply_child_env(
+pub(crate) fn apply_child_env(
     cmd: &mut Command,
     session_home: &str,
     session_user: &str,
@@ -1368,7 +1368,7 @@ fn spawn_pty_shell(
     #[cfg(target_os = "linux")]
     let child_pid = child.id();
     #[cfg(target_os = "linux")]
-    managed_children::register(child_pid);
+    let managed_child = managed_children::register(child_pid);
     let master_file = master;
 
     let (sender, receiver) = mpsc::channel::<Vec<u8>>();
@@ -1414,7 +1414,9 @@ fn spawn_pty_shell(
     std::thread::spawn(move || {
         let status = child.wait().ok();
         #[cfg(target_os = "linux")]
-        managed_children::unregister(child_pid);
+        if let Some(child) = managed_child {
+            managed_children::unregister(child);
+        }
         let code = status.and_then(|s| s.code()).unwrap_or(1).unsigned_abs();
         // Wait for the reader thread to finish forwarding all output before
         // sending exit-status and closing the channel.  This prevents the
@@ -1517,7 +1519,7 @@ fn spawn_pipe_exec(
     #[cfg(target_os = "linux")]
     let child_pid = child.id();
     #[cfg(target_os = "linux")]
-    managed_children::register(child_pid);
+    let managed_child = managed_children::register(child_pid);
 
     let child_stdin = child.stdin.take();
     let child_stdout = child.stdout.take().expect("stdout must be piped");
@@ -1589,7 +1591,9 @@ fn spawn_pipe_exec(
     std::thread::spawn(move || {
         let status = child.wait().ok();
         #[cfg(target_os = "linux")]
-        managed_children::unregister(child_pid);
+        if let Some(child) = managed_child {
+            managed_children::unregister(child);
+        }
         let code = status.and_then(|s| s.code()).unwrap_or(1).unsigned_abs();
         // Wait for both reader threads.
         let _ = reader_done_rx.recv_timeout(Duration::from_secs(2));
@@ -1604,7 +1608,7 @@ fn spawn_pipe_exec(
     Ok(sender)
 }
 
-mod unsafe_pty {
+pub(crate) mod unsafe_pty {
     #[cfg(not(target_os = "linux"))]
     use super::sandbox;
     use super::{
@@ -1621,6 +1625,23 @@ mod unsafe_pty {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// Install a pre-exec hook that gives the child a dedicated process group.
+    ///
+    /// Boundary-owned pipe execs use the child's PID as the process-group ID
+    /// for signal delivery and tree cleanup. Keep this separate from
+    /// [`install_pre_exec_no_pty`] so legacy SSH exec behavior is unchanged.
+    #[allow(unsafe_code)]
+    pub fn install_dedicated_process_group(cmd: &mut Command) {
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
 
     #[allow(unsafe_code)]

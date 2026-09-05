@@ -37,8 +37,20 @@ pub struct Router {
 
 impl Router {
     pub fn new() -> Result<Self, RouterError> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
+        Self::with_dns_overrides(std::iter::empty::<(&str, std::net::IpAddr)>())
+    }
+
+    /// Build a router with trusted, static DNS overrides for its upstream
+    /// HTTP client. URL hostnames remain unchanged for HTTP and TLS; only the
+    /// dial address is replaced.
+    pub fn with_dns_overrides<'a>(
+        overrides: impl IntoIterator<Item = (&'a str, std::net::IpAddr)>,
+    ) -> Result<Self, RouterError> {
+        let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(30));
+        for (host, ip) in overrides {
+            builder = builder.resolve(host, std::net::SocketAddr::new(ip, 0));
+        }
+        let client = builder
             .build()
             .map_err(|e| RouterError::Internal(format!("failed to build HTTP client: {e}")))?;
         Ok(Self {
@@ -185,5 +197,41 @@ mod tests {
         };
         let err = Router::from_config(&config).unwrap_err();
         assert!(matches!(err, RouterError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn trusted_dns_override_preserves_url_host_and_port() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let port = listener.local_addr().expect("server address").port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = vec![0_u8; 1024];
+            let length = stream.read(&mut request).await.expect("read request");
+            assert!(
+                String::from_utf8_lossy(&request[..length])
+                    .to_ascii_lowercase()
+                    .contains(&format!("host: host.openshell.internal:{port}"))
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .expect("write response");
+        });
+
+        let router =
+            Router::with_dns_overrides([("host.openshell.internal", "127.0.0.1".parse().unwrap())])
+                .expect("build router");
+        let response = router
+            .client
+            .get(format!("http://host.openshell.internal:{port}/health"))
+            .send()
+            .await
+            .expect("request through DNS override");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        server.await.expect("server task");
     }
 }
