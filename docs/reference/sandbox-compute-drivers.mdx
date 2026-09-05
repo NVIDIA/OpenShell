@@ -241,6 +241,26 @@ For maintainer-level implementation details, refer to the [Podman driver README]
 
 Select Podman with `compute_drivers = ["podman"]` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, `host_gateway_ip`, `sandbox_ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.podman]`.
 
+### macOS Podman Socket Path
+
+On macOS, Homebrew-installed Podman does not create the default socket path
+that the driver probes (`~/.local/share/containers/podman/machine/podman.sock`).
+The actual API socket lives under `/var/folders/` in a path that macOS can
+rotate after a reboot.
+
+If the gateway fails with `Podman socket not found; is podman machine running?`
+while `podman machine list` shows a running machine, set the
+`OPENSHELL_PODMAN_SOCKET` environment variable to the dynamic socket path:
+
+```shell
+export OPENSHELL_PODMAN_SOCKET="$(podman machine inspect --format '{{.ConnectionInfo.PodmanSocket.Path}}')"
+```
+
+Add this to your shell profile or gateway launch environment so it resolves
+correctly after each reboot. Alternatively, set `socket_path` in
+`[openshell.drivers.podman]` to the current path, but note that the path may
+change when macOS rotates `/var/folders/`.
+
 Podman sandboxes default to a 45-second graceful stop window before Podman escalates from `SIGTERM` to `SIGKILL`. Set `stop_timeout_secs` in gateway config, or `OPENSHELL_STOP_TIMEOUT` for the standalone driver, when a local runtime needs a different teardown window.
 
 Stop stops the existing Podman container while retaining its named workspace
