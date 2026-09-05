@@ -1106,7 +1106,21 @@ fn classify_send(
             }
         }
         Ok(entry) if matches!(entry.state(), SocketState::DnsUdp { .. }) => {
-            if messages.iter().all(|message| message.destination.is_none()) {
+            let SocketState::DnsUdp { relay } = entry.state() else {
+                unreachable!("guard requires DNS UDP state");
+            };
+            // musl-based resolvers, including the statically linked `uv`
+            // client, send A and AAAA as separate destination-bearing
+            // datagrams on one socket. The first send pins the socket to the
+            // private relay; permit later sends only when their copied
+            // destination is absent or names that same relay. The mandatory
+            // outer network fence remains the fail-closed backstop for the
+            // sibling-thread pointer race inherent in seccomp CONTINUE.
+            if messages.iter().all(|message| {
+                message
+                    .destination
+                    .is_none_or(|destination| destination == *relay)
+            }) {
                 listener.respond_continue(notification.id)
             } else {
                 Err(io::Error::from_raw_os_error(libc::EACCES))
@@ -1845,6 +1859,57 @@ mod tests {
         assert_eq!(
             client.join().expect("join client").expect("DNS client"),
             dns_address
+        );
+    }
+
+    #[test]
+    fn udp_dns_allows_repeated_destination_sends_to_the_pinned_relay() {
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        let dns_address = broker.dns_address();
+        let client = std::thread::spawn(move || {
+            launcher
+                .execute(move || -> io::Result<Vec<Vec<u8>>> {
+                    // Static musl clients send A and AAAA with two sendto(2)
+                    // calls on the same initially-unconnected socket.
+                    let socket = UdpSocket::bind("0.0.0.0:0")?;
+                    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+                    socket.send_to(b"dns-query-a", dns_address)?;
+                    socket.send_to(b"dns-query-aaaa", dns_address)?;
+                    let mut responses = Vec::new();
+                    for _ in 0..2 {
+                        let mut response = [0_u8; 32];
+                        let (length, source) = socket.recv_from(&mut response)?;
+                        if source != dns_address {
+                            return Err(io::Error::other("wrong DNS response source"));
+                        }
+                        responses.push(response[..length].to_vec());
+                    }
+                    responses.sort();
+                    Ok(responses)
+                })
+                .expect("launcher result")
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        for _ in 0..2 {
+            let query = runtime.block_on(broker.accept_dns()).expect("DNS query");
+            let response = if query.request == b"dns-query-a" {
+                b"dns-response-a".to_vec()
+            } else if query.request == b"dns-query-aaaa" {
+                b"dns-response-aaaa".to_vec()
+            } else {
+                panic!("unexpected DNS query: {:?}", query.request);
+            };
+            query.complete(Ok(response)).unwrap();
+        }
+        assert_eq!(
+            client.join().expect("join client").expect("DNS client"),
+            vec![b"dns-response-a".to_vec(), b"dns-response-aaaa".to_vec()]
         );
     }
 
