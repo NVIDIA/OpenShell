@@ -31,7 +31,7 @@ func TestSandbox_Create(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{LogLevel: "debug"}, map[string]string{"env": "test"})
+	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{LogLevel: "debug"}, types.WithLabels(map[string]string{"env": "test"}))
 	require.NoError(t, err)
 	assert.Equal(t, "test-sb", sb.Name)
 	assert.Equal(t, "debug", sb.Spec.LogLevel)
@@ -45,10 +45,10 @@ func TestSandbox_Create_AlreadyExists(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{})
 	require.NoError(t, err)
 
-	_, err = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, err = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{})
 	require.Error(t, err)
 	assert.True(t, types.IsAlreadyExists(err))
 }
@@ -57,8 +57,8 @@ func TestSandbox_Create_WithAnnotations(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "annotated", &types.SandboxSpec{}, nil,
-		types.CreateOptions{Annotations: map[string]string{"source": "cli", "user": "admin"}})
+	sb, err := sc.Create(ctx, "default", "annotated", &types.SandboxSpec{},
+		types.WithAnnotations(map[string]string{"source": "cli", "user": "admin"}))
 	require.NoError(t, err)
 	assert.Equal(t, "cli", sb.Annotations["source"])
 	assert.Equal(t, "admin", sb.Annotations["user"])
@@ -73,8 +73,8 @@ func TestSandbox_Create_WithAnnotationsDeepCopy(t *testing.T) {
 	ctx := context.Background()
 
 	input := map[string]string{"key": "original"}
-	sb, err := sc.Create(ctx, "default", "dc-test", &types.SandboxSpec{}, nil,
-		types.CreateOptions{Annotations: input})
+	sb, err := sc.Create(ctx, "default", "dc-test", &types.SandboxSpec{},
+		types.WithAnnotations(input))
 	require.NoError(t, err)
 
 	input["key"] = "MUTATED"
@@ -85,7 +85,7 @@ func TestSandbox_Create_NoAnnotations(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "no-ann", &types.SandboxSpec{}, nil)
+	sb, err := sc.Create(ctx, "default", "no-ann", &types.SandboxSpec{})
 	require.NoError(t, err)
 	assert.Nil(t, sb.Annotations)
 }
@@ -161,7 +161,7 @@ func TestSandbox_Create_NilSpec(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "test-sb", nil, nil)
+	sb, err := sc.Create(ctx, "default", "test-sb", nil)
 	require.NoError(t, err)
 	assert.Equal(t, "test-sb", sb.Name)
 }
@@ -170,7 +170,7 @@ func TestSandbox_Get(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{LogLevel: "info"}, nil)
+	_, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{LogLevel: "info"})
 	require.NoError(t, err)
 
 	got, err := sc.Get(ctx, "default", "test-sb")
@@ -201,8 +201,8 @@ func TestSandbox_List(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, _ = sc.Create(ctx, "default", "sb-1", &types.SandboxSpec{}, nil)
-	_, _ = sc.Create(ctx, "default", "sb-2", &types.SandboxSpec{}, nil)
+	_, _ = sc.Create(ctx, "default", "sb-1", &types.SandboxSpec{})
+	_, _ = sc.Create(ctx, "default", "sb-2", &types.SandboxSpec{})
 
 	list, err := sc.List(ctx, "default")
 	require.NoError(t, err)
@@ -213,7 +213,7 @@ func TestSandbox_Delete(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{})
 
 	err := sc.Delete(ctx, "default", "test-sb")
 	require.NoError(t, err)
@@ -242,7 +242,7 @@ func TestSandbox_DeepCopy_OnCreate(t *testing.T) {
 		Environment: map[string]string{"KEY": "value"},
 	}
 
-	sb, err := sc.Create(ctx, "default", "test-sb", spec, labels)
+	sb, err := sc.Create(ctx, "default", "test-sb", spec, types.WithLabels(labels))
 	require.NoError(t, err)
 
 	// Mutating inputs should not affect stored object
@@ -269,7 +269,7 @@ func TestSandbox_DeepCopy_OnGet(t *testing.T) {
 
 	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{
 		Environment: map[string]string{"KEY": "value"},
-	}, nil)
+	})
 
 	got, err := sc.Get(ctx, "default", "test-sb")
 	require.NoError(t, err)
@@ -287,7 +287,7 @@ func TestSandbox_WaitReady(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{})
 	require.NoError(t, err)
 
 	sb, err := sc.WaitReady(ctx, "default", "test-sb")
@@ -312,7 +312,7 @@ func TestSandbox_WaitReady_NotFound(t *testing.T) {
 func TestSandbox_WaitReady_ContextCancellation(t *testing.T) {
 	sc := newTestSandboxClient()
 
-	_, err := sc.Create(context.Background(), "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, err := sc.Create(context.Background(), "default", "test-sb", &types.SandboxSpec{})
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -327,7 +327,7 @@ func TestSandbox_WaitReady_ContextCancellation(t *testing.T) {
 func TestSandbox_WaitReady_ContextDeadlineExceeded(t *testing.T) {
 	sc := newTestSandboxClient()
 
-	_, err := sc.Create(context.Background(), "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, err := sc.Create(context.Background(), "default", "test-sb", &types.SandboxSpec{})
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
@@ -342,7 +342,7 @@ func TestSandbox_WaitReady_AlreadyReady(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{})
 
 	// Make it ready
 	_, err := sc.WaitReady(ctx, "default", "test-sb")
@@ -358,7 +358,7 @@ func TestSandbox_WaitReady_IncrementsResourceVersion(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	created, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	created, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{})
 	require.NoError(t, err)
 	initialVersion := created.ResourceVersion
 
@@ -370,7 +370,7 @@ func TestSandbox_WaitReady_IncrementsResourceVersion(t *testing.T) {
 func TestSandbox_WaitReady_ContextTimeout(t *testing.T) {
 	sc := newTestSandboxClient()
 
-	_, err := sc.Create(context.Background(), "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, err := sc.Create(context.Background(), "default", "test-sb", &types.SandboxSpec{})
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
@@ -394,7 +394,7 @@ func TestSandbox_Watch_AddedOnCreate(t *testing.T) {
 	require.NoError(t, err)
 	defer w.Stop()
 
-	_, err = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{LogLevel: "info"}, nil)
+	_, err = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{LogLevel: "info"})
 	require.NoError(t, err)
 
 	select {
@@ -411,7 +411,7 @@ func TestSandbox_Watch_DeletedOnDelete(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{})
 
 	w, err := sc.Watch(ctx, "default", "")
 	require.NoError(t, err)
@@ -433,7 +433,7 @@ func TestSandbox_Watch_ModifiedOnWaitReady(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{})
 
 	w, err := sc.Watch(ctx, "default", "")
 	require.NoError(t, err)
@@ -461,10 +461,10 @@ func TestSandbox_Watch_NameFiltering(t *testing.T) {
 	defer w.Stop()
 
 	// Create "beta" — should not be received
-	_, _ = sc.Create(ctx, "default", "beta", &types.SandboxSpec{}, nil)
+	_, _ = sc.Create(ctx, "default", "beta", &types.SandboxSpec{})
 
 	// Create "alpha" — should be received
-	_, _ = sc.Create(ctx, "default", "alpha", &types.SandboxSpec{}, nil)
+	_, _ = sc.Create(ctx, "default", "alpha", &types.SandboxSpec{})
 
 	select {
 	case ev := <-w.ResultChan():
@@ -487,7 +487,7 @@ func TestSandbox_Watch_MultipleWatchers(t *testing.T) {
 	require.NoError(t, err)
 	defer w2.Stop()
 
-	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{})
 
 	for _, w := range []types.WatchInterface[*types.Sandbox]{w1, w2} {
 		select {
@@ -517,7 +517,7 @@ func TestSandbox_Watch_DeletedEventContainsFullObject(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{LogLevel: "debug"}, map[string]string{"env": "test"})
+	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{LogLevel: "debug"}, types.WithLabels(map[string]string{"env": "test"}))
 
 	w, err := sc.Watch(ctx, "default", "")
 	require.NoError(t, err)
@@ -565,7 +565,7 @@ func TestSandbox_ConcurrentCreateGetDeleteWatch(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < opsPerGoroutine; j++ {
 				name := fmt.Sprintf("sb-%d-%d", id, j)
-				_, _ = sc.Create(ctx, "default", name, &types.SandboxSpec{LogLevel: "info"}, nil)
+				_, _ = sc.Create(ctx, "default", name, &types.SandboxSpec{LogLevel: "info"})
 				_, _ = sc.Get(ctx, "default", name)
 				_, _ = sc.List(ctx, "default")
 				_, _ = sc.WaitReady(ctx, "default", name)
@@ -586,7 +586,7 @@ func TestSandbox_AttachProvider(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{})
 	require.NoError(t, err)
 
 	result, err := sc.AttachProvider(ctx, "default", "test-sb", "openai", sb.ResourceVersion)
@@ -600,7 +600,7 @@ func TestSandbox_AttachProvider_AlreadyAttached(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{})
 	require.NoError(t, err)
 
 	result, err := sc.AttachProvider(ctx, "default", "test-sb", "openai", sb.ResourceVersion)
@@ -626,7 +626,7 @@ func TestSandbox_DetachProvider(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{})
 	require.NoError(t, err)
 
 	result, err := sc.AttachProvider(ctx, "default", "test-sb", "openai", sb.ResourceVersion)
@@ -642,7 +642,7 @@ func TestSandbox_DetachProvider_NotAttached(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{})
 	require.NoError(t, err)
 
 	result, err := sc.DetachProvider(ctx, "default", "test-sb", "openai", sb.ResourceVersion)
@@ -663,7 +663,7 @@ func TestSandbox_ListProviders(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{})
 	require.NoError(t, err)
 
 	// No providers yet
@@ -703,7 +703,7 @@ func TestSandbox_AttachProvider_BroadcastsModified(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{})
 	require.NoError(t, err)
 
 	w, err := sc.Watch(ctx, "default", "")
@@ -728,7 +728,7 @@ func TestSandbox_Watch_StopOnTerminal_Ready(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{})
 	require.NoError(t, err)
 
 	w, err := sc.Watch(ctx, "default", "test-sb", v1.WatchOptions{StopOnTerminal: true})
@@ -753,7 +753,7 @@ func TestSandbox_Watch_StopOnTerminal_Error(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{})
 	require.NoError(t, err)
 
 	w, err := sc.Watch(ctx, "default", "test-sb", v1.WatchOptions{StopOnTerminal: true})
@@ -783,7 +783,7 @@ func TestSandbox_Watch_StopOnTerminal_False_DoesNotClose(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{}, nil)
+	_, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{})
 	require.NoError(t, err)
 
 	// Watch WITHOUT StopOnTerminal
@@ -848,7 +848,7 @@ func TestFakeSandboxCreateWithPolicy(t *testing.T) {
 		},
 	}
 
-	created, err := sc.Create(ctx, "default", "policy-sb", spec, nil)
+	created, err := sc.Create(ctx, "default", "policy-sb", spec)
 	require.NoError(t, err)
 
 	// Verify created sandbox has policy
@@ -905,7 +905,7 @@ func TestFakeSandboxCreateWithNilPolicy(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	created, err := sc.Create(ctx, "default", "no-policy-sb", &types.SandboxSpec{LogLevel: "info"}, nil)
+	created, err := sc.Create(ctx, "default", "no-policy-sb", &types.SandboxSpec{LogLevel: "info"})
 	require.NoError(t, err)
 	assert.Nil(t, created.Spec.Policy)
 
@@ -932,7 +932,7 @@ func TestFakeSandboxCreateFromTemplatePreservesCommandAndTTY(t *testing.T) {
 		TTY:       true,
 	}
 
-	created, err := sc.CreateFromTemplate(ctx, "default", "job-1", "gpu-kata", spec, map[string]string{"team": "runtime"})
+	created, err := sc.CreateFromTemplate(ctx, "default", "job-1", "gpu-kata", spec, types.WithLabels(map[string]string{"team": "runtime"}))
 
 	require.NoError(t, err)
 	assert.Equal(t, []string{"/opt/worker", "--serve"}, created.Spec.Command)

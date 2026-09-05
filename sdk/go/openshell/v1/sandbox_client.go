@@ -28,19 +28,18 @@ func newSandboxClient(conn grpc.ClientConnInterface) *sandboxClient {
 	return &sandboxClient{client: pb.NewOpenShellClient(conn)}
 }
 
-func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error) {
+func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec *SandboxSpec, opts ...CreateOption) (*Sandbox, error) {
 	protoSpec, err := converter.SandboxSpecToProtoChecked(spec)
 	if err != nil {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: err.Error()}
 	}
+	cfg := types.ApplyCreateOptions(opts)
 	req := &pb.CreateSandboxRequest{
-		Name:      name,
-		Spec:      protoSpec,
-		Labels:    labels,
-		Workspace: workspace,
-	}
-	if len(opts) > 0 {
-		req.Annotations = converter.CopyStringMap(opts[0].Annotations)
+		Name:        name,
+		Spec:        protoSpec,
+		Labels:      converter.CopyStringMap(cfg.Labels()),
+		Annotations: converter.CopyStringMap(cfg.Annotations()),
+		Workspace:   workspace,
 	}
 	resp, err := s.client.CreateSandbox(ctx, req)
 	if err != nil {
@@ -49,7 +48,7 @@ func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec
 	return converter.SandboxFromProto(resp.GetSandbox()), nil
 }
 
-func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error) {
+func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, opts ...CreateOption) (*Sandbox, error) {
 	if templateName == "" {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "template name is required"}
 	}
@@ -60,15 +59,14 @@ func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name,
 	if err != nil {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: err.Error()}
 	}
+	cfg := types.ApplyCreateOptions(opts)
 	req := &pb.CreateSandboxRequest{
 		Name:                 name,
 		Spec:                 protoSpec,
-		Labels:               labels,
+		Labels:               converter.CopyStringMap(cfg.Labels()),
+		Annotations:          converter.CopyStringMap(cfg.Annotations()),
 		Workspace:            workspace,
 		WorkloadTemplateName: templateName,
-	}
-	if len(opts) > 0 {
-		req.Annotations = converter.CopyStringMap(opts[0].Annotations)
 	}
 	resp, err := s.client.CreateSandbox(ctx, req)
 	if err != nil {
