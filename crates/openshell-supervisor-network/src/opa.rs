@@ -1507,6 +1507,28 @@ fn normalize_l7_config_aliases(data: &mut serde_json::Value) -> Vec<String> {
             for stanza in L7ConfigStanza::ALL {
                 normalize_l7_config_alias(&mut errors, ep_obj, &loc, stanza);
             }
+
+            // The nested MCP stanza is optional, but the runtime projection is
+            // not. Materialize the pinned default at this YAML boundary so a
+            // missing alias cannot later look like corrupted runtime state.
+            if ep_obj
+                .get("protocol")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|protocol| protocol.eq_ignore_ascii_case("mcp"))
+                && !ep_obj.contains_key("mcp_versions")
+            {
+                match openshell_policy::l7_config_alias_runtime_fields(
+                    L7ConfigStanza::Mcp,
+                    serde_json::json!({}),
+                ) {
+                    Ok(fields) => {
+                        for (field, value) in fields {
+                            ep_obj.insert(field.to_string(), value);
+                        }
+                    }
+                    Err(error) => errors.push(format!("{loc}.mcp: {error}")),
+                }
+            }
         }
     }
 
@@ -1531,6 +1553,15 @@ fn normalize_l7_config_alias(
         Ok(fields) => {
             ep.remove(key);
             for (field, value) in fields {
+                if stanza == L7ConfigStanza::Mcp
+                    && field == "mcp_versions"
+                    && ep.contains_key(field)
+                {
+                    errors.push(format!(
+                        "{loc}: mcp.versions and mcp_versions cannot both be set"
+                    ));
+                    continue;
+                }
                 ep.entry(field.to_string()).or_insert(value);
             }
         }
@@ -2083,6 +2114,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                         ep["json_rpc_max_body_bytes"] = e.json_rpc_max_body_bytes.into();
                     }
                     if let Some(mcp) = &e.mcp {
+                        if e.protocol.eq_ignore_ascii_case("mcp") {
+                            ep["mcp_versions"] = mcp.versions.clone().into();
+                        }
                         if let Some(strict_tool_names) = mcp.strict_tool_names {
                             ep["mcp_strict_tool_names"] = strict_tool_names.into();
                         }
@@ -2307,7 +2341,10 @@ mod tests {
                     }],
                     ..Default::default()
                 }],
-                ..Default::default()
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
             },
         );
         policy
@@ -4956,6 +4993,7 @@ network_policies:
         protocol: mcp
         enforcement: enforce
         mcp:
+          versions: ["2025-11-25", "2025-03-26"]
           strict_tool_names: false
         rules:
           - allow:
@@ -4979,6 +5017,151 @@ network_policies:
         let l7 = crate::l7::parse_l7_config(&config).expect("parse l7 config");
         assert_eq!(l7.protocol, crate::l7::L7Protocol::Mcp);
         assert!(!l7.mcp_strict_tool_names);
+        assert_eq!(
+            l7.mcp_versions,
+            vec![
+                openshell_core::mcp::McpProtocolVersion::V2025_03_26,
+                openshell_core::mcp::McpProtocolVersion::V2025_11_25,
+            ]
+        );
+    }
+
+    #[test]
+    fn yaml_load_accepts_mixed_case_mcp_protocol_with_default_versions() {
+        let data = r#"
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: MCP
+        rules:
+          - allow:
+              method: tools/list
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from yaml");
+        let input = NetworkInput {
+            host: "mcp.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let config = engine
+            .query_endpoint_config(&input)
+            .expect("query endpoint config")
+            .expect("expected MCP endpoint config");
+        let l7 = crate::l7::parse_l7_config(&config).expect("parse L7 endpoint config");
+
+        assert_eq!(l7.mcp_versions, vec![DEFAULT_MCP_PROTOCOL_VERSION]);
+    }
+
+    #[test]
+    fn yaml_load_rejects_invalid_flat_mcp_versions_before_activation() {
+        for (case, versions) in [
+            ("empty", "[]"),
+            ("non-string", "[1]"),
+            ("unsupported", "[\"2026-01-01\"]"),
+            ("duplicate", "[\"2025-11-25\", \"2025-11-25\"]"),
+            ("non-canonical", "[\"2025-11-25\", \"2025-03-26\"]"),
+        ] {
+            let data = format!(
+                r#"
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: mcp
+        mcp_versions: {versions}
+        rules:
+          - allow:
+              method: tools/list
+    binaries:
+      - {{ path: /usr/bin/curl }}
+"#
+            );
+
+            let Err(error) = OpaEngine::from_strings(TEST_POLICY, &data) else {
+                panic!("invalid MCP runtime metadata must reject activation: {case}");
+            };
+            assert!(
+                error.to_string().contains("mcp.versions"),
+                "{case}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_load_rejects_nested_and_flat_mcp_version_collision() {
+        let data = r#"
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: mcp
+        mcp_versions: ["2025-03-26"]
+        mcp:
+          versions: ["2025-11-25"]
+        rules:
+          - allow:
+              method: tools/list
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+
+        let Err(error) = OpaEngine::from_strings(TEST_POLICY, data) else {
+            panic!("ambiguous MCP revision sources must reject activation");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("mcp.versions and mcp_versions cannot both be set"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn yaml_load_rejects_mcp_versions_on_non_mcp_protocols() {
+        for mcp_fields in [
+            "mcp:\n          versions: [\"2025-11-25\"]",
+            "mcp_versions: [\"2025-11-25\"]",
+        ] {
+            let data = format!(
+                r#"
+network_policies:
+  json_rpc:
+    name: json_rpc
+    endpoints:
+      - host: rpc.example.com
+        port: 443
+        protocol: json-rpc
+        {mcp_fields}
+        rules:
+          - allow:
+              method: ping
+    binaries:
+      - {{ path: /usr/bin/curl }}
+"#
+            );
+
+            let Err(error) = OpaEngine::from_strings(TEST_POLICY, &data) else {
+                panic!("MCP revision policy must not apply to generic JSON-RPC");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("mcp.versions is only valid for protocol mcp"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -5399,14 +5582,69 @@ network_policies:
     }
 
     #[test]
-    fn proto_load_accepts_defaultable_mcp_versions() {
-        for policy in [
-            defaultable_mcp_proto(None),
-            defaultable_mcp_proto(Some(McpOptions::default())),
-        ] {
-            OpaEngine::from_proto(&policy)
+    fn proto_load_accepts_defaultable_mcp_versions_with_mixed_case_protocol() {
+        let mut implicit_defaults = defaultable_mcp_proto(None);
+        implicit_defaults
+            .network_policies
+            .get_mut("mcp")
+            .expect("defaultable MCP fixture contains the MCP policy")
+            .endpoints[0]
+            .protocol = "Mcp".to_string();
+        let explicit_defaults = defaultable_mcp_proto(Some(McpOptions::default()));
+
+        for policy in [implicit_defaults, explicit_defaults] {
+            let engine = OpaEngine::from_proto(&policy)
                 .expect("supervisor ingress must materialize the pinned MCP revision");
+            let input = NetworkInput {
+                host: "mcp.example.com".into(),
+                port: 443,
+                binary_path: PathBuf::from("/usr/bin/curl"),
+                binary_sha256: "unused".into(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            let config = engine
+                .query_endpoint_config(&input)
+                .expect("query endpoint config")
+                .expect("expected MCP endpoint config");
+            let l7 = crate::l7::parse_l7_config(&config).expect("parse L7 endpoint config");
+            assert_eq!(
+                l7.mcp_versions,
+                vec![DEFAULT_MCP_PROTOCOL_VERSION],
+                "protobuf ingress must preserve the materialized default through OPA"
+            );
         }
+    }
+
+    #[test]
+    fn proto_load_projects_canonical_mcp_versions_to_l7_config() {
+        let policy = defaultable_mcp_proto(Some(McpOptions {
+            versions: vec!["2025-11-25".to_string(), "2025-03-26".to_string()],
+            ..Default::default()
+        }));
+        let engine = OpaEngine::from_proto(&policy).expect("valid MCP policy");
+        let input = NetworkInput {
+            host: "mcp.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let config = engine
+            .query_endpoint_config(&input)
+            .expect("query endpoint config")
+            .expect("expected MCP endpoint config");
+        let l7 = crate::l7::parse_l7_config(&config).expect("parse L7 endpoint config");
+
+        assert_eq!(
+            l7.mcp_versions,
+            vec![
+                openshell_core::mcp::McpProtocolVersion::V2025_03_26,
+                openshell_core::mcp::McpProtocolVersion::V2025_11_25,
+            ],
+            "protobuf ingress must preserve the canonical allowlist through OPA"
+        );
     }
 
     #[test]
