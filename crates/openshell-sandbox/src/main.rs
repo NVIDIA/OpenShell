@@ -3,13 +3,17 @@
 
 //! `OpenShell` capability-free in-workload sandbox boundary.
 
+#[cfg(target_os = "linux")]
 use std::mem::size_of;
 use std::path::Path;
 
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
+#[cfg(target_os = "linux")]
 use openshell_ocsf::OcsfShorthandLayer;
+#[cfg(target_os = "linux")]
 use tracing_subscriber::EnvFilter;
+#[cfg(target_os = "linux")]
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Subcommand name used to self-copy the sandbox binary into a shared volume.
@@ -1087,6 +1091,13 @@ fn run_capability_socket_child(args: &[String]) -> Result<()> {
     probe_tcp_denial()?;
     probe_child_self_protection(sandbox_tgid, alias.as_raw_fd())?;
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_capability_socket_child(_args: &[String]) -> Result<()> {
+    Err(miette::miette!(
+        "socket qualification is supported only on Linux"
+    ))
 }
 
 #[cfg(target_os = "linux")]
