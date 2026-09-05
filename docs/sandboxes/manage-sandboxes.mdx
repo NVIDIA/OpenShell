@@ -144,20 +144,52 @@ openshell sandbox create \
 
 ### Custom Containers
 
-Use `--from` to create a sandbox from the base image, another pre-built sandbox name, a local directory, or a container image:
+Use `--from` to create a sandbox from the base image, another pre-built sandbox name, a local directory, a rootfs tar archive, or a container image:
 
 ```shell
 openshell sandbox create --from base
 openshell sandbox create --from ollama
 openshell sandbox create --from ./my-sandbox-dir
+openshell sandbox create --from ./rootfs.tar
 openshell sandbox create --from my-registry.example.com/my-image:latest
 ```
 
 Bare names such as `base` and `ollama` resolve to images under `ghcr.io/nvidia/openshell-community/sandboxes`. Set `OPENSHELL_COMMUNITY_REGISTRY` when you need to use an internal mirror.
 
-Local directories and Dockerfiles require a local gateway because the CLI builds
-through the local Docker daemon. Use a registry image reference for remote
-gateways.
+Local directories and Dockerfiles require a local gateway because the CLI
+builds images through the local Docker daemon. Use a registry image reference
+for remote gateways.
+
+#### Rootfs Tar Archives
+
+A rootfs tar archive (`.tar`, `.tar.gz`, `.tgz`) is a flat filesystem produced
+by `docker export`, `podman export`, or `buildah mount` plus `tar`. It lets you
+create a sandbox without a registry or a running image daemon:
+
+```shell
+docker create --name export-me my-image:latest
+docker export -o rootfs.tar export-me
+docker rm export-me
+
+openshell sandbox create --from ./rootfs.tar
+```
+
+Rootfs tar sources require a local gateway running the VM compute driver. The
+CLI asks the gateway for a staging slot, writes the archive to the location the
+gateway allocates, and passes back a single-use token; the gateway resolves that
+token to a path for the driver. Because the CLI writes the archive directly to
+the gateway host's filesystem, the two must share a filesystem and run as the
+same user. Gateways using the Docker, Podman, or Kubernetes drivers reject
+rootfs tar sources.
+
+Gzip-compressed archives (`.tar.gz`, `.tgz`) are decompressed while the gateway
+stages them, so the sandbox sees the same filesystem either way. Compression is
+detected from the archive contents, not the file name.
+
+The gateway caps archive size (10 GiB by default, configurable with the VM
+driver's `rootfs_tar_max_bytes`), and reclaims an unused staging slot after 30
+minutes. The cap applies to the expanded archive too: a compressed source that
+decompresses past the limit is rejected.
 
 ## Reuse Workload Templates
 

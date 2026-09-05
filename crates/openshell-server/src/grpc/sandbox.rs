@@ -32,7 +32,10 @@ use openshell_core::proto::{
     TcpForwardFrame, TcpForwardInit, TcpRelayTarget, WatchSandboxRequest, relay_open,
     tcp_forward_init,
 };
-use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
+use openshell_core::proto::{
+    BeginRootfsTarStagingRequest, BeginRootfsTarStagingResponse, Sandbox, SandboxPhase,
+    SandboxTemplate, SshSession,
+};
 use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryOutcome,
 };
@@ -179,6 +182,73 @@ pub(super) async fn handle_create_sandbox(
     result
 }
 
+/// Allocate a gateway-owned staging slot for a local rootfs tar archive.
+///
+/// The caller writes the archive to the returned path and then names the token
+/// on `CreateSandbox`. It never names a filesystem path of its own choosing.
+pub(super) async fn handle_begin_rootfs_tar_staging(
+    state: &Arc<ServerState>,
+    request: Request<BeginRootfsTarStagingRequest>,
+) -> Result<Response<BeginRootfsTarStagingResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let request = request.into_inner();
+
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &request.workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .ensure_active()?;
+
+    let subject = principal_subject(&principal)?;
+    let slot = state.compute.rootfs_tar_staging().begin(
+        &workspace,
+        &subject,
+        &request.file_name,
+        request.size_bytes,
+    )?;
+
+    Ok(Response::new(BeginRootfsTarStagingResponse {
+        staging_token: slot.token,
+        upload_path: slot.upload_path.to_string_lossy().into_owned(),
+        max_bytes: slot.max_bytes,
+        expires_at_ms: slot.expires_at_ms,
+    }))
+}
+
+/// Stable caller identity used to bind a staging slot to its requester.
+fn principal_subject(principal: &crate::auth::principal::Principal) -> Result<String, Status> {
+    match principal {
+        crate::auth::principal::Principal::User(user) => Ok(user.identity.subject.clone()),
+        _ => Err(Status::permission_denied(
+            "rootfs tar staging requires a user principal",
+        )),
+    }
+}
+
+/// Read the staging token a caller named for the active driver, without
+/// removing it. The gateway consumes it later, inside `create_sandbox`.
+fn staging_token_in_spec(spec: &SandboxSpec, driver_name: &str) -> Option<String> {
+    let config = spec.template.as_ref()?.driver_config.as_ref()?;
+    let Kind::StructValue(driver_config) = config.fields.get(driver_name)?.kind.as_ref()? else {
+        return None;
+    };
+    match driver_config
+        .fields
+        .get(crate::compute::rootfs_tar::STAGING_TOKEN_FIELD)?
+        .kind
+        .as_ref()?
+    {
+        Kind::StringValue(token) => Some(token.clone()),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SandboxCreateTelemetryAttrs {
     requested_gpu: bool,
@@ -308,6 +378,16 @@ async fn handle_create_sandbox_inner(
 
     // Validate field sizes before any create-side effects.
     validate_sandbox_spec(&request.name, &spec)?;
+
+    // A staging slot may only be redeemed by the caller it was issued to. This
+    // is the only point in the create path where the principal is in scope.
+    if let Some(token) = staging_token_in_spec(&spec, state.compute.configured_driver_name()) {
+        let subject = principal_subject(&principal)?;
+        state
+            .compute
+            .rootfs_tar_staging()
+            .authorize(&token, &workspace, &subject)?;
+    }
 
     let _sandbox_sync_guard = if spec.providers.is_empty() {
         None

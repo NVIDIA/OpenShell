@@ -52,6 +52,23 @@ service OpenShell {
     };
   }
 
+  // Allocate a gateway-owned staging slot for a local rootfs tar archive.
+  //
+  // The gateway creates a request-scoped directory inside the compute driver's
+  // staging root and returns an opaque single-use token plus the absolute path
+  // the client must write the archive to. The token is then passed as
+  // `template.driver_config.<driver>.rootfs_tar_staging_token` on
+  // CreateSandbox; callers never name a filesystem path themselves. Only a
+  // client sharing the gateway's filesystem can complete the upload.
+  rpc BeginRootfsTarStaging(BeginRootfsTarStagingRequest)
+      returns (BeginRootfsTarStagingResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
   // Fetch a sandbox by name.
   rpc GetSandbox(GetSandboxRequest) returns (SandboxResponse) {
     option (openshell.options.v1.authorization) = {
@@ -836,7 +853,6 @@ message ComputeDriverCapabilities {
 
   // Driver-reported implementation version from the startup capability snapshot.
   string driver_version = 2;
-
 }
 
 // Public sandbox resource exposed by the OpenShell API.
@@ -1129,6 +1145,33 @@ message ListSandboxTemplatesResponse {
 
 message DeleteSandboxTemplateResponse {
   bool deleted = 1;
+}
+
+// Request a gateway-owned staging slot for a local rootfs tar archive.
+message BeginRootfsTarStagingRequest {
+  // Workspace that will own the sandbox created from this archive. Empty
+  // defaults to "default", matching CreateSandboxRequest.workspace.
+  string workspace = 1;
+  // Base file name of the local archive. The gateway uses it only to name the
+  // staged file; path separators and traversal components are rejected.
+  string file_name = 2;
+  // Size of the local archive in bytes, checked against the driver limit
+  // before the gateway allocates a slot.
+  uint64 size_bytes = 3;
+}
+
+// Gateway-issued staging slot.
+message BeginRootfsTarStagingResponse {
+  // Opaque single-use token. Pass it as
+  // `template.driver_config.<driver>.rootfs_tar_staging_token` on
+  // CreateSandbox. The first CreateSandbox presenting it consumes it.
+  string staging_token = 1;
+  // Absolute path on the gateway host the client must write the archive to.
+  string upload_path = 2;
+  // Maximum accepted archive size in bytes, enforced again by the driver.
+  uint64 max_bytes = 3;
+  // Wall-clock deadline after which the gateway reclaims the slot.
+  int64 expires_at_ms = 4;
 }
 
 // Get sandbox request.

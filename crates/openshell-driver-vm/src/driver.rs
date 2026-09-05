@@ -18,7 +18,7 @@ use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::ContainerCreateBody;
 use bollard::query_parameters::{CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder};
-use flate2::read::GzDecoder;
+use flate2::read::{GzDecoder, MultiGzDecoder};
 use futures::{Stream, StreamExt, TryStreamExt};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
@@ -61,7 +61,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
-use std::io::Read;
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -91,6 +91,9 @@ const MAX_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY: usize = 16;
 const REGISTRY_REQUEST_MAX_ATTEMPTS: usize = 4;
 const REGISTRY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const REGISTRY_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+/// 10 GiB — configurable via `rootfs_tar_max_bytes`.
+const DEFAULT_ROOTFS_TAR_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const ROOTFS_TAR_STAGING_DIR: &str = "rootfs-tar-staging";
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -100,6 +103,7 @@ struct VmSandboxDriverConfig {
         deserialize_with = "deserialize_optional_non_empty_string_list"
     )]
     gpu_device_ids: Option<Vec<String>>,
+    rootfs_tar_path: Option<String>,
 }
 
 impl VmSandboxDriverConfig {
@@ -324,6 +328,13 @@ pub struct VmDriverConfig {
     /// TLS-intercepting proxy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_ca_bundle: Option<String>,
+    /// Directory where rootfs tar files must be staged before they can be
+    /// referenced in a `CreateSandbox` request. Defaults to `<state_dir>/rootfs-tar-staging`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rootfs_tar_staging_dir: Option<PathBuf>,
+    /// Maximum rootfs tar file size in bytes. Defaults to 10 GiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rootfs_tar_max_bytes: Option<u64>,
 }
 
 /// Redacting `Debug` so a proxy URL or credential path never reaches a log.
@@ -357,6 +368,8 @@ impl std::fmt::Debug for VmDriverConfig {
             .field("proxy_auth_allow_insecure", &self.proxy_auth_allow_insecure)
             .field("proxy_connect_by_hostname", &self.proxy_connect_by_hostname)
             .field("proxy_ca_bundle", &self.proxy_ca_bundle)
+            .field("rootfs_tar_staging_dir", &self.rootfs_tar_staging_dir)
+            .field("rootfs_tar_max_bytes", &self.rootfs_tar_max_bytes)
             .finish()
     }
 }
@@ -391,6 +404,8 @@ impl Default for VmDriverConfig {
             proxy_auth_allow_insecure: None,
             proxy_connect_by_hostname: None,
             proxy_ca_bundle: None,
+            rootfs_tar_staging_dir: None,
+            rootfs_tar_max_bytes: None,
         }
     }
 }
@@ -450,6 +465,17 @@ impl VmDriverConfig {
                 ca_bundle: self.proxy_ca_bundle.as_deref(),
             },
         )
+    }
+
+    fn rootfs_tar_staging_dir(&self) -> PathBuf {
+        self.rootfs_tar_staging_dir
+            .clone()
+            .unwrap_or_else(|| self.state_dir.join(ROOTFS_TAR_STAGING_DIR))
+    }
+
+    fn rootfs_tar_max_bytes(&self) -> u64 {
+        self.rootfs_tar_max_bytes
+            .unwrap_or(DEFAULT_ROOTFS_TAR_MAX_BYTES)
     }
 
     fn requires_tls_materials(&self) -> bool {
@@ -623,6 +649,13 @@ impl VmDriver {
                     image_cache_root.display()
                 )
             })?;
+        let staging_dir = config.rootfs_tar_staging_dir();
+        create_private_dir_all(&staging_dir).await.map_err(|err| {
+            format!(
+                "failed to create rootfs tar staging dir '{}': {err}",
+                staging_dir.display()
+            )
+        })?;
 
         let launcher_bin = if let Some(path) = config.launcher_bin.clone() {
             path
@@ -663,6 +696,68 @@ impl VmDriver {
         Ok(driver)
     }
 
+    async fn validate_rootfs_tar_path(&self, raw: &Path) -> Result<PathBuf, Status> {
+        let staging_dir = self.config.rootfs_tar_staging_dir();
+        let canonical_staging = tokio::fs::canonicalize(&staging_dir).await.map_err(|err| {
+            Status::internal(format!(
+                "rootfs tar staging dir not accessible at {}: {err}",
+                staging_dir.display()
+            ))
+        })?;
+
+        let canonical = tokio::fs::canonicalize(raw).await.map_err(|err| {
+            Status::failed_precondition(format!(
+                "rootfs tar path not accessible at {}: {err}",
+                raw.display()
+            ))
+        })?;
+
+        if !canonical.starts_with(&canonical_staging) {
+            return Err(Status::permission_denied(format!(
+                "rootfs tar path {} is outside the staging directory {}",
+                canonical.display(),
+                canonical_staging.display()
+            )));
+        }
+
+        let relative = canonical.strip_prefix(&canonical_staging).unwrap();
+        let depth = relative.components().count();
+        if depth != 2 {
+            return Err(Status::permission_denied(format!(
+                "rootfs tar path {} must be inside a request subdirectory of the staging root",
+                canonical.display(),
+            )));
+        }
+
+        let metadata = tokio::fs::symlink_metadata(&canonical)
+            .await
+            .map_err(|err| {
+                Status::failed_precondition(format!(
+                    "rootfs tar not accessible at {}: {err}",
+                    canonical.display()
+                ))
+            })?;
+        if !metadata.file_type().is_file() {
+            return Err(Status::invalid_argument(format!(
+                "rootfs tar path {} is not a regular file",
+                canonical.display()
+            )));
+        }
+
+        let max_bytes = self.config.rootfs_tar_max_bytes();
+        let file_size = metadata.len();
+        if file_size > max_bytes {
+            return Err(Status::invalid_argument(format!(
+                "rootfs tar {} is {} bytes, exceeding the {} byte limit",
+                canonical.display(),
+                file_size,
+                max_bytes
+            )));
+        }
+
+        Ok(canonical)
+    }
+
     #[must_use]
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
         GetCapabilitiesResponse {
@@ -672,6 +767,12 @@ impl VmDriver {
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
             driver_reports_runtime_readiness: false,
+            rootfs_tar_staging_dir: self
+                .config
+                .rootfs_tar_staging_dir()
+                .to_string_lossy()
+                .into_owned(),
+            rootfs_tar_max_bytes: self.config.rootfs_tar_max_bytes(),
         }
     }
 
@@ -680,9 +781,11 @@ impl VmDriver {
     #[allow(clippy::result_large_err)]
     pub fn validate_sandbox(&self, sandbox: &Sandbox) -> Result<(), Status> {
         validate_vm_sandbox(sandbox, self.config.gpu_enabled)?;
-        if self.resolved_sandbox_image(sandbox).is_none() {
+        let has_rootfs_tar =
+            VmSandboxDriverConfig::from_sandbox(sandbox).is_ok_and(|c| c.rootfs_tar_path.is_some());
+        if self.resolved_sandbox_image(sandbox).is_none() && !has_rootfs_tar {
             return Err(Status::failed_precondition(
-                "vm sandboxes require template.image or a configured default sandbox image",
+                "vm sandboxes require template.image, rootfs_tar_path in driver_config, or a configured default sandbox image",
             ));
         }
         Ok(())
@@ -700,11 +803,20 @@ impl VmDriver {
         validate_vm_sandbox(sandbox, self.config.gpu_enabled)?;
 
         let state_dir = sandbox_state_dir(&self.config.state_dir, &sandbox.id)?;
-        let image_ref = self.resolved_sandbox_image(sandbox).ok_or_else(|| {
-            Status::failed_precondition(
-                "vm sandboxes require template.image or a configured default sandbox image",
-            )
-        })?;
+        let has_rootfs_tar =
+            VmSandboxDriverConfig::from_sandbox(sandbox).is_ok_and(|c| c.rootfs_tar_path.is_some());
+        let image_ref = self
+            .resolved_sandbox_image(sandbox)
+            .or_else(|| {
+                has_rootfs_tar
+                    .then(|| self.bootstrap_image_ref_default())
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "vm sandboxes require template.image, rootfs_tar_path in driver_config, or a configured default sandbox image",
+                )
+            })?;
         info!(
             sandbox_id = %sandbox.id,
             image_ref = %image_ref,
@@ -869,6 +981,16 @@ impl VmDriver {
             .and_then(|spec| spec.resource_requirements.as_ref())
             .and_then(|requirements| driver_gpu_requirements(Some(requirements)))
             .is_some();
+        let driver_config =
+            VmSandboxDriverConfig::from_sandbox(&sandbox).map_err(Status::invalid_argument)?;
+        let driver_config_had_rootfs_tar = driver_config.rootfs_tar_path.is_some();
+        let rootfs_tar_path = match driver_config.rootfs_tar_path {
+            Some(raw) if overlay_preparation == OverlayPreparation::Fresh => {
+                Some(self.validate_rootfs_tar_path(Path::new(&raw)).await?)
+            }
+            Some(_) | None => None,
+        };
+
         self.publish_platform_event(
             sandbox.id.clone(),
             platform_event(
@@ -879,7 +1001,32 @@ impl VmDriver {
             ),
         );
 
-        let image_plan = self.prepare_runtime_images(&sandbox.id, &image_ref).await?;
+        let image_plan = if overlay_preparation == OverlayPreparation::PreserveExisting
+            && driver_config_had_rootfs_tar
+        {
+            let persisted_identity =
+                read_persisted_image_identity(&state_dir).await.map_err(|err| {
+                    Status::internal(format!(
+                        "cannot restore rootfs-tar sandbox: persisted image identity not found: {err}"
+                    ))
+                })?;
+            let bootstrap_image_ref = self.bootstrap_image_ref(&image_ref);
+            let bootstrap_image_identity = self
+                .ensure_cached_bootstrap_rootfs_image(&sandbox.id, &bootstrap_image_ref)
+                .await?;
+            let root_disk =
+                image_cache_rootfs_image(&self.config.state_dir, &bootstrap_image_identity);
+            let image_disk = image_cache_rootfs_image(&self.config.state_dir, &persisted_identity);
+            RuntimeImagePlan {
+                root_disk,
+                image_disk: Some(image_disk),
+                image_identity: persisted_identity,
+                bootstrap_image_identity,
+            }
+        } else {
+            self.prepare_runtime_images(&sandbox.id, &image_ref, rootfs_tar_path.as_deref())
+                .await?
+        };
         let image_identity = image_plan.image_identity.clone();
         self.ensure_provisioning_active(&sandbox.id).await?;
         info!(
@@ -1620,7 +1767,14 @@ impl VmDriver {
         clear_stop_marker: bool,
         reconciliation_span: &tracing::Span,
     ) -> bool {
-        let Some(image_ref) = self.resolved_sandbox_image(&sandbox) else {
+        let has_rootfs_tar = VmSandboxDriverConfig::from_sandbox(&sandbox)
+            .is_ok_and(|c| c.rootfs_tar_path.is_some());
+
+        let Some(image_ref) = self.resolved_sandbox_image(&sandbox).or_else(|| {
+            has_rootfs_tar
+                .then(|| self.bootstrap_image_ref_default())
+                .flatten()
+        }) else {
             warn!(
                 sandbox_id = %sandbox.id,
                 sandbox_name = %sandbox.name,
@@ -2164,6 +2318,7 @@ impl VmDriver {
         &self,
         sandbox_id: &str,
         image_ref: &str,
+        rootfs_tar_path: Option<&Path>,
     ) -> Result<RuntimeImagePlan, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let bootstrap_image_ref = self.bootstrap_image_ref(image_ref);
@@ -2171,6 +2326,18 @@ impl VmDriver {
             .ensure_cached_bootstrap_rootfs_image(sandbox_id, &bootstrap_image_ref)
             .await?;
         let root_disk = image_cache_rootfs_image(&self.config.state_dir, &bootstrap_image_identity);
+
+        if let Some(tar_path) = rootfs_tar_path {
+            let prepared = self
+                .ensure_prepared_rootfs_tar_disk(sandbox_id, tar_path, &root_disk)
+                .await?;
+            return Ok(RuntimeImagePlan {
+                root_disk,
+                image_disk: Some(prepared.disk_path),
+                image_identity: prepared.image_identity,
+                bootstrap_image_identity,
+            });
+        }
 
         if image_ref.trim() == bootstrap_image_ref.trim() {
             return span_status.finish(Ok(RuntimeImagePlan {
@@ -2193,15 +2360,20 @@ impl VmDriver {
     }
 
     fn bootstrap_image_ref(&self, sandbox_image_ref: &str) -> String {
+        self.bootstrap_image_ref_default()
+            .unwrap_or_else(|| sandbox_image_ref.to_string())
+    }
+
+    fn bootstrap_image_ref_default(&self) -> Option<String> {
         let configured = self.config.bootstrap_image.trim();
         if !configured.is_empty() {
-            return configured.to_string();
+            return Some(configured.to_string());
         }
         let default = self.config.default_image.trim();
         if !default.is_empty() {
-            return default.to_string();
+            return Some(default.to_string());
         }
-        sandbox_image_ref.to_string()
+        None
     }
 
     #[tracing::instrument(
@@ -2690,6 +2862,149 @@ impl VmDriver {
             sandbox_id,
             image_ref,
             "local_docker",
+            &cache_identity,
+            bootstrap_root_disk,
+            &staging_dir,
+            &payload,
+        )
+        .await?;
+
+        Ok(PreparedImageDisk {
+            image_identity: cache_identity,
+            disk_path: image_path,
+        })
+    }
+
+    async fn ensure_prepared_rootfs_tar_disk(
+        &self,
+        sandbox_id: &str,
+        tar_path: &Path,
+        bootstrap_root_disk: &Path,
+    ) -> Result<PreparedImageDisk, Status> {
+        let request_staging_dir = tar_path.parent().map(Path::to_path_buf);
+        let cleanup_request_staging = || async {
+            if let Some(d) = &request_staging_dir {
+                let _ = tokio::fs::remove_dir_all(d).await;
+            }
+        };
+
+        // Identity comes from the archive contents. See `rootfs_tar_cache_identity`.
+        let hash_source = tar_path.to_path_buf();
+        let source_digest = match tokio::task::spawn_blocking(move || {
+            compute_file_sha256_hex(&hash_source)
+        })
+        .await
+        {
+            Ok(Ok(digest)) => digest,
+            Ok(Err(err)) => {
+                cleanup_request_staging().await;
+                return Err(Status::failed_precondition(format!(
+                    "rootfs tar not readable at {}: {err}",
+                    tar_path.display()
+                )));
+            }
+            Err(err) => {
+                cleanup_request_staging().await;
+                return Err(Status::internal(format!(
+                    "failed to hash rootfs tar at {}: {err}",
+                    tar_path.display()
+                )));
+            }
+        };
+        let cache_identity = rootfs_tar_cache_identity(&source_digest);
+        let image_path = image_cache_rootfs_image(&self.config.state_dir, &cache_identity);
+        let tar_display = tar_path.display().to_string();
+
+        if tokio::fs::metadata(&image_path).await.is_ok() {
+            self.publish_prepared_cache_hit(
+                sandbox_id,
+                &tar_display,
+                "rootfs_tar",
+                &cache_identity,
+            );
+            cleanup_request_staging().await;
+            return Ok(PreparedImageDisk {
+                image_identity: cache_identity,
+                disk_path: image_path,
+            });
+        }
+
+        self.publish_prepared_cache_miss(sandbox_id, &tar_display, "rootfs_tar", &cache_identity);
+        let _cache_guard = self.image_cache_lock.lock().await;
+        if tokio::fs::metadata(&image_path).await.is_ok() {
+            self.publish_prepared_cache_hit(
+                sandbox_id,
+                &tar_display,
+                "rootfs_tar",
+                &cache_identity,
+            );
+            cleanup_request_staging().await;
+            return Ok(PreparedImageDisk {
+                image_identity: cache_identity,
+                disk_path: image_path,
+            });
+        }
+
+        let staging_dir = image_cache_staging_dir(&self.config.state_dir, &cache_identity);
+        let rootfs_archive = staging_dir.join(IMAGE_EXPORT_ROOTFS_ARCHIVE);
+        self.reset_image_staging_dir(&staging_dir).await?;
+
+        self.publish_vm_progress(
+            sandbox_id,
+            "CopyingRootfsTar",
+            format!("Copying rootfs tar \"{tar_display}\""),
+            HashMap::from([
+                ("rootfs_tar_path".to_string(), tar_display.clone()),
+                ("image_source".to_string(), "rootfs_tar".to_string()),
+                ("image_identity".to_string(), cache_identity.clone()),
+            ]),
+        );
+        let copy_src = tar_path.to_path_buf();
+        let copy_dst = rootfs_archive.clone();
+        let max_bytes = self.config.rootfs_tar_max_bytes();
+        let copied_digest = match tokio::task::spawn_blocking(move || {
+            stage_rootfs_tar_archive(&copy_src, &copy_dst, max_bytes)
+        })
+        .await
+        {
+            Ok(Ok(digest)) => digest,
+            Ok(Err(err)) => {
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                cleanup_request_staging().await;
+                return Err(Status::internal(format!(
+                    "failed to copy rootfs tar to staging: {err}"
+                )));
+            }
+            Err(err) => {
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                cleanup_request_staging().await;
+                return Err(Status::internal(format!(
+                    "failed to copy rootfs tar to staging: {err}"
+                )));
+            }
+        };
+
+        // The archive changed between the hash pass and the copy: the prepared
+        // disk we are about to build would not match the identity it is cached
+        // under. Reject rather than poison the cache.
+        if copied_digest != source_digest {
+            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            cleanup_request_staging().await;
+            return Err(Status::aborted(format!(
+                "rootfs tar {tar_display} changed while it was being staged; retry the request"
+            )));
+        }
+        cleanup_request_staging().await;
+
+        let payload = GuestImagePayload {
+            image_ref: tar_display.clone(),
+            image_identity: cache_identity.clone(),
+            source: GuestImagePayloadSource::LocalDocker { rootfs_archive },
+        };
+        self.build_prepared_image_disk(
+            sandbox_id,
+            &tar_display,
+            "rootfs_tar",
             &cache_identity,
             bootstrap_root_disk,
             &staging_dir,
@@ -4501,6 +4816,113 @@ fn compute_bytes_sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Stage the caller-supplied rootfs archive at `src` into the image cache at
+/// `dst`, and return the SHA-256 of the source bytes that were read.
+///
+/// The staged file is always an uncompressed tar. `--from` accepts `.tar.gz`
+/// and `.tgz`, but the guest image-prep VM extracts the staged file with a
+/// plain `tar -xpf`, and the prepared disk is sized from that file's length,
+/// so leaving gzip bytes on disk would both depend on the guest tar
+/// auto-detecting compression and size the disk from the compressed length.
+/// Compression is detected from the magic bytes: the driver only ever sees a
+/// gateway-issued staging path, never the caller's file name.
+///
+/// Expansion is bounded by `max_bytes` — the same limit the driver applies to
+/// the archive it accepts — so a compression bomb cannot fill the host disk.
+///
+/// The digest covers the source bytes rather than the bytes written, which is
+/// what lets the caller detect an archive that changed underneath it during
+/// staging: it stays comparable with the pre-copy hash pass whether or not the
+/// source was compressed.
+fn stage_rootfs_tar_archive(src: &Path, dst: &Path, max_bytes: u64) -> Result<String, String> {
+    let file = fs::File::open(src).map_err(|err| format!("open {}: {err}", src.display()))?;
+    let mut reader = BufReader::new(file);
+    let compressed = reader
+        .fill_buf()
+        .map_err(|err| format!("read {}: {err}", src.display()))?
+        .starts_with(&crate::rootfs::GZIP_MAGIC);
+
+    let mut source = HashingReader::new(reader);
+    if compressed {
+        write_stream_to_file(MultiGzDecoder::new(&mut source), dst, max_bytes)?;
+    } else {
+        write_stream_to_file(&mut source, dst, max_bytes)?;
+    }
+
+    // A decoder stops at the end of the compressed stream, so drain whatever
+    // it left behind: the digest has to describe the whole source file for the
+    // caller's change-detection comparison to mean anything.
+    std::io::copy(&mut source, &mut std::io::sink())
+        .map_err(|err| format!("read {}: {err}", src.display()))?;
+    Ok(source.finish())
+}
+
+/// Reader adapter that digests every byte it yields.
+struct HashingReader<R> {
+    inner: R,
+    hasher: Sha256,
+}
+
+impl<R: Read> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+        }
+    }
+
+    fn finish(self) -> String {
+        format!("{:x}", self.hasher.finalize())
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.hasher.update(&buf[..read]);
+        Ok(read)
+    }
+}
+
+fn write_stream_to_file(mut reader: impl Read, dst: &Path, max_bytes: u64) -> Result<(), String> {
+    let mut writer = BufWriter::new(
+        fs::File::create(dst).map_err(|err| format!("create {}: {err}", dst.display()))?,
+    );
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    let mut written = 0_u64;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|err| format!("read rootfs tar: {err}"))?;
+        if read == 0 {
+            break;
+        }
+        written = written.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        if written > max_bytes {
+            return Err(format!(
+                "rootfs tar expands to more than the {max_bytes} byte limit"
+            ));
+        }
+        writer
+            .write_all(&buffer[..read])
+            .map_err(|err| format!("write {}: {err}", dst.display()))?;
+    }
+    writer
+        .flush()
+        .map_err(|err| format!("flush {}: {err}", dst.display()))
+}
+
+/// Cache identity for a rootfs tar archive, derived from its contents.
+///
+/// Deliberately not path- or mtime-derived: staging directories are unique per
+/// request, so a path-based key would never hit the cache, and a
+/// seconds-truncated mtime cannot distinguish two writes within the same
+/// second. A fixed-length digest also keeps the cache directory name inside
+/// filesystem component limits regardless of how long the source path was.
+fn rootfs_tar_cache_identity(digest: &str) -> String {
+    prepared_image_cache_identity(&format!("rootfs-tar:sha256:{digest}"))
+}
+
 fn extract_layer_blob_to_dir(
     blob_path: &Path,
     media_type: &str,
@@ -5197,6 +5619,11 @@ async fn write_sandbox_image_metadata(
     .await?;
 
     Ok(())
+}
+
+async fn read_persisted_image_identity(state_dir: &Path) -> Result<String, std::io::Error> {
+    let raw = tokio::fs::read_to_string(state_dir.join(IMAGE_IDENTITY_FILE)).await?;
+    Ok(raw.trim().to_string())
 }
 
 async fn write_sandbox_request(state_dir: &Path, sandbox: &Sandbox) -> Result<(), std::io::Error> {
@@ -8638,6 +9065,312 @@ mod tests {
         LifecycleResult,
     };
     use crate::runtime::VmBackend;
+
+    /// Driver whose rootfs tar staging root is an isolated temp directory.
+    fn rootfs_tar_test_driver(staging_root: &Path, max_bytes: Option<u64>) -> VmDriver {
+        let (events, _) = broadcast::channel(WATCH_BUFFER);
+        VmDriver {
+            config: VmDriverConfig {
+                rootfs_tar_staging_dir: Some(staging_root.to_path_buf()),
+                rootfs_tar_max_bytes: max_bytes,
+                ..Default::default()
+            },
+            launcher_bin: PathBuf::from("openshell-driver-vm"),
+            registry: Arc::new(Mutex::new(HashMap::new())),
+            image_cache_lock: Arc::new(Mutex::new(())),
+            events,
+            gpu_inventory: None,
+            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
+                Ipv4Addr::new(10, 0, 128, 0),
+                17,
+            ))),
+            lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
+        }
+    }
+
+    /// `<staging_root>/req-<name>/<file>` with `contents`, the shape the
+    /// gateway allocates for one create request.
+    fn staged_rootfs_tar(staging_root: &Path, request: &str, contents: &[u8]) -> PathBuf {
+        let request_dir = staging_root.join(format!("req-{request}"));
+        std::fs::create_dir_all(&request_dir).expect("create request dir");
+        let archive = request_dir.join("rootfs.tar");
+        std::fs::write(&archive, contents).expect("write archive");
+        archive
+    }
+
+    #[tokio::test]
+    async fn validate_rootfs_tar_path_accepts_staged_archive() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("create staging root");
+        let archive = staged_rootfs_tar(&root, "a", b"payload");
+        let driver = rootfs_tar_test_driver(&root, None);
+
+        let resolved = driver
+            .validate_rootfs_tar_path(&archive)
+            .await
+            .expect("a correctly staged archive is accepted");
+
+        assert_eq!(
+            resolved,
+            archive.canonicalize().expect("canonicalize archive")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The core of the fix: a caller-named host path must never reach
+    /// privileged driver I/O, even if the caller is authenticated.
+    #[tokio::test]
+    async fn validate_rootfs_tar_path_rejects_arbitrary_host_paths() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("create staging root");
+        let driver = rootfs_tar_test_driver(&root, None);
+
+        for candidate in ["/etc/passwd", "/dev/zero"] {
+            let path = Path::new(candidate);
+            if !path.exists() {
+                continue;
+            }
+            let Err(err) = driver.validate_rootfs_tar_path(path).await else {
+                panic!("{candidate} must be rejected");
+            };
+            assert_eq!(
+                err.code(),
+                Code::PermissionDenied,
+                "{candidate} should be denied, got: {err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn validate_rootfs_tar_path_rejects_symlink_escape() {
+        let root = unique_temp_dir();
+        let request_dir = root.join("req-a");
+        std::fs::create_dir_all(&request_dir).expect("create request dir");
+        let target = unique_temp_dir();
+        std::fs::create_dir_all(&target).expect("create escape target dir");
+        let secret = target.join("secret.tar");
+        std::fs::write(&secret, b"not yours").expect("write escape target");
+        let link = request_dir.join("rootfs.tar");
+        std::os::unix::fs::symlink(&secret, &link).expect("create symlink");
+        let driver = rootfs_tar_test_driver(&root, None);
+
+        let err = driver
+            .validate_rootfs_tar_path(&link)
+            .await
+            .expect_err("a symlink out of the staging root must be rejected");
+
+        assert_eq!(err.code(), Code::PermissionDenied, "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[tokio::test]
+    async fn validate_rootfs_tar_path_rejects_wrong_depth() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("create staging root");
+        let shallow = root.join("rootfs.tar");
+        std::fs::write(&shallow, b"payload").expect("write shallow archive");
+        let deep_dir = root.join("req-a").join("nested");
+        std::fs::create_dir_all(&deep_dir).expect("create deep dir");
+        let deep = deep_dir.join("rootfs.tar");
+        std::fs::write(&deep, b"payload").expect("write deep archive");
+        let driver = rootfs_tar_test_driver(&root, None);
+
+        for path in [&shallow, &deep] {
+            let err = driver
+                .validate_rootfs_tar_path(path)
+                .await
+                .expect_err("only request-directory depth is accepted");
+            assert_eq!(err.code(), Code::PermissionDenied, "{err}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn validate_rootfs_tar_path_rejects_directory() {
+        let root = unique_temp_dir();
+        let request_dir = root.join("req-a");
+        let not_a_file = request_dir.join("rootfs.tar");
+        std::fs::create_dir_all(&not_a_file).expect("create directory in archive position");
+        let driver = rootfs_tar_test_driver(&root, None);
+
+        let err = driver
+            .validate_rootfs_tar_path(&not_a_file)
+            .await
+            .expect_err("a directory is not a rootfs tar");
+
+        assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn validate_rootfs_tar_path_enforces_max_bytes() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("create staging root");
+        let archive = staged_rootfs_tar(&root, "a", &[0_u8; 64]);
+        let driver = rootfs_tar_test_driver(&root, Some(16));
+
+        let err = driver
+            .validate_rootfs_tar_path(&archive)
+            .await
+            .expect_err("an oversized archive must be rejected");
+
+        assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Identity must follow the bytes, not the path. The gateway hands every
+    /// request its own staging directory, so a path-derived key would miss the
+    /// cache on every single create.
+    #[test]
+    fn rootfs_tar_cache_identity_tracks_contents_not_path() {
+        let same_a = rootfs_tar_cache_identity(&compute_bytes_sha256_hex(b"rootfs-bytes"));
+        let same_b = rootfs_tar_cache_identity(&compute_bytes_sha256_hex(b"rootfs-bytes"));
+        let different = rootfs_tar_cache_identity(&compute_bytes_sha256_hex(b"other-bytes"));
+
+        assert_eq!(
+            same_a, same_b,
+            "identical contents must share one prepared disk"
+        );
+        assert_ne!(
+            same_a, different,
+            "different contents must not collide on one prepared disk"
+        );
+    }
+
+    /// The old key was `path + seconds-truncated mtime` run through a
+    /// punctuation sanitizer, so `/tmp/a/b.tar` and `/tmp/a-b.tar` collided and
+    /// a long path could blow past filesystem component limits.
+    #[test]
+    fn rootfs_tar_cache_identity_is_bounded_and_separator_safe() {
+        let long_path_digest = compute_bytes_sha256_hex(&vec![7_u8; 4096]);
+        let identity = rootfs_tar_cache_identity(&long_path_digest);
+        let sanitized = sanitize_image_identity(&identity);
+
+        assert!(
+            sanitized.len() < 255,
+            "cache directory component must stay within filesystem limits, got {}",
+            sanitized.len()
+        );
+        assert_ne!(
+            rootfs_tar_cache_identity(&compute_bytes_sha256_hex(b"/tmp/a/b.tar")),
+            rootfs_tar_cache_identity(&compute_bytes_sha256_hex(b"/tmp/a-b.tar")),
+            "separator-colliding inputs must not share an identity"
+        );
+    }
+
+    const TEST_STAGING_LIMIT: u64 = 10 * 1024 * 1024;
+
+    /// Build an uncompressed tar holding a single file.
+    fn tar_bytes_with_file(name: &str, contents: &[u8]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(u64::try_from(contents.len()).expect("tar entry size fits u64"));
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, name, contents)
+            .expect("append tar entry");
+        builder.into_inner().expect("finish tar")
+    }
+
+    fn gzip_bytes(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).expect("gzip payload");
+        encoder.finish().expect("finish gzip")
+    }
+
+    #[test]
+    fn stage_rootfs_tar_archive_matches_source_digest() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).expect("create base dir");
+        let src = base.join("src.tar");
+        let dst = base.join("dst.tar");
+        let payload = vec![3_u8; 200 * 1024];
+        std::fs::write(&src, &payload).expect("write source");
+
+        let copied =
+            stage_rootfs_tar_archive(&src, &dst, TEST_STAGING_LIMIT).expect("copy should succeed");
+
+        assert_eq!(copied, compute_file_sha256_hex(&src).expect("hash source"));
+        assert_eq!(copied, compute_bytes_sha256_hex(&payload));
+        assert_eq!(std::fs::read(&dst).expect("read copy"), payload);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An archive rewritten between the hash pass and the copy pass yields a
+    /// different digest, which is what lets the caller reject it instead of
+    /// caching a disk under an identity that does not describe it.
+    #[test]
+    fn stage_rootfs_tar_archive_detects_content_change_between_passes() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).expect("create base dir");
+        let src = base.join("src.tar");
+        std::fs::write(&src, b"original").expect("write source");
+        let first = compute_file_sha256_hex(&src).expect("hash source");
+
+        std::fs::write(&src, b"replaced").expect("rewrite source");
+        let second = stage_rootfs_tar_archive(&src, &base.join("dst.tar"), TEST_STAGING_LIMIT)
+            .expect("copy");
+
+        assert_ne!(
+            first, second,
+            "a mid-staging rewrite must produce a different digest"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `--from` accepts `.tar.gz`/`.tgz`, and the guest extracts the staged
+    /// file as a plain tar, so staging has to decompress on the way in.
+    #[test]
+    fn stage_rootfs_tar_archive_decompresses_gzip_sources() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).expect("create base dir");
+        let tar = tar_bytes_with_file("etc/marker.txt", b"rootfs-tar-gzip\n");
+        let gzipped = gzip_bytes(&tar);
+        let src = base.join("src.tar.gz");
+        let dst = base.join("source-rootfs.tar");
+        std::fs::write(&src, &gzipped).expect("write source");
+
+        let digest =
+            stage_rootfs_tar_archive(&src, &dst, TEST_STAGING_LIMIT).expect("stage gzip archive");
+
+        assert_eq!(
+            digest,
+            compute_bytes_sha256_hex(&gzipped),
+            "the digest must cover the whole compressed source"
+        );
+        assert_eq!(
+            std::fs::read(&dst).expect("read staged archive"),
+            tar,
+            "the staged archive must be an uncompressed tar"
+        );
+
+        let extracted = base.join("extracted");
+        extract_rootfs_archive_to(&dst, &extracted).expect("extract staged archive");
+        assert_eq!(
+            std::fs::read_to_string(extracted.join("etc/marker.txt")).expect("read marker"),
+            "rootfs-tar-gzip\n"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The configured limit bounds what the driver writes, not just what it
+    /// accepts, so a highly compressible archive cannot fill the host disk.
+    #[test]
+    fn stage_rootfs_tar_archive_rejects_oversized_expansion() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).expect("create base dir");
+        let src = base.join("bomb.tar.gz");
+        std::fs::write(&src, gzip_bytes(&vec![0_u8; 4 * 1024 * 1024])).expect("write source");
+
+        let err = stage_rootfs_tar_archive(&src, &base.join("dst.tar"), 64 * 1024)
+            .expect_err("expansion beyond the limit must be rejected");
+
+        assert!(err.contains("65536"), "unexpected error: {err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     fn test_driver_with_extensions(extensions: LifecycleExtensionRegistry) -> VmDriver {
         let (events, _) = broadcast::channel(WATCH_BUFFER);
