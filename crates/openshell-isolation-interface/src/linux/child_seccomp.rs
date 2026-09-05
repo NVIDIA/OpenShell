@@ -34,6 +34,13 @@ const F_SETSIG_COMMAND: u32 = 10;
 const F_SETOWN_EX_COMMAND: u32 = 15;
 const FIOSETOWN_REQUEST: u32 = 0x8901;
 const SIOCSPGRP_REQUEST: u32 = 0x8902;
+const CLONE_NAMESPACE_FLAGS: u32 = (libc::CLONE_NEWCGROUP
+    | libc::CLONE_NEWIPC
+    | libc::CLONE_NEWNET
+    | libc::CLONE_NEWNS
+    | libc::CLONE_NEWPID
+    | libc::CLONE_NEWUSER
+    | libc::CLONE_NEWUTS) as u32;
 
 /// A prebuilt child filter that can be installed without heap allocation.
 pub struct ChildHardeningProgram {
@@ -151,10 +158,16 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
         libc::SYS_setdomainname,
         libc::SYS_setpriority,
         libc::SYS_ioprio_set,
-        libc::SYS_clone3,
     ] {
         append_unconditional_deny(&mut instructions, syscall)?;
     }
+
+    // glibc falls back from clone3 to clone only for ENOSYS. Returning EPERM
+    // here breaks pthread_create and posix_spawn on modern glibc. The legacy
+    // clone path remains available for ordinary process/thread creation, but
+    // namespace creation is denied from its scalar flags argument.
+    append_unconditional_errno(&mut instructions, libc::SYS_clone3, libc::ENOSYS)?;
+    append_argument_masked_deny(&mut instructions, libc::SYS_clone, 0, CLONE_NAMESPACE_FLAGS)?;
 
     for (syscall, argument) in [
         (libc::SYS_kill, 0),
@@ -163,6 +176,12 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
         (libc::SYS_rt_tgsigqueueinfo, 0),
     ] {
         append_argument_equal_deny(&mut instructions, syscall, argument, sandbox_tgid)?;
+    }
+    for syscall in [libc::SYS_kill, libc::SYS_rt_sigqueueinfo] {
+        // PID zero targets the caller's process group. Deny it even though
+        // OpenShell normally gives each workload a dedicated process group:
+        // an untrusted child can otherwise rejoin a trusted group first.
+        append_argument_equal_deny(&mut instructions, syscall, 0, 0)?;
     }
     // Negative PID arguments target process groups or every signalable
     // process. The workload never needs that authority and must not be able
@@ -209,6 +228,20 @@ fn append_unconditional_deny(
         stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
         jump(BPF_JMP_JEQ_K, syscall, 0, 1),
         errno(libc::EPERM),
+    ]);
+    Ok(())
+}
+
+fn append_unconditional_errno(
+    instructions: &mut Vec<libc::sock_filter>,
+    syscall: i64,
+    error: i32,
+) -> io::Result<()> {
+    let syscall = syscall_number(syscall)?;
+    instructions.extend([
+        stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
+        jump(BPF_JMP_JEQ_K, syscall, 0, 1),
+        errno(error),
     ]);
     Ok(())
 }
@@ -367,6 +400,11 @@ mod tests {
             {
                 unsafe { libc::_exit(4) };
             }
+            if unsafe { libc::kill(0, 0) } != -1
+                || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
+            {
+                unsafe { libc::_exit(10) };
+            }
             let sandbox_group = -unsafe { libc::getpgrp() };
             if unsafe { libc::kill(sandbox_group, 0) } != -1
                 || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
@@ -404,5 +442,64 @@ mod tests {
         assert_eq!(unsafe { libc::waitpid(child, &raw mut status, 0) }, child);
         assert!(libc::WIFEXITED(status));
         assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn filter_preserves_thread_and_process_creation() {
+        if std::env::var_os("OPENSHELL_CHILD_SECCOMP_CREATION_PROBE").is_some() {
+            let mut filter = prepare(std::process::id().saturating_add(1))
+                .expect("prepare child hardening filter");
+            filter.install().expect("install child hardening filter");
+
+            // A direct clone3 request must report ENOSYS so libc can use its
+            // established clone fallback.
+            let result =
+                unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<libc::c_void>(), 0) };
+            assert_eq!(result, -1);
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENOSYS)
+            );
+
+            let joined = std::thread::spawn(|| 17_u8)
+                .join()
+                .expect("pthread-style child must start");
+            assert_eq!(joined, 17);
+            assert!(
+                std::process::Command::new("/bin/true")
+                    .status()
+                    .expect("posix-spawn-style child must start")
+                    .success()
+            );
+
+            let namespaced = unsafe {
+                libc::syscall(
+                    libc::SYS_clone,
+                    u64::from(CLONE_NAMESPACE_FLAGS & libc::CLONE_NEWUSER as u32)
+                        | u64::from(libc::SIGCHLD as u32),
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            };
+            assert_eq!(namespaced, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+            return;
+        }
+
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .arg("--exact")
+                .arg("linux::child_seccomp::tests::filter_preserves_thread_and_process_creation")
+                .arg("--nocapture")
+                .env("OPENSHELL_CHILD_SECCOMP_CREATION_PROBE", "1")
+                .output()
+                .expect("run isolated child-hardening probe");
+        assert!(
+            output.status.success(),
+            "isolated probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

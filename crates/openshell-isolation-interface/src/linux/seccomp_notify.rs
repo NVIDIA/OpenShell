@@ -15,6 +15,7 @@ use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
 const SECCOMP_GET_NOTIF_SIZES: libc::c_uint = 3;
@@ -44,6 +45,7 @@ const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
 const CONNECTED_SEND_FLAGS: u32 =
     (libc::MSG_DONTWAIT | libc::MSG_EOR | libc::MSG_MORE | libc::MSG_NOSIGNAL | libc::MSG_OOB)
         as u32;
+const PROBE_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 const IOC_NRBITS: u32 = 8;
 const IOC_TYPEBITS: u32 = 8;
@@ -393,7 +395,13 @@ fn probe_scalar_round_trip() -> io::Result<bool> {
     let (listener, wait_killable) = receiver
         .recv()
         .map_err(|_| io::Error::other("notification launcher disappeared"))?;
-    let notification = listener.receive()?;
+    let notification = match receive_probe_notification(&listener) {
+        Ok(notification) => notification,
+        Err(error) => {
+            let _ = launcher.join();
+            return Err(error);
+        }
+    };
     if i64::from(notification.syscall) != libc::SYS_getppid {
         return Err(io::Error::other("unexpected scalar probe syscall"));
     }
@@ -429,8 +437,10 @@ fn probe_addfd_send() -> io::Result<()> {
         }
         let injected = RawFd::try_from(injected)
             .map_err(|_| io::Error::other("injected descriptor does not fit RawFd"))?;
+        // SAFETY: ADDFD-SEND returned one newly owned descriptor to this task.
+        let injected = unsafe { OwnedFd::from_raw_fd(injected) };
         // SAFETY: `injected` was returned as an open descriptor by the kernel.
-        let descriptor_flags = unsafe { libc::fcntl(injected, libc::F_GETFD) };
+        let descriptor_flags = unsafe { libc::fcntl(injected.as_raw_fd(), libc::F_GETFD) };
         if descriptor_flags < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -441,13 +451,11 @@ fn probe_addfd_send() -> io::Result<()> {
         // SAFETY: eventfd reads exactly one u64 into a valid aligned pointer.
         let read = unsafe {
             libc::read(
-                injected,
+                injected.as_raw_fd(),
                 std::ptr::addr_of_mut!(value).cast(),
                 size_of::<u64>(),
             )
         };
-        // SAFETY: close consumes the descriptor returned by the kernel.
-        unsafe { libc::close(injected) };
         let word_size = isize::try_from(size_of::<u64>()).expect("u64 size fits isize");
         if read != word_size || value != 7 {
             return Err(io::Error::other("injected eventfd was not usable"));
@@ -458,7 +466,13 @@ fn probe_addfd_send() -> io::Result<()> {
     let listener = receiver
         .recv()
         .map_err(|_| io::Error::other("ADDFD launcher disappeared"))?;
-    let notification = listener.receive()?;
+    let notification = match receive_probe_notification(&listener) {
+        Ok(notification) => notification,
+        Err(error) => {
+            let _ = launcher.join();
+            return Err(error);
+        }
+    };
     if i64::from(notification.syscall) != libc::SYS_socket {
         return Err(io::Error::other("unexpected ADDFD probe syscall"));
     }
@@ -641,7 +655,13 @@ fn probe_connected_sendto_fast_path() -> io::Result<()> {
     let listener = receiver
         .recv()
         .map_err(|_| io::Error::other("sendto launcher disappeared"))?;
-    let destination = listener.receive()?;
+    let destination = match receive_probe_notification(&listener) {
+        Ok(notification) => notification,
+        Err(error) => {
+            let _ = launcher.join();
+            return Err(error);
+        }
+    };
     if i64::from(destination.syscall) != libc::SYS_sendto
         || destination.args[4] == 0
         || destination.args[5] == 0
@@ -652,7 +672,13 @@ fn probe_connected_sendto_fast_path() -> io::Result<()> {
     }
     listener.respond_errno(destination.id, libc::EACCES)?;
 
-    let fast_open = listener.receive()?;
+    let fast_open = match receive_probe_notification(&listener) {
+        Ok(notification) => notification,
+        Err(error) => {
+            let _ = launcher.join();
+            return Err(error);
+        }
+    };
     if i64::from(fast_open.syscall) != libc::SYS_sendto
         || fast_open.args[4] != 0
         || fast_open.args[5] != 0
@@ -668,6 +694,34 @@ fn probe_connected_sendto_fast_path() -> io::Result<()> {
         .join()
         .map_err(|_| io::Error::other("sendto launcher panicked"))??;
     Ok(())
+}
+
+fn receive_probe_notification(listener: &NotificationListener) -> io::Result<Notification> {
+    let mut descriptor = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN | libc::POLLHUP,
+        revents: 0,
+    };
+    let timeout = i32::try_from(PROBE_NOTIFICATION_TIMEOUT.as_millis())
+        .expect("probe timeout fits poll milliseconds");
+    // SAFETY: descriptor points to one live pollfd for the duration of poll.
+    let ready = unsafe { libc::poll(&raw mut descriptor, 1, timeout) };
+    if ready < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if ready == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "seccomp notification probe timed out",
+        ));
+    }
+    if descriptor.revents & libc::POLLIN == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "seccomp notification probe listener closed",
+        ));
+    }
+    listener.receive()
 }
 
 fn install_listener_with_flags(
