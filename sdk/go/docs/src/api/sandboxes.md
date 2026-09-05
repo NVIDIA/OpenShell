@@ -7,7 +7,7 @@ wait for readiness, watch state changes, and retrieve logs.
 
 ## Create
 
-Creates a new sandbox with the given name, spec, and labels.
+Creates a new sandbox with the given name and spec.
 
 ```go
 sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{
@@ -15,11 +15,9 @@ sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSp
         Image: "nvcr.io/nvidia/openshell:latest",
     },
     Providers: []string{"openai"},
-}, map[string]string{
+}, v1.WithLabels(map[string]string{
     "team": "platform",
-}, v1.CreateOptions{ServiceExposures: []v1.ServiceExposure{
-    {TargetPort: 8080},
-}})
+}), v1.WithServiceExposures(v1.ServiceExposure{TargetPort: 8080}))
 fmt.Println(sb.ServiceURLs[""])
 ```
 
