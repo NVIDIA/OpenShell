@@ -49,6 +49,7 @@ fn test_sandbox() -> DriverSandbox {
             command: Vec::new(),
             tty: false,
             await_main_process_attachment: false,
+            workload_identity: None,
         }),
         status: None,
         workspace: String::new(),
@@ -3262,6 +3263,7 @@ fn exited_sandbox_with_ready_reason(reason: &str) -> DriverSandbox {
                 last_transition_time: String::new(),
             }],
             deleting: false,
+            ..Default::default()
         }),
         workspace: String::new(),
     }
