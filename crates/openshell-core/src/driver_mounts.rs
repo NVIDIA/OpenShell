@@ -296,7 +296,6 @@ mod tests {
             "/etc/openshell-tls",
             "/run",
             "/run/openshell/cache",
-            "/run/openshell-sidecar/control.sock",
             "/run/netns/project",
             "/var/run/netns/project",
         ] {
