@@ -1647,7 +1647,7 @@ impl DockerComputeDriver {
                 )
                 .await
                 .or_else(|error| {
-                    if is_not_found_error(&error) {
+                    if is_not_found_error(&error) || is_removal_in_progress_error(&error) {
                         Ok(())
                     } else {
                         Err(error)
@@ -5887,6 +5887,16 @@ fn is_conflict_error(err: &BollardError) -> bool {
             status_code: 409,
             ..
         }
+    )
+}
+
+fn is_removal_in_progress_error(err: &BollardError) -> bool {
+    matches!(
+        err,
+        BollardError::DockerResponseServerError {
+            status_code: 409,
+            message,
+        } if message.contains("removal of container") && message.contains("is already in progress")
     )
 }
 
