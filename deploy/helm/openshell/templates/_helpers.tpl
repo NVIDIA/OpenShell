@@ -104,6 +104,7 @@ defaults.
 */}}
 {{- define "openshell.gatewayClientCaEnabled" -}}
 {{- if .Values.server.disableTls -}}
+{{- else if not .Values.server.tls.enableMtls -}}
 {{- else if eq .Values.server.tls.clientCaSecretName "" -}}
 {{- else if or .Values.server.tls.clientCaSecretName (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) -}}
 true
@@ -238,6 +239,13 @@ Returns a YAML list. Append extra SANs from values with range loops.
       "host.docker.internal"
       "host.containers.internal"
   | toYaml }}
+{{- end }}
+
+{{/*
+Name of the ConfigMap holding the backend CA for BackendTLSPolicy validation.
+*/}}
+{{- define "openshell.backendCaConfigMapName" -}}
+{{- .Values.grpcRoute.backendTLSPolicy.caCertificateConfigMapName | default (printf "%s-backend-ca" (include "openshell.fullname" .)) -}}
 {{- end }}
 
 {{/*

@@ -464,6 +464,9 @@ compute_drivers       = ["kubernetes"]
 [openshell.gateway.tls]
 cert_path      = "/etc/openshell-tls/server/tls.crt"
 key_path       = "/etc/openshell-tls/server/tls.key"
+# client_ca_path is only rendered when server.tls.enableMtls is true (the
+# default). When enableMtls is false — required for BackendTLSPolicy — the
+# gateway runs HTTPS-only and this line is omitted by Helm.
 client_ca_path = "/etc/openshell-tls/client-ca/ca.crt"
 # When cert-manager serverIssuerRef is configured, these are populated by Helm:
 # external_cert_path    = "/etc/openshell-tls/server-external/tls.crt"

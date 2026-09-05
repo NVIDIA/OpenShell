@@ -64,6 +64,25 @@ tests:
       - notExists:
           path: spec.template.spec.volumes[3].secret.items
 
+  - it: omits client CA volume and mount when mTLS is disabled
+    template: templates/statefulset.yaml
+    set:
+      pkiInitJob.enabled: true
+      certManager.enabled: false
+      server.tls.enableMtls: false
+    asserts:
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: tls-client-ca
+          any: true
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: tls-client-ca
+            mountPath: /etc/openshell-tls/client-ca
+            readOnly: true
+
   # When cert-manager owns TLS, does not share its CA, and no separate client CA
   # secret is configured, there is no client CA to mount: the volume must not
   # render rather than mounting an empty secret name.
