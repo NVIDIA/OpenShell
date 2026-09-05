@@ -4930,7 +4930,7 @@ network_policies:
     }
 
     #[test]
-    fn l7_endpoint_config_materializes_default_mcp_versions_without_alias() {
+    fn yaml_load_accepts_mixed_case_mcp_protocol_with_default_versions() {
         let data = r#"
 network_policies:
   mcp:
@@ -4938,7 +4938,7 @@ network_policies:
     endpoints:
       - host: mcp.example.com
         port: 443
-        protocol: mcp
+        protocol: MCP
         rules:
           - allow:
               method: tools/list
@@ -5485,11 +5485,17 @@ network_policies:
     }
 
     #[test]
-    fn proto_load_accepts_defaultable_mcp_versions() {
-        for policy in [
-            defaultable_mcp_proto(None),
-            defaultable_mcp_proto(Some(McpOptions::default())),
-        ] {
+    fn proto_load_accepts_defaultable_mcp_versions_with_mixed_case_protocol() {
+        let mut implicit_defaults = defaultable_mcp_proto(None);
+        implicit_defaults
+            .network_policies
+            .get_mut("mcp")
+            .expect("defaultable MCP fixture contains the MCP policy")
+            .endpoints[0]
+            .protocol = "Mcp".to_string();
+        let explicit_defaults = defaultable_mcp_proto(Some(McpOptions::default()));
+
+        for policy in [implicit_defaults, explicit_defaults] {
             let engine = OpaEngine::from_proto(&policy)
                 .expect("supervisor ingress must materialize the pinned MCP revision");
             let input = NetworkInput {

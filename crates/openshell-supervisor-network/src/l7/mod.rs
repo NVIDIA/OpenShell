@@ -1285,7 +1285,7 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                     "{loc}: JSON-RPC-specific endpoint fields are ignored unless protocol is json-rpc or mcp"
                 ));
             }
-            validate_mcp_versions_field(&mut errors, &loc, ep, protocol);
+            validate_mcp_versions_field(&mut errors, &loc, ep, l7_protocol);
             let has_mcp_strict_tool_names = ep.get("mcp_strict_tool_names").is_some();
             let has_mcp_allow_all_known_mcp_methods =
                 ep.get("mcp_allow_all_known_mcp_methods").is_some();
@@ -1609,12 +1609,12 @@ fn validate_mcp_versions_field(
     errors: &mut Vec<String>,
     loc: &str,
     endpoint: &serde_json::Value,
-    protocol: &str,
+    protocol: Option<L7Protocol>,
 ) {
     let Some(value) = endpoint.get("mcp_versions") else {
         return;
     };
-    if protocol != "mcp" {
+    if protocol != Some(L7Protocol::Mcp) {
         errors.push(format!(
             "{loc}: mcp.versions is only valid for protocol mcp"
         ));
