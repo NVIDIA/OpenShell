@@ -1,0 +1,151 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Core Approval
+
+on:
+  merge_group:
+    types: [checks_requested]
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  pull_request_review:
+    types: [submitted, dismissed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to re-evaluate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.sha || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  core-approval:
+    name: Publish core approval status
+    if: github.repository_owner == 'NVIDIA'
+    runs-on: ubuntu-latest
+    env:
+      STATUS_CONTEXT: OpenShell / Core Approval
+    steps:
+      # Check out the default branch, never the pull request head. This job runs
+      # with a write-capable token, so it must not fetch or execute contributor
+      # code. Only the approval helper is needed. "main" is hardcoded here and
+      # in the MAINTAINERS.md fetch below; both must change together if the
+      # default branch is ever renamed.
+      - name: Check out the approval helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          sparse-checkout: tasks/scripts/core_approval.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Publish core approval status
+        id: publish
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER_FROM_EVENT: ${{ github.event.pull_request.number }}
+          PR_NUMBER_FROM_INPUT: ${{ inputs.pr_number }}
+          MERGE_GROUP_SHA: ${{ github.event.merge_group.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RUN_URL="https://github.com/$GH_REPO/actions/runs/$GITHUB_RUN_ID"
+
+          post_status() {
+            local sha="$1" state="$2" description="$3" target_url="$4"
+            echo "$STATUS_CONTEXT: $state - $description"
+            gh api --method POST "repos/$GH_REPO/statuses/$sha" \
+              -f "state=$state" \
+              -f "context=$STATUS_CONTEXT" \
+              -f "description=$description" \
+              -f "target_url=$target_url" >/dev/null
+            # A status was published, so the guard step has nothing to add.
+            # Step outputs are collected after the step finishes, including
+            # when it fails, so this reaches the guard either way.
+            echo "posted=true" >> "$GITHUB_OUTPUT"
+          }
+
+          # A merge group only forms after the pull request satisfied this gate,
+          # and approvals cannot change while an entry sits in the queue. Publish
+          # success so the queue's required-check evaluation resolves instead of
+          # waiting out check_response_timeout_minutes.
+          if [ "$EVENT_NAME" = "merge_group" ]; then
+            post_status "$MERGE_GROUP_SHA" success \
+              "Approval enforced at pull request" "$RUN_URL"
+            exit 0
+          fi
+
+          PR_NUMBER="${PR_NUMBER_FROM_EVENT:-$PR_NUMBER_FROM_INPUT}"
+          PR=$(gh api "repos/$GH_REPO/pulls/$PR_NUMBER")
+
+          if [ "$(jq -r '.state' <<< "$PR")" != "open" ]; then
+            echo "PR #$PR_NUMBER is not open; nothing to publish."
+            exit 0
+          fi
+
+          HEAD_SHA=$(jq -r '.head.sha' <<< "$PR")
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          AUTHOR=$(jq -r '.user.login' <<< "$PR")
+          TARGET_URL="https://github.com/$GH_REPO/pull/$PR_NUMBER"
+
+          # Pinned to main on purpose. Reading this file from the pull request
+          # ref would let a contributor add themselves and self-approve.
+          gh api -H "Accept: application/vnd.github.raw" \
+            "repos/$GH_REPO/contents/MAINTAINERS.md?ref=main" > maintainers.md
+
+          gh api --paginate "repos/$GH_REPO/pulls/$PR_NUMBER/reviews" --jq '.[]' \
+            | jq -s '.' > reviews.json
+
+          if ! RESULT=$(python3 tasks/scripts/core_approval.py decide \
+                --maintainers maintainers.md \
+                --reviews reviews.json \
+                --author "$AUTHOR"); then
+            post_status "$HEAD_SHA" failure \
+              "Could not evaluate maintainer approval" "$RUN_URL"
+            exit 1
+          fi
+
+          post_status "$HEAD_SHA" "${RESULT%%$'\t'*}" "${RESULT#*$'\t'}" "$TARGET_URL"
+
+      # If the step above aborted before publishing anything — a transient API
+      # failure, a failed checkout, the step timing out — the required check
+      # would otherwise sit at "Expected" forever. Publish red so the state is
+      # visible and the job can be re-run.
+      - name: Publish a failure status if none was published
+        if: failure() && steps.publish.outputs.posted != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          # The step output covers a failure after the pull request was looked
+          # up, including on workflow_dispatch. The event payload covers a
+          # failure before that — a failed checkout, or a transient API error.
+          STATUS_SHA: ${{ steps.publish.outputs.head_sha || github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # workflow_dispatch aborting before the lookup leaves no SHA to
+          # address. Nothing can be published; say so rather than failing here.
+          if [ -z "$STATUS_SHA" ]; then
+            echo "::warning::No head SHA resolved; cannot publish a failure status."
+            exit 0
+          fi
+
+          gh api --method POST "repos/$GH_REPO/statuses/$STATUS_SHA" \
+            -f "state=failure" \
+            -f "context=$STATUS_CONTEXT" \
+            -f "description=Could not evaluate maintainer approval" \
+            -f "target_url=https://github.com/$GH_REPO/actions/runs/$GITHUB_RUN_ID" \
+            >/dev/null

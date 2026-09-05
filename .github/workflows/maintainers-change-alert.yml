@@ -1,0 +1,98 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Maintainers Change Alert
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+    paths:
+      - MAINTAINERS.md
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  describe-change:
+    name: Comment on the approver set change
+    if: github.repository_owner == 'NVIDIA'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Default branch only. The helper must be the reviewed version, not
+      # whatever the pull request happens to contain.
+      - name: Check out the approval helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          sparse-checkout: tasks/scripts/core_approval.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Post the maintainer delta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Fetching file contents is reading data, not executing it. The head
+          # revision is never checked out or run.
+          #
+          # A 404 means the file genuinely does not exist at that revision — a
+          # pull request that adds or deletes MAINTAINERS.md — and yields an
+          # empty side of the comparison. Every other failure is fatal: an empty
+          # file from a rate limit or a 5xx would render as "every maintainer
+          # was just added" or "nothing changed", both of which mislead the
+          # reviewer about who can merge code.
+          fetch_maintainers() {
+            local ref="$1" out="$2" err
+            err="$(mktemp)"
+            if gh api -H "Accept: application/vnd.github.raw" \
+                 "repos/$GH_REPO/contents/MAINTAINERS.md?ref=$ref" > "$out" 2>"$err"; then
+              rm -f "$err"
+              return 0
+            fi
+            if grep -q 'HTTP 404' "$err"; then
+              rm -f "$err"
+              : > "$out"
+              return 0
+            fi
+            echo "::error::Could not fetch MAINTAINERS.md at $ref"
+            cat "$err" >&2
+            rm -f "$err"
+            return 1
+          }
+
+          fetch_maintainers "$BASE_SHA" before.md
+          fetch_maintainers "$HEAD_SHA" after.md
+
+          python3 tasks/scripts/core_approval.py diff \
+            --before before.md --after after.md > body.md
+          cat body.md >> "$GITHUB_STEP_SUMMARY"
+
+          # Update the existing comment rather than stacking one per push.
+          # This marker must stay identical to COMMENT_MARKER in
+          # tasks/scripts/core_approval.py, which emits it as the first line of
+          # the body. If they drift, the lookup below silently stops matching
+          # and every push stacks another comment.
+          COMMENT_ID=$(gh api --paginate "repos/$GH_REPO/issues/$PR_NUMBER/comments" \
+            --jq '.[] | select(.body | startswith("<!-- core-approval-maintainer-delta -->")) | .id' \
+            | head -n 1)
+
+          if [ -n "$COMMENT_ID" ]; then
+            gh api --method PATCH "repos/$GH_REPO/issues/comments/$COMMENT_ID" \
+              -F "body=@body.md" >/dev/null
+          else
+            gh api --method POST "repos/$GH_REPO/issues/$PR_NUMBER/comments" \
+              -F "body=@body.md" >/dev/null
+          fi
