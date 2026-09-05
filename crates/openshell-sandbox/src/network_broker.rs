@@ -565,7 +565,25 @@ fn connect_socket(
     active_opens: Arc<AtomicUsize>,
 ) -> io::Result<()> {
     let fd = raw_fd(notification.args[0])?;
-    if !socket_address_is_inet(notification.tid, notification.args[1], notification.args[2])? {
+    let address_family =
+        read_socket_family(notification.tid, notification.args[1], notification.args[2])?;
+    if !matches!(address_family, libc::AF_INET | libc::AF_INET6) {
+        if address_family == libc::AF_UNSPEC {
+            let mut registry = lock(&registry);
+            if let Ok(entry) = registry.resolve_mut(notification.tid, fd)
+                && entry.metadata().kind == InetKind::DnsUdp
+                && matches!(
+                    entry.state(),
+                    SocketState::Created | SocketState::Bound { .. }
+                )
+            {
+                // Address-selection implementations disconnect a temporary
+                // UDP route-probe socket with AF_UNSPEC before trying the next
+                // candidate. The probe below never connects the real OFD, so
+                // this is an idempotent no-op rather than a kernel CONTINUE.
+                return listener.respond_value(notification.id, 0);
+            }
+        }
         if lock(&registry).resolve(notification.tid, fd).is_ok() {
             // Every registered descriptor is an injected INET socket. Never
             // CONTINUE based on a mutable workload sockaddr for such an FD.
@@ -585,6 +603,34 @@ fn connect_socket(
             entry.metadata().nonblocking,
         )
     };
+    if kind == InetKind::DnsUdp && destination.port() == 0 {
+        let mut registry = lock(&registry);
+        let entry = registry.resolve_mut(notification.tid, fd)?;
+        if !matches!(
+            entry.state(),
+            SocketState::Created | SocketState::Bound { .. }
+        ) {
+            return Err(io::Error::from_raw_os_error(libc::EISCONN));
+        }
+        let destination_family = match destination {
+            SocketAddr::V4(_) => InetFamily::V4,
+            SocketAddr::V6(_) => InetFamily::V6,
+        };
+        if entry.metadata().family != destination_family {
+            return Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT));
+        }
+        // glibc and uv use UDP connect(..., port 0), getsockname(), and an
+        // AF_UNSPEC disconnect to rank resolved addresses. Bind only to the
+        // matching loopback family and report success; never connect the
+        // kernel socket to the external candidate. write(2) therefore remains
+        // EDESTADDRREQ and destination-bearing sends remain broker-denied.
+        let local = ensure_dns_source_bound(
+            entry.retained_preconnect()?.as_raw_fd(),
+            entry.metadata().family,
+        )?;
+        entry.set_state(SocketState::Bound { local });
+        return listener.respond_value(notification.id, 0);
+    }
     if destination == dns_relay.address {
         let identity = ProcfsIdentityResolver::for_pid_namespace().resolve(notification.tid);
         let mut registry = lock(&registry);
@@ -1401,16 +1447,20 @@ fn read_socket_addr(tid: u32, address: u64, length: u64) -> io::Result<SocketAdd
 }
 
 fn socket_address_is_inet(tid: u32, address: u64, length: u64) -> io::Result<bool> {
+    Ok(matches!(
+        read_socket_family(tid, address, length)?,
+        libc::AF_INET | libc::AF_INET6
+    ))
+}
+
+fn read_socket_family(tid: u32, address: u64, length: u64) -> io::Result<i32> {
     let length = usize::try_from(length).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
     if address == 0 || length < size_of::<libc::sa_family_t>() {
         return Err(io::Error::from_raw_os_error(libc::EFAULT));
     }
     let mut family = [0_u8; size_of::<libc::sa_family_t>()];
     task_memory::read_exact(tid, address, &mut family)?;
-    Ok(matches!(
-        i32::from(libc::sa_family_t::from_ne_bytes(family)),
-        libc::AF_INET | libc::AF_INET6
-    ))
+    Ok(i32::from(libc::sa_family_t::from_ne_bytes(family)))
 }
 
 fn decode_sockaddr(storage: libc::sockaddr_storage, length: usize) -> io::Result<SocketAddr> {
@@ -1796,6 +1846,69 @@ mod tests {
             client.join().expect("join client").expect("DNS client"),
             dns_address
         );
+    }
+
+    #[test]
+    fn udp_port_zero_route_probes_are_local_and_reusable() {
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
+        launcher
+            .execute(|| -> io::Result<()> {
+                let socket = UdpSocket::bind("0.0.0.0:0")?;
+                socket.connect("198.51.100.7:0")?;
+                let local = socket.local_addr()?;
+                if !local.ip().is_loopback() || local.port() == 0 {
+                    return Err(io::Error::other(format!(
+                        "route probe did not expose a local source: {local}"
+                    )));
+                }
+
+                let unspecified = libc::sockaddr {
+                    sa_family: libc::sa_family_t::try_from(libc::AF_UNSPEC)
+                        .expect("AF_UNSPEC fits sa_family_t"),
+                    sa_data: [0; 14],
+                };
+                // SAFETY: unspecified is a live native sockaddr used for the
+                // conventional UDP disconnect operation.
+                let disconnected = unsafe {
+                    libc::connect(
+                        socket.as_raw_fd(),
+                        (&raw const unspecified).cast(),
+                        libc::socklen_t::try_from(size_of::<libc::sockaddr>())
+                            .expect("sockaddr size fits socklen_t"),
+                    )
+                };
+                if disconnected != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                socket.connect("203.0.113.9:0")?;
+
+                // The route probe never commits an external UDP peer. A
+                // destination-free send must therefore remain kernel-denied.
+                // SAFETY: payload is live for the duration of this syscall.
+                let sent = unsafe {
+                    libc::send(
+                        socket.as_raw_fd(),
+                        b"blocked".as_ptr().cast(),
+                        b"blocked".len(),
+                        0,
+                    )
+                };
+                if sent >= 0 {
+                    return Err(io::Error::other("route probe became a data path"));
+                }
+                let error = io::Error::last_os_error();
+                if !matches!(
+                    error.raw_os_error(),
+                    Some(libc::EDESTADDRREQ | libc::ENOTCONN)
+                ) {
+                    return Err(error);
+                }
+                Ok(())
+            })
+            .expect("launcher result")
+            .expect("route-probe workload");
     }
 
     #[test]
