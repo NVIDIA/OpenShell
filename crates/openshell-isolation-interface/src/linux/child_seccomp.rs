@@ -119,7 +119,6 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
         libc::SYS_ptrace,
         libc::SYS_process_vm_readv,
         libc::SYS_process_vm_writev,
-        libc::SYS_pidfd_open,
         libc::SYS_pidfd_getfd,
         libc::SYS_pidfd_send_signal,
         libc::SYS_kcmp,
@@ -162,11 +161,12 @@ pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
         append_unconditional_deny(&mut instructions, syscall)?;
     }
 
-    // glibc falls back from clone3 to clone only for ENOSYS. Returning EPERM
-    // here breaks pthread_create and posix_spawn on modern glibc. The legacy
-    // clone path remains available for ordinary process/thread creation, but
-    // namespace creation is denied from its scalar flags argument.
+    // Modern launchers fall back from clone3 and pidfd_open only for ENOSYS.
+    // Returning EPERM here breaks otherwise portable process creation. The
+    // fallback paths remain constrained: namespace creation is denied from
+    // clone's scalar flags and no pidfd can be acquired.
     append_unconditional_errno(&mut instructions, libc::SYS_clone3, libc::ENOSYS)?;
+    append_unconditional_errno(&mut instructions, libc::SYS_pidfd_open, libc::ENOSYS)?;
     append_argument_masked_deny(&mut instructions, libc::SYS_clone, 0, CLONE_NAMESPACE_FLAGS)?;
 
     for (syscall, argument) in [
@@ -455,6 +455,15 @@ mod tests {
             // established clone fallback.
             let result =
                 unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<libc::c_void>(), 0) };
+            assert_eq!(result, -1);
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENOSYS)
+            );
+
+            // Process launchers such as uv also probe pidfd_open and require
+            // ENOSYS to select their non-pidfd fallback.
+            let result = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
             assert_eq!(result, -1);
             assert_eq!(
                 io::Error::last_os_error().raw_os_error(),
