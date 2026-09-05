@@ -1855,7 +1855,23 @@ mod tests {
         let _broker = NetworkBroker::start_for_test(listener).expect("start network broker");
         launcher
             .execute(|| -> io::Result<()> {
-                let socket = UdpSocket::bind("0.0.0.0:0")?;
+                // Address-selection probes create an unbound datagram socket;
+                // binding to INADDR_ANY first would intentionally preserve an
+                // unspecified local address and would not model that path.
+                // SAFETY: the return value is checked before ownership moves
+                // into UdpSocket.
+                let raw_socket = unsafe {
+                    libc::socket(
+                        libc::AF_INET,
+                        libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                        libc::IPPROTO_UDP,
+                    )
+                };
+                if raw_socket < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: raw_socket is a new, owned socket descriptor.
+                let socket = unsafe { UdpSocket::from_raw_fd(raw_socket) };
                 socket.connect("198.51.100.7:0")?;
                 let local = socket.local_addr()?;
                 if !local.ip().is_loopback() || local.port() == 0 {
