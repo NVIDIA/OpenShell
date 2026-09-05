@@ -281,9 +281,7 @@ fn start_dns_relay(
     address: SocketAddr,
     pending: mpsc::Sender<PendingDnsQuery>,
 ) -> io::Result<DnsRelay> {
-    let udp = UdpSocket::bind(address)?;
-    let address = udp.local_addr()?;
-    let tcp = TcpListener::bind(address)?;
+    let (udp, tcp, address) = bind_dns_relay_sockets(address)?;
     let udp_attribution = Arc::new(Mutex::new(HashMap::new()));
     let tcp_attribution = Arc::new(Mutex::new(HashMap::new()));
     let active_workers = Arc::new(AtomicUsize::new(0));
@@ -364,6 +362,36 @@ fn start_dns_relay(
         })
         .map_err(|error| io::Error::other(format!("start TCP DNS relay: {error}")))?;
     Ok(relay)
+}
+
+fn bind_dns_relay_sockets(address: SocketAddr) -> io::Result<(UdpSocket, TcpListener, SocketAddr)> {
+    const EPHEMERAL_BIND_ATTEMPTS: usize = 32;
+
+    if address.port() != 0 {
+        let udp = UdpSocket::bind(address)?;
+        let tcp = TcpListener::bind(address)?;
+        return Ok((udp, tcp, address));
+    }
+
+    // TCP and UDP have independent ephemeral-port allocators. The port picked
+    // by the first bind can therefore already be occupied by the other
+    // protocol, especially while the test suite starts several brokers in
+    // parallel. Retry the pair rather than treating that collision as an
+    // unavailable network broker.
+    for _ in 0..EPHEMERAL_BIND_ATTEMPTS {
+        let udp = UdpSocket::bind(address)?;
+        let selected = udp.local_addr()?;
+        match TcpListener::bind(selected) {
+            Ok(tcp) => return Ok((udp, tcp, selected)),
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        "could not reserve a shared ephemeral TCP/UDP DNS relay port",
+    ))
 }
 
 fn pending_try_send(
