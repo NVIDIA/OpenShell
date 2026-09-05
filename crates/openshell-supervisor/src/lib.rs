@@ -1028,7 +1028,11 @@ const PROXY_BASELINE_READ_ONLY: &[&str] = &[
 
 /// Minimum read-write paths required for a proxy-mode sandbox child process.
 /// The active workspace is granted separately through `include_workdir`.
-const PROXY_BASELINE_READ_WRITE: &[&str] = &["/tmp"];
+// `/dev/null` is opened by common child-process launchers when they construct
+// piped or discarded stdio. Without it, tools such as uv report EACCES while
+// probing an otherwise executable interpreter under an explicit filesystem
+// policy.
+const PROXY_BASELINE_READ_WRITE: &[&str] = &["/tmp", "/dev/null"];
 
 /// GPU read-only paths.
 ///
@@ -1381,6 +1385,7 @@ mod baseline_tests {
     fn baseline_read_write_does_not_hardcode_sandbox() {
         let (_ro, rw) = baseline_enrichment_paths();
         assert!(rw.contains(&"/tmp".to_string()));
+        assert!(rw.contains(&"/dev/null".to_string()));
         assert!(!rw.contains(&"/sandbox".to_string()));
     }
 
