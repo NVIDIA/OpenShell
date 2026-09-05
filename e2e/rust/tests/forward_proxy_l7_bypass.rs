@@ -10,13 +10,11 @@
 
 use std::io::Write;
 
-use openshell_e2e::harness::container::HostSupportContainer;
+use openshell_e2e::harness::container::ContainerHttpServer;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
-const TEST_SERVER_HOST: &str = "host.openshell.internal";
-
-async fn start_test_server() -> Result<HostSupportContainer, String> {
+async fn start_test_server(alias: &str) -> Result<ContainerHttpServer, String> {
     let script = r#"from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class Handler(BaseHTTPRequestHandler):
@@ -34,7 +32,7 @@ class Handler(BaseHTTPRequestHandler):
 HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
 "#;
 
-    HostSupportContainer::start_python(script, 8000).await
+    ContainerHttpServer::start_python(alias, script).await
 }
 
 fn write_policy_with_l7_rules(host: &str, port: u16) -> Result<NamedTempFile, String> {
@@ -98,9 +96,11 @@ network_policies:
 /// GET /allowed should succeed — the L7 policy explicitly allows it.
 #[tokio::test]
 async fn forward_proxy_allows_l7_permitted_request() {
-    let server = start_test_server().await.expect("start test server");
+    let server = start_test_server("rest-l7-allow.openshell.test")
+        .await
+        .expect("start test server");
     let policy =
-        write_policy_with_l7_rules(TEST_SERVER_HOST, server.port).expect("write custom policy");
+        write_policy_with_l7_rules(&server.host, server.port).expect("write custom policy");
     let policy_path = policy
         .path()
         .to_str()
@@ -129,7 +129,7 @@ for attempt in range(6):
         break
 print(json.dumps(last))
 "#,
-        host = TEST_SERVER_HOST,
+        host = server.host,
         port = server.port,
     );
 
@@ -148,9 +148,11 @@ print(json.dumps(last))
 /// POST /allowed should be denied — the L7 policy only allows GET.
 #[tokio::test]
 async fn forward_proxy_denies_l7_blocked_request() {
-    let server = start_test_server().await.expect("start test server");
+    let server = start_test_server("rest-l7-deny.openshell.test")
+        .await
+        .expect("start test server");
     let policy =
-        write_policy_with_l7_rules(TEST_SERVER_HOST, server.port).expect("write custom policy");
+        write_policy_with_l7_rules(&server.host, server.port).expect("write custom policy");
     let policy_path = policy
         .path()
         .to_str()
@@ -170,7 +172,7 @@ except urllib.error.HTTPError as e:
 except Exception as e:
     print(json.dumps({{"status": -1, "error": str(e)}}))
 "#,
-        host = TEST_SERVER_HOST,
+        host = server.host,
         port = server.port,
     );
 
