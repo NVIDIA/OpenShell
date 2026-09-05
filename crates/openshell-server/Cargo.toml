@@ -119,6 +119,7 @@ default = ["telemetry"]
 ## that contains no telemetry endpoint, HTTP client, or emission code.
 telemetry = ["openshell-core/telemetry"]
 bundled-z3 = ["openshell-prover/bundled-z3"]
+prebuilt-z3 = ["openshell-prover/prebuilt-z3"]
 test-support = []
 
 [dev-dependencies]
