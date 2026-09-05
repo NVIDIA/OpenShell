@@ -211,10 +211,10 @@ impl<K: MockKind> BoundBoundary for MockBound<K> {
         self.source.clone()
     }
     async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError> {
-        Ok(ConfirmedBoundary {
-            boundary: Box::new(MockReady::<K> { _k: PhantomData }),
-            evidence: confirmation_evidence(),
-        })
+        Ok(ConfirmedBoundary::new(
+            Box::new(MockReady::<K> { _k: PhantomData }),
+            confirmation_evidence(),
+        ))
     }
 }
 
