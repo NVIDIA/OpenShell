@@ -228,6 +228,13 @@ if [ -f openshell.kconfig ]; then
       all_ok=false
     fi
   done
+  lsm_order="$(grep '^CONFIG_LSM=' "${KERNEL_SOURCES}/.config" 2>/dev/null || true)"
+  if [[ "$lsm_order" == *landlock* ]]; then
+    echo "    CONFIG_LSM: ${lsm_order#*=}"
+  else
+    echo "    WARNING: CONFIG_LSM does not activate Landlock: ${lsm_order:-unset}" >&2
+    all_ok=false
+  fi
   if [ "$all_ok" = false ]; then
     echo "ERROR: kernel config fragment merge failed — required options missing" >&2
     exit 1

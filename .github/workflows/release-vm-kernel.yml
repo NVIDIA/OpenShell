@@ -16,6 +16,12 @@ name: Release VM Kernel
 
 on:
   workflow_dispatch:
+    inputs:
+      release-tag:
+        description: Rolling prerelease tag to create or update
+        required: false
+        default: vm-runtime
+        type: string
 
 permissions:
   contents: write
@@ -23,7 +29,7 @@ permissions:
 
 # Serialize runtime release updates.
 concurrency:
-  group: vm-runtime-release
+  group: vm-runtime-release-${{ inputs.release-tag || 'vm-runtime' }}
   cancel-in-progress: false
 
 defaults:
@@ -194,23 +200,28 @@ jobs:
             release/vm-runtime-darwin-aarch64.tar.zst
 
       - name: Ensure vm-runtime tag exists
+        env:
+          RELEASE_TAG: ${{ inputs.release-tag || 'vm-runtime' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -fa vm-runtime -m "VM Runtime Development Build" "${GITHUB_SHA}"
-          git push --force origin vm-runtime
+          git tag -fa "$RELEASE_TAG" -m "VM Runtime Development Build" "${GITHUB_SHA}"
+          git push --force origin "$RELEASE_TAG"
 
       - name: Prune stale runtime assets from vm-runtime release
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          RELEASE_TAG: ${{ inputs.release-tag || 'vm-runtime' }}
         with:
           script: |
             const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+            const tag = process.env.RELEASE_TAG;
             let release;
             try {
-              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag: 'vm-runtime' });
+              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
             } catch (err) {
               if (err.status === 404) {
-                core.info('No existing vm-runtime release; will create fresh.');
+                core.info(`No existing ${tag} release; will create fresh.`);
                 return;
               }
               throw err;
@@ -228,7 +239,7 @@ jobs:
         with:
           name: OpenShell VM Runtime
           prerelease: true
-          tag_name: vm-runtime
+          tag_name: ${{ inputs.release-tag || 'vm-runtime' }}
           target_commitish: ${{ github.sha }}
           body: |
             Build of the OpenShell VM runtime artifacts used by `openshell-driver-vm`.
@@ -250,7 +261,7 @@ jobs:
             ### Verify
 
             ```bash
-            gh release download vm-runtime -R NVIDIA/OpenShell -p vm-runtime-linux-x86_64.tar.zst
+            gh release download ${{ inputs.release-tag || 'vm-runtime' }} -R NVIDIA/OpenShell -p vm-runtime-linux-x86_64.tar.zst
             gh attestation verify vm-runtime-linux-x86_64.tar.zst -R NVIDIA/OpenShell
             ```
 
