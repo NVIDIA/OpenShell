@@ -161,4 +161,148 @@ mod tests {
         assert_eq!(resource.attributes.len(), 1);
         assert_eq!(resource.attributes[0].key, "openshell.telemetry.source");
     }
+
+    #[test]
+    fn enrichment_strips_agent_supplied_trusted_keys() {
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        let req = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![
+                        KeyValue {
+                            key: "openshell.sandbox.id".into(),
+                            value: Some(AnyValue {
+                                value: Some(any_value::Value::StringValue(
+                                    "agent-spoofed-id".into(),
+                                )),
+                            }),
+                            key_strindex: 0,
+                        },
+                        KeyValue {
+                            key: "openshell.telemetry.source".into(),
+                            value: Some(AnyValue {
+                                value: Some(any_value::Value::StringValue("fake".into())),
+                            }),
+                            key_strindex: 0,
+                        },
+                    ],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![],
+                schema_url: String::new(),
+            }],
+        };
+        let raw = req.encode_to_vec();
+
+        let result = enrich_spans(&raw, ContentType::Protobuf, &test_metadata(), true).unwrap();
+        let decoded = ExportTraceServiceRequest::decode(result.as_slice()).unwrap();
+        let attrs = &decoded.resource_spans[0]
+            .resource
+            .as_ref()
+            .unwrap()
+            .attributes;
+
+        let sandbox_ids: Vec<_> = attrs
+            .iter()
+            .filter(|a| a.key == "openshell.sandbox.id")
+            .collect();
+        assert_eq!(sandbox_ids.len(), 1, "should have exactly one sandbox.id");
+
+        let sources: Vec<_> = attrs
+            .iter()
+            .filter(|a| a.key == "openshell.telemetry.source")
+            .collect();
+        assert_eq!(sources.len(), 1, "should have exactly one telemetry.source");
+
+        if let Some(AnyValue {
+            value: Some(any_value::Value::StringValue(v)),
+        }) = &sandbox_ids[0].value
+        {
+            assert_eq!(v, "sb-123", "should use supervisor's value, not agent's");
+        }
+    }
+
+    #[test]
+    fn enrichment_preserves_non_trusted_agent_attributes() {
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        let req = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "my.custom.attr".into(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("keep-me".into())),
+                        }),
+                        key_strindex: 0,
+                    }],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![],
+                schema_url: String::new(),
+            }],
+        };
+        let raw = req.encode_to_vec();
+
+        let result = enrich_spans(&raw, ContentType::Protobuf, &test_metadata(), true).unwrap();
+        let decoded = ExportTraceServiceRequest::decode(result.as_slice()).unwrap();
+        let attrs = &decoded.resource_spans[0]
+            .resource
+            .as_ref()
+            .unwrap()
+            .attributes;
+
+        assert!(
+            attrs.iter().any(|a| a.key == "my.custom.attr"),
+            "custom agent attribute should be preserved"
+        );
+        assert!(
+            attrs.iter().any(|a| a.key == "openshell.sandbox.id"),
+            "enrichment attributes should also be present"
+        );
+    }
+
+    #[test]
+    fn enrichment_handles_json_content_type() {
+        let req = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: None,
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        name: "json-span".into(),
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let json = serde_json::to_vec(&req).unwrap();
+
+        let result =
+            enrich_spans(&json, ContentType::Json, &test_metadata(), true).unwrap();
+
+        let decoded = ExportTraceServiceRequest::decode(result.as_slice()).unwrap();
+        let resource = decoded.resource_spans[0].resource.as_ref().unwrap();
+        assert!(resource
+            .attributes
+            .iter()
+            .any(|a| a.key == "openshell.telemetry.source"));
+    }
+
+    #[test]
+    fn enrichment_rejects_invalid_protobuf() {
+        let garbage = vec![0xFF, 0xFE, 0xFD, 0xFC];
+        let result = enrich_spans(&garbage, ContentType::Protobuf, &test_metadata(), true);
+        assert!(
+            matches!(result, Err(EnrichmentError::ProtobufDecode(_))),
+            "should return ProtobufDecode error"
+        );
+    }
 }

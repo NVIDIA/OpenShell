@@ -149,4 +149,63 @@ mod tests {
         assert!(matches!(&items[1], TelemetryItem::Ocsf(_)));
         assert_eq!(rx.metrics().depth(), 0);
     }
+
+    #[tokio::test]
+    async fn depth_tracks_send_and_recv() {
+        let (tx, mut rx) = new_telemetry_buffer(16);
+
+        tx.send_trace(vec![1]);
+        tx.send_trace(vec![2]);
+        tx.send_trace(vec![3]);
+        assert_eq!(tx.metrics().depth(), 3);
+
+        rx.recv().await.unwrap();
+        assert_eq!(rx.metrics().depth(), 2);
+
+        let remaining = rx.drain();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(rx.metrics().depth(), 0);
+    }
+
+    #[tokio::test]
+    async fn drop_count_increments_on_each_overflow() {
+        let (tx, _rx) = new_telemetry_buffer(2);
+
+        tx.send_trace(vec![1]);
+        tx.send_trace(vec![2]);
+        assert_eq!(tx.metrics().drops(), 0);
+
+        for _ in 0..5 {
+            tx.send_trace(vec![99]);
+        }
+        assert_eq!(tx.metrics().drops(), 5);
+        assert_eq!(tx.metrics().depth(), 2);
+    }
+
+    #[tokio::test]
+    async fn metrics_shared_across_clones() {
+        let (tx, mut rx) = new_telemetry_buffer(16);
+        let tx2 = tx.clone();
+
+        tx.send_trace(vec![1]);
+        tx2.send_trace(vec![2]);
+        tx.send_ocsf(vec![3]);
+
+        assert_eq!(tx.metrics().depth(), 3);
+        assert_eq!(tx2.metrics().depth(), 3);
+
+        rx.recv().await.unwrap();
+        assert_eq!(tx.metrics().depth(), 2);
+        assert_eq!(tx2.metrics().depth(), 2);
+    }
+
+    #[tokio::test]
+    async fn recv_returns_none_when_all_senders_dropped() {
+        let (tx, mut rx) = new_telemetry_buffer(16);
+        tx.send_trace(vec![1]);
+        drop(tx);
+
+        assert!(rx.recv().await.is_some());
+        assert!(rx.recv().await.is_none());
+    }
 }

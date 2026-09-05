@@ -297,3 +297,107 @@ fn spawn_forwarder(
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openshell_ocsf::OcsfRelaySink;
+
+    #[test]
+    fn rate_limiter_acquires_initial_tokens() {
+        let (buf_tx, _rx) = buffer::new_telemetry_buffer(64);
+        let sink = RateLimitedOcsfSink::new(buf_tx, 10);
+
+        for i in 0..10 {
+            assert!(sink.try_acquire(), "token {i} should be available");
+        }
+        assert!(!sink.try_acquire(), "11th token should fail");
+    }
+
+    #[test]
+    fn rate_limiter_drops_when_exhausted() {
+        let (buf_tx, mut rx) = buffer::new_telemetry_buffer(64);
+        let sink = RateLimitedOcsfSink::new(buf_tx, 2);
+
+        sink.send(vec![1]);
+        sink.send(vec![2]);
+        sink.send(vec![3]);
+
+        assert_eq!(sink.drops(), 1);
+        let items = rx.drain();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn rate_limiter_refills_after_time() {
+        let (buf_tx, _rx) = buffer::new_telemetry_buffer(64);
+        let sink = RateLimitedOcsfSink::new(buf_tx, 100);
+
+        for _ in 0..100 {
+            sink.try_acquire();
+        }
+        assert!(!sink.try_acquire(), "should be exhausted");
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(sink.try_acquire(), "should have refilled after 50ms");
+    }
+
+    #[tokio::test]
+    async fn forwarder_constructs_telemetry_data_messages() {
+        let (buf_tx, buf_rx) = buffer::new_telemetry_buffer(64);
+        let (session_tx, mut session_rx) = mpsc::channel::<SupervisorMessage>(64);
+        let drop_counter = Arc::new(AtomicU64::new(0));
+
+        buf_tx.send_trace(vec![1, 2, 3]);
+        buf_tx.send_ocsf(vec![4, 5, 6]);
+        drop(buf_tx);
+
+        let handle = spawn_forwarder(buf_rx, session_tx, "sb-test".into(), drop_counter);
+
+        let msg1 = session_rx.recv().await.unwrap();
+        if let Some(supervisor_message::Payload::Telemetry(tel)) = msg1.payload {
+            assert_eq!(tel.sandbox_id, "sb-test");
+            assert_eq!(tel.trace_data, vec![1, 2, 3]);
+            assert!(tel.ocsf_events.is_empty());
+        } else {
+            panic!("expected Telemetry payload for trace");
+        }
+
+        let msg2 = session_rx.recv().await.unwrap();
+        if let Some(supervisor_message::Payload::Telemetry(tel)) = msg2.payload {
+            assert_eq!(tel.sandbox_id, "sb-test");
+            assert!(tel.trace_data.is_empty());
+            assert_eq!(tel.ocsf_events, vec![vec![4, 5, 6]]);
+        } else {
+            panic!("expected Telemetry payload for OCSF");
+        }
+
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn forwarder_increments_session_drop_counter() {
+        let (buf_tx, buf_rx) = buffer::new_telemetry_buffer(64);
+        let (session_tx, _session_rx) = mpsc::channel::<SupervisorMessage>(1);
+        let drop_counter = Arc::new(AtomicU64::new(0));
+
+        // Fill the session channel
+        session_tx
+            .send(SupervisorMessage { payload: None })
+            .await
+            .unwrap();
+
+        buf_tx.send_trace(vec![1]);
+        buf_tx.send_trace(vec![2]);
+        buf_tx.send_trace(vec![3]);
+        drop(buf_tx);
+
+        let handle = spawn_forwarder(buf_rx, session_tx, "sb-test".into(), drop_counter.clone());
+        handle.await.unwrap();
+
+        assert!(
+            drop_counter.load(Ordering::Relaxed) >= 2,
+            "should have dropped at least 2 messages (channel capacity 1, pre-filled)"
+        );
+    }
+}
