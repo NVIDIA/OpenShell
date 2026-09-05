@@ -86,7 +86,7 @@ jobs:
           # the body. If they drift, the lookup below silently stops matching
           # and every push stacks another comment.
           COMMENT_ID=$(gh api --paginate "repos/$GH_REPO/issues/$PR_NUMBER/comments" \
-            --jq '.[] | select(.body | startswith("<!-- core-approval-maintainer-delta -->")) | .id' \
+            --jq '.[] | select(.body | startswith("<!-- maintainer-approval-delta -->")) | .id' \
             | head -n 1)
 
           if [ -n "$COMMENT_ID" ]; then

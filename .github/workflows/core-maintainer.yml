@@ -1,0 +1,73 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Maintainer Approval
+
+on:
+  merge_group:
+    types: [checks_requested]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  maintainer-approval:
+    # This name is the required status check context. Changing it silently
+    # breaks the ruleset entry that gates merges on this job.
+    name: OpenShell / Maintainer Approval
+    if: github.repository_owner == 'NVIDIA'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Check out the default branch, never the pull request head. Both the
+      # maintainer list and the decision helper must come from main: reading
+      # either from the pull request ref would let a contributor add themselves
+      # to the list, or rewrite the decision logic, and self-approve.
+      - name: Check out the maintainer list and helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          sparse-checkout: |
+            MAINTAINERS.md
+            tasks/scripts/core_approval.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Require an approving review from a maintainer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          # merge_group carries no pull request in its payload, but the queue
+          # branch names the entry: gh-readonly-queue/main/pr-3027-<base sha>.
+          MERGE_GROUP_REF: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${PR_NUMBER:-}" ]; then
+            if [[ "$MERGE_GROUP_REF" =~ /pr-([0-9]+)-[0-9a-f]+$ ]]; then
+              PR_NUMBER="${BASH_REMATCH[1]}"
+            else
+              # Fail closed: an unrecognised ref must never satisfy the gate.
+              echo "::error::No pull request resolved from '$MERGE_GROUP_REF'."
+              exit 1
+            fi
+          fi
+
+          gh api --paginate "repos/$GH_REPO/pulls/$PR_NUMBER/reviews" --jq '.[]' \
+            | jq -s '.' > reviews.json
+
+          # Exits non-zero when no maintainer's latest decisive review is an
+          # approval, and when MAINTAINERS.md yields no handles. That exit code
+          # is the check result; nothing is posted anywhere.
+          python3 tasks/scripts/core_approval.py decide \
+            --maintainers MAINTAINERS.md \
+            --reviews reviews.json

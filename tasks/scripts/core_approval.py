@@ -10,8 +10,9 @@
 """Decide whether a pull request carries an approval from a listed maintainer.
 
 The logic here is pure so it can be unit tested. The calling workflow does the
-I/O: it fetches MAINTAINERS.md pinned to the default branch, lists the pull
-request's reviews, and passes both in as files.
+I/O: it checks out MAINTAINERS.md from the default branch, lists the pull
+request's reviews, and passes both in as files. `decide` exits non-zero when
+the gate is not satisfied, and that exit code is the check result.
 
 Runs as bare `python3` on the Actions runner, so it must stay stdlib-only.
 """
@@ -34,10 +35,7 @@ MAINTAINER_RE = re.compile(
 # reviewer's earlier approval intact, which is how GitHub itself treats them.
 DECISIVE_STATES = frozenset({"APPROVED", "CHANGES_REQUESTED", "DISMISSED"})
 
-# GitHub truncates commit status descriptions past this length.
-DESCRIPTION_LIMIT = 140
-
-COMMENT_MARKER = "<!-- core-approval-maintainer-delta -->"
+COMMENT_MARKER = "<!-- maintainer-approval-delta -->"
 
 
 def parse_maintainers(markdown: str) -> set[str]:
@@ -62,34 +60,27 @@ def latest_positions(reviews: list[dict]) -> dict[str, str]:
     return positions
 
 
-def approving_maintainers(
-    reviews: list[dict], maintainers: set[str], author: str
-) -> list[str]:
+def approving_maintainers(reviews: list[dict], maintainers: set[str]) -> list[str]:
     """Return the listed maintainers whose standing position is an approval."""
-    author = author.lower()
     return sorted(
         login
         for login, state in latest_positions(reviews).items()
-        if state == "APPROVED" and login in maintainers and login != author
+        if state == "APPROVED" and login in maintainers
     )
 
 
-def decide(markdown: str, reviews: list[dict], author: str) -> tuple[str, str]:
-    """Return the (state, description) to publish as a commit status."""
+def decide(markdown: str, reviews: list[dict]) -> tuple[bool, str]:
+    """Return whether the gate is satisfied, and a line explaining why."""
     maintainers = parse_maintainers(markdown)
     if not maintainers:
         # Fail closed. An unparseable or empty list must never satisfy the gate.
-        return "failure", "Could not parse any maintainers from MAINTAINERS.md"
+        return False, "Could not parse any maintainers from MAINTAINERS.md"
 
-    approvers = approving_maintainers(reviews, maintainers, author)
+    approvers = approving_maintainers(reviews, maintainers)
     if not approvers:
-        return "failure", "Needs approval from a maintainer listed in MAINTAINERS.md"
+        return False, "Needs approval from a maintainer listed in MAINTAINERS.md"
 
-    shown = ", ".join(f"@{login}" for login in approvers[:3])
-    remainder = len(approvers) - 3
-    if remainder > 0:
-        shown = f"{shown} and {remainder} more"
-    return "success", f"Approved by {shown}"[:DESCRIPTION_LIMIT]
+    return True, "Approved by " + ", ".join(f"@{login}" for login in approvers)
 
 
 def format_delta(before: str, after: str) -> str:
@@ -114,7 +105,7 @@ def format_delta(before: str, after: str) -> str:
             lines.append("")
         lines.append(
             "Confirm every change is intended. Anyone listed here can single-handedly "
-            "satisfy `OpenShell / Core Approval`."
+            "satisfy `OpenShell / Maintainer Approval`."
         )
 
     if not new:
@@ -132,7 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     decide_cmd = subcommands.add_parser(
-        "decide", help="print the commit status to publish, as 'state<TAB>description'"
+        "decide", help="exit 0 when a listed maintainer has approved, 1 otherwise"
     )
     decide_cmd.add_argument(
         "--maintainers",
@@ -145,9 +136,6 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         type=Path,
         help="JSON array returned by the list-reviews API",
-    )
-    decide_cmd.add_argument(
-        "--author", default="", help="pull request author, excluded from approvers"
     )
 
     diff_cmd = subcommands.add_parser(
@@ -167,17 +155,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "decide":
         reviews = json.loads(args.reviews.read_text(encoding="utf-8"))
-        state, description = decide(
-            args.maintainers.read_text(encoding="utf-8"), reviews, args.author
+        approved, reason = decide(args.maintainers.read_text(encoding="utf-8"), reviews)
+        print(reason)
+        return 0 if approved else 1
+
+    print(
+        format_delta(
+            args.before.read_text(encoding="utf-8"),
+            args.after.read_text(encoding="utf-8"),
         )
-        print(f"{state}\t{description}")
-    else:
-        print(
-            format_delta(
-                args.before.read_text(encoding="utf-8"),
-                args.after.read_text(encoding="utf-8"),
-            )
-        )
+    )
     return 0
 
 

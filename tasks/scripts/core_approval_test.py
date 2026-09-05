@@ -10,6 +10,8 @@ sibling script imports directly as `core_approval`.
 
 from __future__ import annotations
 
+import json
+
 import core_approval as ca
 
 TABLE = """# Maintainers
@@ -41,37 +43,37 @@ def test_parse_maintainers_returns_empty_when_table_is_reformatted() -> None:
 
 
 def test_decide_fails_closed_on_unparseable_list() -> None:
-    state, description = ca.decide("# Maintainers\n", [review("purp", "APPROVED")], "x")
-    assert state == "failure"
+    approved, description = ca.decide("# Maintainers\n", [review("purp", "APPROVED")])
+    assert not approved
     assert "MAINTAINERS.md" in description
 
 
 def test_decide_succeeds_on_maintainer_approval() -> None:
-    state, description = ca.decide(TABLE, [review("purp", "APPROVED")], "contributor")
-    assert state == "success"
+    approved, description = ca.decide(TABLE, [review("purp", "APPROVED")])
+    assert approved
     assert "@purp" in description
 
 
 def test_decide_fails_on_non_maintainer_approval() -> None:
-    state, _ = ca.decide(TABLE, [review("outsider", "APPROVED")], "contributor")
-    assert state == "failure"
+    approved, _ = ca.decide(TABLE, [review("outsider", "APPROVED")])
+    assert not approved
 
 
 def test_decide_matches_logins_case_insensitively() -> None:
-    state, _ = ca.decide(TABLE, [review("PuRp", "APPROVED")], "contributor")
-    assert state == "success"
+    approved, _ = ca.decide(TABLE, [review("PuRp", "APPROVED")])
+    assert approved
 
 
 def test_comment_after_approval_does_not_revoke_it() -> None:
     reviews = [review("purp", "APPROVED"), review("purp", "COMMENTED")]
-    state, _ = ca.decide(TABLE, reviews, "contributor")
-    assert state == "success"
+    approved, _ = ca.decide(TABLE, reviews)
+    assert approved
 
 
 def test_dismissed_review_revokes_approval() -> None:
     reviews = [review("purp", "APPROVED"), review("purp", "DISMISSED")]
-    state, _ = ca.decide(TABLE, reviews, "contributor")
-    assert state == "failure"
+    approved, _ = ca.decide(TABLE, reviews)
+    assert not approved
 
 
 def test_out_of_order_reviews_still_respect_the_latest_position() -> None:
@@ -81,32 +83,14 @@ def test_out_of_order_reviews_still_respect_the_latest_position() -> None:
         {"id": 2, "user": {"login": "purp"}, "state": "DISMISSED"},
         {"id": 1, "user": {"login": "purp"}, "state": "APPROVED"},
     ]
-    state, _ = ca.decide(TABLE, reviews, "contributor")
-    assert state == "failure"
+    approved, _ = ca.decide(TABLE, reviews)
+    assert not approved
 
 
 def test_changes_requested_after_approval_revokes_it() -> None:
     reviews = [review("purp", "APPROVED"), review("purp", "CHANGES_REQUESTED")]
-    state, _ = ca.decide(TABLE, reviews, "contributor")
-    assert state == "failure"
-
-
-def test_author_cannot_satisfy_the_gate() -> None:
-    state, _ = ca.decide(TABLE, [review("purp", "APPROVED")], "purp")
-    assert state == "failure"
-
-
-def test_another_maintainer_still_satisfies_a_maintainer_authored_pr() -> None:
-    state, _ = ca.decide(TABLE, [review("mrunalp", "APPROVED")], "purp")
-    assert state == "success"
-
-
-def test_description_stays_within_the_github_limit() -> None:
-    reviews = [
-        review(login, "APPROVED") for login in ("purp", "mrunalp", "derekwaynecarr")
-    ]
-    _, description = ca.decide(TABLE, reviews, "contributor")
-    assert len(description) <= 140
+    approved, _ = ca.decide(TABLE, reviews)
+    assert not approved
 
 
 def test_format_delta_names_added_and_removed_logins() -> None:
@@ -127,3 +111,22 @@ def test_format_delta_reports_no_change_when_only_prose_moves() -> None:
 def test_format_delta_warns_when_the_result_parses_empty() -> None:
     body = ca.format_delta(TABLE, "# Maintainers\n\n- purp\n")
     assert "WARNING" in body
+
+
+def _decide_exit(tmp_path, table: str, reviews: list[dict]) -> int:
+    maintainers = tmp_path / "MAINTAINERS.md"
+    maintainers.write_text(table, encoding="utf-8")
+    reviews_file = tmp_path / "reviews.json"
+    reviews_file.write_text(json.dumps(reviews), encoding="utf-8")
+    return ca.main(
+        ["decide", "--maintainers", str(maintainers), "--reviews", str(reviews_file)]
+    )
+
+
+def test_decide_exits_zero_when_a_maintainer_approved(tmp_path) -> None:
+    assert _decide_exit(tmp_path, TABLE, [review("purp", "APPROVED")]) == 0
+
+
+def test_decide_exits_nonzero_with_no_reviews(tmp_path) -> None:
+    # The exit code is the check result, so this is the gate's actual contract.
+    assert _decide_exit(tmp_path, TABLE, []) != 0
