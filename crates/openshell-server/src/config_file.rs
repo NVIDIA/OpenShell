@@ -214,10 +214,38 @@ pub struct OtlpConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupervisorFileSection {
+    /// Wall-clock limit for accumulating and processing a response through
+    /// whole-body middleware. Accepts a positive integer followed by `ms`,
+    /// `s`, or `m`.
+    #[serde(default)]
+    pub http_response_whole_body_timeout: Option<String>,
+
     /// Statically registered supervisor middleware services. Registration is
     /// operator-owned and changes require a gateway restart.
     #[serde(default)]
     pub middleware: Vec<MiddlewareServiceFileConfig>,
+}
+
+impl SupervisorFileSection {
+    /// Resolve the configured whole-body timeout to milliseconds.
+    #[must_use]
+    pub fn http_response_whole_body_timeout_ms(&self) -> u64 {
+        self.http_response_whole_body_timeout
+            .as_deref()
+            .and_then(parse_positive_duration_ms)
+            .unwrap_or(openshell_core::DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT_MS)
+    }
+}
+
+fn parse_positive_duration_ms(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let (number, multiplier) = value
+        .strip_suffix("ms")
+        .map(|number| (number, 1))
+        .or_else(|| value.strip_suffix('s').map(|number| (number, 1_000)))
+        .or_else(|| value.strip_suffix('m').map(|number| (number, 60_000)))?;
+    let number = number.parse::<u64>().ok()?;
+    (number > 0).then_some(number.checked_mul(multiplier)?)
 }
 
 /// One `[[openshell.supervisor.middleware]]` supervisor middleware registration.
@@ -415,6 +443,18 @@ pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
             message: "omit the field to use default encrypted gateway credential storage, or specify exactly one external credential driver",
         });
     }
+    if file
+        .openshell
+        .supervisor
+        .http_response_whole_body_timeout
+        .as_deref()
+        .is_some_and(|value| parse_positive_duration_ms(value).is_none())
+    {
+        return Err(ConfigFileError::InvalidValue {
+            field: "openshell.supervisor.http_response_whole_body_timeout",
+            message: "expected a positive integer duration ending in ms, s, or m",
+        });
+    }
 
     Ok(file)
 }
@@ -602,6 +642,39 @@ service_name = "openshell-gateway-dev"
             "http://otel-collector.observability.svc:4317"
         );
         assert_eq!(otlp.service_name.as_deref(), Some("openshell-gateway-dev"));
+    }
+
+    #[test]
+    fn parses_http_response_whole_body_timeout() {
+        let tmp = write_tmp(
+            r#"
+[openshell.supervisor]
+http_response_whole_body_timeout = "2m"
+"#,
+        );
+        let file = load(tmp.path()).expect("valid supervisor timeout parses");
+        assert_eq!(
+            file.openshell
+                .supervisor
+                .http_response_whole_body_timeout_ms(),
+            120_000
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_http_response_whole_body_timeout() {
+        for value in ["0s", "120", "later", "18446744073709551615m"] {
+            let tmp = write_tmp(&format!(
+                "[openshell.supervisor]\nhttp_response_whole_body_timeout = \"{value}\"\n"
+            ));
+            let error = load(tmp.path()).expect_err("invalid timeout must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("http_response_whole_body_timeout"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

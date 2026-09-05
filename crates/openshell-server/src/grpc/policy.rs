@@ -2524,6 +2524,7 @@ pub(super) async fn handle_get_sandbox_config(
             .as_str()
             .to_string(),
         extension_authentication_enabled: state.sandbox_jwt_issuer.is_some(),
+        http_response_whole_body_timeout_ms: state.http_response_whole_body_timeout_ms,
     }))
 }
 

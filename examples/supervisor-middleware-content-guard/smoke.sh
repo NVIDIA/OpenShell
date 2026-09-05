@@ -24,6 +24,8 @@ Options:
 Environment:
   CONTENT_GUARD_SMOKE_HOST  Non-loopback host address reachable from both the
                             gateway and sandbox containers.
+  CONTENT_GUARD_SMOKE_DRIVER
+                            Optional compute driver name, such as docker or podman.
 EOF
 }
 
@@ -103,6 +105,7 @@ detect_service_host() {
 }
 
 SERVICE_HOST="$(detect_service_host)"
+COMPUTE_DRIVER="${CONTENT_GUARD_SMOKE_DRIVER:-}"
 if [[ "$SERVICE_HOST" == "localhost" || "$SERVICE_HOST" == "::1" || "$SERVICE_HOST" == 127.* || "$SERVICE_HOST" == *:* ]]; then
   echo "CONTENT_GUARD_SMOKE_HOST must be a non-loopback IPv4 address: $SERVICE_HOST" >&2
   exit 1
@@ -115,6 +118,8 @@ GATEWAY_CONFIG="$TMPDIR/gateway.toml"
 SETUP_LOG="$LOG_DIR/setup.log"
 GATEWAY_LOG="$LOG_DIR/gateway.log"
 MIDDLEWARE_LOG="$LOG_DIR/middleware.log"
+UPSTREAM_LOG="$LOG_DIR/upstream.log"
+SANDBOX_LOG="$LOG_DIR/sandbox.log"
 RUN_ID="content-guard-smoke-$$-$RANDOM"
 # Sandbox names are capped at 19 characters. Use a short prefix with
 # the PID for uniqueness; keep the full RUN_ID for gateway identity.
@@ -139,6 +144,11 @@ cleanup() {
   if [[ -n "${MIDDLEWARE_PID:-}" ]]; then
     kill "$MIDDLEWARE_PID" 2>/dev/null || true
     wait "$MIDDLEWARE_PID" 2>/dev/null || true
+  fi
+
+  if [[ -n "${UPSTREAM_PID:-}" ]]; then
+    kill "$UPSTREAM_PID" 2>/dev/null || true
+    wait "$UPSTREAM_PID" 2>/dev/null || true
   fi
 
   if [[ "$status" -eq 0 ]]; then
@@ -214,8 +224,12 @@ ttl_secs = 0
 [[openshell.supervisor.middleware]]
 name = "content-guard-example"
 grpc_endpoint = "http://$SERVICE_HOST:$MIDDLEWARE_PORT"
+allow_insecure_transport = true
 max_payload_bytes = 262144
 timeout = "500ms"
+
+[openshell.drivers.docker]
+supervisor_bin = "$ROOT/target/debug/openshell-sandbox"
 EOF
 }
 
@@ -239,11 +253,13 @@ generate_gateway_jwt_bundle() {
 
 dump_logs() {
   local label path
-  for label in setup gateway middleware; do
+  for label in setup gateway middleware upstream sandbox; do
     case "$label" in
       setup) path="$SETUP_LOG" ;;
       gateway) path="$GATEWAY_LOG" ;;
       middleware) path="$MIDDLEWARE_LOG" ;;
+      upstream) path="$UPSTREAM_LOG" ;;
+      sandbox) path="$SANDBOX_LOG" ;;
     esac
     printf '\n--- %s log: %s ---\n' "$label" "$path" >&2
     if [[ -f "$path" ]]; then
@@ -254,8 +270,23 @@ dump_logs() {
   done
 }
 
+capture_sandbox_log() {
+  local container_id
+
+  if [[ "$SANDBOX_CREATED" -ne 1 || "$COMPUTE_DRIVER" != "docker" ]] ||
+    ! command -v docker >/dev/null 2>&1; then
+    return
+  fi
+
+  container_id="$(docker ps -aq --filter "name=$SANDBOX_NAME" | head -n 1)"
+  if [[ -n "$container_id" ]]; then
+    docker logs "$container_id" >"$SANDBOX_LOG" 2>&1 || true
+  fi
+}
+
 fail() {
   printf 'FAIL %s\n' "$1" >&2
+  capture_sandbox_log
   dump_logs
   exit 1
 }
@@ -316,15 +347,40 @@ wait_for_middleware() {
   fail "content guard service is reachable at $SERVICE_HOST:$MIDDLEWARE_PORT"
 }
 
+start_upstream() {
+  printf 'INFO starting response framing upstream at %s:18081\n' "$SERVICE_HOST"
+  python3 "$EXAMPLE_DIR/upstream.py" >"$UPSTREAM_LOG" 2>&1 &
+  UPSTREAM_PID=$!
+}
+
+wait_for_upstream() {
+  for _ in {1..30}; do
+    if ! kill -0 "$UPSTREAM_PID" 2>/dev/null; then
+      fail "response framing upstream starts"
+    fi
+    if curl -fsS --max-time 1 "http://127.0.0.1:18081/headers-only" >/dev/null 2>&1; then
+      printf 'INFO response framing upstream is ready\n'
+      return
+    fi
+    sleep 1
+  done
+  fail "response framing upstream is reachable"
+}
+
 start_gateway() {
+  local -a driver_args=()
+  if [[ -n "$COMPUTE_DRIVER" ]]; then
+    driver_args=(--drivers "$COMPUTE_DRIVER")
+  fi
   printf 'INFO starting gateway\n'
   env -u OPENSHELL_DRIVERS "$GATEWAY_BIN" \
+    "${driver_args[@]}" \
     --config "$GATEWAY_CONFIG" \
     --bind-address 127.0.0.1 \
     --port "$GATEWAY_PORT" \
     --health-port "$HEALTH_PORT" \
     --metrics-port 0 \
-    --log-level info \
+    --log-level "${CONTENT_GUARD_SMOKE_LOG_LEVEL:-info}" \
     --disable-tls \
     --db-url "sqlite://$TMPDIR/gateway.db" >"$GATEWAY_LOG" 2>&1 &
   GATEWAY_PID=$!
@@ -354,10 +410,10 @@ create_sandbox() {
     "$CLI_BIN"
     --gateway-endpoint "$GATEWAY_ENDPOINT"
   )
+  SANDBOX_CREATED=1
   run_setup_step \
     "creating content guard sandbox" \
-    "${CLI[@]}" sandbox create --name "$SANDBOX_NAME" --policy "$EXAMPLE_DIR/policy.yaml" --keep --no-tty -- /bin/sh -lc true
-  SANDBOX_CREATED=1
+    "${CLI[@]}" sandbox create --name "$SANDBOX_NAME" --policy "$EXAMPLE_DIR/policy.yaml" --no-tty --detach -- sleep infinity
 }
 
 request() {
@@ -368,14 +424,48 @@ request() {
     --data '{"note":"prototype-secret"}'
 }
 
+response_request() {
+  local path="$1"
+  "${CLI[@]}" sandbox exec --name "$SANDBOX_NAME" --no-tty -- \
+    curl -sS -i --raw --max-time 20 "http://host.openshell.internal:18081/$path"
+}
+
 run_suite() {
   local guarded_output="$LOG_DIR/guarded.out"
   local unguarded_output="$LOG_DIR/unguarded.out"
+  local response_output="$LOG_DIR/response.out"
 
   printf 'INFO sending guarded request to httpbin.org\n'
   if ! request httpbin.org >"$guarded_output" 2>>"$SETUP_LOG"; then
     fail "guarded request completes"
   fi
+
+  printf 'INFO exercising HTTP response middleware modes\n'
+  if ! response_request headers-only >"$response_output" 2>>"$SETUP_LOG" ||
+    ! grep -Fiq 'x-example-response-mode: headers-only' "$response_output" ||
+    ! grep -Fq 'headers-only' "$response_output"; then
+    fail "headers-only response middleware"
+  fi
+  if ! response_request whole-body >"$response_output" 2>>"$SETUP_LOG" ||
+    ! grep -Fq '[whole] whole body' "$response_output"; then
+    fail "whole-body response middleware"
+  fi
+  if ! response_request stream >"$response_output" 2>>"$SETUP_LOG" ||
+    ! grep -Fq 'STREAM BODY' "$response_output" ||
+    ! grep -Fiq 'x-example-body-bytes: 11' "$response_output"; then
+    fail "stream response middleware with trailer mutation"
+  fi
+  if ! response_request stream-close >"$response_output" 2>>"$SETUP_LOG" ||
+    ! grep -Fq 'DATA: STREAM CLOSE' "$response_output"; then
+    fail "close-delimited SSE response middleware"
+  fi
+  if ! response_request block >"$response_output" 2>>"$SETUP_LOG" ||
+    ! grep -Fq 'HTTP/1.1 403 Forbidden' "$response_output" ||
+    ! grep -Fq 'middleware_denied' "$response_output" ||
+    ! grep -Fq 'content_match' "$response_output"; then
+    fail "response middleware block"
+  fi
+  printf 'PASS HTTP response middleware modes\n'
   if grep -Fq '[FILTERED]' "$guarded_output" && ! grep -Fq 'prototype-secret' "$guarded_output"; then
     printf 'PASS guarded request is filtered\n'
   else
@@ -439,15 +529,19 @@ require_command cargo
 require_command curl
 require_command jq
 require_command openssl
+require_command python3
 ROOT_TARGET_DIR="$(cargo_target_dir "$ROOT/Cargo.toml")"
 EXAMPLE_TARGET_DIR="$(cargo_target_dir "$EXAMPLE_DIR/Cargo.toml")"
 GATEWAY_BIN="$ROOT_TARGET_DIR/debug/openshell-gateway"
 CLI_BIN="$ROOT_TARGET_DIR/debug/openshell"
 MIDDLEWARE_BIN="$EXAMPLE_TARGET_DIR/debug/supervisor-middleware-content-guard"
 run_setup_step "building gateway" cargo build --quiet -p openshell-gateway --bin openshell-gateway
+run_setup_step "building sandbox supervisor" cargo build --quiet -p openshell-sandbox --bin openshell-sandbox
 run_setup_step "building content guard" cargo build --quiet --manifest-path "$EXAMPLE_DIR/Cargo.toml"
 run_setup_step "building CLI" cargo build --quiet -p openshell-cli --bin openshell
 generate_gateway_jwt_bundle
+start_upstream
+wait_for_upstream
 start_middleware
 wait_for_middleware
 start_gateway

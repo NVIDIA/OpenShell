@@ -8,18 +8,18 @@ SPDX-License-Identifier: Apache-2.0
 > [!WARNING]
 > Supervisor middleware is a research preview. Its policy and service contracts may change without compatibility guarantees. Use it only to prototype and evaluate middleware integrations.
 
-This example implements an operator-run supervisor middleware service. It scans UTF-8 HTTP request bodies and complete client-to-upstream WebSocket text messages for configured literal strings, then either replaces every match or denies the request or message. Findings report only aggregate counts and never include configured terms or inspected content.
+This example implements request, response, and client WebSocket bindings in one operator-run supervisor middleware service. The response binding demonstrates header-only inspection, whole-body and streaming transforms, trailer mutation, and block delivery.
 
 > [!WARNING]
 > This intentionally simple implementation demonstrates the supervisor middleware service contract. It is not a complete or reliable content guard and must not be used as a security control. It handles only UTF-8 HTTP request bodies and WebSocket text messages with case-sensitive literal terms, merges overlapping literal match ranges before redaction, and does not address encodings, transformations, normalization, binary WebSocket messages, upstream-to-client messages, or adversarial inputs that a production content guard must handle.
 
 ## Prerequisites
 
-Install `cargo`, `curl`, `jq`, and `openssl` on the host before running the smoke script.
+Install `cargo`, `curl`, `jq`, `openssl`, and Python 3 on the host before running the smoke script.
 
 ## Run the smoke example
 
-Run the end-to-end smoke suite to build and start a local gateway, start the content-guard service, create a sandbox, and send the same request body to two destinations:
+Run the end-to-end smoke suite to build a local gateway and sandbox supervisor, start the content-guard service, create a sandbox, and send the same request body to two destinations:
 
 ```shell
 ./examples/supervisor-middleware-content-guard/smoke.sh --test-suite
@@ -39,6 +39,8 @@ The script creates the sandbox and prints the guarded and unguarded request comm
 CONTENT_GUARD_SMOKE_HOST=192.168.1.10 ./examples/supervisor-middleware-content-guard/smoke.sh --test-suite
 ```
 
+The gateway auto-detects its compute driver. Set `CONTENT_GUARD_SMOKE_DRIVER=docker` or `CONTENT_GUARD_SMOKE_DRIVER=podman` if more than one local runtime is installed and auto-detection selects the wrong one.
+
 ## Run manually
 
 Start the service before starting the gateway. Bind to all host interfaces so a local containerized gateway and sandbox supervisor can reach it:
@@ -54,6 +56,7 @@ Add the service registration to your local gateway TOML:
 [[openshell.supervisor.middleware]]
 name = "content-guard-example"
 grpc_endpoint = "http://host.openshell.internal:50051"
+allow_insecure_transport = true
 max_payload_bytes = 262144
 timeout = "500ms"
 ```
@@ -84,6 +87,34 @@ curl -sS https://httpbin.org/anything \
 
 The echoed JSON body contains `[FILTERED]` instead of the configured term.
 
+## HTTP response behavior
+
+Start the included raw HTTP upstream in another terminal:
+
+```shell
+python3 examples/supervisor-middleware-content-guard/upstream.py
+```
+
+From the sandbox, exercise the response protocol:
+
+```shell
+curl -i http://host.openshell.internal:18081/headers-only
+curl -i http://host.openshell.internal:18081/whole-body
+curl -i --raw http://host.openshell.internal:18081/stream
+curl -i --raw http://host.openshell.internal:18081/stream-close
+curl -i http://host.openshell.internal:18081/block
+```
+
+| Path | Mode | Result |
+| --- | --- | --- |
+| `/headers-only` | `HEADERS_ONLY` | Adds `x-example-response-mode` without changing content-length framing. |
+| `/whole-body` | `WHOLE_BODY_BYTES` | Prefixes the normalized body with `[whole]`. |
+| `/stream` | `STREAM_BYTES` | Uppercases normalized units and changes the existing `x-example-body-bytes` trailer to `11`. |
+| `/stream-close` | `STREAM_BYTES` | Uppercases a close-delimited `text/event-stream` response. |
+| `/block` | `WHOLE_BODY_BYTES` | Returns OpenShell's canonical 403 response with reason code `content_match`. |
+
+The upstream deliberately uses content-length, chunked, and close-delimited responses. OpenShell normalizes transport framing only for body-processing modes and validates trailer changes against the names supplied by the upstream.
+
 ## WebSocket behavior
 
 For a selected WebSocket upgrade, the service accepts preflight, waits for the session-start notification, and evaluates each complete client-to-upstream text message. Redact mode returns a replacement message, while deny mode returns `content_match` and OpenShell closes the session according to middleware policy. Session-start and session-end events are notifications and do not produce results.
@@ -107,4 +138,4 @@ config:
     - prototype-secret
 ```
 
-The implementation supports `HTTP_REQUEST/PRE_CREDENTIALS` and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`, advertises a 256 KiB limit for each operation, and inherits the service-wide RPC timeout. The gateway registration's `max_payload_bytes` may set a smaller shared limit. A binding can advertise a shorter timeout, but it cannot extend the operator-configured timeout.
+The implementation supports `HTTP_REQUEST/PRE_CREDENTIALS`, `HTTP_RESPONSE/PRE_RETURN`, and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`. It advertises a 256 KiB limit for each operation and inherits the service-wide RPC timeout. The gateway registration's `max_payload_bytes` may set a smaller shared limit. A binding can advertise a shorter timeout, but it cannot extend the operator-configured timeout.

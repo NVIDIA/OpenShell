@@ -8,6 +8,24 @@
 //! owned by the orchestrator; this crate produces denials but does not
 //! aggregate them.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+static HTTP_RESPONSE_WHOLE_BODY_TIMEOUT_MS: AtomicU64 =
+    AtomicU64::new(openshell_core::DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT_MS);
+
+/// Configure the supervisor-wide wall-clock bound for whole-response buffering.
+pub fn set_http_response_whole_body_timeout(timeout: Duration) {
+    let milliseconds = u64::try_from(timeout.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    HTTP_RESPONSE_WHOLE_BODY_TIMEOUT_MS.store(milliseconds, Ordering::Relaxed);
+}
+
+pub(crate) fn http_response_whole_body_timeout() -> Duration {
+    Duration::from_millis(HTTP_RESPONSE_WHOLE_BODY_TIMEOUT_MS.load(Ordering::Relaxed))
+}
+
 pub mod identity;
 pub mod inference_routes;
 pub mod l7;
