@@ -487,8 +487,26 @@ impl SandboxConfirmEvidence {
 
 /// Ready boundary paired with the evidence measured by `confirm`.
 pub struct ConfirmedBoundary {
-    pub boundary: Box<dyn ReadyBoundary>,
-    pub evidence: SandboxConfirmEvidence,
+    boundary: Box<dyn ReadyBoundary>,
+    evidence: SandboxConfirmEvidence,
+}
+
+impl ConfirmedBoundary {
+    /// Construct a confirmed state after backend-specific evidence validation.
+    #[allow(dead_code)] // Implemented by the remote backend in the next stack layer.
+    pub(crate) fn new(boundary: Box<dyn ReadyBoundary>, evidence: SandboxConfirmEvidence) -> Self {
+        Self { boundary, evidence }
+    }
+
+    /// Return the measured evidence carried by this confirmed state.
+    pub fn evidence(&self) -> &SandboxConfirmEvidence {
+        &self.evidence
+    }
+
+    /// Consume confirmation and advance to the sole launch-capable state.
+    pub fn into_boundary(self) -> Box<dyn ReadyBoundary> {
+        self.boundary
+    }
 }
 
 /// Ready: standing enforcement is confirmed, and the backend is prepared to
