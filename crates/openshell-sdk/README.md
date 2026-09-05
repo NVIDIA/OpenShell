@@ -93,6 +93,17 @@ let _sandbox = client
 # }
 ```
 
+Enable the `extension` Cargo feature when building an OpenShell extension
+service:
+
+```toml
+openshell-sdk = { version = "...", features = ["extension"] }
+```
+
+The `extension` module provides common SDK building blocks for extension
+services. It currently handles caller verification; shared service interfaces
+and observability support will follow.
+
 ## Modules
 
 | Module | Purpose |
@@ -104,6 +115,7 @@ let _sandbox = client
 | `oidc` | OIDC token handling at the transport layer. |
 | `refresh` | `Refresh` trait and single-flight refresh coalescing. |
 | `edge_tunnel` | Cloudflare Access tunnel dialer. |
+| `extension` | Opt-in SDK building blocks for extension services. |
 | `error` | `SdkError` taxonomy. |
 | `types` | Curated request/response types and proto conversions. |
 | `raw` | Escape hatch re-exporting the generated tonic clients. |

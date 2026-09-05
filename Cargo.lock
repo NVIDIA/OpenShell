@@ -4304,6 +4304,7 @@ dependencies = [
  "futures",
  "hyper",
  "hyper-util",
+ "jsonwebtoken",
  "miette",
  "oauth2",
  "openshell-core",

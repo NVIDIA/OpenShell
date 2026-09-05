@@ -110,6 +110,12 @@ run = [
   "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test websocket_conformance",
 ]
 
+["e2e:supervisor-middleware"]
+description = "Run the authenticated supervisor middleware happy-path E2E test against a Docker-backed gateway"
+run = [
+  "OPENSHELL_E2E_MIDDLEWARE_FIXTURE=1 e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-supervisor-middleware --test supervisor_middleware -- --nocapture",
+]
+
 ["e2e:mcp"]
 description = "Run MCP conformance e2e scenarios against one Docker-backed gateway (static defaults for spec 2025-11-25; set OPENSHELL_MCP_CONFORMANCE_SCENARIOS for a focused subset)"
 run = "bash e2e/mcp-conformance.sh"
