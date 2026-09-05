@@ -164,6 +164,89 @@ where
     Ok(())
 }
 
+async fn enforce_mcp_protocol_version<W>(
+    config: &L7EndpointConfig,
+    request: &crate::l7::provider::L7Request,
+    info: &crate::l7::jsonrpc::JsonRpcRequestInfo,
+    client: &mut W,
+    ctx: &L7EvalContext,
+    redacted_target: &str,
+) -> Result<bool>
+where
+    W: AsyncWrite + Unpin,
+{
+    if config.protocol != L7Protocol::Mcp {
+        return Ok(true);
+    }
+
+    match crate::l7::mcp::select_request_protocol_version(request, info, &config.mcp_versions) {
+        Ok(crate::l7::mcp::McpRequestProtocolVersion::Initialization) => Ok(true),
+        Ok(crate::l7::mcp::McpRequestProtocolVersion::Selected(version)) => {
+            debug!(mcp_protocol_version = %version, "Selected MCP request protocol version");
+            Ok(true)
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            let summary = l7_protocol_log_summary(None, Some(info));
+            ocsf_emit!(build_l7_request_event(
+                ctx,
+                &request.action,
+                redacted_target,
+                "deny",
+                "l7-mcp",
+                &reason,
+                summary.as_deref(),
+            ));
+            let deny_group = match error {
+                crate::l7::mcp::McpProtocolVersionError::NotAllowed(_) => "l7_policy",
+                crate::l7::mcp::McpProtocolVersionError::InvalidHeader
+                | crate::l7::mcp::McpProtocolVersionError::UnsupportedHeaderValue => {
+                    "l7_parse_rejection"
+                }
+            };
+            emit_activity(ctx, true, deny_group);
+
+            let body = serde_json::json!({
+                "error": error.response_code(),
+                "detail": reason,
+                "policy": ctx.policy_name,
+                "layer": "l7",
+                "protocol": "mcp",
+                "method": request.action,
+                "path": redacted_target,
+            });
+            crate::l7::rest::send_json_response(
+                &ctx.policy_name,
+                body,
+                client,
+                error.http_status(),
+            )
+            .await?;
+            Ok(false)
+        }
+    }
+}
+
+async fn enforce_final_mcp_protocol_version<W>(
+    config: &L7EndpointConfig,
+    request: &crate::l7::provider::L7Request,
+    client: &mut W,
+    ctx: &L7EvalContext,
+    redacted_target: &str,
+) -> Result<bool>
+where
+    W: AsyncWrite + Unpin,
+{
+    if config.protocol != L7Protocol::Mcp {
+        return Ok(true);
+    }
+    let info = crate::l7::jsonrpc::inspect_buffered_jsonrpc_http_request(
+        request,
+        crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config),
+    )?;
+    enforce_mcp_protocol_version(config, request, &info, client, ctx, redacted_target).await
+}
+
 fn build_request_authority_mismatch_event(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
     HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Fail)
@@ -688,6 +771,12 @@ where
             graphql: graphql_info.clone(),
             jsonrpc: jsonrpc_info.clone(),
         };
+        if let Some(info) = jsonrpc_info.as_ref()
+            && !enforce_mcp_protocol_version(config, &req, info, client, ctx, &redacted_target)
+                .await?
+        {
+            return Ok(());
+        }
         let websocket_request = crate::l7::rest::request_is_websocket_upgrade(&req.raw_header);
         if config.protocol == L7Protocol::Websocket && !websocket_request {
             crate::l7::rest::RestProvider::default()
@@ -790,6 +879,11 @@ where
                     return Ok(());
                 }
             };
+            if !enforce_final_mcp_protocol_version(config, &req, client, ctx, &redacted_target)
+                .await?
+            {
+                return Ok(());
+            }
             let scoped_ctx = scoped_context_for_request(ctx, &req);
             let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
             let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
@@ -1759,9 +1853,6 @@ where
             return Ok(());
         }
 
-        // Future MCP version-profile request checks should hook here before OPA
-        // evaluation. See McpOptions in proto/sandbox.proto for the policy
-        // roadmap and source documentation.
         let parsed = match crate::l7::jsonrpc::parse_jsonrpc_http_request(
             client,
             config.json_rpc_max_body_bytes,
@@ -1817,6 +1908,11 @@ where
             graphql: None,
             jsonrpc: Some(jsonrpc_info.clone()),
         };
+        if !enforce_mcp_protocol_version(config, &req, &jsonrpc_info, client, ctx, &redacted_target)
+            .await?
+        {
+            return Ok(());
+        }
 
         let hard_deny_reason = l7_request_hard_deny_reason(config.protocol, &request_info);
         let force_deny = hard_deny_reason.is_some();
@@ -1928,6 +2024,11 @@ where
                     return Ok(());
                 }
             };
+            if !enforce_final_mcp_protocol_version(config, &req, client, ctx, &redacted_target)
+                .await?
+            {
+                return Ok(());
+            }
             let scoped_ctx = scoped_context_for_request(ctx, &req);
             let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
             // Future MCP response/SSE introspection or rewrite would hook here
@@ -8575,6 +8676,213 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn mcp_relay_forwards_standalone_initialize_without_version_header() {
+        let (config, tunnel_engine, ctx) = mcp_test_relay_context();
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+        app.write_all(body).await.unwrap();
+
+        let mut upstream_bytes = vec![0; 2048];
+        let count = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut upstream_bytes),
+        )
+        .await
+        .expect("standalone initialize should reach upstream")
+        .unwrap();
+        let upstream_request = String::from_utf8_lossy(&upstream_bytes[..count]);
+        assert!(upstream_request.contains(r#""method":"initialize""#));
+
+        upstream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
+            )
+            .await
+            .unwrap();
+        let mut response = [0; 512];
+        let count =
+            tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+                .await
+                .expect("initialize response should reach client")
+                .unwrap();
+        assert!(String::from_utf8_lossy(&response[..count]).contains("200 OK"));
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should complete")
+            .unwrap()
+            .unwrap();
+    }
+
+    async fn run_rejected_mcp_version_request(
+        route_selected: bool,
+        version_headers: &str,
+    ) -> (String, Vec<u8>) {
+        let (config, tunnel_engine, ctx) = mcp_test_relay_context();
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            if route_selected {
+                relay_with_route_selection(
+                    &[config],
+                    tunnel_engine,
+                    &mut relay_client,
+                    &mut relay_upstream,
+                    &ctx,
+                )
+                .await
+            } else {
+                relay_with_inspection(
+                    &config,
+                    tunnel_engine,
+                    &mut relay_client,
+                    &mut relay_upstream,
+                    &ctx,
+                )
+                .await
+            }
+        });
+
+        let body = br#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#;
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\n{version_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+        app.write_all(body).await.unwrap();
+
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read_to_end(&mut response),
+        )
+        .await
+        .expect("MCP version rejection should close the client response")
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should complete after version rejection")
+            .unwrap()
+            .unwrap();
+
+        let mut forwarded = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read_to_end(&mut forwarded),
+        )
+        .await
+        .expect("version rejection should close upstream without forwarding")
+        .unwrap();
+        (
+            String::from_utf8(response).expect("UTF-8 response"),
+            forwarded,
+        )
+    }
+
+    #[tokio::test]
+    async fn mcp_relay_rejects_invalid_disallowed_and_missing_versions_without_forwarding() {
+        for (headers, status, code) in [
+            (
+                "MCP-Protocol-Version: 2026-07-28\r\n",
+                "400 Bad Request",
+                "unsupported_mcp_protocol_version",
+            ),
+            (
+                "MCP-Protocol-Version: 2025-11-25\r\nMCP-Protocol-Version: 2025-11-25\r\n",
+                "400 Bad Request",
+                "invalid_mcp_protocol_version_header",
+            ),
+            (
+                "MCP-Protocol-Version: 2025-06-18\r\n",
+                "403 Forbidden",
+                "mcp_protocol_version_not_allowed",
+            ),
+            ("", "403 Forbidden", "mcp_protocol_version_not_allowed"),
+        ] {
+            let (response, forwarded) = run_rejected_mcp_version_request(false, headers).await;
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}")),
+                "{response}"
+            );
+            assert!(response.contains(code), "{response}");
+            assert!(forwarded.is_empty(), "rejected request reached upstream");
+        }
+    }
+
+    #[tokio::test]
+    async fn route_selected_mcp_relay_enforces_request_version_before_forwarding() {
+        let (response, forwarded) =
+            run_rejected_mcp_version_request(true, "MCP-Protocol-Version: 2026-07-28\r\n").await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{response}"
+        );
+        assert!(
+            response.contains("unsupported_mcp_protocol_version"),
+            "{response}"
+        );
+        assert!(forwarded.is_empty(), "rejected request reached upstream");
+    }
+
+    #[tokio::test]
+    async fn final_mcp_version_check_reclassifies_a_rewritten_initialize_body() {
+        let (config, _, ctx) = mcp_test_relay_context();
+        let final_body = br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        let mut raw_header = format!(
+            "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            final_body.len()
+        )
+        .into_bytes();
+        raw_header.extend_from_slice(final_body);
+        let request = crate::l7::provider::L7Request {
+            action: "POST".to_string(),
+            target: "/mcp".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header,
+            body_length: crate::l7::provider::BodyLength::ContentLength(final_body.len() as u64),
+        };
+        let (mut client, mut relay_client) = tokio::io::duplex(2048);
+
+        let allowed =
+            enforce_final_mcp_protocol_version(&config, &request, &mut relay_client, &ctx, "/mcp")
+                .await
+                .expect("final request inspection");
+        assert!(
+            !allowed,
+            "rewritten non-initialize request must require a version"
+        );
+        drop(relay_client);
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).expect("UTF-8 response");
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
+        assert!(
+            response.contains("mcp_protocol_version_not_allowed"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
     async fn mcp_relay_forwards_jsonrpc_response_frame() {
         let (config, tunnel_engine, ctx) = mcp_test_relay_context();
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -8592,7 +8900,7 @@ network_policies:
 
         let body = br#"{"jsonrpc":"2.0","id":7,"result":{"action":"accept","content":{}}}"#;
         let request = format!(
-            "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2025-11-25\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
         app.write_all(request.as_bytes()).await.unwrap();
