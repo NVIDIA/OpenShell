@@ -510,6 +510,13 @@ openshell forward start 8000 my-sandbox -d    # run in background
 
 OpenShell prints the local URL only after the forward listener is reachable. Background forwards must be tracked locally so `openshell forward list` and `openshell forward stop` can manage them.
 
+To bind the local side to an IPv6 loopback address, pass it positionally as `[bind_address:]port`. IPv6 addresses are bracketed in both the SSH forward argument and the printed access URL:
+
+```shell
+openshell forward start ::1:8000 my-sandbox
+# Local URL: http://[::1]:8000/
+```
+
 List and stop active forwards:
 
 ```shell
