@@ -698,15 +698,6 @@ pub(crate) async fn run_server(
     )
     .await?;
 
-    if let Err(err) = state.compute.start_persisted_sandboxes().await {
-        warn!(error = %err, "Failed to start persisted sandboxes during startup");
-    }
-
-    state.compute.spawn_watchers(shutdown_rx.clone());
-    ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
-    supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
-    provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_secs(60));
-
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
 
@@ -790,6 +781,19 @@ pub(crate) async fn run_server(
             shutdown_rx.clone(),
         )));
     }
+
+    // Restored supervisors need the callback listeners while the compute
+    // driver reconciles persisted sandboxes. Serve them before starting that
+    // reconciliation so policy fetch and supervisor-session registration
+    // cannot deadlock gateway startup.
+    if let Err(err) = state.compute.start_persisted_sandboxes().await {
+        warn!(error = %err, "Failed to start persisted sandboxes during startup");
+    }
+
+    state.compute.spawn_watchers(shutdown_rx.clone());
+    ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
+    supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
+    provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_secs(60));
 
     shutdown_signal().await;
     info!("Shutdown signal received; stopping gateway");
