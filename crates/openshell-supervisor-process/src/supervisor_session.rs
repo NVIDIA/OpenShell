@@ -452,7 +452,9 @@ async fn run_single_session(
                 }
             }, if telemetry_confirmed => {
                 if let Some(msg) = telemetry_msg {
-                    let _ = tx.try_send(msg);
+                    if tx.try_send(msg).is_err() {
+                        debug!("telemetry: session channel full or closed, dropping message");
+                    }
                 }
             }
         }

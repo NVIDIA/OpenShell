@@ -1062,24 +1062,54 @@ fn handle_telemetry_data(
         let trace_data = telemetry.trace_data;
         let sandbox_id = sandbox_id.to_string();
         tokio::spawn(async move {
-            if let Err(e) = exporter.export_raw(trace_data).await {
-                debug!(
-                    sandbox_id = %sandbox_id,
-                    error = %e,
-                    "telemetry relay: failed to export trace data"
-                );
+            match tokio::time::timeout(
+                Duration::from_secs(10),
+                exporter.export_raw(trace_data),
+            )
+            .await
+            {
+                Ok(Err(e)) => {
+                    debug!(
+                        sandbox_id = %sandbox_id,
+                        error = %e,
+                        "telemetry relay: failed to export trace data"
+                    );
+                }
+                Err(_) => {
+                    debug!(
+                        sandbox_id = %sandbox_id,
+                        "telemetry relay: export timed out"
+                    );
+                }
+                Ok(Ok(())) => {}
             }
         });
     }
 
+    const MAX_OCSF_EVENT_SIZE: usize = 256 * 1024;
     for ocsf_event in &telemetry.ocsf_events {
+        if ocsf_event.len() > MAX_OCSF_EVENT_SIZE {
+            debug!(
+                sandbox_id = %sandbox_id,
+                size = ocsf_event.len(),
+                "telemetry relay: OCSF event too large, skipping"
+            );
+            continue;
+        }
         if let Ok(json_str) = std::str::from_utf8(ocsf_event) {
+            if serde_json::from_str::<serde_json::Value>(json_str).is_err() {
+                debug!(
+                    sandbox_id = %sandbox_id,
+                    "telemetry relay: OCSF event is not valid JSON, skipping"
+                );
+                continue;
+            }
             info!(
                 target: "ocsf_relay",
                 sandbox_id = %sandbox_id,
                 session_id = %session_id,
-                "{}",
-                json_str
+                ocsf_json = %json_str,
+                "relayed OCSF event"
             );
         }
     }

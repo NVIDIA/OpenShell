@@ -5,6 +5,7 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -52,6 +53,8 @@ pub async fn spawn_receiver(
     ))
 }
 
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+
 fn spawn_receiver_inner(
     listener: TcpListener,
     buf_tx: TelemetrySender,
@@ -61,6 +64,7 @@ fn spawn_receiver_inner(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut shutdown_rx = shutdown_rx;
+        let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
         loop {
             tokio::select! {
@@ -70,6 +74,14 @@ fn spawn_receiver_inner(
                             openshell_core::net::set_tcp_nodelay_best_effort(&stream);
                             let buf_tx = buf_tx.clone();
                             let metadata = metadata.clone();
+                            let permit = match conn_semaphore.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    debug!("OTLP receiver: max concurrent connections reached, dropping");
+                                    drop(stream);
+                                    continue;
+                                }
+                            };
                             tokio::spawn(async move {
                                 let svc = service_fn(move |req| {
                                     let buf_tx = buf_tx.clone();
@@ -84,6 +96,7 @@ fn spawn_receiver_inner(
                                 {
                                     debug!(error = %e, "OTLP HTTP connection error");
                                 }
+                                drop(permit);
                             });
                         }
                         Err(e) => {
@@ -122,12 +135,20 @@ async fn handle_request(
             .unwrap());
     };
 
-    let body = match http_body_util::BodyExt::collect(req.into_body()).await {
+    const MAX_BODY_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
+    let limited = http_body_util::Limited::new(req.into_body(), MAX_BODY_SIZE);
+    let body = match http_body_util::BodyExt::collect(limited).await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
-            warn!(error = %e, "failed to read OTLP request body");
+            let status = if e.to_string().contains("length limit exceeded") {
+                warn!("OTLP request body exceeds 4 MiB limit");
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else {
+                warn!(error = %e, "failed to read OTLP request body");
+                StatusCode::BAD_REQUEST
+            };
             return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
+                .status(status)
                 .body(Full::new(Bytes::from(
                     "{\"error\":\"failed to read body\"}",
                 )))

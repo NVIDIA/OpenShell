@@ -24,11 +24,12 @@ pub struct TelemetryRelayExporter {
 
 impl TelemetryRelayExporter {
     /// Connect to the OTLP collector at the given gRPC endpoint.
-    pub async fn connect(endpoint: &str) -> Result<Self, tonic::transport::Error> {
+    pub async fn connect(endpoint: &str) -> Result<Self, ConnectError> {
         let channel = Channel::from_shared(endpoint.to_string())
-            .expect("valid OTLP endpoint URL")
+            .map_err(|e| ConnectError::InvalidUri(e.to_string()))?
             .connect()
-            .await?;
+            .await
+            .map_err(ConnectError::Transport)?;
         Ok(Self {
             client: TraceServiceClient::new(channel),
         })
@@ -55,6 +56,14 @@ pub enum ExportError {
     Decode(prost::DecodeError),
     #[error("gRPC export failed: {0}")]
     Grpc(tonic::Status),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectError {
+    #[error("invalid OTLP endpoint URI: {0}")]
+    InvalidUri(String),
+    #[error("transport error: {0}")]
+    Transport(tonic::transport::Error),
 }
 
 /// Create a relay exporter from the gateway's OTLP config, if configured.

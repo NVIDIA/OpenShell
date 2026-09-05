@@ -74,9 +74,12 @@ impl RateLimitedOcsfSink {
         let new_tokens = (elapsed.as_secs_f64() * f64::from(self.max_tokens)) as u32;
         if new_tokens > 0 {
             *last = now;
-            let current = self.tokens.load(Ordering::Relaxed);
-            let capped = (current + new_tokens).min(self.max_tokens);
-            self.tokens.store(capped, Ordering::Relaxed);
+            let max = self.max_tokens;
+            self.tokens
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_add(new_tokens).min(max))
+                })
+                .ok();
         }
     }
 
@@ -131,6 +134,7 @@ pub struct RelayHandle {
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
     forwarder_handle: tokio::task::JoinHandle<()>,
     receiver_handle: tokio::task::JoinHandle<()>,
+    session_drop_counter: Arc<AtomicU64>,
     pub telemetry_tx: TelemetrySender,
 }
 
@@ -141,10 +145,12 @@ impl RelayHandle {
         let metrics = self.telemetry_tx.metrics().clone();
         let _ = self.shutdown_tx.send(());
         let _ = self.receiver_handle.await;
+        drop(self.telemetry_tx);
         let _ = self.forwarder_handle.await;
         info!(
-            spans_dropped = metrics.drops(),
+            buffer_drops = metrics.drops(),
             queue_depth = metrics.depth(),
+            session_drops = self.session_drop_counter.load(Ordering::Relaxed),
             "telemetry relay shut down"
         );
     }
@@ -191,7 +197,7 @@ impl TelemetryRelay {
             buf_rx,
             self.session_tx,
             self.sandbox_id.clone(),
-            session_drop_counter,
+            session_drop_counter.clone(),
         );
 
         info!(
@@ -204,6 +210,7 @@ impl TelemetryRelay {
             shutdown_tx,
             forwarder_handle,
             receiver_handle,
+            session_drop_counter,
             telemetry_tx: buf_tx,
         }
     }
@@ -230,7 +237,7 @@ impl TelemetryRelay {
             buf_rx,
             self.session_tx,
             self.sandbox_id.clone(),
-            session_drop_counter,
+            session_drop_counter.clone(),
         );
 
         info!(
@@ -244,6 +251,7 @@ impl TelemetryRelay {
             shutdown_tx,
             forwarder_handle,
             receiver_handle,
+            session_drop_counter,
             telemetry_tx: buf_tx,
         })
     }

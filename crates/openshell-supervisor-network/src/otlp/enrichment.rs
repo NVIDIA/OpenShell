@@ -38,10 +38,19 @@ pub fn enrich_spans(
 
     let extra_attrs = build_attributes(attrs, enrichment_enabled);
 
+    let trusted_keys: Vec<&str> = extra_attrs
+        .iter()
+        .filter_map(|a| a.key.as_str().into())
+        .collect();
+
     for resource_spans in &mut request.resource_spans {
         let resource = resource_spans
             .resource
             .get_or_insert_with(Resource::default);
+
+        resource
+            .attributes
+            .retain(|a| !trusted_keys.contains(&a.key.as_str()));
 
         for attr in &extra_attrs {
             resource.attributes.push(attr.clone());
