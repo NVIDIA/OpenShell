@@ -156,6 +156,30 @@ impl VmComputeConfig {
         4096
     }
 
+    /// Validate startup configuration without resolving binaries, creating
+    /// state directories, spawning a process, or connecting a socket.
+    pub fn validate_configuration(&self) -> Result<()> {
+        if self.grpc_endpoint.trim().is_empty() {
+            return Err(Error::config(
+                "grpc_endpoint is required when using the vm compute driver",
+            ));
+        }
+        validate_vm_sandbox_identity(self)?;
+        self.validate_proxy_config()?;
+        if let Some(endpoint) = self.provider_spiffe_workload_api_tcp_endpoint.as_deref() {
+            openshell_core::driver_utils::validate_guest_spiffe_tcp_endpoint(
+                endpoint,
+                self.provider_spiffe_allow_guest_tcp,
+            )
+            .map_err(Error::config)?;
+        } else if self.provider_spiffe_allow_guest_tcp {
+            return Err(Error::config(
+                "provider_spiffe_allow_guest_tcp is set but no provider_spiffe_workload_api_tcp_endpoint is configured",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_proxy_config(&self) -> Result<()> {
         self.upstream_proxy.validate().map_err(Error::config)?;
         if let Some(path) = self.proxy_ca_bundle.as_ref() {
@@ -496,28 +520,7 @@ pub async fn spawn(
     vm_config: &VmComputeConfig,
     otlp_config: Option<&OtlpConfig>,
 ) -> Result<AcquiredRemoteDriverEndpoint> {
-    if vm_config.grpc_endpoint.trim().is_empty() {
-        return Err(Error::config(
-            "grpc_endpoint is required when using the vm compute driver",
-        ));
-    }
-
-    validate_vm_sandbox_identity(vm_config)?;
-    vm_config.validate_proxy_config()?;
-    if let Some(endpoint) = vm_config
-        .provider_spiffe_workload_api_tcp_endpoint
-        .as_deref()
-    {
-        openshell_core::driver_utils::validate_guest_spiffe_tcp_endpoint(
-            endpoint,
-            vm_config.provider_spiffe_allow_guest_tcp,
-        )
-        .map_err(Error::config)?;
-    } else if vm_config.provider_spiffe_allow_guest_tcp {
-        return Err(Error::config(
-            "provider_spiffe_allow_guest_tcp is set but no provider_spiffe_workload_api_tcp_endpoint is configured",
-        ));
-    }
+    vm_config.validate_configuration()?;
     let driver_bin = resolve_compute_driver_bin(vm_config)?;
     let socket_path = compute_driver_socket_path(vm_config);
     let guest_tls_paths = compute_driver_guest_tls_paths(vm_config)?;

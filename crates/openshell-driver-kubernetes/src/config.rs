@@ -401,6 +401,16 @@ impl Default for KubernetesComputeConfig {
 }
 
 impl KubernetesComputeConfig {
+    /// Validate startup configuration without connecting to Kubernetes.
+    pub fn validate_configuration(&self) -> Result<(), String> {
+        self.validate_workspace_mode()?;
+        self.validate_provider_spiffe_workload_api_socket_path()?;
+        self.validate_sandbox_identity_config()?;
+        self.validate_proxy_uid()?;
+        self.validate_image_pull_policies()?;
+        self.validate_upstream_proxy_config()
+    }
+
     /// Clamp `sa_token_ttl_secs` into the `[MIN_SA_TOKEN_TTL_SECS,
     /// MAX_SA_TOKEN_TTL_SECS]` range used by the projected-volume spec.
     /// Invalid (≤0) values fall back to the default 3600.

@@ -127,9 +127,14 @@ defines the available implementation set, while the runtime consumes a generic
 registry. Adding or removing a compiled driver therefore changes registration
 rather than the server's selection flow. Alternate gateway binaries can install
 their own `ComputeDriverFactory` registrations and hand the completed registry
-to `run_cli_with_compute_drivers`; factories receive only the selected
-`[openshell.drivers.<name>]` table and return either an in-process driver or a
-gateway-managed remote endpoint. The server constructs the common runtime
+to `run_cli_with_compute_drivers`. Factories expose the same side-effect-free
+configuration validation to package preflight and runtime startup, receive only
+the selected `[openshell.drivers.<name>]` table, and return either an in-process
+driver or a gateway-managed remote endpoint when built. If a selected config file
+omits the selector, preflight validates each configured table that belongs to an
+auto-detectable registration. It does not run runtime detection probes because
+those probes can connect local sockets or launch bounded discovery commands.
+Preflight never builds a driver or connects to its transport. The server constructs the common runtime
 adapter and snapshots `GetCapabilities` for either result. A configured UDS
 endpoint still takes precedence over a compiled registration with the same name.
 

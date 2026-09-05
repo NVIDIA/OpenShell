@@ -23,8 +23,20 @@ printf 'env:%s|%s|%s\n' \
   "${OPENSHELL_GATEWAY_CONFIG:-}" \
   "${OPENSHELL_DB_URL:-}" \
   "${OPENSHELL_DISABLE_TLS:-}" >>"$FAKE_GATEWAY_LOG"
-if [ "${1:-}" = config ] && [ "${2:-}" = preflight ] && [ "${FAKE_PREFLIGHT_FAIL:-}" = 1 ]; then
-  exit 42
+if [ "${1:-}" = config ] && [ "${2:-}" = preflight ]; then
+  if [ "${FAKE_PREFLIGHT_FAIL:-}" = 1 ]; then
+    exit 42
+  fi
+  if [ "${FAKE_REJECT_UNPAIRED_RATE:-}" = 1 ]; then
+    case " $* " in
+      *" --grpc-rate-limit-requests "*)
+        case " $* " in
+          *" --grpc-rate-limit-window-seconds "*) ;;
+          *) exit 43 ;;
+        esac
+        ;;
+    esac
+  fi
 fi
 EOF
 chmod +x "$snap/bin/openshell-gateway"
@@ -64,7 +76,7 @@ printf 'operator override\n' >"$override"
 cp "$override" "$work/override-before"
 : >"$log"
 run_wrapper "$override"
-assert_log "config preflight
+assert_log "config preflight -- --trace
 env:$override|sqlite:$common/gateway.db?mode=rwc|true
 --trace
 env:$override|sqlite:$common/gateway.db?mode=rwc|true"
@@ -80,7 +92,7 @@ env \
   OPENSHELL_GATEWAY_CONFIG="$override" \
   FAKE_GATEWAY_LOG="$log" \
   "$wrapper" --trace --config "$cli_config"
-assert_log "config preflight --path=$cli_config
+assert_log "config preflight -- --trace --config $cli_config
 env:$override|sqlite:$common/gateway.db?mode=rwc|true
 --trace --config $cli_config
 env:$override|sqlite:$common/gateway.db?mode=rwc|true"
@@ -97,9 +109,23 @@ if env \
   echo "FAIL: CLI-selected config preflight failure reached gateway start" >&2
   exit 1
 fi
-assert_log "config preflight --path=$cli_config
+assert_log "config preflight -- --config=$cli_config
 env:$override|sqlite:$common/gateway.db?mode=rwc|true"
 cmp -s "$work/cli-before" "$cli_config"
+
+: >"$log"
+if env \
+  SNAP="$snap" \
+  SNAP_COMMON="$common" \
+  OPENSHELL_GATEWAY_CONFIG="$override" \
+  FAKE_GATEWAY_LOG="$log" \
+  FAKE_REJECT_UNPAIRED_RATE=1 \
+  "$wrapper" --grpc-rate-limit-requests 10; then
+  echo "FAIL: invalid daemon overrides reached gateway start" >&2
+  exit 1
+fi
+assert_log "config preflight -- --grpc-rate-limit-requests 10
+env:$override|sqlite:$common/gateway.db?mode=rwc|true"
 
 for invalid_selector in terminator nested-config; do
   : >"$log"
@@ -130,7 +156,7 @@ env \
   OPENSHELL_GATEWAY_CONFIG="$override" \
   FAKE_GATEWAY_LOG="$log" \
   "$wrapper" --config=--dash-leading
-assert_log "config preflight --path=--dash-leading
+assert_log "config preflight -- --config=--dash-leading
 env:$override|sqlite:$common/gateway.db?mode=rwc|true
 --config=--dash-leading
 env:$override|sqlite:$common/gateway.db?mode=rwc|true"
@@ -140,7 +166,7 @@ printf 'valid schema-v2\n' >"$canonical"
 cp "$canonical" "$work/canonical-before"
 : >"$log"
 run_wrapper unset
-assert_log "config preflight --path $canonical
+assert_log "config preflight -- --config $canonical --trace
 env:|sqlite:$common/gateway.db?mode=rwc|true
 --config $canonical --trace
 env:|sqlite:$common/gateway.db?mode=rwc|true"
@@ -149,7 +175,7 @@ cmp -s "$work/canonical-before" "$canonical"
 rm "$canonical"
 : >"$log"
 run_wrapper unset
-assert_log "config preflight
+assert_log "config preflight -- --trace
 env:|sqlite:$common/gateway.db?mode=rwc|true
 --trace
 env:|sqlite:$common/gateway.db?mode=rwc|true"
@@ -161,7 +187,7 @@ assert_preflight_failure() {
     echo "FAIL: $name reached gateway start" >&2
     exit 1
   fi
-  assert_log "config preflight --path $canonical
+  assert_log "config preflight -- --config $canonical --trace
 env:|sqlite:$common/gateway.db?mode=rwc|true"
 }
 
