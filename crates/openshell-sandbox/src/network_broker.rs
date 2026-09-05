@@ -596,8 +596,7 @@ fn connect_socket(
             return Err(io::Error::from_raw_os_error(libc::EISCONN));
         }
         let source_fd = entry.retained_preconnect()?.as_raw_fd();
-        ensure_dns_source_bound(source_fd, entry.metadata().family)?;
-        let peer = socket_local_addr(source_fd)?;
+        let peer = ensure_dns_source_bound(source_fd, entry.metadata().family)?;
         let attribution = match kind {
             InetKind::Tcp => &dns_relay.tcp_attribution,
             InetKind::DnsUdp => &dns_relay.udp_attribution,
@@ -681,18 +680,26 @@ fn connect_socket(
     Ok(())
 }
 
-fn ensure_dns_source_bound(fd: RawFd, family: InetFamily) -> io::Result<()> {
-    let address = socket_local_addr(fd)?;
-    if address.port() != 0 {
-        return Ok(());
+fn ensure_dns_source_bound(fd: RawFd, family: InetFamily) -> io::Result<SocketAddr> {
+    let mut address = socket_local_addr(fd)?;
+    let loopback = match family {
+        InetFamily::V4 => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        InetFamily::V6 => IpAddr::V6(Ipv6Addr::LOCALHOST),
+    };
+    if address.port() == 0 {
+        bind_exact(fd, SocketAddr::new(loopback, 0))?;
+        address = socket_local_addr(fd)?;
     }
-    bind_exact(
-        fd,
-        match family {
-            InetFamily::V4 => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-            InetFamily::V6 => SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
-        },
-    )
+    // Async resolvers commonly bind an unspecified address before sendto(2).
+    // A loopback destination makes the kernel select loopback as the actual
+    // source, so key attribution by that effective peer rather than by the
+    // wildcard returned before connect/send. Otherwise the relay observes
+    // 127.0.0.1:<port> (or ::1:<port>) and drops a valid query registered as
+    // 0.0.0.0:<port> (or [::]:<port>).
+    if address.ip().is_unspecified() {
+        address.set_ip(loopback);
+    }
+    Ok(address)
 }
 
 fn establish_relay(
@@ -1074,8 +1081,7 @@ fn classify_send(
             let identity = ProcfsIdentityResolver::for_pid_namespace().resolve(notification.tid);
             let entry = registry.resolve_mut(notification.tid, fd)?;
             let source_fd = entry.retained_preconnect()?.as_raw_fd();
-            ensure_dns_source_bound(source_fd, entry.metadata().family)?;
-            let peer = socket_local_addr(source_fd)?;
+            let peer = ensure_dns_source_bound(source_fd, entry.metadata().family)?;
             lock(&dns_relay.udp_attribution).insert(peer, identity);
             if let Err(error) = connect_exact(source_fd, dns_relay.address) {
                 lock(&dns_relay.udp_attribution).remove(&peer);
@@ -1755,7 +1761,7 @@ mod tests {
     }
 
     #[test]
-    fn udp_dns_uses_exact_local_relay_source() {
+    fn udp_dns_normalizes_wildcard_source_for_relay_attribution() {
         let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
             .expect("start workload launcher");
         let broker = NetworkBroker::start_for_test(listener).expect("start network broker");
@@ -1763,7 +1769,9 @@ mod tests {
         let client = std::thread::spawn(move || {
             launcher
                 .execute(move || -> io::Result<SocketAddr> {
-                    let socket = UdpSocket::bind("127.0.0.1:0")?;
+                    // Tokio/Hickory-style resolvers bind a wildcard source
+                    // before sending to the configured nameserver.
+                    let socket = UdpSocket::bind("0.0.0.0:0")?;
                     socket.set_read_timeout(Some(Duration::from_secs(5)))?;
                     socket.send_to(b"dns-query", dns_address)?;
                     let mut response = [0_u8; 32];
