@@ -9,7 +9,6 @@ use std::io::BufWriter;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -48,7 +47,6 @@ pub fn sandbox_guest_runtime_identity() -> String {
 }
 
 /// Materialize the supervisor embedded in the VM driver for host-side use.
-#[cfg(target_os = "linux")]
 pub fn extract_host_supervisor(path: &Path) -> Result<(), String> {
     if SANDBOX.is_empty() {
         return Err(
@@ -61,12 +59,10 @@ pub fn extract_host_supervisor(path: &Path) -> Result<(), String> {
     validate_host_supervisor(path)
 }
 
-#[cfg(target_os = "linux")]
 pub fn validate_host_supervisor(path: &Path) -> Result<(), String> {
     validate_host_supervisor_digest(path, embedded_host_supervisor_digest()?)
 }
 
-#[cfg(target_os = "linux")]
 fn validate_host_supervisor_digest(path: &Path, expected: [u8; 32]) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("inspect cached host supervisor {}: {error}", path.display()))?;
@@ -100,13 +96,11 @@ fn validate_host_supervisor_digest(path: &Path, expected: [u8; 32]) -> Result<()
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn embedded_host_supervisor() -> Result<Vec<u8>, String> {
     zstd::decode_all(Cursor::new(SUPERVISOR))
         .map_err(|error| format!("decompress host supervisor: {error}"))
 }
 
-#[cfg(target_os = "linux")]
 fn embedded_host_supervisor_digest() -> Result<[u8; 32], String> {
     static DIGEST: OnceLock<Result<[u8; 32], String>> = OnceLock::new();
     DIGEST
@@ -114,12 +108,10 @@ fn embedded_host_supervisor_digest() -> Result<[u8; 32], String> {
         .clone()
 }
 
-#[cfg(target_os = "linux")]
 fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-#[cfg(target_os = "linux")]
 fn sha256_reader(mut reader: impl Read) -> std::io::Result<[u8; 32]> {
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 16 * 1024];
@@ -133,7 +125,6 @@ fn sha256_reader(mut reader: impl Read) -> std::io::Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
-#[cfg(target_os = "linux")]
 fn install_host_supervisor_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()

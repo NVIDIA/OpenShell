@@ -25,6 +25,22 @@ permissions:
   contents: read
 
 jobs:
+  host-supervisor-macos:
+    name: native host supervisor (aarch64-apple-darwin)
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      package: openshell-supervisor
+      binary: openshell-supervisor
+      triple: aarch64-apple-darwin
+      runner: macos-15-xlarge
+      dev-shell: .#devShells.aarch64-darwin.default
+      cargo-version: ${{ inputs.cargo-version }}
+      image-tag: ${{ inputs.image-tag }}
+      checkout-ref: ${{ inputs.checkout-ref }}
+    secrets: inherit
+
   helper-runtime:
     name: helper runtime (${{ matrix.arch }})
     strategy:
@@ -90,7 +106,7 @@ jobs:
 
   build:
     name: openshell-driver-vm (${{ matrix.triple }})
-    needs: helper-runtime
+    needs: [helper-runtime, host-supervisor-macos]
     strategy:
       matrix:
         include:
@@ -134,6 +150,13 @@ jobs:
           name: openshell-supervisor-${{ matrix.arch }}-unknown-linux-musl
           path: supervisor
 
+      - name: Download native macOS host supervisor
+        if: endsWith(matrix.triple, '-apple-darwin')
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-supervisor-aarch64-apple-darwin
+          path: host-supervisor
+
       - name: Download trusted helper runtime
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -146,10 +169,14 @@ jobs:
       - name: Assemble compressed VM runtime
         run: |
           compressed_dir="${RUNNER_TEMP}/vm-runtime-compressed"
+          host_supervisor="supervisor/openshell-supervisor"
+          if [[ "${{ matrix.triple }}" == *-apple-darwin ]]; then
+            host_supervisor="host-supervisor/openshell-supervisor"
+          fi
           install -d "$compressed_dir"
           cp result/compressed/*.zst "$compressed_dir/"
           zstd -19 -T1 sandbox/openshell-sandbox -o "$compressed_dir/openshell-sandbox.zst"
-          zstd -19 -T1 supervisor/openshell-supervisor -o "$compressed_dir/openshell-supervisor.zst"
+          zstd -19 -T1 "$host_supervisor" -o "$compressed_dir/openshell-supervisor.zst"
           cp helper-runtime/openshell-runtime.tar.zst "$compressed_dir/"
 
       - name: Build openshell-driver-vm
