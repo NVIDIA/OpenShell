@@ -492,7 +492,7 @@ impl BoundaryProcess for LocalExecProcess {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::sync::Once;
