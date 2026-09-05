@@ -3241,16 +3241,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libyml"
-version = "0.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3302702afa434ffa30847a83305f0a69d6abd74293b6554c18ec85c7ef30c980"
-dependencies = [
- "anyhow",
- "version_check",
-]
-
-[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3559,6 +3549,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "noyalib"
+version = "0.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f075ef19fa3bcf8697c0ef96c37d5c435d339a40ab8081cae3aac3a4e7fee9a"
+dependencies = [
+ "hashbrown 0.17.0",
+ "indexmap",
+ "libm",
+ "memchr",
+ "rustc-hash 2.1.2",
+ "serde",
+ "serde_core",
+ "smallvec",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3793,6 +3799,7 @@ dependencies = [
  "indicatif",
  "miette",
  "nix 0.29.0",
+ "noyalib",
  "oauth2",
  "openshell-bootstrap",
  "openshell-core",
@@ -3808,7 +3815,6 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
- "serde_yml",
  "tar",
  "temp-env",
  "tempfile",
@@ -3991,11 +3997,11 @@ version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
  "futures",
+ "noyalib",
  "openshell-core",
  "openshell-policy",
  "serde",
  "serde_json",
- "serde_yml",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -4212,11 +4218,11 @@ version = "0.0.0"
 dependencies = [
  "hickory-proto",
  "miette",
+ "noyalib",
  "openshell-core",
  "prost-types",
  "serde",
  "serde_json",
- "serde_yml",
 ]
 
 [[package]]
@@ -4226,9 +4232,9 @@ dependencies = [
  "glob",
  "include_dir",
  "miette",
+ "noyalib",
  "owo-colors",
  "serde",
- "serde_yml",
  "z3",
 ]
 
@@ -4237,11 +4243,11 @@ name = "openshell-providers"
 version = "0.0.0"
 dependencies = [
  "glob",
+ "noyalib",
  "openshell-core",
  "openshell-policy",
  "serde",
  "serde_json",
- "serde_yml",
  "thiserror 2.0.18",
  "url",
 ]
@@ -4251,11 +4257,11 @@ name = "openshell-router"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "noyalib",
  "openshell-core",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "serde_yml",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -4471,6 +4477,7 @@ dependencies = [
  "ipnet",
  "libc",
  "miette",
+ "noyalib",
  "openshell-core",
  "openshell-ocsf",
  "openshell-policy",
@@ -4486,7 +4493,6 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
- "serde_yml",
  "sha1 0.10.6",
  "sha2 0.10.9",
  "spiffe",
@@ -6307,21 +6313,6 @@ dependencies = [
  "ryu",
  "serde",
  "unsafe-libyaml",
-]
-
-[[package]]
-name = "serde_yml"
-version = "0.0.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59e2dd588bf1597a252c3b920e0143eb99b0f76e4e082f4c92ce34fbc9e71ddd"
-dependencies = [
- "indexmap",
- "itoa",
- "libyml",
- "memchr",
- "ryu",
- "serde",
- "version_check",
 ]
 
 [[package]]

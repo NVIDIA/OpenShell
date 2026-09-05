@@ -863,11 +863,8 @@ fn load_provider_profile_source(
     let mapping = value
         .as_mapping_mut()
         .ok_or_else(|| format!("provider profile {source} must be a YAML mapping"))?;
-    mapping.insert(
-        serde_yml::Value::String("id".to_string()),
-        serde_yml::Value::String(profile_id.to_string()),
-    );
-    let profile = serde_yml::from_value::<ProviderTypeProfile>(value)
+    mapping.insert("id", serde_yml::Value::String(profile_id.to_string()));
+    let profile = serde_yml::from_value::<ProviderTypeProfile>(&value)
         .map_err(|err| format!("failed to decode provider profile {source}: {err}"))?
         .to_proto();
     Ok(LoadedProviderProfile { profile })
