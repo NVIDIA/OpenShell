@@ -36,6 +36,15 @@ pub struct RuntimeQualification {
     pub tcp_deny_round_trip: bool,
 }
 
+/// Placeholder used when compiling the package on a non-Linux host.
+///
+/// The sandbox binary rejects execution on those hosts before constructing a
+/// qualification, but retaining the type keeps the library API portable for
+/// workspace-wide checks.
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone, Copy, Debug)]
+pub struct RuntimeQualification;
+
 /// Run the authenticated boundary-local sandbox.
 ///
 /// # Errors
