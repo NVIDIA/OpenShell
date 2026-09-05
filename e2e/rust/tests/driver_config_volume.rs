@@ -296,10 +296,20 @@ fn write_bind_mount_policy() -> Result<tempfile::NamedTempFile, String> {
     let mut file =
         tempfile::NamedTempFile::new().map_err(|err| format!("create bind policy: {err}"))?;
     file.write_all(
-        br"version: 1
+        br#"version: 1
 
 filesystem_policy:
   include_workdir: false
+  read_only:
+    - "/bin"
+    - "/dev"
+    - "/etc"
+    - "/lib"
+    - "/proc"
+    - "/usr"
+  read_write:
+    - "/sandbox/e2e-bind"
+    - "/tmp"
 
 landlock:
   compatibility: best_effort
@@ -307,7 +317,7 @@ landlock:
 process:
   run_as_user: sandbox
   run_as_group: sandbox
-",
+"#,
     )
     .map_err(|err| format!("write bind policy: {err}"))?;
     Ok(file)

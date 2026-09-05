@@ -610,17 +610,14 @@ image_pull_policy  = "IfNotPresent"
 sandbox_namespace  = "docker-dev"
 # Empty auto-detects https://host.openshell.internal:<gateway-port> when guest TLS is set.
 grpc_endpoint      = "https://host.openshell.internal:17670"
-# Skip the image-pull-and-extract step by pointing at a locally built binary.
-supervisor_bin     = "/usr/local/libexec/openshell/openshell-sandbox"
-# When supervisor_bin is omitted, Docker extracts /openshell-sandbox from this image.
-# Defaults to the gateway version; override to pin a specific build.
+# Contains both /openshell-sandbox and /openshell-supervisor. Defaults to the
+# gateway version; override to pin a specific build.
 # supervisor_image = "ghcr.io/nvidia/openshell/supervisor:<version>"
 guest_tls_ca       = "/etc/openshell/certs/ca.pem"
 guest_tls_cert     = "/etc/openshell/certs/client.pem"
 guest_tls_key      = "/etc/openshell/certs/client-key.pem"
 network_name       = "openshell-docker"
 host_gateway_ip    = "172.17.0.1"
-ssh_socket_path    = "/run/openshell/ssh.sock"
 # Unsafe operator override. Host bind mounts, including Docker local-driver
 # bind-backed volumes, expose gateway-host paths inside sandboxes and can
 # negate OpenShell isolation and filesystem controls.
