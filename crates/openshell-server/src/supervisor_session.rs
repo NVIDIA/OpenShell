@@ -1041,8 +1041,20 @@ fn confirm_capabilities(advertised: &[String], state: &Arc<ServerState>) -> Vec<
             "telemetry_relay" if state.telemetry_relay_exporter.is_some() => {
                 confirmed.push(cap.clone());
             }
-            _ => {}
+            "telemetry_relay" => {
+                debug!(
+                    capability = "telemetry_relay",
+                    "supervisor advertised telemetry_relay but gateway has no \
+                     [openshell.gateway.otlp] config; capability not confirmed"
+                );
+            }
+            other => {
+                debug!(capability = %other, "ignoring unknown supervisor capability");
+            }
         }
+    }
+    if !confirmed.is_empty() {
+        info!(capabilities = ?confirmed, "confirmed supervisor capabilities");
     }
     confirmed
 }
@@ -1062,11 +1074,8 @@ fn handle_telemetry_data(
         let trace_data = telemetry.trace_data;
         let sandbox_id = sandbox_id.to_string();
         tokio::spawn(async move {
-            match tokio::time::timeout(
-                Duration::from_secs(10),
-                exporter.export_raw(trace_data),
-            )
-            .await
+            match tokio::time::timeout(Duration::from_secs(10), exporter.export_raw(trace_data))
+                .await
             {
                 Ok(Err(e)) => {
                     debug!(

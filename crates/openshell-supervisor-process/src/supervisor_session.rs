@@ -30,7 +30,7 @@ use openshell_ocsf::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use openshell_core::grpc_client;
 use openshell_core::net::set_tcp_nodelay_best_effort;
@@ -395,6 +395,14 @@ async fn run_single_session(
     };
 
     let telemetry_confirmed = accepted.capabilities.iter().any(|c| c == "telemetry_relay");
+    if telemetry_confirmed {
+        info!("gateway confirmed telemetry_relay capability; OTLP drain active");
+    } else {
+        debug!(
+            "gateway did not confirm telemetry_relay; \
+             OTLP forwarding disabled for this session"
+        );
+    }
 
     let heartbeat_secs = accepted.heartbeat_interval_secs.max(5);
     let event = session_established_event(

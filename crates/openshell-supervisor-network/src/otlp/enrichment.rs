@@ -285,15 +285,16 @@ mod tests {
         };
         let json = serde_json::to_vec(&req).unwrap();
 
-        let result =
-            enrich_spans(&json, ContentType::Json, &test_metadata(), true).unwrap();
+        let result = enrich_spans(&json, ContentType::Json, &test_metadata(), true).unwrap();
 
         let decoded = ExportTraceServiceRequest::decode(result.as_slice()).unwrap();
         let resource = decoded.resource_spans[0].resource.as_ref().unwrap();
-        assert!(resource
-            .attributes
-            .iter()
-            .any(|a| a.key == "openshell.telemetry.source"));
+        assert!(
+            resource
+                .attributes
+                .iter()
+                .any(|a| a.key == "openshell.telemetry.source")
+        );
     }
 
     #[test]

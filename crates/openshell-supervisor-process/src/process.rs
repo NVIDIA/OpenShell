@@ -832,7 +832,10 @@ impl ProcessHandle {
         // Set OTEL env vars so agent SDKs export to the supervisor's OTLP receiver.
         // The relay binds on 127.0.0.1:4318 inside the agent's network namespace
         // (all current topologies keep the process supervisor co-located with the agent).
-        for (key, value) in child_env::otel_env_vars(openshell_core::sandbox_env::OTLP_RECEIVER_ENDPOINT, "http/protobuf") {
+        for (key, value) in child_env::otel_env_vars(
+            openshell_core::sandbox_env::OTLP_RECEIVER_ENDPOINT,
+            "http/protobuf",
+        ) {
             cmd.env(key, value);
         }
 

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use prost::Message;
 use tonic::transport::Channel;
-use tracing::debug;
+use tracing::{debug, info};
 
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
 
@@ -70,10 +70,17 @@ pub enum ConnectError {
 pub async fn try_create_exporter(
     config_file: Option<&crate::config_file::ConfigFile>,
 ) -> Option<Arc<TelemetryRelayExporter>> {
-    let otlp = config_file?.openshell.gateway.otlp.as_ref()?;
+    let Some(cf) = config_file else {
+        debug!("no config file; telemetry relay disabled");
+        return None;
+    };
+    let Some(otlp) = cf.openshell.gateway.otlp.as_ref() else {
+        debug!("no [openshell.gateway.otlp] section in config; telemetry relay disabled");
+        return None;
+    };
     match TelemetryRelayExporter::connect(&otlp.endpoint).await {
         Ok(exporter) => {
-            debug!(endpoint = %otlp.endpoint, "telemetry relay exporter connected");
+            info!(endpoint = %otlp.endpoint, "telemetry relay exporter connected");
             Some(Arc::new(exporter))
         }
         Err(e) => {
