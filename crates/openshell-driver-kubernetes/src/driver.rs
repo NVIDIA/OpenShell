@@ -4822,9 +4822,16 @@ async fn sandbox_from_object_with_proxy_pod_readiness(
 
 fn mark_proxy_pod_bootstrapping(sandbox: &mut Sandbox) {
     if let Some(status) = sandbox.status.as_mut() {
-        status
-            .conditions
-            .retain(|condition| condition.r#type != SANDBOX_SUSPENDED_CONDITION);
+        status.conditions.retain(|condition| {
+            condition.r#type != SANDBOX_SUSPENDED_CONDITION && condition.r#type != "Bootstrapping"
+        });
+        status.conditions.push(SandboxCondition {
+            r#type: "Bootstrapping".to_string(),
+            status: "True".to_string(),
+            reason: "ProxyPodGenerationStarting".to_string(),
+            message: "replacement proxy-pod generation is starting".to_string(),
+            last_transition_time: String::new(),
+        });
     }
     mark_proxy_pod_control_unavailable(sandbox);
 }
@@ -9754,6 +9761,11 @@ mod tests {
             condition.r#type == "Ready"
                 && condition.status == "False"
                 && condition.reason == "DependenciesNotReady"
+        }));
+        assert!(conditions.iter().any(|condition| {
+            condition.r#type == "Bootstrapping"
+                && condition.status == "True"
+                && condition.reason == "ProxyPodGenerationStarting"
         }));
     }
 
