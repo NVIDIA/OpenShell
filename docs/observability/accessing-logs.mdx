@@ -50,6 +50,8 @@ The gateway distinguishes recoverable from unrecoverable loss:
 
 On reconnect, a client passes the highest cursor it processed as the resume point. The gateway replays only events after that cursor — logs and platform events merged in cursor order — then resumes live delivery, so no events are lost or duplicated across the reconnect.
 
+Replay is emitted in cursor order. During live delivery the log and platform event sources are read independently, so events from different sources can interleave; order across sources by `cursor` rather than by arrival.
+
 ## Direct Filesystem Access
 
 Start an independent shell with `sandbox exec` to read log files directly:

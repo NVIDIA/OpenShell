@@ -159,14 +159,20 @@ impl TracingLogBus {
         self.sender_for(sandbox_id).subscribe()
     }
 
-    /// Remove all bus entries for the given sandbox id.
+    /// Remove all bus entries for the given sandbox id, including the platform
+    /// event bus that shares this bus's cursor allocator.
     ///
-    /// This drops the broadcast sender (closing any active receivers with
-    /// `RecvError::Closed`) and frees the tail buffer.
+    /// This drops the broadcast senders (closing any active receivers with
+    /// `RecvError::Closed`) and frees the tail buffers. Both per-sandbox maps
+    /// are cleared before the shared `SeqAllocator` entry is reset, so the
+    /// allocator is never reset while either map can still accept a publish that
+    /// references it.
     pub fn remove(&self, sandbox_id: &str) {
-        let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
-        inner.per_id.remove(sandbox_id);
-        drop(inner);
+        {
+            let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
+            inner.per_id.remove(sandbox_id);
+        }
+        self.platform_event_bus.remove(sandbox_id);
         self.seq.remove(sandbox_id);
     }
 
