@@ -3299,6 +3299,7 @@ impl KubernetesComputeDriver {
             if proxy_pod_bootstrap_in_progress(&object) {
                 if proxy_pod_control_availability(&self.client, namespace, &sandbox_id).await
                     == ProxyPodControlAvailability::Available
+                    && proxy_pod_runtime_is_ready(&object)
                 {
                     self.complete_proxy_pod_bootstrap(&lookup_api, &object)
                         .await;
@@ -3917,14 +3918,15 @@ fn spawn_proxy_pod_bootstrap_completion(
     expected_sandbox_uid: Option<String>,
 ) {
     tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + PROXY_POD_BOOTSTRAP_GRACE;
         let available = |deployment: Option<&Deployment>| {
             deployment.is_some_and(|deployment| {
                 proxy_pod_control_availability_from_deployment(deployment)
                     == ProxyPodControlAvailability::Available
             })
         };
-        match tokio::time::timeout(
-            PROXY_POD_BOOTSTRAP_GRACE,
+        match tokio::time::timeout_at(
+            deadline,
             await_condition(deployments, &deployment_name, available),
         )
         .await
@@ -3937,13 +3939,32 @@ fn spawn_proxy_pod_bootstrap_completion(
             }
         }
 
-        let Ok(object) = sandboxes.get(&sandbox_name).await else {
-            return;
+        // A replacement control can become Available before the Agent
+        // Sandbox controller has replaced the prior Suspended condition.
+        // Clearing the bootstrap marker in that window publishes a terminal
+        // Stopped event to the gateway. Wait for the controller's real Ready
+        // condition so the marker removal and readiness annotation expose one
+        // causally complete transition for both API versions.
+        let runtime_ready = |object: Option<&DynamicObject>| {
+            object.is_some_and(|object| {
+                object.metadata.uid == expected_sandbox_uid
+                    && proxy_pod_bootstrap_in_progress(object)
+                    && proxy_pod_runtime_is_ready(object)
+            })
         };
-        if object.metadata.uid != expected_sandbox_uid || !proxy_pod_bootstrap_in_progress(&object)
+        let object = match tokio::time::timeout_at(
+            deadline,
+            await_condition(sandboxes.clone(), &sandbox_name, runtime_ready),
+        )
+        .await
         {
-            return;
-        }
+            Ok(Ok(Some(object))) => object,
+            Ok(Ok(None)) | Err(_) => return,
+            Ok(Err(error)) => {
+                debug!(%error, sandbox = sandbox_name, "proxy-pod runtime readiness watch failed; reconciliation will retry");
+                return;
+            }
+        };
         let Some(resource_version) = object.metadata.resource_version.as_deref() else {
             return;
         };
@@ -3959,6 +3980,19 @@ fn spawn_proxy_pod_bootstrap_completion(
             debug!(%error, sandbox = sandbox_name, "proxy-pod bootstrap completion raced; reconciliation will retry");
         }
     });
+}
+
+fn proxy_pod_runtime_is_ready(object: &DynamicObject) -> bool {
+    object
+        .data
+        .pointer("/status/conditions")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|conditions| {
+            conditions.iter().any(|condition| {
+                condition.get("type").and_then(serde_json::Value::as_str) == Some("Ready")
+                    && condition.get("status").and_then(serde_json::Value::as_str) == Some("True")
+            })
+        })
 }
 
 fn proxy_pod_fence_is_old_enough(policy: &NetworkPolicy, now: SystemTime) -> bool {
@@ -9619,6 +9653,28 @@ mod tests {
             patch["metadata"]["annotations"][ANNOTATION_PROXY_POD_READINESS],
             "ready"
         );
+    }
+
+    #[test]
+    fn proxy_pod_bootstrap_completion_waits_for_runtime_ready() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox", &resource);
+        sandbox.data = serde_json::json!({
+            "status": {
+                "conditions": [{"type": "Suspended", "status": "True"}]
+            }
+        });
+        assert!(!proxy_pod_runtime_is_ready(&sandbox));
+
+        sandbox.data["status"]["conditions"] = serde_json::json!([
+            {"type": "Suspended", "status": "False"},
+            {"type": "Ready", "status": "True"}
+        ]);
+        assert!(proxy_pod_runtime_is_ready(&sandbox));
     }
 
     #[test]
