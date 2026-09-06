@@ -2786,7 +2786,12 @@ impl KubernetesComputeDriver {
         deployments
             .delete(
                 &names.control_deployment,
-                &DeleteParams::default().preconditions(Preconditions {
+                // A stop only requests scale-to-zero; the old ReplicaSet and
+                // Pod can still be terminating when start arrives. Foreground
+                // deletion makes the Deployment disappear only after those
+                // dependents are gone, so an old supervisor cannot reconnect
+                // and supersede the replacement generation's session.
+                &DeleteParams::foreground().preconditions(Preconditions {
                     uid: Some(old_uid),
                     resource_version: None,
                 }),
