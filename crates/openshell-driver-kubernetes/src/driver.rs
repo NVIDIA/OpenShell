@@ -3393,11 +3393,89 @@ fn apply_supervisor_sidecar_topology(
 /// The init container mounts the PVC at a temporary path so it can still see
 /// the image's `/sandbox` directory.  It checks for a sentinel file and skips
 /// the copy if the PVC was already initialised.
+///
+/// Build the `workspace-init` shell script that seeds `dst` from `src`.
+///
+/// The init container mounts the PVC at a temp path so it can still read the
+/// image's original workspace contents.  It copies them into the PVC only when
+/// the sentinel file is absent.
+///
+/// Prefer a tar stream over `cp -a`: some sandbox images contain
+/// self-referential symlinks under `/sandbox/.uv`, and GNU cp can fail while
+/// seeding the PVC even though preserving the symlink as-is is valid. `tar`
+/// copies the tree without dereferencing those links. Archive only the
+/// contents, not the workspace directory entry itself, so extraction never
+/// tries to chmod the PVC mount root.
+///
+/// Ownership is rewritten to the resolved sandbox identity while *building* the
+/// archive (`--owner`/`--group`/`--numeric-owner`), and extraction then restores
+/// it. Seeding as root with `--no-same-owner` used to leave every seeded path
+/// owned by uid 0; a mode-0700 home directory from the image (`~/.config`,
+/// `~/.cache`) was then unreachable for the workload. `fsGroup` does not
+/// compensate: kubelet applies it when the volume is mounted, which is before
+/// this init container writes anything.
+///
+/// Rewriting at archive time — rather than extracting as the sandbox user, or
+/// chowning the tree afterwards — keeps root's ability to read every source
+/// path, so images that ship root-owned private content still seed. It also
+/// avoids a recursive chown over the workspace, the pattern that broke on
+/// read-only submounts in #2294.
+///
+/// Modes and timestamps are still not restored, so a nested read-only mount
+/// under the PVC is never chmod'ed during seeding.
+///
+/// Two environments cannot restore ownership, and neither may turn a
+/// permissions bug into a pod that will not start:
+///
+/// - `--owner`/`--group` at archive time are GNU extensions, and this init
+///   container runs the sandbox image itself. A minimal base such as Alpine
+///   seeds with `BusyBox` tar, which rejects them. The script probes tar once
+///   and drops to the previous flags when they are unavailable.
+/// - A writable PVC backend can still reject `chown`, root-squashed NFS being
+///   the usual case. tar restores ownership by default under uid 0, so the
+///   extraction fails after writing the tree and the sentinel is never
+///   recorded, leaving the pod to retry initialization forever. Extraction
+///   therefore retries with `--no-same-owner`, and the sentinel is written when
+///   either attempt succeeds.
+///
+///   The retry is guarded on the ownership flags actually being in use: an
+///   image that already dropped to `--no-same-owner` at the probe would
+///   otherwise re-run an identical command and mask a genuine failure.
+///
+/// The inner `[ -d ... ]` guard handles custom images that don't have a
+/// workspace directory — the copy is skipped but the sentinel is still written
+/// so subsequent starts are instant.
+#[allow(clippy::similar_names)]
+fn workspace_seed_script(src: &str, dst: &str, sandbox_uid: u32, sandbox_gid: u32) -> String {
+    format!(
+        "if [ ! -f {dst}/{WORKSPACE_SENTINEL} ]; then \
+           if [ -d {src} ]; then \
+             own=\"--owner={sandbox_uid} --group={sandbox_gid} --numeric-owner\"; \
+             ext=\"--numeric-owner\"; \
+             tar $own -cf /dev/null -T /dev/null 2>/dev/null || \
+               {{ own=\"\"; ext=\"--no-same-owner\"; }}; \
+             tmp=$(mktemp) && rm -f \"$tmp\" && \
+               (cd {src} && find . -mindepth 1 -maxdepth 1 -exec tar $own -cf \"$tmp\" {{}} +) && \
+               if [ -f \"$tmp\" ]; then \
+                 {{ tar -C {dst} $ext --no-same-permissions --touch -xf \"$tmp\" || \
+                    {{ [ -n \"$own\" ] && \
+                       tar -C {dst} --no-same-owner --no-same-permissions --touch -xf \"$tmp\"; }}; }} && \
+                 rm -f \"$tmp\"; \
+               fi; \
+           fi && \
+           touch {dst}/{WORKSPACE_SENTINEL}; \
+         fi"
+    )
+}
+
+/// Seeded content is written as `sandbox_uid`/`sandbox_gid` so the workload can
+/// use it.  See the extended note on the tar invocation below.
 #[allow(clippy::similar_names)]
 fn apply_workspace_persistence(
     pod_template: &mut serde_json::Value,
     image: &str,
     image_pull_policy: Option<&str>,
+    sandbox_uid: u32,
     sandbox_gid: u32,
 ) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
@@ -3445,34 +3523,11 @@ fn apply_workspace_persistence(
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut();
     if let Some(init_containers) = init_containers {
-        // The init container mounts the PVC at a temp path so it can still
-        // read the image's original /sandbox contents.  It copies them into
-        // the PVC only when the sentinel file is absent.
-        //
-        // Prefer a tar stream over `cp -a`: some sandbox images contain
-        // self-referential symlinks under `/sandbox/.uv`, and GNU cp can
-        // fail while seeding the PVC even though preserving the symlink as-is
-        // is valid. `tar` copies the tree without dereferencing those links.
-        // Archive only the contents, not the `/sandbox` directory entry
-        // itself, so extraction never tries to chmod the PVC mount root.
-        // Extract without restoring owner, mode, or timestamps so the
-        // non-root init container can seed kubelet-owned PVCs.
-        //
-        // The inner `[ -d ... ]` guard handles custom images that don't have
-        // a /sandbox directory — the copy is skipped but the sentinel is
-        // still written so subsequent starts are instant.
-        let copy_cmd = format!(
-            "if [ ! -f {WORKSPACE_INIT_MOUNT_PATH}/{WORKSPACE_SENTINEL} ]; then \
-               if [ -d {WORKSPACE_MOUNT_PATH} ]; then \
-                 tmp=$(mktemp) && rm -f \"$tmp\" && \
-                   (cd {WORKSPACE_MOUNT_PATH} && find . -mindepth 1 -maxdepth 1 -exec tar -cf \"$tmp\" {{}} +) && \
-                   if [ -f \"$tmp\" ]; then \
-                     tar -C {WORKSPACE_INIT_MOUNT_PATH} --no-same-owner --no-same-permissions --touch -xf \"$tmp\" && \
-                     rm -f \"$tmp\"; \
-                   fi; \
-               fi && \
-               touch {WORKSPACE_INIT_MOUNT_PATH}/{WORKSPACE_SENTINEL}; \
-             fi"
+        let copy_cmd = workspace_seed_script(
+            WORKSPACE_MOUNT_PATH,
+            WORKSPACE_INIT_MOUNT_PATH,
+            sandbox_uid,
+            sandbox_gid,
         );
 
         let mut init_spec = serde_json::json!({
@@ -4112,6 +4167,7 @@ fn sandbox_template_to_k8s_with_validated_config(
             &mut result,
             image,
             params.image_pull_policy,
+            params.sandbox_uid,
             params.sandbox_gid,
         );
     }
@@ -4931,9 +4987,25 @@ mod tests {
     use openshell_core::proto::compute::v1::{GpuResourceRequirements, ResourceRequirements};
     use prost_types::{Struct, Value, value::Kind};
     use std::collections::BTreeSet;
+    use std::time::UNIX_EPOCH;
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    /// A collision-free scratch directory for tests that shell out.
+    #[cfg(unix)]
+    fn unique_temp_dir() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the epoch")
+            .as_nanos();
+        let suffix = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "openshell-k8s-driver-test-{}-{nanos}-{suffix}",
+            std::process::id()
+        ))
+    }
 
     #[tokio::test]
     async fn tracing_create_sandbox_failure_exports_a_kubernetes_operation_span() {
@@ -7404,6 +7476,7 @@ mod tests {
             &mut pod_template,
             "openshell/sandbox:latest",
             Some("IfNotPresent"),
+            1000, // sandbox_uid
             1000, // sandbox_gid
         );
 
@@ -7464,6 +7537,7 @@ mod tests {
             "my-custom-image:v2",
             Some("IfNotPresent"),
             1000,
+            1000,
         );
 
         let init_image = pod_template["spec"]["initContainers"][0]["image"]
@@ -7486,7 +7560,7 @@ mod tests {
             }
         });
 
-        apply_workspace_persistence(&mut pod_template, "img:latest", Some("Always"), 1000);
+        apply_workspace_persistence(&mut pod_template, "img:latest", Some("Always"), 1000, 1000);
 
         let cmd = pod_template["spec"]["initContainers"][0]["command"]
             .as_array()
@@ -7505,10 +7579,334 @@ mod tests {
             "init script must archive sandbox contents without the mount root entry"
         );
         assert!(
-            script.contains("--no-same-owner")
-                && script.contains("--no-same-permissions")
-                && script.contains("--touch"),
-            "init script must avoid restoring metadata onto the PVC root"
+            script.contains("--no-same-permissions") && script.contains("--touch"),
+            "init script must not restore modes or timestamps onto the PVC"
+        );
+    }
+
+    /// Regression: seeding the PVC as root with `--no-same-owner` left every
+    /// seeded path owned by uid 0, so a mode-0700 home directory from the
+    /// image (`~/.config`, `~/.cache`) was unreachable for the workload.
+    /// Ownership must be rewritten to the resolved sandbox identity instead.
+    #[test]
+    fn workspace_init_seeds_content_owned_by_the_sandbox_identity() {
+        let mut pod_template = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "agent",
+                    "image": "img:latest"
+                }]
+            }
+        });
+
+        apply_workspace_persistence(&mut pod_template, "img:latest", Some("Always"), 1234, 5678);
+
+        let script = pod_template["spec"]["initContainers"][0]["command"][2]
+            .as_str()
+            .expect("init script should be the third command element")
+            .to_string();
+
+        assert!(
+            script.contains("--owner=1234") && script.contains("--group=5678"),
+            "init script must rewrite seeded ownership to the resolved sandbox identity, got: {script}"
+        );
+        assert!(
+            script.contains("--numeric-owner"),
+            "ownership rewrite must be numeric so it does not depend on image account files"
+        );
+        assert!(
+            script.contains("ext=\"--numeric-owner\""),
+            "extraction must restore the rewritten ownership, not discard it"
+        );
+        assert!(
+            script.contains(&format!(
+                "tar -C {WORKSPACE_INIT_MOUNT_PATH} $ext --no-same-permissions"
+            )),
+            "the primary extraction must use the probed ownership flags, got: {script}"
+        );
+        assert!(
+            script.contains(&format!(
+                "[ -n \"$own\" ] && tar -C {WORKSPACE_INIT_MOUNT_PATH} --no-same-owner"
+            )),
+            "a literal --no-same-owner extraction may only appear as the guarded \
+             retry; discarding ownership unconditionally is the regression being \
+             fixed, got: {script}"
+        );
+        assert!(
+            !script.contains("chown"),
+            "seeding must not chown the workspace tree — that pattern broke on \
+             read-only submounts (#2294)"
+        );
+    }
+
+    /// `--owner`/`--group` are GNU extensions and this init container runs the
+    /// sandbox image itself, so a minimal base such as Alpine seeds with
+    /// `BusyBox` tar. Rejecting those options fails the init container and the
+    /// pod never starts, so the script probes tar once and degrades to the
+    /// previous flags instead of hard-failing.
+    #[test]
+    fn workspace_init_falls_back_when_tar_lacks_ownership_extensions() {
+        let mut pod_template = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "agent",
+                    "image": "img:latest"
+                }]
+            }
+        });
+
+        apply_workspace_persistence(&mut pod_template, "img:latest", Some("Always"), 1234, 5678);
+
+        let script = pod_template["spec"]["initContainers"][0]["command"][2]
+            .as_str()
+            .expect("init script should be the third command element")
+            .to_string();
+
+        assert!(
+            script.contains("tar $own -cf /dev/null -T /dev/null 2>/dev/null"),
+            "the script must probe tar for the ownership extensions, got: {script}"
+        );
+        assert!(
+            script.contains("own=\"\"; ext=\"--no-same-owner\""),
+            "the probe must fall back to the previous flags, got: {script}"
+        );
+        assert!(
+            script.contains("tar $own -cf \"$tmp\"")
+                && script.contains("$ext --no-same-permissions --touch -xf"),
+            "both tar invocations must use the probed flags, got: {script}"
+        );
+    }
+
+    /// Drive the generated script with a stub `tar` on `PATH` so the retry
+    /// logic is exercised rather than asserted as a substring.
+    ///
+    /// A real tar cannot cover this: ownership is only restored under uid 0, so
+    /// an unprivileged test run skips the `chown` and always succeeds, and the
+    /// Rust job also runs on macOS where bsdtar takes the probe fallback.
+    ///
+    /// The stub reports `probe_status` for the option probe, `owned_status` for
+    /// an extraction that restores ownership, and `plain_status` for one that
+    /// passes `--no-same-owner`. Returns whether the sentinel was written, and
+    /// the argument list of every stub invocation.
+    #[cfg(unix)]
+    fn run_seed_script_with_stub_tar(
+        probe_status: i32,
+        owned_status: i32,
+        plain_status: i32,
+    ) -> (bool, Vec<String>) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_temp_dir();
+        let (bin, src, dst) = (root.join("bin"), root.join("src"), root.join("dst"));
+        for dir in [&bin, &src, &dst] {
+            std::fs::create_dir_all(dir).expect("test directories should be creatable");
+        }
+        // One entry so `find ... -exec tar` runs at all.
+        std::fs::write(src.join("payload"), b"x").expect("payload should be writable");
+
+        let log = root.join("calls.log");
+        let stub = bin.join("tar");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$*\" >> {log}\n\
+                 for a in \"$@\"; do\n\
+                 \x20 case \"$a\" in\n\
+                 \x20   -T) exit {probe_status} ;;\n\
+                 \x20   -xf) case \"$*\" in\n\
+                 \x20          *--no-same-owner*) exit {plain_status} ;;\n\
+                 \x20          *) exit {owned_status} ;;\n\
+                 \x20        esac ;;\n\
+                 \x20 esac\n\
+                 done\n\
+                 # Archive creation: materialize the file the script tests for.\n\
+                 prev=''\n\
+                 for a in \"$@\"; do\n\
+                 \x20 [ \"$prev\" = -cf ] && : > \"$a\"\n\
+                 \x20 prev=\"$a\"\n\
+                 done\n\
+                 exit 0\n",
+                log = log.display(),
+            ),
+        )
+        .expect("stub tar should be writable");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("stub tar should be executable");
+
+        let script = workspace_seed_script(
+            src.to_str().expect("src path should be UTF-8"),
+            dst.to_str().expect("dst path should be UTF-8"),
+            1234,
+            5678,
+        );
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("PATH", path)
+            .status()
+            .expect("seed script should be runnable");
+
+        let sentinel = dst.join(WORKSPACE_SENTINEL).exists();
+        let calls = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let _ = std::fs::remove_dir_all(&root);
+
+        // The script's own status must agree with whether it recorded the seed.
+        assert_eq!(
+            status.success(),
+            sentinel,
+            "script status and sentinel must agree, calls: {calls:?}"
+        );
+        (sentinel, calls)
+    }
+
+    /// Regression: a writable PVC backend can accept the write but reject
+    /// `chown` — root-squashed NFS is the usual case. tar restores ownership by
+    /// default under uid 0, so the extraction failed after writing the tree and
+    /// the sentinel was never recorded, leaving the pod retrying initialization
+    /// forever. Extraction must retry without ownership instead.
+    #[cfg(unix)]
+    #[test]
+    fn workspace_init_retries_extraction_when_ownership_restore_is_denied() {
+        let (sentinel, calls) = run_seed_script_with_stub_tar(0, 2, 0);
+
+        assert!(
+            sentinel,
+            "a destination that rejects chown must still complete seeding, calls: {calls:?}"
+        );
+        let extractions = calls
+            .iter()
+            .filter(|c| c.contains("-xf"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            extractions.len(),
+            2,
+            "the denied extraction must be retried exactly once, calls: {calls:?}"
+        );
+        assert!(
+            extractions[0].contains("--numeric-owner")
+                && !extractions[0].contains("--no-same-owner"),
+            "the first extraction must restore ownership, got: {extractions:?}"
+        );
+        assert!(
+            extractions[1].contains("--no-same-owner"),
+            "the retry must drop ownership restoration, got: {extractions:?}"
+        );
+    }
+
+    /// The retry is a fallback, not an unconditional second pass: a destination
+    /// that accepts ownership must be seeded once.
+    #[cfg(unix)]
+    #[test]
+    fn workspace_init_does_not_retry_when_ownership_restore_succeeds() {
+        let (sentinel, calls) = run_seed_script_with_stub_tar(0, 0, 0);
+
+        assert!(sentinel, "seeding must complete, calls: {calls:?}");
+        assert_eq!(
+            calls.iter().filter(|c| c.contains("-xf")).count(),
+            1,
+            "a successful extraction must not be repeated, calls: {calls:?}"
+        );
+    }
+
+    /// The sentinel records that the workspace was seeded. When no extraction
+    /// succeeds it must stay absent so the next start seeds again, rather than
+    /// marking an empty workspace as initialized.
+    #[cfg(unix)]
+    #[test]
+    fn workspace_init_withholds_sentinel_when_every_extraction_fails() {
+        let (sentinel, calls) = run_seed_script_with_stub_tar(0, 2, 2);
+
+        assert!(
+            !sentinel,
+            "a workspace that never seeded must not be marked initialized, calls: {calls:?}"
+        );
+    }
+
+    /// An image whose tar lacks the ownership extensions already drops to
+    /// `--no-same-owner` at the probe. Retrying there would re-run an identical
+    /// extraction and could report a genuine failure as a fallback attempt, so
+    /// the retry is guarded on the ownership flags being in use.
+    #[cfg(unix)]
+    #[test]
+    fn workspace_init_does_not_retry_when_the_probe_dropped_ownership() {
+        let (sentinel, calls) = run_seed_script_with_stub_tar(1, 0, 2);
+
+        assert!(
+            !sentinel,
+            "a failure that is already the degraded path must not be recorded as \
+             seeded, calls: {calls:?}"
+        );
+        let extractions = calls
+            .iter()
+            .filter(|c| c.contains("-xf"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            extractions.len(),
+            1,
+            "an extraction that already dropped ownership must not be repeated, \
+             calls: {calls:?}"
+        );
+        assert!(
+            extractions[0].contains("--no-same-owner"),
+            "the probe fallback must extract without ownership, got: {extractions:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .filter(|c| !c.contains("-T "))
+                .all(|c| !c.contains("--owner=")),
+            "only the probe itself may carry the ownership flags once it failed, \
+             calls: {calls:?}"
+        );
+    }
+
+    /// The seeded identity must track the driver-resolved UID/GID rather than
+    /// a hardcoded 1000, so images built for a different UID range (or an
+    /// OpenShift-allocated one) still produce a usable workspace.
+    #[test]
+    fn workspace_init_ownership_tracks_resolved_identity() {
+        let params = SandboxPodParams {
+            sandbox_uid: 1_000_660_000,
+            sandbox_gid: 1_000_660_000,
+            ..SandboxPodParams::default()
+        };
+
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "img:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        let init_containers = pod_template["spec"]["initContainers"]
+            .as_array()
+            .expect("initContainers should exist");
+        let workspace_init = init_containers
+            .iter()
+            .find(|c| c["name"] == WORKSPACE_INIT_CONTAINER_NAME)
+            .expect("workspace init container should exist");
+
+        let script = workspace_init["command"][2]
+            .as_str()
+            .expect("init script should be the third command element");
+
+        assert!(
+            script.contains("--owner=1000660000") && script.contains("--group=1000660000"),
+            "seeded ownership must follow the resolved sandbox identity, got: {script}"
         );
     }
 
