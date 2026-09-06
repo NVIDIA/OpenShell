@@ -4277,6 +4277,12 @@ fn apply_driver_snapshot(
             SandboxPhase::Stopping
         }
         SandboxPhase::Stopping if phase != SandboxPhase::Error => SandboxPhase::Stopping,
+        // A driver's explicit bootstrap condition is authoritative evidence
+        // that an accepted StartSandbox operation is provisioning a new
+        // generation. This observation must be able to recover a stale
+        // Stopped view so the replacement supervisor can register. A genuine
+        // stop includes Suspended=True and does not satisfy this predicate.
+        SandboxPhase::Stopped if driver_snapshot_confirms_starting(incoming) => phase,
         SandboxPhase::Stopped => SandboxPhase::Stopped,
         SandboxPhase::Completed => SandboxPhase::Completed,
         SandboxPhase::Starting if !matches!(phase, SandboxPhase::Ready | SandboxPhase::Error) => {
@@ -4346,6 +4352,20 @@ fn driver_snapshot_confirms_stopped(incoming: &DriverSandbox) -> bool {
                     "containerexited" | "containerstopped"
                 )
         })
+    })
+}
+
+fn driver_snapshot_confirms_starting(incoming: &DriverSandbox) -> bool {
+    incoming.status.as_ref().is_some_and(|status| {
+        !status.deleting
+            && status.conditions.iter().any(|condition| {
+                condition.r#type.eq_ignore_ascii_case("Bootstrapping")
+                    && condition.status.eq_ignore_ascii_case("true")
+            })
+            && !status.conditions.iter().any(|condition| {
+                condition.r#type.eq_ignore_ascii_case("Suspended")
+                    && condition.status.eq_ignore_ascii_case("true")
+            })
     })
 }
 
@@ -7754,6 +7774,73 @@ mod tests {
         )));
 
         runtime.apply_sandbox_update(stopped).await.unwrap();
+
+        let current = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.phase(), SandboxPhase::Stopped as i32);
+    }
+
+    #[tokio::test]
+    async fn active_bootstrap_snapshot_recovers_stale_stopped_view() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-restart", "sandbox-restart", SandboxPhase::Stopped);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let mut bootstrapping = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        let mut status = make_driver_status(make_driver_condition(
+            "DependenciesNotReady",
+            "replacement supervisor is starting",
+        ));
+        status.conditions.push(DriverCondition {
+            r#type: "Bootstrapping".to_string(),
+            status: "True".to_string(),
+            reason: "GenerationStarting".to_string(),
+            message: "Replacement generation is starting".to_string(),
+            last_transition_time: String::new(),
+        });
+        bootstrapping.status = Some(status);
+
+        runtime.apply_sandbox_update(bootstrapping).await.unwrap();
+
+        let current = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.phase(), SandboxPhase::Provisioning as i32);
+    }
+
+    #[tokio::test]
+    async fn suspended_bootstrap_snapshot_does_not_revive_stopped_sandbox() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-stopped", "sandbox-stopped", SandboxPhase::Stopped);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let mut status = make_driver_status(make_driver_condition(
+            "DependenciesNotReady",
+            "dependencies are unavailable",
+        ));
+        status.conditions.push(DriverCondition {
+            r#type: "Bootstrapping".to_string(),
+            status: "True".to_string(),
+            reason: "GenerationStarting".to_string(),
+            message: "Replacement generation is starting".to_string(),
+            last_transition_time: String::new(),
+        });
+        status.conditions.push(DriverCondition {
+            r#type: "Suspended".to_string(),
+            status: "True".to_string(),
+            reason: "PodTerminated".to_string(),
+            message: "Sandbox is suspended".to_string(),
+            last_transition_time: String::new(),
+        });
+        let mut suspended = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        suspended.status = Some(status);
+
+        runtime.apply_sandbox_update(suspended).await.unwrap();
 
         let current = runtime
             .store
