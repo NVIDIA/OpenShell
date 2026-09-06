@@ -289,8 +289,12 @@ names, creation timestamps, and labels. Crate-level details live in
 `WatchSandbox` merges three per-sandbox sources into one client stream: status
 snapshots, server/sandbox logs, and platform events. Logs and platform events
 are resumable; a shared per-sandbox counter stamps each with a monotonic
-`cursor` so the merged stream is linearly ordered across both sources. Status
-snapshots and warnings are re-read on demand and carry `cursor = 0`.
+`cursor`. Cursor-ordered delivery is guaranteed for the replay phase: on
+resume the buffered events from both sources are sorted by cursor before
+emission. Live events carry cursors and are monotonic within each source, but
+the two sources are read independently, so a client should order across sources
+by `cursor` rather than by arrival. Status snapshots and warnings are re-read on
+demand and carry `cursor = 0`.
 
 The gateway holds a bounded in-memory tail per sandbox. Loss is reported with
 two distinct, documented behaviors:
@@ -304,9 +308,12 @@ two distinct, documented behaviors:
   requested and earliest-available cursors so the client can restart cleanly.
 
 On resume the server replays only events after the client's cursor from both
-resumable sources, merged in cursor order, before entering live delivery — no
-loss and no duplication. Clients track the highest observed `cursor` and pass it
-as `resume_after_cursor` on reconnect.
+resumable sources, merged in cursor order, before entering live delivery. The
+broadcast receivers are subscribed before replay, so an event buffered during
+initialization could appear in both replay and the live receiver; the producer
+tracks the highest replayed cursor and suppresses live events at or below it, so
+each event is delivered once. Clients track the highest observed `cursor` and
+pass it as `resume_after_cursor` on reconnect.
 
 ## Persistence
 

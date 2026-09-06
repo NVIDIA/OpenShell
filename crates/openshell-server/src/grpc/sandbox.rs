@@ -1057,6 +1057,13 @@ pub(super) async fn handle_watch_sandbox(
                 }
             }
 
+            // Highest resumable cursor already handled by the tail/replay phase.
+            // The broadcast receivers were subscribed before replay ran, so an
+            // event published during initialization can sit in both the replay
+            // buffer and a live receiver. The live loop suppresses events at or
+            // below this cutoff so each is delivered exactly once.
+            let mut replay_cutoff: u64 = resume_after_cursor;
+
             if resume_after_cursor > 0 {
                 // Resume: replay events strictly after the client's cursor from both
                 // resumable buses. Either bus reporting a trimmed range is an
@@ -1107,6 +1114,12 @@ pub(super) async fn handle_watch_sandbox(
 
                 merged.sort_by_key(|e| e.cursor);
 
+                // Everything through the highest replayed cursor is now handled;
+                // suppress its live duplicate below.
+                if let Some(last) = merged.last() {
+                    replay_cutoff = replay_cutoff.max(last.cursor);
+                }
+
                 for evt in merged {
                     if let Some(Payload::Log(ref log)) = evt.payload {
                         if log_since_ms > 0 && log.timestamp_ms < log_since_ms {
@@ -1142,6 +1155,7 @@ pub(super) async fn handle_watch_sandbox(
                                 continue;
                             }
                         }
+                        replay_cutoff = replay_cutoff.max(evt.cursor);
                         if tx.send(Ok(evt)).await.is_err() {
                             return;
                         }
@@ -1155,6 +1169,7 @@ pub(super) async fn handle_watch_sandbox(
                         .platform_event_bus
                         .tail(&sandbox_id, event_tail as usize)
                     {
+                        replay_cutoff = replay_cutoff.max(evt.cursor);
                         if tx.send(Ok(evt)).await.is_err() {
                             return;
                         }
@@ -1217,6 +1232,10 @@ pub(super) async fn handle_watch_sandbox(
                     } => {
                         match res {
                             Ok(evt) => {
+                                // Skip events already delivered by the tail/replay phase.
+                                if evt.cursor != 0 && evt.cursor <= replay_cutoff {
+                                    continue;
+                                }
                                 if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(ref log)) = evt.payload {
                                     if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
                                         continue;
@@ -1249,6 +1268,10 @@ pub(super) async fn handle_watch_sandbox(
                     } => {
                         match res {
                             Ok(evt) => {
+                                // Skip events already delivered by the tail/replay phase.
+                                if evt.cursor != 0 && evt.cursor <= replay_cutoff {
+                                    continue;
+                                }
                                 if tx.send(Ok(evt)).await.is_err() {
                                     return;
                                 }
@@ -3258,6 +3281,73 @@ mod tests {
 
         // Stream ends after the terminal status.
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn watch_delivers_each_event_once_during_init_race() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("race", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        // Seed events that land in the tail before the watch subscribes.
+        seed_log_lines(&state, &id, 5);
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Publish more concurrently with producer initialization. Some of these
+        // can land after the broadcast subscription but before the tail read,
+        // putting them in both replay and the live receiver.
+        for i in 5..15 {
+            state
+                .tracing_log_bus
+                .publish_external(openshell_core::proto::SandboxLogLine {
+                    sandbox_id: id.clone(),
+                    timestamp_ms: i64::from(i),
+                    level: "INFO".to_string(),
+                    target: "test".to_string(),
+                    message: format!("line {i}"),
+                    source: "gateway".to_string(),
+                    ..Default::default()
+                });
+        }
+
+        let mut stream = response.into_inner();
+        let mut cursors = Vec::new();
+        while let Ok(Some(item)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), stream.next()).await
+        {
+            let evt = item.unwrap();
+            if evt.cursor != 0 {
+                cursors.push(evt.cursor);
+            }
+        }
+
+        // Every delivered cursor is unique (no double delivery) and monotonically
+        // increasing (replay ordered, then live in cursor order for one source).
+        let mut sorted = cursors.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            cursors.len(),
+            "duplicate cursors delivered: {cursors:?}"
+        );
+        assert_eq!(
+            cursors, sorted,
+            "cursors not delivered in order: {cursors:?}"
+        );
     }
 
     #[tokio::test]
