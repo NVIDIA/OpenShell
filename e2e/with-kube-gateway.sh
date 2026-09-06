@@ -223,9 +223,11 @@ cleanup() {
       kctl -n "${NAMESPACE}" get pods -o wide 2>&1 || true
       echo "=== Agent Sandbox resources ==="
       kctl -n "${NAMESPACE}" get sandboxes.agents.x-k8s.io -o yaml 2>&1 || true
+      echo "=== gateway sandbox records ==="
+      "${ROOT}/target/debug/openshell" sandbox list --all --output json 2>&1 || true
       echo "=== proxy-pod supervisor Deployments ==="
       kctl -n "${NAMESPACE}" get deployments \
-        -l "openshell.ai/boundary-role=control" -o yaml 2>&1 || true
+        -l "openshell.ai/boundary-role=supervisor" -o yaml 2>&1 || true
       echo "=== proxy-pod supervisor logs (last 200 lines each) ==="
       while IFS= read -r supervisor_pod; do
         [ -n "${supervisor_pod}" ] || continue
@@ -233,13 +235,13 @@ cleanup() {
         kctl -n "${NAMESPACE}" logs "${supervisor_pod}" \
           --all-containers --prefix --tail=200 2>&1 || true
       done < <(kctl -n "${NAMESPACE}" get pods \
-        -l "openshell.ai/boundary-role=control" -o name 2>/dev/null || true)
+        -l "openshell.ai/boundary-role=supervisor" -o name 2>/dev/null || true)
       echo "=== gateway events ==="
       kctl -n "${NAMESPACE}" get events --sort-by=.lastTimestamp 2>&1 \
         | tail -n 80 || true
       echo "=== gateway lifecycle and supervisor-session logs ==="
-      kctl -n "${NAMESPACE}" logs \
-        -l "app.kubernetes.io/instance=${RELEASE_NAME}" --since=20m \
+      kctl -n "${NAMESPACE}" logs "$(kube_workload_ref "${RELEASE_NAME}")" \
+        --since=20m \
         --all-containers --prefix 2>&1 \
         | grep -Ei "sandbox phase changed|start_sandbox|stop_sandbox|supervisor session|proxy-pod|bootstrap" \
         || true
