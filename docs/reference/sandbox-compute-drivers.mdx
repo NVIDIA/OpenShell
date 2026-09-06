@@ -590,7 +590,8 @@ You can override autodetection with explicit `sandbox_uid` / `sandbox_gid` confi
 The resolved UID/GID appear in:
 
 - Supervisor container environment variables (`OPENSHELL_SANDBOX_UID`, `OPENSHELL_SANDBOX_GID`) for direct kernel-level privilege dropping without `/etc/passwd` lookups.
-- PVC init container `securityContext.runAsUser/runAsGroup/fsGroup` for workspace ownership operations.
+- Agent container `securityContext.runAsUser/runAsGroup`, and the pod-level `securityContext.fsGroup` that kubelet applies to the workspace volume at mount time.
+- Ownership of the content the `workspace-init` container seeds into a fresh workspace PVC. That container runs as root so it can read every path the image ships, and writes the seeded tree as the resolved UID/GID. Images whose `tar` lacks the GNU ownership extensions — a minimal base such as Alpine, which provides BusyBox `tar` — seed as root instead, so a mode-`0700` directory from such an image stays unreadable to the workload.
 
 ### VM Driver
 
