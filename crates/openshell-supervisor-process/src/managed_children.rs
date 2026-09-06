@@ -10,44 +10,113 @@
 
 #![cfg(target_os = "linux")]
 
-use std::collections::HashSet;
-use std::sync::{LazyLock, Mutex};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
-static MANAGED_CHILDREN: LazyLock<Mutex<HashSet<i32>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+static MANAGED_CHILDREN: LazyLock<Mutex<HashMap<i32, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-/// Add `pid` to the supervised-child set. Non-positive or out-of-range values
-/// are silently ignored.
-pub fn register(pid: u32) {
-    let Ok(pid) = i32::try_from(pid) else {
-        return;
-    };
-    if pid <= 0 {
-        return;
+/// Identity of one registry entry. The generation prevents an old waiter from
+/// removing a newer child that reused the same numeric PID after reap.
+#[derive(Clone, Copy)]
+pub struct ManagedChild {
+    pid: i32,
+    generation: u64,
+}
+
+/// Exclusive access to the managed-child registry.
+///
+/// A process spawner holds this guard from immediately before `spawn` or
+/// `fork` until the returned PID is registered. The orphan reaper holds the
+/// same guard while deciding whether to reap an exited child. This closes the
+/// otherwise unavoidable window in which a fast-exiting managed child exists
+/// but its PID has not yet been published.
+pub struct RegistryGuard(MutexGuard<'static, HashMap<i32, u64>>);
+
+impl RegistryGuard {
+    /// Add a newly spawned managed child.
+    pub fn register(&mut self, pid: u32) -> Option<ManagedChild> {
+        let Ok(pid) = i32::try_from(pid) else {
+            return None;
+        };
+        if pid <= 0 {
+            return None;
+        }
+        let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        self.0.insert(pid, generation);
+        Some(ManagedChild { pid, generation })
     }
-    if let Ok(mut children) = MANAGED_CHILDREN.lock() {
-        children.insert(pid);
+
+    /// Return whether the PID belongs to an explicit waiter.
+    #[must_use]
+    pub fn contains(&self, pid: i32) -> bool {
+        self.0.contains_key(&pid)
     }
 }
 
-/// Remove `pid` from the supervised-child set. Non-positive or out-of-range
-/// values are silently ignored.
-pub fn unregister(pid: u32) {
-    let Ok(pid) = i32::try_from(pid) else {
-        return;
-    };
-    if pid <= 0 {
-        return;
-    }
-    if let Ok(mut children) = MANAGED_CHILDREN.lock() {
-        children.remove(&pid);
+/// Lock the registry for an atomic spawn-and-register or inspect-and-reap
+/// operation.
+pub fn lock() -> RegistryGuard {
+    RegistryGuard(
+        MANAGED_CHILDREN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// Register a child and return the generation-bearing removal token.
+pub fn register(pid: u32) -> Option<ManagedChild> {
+    lock().register(pid)
+}
+
+/// Remove exactly this supervised-child registration. A newer registration
+/// for a reused PID is preserved.
+pub fn unregister(child: ManagedChild) {
+    if let Ok(mut children) = MANAGED_CHILDREN.lock()
+        && children.get(&child.pid) == Some(&child.generation)
+    {
+        children.remove(&child.pid);
     }
 }
 
 /// Return `true` if `pid` is currently in the supervised-child set.
 #[must_use]
 pub fn is_managed(pid: i32) -> bool {
-    MANAGED_CHILDREN
-        .lock()
-        .is_ok_and(|children| children.contains(&pid))
+    lock().contains(pid)
+}
+
+/// Wait until a managed child is terminal without reaping it.
+///
+/// Keeping the child as a zombie prevents PID/process-group reuse until the
+/// owner publishes terminal state and performs the final wait.
+pub fn wait_until_terminal(pid: u32) -> std::io::Result<()> {
+    use nix::sys::wait::{Id, WaitPidFlag, waitid};
+    let pid = i32::try_from(pid)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "PID out of range"))?;
+    waitid(
+        Id::Pid(nix::unistd::Pid::from_raw(pid)),
+        WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT,
+    )
+    .map(|_| ())
+    .map_err(std::io::Error::other)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_unregister_preserves_reused_pid_registration() {
+        let pid = i32::MAX as u32;
+        let first = lock().register(pid).expect("first registration");
+        let second = lock().register(pid).expect("replacement registration");
+
+        unregister(first);
+        assert!(is_managed(i32::try_from(pid).expect("test pid")));
+
+        unregister(second);
+        assert!(!is_managed(i32::try_from(pid).expect("test pid")));
+    }
 }

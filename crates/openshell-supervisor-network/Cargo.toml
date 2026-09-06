@@ -11,11 +11,15 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+openshell-binary-identity = { path = "../openshell-binary-identity" }
 openshell-core = { path = "../openshell-core", features = ["oauth"] }
+openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-router = { path = "../openshell-router" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
+
+async-trait = "0.1"
 
 apollo-parser = { workspace = true }
 aws-sigv4 = { version = "1", features = ["sign-http", "http1"] }

@@ -24,7 +24,7 @@ pub struct NftCommand {
     pub required: bool,
 }
 
-/// Generate nft commands for sandbox network bypass enforcement.
+/// Generate the legacy nft commands for sandbox bypass detection.
 ///
 /// Creates an `inet` family table (handles both IPv4 and IPv6) with rules that:
 /// 1. Accept traffic to the proxy (IPv4 only)
@@ -34,11 +34,35 @@ pub struct NftCommand {
 ///
 /// If `log_prefix` is provided, log rules are inserted before each reject rule
 /// so that bypass attempts are recorded in the kernel ring buffer before being
-/// rejected. Log rules are always non-required since they need `nf_log` support.
+/// rejected. Log rules are non-required since they need `nf_log` support.
 pub fn generate_bypass_commands(
     host_ip: &str,
     proxy_port: u16,
     log_prefix: Option<&str>,
+) -> Vec<NftCommand> {
+    generate_commands(host_ip, proxy_port, log_prefix, false)
+}
+
+/// Generate the RFC 0012 default-deny egress ceiling.
+///
+/// Only the exact proxy destination and loopback are accepted. TCP and UDP
+/// rejects are optional fast-fail behavior; the base-chain drop policy covers
+/// every address family and protocol. No blanket conntrack exception is
+/// installed because pre-existing or related flows must not bypass mediation.
+#[allow(dead_code, reason = "consumed when RFC 0012 backend activation lands")]
+pub fn generate_egress_ceiling_commands(
+    host_ip: &str,
+    proxy_port: u16,
+    log_prefix: Option<&str>,
+) -> Vec<NftCommand> {
+    generate_commands(host_ip, proxy_port, log_prefix, true)
+}
+
+fn generate_commands(
+    host_ip: &str,
+    proxy_port: u16,
+    log_prefix: Option<&str>,
+    default_deny: bool,
 ) -> Vec<NftCommand> {
     let table = "openshell_bypass";
     let mut cmds = vec![
@@ -52,7 +76,11 @@ pub fn generate_bypass_commands(
                 "inet",
                 table,
                 "output",
-                "{ type filter hook output priority 0; policy accept; }",
+                if default_deny {
+                    "{ type filter hook output priority 0; policy drop; }"
+                } else {
+                    "{ type filter hook output priority 0; policy accept; }"
+                },
             ],
         ),
         nft_cmd(
@@ -78,7 +106,10 @@ pub fn generate_bypass_commands(
                 "add", "rule", "inet", table, "output", "oifname", "lo", "accept",
             ],
         ),
-        nft_cmd(
+    ];
+
+    if !default_deny {
+        cmds.push(nft_cmd(
             false,
             &[
                 "add",
@@ -91,8 +122,8 @@ pub fn generate_bypass_commands(
                 "established,related",
                 "accept",
             ],
-        ),
-    ];
+        ));
+    }
 
     if let Some(prefix) = log_prefix {
         let quoted = nft_quote(prefix);
@@ -106,7 +137,7 @@ pub fn generate_bypass_commands(
     }
 
     cmds.push(nft_cmd(
-        true,
+        !default_deny,
         &[
             "add",
             "rule",
@@ -127,7 +158,7 @@ pub fn generate_bypass_commands(
         ],
     ));
     cmds.push(nft_cmd(
-        true,
+        !default_deny,
         &[
             "add",
             "rule",
@@ -160,7 +191,7 @@ pub fn generate_bypass_commands(
     }
 
     cmds.push(nft_cmd(
-        true,
+        !default_deny,
         &[
             "add",
             "rule",
@@ -181,7 +212,7 @@ pub fn generate_bypass_commands(
         ],
     ));
     cmds.push(nft_cmd(
-        true,
+        !default_deny,
         &[
             "add",
             "rule",
@@ -599,6 +630,25 @@ mod tests {
     }
 
     #[test]
+    fn in_pod_ceiling_is_default_deny_for_all_protocols() {
+        let text = all_strs(&generate_egress_ceiling_commands("10.0.2.2", 3128, None));
+        assert!(text.contains("policy drop"));
+        assert!(!text.contains("policy accept"));
+        assert!(!text.contains("ct state"));
+    }
+
+    #[test]
+    fn in_pod_reject_rules_are_optional_fast_fail_over_default_drop() {
+        let commands = generate_egress_ceiling_commands("10.0.2.2", 3128, None);
+        for command in commands
+            .iter()
+            .filter(|command| command.args.iter().any(|argument| argument == "reject"))
+        {
+            assert!(!command.required);
+        }
+    }
+
+    #[test]
     fn proxy_accept_rule_uses_provided_ip_and_port() {
         let cmds = generate_bypass_commands("172.16.0.1", 9999, None);
         let text = all_strs(&cmds);
@@ -611,7 +661,7 @@ mod tests {
         let text = all_strs(&cmds);
         let proxy_pos = text.find("ip daddr").unwrap();
         let lo_pos = text.find("oifname lo").unwrap();
-        let ct_pos = text.find("ct state established,related").unwrap();
+        let ct_pos = text.find("ct state established").unwrap();
         let reject_pos = text.find("reject with icmp type").unwrap();
 
         assert!(proxy_pos < lo_pos);

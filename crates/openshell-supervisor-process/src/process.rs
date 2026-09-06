@@ -659,6 +659,8 @@ pub struct ProcessHandle {
     child: Child,
     pid: u32,
     io: Option<ProcessIo>,
+    #[cfg(target_os = "linux")]
+    managed_child: Option<managed_children::ManagedChild>,
 }
 
 /// Supervisor-owned canonical-process I/O. These handles outlive individual
@@ -917,7 +919,7 @@ impl ProcessHandle {
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to spawn sandbox entrypoint process '{program}'"))?;
         let pid = child.id().unwrap_or(0);
-        managed_children::register(pid);
+        let managed_child = managed_children::register(pid);
 
         let io = if let Some(master) = pty_master {
             ProcessIo::Pty(master)
@@ -935,6 +937,8 @@ impl ProcessHandle {
             child,
             pid,
             io: Some(io),
+            #[cfg(target_os = "linux")]
+            managed_child,
         })
     }
 
@@ -1103,7 +1107,9 @@ impl ProcessHandle {
     pub async fn wait(&mut self) -> std::io::Result<ProcessStatus> {
         let status = self.child.wait().await;
         #[cfg(target_os = "linux")]
-        managed_children::unregister(self.pid);
+        if let Some(child) = self.managed_child.take() {
+            managed_children::unregister(child);
+        }
         let status = status?;
         Ok(ProcessStatus::from(status))
     }
@@ -1113,7 +1119,9 @@ impl ProcessHandle {
         let status = self.child.try_wait()?;
         if status.is_some() {
             #[cfg(target_os = "linux")]
-            managed_children::unregister(self.pid);
+            if let Some(child) = self.managed_child.take() {
+                managed_children::unregister(child);
+            }
         }
         Ok(status.map(ProcessStatus::from))
     }
@@ -1163,7 +1171,9 @@ impl ProcessHandle {
 impl Drop for ProcessHandle {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
-        managed_children::unregister(self.pid);
+        if let Some(child) = self.managed_child.take() {
+            managed_children::unregister(child);
+        }
     }
 }
 

@@ -12,10 +12,12 @@ rust-version.workspace = true
 
 [dependencies]
 openshell-core = { path = "../openshell-core" }
+openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
 
 anyhow = { workspace = true }
+async-trait = "0.1"
 base64 = { workspace = true }
 bytes = { workspace = true }
 hex = "0.4"

@@ -285,6 +285,7 @@ fn eligible_endpoints(
         let destination_plan = build_validation_plan(
             name.as_str(),
             name.as_str(),
+            None,
             trusted_host_gateway,
             &raw_allowed_ips,
             exact_declared_host,

@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-binary-identity"
+description = "Trusted executable identity resolution for OpenShell isolation backends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+openshell-isolation-interface = { path = "../openshell-isolation-interface" }
+sha2 = { workspace = true }
+
+[lints]
+workspace = true
