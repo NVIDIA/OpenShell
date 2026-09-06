@@ -25,8 +25,88 @@ permissions:
   contents: read
 
 jobs:
+  host-supervisor-macos:
+    name: native host supervisor (aarch64-apple-darwin)
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      package: openshell-supervisor
+      binary: openshell-supervisor
+      triple: aarch64-apple-darwin
+      runner: macos-15-xlarge
+      dev-shell: .#devShells.aarch64-darwin.default
+      cargo-version: ${{ inputs.cargo-version }}
+      image-tag: ${{ inputs.image-tag }}
+      checkout-ref: ${{ inputs.checkout-ref }}
+    secrets: inherit
+
+  helper-runtime:
+    name: helper runtime (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            docker_arch: amd64
+            runner: linux-amd64-cpu8
+          - arch: aarch64
+            docker_arch: arm64
+            runner: linux-arm64-cpu8
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
+
+      - name: Download openshell-sandbox
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-sandbox-${{ matrix.arch }}-unknown-linux-musl
+          path: sandbox
+
+      - name: Download openshell-supervisor
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-supervisor-${{ matrix.arch }}-unknown-linux-musl
+          path: supervisor
+
+      - name: Assemble trusted helper runtime
+        shell: bash
+        run: |
+          binary_dir="deploy/docker/.build/prebuilt-binaries/${{ matrix.docker_arch }}"
+          install -d "$binary_dir" artifacts
+          install -m 0555 sandbox/openshell-sandbox "$binary_dir/openshell-sandbox"
+          install -m 0555 supervisor/openshell-supervisor "$binary_dir/openshell-supervisor"
+
+          image="openshell-vm-helper-runtime:${{ matrix.docker_arch }}-${GITHUB_RUN_ID}"
+          container=""
+          cleanup() {
+            if [ -n "$container" ]; then docker rm -f "$container" >/dev/null 2>&1 || true; fi
+            docker image rm "$image" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker build \
+            --build-arg "TARGETARCH=${{ matrix.docker_arch }}" \
+            --file deploy/docker/Dockerfile.supervisor \
+            --tag "$image" \
+            .
+          container="$(docker create "$image")"
+          docker cp "$container:/openshell-runtime" - \
+            | zstd -19 -T0 -o artifacts/openshell-runtime.tar.zst
+          test -s artifacts/openshell-runtime.tar.zst
+
+      - name: Upload trusted helper runtime
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: openshell-vm-helper-runtime-${{ matrix.arch }}
+          path: artifacts/openshell-runtime.tar.zst
+          if-no-files-found: error
+
   build:
     name: openshell-driver-vm (${{ matrix.triple }})
+    needs: [helper-runtime, host-supervisor-macos]
     strategy:
       matrix:
         include:
@@ -64,15 +144,40 @@ jobs:
           name: openshell-sandbox-${{ matrix.arch }}-unknown-linux-musl
           path: sandbox
 
+      - name: Download openshell-supervisor
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-supervisor-${{ matrix.arch }}-unknown-linux-musl
+          path: supervisor
+
+      - name: Download native macOS host supervisor
+        if: endsWith(matrix.triple, '-apple-darwin')
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-supervisor-aarch64-apple-darwin
+          path: host-supervisor
+
+      - name: Download trusted helper runtime
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openshell-vm-helper-runtime-${{ matrix.arch }}
+          path: helper-runtime
+
       - name: Build VM runtime
         run: nix build .#vm-runtime
 
       - name: Assemble compressed VM runtime
         run: |
           compressed_dir="${RUNNER_TEMP}/vm-runtime-compressed"
+          host_supervisor="supervisor/openshell-supervisor"
+          if [[ "${{ matrix.triple }}" == *-apple-darwin ]]; then
+            host_supervisor="host-supervisor/openshell-supervisor"
+          fi
           install -d "$compressed_dir"
           cp result/compressed/*.zst "$compressed_dir/"
           zstd -19 -T1 sandbox/openshell-sandbox -o "$compressed_dir/openshell-sandbox.zst"
+          zstd -19 -T1 "$host_supervisor" -o "$compressed_dir/openshell-supervisor.zst"
+          cp helper-runtime/openshell-runtime.tar.zst "$compressed_dir/"
 
       - name: Build openshell-driver-vm
         uses: ./.github/actions/build-rust-binary

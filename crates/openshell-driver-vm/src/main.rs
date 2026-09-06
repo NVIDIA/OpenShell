@@ -8,7 +8,9 @@ use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
-use openshell_driver_vm::{VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, procguard, run_vm};
+use openshell_driver_vm::{
+    VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, VsockPortMap, procguard, run_vm,
+};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -144,7 +146,7 @@ struct Args {
     sandbox_gid: Option<u32>,
 
     // Corporate forward proxy for sandbox egress. Operator-owned: these reach
-    // the guest supervisor on its argv, which the sandbox image and the
+    // the host supervisor on its argv, which the sandbox image and the
     // user-supplied environment cannot influence.
     #[arg(long, env = "OPENSHELL_VM_HTTPS_PROXY")]
     https_proxy: Option<String>,
@@ -174,36 +176,21 @@ struct Args {
     vm_gpu_bdf: Option<String>,
 
     #[arg(long, hide = true)]
-    vm_tap_device: Option<String>,
-
-    #[arg(long, hide = true)]
-    vm_guest_ip: Option<String>,
-
-    #[arg(long, hide = true)]
-    vm_host_ip: Option<String>,
-
-    #[arg(long, hide = true)]
     vm_vsock_cid: Option<u32>,
 
     #[arg(long, hide = true)]
-    vm_guest_mac: Option<String>,
+    vm_vsock_control_port: Option<u32>,
 
     #[arg(long, hide = true)]
-    vm_gateway_port: Option<u16>,
+    vm_vsock_control_socket: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     if args.internal_run_vm {
-        // We intentionally defer procguard arming until `run_vm()` so
-        // that the only arm is the one that knows how to clean up
-        // gvproxy. Racing two watchers against the same parent-death
-        // event causes the bare arm's `exit(1)` to win, skipping the
-        // gvproxy cleanup and leaking the helper. The risk window
-        // before `run_vm` arms procguard is ~a few syscalls long
-        // (`build_vm_launch_config`, `configured_runtime_dir`), which
-        // is negligible next to the parent gRPC server's uptime.
+        // The VM launcher arms procguard after resolving its runtime so its
+        // libkrun worker cannot outlive the launcher.
         maybe_reexec_internal_vm_with_runtime_env()?;
         let config = build_vm_launch_config(&args).map_err(|err| miette::miette!("{err}"))?;
         run_vm(&config).map_err(|err| miette::miette!("{err}"))?;
@@ -226,7 +213,7 @@ async fn main() -> Result<()> {
     // we also die. Without this the driver is reparented to init and
     // keeps its per-sandbox VM launchers alive forever. Launchers have
     // their own procguards (armed in `run_vm`) which cascade cleanup of
-    // gvproxy and the libkrun worker the moment this driver exits.
+    // the libkrun worker the moment this driver exits.
     if let Err(err) = procguard::die_with_parent() {
         tracing::warn!(
             error = %err,
@@ -562,12 +549,24 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         console_output,
         backend,
         gpu_bdf: args.vm_gpu_bdf.clone(),
-        tap_device: args.vm_tap_device.clone(),
-        guest_ip: args.vm_guest_ip.clone(),
-        host_ip: args.vm_host_ip.clone(),
         vsock_cid: args.vm_vsock_cid,
-        guest_mac: args.vm_guest_mac.clone(),
-        gateway_port: args.vm_gateway_port,
+        vsock_port_map: match (
+            args.vm_vsock_control_port,
+            args.vm_vsock_control_socket.clone(),
+        ) {
+            (Some(guest_port), Some(host_socket)) => Some(VsockPortMap {
+                guest_port,
+                host_socket,
+                host_initiated: true,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(
+                    "--vm-vsock-control-port and --vm-vsock-control-socket must be set together"
+                        .to_string(),
+                );
+            }
+        },
     })
 }
 

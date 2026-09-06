@@ -1,33 +1,40 @@
 # openshell-driver-vm
 
-> Status: Experimental. The VM compute driver is under active development and the interface still has VM-specific plumbing that will be generalized.
+> Status: Experimental. The VM compute driver is under active development.
 
-Standalone libkrun-backed [`ComputeDriver`](../../proto/compute_driver.proto) for OpenShell. The gateway spawns this binary as a subprocess, talks to it over a Unix domain socket with the `openshell.compute.v1.ComputeDriver` gRPC surface, and lets it manage per-sandbox microVMs. The runtime (libkrun + libkrunfw + gvproxy), guest OCI unpacker, and sandbox supervisor are embedded directly in the binary; each sandbox boots from a cached immutable bootstrap ext4 root disk plus a per-sandbox writable overlay disk. When the requested sandbox image differs from the bootstrap image, the driver prepares a read-only image ext4 disk inside a bootstrap VM and mounts that unpacked rootfs as the sandbox lowerdir.
+Standalone libkrun-backed [`ComputeDriver`](../../proto/compute_driver.proto) for OpenShell. The gateway spawns this binary as a subprocess and talks to it over the `openshell.compute.v1.ComputeDriver` Unix-socket surface. `openshell-supervisor` runs as a native host process, while `openshell-sandbox` runs as capability-free PID 1 inside each microVM and applies guest-local isolation over virtio-vsock.
+
+The driver embeds libkrun, libkrunfw, the guest OCI unpacker, the portable guest sandbox, and the custom kernel runtime. Each sandbox boots from a cached immutable bootstrap ext4 root disk plus a per-sandbox writable overlay disk. When the requested sandbox image differs from the bootstrap image, the driver prepares a read-only image ext4 disk inside a bootstrap VM and mounts that unpacked rootfs as the sandbox lowerdir.
 
 ## How it fits together
 
 ```mermaid
 flowchart LR
-    subgraph host["Host process"]
+    subgraph host["Host"]
         gateway["openshell-gateway<br/>(vm::spawn)"]
-        driver["openshell-driver-vm<br/>├── libkrun (VM)<br/>├── gvproxy (net)<br/>└── openshell-sandbox.zst"]
+        driver["openshell-driver-vm<br/>libkrun"]
+        supervisor["openshell-supervisor<br/>host policy supervisor"]
         gateway <-->|"gRPC over UDS<br/>compute-driver.sock"| driver
+        supervisor <-->|"authenticated gRPC<br/>policy + relay"| gateway
     end
 
     subgraph guest["Per-sandbox microVM"]
         init["/srv/openshell-vm-<br/>sandbox-init.sh"]
-        supervisor["/opt/openshell/bin/<br/>openshell-sandbox<br/>(PID 1)"]
-        init --> supervisor
+        sandbox["openshell-sandbox<br/>capability-free guest PID 1"]
+        workload["sandbox workload"]
+        init --> sandbox --> workload
     end
 
     driver -->|"CreateSandbox<br/>boots via libkrun"| guest
-    supervisor -.->|"gRPC callback<br/>--grpc-endpoint"| gateway
+    supervisor <-->|"mutual TLS RFC 0012<br/>over virtio-vsock"| sandbox
 
-    client["openshell-cli"] -->|"SSH proxy<br/>127.0.0.1:&lt;port&gt;"| supervisor
+    client["openshell-cli"] -->|"connect / exec / forward"| gateway
     client -->|"CreateSandbox / Watch"| gateway
 ```
 
-Sandbox guests execute `/opt/openshell/bin/openshell-sandbox` as PID 1 inside the VM. gvproxy exposes a single inbound SSH port (`host:<allocated>` → `guest:2222`) and provides virtio-net egress.
+The supervisor owns gateway credentials, admitted policy, provider resolution, middleware, the network proxy, and relay registration. The sandbox receives no gateway JWT. Each VM generation receives distinct sandbox and supervisor channel keys; the guest consumes and unlinks its private bootstrap files before launching the workload.
+
+VM-specific RFC 0012 code under `src/isolation/` only chooses the vsock transport and binds immutable VM generation and image claims into the protected guest config and host descriptor. Lifecycle, authentication, process control, binary identity, forwarding, and streaming come from `openshell-isolation-interface` and `openshell-sandbox`.
 
 ## Quick start (recommended)
 
@@ -35,7 +42,7 @@ Sandbox guests execute `/opt/openshell/bin/openshell-sandbox` as PID 1 inside th
 mise run gateway:vm
 ```
 
-First run takes a few minutes while `mise run vm:setup` stages libkrun/libkrunfw/gvproxy/umoci and `mise run vm:supervisor` builds the bundled guest supervisor. Subsequent runs are cached.
+First run takes a few minutes while `mise run vm:setup` stages libkrun/libkrunfw/umoci and `mise run vm:supervisor` builds the portable Linux guest sandbox plus its trusted helper runtime. The development task also builds the native host supervisor. Subsequent runs are cached.
 
 By default `mise run gateway:vm`:
 
@@ -96,13 +103,13 @@ rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/openshell/gateways/vm-dev"
 If you want to drive the launch yourself instead of using `mise run gateway:vm` (i.e. `tasks/scripts/gateway-vm.sh`):
 
 ```shell
-# 1. Stage runtime artifacts + supervisor bundle into target/vm-runtime-compressed/
+# 1. Stage runtime artifacts + guest sandbox into target/vm-runtime-compressed/
 mise run vm:setup
-mise run vm:supervisor          # if openshell-sandbox.zst is not already present
+mise run vm:supervisor          # builds the Linux guest sandbox and trusted helper runtime
 
-# 2. Build both binaries with the staged artifacts embedded
+# 2. Build gateway, native host supervisor, and driver
 OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=$PWD/target/vm-runtime-compressed \
-  cargo build -p openshell-gateway -p openshell-driver-vm
+  cargo build -p openshell-gateway -p openshell-supervisor -p openshell-driver-vm
 
 # 3. macOS only: codesign the driver for Hypervisor.framework
 codesign \
@@ -121,7 +128,7 @@ disable_tls = true
 
 [openshell.drivers.vm]
 default_image = "<compatible-image>"
-grpc_endpoint = "http://host.containers.internal:18081"
+grpc_endpoint = "http://127.0.0.1:18081"
 driver_dir = "$PWD/target/debug"
 state_dir = "/tmp/openshell-vm-driver-$USER-vm-dev"
 EOF
@@ -142,8 +149,8 @@ Select the VM driver with `--drivers vm`, `OPENSHELL_DRIVERS=vm`, or `compute_dr
 
 | Configuration key | Default | Purpose |
 |---|---|---|
-| `grpc_endpoint` | empty | Required. URL the sandbox guest dials to reach the gateway. Use `http://host.containers.internal:<port>` (or `host.docker.internal` / `host.openshell.internal`) so traffic flows through gvproxy's host-loopback NAT (HostIP `192.168.127.254` → host `127.0.0.1`). Loopback URLs like `http://127.0.0.1:<port>` are rewritten automatically by the driver. The bare gateway IP (`192.168.127.1`) only carries gvproxy's own services and will not reach host-bound ports. |
-| `state_dir` | `target/openshell-vm-driver` | Per-sandbox overlay disks, console logs, image cache, and private `run/compute-driver.sock` UDS. |
+| `grpc_endpoint` | empty | Required. URL the native host supervisor uses to reach the gateway. Host loopback such as `http://127.0.0.1:<port>` is valid. Legacy guest aliases are normalized to host loopback. This endpoint is never sent into the VM. |
+| `state_dir` | `target/openshell-vm-driver` | Per-sandbox overlay disks, console logs, image cache, and private `run/compute-driver.sock` UDS. Relative paths are resolved to absolute paths at driver startup. |
 | `driver_dir` | unset | Override the directory searched for `openshell-driver-vm`. |
 | `default_image` | OpenShell base image | Sandbox image used when a create request omits one. |
 | `bootstrap_image` | unset | VM runtime image used as the immutable bootstrap root disk. Defaults to the sandbox image when unset. |
@@ -151,17 +158,17 @@ Select the VM driver with `--drivers vm`, `OPENSHELL_DRIVERS=vm`, or `compute_dr
 | `mem_mib` | `2048` | Memory per sandbox, in MiB. |
 | `overlay_disk_mib` | `4096` | Sparse writable overlay disk size per sandbox, in MiB. |
 | `krun_log_level` | `1` | libkrun verbosity (0-5). |
-| `guest_tls_ca` | unset | CA cert for the guest's mTLS client bundle. Required when `grpc_endpoint` uses `https://`. |
-| `guest_tls_cert` | unset | Guest client certificate. |
-| `guest_tls_key` | unset | Guest client private key. |
-| `https_proxy` | unset | Corporate forward proxy (`http://host:port` or `https://host:port`) the in-guest supervisor chains policy-approved TLS CONNECT egress through. On the libkrun backend a proxy on the gateway host's loopback must be addressed as `http://host.openshell.internal:<port>` — guest egress leaves through gvproxy, which NATs `192.168.127.254` to the host's `127.0.0.1`. The QEMU/TAP backend (GPU sandboxes) has no such NAT and its nftables rules expose only the gateway port to the guest, so a gateway-host proxy URL is rejected at launch there; use an address routable from the guest's masqueraded egress. |
+| `guest_tls_ca` | unset | Historical key name for the host supervisor's gateway CA certificate. Required when `grpc_endpoint` uses `https://`; never copied into the guest. |
+| `guest_tls_cert` | unset | Historical key name for the host supervisor's client certificate; never copied into the guest. |
+| `guest_tls_key` | unset | Historical key name for the host supervisor's client private key; never copied into the guest. |
+| `https_proxy` | unset | Corporate forward proxy (`http://host:port` or `https://host:port`) that host control chains policy-approved TLS CONNECT egress through. Host-loopback proxy URLs work because control runs on the gateway host. |
 | `no_proxy` | unset | Comma-separated bypass list for the corporate proxy only. OpenShell policy evaluation still applies. |
 | `proxy_auth_file` | unset | Gateway-host path to a `user:pass` credential file. Staged root-only into the per-sandbox overlay and removed with the sandbox. |
 | `proxy_auth_allow_insecure` | unset | Required with `proxy_auth_file` against an `http://` proxy: acknowledges that Basic auth is cleartext on the connection to the proxy. |
 | `proxy_connect_by_hostname` | unset | Send hostnames rather than validated IPs in CONNECT. Last resort for proxies whose ACLs reject IP targets. |
 | `proxy_ca_bundle` | unset | Gateway-host path to a PEM CA bundle trusted for an `https://` proxy and for certificates a TLS-intercepting proxy re-signs. |
 
-The proxy settings are operator-owned and deployment-level: they are not accepted through `template.driver_config.vm`, and they reach the supervisor on its command line through a per-sandbox argument file the driver writes into the overlay upperdir on every launch, so a sandbox image cannot forge or shadow them. Every present-but-invalid value is fatal at gateway or sandbox startup rather than degrading to a direct dial.
+The proxy settings are operator-owned and deployment-level: they are not accepted through `template.driver_config.vm`, and the driver passes them only to native host control. Every present-but-invalid value is fatal at gateway or sandbox startup rather than degrading to a direct dial.
 
 See [`openshell-gateway --help`](../openshell-server/src/cli.rs) for the gateway process flag surface.
 
@@ -219,9 +226,17 @@ marked sandboxes without launching compute. Start removes the marker and uses
 the normal persisted restore path with the existing overlay. Delete removes the
 entire sandbox state directory, including a stop marker and overlay.
 
-The driver records a terminal tombstone when the canonical main process exits.
-Driver startup reports that sandbox as terminal instead of relaunching the VM,
-even when the process exited successfully.
+The host control writes and syncs a terminal tombstone when the canonical main
+process exits, before it reports completion and while it retains the boundary
+for exec and forwarding. Driver startup reports that sandbox as terminal
+instead of relaunching the VM, even when the process exited successfully.
+
+The driver embeds a platform-native host supervisor and extracts it into
+`<state-dir>/host-runtime`. It accepts a cached binary only when its SHA-256
+content matches the embedded supervisor and it remains an executable regular
+file. Replacement is written and synced under a temporary name, then atomically
+renamed into place. `OPENSHELL_VM_SUPERVISOR_BIN` remains an explicit
+development override.
 
 ## Logs and debugging
 
@@ -233,34 +248,23 @@ RUST_LOG=openshell_server=debug,openshell_driver_vm=debug \
 ```
 
 The VM guest's serial console is appended to `<state-dir>/<sandbox-id>/console.log`. Sandbox IDs must match `[A-Za-z0-9._-]{1,128}` before the driver uses them in host paths. The gateway-owned compute-driver socket lives at `<state-dir>/run/compute-driver.sock`; OpenShell creates `run/` with owner-only permissions and removes same-owner stale sockets. On clean shutdown, the gateway sends the managed driver `SIGTERM`, waits up to five seconds for it to flush telemetry and exit, then force-kills it if necessary and removes the socket. UDS clients must match the driver UID and provide the expected gateway process PID by default. Standalone same-UID UDS mode requires the explicit `--allow-same-uid-peer` development flag. TCP mode is disabled by default because it is unauthenticated; use `--allow-unauthenticated-tcp --bind-address 127.0.0.1:50061` only for local development.
+The VM serial console is appended to `<state-dir>/sandboxes/<sandbox-id>/rootfs-console.log`. Host-supervisor stdout and stderr are written beside it as `supervisor.log` and `supervisor.err.log`. Sandbox IDs must match `[A-Za-z0-9._-]{1,128}` before the driver uses them in host paths. The gateway-owned compute-driver socket lives at `<state-dir>/run/compute-driver.sock`; OpenShell creates `run/` with owner-only permissions, removes same-owner stale sockets, and the gateway removes the socket on clean shutdown via `ManagedDriverProcess::drop`. UDS clients must match the driver UID and provide the expected gateway process PID by default. Standalone same-UID UDS mode requires the explicit `--allow-same-uid-peer` development flag. TCP mode is disabled by default because it is unauthenticated; use `--allow-unauthenticated-tcp --bind-address 127.0.0.1:50061` only for local development.
 
-## Host-side nftables rules
+## Network isolation
 
-The VM driver creates a per-VM nftables table on the host (`openshell_vm_vmtap_<id>`) with three chains. These rules serve two purposes: NAT infrastructure (required for VM connectivity) and defense-in-depth host isolation. Primary security enforcement — proxy-only egress and bypass detection — is handled by the sandbox supervisor's own nftables rules inside the VM guest.
-
-**`postrouting` (NAT):** Masquerades outbound VM traffic so it can be routed from the VM's private subnet to the external network. This chain handles forwarded traffic (VM → internet), not traffic destined for the host.
-
-**`forward` (defense-in-depth):** Accepts all outbound traffic from the VM (security enforcement happens guest-side) and accepts established/related response traffic back to the VM. Drops unsolicited inbound connections to the VM from the broader network. This chain handles forwarded traffic only — packets transiting the host between the TAP interface and other interfaces.
-
-**`input` (defense-in-depth):** Accepts traffic from the VM to the gateway port on the host. Drops all other traffic from the VM destined for the host itself. This limits what a compromised guest can reach on the host to the gateway service only.
-
-The `input` and `postrouting` chains handle different traffic paths: `input` covers packets addressed to the host (VM → host), while `postrouting` covers packets the host is forwarding on behalf of the VM (VM → internet). A packet from the VM goes through one path or the other, never both.
-
-All chains use `policy accept`, so non-TAP traffic is unaffected. Because nftables evaluates multiple base chains on the same hook independently, host firewalls interact with these rules as follows:
-
-- **Open host (no other firewall):** Our chains are the only filter. The defense-in-depth drop rules block unsolicited inbound and non-gateway host access. Non-TAP traffic passes through.
-- **Restrictive host firewall (e.g. firewalld):** The host firewall's chains may additionally drop TAP traffic that our chains accept. A `drop` verdict from any chain is final — our `accept` cannot override it. If VM connectivity fails, verify that the host firewall allows forwarding and input for `vmtap-*` interfaces.
-
-Each table is created atomically via `nft -f` on VM start and torn down atomically via `nft delete table` when the VM is destroyed.
+VM sandboxes boot without a virtual NIC. The guest exposes only the protected
+vsock channel used by `openshell-sandbox`; `openshell-supervisor` performs DNS,
+policy evaluation, and external networking on the host. The driver does not
+create TAP devices or install nftables/iptables rules.
 
 ## Prerequisites
 
 - macOS on Apple Silicon, or Linux on aarch64/x86_64 with KVM
 - Rust toolchain
 - e2fsprogs (`mke2fs` or `mkfs.ext4`, plus `debugfs`) for root and overlay disk image creation and QEMU environment injection
-- Guest-supervisor cross-compile toolchain (needed on macOS, and on Linux when host arch ≠ guest arch):
-  - Matching rustup target: `rustup target add aarch64-unknown-linux-gnu` (or `x86_64-unknown-linux-gnu` for an amd64 guest)
-  - `cargo install --locked cargo-zigbuild` and `brew install zig` (or distro equivalent). `vm:supervisor` uses `cargo zigbuild` to cross-compile the in-VM `openshell-sandbox` supervisor binary.
+- Guest-sandbox cross-compile toolchain (needed on macOS, and on Linux when host arch differs from the guest):
+  - Matching static guest target: `rustup target add aarch64-unknown-linux-musl` (or `x86_64-unknown-linux-musl` for an amd64 guest)
+  - `cargo install --locked cargo-zigbuild` and `brew install zig` (or distro equivalent). `vm:supervisor` cross-compiles the Linux guest `openshell-sandbox` and its matching `openshell-supervisor`.
 - [mise](https://mise.jdx.dev/) task runner
 - Docker or Podman socket on the local CLI/gateway host when using
   `openshell sandbox create --from ./Dockerfile` or `--from ./dir`; the CLI
@@ -291,11 +295,11 @@ The RPM gateway package is configured for the Podman driver.
 
 On Apple Silicon macOS, `install.sh` stages the generated `openshell.rb`
 formula from the selected release in the `nvidia/openshell` Homebrew tap.
-Homebrew installs `openshell`, `openshell-gateway`, and
-`openshell-driver-vm`, ad-hoc signs the driver with the Hypervisor entitlement
-in `post_install`, and owns the `brew services` gateway lifecycle. The service
-also leaves `OPENSHELL_DRIVERS` unset so driver choice remains automatic unless
-the user explicitly overrides it.
+Homebrew installs `openshell`, `openshell-gateway`, and the self-contained
+`openshell-driver-vm` with its embedded native supervisor. It ad-hoc signs the
+driver with the Hypervisor entitlement in `post_install` and owns the `brew
+services` gateway lifecycle. The service also leaves `OPENSHELL_DRIVERS` unset
+so driver choice remains automatic unless the user explicitly overrides it.
 
 ## TODOs
 

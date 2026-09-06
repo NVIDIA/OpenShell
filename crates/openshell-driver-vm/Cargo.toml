@@ -17,45 +17,83 @@ path = "src/lib.rs"
 [[bin]]
 name = "openshell-driver-vm"
 path = "src/main.rs"
+required-features = ["compute-driver"]
 
 [dependencies]
 openshell-core = { path = "../openshell-core", default-features = false }
-openshell-otel = { path = "../openshell-otel" }
-openshell-policy = { path = "../openshell-policy" }
-openshell-driver-podman = { path = "../openshell-driver-podman" }
-openshell-vfio = { path = "../openshell-vfio" }
+openshell-isolation-interface = { path = "../openshell-isolation-interface" }
+openshell-otel = { path = "../openshell-otel", optional = true }
+openshell-policy = { path = "../openshell-policy", optional = true }
+openshell-driver-podman = { path = "../openshell-driver-podman", optional = true }
+openshell-vfio = { path = "../openshell-vfio", optional = true }
 
-bollard = { version = "0.20", features = ["ssh"] }
+base64 = { workspace = true, optional = true }
+bollard = { version = "0.20", features = ["ssh"], optional = true }
 tokio = { workspace = true }
-tonic = { workspace = true, features = ["transport"] }
-tower-http = { workspace = true }
-http = { workspace = true }
-prost = { workspace = true }
-prost-types = { workspace = true }
-futures = { workspace = true }
-tokio-stream = { workspace = true, features = ["net"] }
-nix = { workspace = true }
-clap = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-opentelemetry = { workspace = true }
-opentelemetry_sdk = { workspace = true }
-tracing-opentelemetry = { workspace = true }
-miette = { workspace = true }
-url = { workspace = true }
+tonic = { workspace = true, features = ["transport"], optional = true }
+tower-http = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+prost-types = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+tokio-stream = { workspace = true, features = ["net"], optional = true }
+nix = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+miette = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-oci-client = "0.16"
+oci-client = { version = "0.16", optional = true }
 libc = "0.2"
-rustix = { workspace = true }
-libloading = "0.8"
-tar = "0.4"
-flate2 = "1"
-sha2 = "0.10"
-zstd = "0.13"
+rustix = { workspace = true, optional = true }
+libloading = { version = "0.8", optional = true }
+tar = { version = "0.4", optional = true }
+flate2 = { version = "1", optional = true }
+sha2 = { version = "0.10", optional = true }
+zstd = { version = "0.13", optional = true }
 
 [features]
-default = ["telemetry"]
+default = ["compute-driver", "telemetry"]
+## Build the standalone compute driver and its host runtime implementation.
+compute-driver = [
+    "dep:base64",
+    "dep:bollard",
+    "dep:clap",
+    "dep:flate2",
+    "dep:futures",
+    "dep:http",
+    "dep:libloading",
+    "dep:miette",
+    "dep:nix",
+    "dep:oci-client",
+    "dep:openshell-otel",
+    "dep:openshell-policy",
+    "dep:openshell-driver-podman",
+    "dep:openshell-vfio",
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:polling",
+    "dep:prost",
+    "dep:prost-types",
+    "dep:rand",
+    "dep:rustix",
+    "dep:sha2",
+    "dep:tar",
+    "dep:tokio-stream",
+    "dep:tonic",
+    "dep:tower-http",
+    "dep:tracing",
+    "dep:tracing-opentelemetry",
+    "dep:tracing-subscriber",
+    "dep:url",
+    "dep:zstd",
+]
 ## Compile in telemetry support (forwards to openshell-core/telemetry). On by
 ## default; build with `--no-default-features` for a telemetry-free VM driver
 ## that reports telemetry disabled to the sandboxes it launches.
@@ -68,7 +106,7 @@ telemetry = ["openshell-core/telemetry"]
 ## enabling it alongside `telemetry` is a compile error rather than a silent
 ## telemetry-on build. Kept in sync with `default` by
 ## `rust:verify:defaults-without-telemetry`.
-defaults-without-telemetry = []
+defaults-without-telemetry = ["compute-driver"]
 
 [dev-dependencies]
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
@@ -82,7 +120,7 @@ opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # nix::sys::prctl::set_pdeathsig there keeps the Linux path a single
 # syscall with no helper thread.
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
-polling = "3.11"
+polling = { version = "3.11", optional = true }
 
 [lints]
 workspace = true
