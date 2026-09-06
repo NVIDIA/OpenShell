@@ -21,6 +21,7 @@ pub struct BoundaryAccess {
     terminating: Arc<AtomicBool>,
     ssh_task: Option<tokio::task::JoinHandle<()>>,
     session_task: Option<tokio::task::JoinHandle<()>>,
+    session_readiness: Option<tokio::sync::watch::Receiver<bool>>,
     main_session: Option<Arc<crate::main_session::MainSession>>,
 }
 
@@ -29,6 +30,13 @@ impl BoundaryAccess {
     #[must_use]
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    /// Observe whether the gateway has accepted the current supervisor
+    /// session. The value returns to false while the session reconnects.
+    #[must_use]
+    pub fn session_readiness(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.session_readiness.clone()
     }
 
     /// Publish the canonical process's terminal status to attached clients.
@@ -85,6 +93,7 @@ pub async fn start_boundary_access(
             terminating,
             ssh_task: None,
             session_task: None,
+            session_readiness: None,
             main_session: None,
         });
     };
@@ -142,7 +151,7 @@ pub async fn start_boundary_access(
         }
     }
 
-    let session_task = match (openshell_endpoint, sandbox_id) {
+    let (session_task, session_readiness) = match (openshell_endpoint, sandbox_id) {
         (Some(endpoint), Some(id)) => {
             let (task, mut accepted) = crate::supervisor_session::spawn_with_readiness(
                 endpoint.to_string(),
@@ -153,10 +162,12 @@ pub async fn start_boundary_access(
                 terminating.clone(),
                 instance_id.clone(),
             );
-            match tokio::time::timeout(Duration::from_secs(10), accepted.wait_for(|ready| *ready))
-                .await
-            {
-                Ok(Ok(_)) => Some(task),
+            let accepted_result =
+                tokio::time::timeout(Duration::from_secs(10), accepted.wait_for(|ready| *ready))
+                    .await
+                    .map(|result| result.map(|_| ()));
+            match accepted_result {
+                Ok(Ok(())) => (Some(task), Some(accepted)),
                 Ok(Err(_)) => {
                     task.abort();
                     return Err(miette::miette!(
@@ -171,7 +182,7 @@ pub async fn start_boundary_access(
                 }
             }
         }
-        _ => None,
+        _ => (None, None),
     };
 
     Ok(BoundaryAccess {
@@ -179,6 +190,7 @@ pub async fn start_boundary_access(
         terminating,
         ssh_task: Some(ssh_task),
         session_task,
+        session_readiness,
         main_session: Some(main_session),
     })
 }
@@ -243,6 +255,7 @@ mod tests {
             terminating: Arc::new(AtomicBool::new(false)),
             ssh_task: None,
             session_task: None,
+            session_readiness: None,
             main_session: Some(main_session.clone()),
         };
 

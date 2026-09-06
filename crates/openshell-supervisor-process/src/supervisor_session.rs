@@ -340,6 +340,7 @@ async fn run_session_loop(config: SessionConfig) {
 
         match run_single_session(&config).await {
             Ok(()) => {
+                config.ready_tx.send_replace(false);
                 let event = session_closed_event(
                     openshell_ocsf::ctx::ctx(),
                     &config.endpoint,
@@ -349,6 +350,7 @@ async fn run_session_loop(config: SessionConfig) {
                 break;
             }
             Err(e) => {
+                config.ready_tx.send_replace(false);
                 let event = session_failed_event(
                     openshell_ocsf::ctx::ctx(),
                     &config.endpoint,
