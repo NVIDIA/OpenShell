@@ -7489,7 +7489,7 @@ mod tests {
         );
         let mut current = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
         current.status = Some(make_driver_status(make_driver_condition(
-            "PodStarting",
+            "ContainerStarting",
             "replacement workload is still starting",
         )));
         driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(current)));
