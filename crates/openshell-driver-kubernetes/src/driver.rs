@@ -3983,16 +3983,34 @@ fn spawn_proxy_pod_bootstrap_completion(
 }
 
 fn proxy_pod_runtime_is_ready(object: &DynamicObject) -> bool {
-    object
+    let Some(generation) = object.metadata.generation else {
+        return false;
+    };
+    let Some(conditions) = object
         .data
         .pointer("/status/conditions")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|conditions| {
-            conditions.iter().any(|condition| {
-                condition.get("type").and_then(serde_json::Value::as_str) == Some("Ready")
-                    && condition.get("status").and_then(serde_json::Value::as_str) == Some("True")
-            })
-        })
+    else {
+        return false;
+    };
+    let observes_current_generation = |condition: &serde_json::Value| {
+        condition
+            .get("observedGeneration")
+            .and_then(serde_json::Value::as_i64)
+            == Some(generation)
+    };
+    let ready = conditions.iter().any(|condition| {
+        condition.get("type").and_then(serde_json::Value::as_str) == Some("Ready")
+            && condition.get("status").and_then(serde_json::Value::as_str) == Some("True")
+            && observes_current_generation(condition)
+    });
+    let suspended = conditions.iter().any(|condition| {
+        condition.get("type").and_then(serde_json::Value::as_str)
+            == Some(SANDBOX_SUSPENDED_CONDITION)
+            && condition.get("status").and_then(serde_json::Value::as_str) == Some("True")
+            && observes_current_generation(condition)
+    });
+    ready && !suspended
 }
 
 fn proxy_pod_fence_is_old_enough(policy: &NetworkPolicy, now: SystemTime) -> bool {
@@ -9663,18 +9681,31 @@ mod tests {
             SANDBOX_KIND,
         ));
         let mut sandbox = DynamicObject::new("sandbox", &resource);
+        sandbox.metadata.generation = Some(7);
         sandbox.data = serde_json::json!({
             "status": {
-                "conditions": [{"type": "Suspended", "status": "True"}]
+                "conditions": [{"type": "Suspended", "status": "True", "observedGeneration": 7}]
             }
         });
         assert!(!proxy_pod_runtime_is_ready(&sandbox));
 
         sandbox.data["status"]["conditions"] = serde_json::json!([
-            {"type": "Suspended", "status": "False"},
-            {"type": "Ready", "status": "True"}
+            {"type": "Suspended", "status": "False", "observedGeneration": 6},
+            {"type": "Ready", "status": "True", "observedGeneration": 6}
+        ]);
+        assert!(!proxy_pod_runtime_is_ready(&sandbox));
+
+        sandbox.data["status"]["conditions"] = serde_json::json!([
+            {"type": "Suspended", "status": "False", "observedGeneration": 7},
+            {"type": "Ready", "status": "True", "observedGeneration": 7}
         ]);
         assert!(proxy_pod_runtime_is_ready(&sandbox));
+
+        sandbox.data["status"]["conditions"] = serde_json::json!([
+            {"type": "Suspended", "status": "True", "observedGeneration": 7},
+            {"type": "Ready", "status": "True", "observedGeneration": 7}
+        ]);
+        assert!(!proxy_pod_runtime_is_ready(&sandbox));
     }
 
     #[test]
