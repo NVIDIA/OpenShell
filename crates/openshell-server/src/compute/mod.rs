@@ -7528,7 +7528,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.phase(), SandboxPhase::Starting as i32);
+        assert_eq!(
+            stored.phase(),
+            SandboxPhase::Provisioning as i32,
+            "the queued Ready event must be replaced by the driver's authoritative not-ready state"
+        );
     }
 
     #[tokio::test]
@@ -7693,7 +7697,8 @@ mod tests {
         // (PodTerminated). Starting from the Starting phase that `start` sets, the
         // reconciled sandbox must advance to Ready rather than being pinned at
         // Starting by the stale Suspended condition.
-        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
         let sandbox = sandbox_record("sb-resumed", "sandbox-resumed", SandboxPhase::Starting);
         runtime.store.put_message(&sandbox).await.unwrap();
         register_test_supervisor_session(&runtime, sandbox.object_id());
@@ -7721,6 +7726,7 @@ mod tests {
             ..Default::default()
         });
 
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(resumed.clone())));
         runtime.apply_sandbox_update(resumed).await.unwrap();
 
         let current = runtime
