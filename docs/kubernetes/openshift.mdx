@@ -3,140 +3,66 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "OpenShift"
 sidebar-title: "OpenShift"
-description: "Install the OpenShell Helm chart on OpenShift, including the SCC binding and chart overrides required by OpenShift's Security Context Constraints."
+description: "Install the OpenShell Helm chart on OpenShift with capability-free sandbox workloads."
 keywords: "Generative AI, Cybersecurity, Kubernetes, OpenShift, SCC, Security Context Constraints, Helm, Gateway, Installation"
 position: 6
 ---
 
+The Kubernetes driver resolves the UID range assigned to each OpenShift
+namespace and renders the sandbox and supervisor with a numeric non-root
+identity from that range. OpenShell does not require the `privileged` SCC or any
+added Linux capability.
+
 <Warning>
-The OpenShift install path is experimental. It currently requires running sandbox pods under the `privileged` SCC and installing the gateway with TLS disabled. Use only for evaluation on a private network.
+Verify that the selected OpenShift runtime profile permits an unprivileged
+process to install a nested seccomp user-notification filter and use Landlock.
+OpenShell fails sandbox startup when either capability-free runtime probe fails.
 </Warning>
-
-OpenShift's [Security Context Constraints](https://docs.openshift.com/container-platform/latest/authentication/managing-security-context-constraints.html) reject the chart's default pod security settings. Installing on OpenShift requires precreating the namespace, granting the `privileged` SCC to the sandbox service account, and overriding a few chart values so the cluster admission controller can assign UIDs and FS groups itself.
-
-OpenShell installs sandbox nftables rules as individual commands. On OpenShift
-nodes where optional conntrack or packet log expressions are unavailable, those
-optional rules can fail without rolling back the required proxy bypass reject
-rules.
 
 ## Prerequisites
 
-- OpenShift 4.x cluster with `oc` configured
-- Helm 3.x
-- [Agent Sandbox](/kubernetes/setup#install-agent-sandbox) controller and CRDs installed
+- OpenShift 4.x cluster with `oc` configured.
+- Helm 3.x.
+- [Agent Sandbox](/kubernetes/setup#install-agent-sandbox) controller and CRDs.
+- A CNI that enforces ingress and egress `NetworkPolicy` in sandbox namespaces.
 
-## Install
+## Install OpenShell
 
-<Steps>
-
-## Create the namespace
-
-Pre-create the namespace so the SCC binding can be applied before the chart installs:
+Pre-create the namespace, then install the chart. Keep the default restricted
+security posture and acknowledge NetworkPolicy only after validating the CNI.
 
 ```shell
 oc create ns openshell
-```
-
-## Grant the privileged SCC to sandbox pods
-
-Sandbox pods run under the `openshell-sandbox` service account in the `openshell` namespace and require the `privileged` SCC:
-
-```shell
-oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell
-```
-
-## Install the chart with OpenShift overrides
-
-```shell
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set server.disableTls=true \
-  --set podSecurityContext.fsGroup=null \
-  --set securityContext.runAsUser=null
+  --set supervisor.proxyPod.networkPolicyEnforced=true
 ```
 
-| Override | Reason |
-|---|---|
-| `server.disableTls=true` | Runs the gateway over plaintext HTTP for simpler evaluation. |
-| `podSecurityContext.fsGroup=null` / `securityContext.runAsUser=null` | Clear the chart's hardcoded UID and fsGroup so OpenShift's SCC admission can assign them. |
+The driver reads the namespace's `openshift.io/sa.scc.uid-range` annotation and
+uses the resulting UID/GID for the sandbox, agent, trusted init containers, and
+supervisor. Each container sets `allowPrivilegeEscalation: false`, drops all
+Linux capabilities, and uses `RuntimeDefault` seccomp.
 
-## Wait for the gateway to be ready
+Wait for the gateway:
 
 ```shell
 oc -n openshell rollout status statefulset/openshell
 ```
 
-If you set `workload.kind=deployment`, use
-`oc -n openshell rollout status deployment/openshell` instead.
+If you set `workload.kind=deployment`, wait for `deployment/openshell` instead.
 
-</Steps>
+## Connect to the Gateway
 
-## Connect to the gateway
-
-The gateway is now running over plaintext HTTP. Connect with `oc port-forward`:
+Forward the gateway port for local evaluation:
 
 ```shell
 oc -n openshell port-forward svc/openshell 8080:8080
-```
-
-Register the gateway with the CLI:
-
-```shell
-openshell gateway add http://127.0.0.1:8080 --local --name openshift
+openshell gateway add https://127.0.0.1:8080 --local --name openshift
 openshell status
 ```
 
-## Production: expose externally with a real certificate
-
-The steps above run the gateway over plaintext HTTP for quick evaluation. For
-a real deployment, cert-manager can issue the gateway's server certificate
-from a real Issuer or ClusterIssuer (for example, an ACME issuer), and an
-OpenShift Route with TLS passthrough exposes it externally while the gateway
-keeps terminating its own TLS and mTLS.
-
-Install cert-manager and configure a working `ClusterIssuer` first — see
-[Managing Certificates](/kubernetes/managing-certificates) for the
-`certManager.serverIssuerRef` details. Configure an OIDC provider as described
-in [Access Control](/kubernetes/access-control) — remote gateways authenticate
-CLI users via OIDC, not mTLS, so the gateway must know the OIDC issuer URL.
-Install the chart with:
-
-```shell
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
-  --version <version> \
-  --namespace openshell \
-  --set podSecurityContext.fsGroup=null \
-  --set securityContext.runAsUser=null \
-  --set server.disableTls=false \
-  --set certManager.enabled=true \
-  --set certManager.serverIssuerRef.name=<cluster-issuer-name> \
-  --set certManager.serverIssuerRef.kind=ClusterIssuer \
-  --set certManager.serverDnsNames[0]=<external-hostname> \
-  --set openshiftRoute.enabled=true \
-  --set openshiftRoute.host=<external-hostname> \
-  --set server.oidc.issuer=<oidc-issuer-url> \
-  --set server.oidc.audience=<oidc-audience>
-```
-
-| Override | Reason |
-|---|---|
-| `certManager.serverIssuerRef` | Creates a second server certificate from your Issuer or ClusterIssuer for external clients. The gateway uses SNI to present this cert for the external hostname while continuing to present the internal (chart CA) cert to supervisors. The internal certificate's `ca.crt` is the chart CA that also signed the client cert, so the default `clientCaFromServerTlsSecret=true` is correct. |
-| `openshiftRoute.enabled` / `openshiftRoute.host` | Creates an OpenShift Route with TLS passthrough — the router forwards the encrypted connection by SNI without decrypting, so the gateway uses the SNI hostname to select the external certificate. |
-| `server.oidc.issuer` / `server.oidc.audience` | Configures server-side OIDC validation. Without these, the gateway expects mTLS client certificates and rejects OIDC-only CLI connections. See [Access Control](/kubernetes/access-control). |
-
-Register the gateway with the CLI over OIDC. Remote gateways authenticate CLI
-users via OIDC, not mTLS — see [Access Control](/kubernetes/access-control):
-
-```shell
-openshell gateway add https://<external-hostname> \
-  --name openshift \
-  --oidc-issuer <issuer-url>
-openshell gateway login openshift
-```
-
-## Next Steps
-
-- For more on certificate provisioning modes, refer to [Managing Certificates](/kubernetes/managing-certificates).
-- To expose the gateway externally through the Kubernetes Gateway API instead of a Route, refer to [Ingress](/kubernetes/ingress).
-- To configure OIDC authentication, refer to [Access Control](/kubernetes/access-control).
+For a remote deployment, configure an OpenShift Route with TLS passthrough and
+an OIDC provider. Refer to [Ingress](/kubernetes/ingress), [Managing
+Certificates](/kubernetes/managing-certificates), and [Access
+Control](/kubernetes/access-control).

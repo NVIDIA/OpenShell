@@ -165,8 +165,8 @@ impl ProviderCredentialState {
     /// Build a static provider state from an already-prepared child
     /// environment snapshot.
     ///
-    /// Kubernetes sidecar topology uses this in the process-only supervisor:
-    /// the network sidecar owns provider credential resolvers and sends the
+    /// The Kubernetes proxy-pod topology uses this in the sandbox process:
+    /// the supervisor owns provider credential resolvers and sends the
     /// workload-facing env map over a local control channel. The process leaf
     /// must inject that map into child processes without re-placeholderizing it
     /// or holding the gateway-side resolver material.

@@ -180,9 +180,9 @@ run = [
   "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" AGENT_SANDBOX_VERSION=v0.4.6 e2e/rust/e2e-kubernetes.sh",
 ]
 
-["e2e:kubernetes:sidecar"]
-description = "Run Kubernetes e2e with the supervisor sidecar topology overlay"
-env = { OPENSHELL_E2E_KUBE_EXTRA_VALUES = "deploy/helm/openshell/ci/values-sidecar.yaml" }
+["e2e:kubernetes:proxy-pod"]
+description = "Run Kubernetes e2e with the sandbox/supervisor proxy-pod topology"
+env = { OPENSHELL_E2E_KUBE_EXTRA_VALUES = "deploy/helm/openshell/ci/values-proxy-pod.yaml" }
 depends = ["e2e:conformance:build"]
 run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh"
 
@@ -200,13 +200,13 @@ run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debu
 
 ["e2e:kubernetes:workspace-managed"]
 description = "Run Kubernetes e2e with managed workspace mode (auto-created per-workspace namespaces)"
-env = { OPENSHELL_E2E_KUBE_EXTRA_VALUES = "deploy/helm/openshell/ci/values-workspace-managed.yaml", OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET = "e2e-regcred", OPENSHELL_E2E_KUBE_TEST = "workspace_namespace_managed", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e,e2e-kubernetes,e2e-kubernetes-workspace-managed" }
+env = { OPENSHELL_E2E_KUBE_EXTRA_VALUES = "deploy/helm/openshell/ci/values-proxy-pod.yaml:deploy/helm/openshell/ci/values-workspace-managed.yaml", OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET = "e2e-regcred", OPENSHELL_E2E_KUBE_TEST = "workspace_namespace_managed", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e,e2e-kubernetes,e2e-kubernetes-workspace-managed" }
 depends = ["e2e:conformance:build"]
 run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh"
 
 ["e2e:kubernetes:workspace-operator"]
 description = "Run Kubernetes e2e with operator workspace mode (pre-provisioned per-workspace namespaces)"
-env = { OPENSHELL_E2E_KUBE_EXTRA_VALUES = "deploy/helm/openshell/ci/values-workspace-operator.yaml", OPENSHELL_E2E_KUBE_TEST = "workspace_namespace_operator", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e,e2e-kubernetes,e2e-kubernetes-workspace-operator" }
+env = { OPENSHELL_E2E_KUBE_EXTRA_VALUES = "deploy/helm/openshell/ci/values-proxy-pod.yaml:deploy/helm/openshell/ci/values-workspace-operator.yaml", OPENSHELL_E2E_KUBE_TEST = "workspace_namespace_operator", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e,e2e-kubernetes,e2e-kubernetes-workspace-operator" }
 depends = ["e2e:conformance:build"]
 run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh"
 
@@ -238,7 +238,7 @@ depends = ["e2e:conformance:build"]
 run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-vm.sh"
 
 ["e2e:kubernetes:external-driver"]
-description = "Run Kubernetes conformance with a driver-free gateway and external Kubernetes driver sidecar"
+description = "Run Kubernetes conformance with a driver-free gateway and external Kubernetes driver"
 env = { OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER = "1", OPENSHELL_E2E_KUBE_BUILD_IMAGES = "1", OPENSHELL_E2E_KUBERNETES_FEATURES = "" }
 depends = ["e2e:conformance:build"]
 run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-kubernetes.sh"

@@ -158,19 +158,21 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<CreateSandboxResponse>, Status> {
-        self.rpc_tracer
-            .trace(openshell_otel::rpc::CREATE_SANDBOX, async {
-                let sandbox = request
-                    .into_inner()
-                    .sandbox
-                    .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-                self.driver
-                    .create_sandbox(&sandbox)
-                    .await
-                    .map_err(|e| Status::from(openshell_core::ComputeDriverError::from(e)))?;
-                Ok(Response::new(CreateSandboxResponse {}))
-            })
-            .await
+        Box::pin(
+            self.rpc_tracer
+                .trace(openshell_otel::rpc::CREATE_SANDBOX, async {
+                    let sandbox = request
+                        .into_inner()
+                        .sandbox
+                        .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
+                    self.driver
+                        .create_sandbox(&sandbox)
+                        .await
+                        .map_err(|e| Status::from(openshell_core::ComputeDriverError::from(e)))?;
+                    Ok(Response::new(CreateSandboxResponse {}))
+                }),
+        )
+        .await
     }
 
     async fn stop_sandbox(
@@ -198,21 +200,22 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         request: Request<StartSandboxRequest>,
     ) -> Result<Response<StartSandboxResponse>, Status> {
-        self.rpc_tracer
-            .trace(openshell_otel::rpc::START_SANDBOX, async {
-                let request = request.into_inner();
-                if request.sandbox_id.is_empty() {
-                    return Err(Status::invalid_argument("sandbox_id is required"));
-                }
-                self.driver
-                    .start_sandbox(&request.sandbox_id)
-                    .await
-                    .map_err(|error| {
-                        Status::from(openshell_core::ComputeDriverError::from(error))
-                    })?;
-                Ok(Response::new(StartSandboxResponse {}))
-            })
-            .await
+        Box::pin(
+            self.rpc_tracer
+                .trace(openshell_otel::rpc::START_SANDBOX, async {
+                    let request = request.into_inner();
+                    if request.sandbox_id.is_empty() {
+                        return Err(Status::invalid_argument("sandbox_id is required"));
+                    }
+                    Box::pin(self.driver.start_sandbox(&request.sandbox_id))
+                        .await
+                        .map_err(|error| {
+                            Status::from(openshell_core::ComputeDriverError::from(error))
+                        })?;
+                    Ok(Response::new(StartSandboxResponse {}))
+                }),
+        )
+        .await
     }
 
     async fn delete_sandbox(
