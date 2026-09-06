@@ -2134,6 +2134,7 @@ fn pending_sandbox_snapshot(
             sandbox_fd: String::new(),
             conditions: vec![condition],
             deleting,
+            ..Default::default()
         }),
         workspace: sandbox.workspace.clone(),
     }
@@ -3468,6 +3469,7 @@ fn driver_status_from_summary(
             last_transition_time: String::new(),
         }],
         deleting,
+        ..Default::default()
     }
 }
 

@@ -182,6 +182,40 @@ message DriverSandboxSpec {
   // One-shot launch hint forwarded by the gateway when the creating client
   // will attach to the canonical main process.
   bool await_main_process_attachment = 14;
+  // Admitted identity selectors that the driver must resolve before creating
+  // an immutable workload. Empty selectors mean the pinned image/rootfs
+  // defaults. Resolution is mandatory for supported isolation backends.
+  WorkloadIdentityRequest workload_identity = 15;
+}
+
+// Identity inputs admitted by the gateway before workload provisioning.
+message WorkloadIdentityRequest {
+  // User selector from policy or driver configuration (numeric or symbolic).
+  string user = 1;
+  // Group selector from policy or driver configuration (numeric or symbolic).
+  string group = 2;
+}
+
+// Exact immutable identity selected by the driver from pinned runtime
+// metadata. UID/GID zero are invalid for the capability-free sandbox.
+message ResolvedWorkloadIdentity {
+  uint32 uid = 1;
+  uint32 gid = 2;
+  // Sorted, unique supplementary groups. GID zero is invalid.
+  repeated uint32 supplementary_gids = 3;
+  // Driver-defined resolution source such as policy, template, or image.
+  string source = 4;
+  // Immutable image/rootfs/config digest used during resolution.
+  string resource_digest = 5;
+}
+
+// Driver-owned proof that the immutable workload and its outer network fence
+// match the sandbox generation. The gateway joins this with sandbox and
+// supervisor evidence before permitting the first untrusted instruction.
+message DriverFenceEvidence {
+  string generation = 1;
+  string evidence_digest = 2;
+  map<string, string> resource_claims = 3;
 }
 
 message ResourceRequirements {
@@ -266,6 +300,10 @@ message DriverSandboxStatus {
   repeated DriverCondition conditions = 5;
   // True when the compute platform has begun deleting this sandbox.
   bool deleting = 6;
+  // Exact process identity used to create the workload.
+  ResolvedWorkloadIdentity resolved_identity = 7;
+  // Immutable backend and outer-fence evidence for this generation.
+  DriverFenceEvidence fence_evidence = 8;
 }
 
 // Raw compute-platform condition.
