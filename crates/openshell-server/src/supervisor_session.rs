@@ -785,26 +785,36 @@ pub async fn handle_connect_supervisor(
         return Err(Status::internal("failed to send session accepted"));
     }
 
-    if superseded {
-        state
-            .supervisor_sessions
-            .replay_pending_relays(&sandbox_id, &tx)
-            .await;
-    }
-
     if let Err(err) = state
         .compute
         .supervisor_session_connected(&sandbox_id, &hello.instance_id)
         .await
     {
+        // Do not expose SessionAccepted to the supervisor when the gateway
+        // could not durably record the connection. Dropping the buffered
+        // response forces a reconnect, which gives the state transition a
+        // fresh chance instead of leaving a healthy-looking supervisor tied
+        // to a sandbox that never reaches Ready.
+        state
+            .supervisor_sessions
+            .remove_if_current(&sandbox_id, &session_id);
         warn!(
             sandbox_id = %sandbox_id,
             session_id = %session_id,
             error = %err,
             "supervisor session: failed to mark sandbox ready"
         );
-    } else {
-        state.telemetry.sandbox_session_connected(&sandbox_id);
+        return Err(Status::aborted(
+            "failed to persist supervisor session state; reconnect",
+        ));
+    }
+    state.telemetry.sandbox_session_connected(&sandbox_id);
+
+    if superseded {
+        state
+            .supervisor_sessions
+            .replay_pending_relays(&sandbox_id, &tx)
+            .await;
     }
 
     // Step 4: Spawn the session loop that reads inbound messages.
