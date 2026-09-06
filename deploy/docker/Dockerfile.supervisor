@@ -3,19 +3,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# The static sandbox binary is staged at:
-#   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-sandbox
+# The static sandbox and supervisor binaries are staged under
+# deploy/docker/.build/prebuilt-binaries/<arch>/.
 #
-# Alpine supplies nftables and iptables for pod-namespace egress enforcement.
+# Alpine supplies the trusted helper runtime used by VM guest init for its
+# one-shot filesystem and loopback setup. Network enforcement stays outside
+# this runtime; the capability-free sandbox never receives nftables or
+# iptables tooling.
 
 FROM alpine:3.22 AS supervisor
 
 ARG TARGETARCH
 
-RUN apk add --no-cache nftables iptables iptables-legacy
+RUN apk add --no-cache iproute2 \
+    && mkdir -p /openshell-runtime \
+    && cp -aL /bin /sbin /lib /usr/bin /usr/sbin /usr/lib /openshell-runtime/ \
+    && mkdir -p /openshell-runtime/etc \
+    && if [ -d /etc/iproute2 ]; then cp -aL /etc/iproute2 /openshell-runtime/etc/; fi \
+    && test -x /openshell-runtime/bin/sh \
+    && test -x /openshell-runtime/sbin/ip
 
 # Keep the binary root-owned for Podman image-volume mounts and executable by
 # the Kubernetes network sidecar's non-root proxy UID.
 COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /openshell-sandbox
+COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-supervisor /openshell-supervisor
 
+# Keep the image default usable by drivers that run the sandbox boundary in
+# this image. Split-topology drivers select /openshell-supervisor explicitly.
 ENTRYPOINT ["/openshell-sandbox"]

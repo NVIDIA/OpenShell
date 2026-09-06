@@ -25,10 +25,9 @@
 //! The risk is contained by existing sandbox layers:
 //! - **Privilege drop**: `CAP_NET_ADMIN` is not granted, so all write operations
 //!   (add/delete routes, addresses, interfaces) fail with `EPERM` regardless.
-//! - **Network namespace**: the sandboxed process sees only `lo` and one veth;
-//!   no host interfaces are visible.
-//! - **nftables bypass rules**: all non-proxy traffic is rejected at the
-//!   netfilter level regardless of what the sandbox learns about its interfaces.
+//! - **Driver outer fence**: direct workload egress is rejected outside this
+//!   process by Docker network-none, Kubernetes `NetworkPolicy`, or a NIC-less
+//!   VM.
 //!
 //! Every other netlink protocol (`NETLINK_SOCK_DIAG`, `NETLINK_NETFILTER`,
 //! `NETLINK_AUDIT`, `NETLINK_XFRM`, `NETLINK_GENERIC`, etc.) remains blocked.
@@ -72,10 +71,10 @@ pub fn apply_supervisor_prelude() -> Result<()> {
 pub fn apply(policy: &SandboxPolicy) -> Result<()> {
     let allow_inet = matches!(policy.network.mode, NetworkMode::Proxy | NetworkMode::Allow);
     let main_filter = build_filter(allow_inet)?;
-    let clone3_filter = build_clone3_filter()?;
+    let compatibility_filter = build_compatibility_filter()?;
 
     set_no_new_privs()?;
-    apply_runtime_filters(&main_filter, &clone3_filter)?;
+    apply_runtime_filters(&main_filter, &compatibility_filter)?;
 
     Ok(())
 }
@@ -148,7 +147,7 @@ fn compile_filter(
     filter.try_into().into_diagnostic()
 }
 
-/// Build a minimal BPF filter that blocks clone3 with ENOSYS.
+/// Build a minimal BPF filter for unavailable process APIs.
 ///
 /// This is a separate filter from the main one because seccomp BPF cannot
 /// dereference the `struct clone_args *` pointer that clone3 takes as arg 0,
@@ -156,27 +155,28 @@ fn compile_filter(
 /// unconditionally with ENOSYS so glibc falls back to the older clone
 /// syscall (where flags are a direct register argument and CAN be filtered).
 ///
-/// glibc's clone3 wrapper checks for ENOSYS specifically — EPERM would be
-/// treated as a hard failure and propagated to the caller instead of
-/// triggering the clone fallback.
-fn build_clone3_filter() -> Result<seccompiler::BpfProgram> {
+/// glibc's clone3 wrapper and process launchers that opportunistically use
+/// pidfds check for ENOSYS specifically. EPERM is treated as a hard policy
+/// failure instead of triggering their portable fallback paths.
+fn build_compatibility_filter() -> Result<seccompiler::BpfProgram> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     rules.entry(libc::SYS_clone3).or_default();
+    rules.entry(libc::SYS_pidfd_open).or_default();
     compile_filter(rules, SeccompAction::Errno(libc::ENOSYS as u32))
 }
 
 /// Install the sandbox seccomp filters in the required order.
 ///
 /// Order matters:
-/// 1. Install the dedicated clone3 filter first so it can still call
+/// 1. Install the compatibility filter first so it can still call
 ///    `seccomp(SECCOMP_SET_MODE_FILTER)`.
 /// 2. Install the main filter second. It blocks further seccomp filter
 ///    installation with `EPERM`, preserving the original hardening intent.
 fn apply_runtime_filters(
     main_filter: seccompiler::BpfProgramRef<'_>,
-    clone3_filter: seccompiler::BpfProgramRef<'_>,
+    compatibility_filter: seccompiler::BpfProgramRef<'_>,
 ) -> Result<()> {
-    apply_filter(clone3_filter).into_diagnostic()?;
+    apply_filter(compatibility_filter).into_diagnostic()?;
     apply_filter(main_filter).into_diagnostic()?;
     Ok(())
 }
@@ -227,8 +227,9 @@ fn build_filter_rules(allow_inet: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>
     rules.entry(libc::SYS_process_vm_readv).or_default();
     // Cross-process memory write (symmetric with process_vm_readv).
     rules.entry(libc::SYS_process_vm_writev).or_default();
-    // Process handle acquisition, fd theft, and signalling via pidfd.
-    rules.entry(libc::SYS_pidfd_open).or_default();
+    // Process fd theft and signalling via pidfd. pidfd_open is made
+    // unavailable with ENOSYS by the compatibility filter so runtimes can
+    // fall back without gaining a handle to the trusted sandbox boundary.
     rules.entry(libc::SYS_pidfd_getfd).or_default();
     rules.entry(libc::SYS_pidfd_send_signal).or_default();
     // Async I/O subsystem with extensive CVE history.
@@ -279,7 +280,7 @@ fn build_filter_rules(allow_inet: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>
         0, // flags argument
         libc::CLONE_NEWUSER as u64,
     )?;
-    // clone3 is handled by a separate filter — see build_clone3_filter().
+    // clone3 is handled by the ENOSYS compatibility filter.
 
     // seccomp(SECCOMP_SET_MODE_FILTER) would let sandboxed code replace the active filter.
     let condition = SeccompCondition::new(
@@ -426,7 +427,6 @@ mod tests {
             libc::SYS_bpf,
             libc::SYS_process_vm_readv,
             libc::SYS_process_vm_writev,
-            libc::SYS_pidfd_open,
             libc::SYS_pidfd_getfd,
             libc::SYS_pidfd_send_signal,
             libc::SYS_io_uring_setup,
@@ -552,19 +552,25 @@ mod tests {
     }
 
     #[test]
-    fn clone3_filter_compiles_and_blocks_clone3() {
-        let bpf = build_clone3_filter();
-        assert!(bpf.is_ok(), "clone3 ENOSYS filter should compile");
+    fn compatibility_filter_compiles() {
+        let bpf = build_compatibility_filter();
+        assert!(
+            bpf.is_ok(),
+            "process API compatibility filter should compile"
+        );
     }
 
     #[test]
-    fn clone3_not_in_main_filter() {
-        // clone3 must NOT be in the main filter; it has its own ENOSYS filter.
+    fn compatibility_syscalls_are_not_in_main_filter() {
+        // These APIs must NOT be in the EPERM filter; the compatibility filter
+        // reports them unavailable so process launchers can fall back.
         let filter_rules = build_filter_rules(true).unwrap();
-        assert!(
-            !filter_rules.contains_key(&libc::SYS_clone3),
-            "clone3 should not be in the main filter — it uses a separate ENOSYS filter"
-        );
+        for syscall in [libc::SYS_clone3, libc::SYS_pidfd_open] {
+            assert!(
+                !filter_rules.contains_key(&syscall),
+                "syscall {syscall} should use the ENOSYS compatibility filter"
+            );
+        }
     }
 
     // --- Behavioral tests ---
@@ -611,10 +617,10 @@ mod tests {
 
     unsafe fn install_runtime_filters_in_child(
         main_filter: &seccompiler::BpfProgram,
-        clone3_filter: &seccompiler::BpfProgram,
+        compatibility_filter: &seccompiler::BpfProgram,
     ) {
         libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-        if let Err(err) = apply_runtime_filters(main_filter, clone3_filter) {
+        if let Err(err) = apply_runtime_filters(main_filter, compatibility_filter) {
             let msg = format!("failed to install runtime seccomp filters: {err}\n");
             libc::write(2, msg.as_ptr().cast(), msg.len());
             libc::_exit(1);
@@ -702,13 +708,13 @@ mod tests {
         // clone3 uses a separate filter that returns ENOSYS (not EPERM) so
         // glibc falls back to clone.
         let main_filter = build_filter(true).unwrap();
-        let clone3_filter = build_clone3_filter().unwrap();
-        // Apply in the same order as apply(): clone3 filter first, main filter second.
+        let compatibility_filter = build_compatibility_filter().unwrap();
+        // Apply in the same order as apply(): compatibility filter first, main filter second.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
             unsafe {
-                install_runtime_filters_in_child(&main_filter, &clone3_filter);
+                install_runtime_filters_in_child(&main_filter, &compatibility_filter);
                 let ret = libc::syscall(libc::SYS_clone3, 0 as libc::c_ulong, 0 as libc::c_ulong);
                 let errno = *libc::__errno_location();
                 if ret == -1 && errno == libc::ENOSYS {
@@ -729,16 +735,22 @@ mod tests {
     }
 
     #[test]
+    fn behavioral_pidfd_open_returns_enosys() {
+        let filter = build_compatibility_filter().unwrap();
+        unsafe { assert_blocked_in_child(&filter, libc::SYS_pidfd_open, libc::ENOSYS) };
+    }
+
+    #[test]
     fn behavioral_third_filter_install_blocked_after_startup() {
         let main_filter = build_filter(true).unwrap();
-        let clone3_filter = build_clone3_filter().unwrap();
-        let third_filter = build_clone3_filter().unwrap();
+        let compatibility_filter = build_compatibility_filter().unwrap();
+        let third_filter = build_compatibility_filter().unwrap();
 
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
             unsafe {
-                install_runtime_filters_in_child(&main_filter, &clone3_filter);
+                install_runtime_filters_in_child(&main_filter, &compatibility_filter);
                 match apply_filter(&third_filter) {
                     Err(seccompiler::Error::Seccomp(e))
                         if e.raw_os_error() == Some(libc::EPERM) =>

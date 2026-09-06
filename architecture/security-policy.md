@@ -160,13 +160,15 @@ policy without provenance applies neither the raw-tunnel refusal nor the
 WebSocket binary-frame refusal. The request-body backstop still applies, because
 it keys off the presence of a secret resolver rather than endpoint provenance.
 
-Two paths load a policy without provenance. A supervisor booting from a
-container-image policy is a bounded window: that policy is resynchronized to the
-gateway, which then serves a stamped effective policy. An explicit local Rego and
-data override is permanent, because gateway revisions are observed for settings
-and providers but never replace the local policy. When that override is combined
-with injected provider credentials, the supervisor emits a high-severity
-detection finding at startup naming the inactive controls.
+Two supervisor-local paths load a policy without provenance. A supervisor
+booting from an explicitly provisioned policy file has a bounded window before
+that policy is resynchronized to the gateway, which then serves a stamped
+effective policy. An explicit supervisor Rego and data override is permanent,
+because gateway revisions are observed for settings and providers but never
+replace the local policy. Workload-image files and environment variables cannot
+configure the separately isolated supervisor. When a supervisor override is
+combined with injected provider credentials, the supervisor emits a
+high-severity detection finding at startup naming the inactive controls.
 
 ## Live Updates
 

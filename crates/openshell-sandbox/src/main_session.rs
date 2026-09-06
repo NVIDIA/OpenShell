@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -21,17 +21,9 @@ use openshell_isolation_interface::contract::{
     BoundaryProcess, BoundarySignal, BoundaryTerminal, ProcessAttachment,
 };
 
-const OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
+use crate::process::ProcessIo;
 
-/// Canonical-process I/O retained by the supervisor session multiplexer.
-pub enum ProcessIo {
-    Pty(std::fs::File),
-    Pipes {
-        stdin: tokio::process::ChildStdin,
-        stdout: tokio::process::ChildStdout,
-        stderr: tokio::process::ChildStderr,
-    },
-}
+const OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub enum MainOutput {
@@ -66,7 +58,7 @@ struct OutputLogState {
 struct OutputLog {
     state: Mutex<OutputLogState>,
     version: watch::Sender<u64>,
-    terminal_reported: std::sync::atomic::AtomicBool,
+    terminal_reported: AtomicBool,
     terminal_reported_notify: Notify,
 }
 
@@ -80,7 +72,7 @@ impl OutputLog {
                 next_sequence: 0,
             }),
             version,
-            terminal_reported: std::sync::atomic::AtomicBool::new(false),
+            terminal_reported: AtomicBool::new(false),
             terminal_reported_notify: Notify::new(),
         })
     }
@@ -190,19 +182,43 @@ impl MainOutputCursor {
     }
 }
 
+enum MainInput {
+    Data(Vec<u8>),
+    Close,
+}
+
+#[derive(Clone)]
+pub(crate) struct MainInputSender {
+    sender: tokio::sync::mpsc::Sender<MainInput>,
+}
+
+impl MainInputSender {
+    pub(crate) async fn send(&self, data: Vec<u8>) -> Result<(), &'static str> {
+        self.sender
+            .send(MainInput::Data(data))
+            .await
+            .map_err(|_| "canonical process stdin closed")
+    }
+
+    async fn close(&self) {
+        let _ = self.sender.send(MainInput::Close).await;
+    }
+}
+
 pub struct MainSession {
     pid: u32,
     terminal: bool,
-    input: tokio::sync::mpsc::Sender<Vec<u8>>,
+    input: MainInputSender,
     output: Arc<OutputLog>,
     input_owner: Mutex<Option<u64>>,
+    input_closed: AtomicBool,
     next_owner: AtomicU64,
     pty_master: Option<Arc<std::fs::File>>,
     boundary_process: Option<Arc<dyn BoundaryProcess>>,
     boundary_terminal: Option<Arc<dyn BoundaryTerminal>>,
     readers_remaining: AtomicUsize,
     readers_done: Notify,
-    finished: std::sync::atomic::AtomicBool,
+    finished: AtomicBool,
     terminal_attachments: Mutex<TerminalAttachmentState>,
     terminal_attachments_done: Notify,
 }
@@ -215,16 +231,17 @@ impl MainSession {
         Arc::new(Self {
             pid: 1,
             terminal: false,
-            input,
+            input: MainInputSender { sender: input },
             output: OutputLog::new(),
             input_owner: Mutex::new(None),
+            input_closed: AtomicBool::new(false),
             next_owner: AtomicU64::new(1),
             pty_master: None,
             boundary_process: None,
             boundary_terminal: None,
             readers_remaining: AtomicUsize::new(0),
             readers_done: Notify::new(),
-            finished: std::sync::atomic::AtomicBool::new(false),
+            finished: AtomicBool::new(false),
             terminal_attachments: Mutex::new(TerminalAttachmentState {
                 active: 0,
                 process_finished: false,
@@ -257,7 +274,7 @@ impl MainSession {
     #[must_use]
     pub fn new(io: ProcessIo, pid: u32) -> Arc<Self> {
         let terminal = matches!(io, ProcessIo::Pty(_));
-        let (input, input_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (input, input_rx) = tokio::sync::mpsc::channel(64);
         let pty_master = match &io {
             ProcessIo::Pty(master) => {
                 set_nonblocking(master).expect("set canonical PTY master nonblocking");
@@ -268,16 +285,17 @@ impl MainSession {
         let session = Arc::new(Self {
             pid,
             terminal,
-            input,
+            input: MainInputSender { sender: input },
             output: OutputLog::new(),
             input_owner: Mutex::new(None),
+            input_closed: AtomicBool::new(false),
             next_owner: AtomicU64::new(1),
             pty_master,
             boundary_process: None,
             boundary_terminal: None,
             readers_remaining: AtomicUsize::new(if terminal { 1 } else { 2 }),
             readers_done: Notify::new(),
-            finished: std::sync::atomic::AtomicBool::new(false),
+            finished: AtomicBool::new(false),
             terminal_attachments: Mutex::new(TerminalAttachmentState {
                 active: 0,
                 process_finished: false,
@@ -304,20 +322,21 @@ impl MainSession {
             terminal,
         } = attachment;
         let terminal_mode = terminal.is_some();
-        let (input, mut input_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (input, mut input_rx) = tokio::sync::mpsc::channel(64);
         let session = Arc::new(Self {
             pid: 0,
             terminal: terminal_mode,
-            input,
+            input: MainInputSender { sender: input },
             output: OutputLog::new(),
             input_owner: Mutex::new(None),
+            input_closed: AtomicBool::new(false),
             next_owner: AtomicU64::new(1),
             pty_master: None,
             boundary_process: Some(process),
             boundary_terminal: terminal,
             readers_remaining: AtomicUsize::new(if terminal_mode { 1 } else { 2 }),
             readers_done: Notify::new(),
-            finished: std::sync::atomic::AtomicBool::new(false),
+            finished: AtomicBool::new(false),
             terminal_attachments: Mutex::new(TerminalAttachmentState {
                 active: 0,
                 process_finished: false,
@@ -354,11 +373,16 @@ impl MainSession {
         }
         tokio::spawn(async move {
             let mut stdin = stdin;
-            while let Some(data) = input_rx.recv().await {
-                if stdin.write_all(&data).await.is_err() {
-                    break;
+            while let Some(input) = input_rx.recv().await {
+                match input {
+                    MainInput::Data(data) => {
+                        if stdin.write_all(&data).await.is_err() {
+                            break;
+                        }
+                        let _ = stdin.flush().await;
+                    }
+                    MainInput::Close => break,
                 }
-                let _ = stdin.flush().await;
             }
         });
         session
@@ -367,7 +391,7 @@ impl MainSession {
     fn start_io(
         this: &Arc<Self>,
         io: ProcessIo,
-        mut input_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        mut input_rx: tokio::sync::mpsc::Receiver<MainInput>,
     ) {
         match io {
             ProcessIo::Pty(master) => {
@@ -394,7 +418,10 @@ impl MainSession {
                     output.reader_finished();
                 });
                 tokio::spawn(async move {
-                    while let Some(data) = input_rx.recv().await {
+                    while let Some(input) = input_rx.recv().await {
+                        let MainInput::Data(data) = input else {
+                            return;
+                        };
                         let mut remaining = data.as_slice();
                         while !remaining.is_empty() {
                             let Ok(mut ready) = master.writable().await else {
@@ -448,11 +475,16 @@ impl MainSession {
                     stderr_session.reader_finished();
                 });
                 tokio::spawn(async move {
-                    while let Some(data) = input_rx.recv().await {
-                        if stdin.write_all(&data).await.is_err() {
-                            break;
+                    while let Some(input) = input_rx.recv().await {
+                        match input {
+                            MainInput::Data(data) => {
+                                if stdin.write_all(&data).await.is_err() {
+                                    break;
+                                }
+                                let _ = stdin.flush().await;
+                            }
+                            MainInput::Close => break,
                         }
-                        let _ = stdin.flush().await;
                     }
                 });
             }
@@ -622,7 +654,10 @@ impl MainSession {
         }
     }
 
-    pub fn acquire_input(&self) -> Result<(u64, tokio::sync::mpsc::Sender<Vec<u8>>), &'static str> {
+    pub(crate) fn acquire_input(&self) -> Result<(u64, MainInputSender), &'static str> {
+        if self.input_closed.load(Ordering::Acquire) {
+            return Err("canonical process stdin closed");
+        }
         let mut owner = self.input_owner.lock().expect("main input lock poisoned");
         if owner.is_some() {
             return Err("canonical main process already has an input owner");
@@ -632,10 +667,37 @@ impl MainSession {
         Ok((id, self.input.clone()))
     }
 
-    pub fn release_input(&self, id: u64) {
+    /// Acquire canonical input when it remains open. A replacement control may
+    /// still attach output after a prior control intentionally closed stdin.
+    pub(crate) fn acquire_input_if_open(
+        &self,
+    ) -> Result<Option<(u64, MainInputSender)>, &'static str> {
+        match self.acquire_input() {
+            Ok(input) => Ok(Some(input)),
+            Err(_) if self.input_closed.load(Ordering::Acquire) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn release_input(&self, id: u64) {
         let mut owner = self.input_owner.lock().expect("main input lock poisoned");
         if *owner == Some(id) {
             *owner = None;
+        }
+    }
+
+    pub(crate) async fn close_input(&self, id: u64) {
+        let owns_input = {
+            let mut owner = self.input_owner.lock().expect("main input lock poisoned");
+            if *owner == Some(id) {
+                *owner = None;
+                true
+            } else {
+                false
+            }
+        };
+        if owns_input && !self.input_closed.swap(true, Ordering::AcqRel) {
+            self.input.close().await;
         }
     }
 
@@ -770,11 +832,24 @@ mod tests {
             MainOutput::Stdout(data) if data == b"ready\n"[..]
         ));
 
-        let (_owner, input) = session.acquire_input().unwrap();
+        let (owner, input) = session.acquire_input().unwrap();
         input.send(b"hello\n".to_vec()).await.unwrap();
         let mut received = [0_u8; 6];
         stdin_peer.read_exact(&mut received).await.unwrap();
         assert_eq!(&received, b"hello\n");
+        session.close_input(owner).await;
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                stdin_peer.read(&mut received)
+            )
+            .await
+            .expect("boundary stdin close timed out")
+            .expect("read boundary stdin EOF"),
+            0
+        );
+        assert!(session.acquire_input().is_err());
+        assert!(session.acquire_input_if_open().unwrap().is_none());
 
         session.resize(120, 40, 0, 0).await;
         assert_eq!(*terminal.size.lock().unwrap(), Some((120, 40)));

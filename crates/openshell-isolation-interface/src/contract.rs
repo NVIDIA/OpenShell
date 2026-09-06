@@ -37,6 +37,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::oneshot;
 
@@ -188,7 +189,7 @@ impl VerifiedTopologyDescriptor {
 }
 
 /// Exact non-root identity selected before the immutable workload is created.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedWorkloadIdentity {
     /// Effective and real user ID used by sandbox and all workload children.
     pub uid: u32,
@@ -221,6 +222,7 @@ impl ResolvedWorkloadIdentity {
                 "workload identity source and resource digest are required".to_string(),
             ));
         }
+        supplementary_gids.retain(|supplementary_gid| *supplementary_gid != gid);
         supplementary_gids.sort_unstable();
         supplementary_gids.dedup();
         Ok(Self {
@@ -379,7 +381,7 @@ pub trait BoundBoundary: Send {
 }
 
 /// Capability masks measured from `/proc/<pid>/status`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityEvidence {
     pub inheritable: u64,
     pub permitted: u64,
@@ -401,7 +403,7 @@ impl CapabilityEvidence {
 }
 
 /// Active seccomp notification and socket-broker evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "each independently measured kernel operation is reported explicitly"
@@ -418,8 +420,88 @@ pub struct SeccompEvidence {
     pub cancellation: bool,
 }
 
+/// Driver-owned evidence that the mandatory outer network fence is installed.
+///
+/// The sandbox cannot observe the Docker daemon, Kubernetes API, or VM device
+/// model directly. Drivers therefore bind the exact fence they validated into
+/// both protected bootstrap halves. The sandbox reports that value back during
+/// confirmation, and the supervisor rejects any mismatch before agent launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "backend", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum DriverFenceEvidence {
+    Docker {
+        container_id: String,
+        network_mode: String,
+        unexpected_networks: Vec<String>,
+    },
+    Kubernetes {
+        network_policy_uid: String,
+        network_policy_resource_version: String,
+        ingress_isolated: bool,
+        egress_isolated: bool,
+        egress_rule_count: u32,
+    },
+    Vm {
+        generation: String,
+        network_device_count: u32,
+    },
+}
+
+impl DriverFenceEvidence {
+    #[must_use]
+    pub const fn backend_name(&self) -> &'static str {
+        match self {
+            Self::Docker { .. } => "docker",
+            Self::Kubernetes { .. } => "kubernetes-proxy-pod",
+            Self::Vm { .. } => "vm",
+        }
+    }
+
+    /// Validate the concrete fence properties and bind them to the selected
+    /// isolation backend.
+    pub fn validate_for_backend(&self, backend_name: &str) -> Result<(), BackendError> {
+        let valid = match self {
+            Self::Docker {
+                container_id,
+                network_mode,
+                unexpected_networks,
+            } => {
+                backend_name == "docker"
+                    && !container_id.is_empty()
+                    && network_mode == "none"
+                    && unexpected_networks.is_empty()
+            }
+            Self::Kubernetes {
+                network_policy_uid,
+                network_policy_resource_version,
+                ingress_isolated,
+                egress_isolated,
+                egress_rule_count,
+            } => {
+                backend_name == "kubernetes-proxy-pod"
+                    && !network_policy_uid.is_empty()
+                    && !network_policy_resource_version.is_empty()
+                    && *ingress_isolated
+                    && *egress_isolated
+                    && *egress_rule_count == 0
+            }
+            Self::Vm {
+                generation,
+                network_device_count,
+            } => backend_name == "vm" && !generation.is_empty() && *network_device_count == 0,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(BackendError::Confirm(format!(
+                "driver fence evidence is incomplete or does not match backend {backend_name:?}"
+            )))
+        }
+    }
+}
+
 /// Measured sandbox-owned evidence produced before agent launch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "confirmation preserves independently measured security results"
@@ -443,13 +525,15 @@ pub struct SandboxConfirmEvidence {
     pub tcp_deny_round_trip: bool,
     pub authenticated_supervisor: bool,
     pub session_epoch: String,
-    pub direct_egress_blocked: bool,
+    pub driver_fence: DriverFenceEvidence,
     pub resource_claims: BTreeMap<String, String>,
 }
 
 impl SandboxConfirmEvidence {
     /// Validate the security-critical evidence required before launch.
     pub fn validate(&self, expected: &ResolvedWorkloadIdentity) -> Result<(), BackendError> {
+        self.driver_fence
+            .validate_for_backend(self.driver_fence.backend_name())?;
         let complete = &self.identity == expected
             && self.capabilities.is_empty()
             && self.no_new_privileges
@@ -472,7 +556,6 @@ impl SandboxConfirmEvidence {
             && self.tcp_allow_round_trip
             && self.tcp_deny_round_trip
             && self.authenticated_supervisor
-            && self.direct_egress_blocked
             && !self.generation.is_empty()
             && !self.session_epoch.is_empty();
         if complete {
@@ -568,6 +651,13 @@ pub enum BoundarySignal {
 /// however many times it is called; a local PID is never the process handle.
 #[async_trait]
 pub trait BoundaryProcess: Send + Sync {
+    /// Attach to the admitted process's retained standard I/O. The boundary
+    /// remains the process owner and may permit only one control attachment.
+    async fn attach(&self) -> Result<ProcessAttachment, BackendError> {
+        Err(BackendError::Unsupported(
+            "process attachment is not supported".to_string(),
+        ))
+    }
     /// Await terminal status (stable across repeated calls).
     async fn wait(&self) -> Result<BoundaryExitStatus, BackendError>;
     /// Deliver a signal to the process or its group.
@@ -580,6 +670,18 @@ pub trait BoundaryProcess: Send + Sync {
 pub type BoundaryInput = Box<dyn AsyncWrite + Send + Unpin>;
 /// A boxed async reader from a boundary process's stdout or stderr.
 pub type BoundaryOutput = Box<dyn AsyncRead + Send + Unpin>;
+
+/// A control-side attachment to the admitted process's retained I/O.
+pub struct ProcessAttachment {
+    /// Stdin writer.
+    pub stdin: BoundaryInput,
+    /// Stdout reader, or the PTY-merged output stream.
+    pub stdout: BoundaryOutput,
+    /// Stderr reader, distinct from stdout for non-PTY processes.
+    pub stderr: Option<BoundaryOutput>,
+    /// PTY control, present when the admitted process owns a terminal.
+    pub terminal: Option<Arc<dyn BoundaryTerminal>>,
+}
 
 /// A PTY attached to an exec session.
 #[async_trait]
@@ -747,7 +849,7 @@ impl FromStr for Sha256Digest {
 }
 
 /// Immutable socket metadata supplied with a pending external TCP open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkSocketMetadata {
     /// Kernel socket cookie captured for the exact open-file description.
     pub socket_cookie: u64,
@@ -758,7 +860,7 @@ pub struct NetworkSocketMetadata {
 }
 
 /// Typed supervisor decision for one pending TCP open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkOpenResult {
     /// L4 authorization and a bounded relay handler are ready. L7 policy still
     /// applies to bytes after the local connection commits.
@@ -791,8 +893,8 @@ pub struct PendingNetworkOpen {
 /// mediation service wherever that service runs.
 ///
 /// It may wrap a dedicated listener or a demultiplexed view over shared
-/// transport; how it reaches a co-located proxy, a sidecar, or a shared
-/// mediation service is backend-private. A trusted backend component associates
+/// transport; how it reaches the separate supervisor is backend-private. A
+/// trusted backend component associates
 /// every returned connection with its active boundary without relying solely on
 /// a transport tuple or workload-provided identifier. An `Err` from `accept`
 /// means the source itself is unusable and fails the boundary closed.
@@ -803,7 +905,7 @@ pub trait NetworkMediationSource: Send + Sync {
 }
 
 /// DNS transport used by one workload exchange.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DnsTransport {
     /// One DNS wire datagram without a TCP length prefix.
     Udp,

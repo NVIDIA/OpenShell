@@ -32,13 +32,27 @@ jobs:
           - triple: x86_64-unknown-linux-musl
             runner: linux-amd64-cpu8
             dev_shell: .#devShells.x86_64-linux.musl
+            package: openshell-sandbox
+            binary: openshell-sandbox
+          - triple: x86_64-unknown-linux-musl
+            runner: linux-amd64-cpu8
+            dev_shell: .#devShells.x86_64-linux.musl
+            package: openshell-supervisor
+            binary: openshell-supervisor
           - triple: aarch64-unknown-linux-musl
             runner: linux-arm64-cpu8
             dev_shell: .#devShells.aarch64-linux.musl
+            package: openshell-sandbox
+            binary: openshell-sandbox
+          - triple: aarch64-unknown-linux-musl
+            runner: linux-arm64-cpu8
+            dev_shell: .#devShells.aarch64-linux.musl
+            package: openshell-supervisor
+            binary: openshell-supervisor
     uses: ./.github/workflows/build-binaries.yml
     with:
-      package: openshell-sandbox
-      binary: openshell-sandbox
+      package: ${{ matrix.package }}
+      binary: ${{ matrix.binary }}
       triple: ${{ matrix.triple }}
       runner: ${{ matrix.runner }}
       dev-shell: ${{ matrix.dev_shell }}

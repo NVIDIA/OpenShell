@@ -16,20 +16,21 @@ path = "src/main.rs"
 
 [dependencies]
 openshell-core = { path = "../openshell-core", default-features = false }
-openshell-extension-core = { path = "../openshell-extension-core" }
+openshell-binary-identity = { path = "../openshell-binary-identity" }
+openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
-openshell-supervisor-network = { path = "../openshell-supervisor-network", default-features = false }
-openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
-openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
-openshell-supervisor-process = { path = "../openshell-supervisor-process" }
+
+anyhow = { workspace = true }
+async-trait = "0.1"
+bytes = { workspace = true }
+hex = "0.4"
+ipnet = "2"
+rand = "0.10"
+sha2 = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
-
-# gRPC (tonic::Status downcast in error mapping)
-tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
-prost-types = { workspace = true }
 
 # CLI
 clap = { workspace = true }
@@ -37,49 +38,37 @@ clap = { workspace = true }
 # Error handling
 miette = { workspace = true }
 
-# Unix ownership for Kubernetes sidecar init setup
+# Unix identity and bootstrap ownership
 nix = { workspace = true }
 
 # TLS crypto provider install (main.rs)
 rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
 
 # Serialization (serde_json::json! for OCSF unmapped fields)
+base64 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-prost = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
-uuid = { workspace = true }
 tracing-subscriber = { workspace = true }
-tracing-appender = { workspace = true }
 
-[features]
-default = ["telemetry", "bundled-ca-roots"]
-## Convenience alias: all defaults except bundled CA roots. Use
-## `--no-default-features --features system-ca-roots` to build a supervisor
-## that uses the platform trust store with telemetry intact.
-system-ca-roots = ["telemetry"]
-## Convenience alias: every default feature except `telemetry`. Build a
-## telemetry-free supervisor with
-## `--no-default-features --features defaults-without-telemetry` and stay
-## correct as new default features are added. Cargo cannot subtract a single
-## default feature, so this alias must be paired with `--no-default-features`;
-## enabling it alongside `telemetry` is a compile error rather than a silent
-## telemetry-on build. Kept in sync with `default` by
-## `rust:verify:defaults-without-telemetry`. Do not pair it with
-## `system-ca-roots`, which re-enables `telemetry`; a build with neither
-## telemetry nor bundled CA roots is plain `--no-default-features`.
-defaults-without-telemetry = ["bundled-ca-roots"]
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+rustix = { workspace = true }
 
-telemetry = ["openshell-core/telemetry"]
-bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
+[target.'cfg(target_os = "linux")'.dependencies]
+capctl = "0.2.4"
+landlock = "0.4"
+seccompiler = "0.5"
+socket2 = { workspace = true }
+tempfile = "3"
 
 [dev-dependencies]
+rcgen = { workspace = true }
 tempfile = "3"
-temp-env = "0.3"
-tokio-tungstenite = { workspace = true }
-futures = { workspace = true }
 
 [lints]
 workspace = true

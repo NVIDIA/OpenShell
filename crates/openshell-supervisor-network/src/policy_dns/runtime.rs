@@ -9,6 +9,7 @@ use super::{PolicyDnsService, SocketTrustedResolver, wire};
 use crate::opa::OpaEngine;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::net::set_tcp_nodelay_best_effort;
+use openshell_isolation_interface::contract::{DnsMediationSource, DnsTransport};
 use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -63,6 +64,77 @@ pub(crate) struct PolicyDnsRuntime {
 }
 
 impl PolicyDnsRuntime {
+    /// Start policy DNS over an isolation-backend exchange source. No UDP or
+    /// TCP listener is bound in the supervisor namespace.
+    pub(crate) fn start_mediated(
+        policy: Arc<OpaEngine>,
+        source: Arc<dyn DnsMediationSource>,
+        trusted_host_gateway: Option<IpAddr>,
+        config: PolicyDnsRuntimeConfig,
+        mut engine_ready: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Self> {
+        let upstream = trusted_resolver_from_resolv_conf()?;
+        let store = Arc::new(ResolvedEndpointStore::new(
+            StoreConfig::new(config.pools, MAX_MAPPINGS)
+                .map_err(|error| miette::miette!(error.to_string()))?,
+        ));
+        let service = Arc::new(PolicyDnsService::new(
+            policy,
+            SocketTrustedResolver::new(upstream),
+            store.clone(),
+            trusted_host_gateway,
+        ));
+        let task = tokio::spawn(async move {
+            if engine_ready.wait_for(|ready| *ready).await.is_err() {
+                return;
+            }
+            loop {
+                let Ok(query) = source.accept().await else {
+                    return;
+                };
+                let service = service.clone();
+                tokio::spawn(async move {
+                    let response = match query.transport {
+                        DnsTransport::Udp => {
+                            wire::handle_udp_query_with_ipv6(&service, &query.request, false).await
+                        }
+                        DnsTransport::Tcp => {
+                            wire::handle_tcp_query_with_ipv6(&service, &query.request, false).await
+                        }
+                    }
+                    .map_err(|error| {
+                        openshell_isolation_interface::contract::BackendError::Process(format!(
+                            "policy DNS response failed: {error}"
+                        ))
+                    });
+                    if query.response.send(response).is_err() {
+                        tracing::warn!("sandbox DNS response channel closed before delivery");
+                    }
+                });
+            }
+        });
+        let expiry_store = store.clone();
+        let expiry_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let _ = expiry_store.expire(std::time::Instant::now());
+            }
+        });
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Enabled, "ready")
+                .message("Policy DNS connected to isolation boundary")
+                .build()
+        );
+        Ok(Self {
+            store,
+            tasks: vec![task, expiry_task],
+        })
+    }
+
     pub(crate) fn start(
         policy: Arc<OpaEngine>,
         udp: tokio::net::UdpSocket,

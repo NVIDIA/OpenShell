@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(dead_code)]
+
 //! Transport-neutral egress inputs and authorization results.
 //!
 //! Explicit proxy adapters normalize their protocol-specific request into an
