@@ -224,7 +224,8 @@ cleanup() {
       echo "=== Agent Sandbox resources ==="
       kctl -n "${NAMESPACE}" get sandboxes.agents.x-k8s.io -o yaml 2>&1 || true
       echo "=== gateway sandbox records ==="
-      "${ROOT}/target/debug/openshell" sandbox list --all --output json 2>&1 || true
+      "${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}" \
+        sandbox list --all-workspaces --output json 2>&1 || true
       echo "=== proxy-pod supervisor Deployments ==="
       kctl -n "${NAMESPACE}" get deployments \
         -l "openshell.ai/boundary-role=supervisor" -o yaml 2>&1 || true
@@ -233,6 +234,9 @@ cleanup() {
         [ -n "${supervisor_pod}" ] || continue
         echo "--- ${supervisor_pod} ---"
         kctl -n "${NAMESPACE}" logs "${supervisor_pod}" \
+          --all-containers --prefix --tail=200 2>&1 || true
+        echo "--- ${supervisor_pod} (previous containers) ---"
+        kctl -n "${NAMESPACE}" logs "${supervisor_pod}" --previous \
           --all-containers --prefix --tail=200 2>&1 || true
       done < <(kctl -n "${NAMESPACE}" get pods \
         -l "openshell.ai/boundary-role=supervisor" -o name 2>/dev/null || true)
