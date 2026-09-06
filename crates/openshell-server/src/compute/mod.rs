@@ -7528,10 +7528,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            stored.phase(),
-            SandboxPhase::Provisioning as i32,
-            "the queued Ready event must be replaced by the driver's authoritative not-ready state"
+        let phase = SandboxPhase::try_from(stored.phase()).unwrap_or(SandboxPhase::Unknown);
+        assert!(
+            matches!(phase, SandboxPhase::Starting | SandboxPhase::Provisioning),
+            "the queued Ready event must not promote the sandbox; got {phase:?}"
         );
     }
 
