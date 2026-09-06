@@ -39,6 +39,19 @@ The sandbox pushes logs to the gateway over gRPC in real time. The gateway store
 
 For durable log storage, use the log files inside the sandbox or enable [OCSF JSON export](/observability/ocsf-json-export) and ship the JSONL files to an external log aggregator.
 
+## Loss Awareness and Resume
+
+The watch stream behind `openshell logs` is loss-aware. Each resumable event (log line or platform event) carries a monotonic `cursor`. Status snapshots and warnings carry cursor `0`.
+
+The gateway distinguishes recoverable from unrecoverable loss:
+
+- **Recoverable lag.** When a consumer falls behind and the gateway skips ahead in its buffer, the stream emits a warning event and keeps running. Clients see the gap as a jump in cursor values.
+- **Unrecoverable gap.** When a client reconnects and asks to resume after a cursor the gateway has already trimmed from its buffer, the stream ends with an `OUT_OF_RANGE` status that reports the requested and earliest-available cursors. The client should restart observation and, if it needs the missing lines, read them from the log files inside the sandbox.
+
+On reconnect, a client passes the highest cursor it processed as the resume point. The gateway replays only events after that cursor — logs and platform events merged in cursor order — then resumes live delivery, so no events are lost or duplicated across the reconnect.
+
+Replay is emitted in cursor order. During live delivery the log and platform event sources are read independently, so events from different sources can interleave; order across sources by `cursor` rather than by arrival.
+
 ## Direct Filesystem Access
 
 Start an independent shell with `sandbox exec` to read log files directly:

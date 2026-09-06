@@ -607,6 +607,7 @@ impl OpenShell for TestOpenShell {
             let _ = tx
                 .send(Ok(SandboxStreamEvent {
                     payload: Some(sandbox_stream_event::Payload::Sandbox(provisioning)),
+                    cursor: 0,
                 }))
                 .await;
             if vm_error_after_started {
@@ -618,11 +619,13 @@ impl OpenShell for TestOpenShell {
                             message: "Started VM launcher".to_string(),
                             ..PlatformEvent::default()
                         })),
+                        cursor: 0,
                     }))
                     .await;
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(error)),
+                        cursor: 0,
                     }))
                     .await;
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -642,12 +645,14 @@ impl OpenShell for TestOpenShell {
                                 source: "gateway".to_string(),
                                 fields: HashMap::new(),
                             })),
+                            cursor: 0,
                         }))
                         .await;
                 }
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                        cursor: 0,
                     }))
                     .await;
                 return;
@@ -656,6 +661,7 @@ impl OpenShell for TestOpenShell {
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(completed)),
+                        cursor: 0,
                     }))
                     .await;
                 return;
@@ -670,6 +676,7 @@ impl OpenShell for TestOpenShell {
                             message: "Preparing rootfs".to_string(),
                             ..PlatformEvent::default()
                         })),
+                        cursor: 0,
                     }))
                     .await;
                 tokio::time::sleep(Duration::from_millis(600)).await;
@@ -681,12 +688,14 @@ impl OpenShell for TestOpenShell {
                             message: "Formatting root disk".to_string(),
                             ..PlatformEvent::default()
                         })),
+                        cursor: 0,
                     }))
                     .await;
                 tokio::time::sleep(Duration::from_millis(600)).await;
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                        cursor: 0,
                     }))
                     .await;
                 return;
@@ -698,11 +707,13 @@ impl OpenShell for TestOpenShell {
                         message: "Sandbox scheduled".to_string(),
                         ..PlatformEvent::default()
                     })),
+                    cursor: 0,
                 }))
                 .await;
             let _ = tx
                 .send(Ok(SandboxStreamEvent {
                     payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                    cursor: 0,
                 }))
                 .await;
         });

@@ -284,6 +284,37 @@ Domain objects use shared metadata: stable server-generated IDs, human-readable
 names, creation timestamps, and labels. Crate-level details live in
 `crates/openshell-core/README.md`.
 
+### Watch streams
+
+`WatchSandbox` merges three per-sandbox sources into one client stream: status
+snapshots, server/sandbox logs, and platform events. Logs and platform events
+are resumable; a shared per-sandbox counter stamps each with a monotonic
+`cursor`. Cursor-ordered delivery is guaranteed for the replay phase: on
+resume the buffered events from both sources are sorted by cursor before
+emission. Live events carry cursors and are monotonic within each source, but
+the two sources are read independently, so a client should order across sources
+by `cursor` rather than by arrival. Status snapshots and warnings are re-read on
+demand and carry `cursor = 0`.
+
+The gateway holds a bounded in-memory tail per sandbox. Loss is reported with
+two distinct, documented behaviors:
+
+- **Recoverable lag** — a broadcast receiver falls behind and the server skips
+  ahead. The stream emits a `SandboxStreamWarning` event and continues; the
+  client sees the gap as a cursor discontinuity.
+- **Unrecoverable gap** — a reconnect requests `resume_after_cursor` below the
+  oldest buffered cursor (the tail has been trimmed past it). The server sends a
+  snapshot, then terminates the stream with `OUT_OF_RANGE` carrying the
+  requested and earliest-available cursors so the client can restart cleanly.
+
+On resume the server replays only events after the client's cursor from both
+resumable sources, merged in cursor order, before entering live delivery. The
+broadcast receivers are subscribed before replay, so an event buffered during
+initialization could appear in both replay and the live receiver; the producer
+tracks the highest replayed cursor and suppresses live events at or below it, so
+each event is delivered once. Clients track the highest observed `cursor` and
+pass it as `resume_after_cursor` on reconnect.
+
 ## Persistence
 
 The gateway persistence layer is a protobuf object store. Domain services store

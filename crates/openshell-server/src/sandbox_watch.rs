@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use openshell_core::proto::SandboxStreamWarning;
 use tokio::sync::broadcast;
-use tonic::Status;
 
 /// Broadcast bus of sandbox updates keyed by sandbox id.
 ///
@@ -26,6 +26,7 @@ impl SandboxWatchBus {
         }
     }
 
+    /// Private method to register sandbox in the `SandboxWatchBus` registry if it does not exist.
     fn sender_for(&self, sandbox_id: &str) -> broadcast::Sender<()> {
         let mut inner = self.inner.lock().expect("sandbox watch bus lock poisoned");
         inner
@@ -59,13 +60,24 @@ impl SandboxWatchBus {
     }
 }
 
-/// Helper to translate broadcast lag into a gRPC status.
-pub fn broadcast_to_status(err: broadcast::error::RecvError) -> Status {
-    match err {
-        broadcast::error::RecvError::Closed => Status::cancelled("stream closed"),
-        broadcast::error::RecvError::Lagged(n) => {
-            Status::resource_exhausted(format!("watch stream lagged; dropped {n} messages"))
-        }
+/// Build the warning payload emitted when a watch broadcast receiver lags.
+///
+/// Broadcast lag is recoverable: the receiver skips ahead to the oldest
+/// surviving message, so the stream continues after surfacing this warning
+/// instead of terminating.
+pub fn lag_warning(n: u64) -> SandboxStreamWarning {
+    SandboxStreamWarning {
+        message: format!("watch stream lagged; dropped {n} messages"),
+    }
+}
+
+/// Wrap [`lag_warning`] in a `SandboxStreamEvent` ready to send on the stream.
+pub fn lag_warning_event(n: u64) -> openshell_core::proto::SandboxStreamEvent {
+    use openshell_core::proto::sandbox_stream_event::Payload;
+    openshell_core::proto::SandboxStreamEvent {
+        payload: Some(Payload::Warning(lag_warning(n))),
+        // Warnings are not part of the resumable log/platform sequence.
+        cursor: 0,
     }
 }
 
@@ -113,5 +125,48 @@ mod tests {
         let bus = SandboxWatchBus::new();
         // Should not panic
         bus.remove("nonexistent");
+    }
+
+    #[test]
+    fn lag_warning_reports_dropped_count() {
+        let warning = lag_warning(7);
+        assert!(
+            warning.message.contains('7'),
+            "message: {}",
+            warning.message
+        );
+        assert!(
+            warning.message.contains("lagged"),
+            "message: {}",
+            warning.message
+        );
+    }
+
+    #[test]
+    fn lag_warning_event_wraps_warning_payload() {
+        use openshell_core::proto::sandbox_stream_event::Payload;
+        let evt = lag_warning_event(3);
+        match evt.payload {
+            Some(Payload::Warning(w)) => assert!(w.message.contains('3')),
+            other => panic!("expected Warning payload, got {other:?}"),
+        }
+    }
+
+    // Broadcast lag is recoverable at the tokio layer: after `Lagged`, the same
+    // receiver keeps yielding the oldest surviving messages instead of closing.
+    #[tokio::test]
+    async fn lagged_receiver_recovers_after_lag() {
+        const N: usize = 4;
+        let (tx, mut rx) = broadcast::channel(N);
+        for _ in 0..=N {
+            let _ = tx.send(());
+        }
+
+        let err = rx.recv().await.expect_err("expected Lagged");
+        assert!(matches!(err, broadcast::error::RecvError::Lagged(_)));
+
+        // The receiver is still usable: after lag it resumes at the oldest
+        // surviving message instead of closing.
+        assert!(rx.recv().await.is_ok(), "receiver should recover after lag");
     }
 }

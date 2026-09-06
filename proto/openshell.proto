@@ -1536,6 +1536,16 @@ message WatchSandboxRequest {
 
   // Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
   string log_min_level = 10;
+
+  // Resume streaming after this cursor. 0 means no cursor resume: the server
+  // falls back to tail-limited replay controlled by log_tail_lines and
+  // event_tail. When greater than zero, set it to the highest
+  // `SandboxStreamEvent.cursor` already processed; the server replays only log
+  // and platform events after it, merged in cursor order, before resuming live
+  // delivery. If the requested cursor has already been trimmed from the
+  // server's buffer, the resume is unrecoverable and the stream terminates with
+  // OUT_OF_RANGE (see SandboxStreamWarning for the recoverable case).
+  uint64 resume_after_cursor = 11;
 }
 
 // One event in a sandbox watch stream.
@@ -1547,11 +1557,18 @@ message SandboxStreamEvent {
     SandboxLogLine log = 2;
     // One platform event.
     PlatformEvent event = 3;
-    // Warning from the server (e.g. missed messages due to lag).
+    // Recoverable warning from the server, e.g. messages dropped because a
+    // broadcast receiver lagged. The stream continues after this warning; the
+    // client can detect the gap from cursor discontinuity.
     SandboxStreamWarning warning = 4;
     // Draft policy update notification.
     DraftPolicyUpdate draft_policy_update = 5;
   }
+  // Monotonic per-sandbox position shared across the resumable log and platform
+  // event sources. Pass the highest observed value as
+  // WatchSandboxRequest.resume_after_cursor to resume without loss or
+  // duplication. 0 for non-resumable events (status snapshots, warnings).
+  uint64 cursor = 6;
 }
 
 // Log line correlated to a sandbox.
@@ -1568,6 +1585,10 @@ message SandboxLogLine {
   map<string, string> fields = 7;
 }
 
+// Recoverable loss notification on a watch stream. Emitted when the server
+// skips ahead after a broadcast lag instead of terminating; the stream keeps
+// running. Unrecoverable loss (a trimmed resume cursor) is reported as an
+// OUT_OF_RANGE stream status, not this message.
 message SandboxStreamWarning {
   string message = 1;
 }
