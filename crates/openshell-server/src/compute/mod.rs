@@ -6888,6 +6888,9 @@ mod tests {
         );
 
         register_test_supervisor_session(&runtime, sandbox.object_id());
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+            ready_driver_sandbox(sandbox.object_id(), sandbox.object_name()),
+        )));
         runtime
             .apply_sandbox_update(ready_driver_sandbox(
                 sandbox.object_id(),
