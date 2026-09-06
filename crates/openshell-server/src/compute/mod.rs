@@ -171,6 +171,7 @@ mod traced_driver {
 }
 
 const DELETE_PHASE_CAS_RETRY_LIMIT: usize = 3;
+const SUPERVISOR_SESSION_CAS_RETRY_LIMIT: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GatewayListenerRequirement {
@@ -2841,18 +2842,19 @@ impl ComputeRuntime {
                 SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown)
             });
 
-        if !driver_snapshot_reports_terminal_container_exit(&incoming)
-            || existing_phase != SandboxPhase::Starting
-        {
+        if existing_phase != SandboxPhase::Starting {
             return self.apply_sandbox_update_locked(incoming, existing).await;
         }
 
-        // A terminal snapshot can already be queued when StartSandbox moves
-        // the durable phase to Starting. Release the global watch lock, wait
-        // for that lifecycle operation, and then reread both the driver and
-        // store before applying the terminal observation. Taking the
-        // per-sandbox gate only for this ambiguous phase avoids delaying
-        // unrelated watch events behind slow lifecycle operations.
+        // Any snapshot can already be queued when StartSandbox moves the
+        // durable phase to Starting. In particular, an old-generation Ready
+        // event followed by its terminal event can otherwise promote and then
+        // stop the new generation before the replacement supervisor connects.
+        // Release the global watch lock, wait for that lifecycle operation,
+        // and then reread both the driver and store before applying an
+        // authoritative observation. Taking the per-sandbox gate only for
+        // this ambiguous phase avoids delaying unrelated watch events behind
+        // slow lifecycle operations.
         let existing_name = existing_sandbox.as_ref().map_or_else(
             || incoming.name.clone(),
             |sandbox| sandbox.object_name().to_string(),
@@ -2881,7 +2883,7 @@ impl ComputeRuntime {
             {
                 warn!(
                     sandbox_id = %incoming.id,
-                    "Could not validate terminal driver snapshot; retaining current sandbox state"
+                    "Could not validate driver snapshot during sandbox start; retaining current sandbox state"
                 );
                 return Ok(());
             }
@@ -2993,82 +2995,129 @@ impl ComputeRuntime {
         instance_id: Option<&str>,
         terminal_delivery_finalized: bool,
     ) -> Result<(), String> {
-        let guard = self.sync_lock.lock().await;
-
-        let Some(existing) = self
+        let _guard = self.sync_lock.lock().await;
+        let existing = self
             .store
             .get_message::<Sandbox>(sandbox_id)
             .await
-            .map_err(|err| err.to_string())?
-        else {
-            return Ok(());
-        };
-        let current_phase =
-            SandboxPhase::try_from(existing.phase()).unwrap_or(SandboxPhase::Unknown);
-        if !connected
-            && matches!(current_phase, SandboxPhase::Error | SandboxPhase::Completed)
-            && terminal_delivery_finalized
-        {
-            drop(guard);
-            self.schedule_ephemeral_sandbox_delete(&existing);
-            return Ok(());
-        }
-        if matches!(
-            current_phase,
-            SandboxPhase::Deleting
-                | SandboxPhase::Error
-                | SandboxPhase::Stopping
-                | SandboxPhase::Stopped
-                | SandboxPhase::Completed
-        ) {
-            return Ok(());
-        }
-        if !connected && current_phase != SandboxPhase::Ready {
-            return Ok(());
-        }
-        let expected_resource_version = sandbox_resource_version(&existing);
+            .map_err(|err| err.to_string())?;
+        self.set_supervisor_session_state_from_snapshot(
+            sandbox_id,
+            connected,
+            instance_id,
+            terminal_delivery_finalized,
+            existing,
+        )
+        .await
+    }
 
-        // Use CAS to update sandbox phase based on supervisor session state
-        let result = self
-            .store
-            .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
-                let sandbox_name = sandbox.object_name().to_string();
-                if connected {
-                    ensure_supervisor_ready_status(&mut sandbox.status, &sandbox_name);
-                    let status = sandbox.status.get_or_insert_with(Default::default);
-                    status.main_process_instance_id = instance_id.unwrap_or_default().to_string();
-                    status.exit_code = None;
-                    sandbox.set_phase(SandboxPhase::Ready as i32);
-                } else {
-                    ensure_supervisor_not_ready_status(&mut sandbox.status, &sandbox_name);
-                    sandbox.set_phase(SandboxPhase::Provisioning as i32);
-                }
-            })
-            .await;
-
-        // Handle not found gracefully (sandbox may have been deleted)
-        let sandbox = match result {
-            Ok(s) => s,
-            Err(crate::persistence::PersistenceError::Database(ref msg))
-                if msg.contains("not found") =>
-            {
+    async fn set_supervisor_session_state_from_snapshot(
+        &self,
+        sandbox_id: &str,
+        connected: bool,
+        instance_id: Option<&str>,
+        terminal_delivery_finalized: bool,
+        mut existing: Option<Sandbox>,
+    ) -> Result<(), String> {
+        for attempt in 1..=SUPERVISOR_SESSION_CAS_RETRY_LIMIT {
+            let Some(current) = existing else {
                 return Ok(());
-            }
-            Err(crate::persistence::PersistenceError::Conflict {
-                current_resource_version,
-            }) => {
+            };
+            let current_phase =
+                SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
+            if connected
+                && matches!(
+                    current_phase,
+                    SandboxPhase::Deleting | SandboxPhase::Stopping | SandboxPhase::Stopped
+                )
+            {
                 return Err(format!(
-                    "concurrent modification detected (current resource_version: {})",
-                    current_resource_version
-                        .map_or_else(|| "unknown".to_string(), |v| v.to_string())
+                    "sandbox is not accepting supervisor sessions while {current_phase:?}"
                 ));
             }
-            Err(e) => return Err(e.to_string()),
-        };
+            if !connected
+                && matches!(current_phase, SandboxPhase::Error | SandboxPhase::Completed)
+                && terminal_delivery_finalized
+            {
+                self.schedule_ephemeral_sandbox_delete(&current);
+                return Ok(());
+            }
+            if matches!(
+                current_phase,
+                SandboxPhase::Deleting
+                    | SandboxPhase::Error
+                    | SandboxPhase::Stopping
+                    | SandboxPhase::Stopped
+                    | SandboxPhase::Completed
+            ) {
+                return Ok(());
+            }
+            if !connected && current_phase != SandboxPhase::Ready {
+                return Ok(());
+            }
+            let expected_resource_version = sandbox_resource_version(&current);
+            let result = self
+                .store
+                .update_message_cas::<Sandbox, _>(
+                    sandbox_id,
+                    expected_resource_version,
+                    |sandbox| {
+                        let sandbox_name = sandbox.object_name().to_string();
+                        if connected {
+                            ensure_supervisor_ready_status(&mut sandbox.status, &sandbox_name);
+                            let status = sandbox.status.get_or_insert_with(Default::default);
+                            status.main_process_instance_id =
+                                instance_id.unwrap_or_default().to_string();
+                            status.exit_code = None;
+                            sandbox.set_phase(SandboxPhase::Ready as i32);
+                        } else {
+                            ensure_supervisor_not_ready_status(&mut sandbox.status, &sandbox_name);
+                            sandbox.set_phase(SandboxPhase::Provisioning as i32);
+                        }
+                    },
+                )
+                .await;
 
-        self.sandbox_index.update_from_sandbox(&sandbox);
-        self.sandbox_watch_bus.notify(sandbox_id);
-        Ok(())
+            match result {
+                Ok(sandbox) => {
+                    self.sandbox_index.update_from_sandbox(&sandbox);
+                    self.sandbox_watch_bus.notify(sandbox_id);
+                    return Ok(());
+                }
+                Err(crate::persistence::PersistenceError::Database(ref message))
+                    if message.contains("not found") =>
+                {
+                    return Ok(());
+                }
+                Err(crate::persistence::PersistenceError::Conflict {
+                    current_resource_version,
+                }) if attempt < SUPERVISOR_SESSION_CAS_RETRY_LIMIT => {
+                    debug!(
+                        sandbox_id,
+                        attempt,
+                        ?current_resource_version,
+                        "Retrying supervisor session state after concurrent modification"
+                    );
+                    existing = self
+                        .store
+                        .get_message::<Sandbox>(sandbox_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                Err(crate::persistence::PersistenceError::Conflict {
+                    current_resource_version,
+                }) => {
+                    return Err(format!(
+                        "concurrent modification detected after {attempt} attempts (current resource_version: {})",
+                        current_resource_version
+                            .map_or_else(|| "unknown".to_string(), |version| version.to_string())
+                    ));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+
+        unreachable!("supervisor session CAS retry loop always returns")
     }
 
     /// Persist a terminal canonical-process result. Successful completion is
@@ -4295,18 +4344,6 @@ fn driver_snapshot_confirms_stopped(incoming: &DriverSandbox) -> bool {
                 && matches!(
                     condition.reason.to_ascii_lowercase().as_str(),
                     "containerexited" | "containerstopped"
-                )
-        })
-    })
-}
-
-fn driver_snapshot_reports_terminal_container_exit(incoming: &DriverSandbox) -> bool {
-    incoming.status.as_ref().is_some_and(|status| {
-        status.conditions.iter().any(|condition| {
-            condition.status.eq_ignore_ascii_case("false")
-                && matches!(
-                    condition.reason.to_ascii_lowercase().as_str(),
-                    "containerexited" | "containerstopped" | "containerruntimerestart"
                 )
         })
     })
@@ -7439,6 +7476,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_ready_snapshot_queued_before_start_is_revalidated() {
+        let driver = ControlledDriver::new();
+        driver.block_start();
+        let sandbox = sandbox_record(
+            "sb-start-ready-race",
+            "sandbox-start-ready-race",
+            SandboxPhase::Stopped,
+        );
+        let mut current = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        current.status = Some(make_driver_status(make_driver_condition(
+            "PodStarting",
+            "replacement workload is still starting",
+        )));
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(current)));
+        let mut runtime = test_runtime(driver.clone()).await;
+        runtime.driver_info.driver_reports_runtime_readiness = true;
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let start_runtime = runtime.clone();
+        let sandbox_name = sandbox.object_name().to_string();
+        let start =
+            tokio::spawn(
+                async move { start_runtime.start_sandbox("default", &sandbox_name).await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())
+            .await
+            .expect("start did not reach the driver");
+
+        let stale_ready = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        let update_runtime = runtime.clone();
+        let mut update =
+            tokio::spawn(async move { update_runtime.apply_sandbox_update(stale_ready).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut update)
+                .await
+                .is_err(),
+            "queued Ready event must wait for the active start operation"
+        );
+
+        driver.release_start();
+        start.await.unwrap().unwrap();
+        update.await.unwrap().unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Starting as i32);
+    }
+
+    #[tokio::test]
     async fn live_container_exit_during_start_still_transitions_to_error() {
         for reason in [
             "ContainerExited",
@@ -9296,6 +9386,66 @@ mod tests {
             SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Ready
         );
+    }
+
+    #[tokio::test]
+    async fn supervisor_session_connected_rejects_stopped_sandbox() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Stopped);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let error = runtime
+            .supervisor_session_connected("sb-1", "stale-generation")
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("Stopped"));
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Stopped as i32);
+    }
+
+    #[tokio::test]
+    async fn supervisor_session_connected_retries_a_stale_store_snapshot() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let stale = runtime.store.get_message::<Sandbox>("sb-1").await.unwrap();
+
+        runtime
+            .store
+            .update_message_cas::<Sandbox, _>("sb-1", 0, |sandbox| {
+                sandbox.set_current_policy_version(7);
+            })
+            .await
+            .unwrap();
+
+        runtime
+            .set_supervisor_session_state_from_snapshot(
+                "sb-1",
+                true,
+                Some("test-generation"),
+                false,
+                stale,
+            )
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+        assert_eq!(stored.current_policy_version(), 7);
     }
 
     #[tokio::test]
