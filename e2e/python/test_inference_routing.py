@@ -372,4 +372,5 @@ def test_non_inference_host_is_not_intercepted(
         result = sb.exec_python(call_external_openai_endpoint, timeout_seconds=60)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         output = result.stdout.strip()
-        assert "Tunnel connection failed: 403 Forbidden" in output
+        assert output.startswith("url_error:"), output
+        assert "No address associated with hostname" in output, output
