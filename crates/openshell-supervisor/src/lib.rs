@@ -94,21 +94,89 @@ struct ControlReadiness {
 }
 
 impl ControlReadiness {
-    fn start(path: std::path::PathBuf) -> Result<Self> {
+    fn start(
+        path: std::path::PathBuf,
+        mut session_readiness: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<Self> {
+        if session_readiness
+            .as_ref()
+            .is_some_and(|readiness| !*readiness.borrow())
+        {
+            return Err(miette::miette!(
+                "supervisor session is not ready when starting health listener"
+            ));
+        }
         prepare_control_readiness_path(&path)?;
         let listener = tokio::net::UnixListener::bind(&path)
             .into_diagnostic()
             .wrap_err_with(|| format!("bind supervisor readiness socket on {}", path.display()))?;
+        let task_path = path.clone();
         let task = tokio::spawn(async move {
+            let mut listener = Some(listener);
             loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => drop(stream),
-                    Err(error) => {
-                        tracing::warn!(%error, "control-mode readiness accept failed; retrying");
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                let session_unready = session_readiness
+                    .as_ref()
+                    .is_some_and(|readiness| !*readiness.borrow());
+                if listener.is_none() || session_unready {
+                    if session_unready {
+                        listener.take();
+                        let _ = std::fs::remove_file(&task_path);
+                        let Some(readiness) = session_readiness.as_mut() else {
+                            break;
+                        };
+                        if readiness.wait_for(|ready| *ready).await.is_err() {
+                            break;
+                        }
+                    }
+                    match prepare_control_readiness_path(&task_path).and_then(|()| {
+                        tokio::net::UnixListener::bind(&task_path)
+                            .into_diagnostic()
+                            .wrap_err_with(|| {
+                                format!(
+                                    "rebind supervisor readiness socket on {}",
+                                    task_path.display()
+                                )
+                            })
+                    }) {
+                        Ok(rebound) => listener = Some(rebound),
+                        Err(error) => {
+                            tracing::warn!(%error, "control-mode readiness rebind failed; retrying");
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    }
+                    continue;
+                }
+
+                let Some(active_listener) = listener.as_ref() else {
+                    continue;
+                };
+                if let Some(readiness) = session_readiness.as_mut() {
+                    tokio::select! {
+                        accepted = active_listener.accept() => match accepted {
+                            Ok((stream, _)) => drop(stream),
+                            Err(error) => {
+                                tracing::warn!(%error, "control-mode readiness accept failed; retrying");
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        },
+                        changed = readiness.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    match active_listener.accept().await {
+                        Ok((stream, _)) => drop(stream),
+                        Err(error) => {
+                            tracing::warn!(%error, "control-mode readiness accept failed; retrying");
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
                     }
                 }
             }
+            let _ = std::fs::remove_file(&task_path);
         });
         Ok(Self { task, path })
     }
@@ -738,7 +806,10 @@ pub async fn run_sandbox(
         .await?;
         info!(backend = %backend_name, "Control-mode access plane started");
         let mut control_readiness = if let Some(path) = health_socket_path {
-            Some(ControlReadiness::start(path)?)
+            Some(ControlReadiness::start(
+                path,
+                boundary_access.session_readiness(),
+            )?)
         } else {
             None
         };
@@ -3885,12 +3956,41 @@ mod tests {
     async fn control_readiness_exists_only_while_guard_is_live() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("health.sock");
-        let readiness = ControlReadiness::start(path.clone()).expect("start readiness listener");
+        let readiness =
+            ControlReadiness::start(path.clone(), None).expect("start readiness listener");
         check_control_readiness(&path).expect("running supervisor accepts readiness probes");
 
         drop(readiness);
         tokio::task::yield_now().await;
         assert!(check_control_readiness(&path).is_err());
+    }
+
+    #[tokio::test]
+    async fn control_readiness_tracks_supervisor_session() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("health.sock");
+        let (session_tx, session_rx) = tokio::sync::watch::channel(true);
+        let _readiness = ControlReadiness::start(path.clone(), Some(session_rx))
+            .expect("start readiness listener");
+        check_control_readiness(&path).expect("accepted session is ready");
+
+        session_tx.send_replace(false);
+        timeout(Duration::from_secs(1), async {
+            while check_control_readiness(&path).is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lost session removes readiness socket");
+
+        session_tx.send_replace(true);
+        timeout(Duration::from_secs(1), async {
+            while check_control_readiness(&path).is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement session restores readiness socket");
     }
 
     #[test]
