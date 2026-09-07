@@ -3205,15 +3205,19 @@ pub async fn service_list(
         .map_err(|status| service_status_error("list services", "sandbox:read", status))?
         .into_inner();
 
+    let next_page_token = response.next_page_token;
     let services = response
         .services
         .iter()
         .filter_map(|response| service_endpoint_to_json(response, server))
         .collect::<Vec<_>>();
-    if crate::output::print_output_collection(output, &services, Clone::clone)? {
+    let structured = serde_json::json!({
+        "services": services,
+        "next_page_token": next_page_token,
+    });
+    if crate::output::print_output_single(output, &structured, Clone::clone)? {
         return Ok(());
     }
-
     if response.services.is_empty() {
         if let Some(sandbox) = sandbox {
             println!("No services exposed for sandbox {sandbox}.");
@@ -3224,9 +3228,9 @@ pub async fn service_list(
     }
 
     print_service_endpoint_table(&response.services, server, all_workspaces);
-    if !response.next_page_token.is_empty() {
+    if !next_page_token.is_empty() {
         println!();
-        println!("Next page token: {}", response.next_page_token);
+        println!("Next page token: {}", next_page_token);
     }
     Ok(())
 }
@@ -3573,9 +3577,14 @@ pub async fn workspace_list(
         .await
         .into_diagnostic()?;
     let response = response.into_inner();
+    let next_page_token = response.next_page_token;
     let workspaces = response.workspaces;
+    let structured = serde_json::json!({
+        "workspaces": workspaces.iter().map(workspace_to_json).collect::<Vec<_>>(),
+        "next_page_token": next_page_token,
+    });
 
-    if crate::output::print_output_collection(output, &workspaces, workspace_to_json)? {
+    if crate::output::print_output_single(output, &structured, Clone::clone)? {
         return Ok(());
     }
 
@@ -3621,9 +3630,9 @@ pub async fn workspace_list(
         );
     }
 
-    if !response.next_page_token.is_empty() {
+    if !next_page_token.is_empty() {
         println!();
-        println!("Next page token: {}", response.next_page_token);
+        println!("Next page token: {}", next_page_token);
     }
 
     Ok(())
@@ -3751,9 +3760,14 @@ pub async fn workspace_member_list(
         .await
         .into_diagnostic()?;
     let response = response.into_inner();
+    let next_page_token = response.next_page_token;
     let members = response.members;
+    let structured = serde_json::json!({
+        "members": members.iter().map(workspace_member_to_json).collect::<Vec<_>>(),
+        "next_page_token": next_page_token,
+    });
 
-    if crate::output::print_output_collection(output, &members, workspace_member_to_json)? {
+    if crate::output::print_output_single(output, &structured, Clone::clone)? {
         return Ok(());
     }
 
@@ -3776,9 +3790,9 @@ pub async fn workspace_member_list(
         println!("{:<subject_width$}  {}", member.principal_subject, role_str);
     }
 
-    if !response.next_page_token.is_empty() {
+    if !next_page_token.is_empty() {
         println!();
-        println!("Next page token: {}", response.next_page_token);
+        println!("Next page token: {}", next_page_token);
     }
 
     Ok(())
@@ -5387,9 +5401,13 @@ pub async fn sandbox_policy_list(
         .into_diagnostic()?;
 
     let response = resp.into_inner();
+    let next_page_token = response.next_page_token;
     let revisions = response.revisions;
-    let structured = policy_revision_list_json("sandbox", Some(name), &revisions)?;
-    if crate::output::print_output_collection(output, &structured, Clone::clone)? {
+    let structured = serde_json::json!({
+        "revisions": policy_revision_list_json("sandbox", Some(name), &revisions)?,
+        "next_page_token": next_page_token,
+    });
+    if crate::output::print_output_single(output, &structured, Clone::clone)? {
         return Ok(());
     }
 
@@ -5399,9 +5417,9 @@ pub async fn sandbox_policy_list(
     }
 
     print_policy_revision_table(&revisions);
-    if !response.next_page_token.is_empty() {
+    if !next_page_token.is_empty() {
         println!();
-        println!("Next page token: {}", response.next_page_token);
+        println!("Next page token: {}", next_page_token);
     }
     Ok(())
 }
@@ -5429,9 +5447,13 @@ pub async fn sandbox_policy_list_global(
         .into_diagnostic()?;
 
     let response = resp.into_inner();
+    let next_page_token = response.next_page_token;
     let revisions = response.revisions;
-    let structured = policy_revision_list_json("global", None, &revisions)?;
-    if crate::output::print_output_collection(output, &structured, Clone::clone)? {
+    let structured = serde_json::json!({
+        "revisions": policy_revision_list_json("global", None, &revisions)?,
+        "next_page_token": next_page_token,
+    });
+    if crate::output::print_output_single(output, &structured, Clone::clone)? {
         return Ok(());
     }
 
@@ -5441,9 +5463,9 @@ pub async fn sandbox_policy_list_global(
     }
 
     print_policy_revision_table(&revisions);
-    if !response.next_page_token.is_empty() {
+    if !next_page_token.is_empty() {
         println!();
-        println!("Next page token: {}", response.next_page_token);
+        println!("Next page token: {}", next_page_token);
     }
     Ok(())
 }

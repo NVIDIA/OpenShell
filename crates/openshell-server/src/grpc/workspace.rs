@@ -282,6 +282,11 @@ pub(super) async fn handle_list_workspaces(
             "page_token is currently supported only for unfiltered global workspace listings",
         ));
     }
+    if !page_token.is_empty() && req.offset > 0 {
+        return Err(Status::invalid_argument(
+            "page_token cannot be combined with an explicit offset",
+        ));
+    }
 
     let use_cursor_pagination = subject.is_none()
         && req.label_selector.is_empty()
@@ -1933,7 +1938,21 @@ mod tests {
 
         state
             .store
-            .delete_by_name(Workspace::object_type(), "", "default")
+            .put_message(&Workspace {
+                metadata: Some(ObjectMeta {
+                    id: "ws-page-aa".to_string(),
+                    name: "page-aa".to_string(),
+                    created_at_ms: 999_999,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: String::new(),
+                    deletion_timestamp_ms: 0,
+                }),
+                status: Some(WorkspaceStatus {
+                    phase: WorkspacePhase::Active.into(),
+                }),
+            })
             .await
             .unwrap();
 
@@ -1976,7 +1995,27 @@ mod tests {
                 .iter()
                 .filter_map(|workspace| workspace.metadata.as_ref().map(|m| m.name.as_str()))
                 .collect::<Vec<_>>(),
-            vec!["page-c"]
+            vec!["page-b", "page-c"]
         );
+    }
+
+    #[tokio::test]
+    async fn list_workspaces_rejects_page_token_with_offset() {
+        let state = test_server_state().await;
+
+        let err = handle_list_workspaces(
+            &state,
+            authed_request(ListWorkspacesRequest {
+                limit: 1,
+                offset: 1,
+                page_token: "opaque-token".to_string(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("page_token combined with offset should fail");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("page_token cannot be combined"));
     }
 }
