@@ -5,6 +5,8 @@
 
 mod auth_rpc;
 pub mod policy;
+#[cfg(test)]
+mod policy_pagination_tests;
 pub mod provider;
 mod sandbox;
 mod service;
@@ -203,7 +205,7 @@ struct PolicyListPageToken {
     version: i64,
 }
 
-pub(crate) fn encode_list_page_token(
+fn encode_list_page_token(
     kind: &str,
     query: &str,
     cursor: &ObjectCursor,
@@ -218,7 +220,7 @@ pub(crate) fn encode_list_page_token(
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json))
 }
 
-pub(crate) fn decode_list_page_token(
+fn decode_list_page_token(
     expected_kind: &str,
     expected_query: &str,
     token: &str,
@@ -240,11 +242,7 @@ pub(crate) fn decode_list_page_token(
     Ok(decoded.cursor)
 }
 
-pub(crate) fn encode_policy_list_page_token(
-    kind: &str,
-    query: &str,
-    version: i64,
-) -> Result<String, Status> {
+fn encode_policy_list_page_token(kind: &str, query: &str, version: i64) -> Result<String, Status> {
     let token = PolicyListPageToken {
         kind: kind.to_string(),
         query: query.to_string(),
@@ -255,7 +253,7 @@ pub(crate) fn encode_policy_list_page_token(
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json))
 }
 
-pub(crate) fn decode_policy_list_page_token(
+fn decode_policy_list_page_token(
     expected_kind: &str,
     expected_query: &str,
     token: &str,

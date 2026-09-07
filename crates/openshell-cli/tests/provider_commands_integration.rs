@@ -475,7 +475,10 @@ impl OpenShell for TestOpenShell {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        Ok(Response::new(ListProvidersResponse { providers }))
+        Ok(Response::new(ListProvidersResponse {
+            providers,
+            next_page_token: String::new(),
+        }))
     }
 
     async fn list_provider_profiles(
@@ -1355,6 +1358,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
         &ts.endpoint,
         100,
         0,
+        "",
         false,
         "table",
         "default",
@@ -1426,6 +1430,7 @@ async fn provider_list_json_output() {
         &ts.endpoint,
         100,
         0,
+        "",
         false,
         "json",
         "default",
@@ -1469,6 +1474,7 @@ async fn provider_list_yaml_output() {
         &ts.endpoint,
         100,
         0,
+        "",
         false,
         "yaml",
         "default",
@@ -1497,6 +1503,7 @@ async fn provider_list_json_empty() {
         &ts.endpoint,
         100,
         0,
+        "",
         false,
         "json",
         "default",
@@ -3028,7 +3035,7 @@ async fn provider_create_from_gcloud_adc_rejects_service_account() {
         "type": "service_account",
         "project_id": "my-project",
         "private_key_id": "key-id",
-        "private_key": "-----BEGIN RSA PRIVATE KEY-----\n...",
+        "private_key": "redacted-pem-placeholder",
         "client_email": "sa@my-project.iam.gserviceaccount.com"
     });
     let adc_file = tempfile::NamedTempFile::new().unwrap();

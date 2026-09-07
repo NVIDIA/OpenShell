@@ -346,6 +346,7 @@ impl OpenShell for TestOpenShell {
                 sandbox_with_phase("alpha", proto::SandboxPhase::Ready),
                 sandbox_with_phase("beta", proto::SandboxPhase::Provisioning),
             ],
+            next_page_token: String::new(),
         }))
     }
 
@@ -805,6 +806,7 @@ impl OpenShell for TestOpenShell {
                 workspace_proto("default", proto::datamodel::v1::WorkspacePhase::Active),
                 workspace_proto("staging", proto::datamodel::v1::WorkspacePhase::Active),
             ],
+            next_page_token: String::new(),
         }))
     }
 

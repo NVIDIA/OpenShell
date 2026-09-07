@@ -205,14 +205,14 @@ pub(super) async fn handle_list_services(
             ));
         }
         if use_cursor_pagination {
-            let after = if !page_token.is_empty() {
+            let after = if page_token.is_empty() {
+                None
+            } else {
                 Some(super::decode_list_page_token(
                     "service.list",
                     "all_workspaces",
                     page_token,
                 )?)
-            } else {
-                None
             };
             state
                 .store
@@ -234,36 +234,34 @@ pub(super) async fn handle_list_services(
             .await?
             .name;
         if use_cursor_pagination {
-            let after = if !page_token.is_empty() {
+            let after = if page_token.is_empty() {
+                None
+            } else {
                 Some(super::decode_list_page_token(
                     "service.list",
                     &format!("workspace:{workspace}"),
                     page_token,
                 )?)
-            } else {
-                None
             };
             state
                 .store
                 .list_messages_after::<ServiceEndpoint>(&workspace, after.as_ref(), limit)
                 .await
+        } else if req.sandbox.is_empty() {
+            state
+                .store
+                .list_messages(&workspace, limit, req.offset)
+                .await
         } else {
-            if req.sandbox.is_empty() {
-                state
-                    .store
-                    .list_messages(&workspace, limit, req.offset)
-                    .await
-            } else {
-                state
-                    .store
-                    .list_messages_with_selector(
-                        &workspace,
-                        &format!("sandbox={}", req.sandbox),
-                        limit,
-                        req.offset,
-                    )
-                    .await
-            }
+            state
+                .store
+                .list_messages_with_selector(
+                    &workspace,
+                    &format!("sandbox={}", req.sandbox),
+                    limit,
+                    req.offset,
+                )
+                .await
         }
     }
     .map_err(|e| Status::internal(format!("list endpoints failed: {e}")))?;
@@ -970,7 +968,6 @@ mod tests {
             }),
             spec: Some(SandboxSpec::default()),
             status: None,
-            ..Sandbox::default()
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();

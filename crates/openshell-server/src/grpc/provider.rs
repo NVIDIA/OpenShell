@@ -1094,6 +1094,7 @@ pub(super) async fn load_provider_environment_records(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(super) async fn resolve_provider_environment_from_records(
     store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
@@ -2611,14 +2612,14 @@ pub(super) async fn handle_list_providers(
             ));
         }
         let providers = if use_cursor_pagination {
-            let after = if !page_token.is_empty() {
+            let after = if page_token.is_empty() {
+                None
+            } else {
                 Some(decode_list_page_token(
                     "provider.list",
                     "all_workspaces",
                     page_token,
                 )?)
-            } else {
-                None
             };
             state
                 .store
@@ -2662,14 +2663,14 @@ pub(super) async fn handle_list_providers(
             .await?
             .name;
         let providers = if use_cursor_pagination {
-            let after = if !page_token.is_empty() {
+            let after = if page_token.is_empty() {
+                None
+            } else {
                 Some(decode_list_page_token(
                     "provider.list",
                     &format!("workspace:{workspace}"),
                     page_token,
                 )?)
-            } else {
-                None
             };
             list_provider_records(
                 state.store.as_ref(),
@@ -13247,8 +13248,6 @@ mod tests {
     async fn list_providers_uses_stable_page_tokens_for_workspace_scope() {
         use openshell_core::proto::datamodel::v1::ObjectMeta;
 
-        let state = test_server_state().await;
-
         fn provider(name: &str, id: &str, created_at_ms: i64) -> Provider {
             Provider {
                 metadata: Some(ObjectMeta {
@@ -13269,6 +13268,8 @@ mod tests {
                 credential_handles: HashMap::new(),
             }
         }
+
+        let state = test_server_state().await;
 
         for (id, name, created_at_ms) in [
             ("prov-page-a", "page-a", 1_000_000_i64),

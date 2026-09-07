@@ -292,14 +292,14 @@ pub(super) async fn handle_list_workspaces(
         && req.label_selector.is_empty()
         && (req.offset == 0 || !page_token.is_empty());
     let workspaces = if use_cursor_pagination {
-        let after = if !page_token.is_empty() {
+        let after = if page_token.is_empty() {
+            None
+        } else {
             Some(decode_list_page_token(
                 "workspace.list",
                 "global",
                 page_token,
             )?)
-        } else {
-            None
         };
         state
             .store
@@ -687,14 +687,14 @@ pub(super) async fn handle_list_workspace_members(
 
     let use_cursor_pagination = req.offset == 0 || !page_token.is_empty();
     let members: Vec<WorkspaceMember> = if use_cursor_pagination {
-        let after = if !page_token.is_empty() {
+        let after = if page_token.is_empty() {
+            None
+        } else {
             Some(decode_list_page_token(
                 "workspace.members.list",
                 &format!("workspace:{workspace}"),
                 page_token,
             )?)
-        } else {
-            None
         };
         state
             .store

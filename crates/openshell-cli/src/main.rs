@@ -891,6 +891,10 @@ enum ProviderCommands {
         #[arg(long, default_value_t = 0)]
         offset: u32,
 
+        /// Opaque continuation token returned by the previous provider page.
+        #[arg(long)]
+        page_token: Option<String>,
+
         /// Print only provider names, one per line.
         #[arg(long, conflicts_with = "output")]
         names: bool,
@@ -2219,6 +2223,10 @@ enum ServiceCommands {
         #[arg(long, default_value_t = 0)]
         offset: u32,
 
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+
         /// Opaque continuation token returned by the previous service page.
         #[arg(long)]
         page_token: Option<String>,
@@ -2768,9 +2776,9 @@ async fn run_async() -> Result<()> {
                     sandbox,
                     limit,
                     offset,
+                    output,
                     page_token,
                     all_workspaces,
-                    output,
                 } => {
                     run::service_list(
                         &ctx.endpoint,
@@ -3817,6 +3825,7 @@ async fn run_async() -> Result<()> {
                 ProviderCommands::List {
                     limit,
                     offset,
+                    page_token,
                     names,
                     output,
                     all_workspaces,
@@ -3825,6 +3834,7 @@ async fn run_async() -> Result<()> {
                         endpoint,
                         limit,
                         offset,
+                        page_token.as_deref().unwrap_or(""),
                         names,
                         output.as_str(),
                         &cli.workspace,
@@ -5134,6 +5144,7 @@ mod tests {
             Some(Commands::Provider {
                 command: Some(ProviderCommands::List {
                     output: OutputFormat::Json,
+                    page_token: None,
                     ..
                 })
             })
@@ -5150,6 +5161,7 @@ mod tests {
             Some(Commands::Provider {
                 command: Some(ProviderCommands::List {
                     output: OutputFormat::Yaml,
+                    page_token: None,
                     ..
                 })
             })

@@ -650,14 +650,14 @@ pub(super) async fn handle_list_sandboxes(
     let sandboxes: Vec<Sandbox> = if request.all_workspaces {
         require_platform_admin(&state.admin_role, &principal)?;
         if use_cursor_pagination {
-            let after = if !page_token.is_empty() {
+            let after = if page_token.is_empty() {
+                None
+            } else {
                 Some(decode_list_page_token(
                     "sandbox.list",
                     "all_workspaces",
                     page_token,
                 )?)
-            } else {
-                None
             };
             state
                 .store
@@ -691,42 +691,40 @@ pub(super) async fn handle_list_sandboxes(
             .await?
             .name;
         if use_cursor_pagination {
-            let after = if !page_token.is_empty() {
+            let after = if page_token.is_empty() {
+                None
+            } else {
                 Some(decode_list_page_token(
                     "sandbox.list",
                     &format!("workspace:{workspace}"),
                     page_token,
                 )?)
-            } else {
-                None
             };
             state
                 .store
                 .list_messages_after::<Sandbox>(&workspace, after.as_ref(), limit)
                 .await
                 .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
+        } else if !request.label_selector.is_empty() {
+            crate::grpc::validation::validate_label_selector(&request.label_selector)?;
+            state
+                .store
+                .list_messages_with_selector(
+                    &workspace,
+                    &request.label_selector,
+                    limit,
+                    request.offset,
+                )
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("list sandboxes with selector failed: {e}"))
+                })?
         } else {
-            if !request.label_selector.is_empty() {
-                crate::grpc::validation::validate_label_selector(&request.label_selector)?;
-                state
-                    .store
-                    .list_messages_with_selector(
-                        &workspace,
-                        &request.label_selector,
-                        limit,
-                        request.offset,
-                    )
-                    .await
-                    .map_err(|e| {
-                        Status::internal(format!("list sandboxes with selector failed: {e}"))
-                    })?
-            } else {
-                state
-                    .store
-                    .list_messages(&workspace, limit, request.offset)
-                    .await
-                    .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
-            }
+            state
+                .store
+                .list_messages(&workspace, limit, request.offset)
+                .await
+                .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
         }
     };
 
@@ -6415,18 +6413,10 @@ mod tests {
 
         // all_workspaces returns sandboxes from all workspaces.
         // Re-create the "default" sandbox so both workspaces have one.
-        state
-            .store
-            .put(
-                Sandbox::object_type(),
-                "sbx-default-2",
-                "sandbox-d",
-                "default",
-                &Sandbox::default().encode_to_vec(),
-                None,
-            )
-            .await
-            .unwrap();
+        let mut sbx_default_2 = test_sandbox("sandbox-d", Vec::new());
+        sbx_default_2.metadata.as_mut().unwrap().id = "sbx-default-2".to_string();
+        sbx_default_2.metadata.as_mut().unwrap().workspace = "default".to_string();
+        state.store.put_message(&sbx_default_2).await.unwrap();
         let listed = handle_list_sandboxes(
             &state,
             authed_request(ListSandboxesRequest {
@@ -6482,9 +6472,8 @@ mod tests {
                     workspace: "default".to_string(),
                     deletion_timestamp_ms: 0,
                 }),
-                spec: Some(SandboxSpec::default()),
+                spec: Some(openshell_core::proto::SandboxSpec::default()),
                 status: None,
-                ..Sandbox::default()
             };
             sandbox.set_phase(SandboxPhase::Ready as i32);
             state.store.put_message(&sandbox).await.unwrap();
