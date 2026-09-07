@@ -263,7 +263,7 @@ impl OpenShell for OpenShellService {
                     resource_capabilities: driver
                         .resource_capabilities
                         .as_ref()
-                        .map(public_resource_capabilities),
+                        .map(|resources| public_resource_capabilities(*resources)),
                 }),
             })
             .collect();
@@ -802,7 +802,7 @@ impl OpenShell for OpenShellService {
 }
 
 fn public_resource_capabilities(
-    resources: &openshell_core::proto::compute::v1::ResourceCapabilities,
+    resources: openshell_core::proto::compute::v1::ResourceCapabilities,
 ) -> ResourceCapabilities {
     ResourceCapabilities {
         cpu: resources.cpu.as_ref().map(|cpu| CpuResourceCapabilities {
@@ -978,7 +978,7 @@ mod tests {
             }),
         };
 
-        let capabilities = public_resource_capabilities(&driver_capabilities);
+        let capabilities = public_resource_capabilities(driver_capabilities);
 
         assert!(capabilities.cpu.expect("CPU capabilities").limit_supported);
         assert!(
@@ -995,6 +995,6 @@ mod tests {
     #[test]
     fn public_resource_capabilities_preserves_absence() {
         let absent: Option<DriverResourceCapabilities> = None;
-        assert!(absent.as_ref().map(public_resource_capabilities).is_none());
+        assert!(absent.map(public_resource_capabilities).is_none());
     }
 }
