@@ -39,7 +39,6 @@ When a sandbox curls `alpha-exchange` or `beta-exchange`:
 - Gateway and supervisor access to SPIRE OIDC/JWKS discovery.
 - OpenShell configured with the Kubernetes ServiceAccount supervisor bootstrap
   path.
-- `providers_v2_enabled=true` on the target gateway.
 - Local `curl`, `python3`, `openssl`, `nc`, `kubectl`, and `openshell`.
 - A registered and logged-in CLI gateway. The script uses `GATEWAY_NAME`, then
   `OPENSHELL_GATEWAY`, then the active OpenShell gateway selection.
@@ -128,9 +127,6 @@ Then run:
 
 ```bash
 export GATEWAY=https://127.0.0.1:8097
-
-openshell --gateway "$OPENSHELL_GATEWAY" --gateway-endpoint "$GATEWAY" settings set \
-  --global --key providers_v2_enabled --value true --yes
 
 openshell --gateway "$OPENSHELL_GATEWAY" --gateway-endpoint "$GATEWAY" provider profile import \
   -f "$OPENSHELL_REPO/examples/spiffe-token-exchange-demo/provider-profile.yaml"

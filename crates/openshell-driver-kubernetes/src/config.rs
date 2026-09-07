@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-pub use openshell_core::OperatorNamespaceAllowlist;
+pub use openshell_core::DynamicStringAllowlist as OperatorNamespaceAllowlist;
 use openshell_core::config;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;

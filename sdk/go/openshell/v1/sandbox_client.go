@@ -21,6 +21,9 @@ type sandboxClient struct {
 	client pb.OpenShellClient
 }
 
+var _ SandboxInterface = (*sandboxClient)(nil)
+var _ SandboxTemplateCreateInterface = (*sandboxClient)(nil)
+
 func newSandboxClient(conn grpc.ClientConnInterface) *sandboxClient {
 	return &sandboxClient{client: pb.NewOpenShellClient(conn)}
 }
@@ -44,6 +47,44 @@ func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec
 		return nil, converter.FromGRPCError(err)
 	}
 	return converter.SandboxFromProto(resp.GetSandbox()), nil
+}
+
+func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error) {
+	if templateName == "" {
+		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "template name is required"}
+	}
+	if err := validateTemplateCreateSpec(spec); err != nil {
+		return nil, err
+	}
+	protoSpec, err := converter.SandboxSpecToProtoChecked(spec)
+	if err != nil {
+		return nil, &StatusError{Code: ErrorInvalidArgument, Message: err.Error()}
+	}
+	req := &pb.CreateSandboxRequest{
+		Name:                 name,
+		Spec:                 protoSpec,
+		Labels:               labels,
+		Workspace:            workspace,
+		WorkloadTemplateName: templateName,
+	}
+	if len(opts) > 0 {
+		req.Annotations = converter.CopyStringMap(opts[0].Annotations)
+	}
+	resp, err := s.client.CreateSandbox(ctx, req)
+	if err != nil {
+		return nil, converter.FromGRPCError(err)
+	}
+	return converter.SandboxFromProto(resp.GetSandbox()), nil
+}
+
+func validateTemplateCreateSpec(spec *SandboxSpec) error {
+	if spec == nil {
+		return nil
+	}
+	if spec.LogLevel != "" || len(spec.Environment) > 0 || spec.Template != nil || spec.GPU || spec.GPUCount != nil {
+		return &StatusError{Code: ErrorInvalidArgument, Message: "template creates only allow policy, providers, command, and tty in spec"}
+	}
+	return nil
 }
 
 func (s *sandboxClient) Get(ctx context.Context, workspace, name string) (*Sandbox, error) {

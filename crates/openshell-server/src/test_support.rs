@@ -96,6 +96,7 @@ impl FakeComputeDriver {
                     default_image: "openshell/sandbox:test".to_string(),
                     gateway_manages_lifecycle: false,
                     supports_sandbox_authentication: false,
+                    driver_reports_runtime_readiness: false,
                 },
                 gateway_listener_requirements: Vec::new(),
                 gateway_listener_requirements_supported: true,
@@ -284,11 +285,13 @@ impl ComputeDriver for FakeComputeDriver {
         request: Request<ValidateSandboxCreateRequest>,
     ) -> Result<Response<ValidateSandboxCreateResponse>, Status> {
         self.record_traceparent(request.metadata());
-        let sandbox = request.into_inner().sandbox;
+        let request = request.into_inner();
         self.with_state(|state| {
             state
                 .calls
-                .push(FakeComputeDriverCall::ValidateSandboxCreate { sandbox });
+                .push(FakeComputeDriverCall::ValidateSandboxCreate {
+                    sandbox: request.sandbox,
+                });
         });
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
@@ -337,7 +340,8 @@ impl ComputeDriver for FakeComputeDriver {
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<CreateSandboxResponse>, Status> {
         self.record_traceparent(request.metadata());
-        let sandbox = request.into_inner().sandbox;
+        let request = request.into_inner();
+        let sandbox = request.sandbox;
         self.with_state(|state| {
             if let Some(sandbox) = sandbox.as_ref() {
                 state.sandboxes.insert(sandbox.id.clone(), sandbox.clone());

@@ -28,13 +28,15 @@ The GitHub ruleset should require the `OpenShell / ...` statuses published by `R
 
 ## Informational security reports
 
-Security analysis that does not need NVIDIA infrastructure runs directly on
-GitHub-hosted runners. These workflows receive no secrets. The PR-oriented
-reports run on fork pull requests without waiting for copy-pr-bot. Scanner jobs
-request `security-events: write` to publish SARIF to Code Scanning. GitHub
-permits Code Scanning uploads from `pull_request` runs even when fork and
-Dependabot contexts receive a read-only `GITHUB_TOKEN`, so those scanners upload
-results directly and also retain report artifacts:
+Security workflow compute runs directly on GitHub-hosted runners instead of
+NVIDIA self-hosted runners. The PR-oriented workflows receive no secrets and run
+on fork pull requests without waiting for copy-pr-bot. Codex Security release
+qualification is the exception: it runs only for maintainer-created
+pre-release tags and receives a scoped NVIDIA Inference API key for the scan
+step. Scanner jobs request `security-events: write` to publish SARIF to Code
+Scanning. GitHub permits Code Scanning uploads from `pull_request` runs even
+when fork and Dependabot contexts receive a read-only `GITHUB_TOKEN`, so those
+scanners upload results directly:
 
 - `Workflow Security Reports` runs Actionlint and Zizmor. Actionlint reports
   workflow syntax and expression findings. Zizmor reports only High severity,
@@ -50,6 +52,20 @@ results directly and also retain report artifacts:
   E2E test code are excluded. It runs nightly on `main`, remains manually
   dispatchable for diagnostics, uploads results to Code Scanning, and retains
   workflow artifacts.
+- `Codex Security Release Qualification` analyzes each `vX.Y.Z-pre.N`
+  candidate against the previous stable release. Every candidate in a release
+  train therefore rescans the cumulative stable-to-candidate diff. It calls
+  `https://inference-api.nvidia.com/v1` with
+  `openai/openai/gpt-5.6-sol` at medium reasoning effort. The
+  `CODEX_SECURITY_API_KEY` secret must contain an API key authorized for that
+  NVIDIA endpoint. Results are uploaded against the candidate commit on `main`
+  under a category shared by the train, for example
+  `codex-security/v0.1.1`, so later candidates replace earlier analyses. The
+  slash-qualified NVIDIA model identifier prevents Codex Security 0.1.24 from
+  enforcing `--max-cost`, so the workflow relies on its timeout, serialized
+  concurrency, and the inference account's spend controls. Raw reports are not
+  retained as workflow artifacts. Pre-release creation and stable-promotion
+  enforcement remain part of RFC 0014 and are not implemented by this workflow.
 
 Findings do not fail these workflows. Tool startup, configuration, build, and
 analysis failures still fail so a broken scanner cannot appear healthy. The
@@ -187,6 +203,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/workflows/workflow-security.yml` | Runs informational Actionlint and High-severity Zizmor reports on GitHub-hosted runners. |
 | `.github/workflows/dependency-review.yml` | Reports dependency changes when GitHub Dependency Graph is available; otherwise publishes a neutral warning. |
 | `.github/workflows/codeql.yml` | Runs nightly informational CodeQL analysis on `main` for Rust and the Go, Python, and TypeScript SDKs and retains SARIF artifacts. |
+| `.github/workflows/codex-security.yml` | Scans the cumulative diff from the previous stable release to each pre-release candidate and publishes train-scoped SARIF on `main`. |
 
 ## Release workflows
 
@@ -195,7 +212,7 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | File | Role |
 |---|---|
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway/supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
-| `.github/workflows/release-tag.yml` | Publishes a tagged public release. |
+| `.github/workflows/release-tag.yml` | Publishes a tagged stable release. Its automatic tag trigger excludes `-pre.*`; manual dispatch remains maintainer-controlled. |
 | `.github/workflows/release-canary.yml` | Smoke-tests published artifacts on `macos`, `ubuntu`, `fedora`, and `kubernetes` (kind + Helm) runners. Triggers automatically when `Release Dev` succeeds, and via `workflow_dispatch` on any branch (`gh workflow run release-canary.yml --ref <branch>`). The `kubernetes` job pins to `0.0.0-dev` artifacts; the other jobs install the latest tagged release via `install.sh`. See the `test-release-canary` skill for the manual-dispatch playbook and local kind reproduction. |
 
 ## Required status contexts

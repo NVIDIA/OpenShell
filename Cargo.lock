@@ -2224,9 +2224,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.13"
+version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f44da3a8150a6703ed5d34e164b875fd14c2cdab9af1252a9a1020bde2bdc54"
+checksum = "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3804,6 +3804,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "console",
  "crossterm 0.28.1",
  "dialoguer",
  "futures",
@@ -3854,6 +3855,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -3882,8 +3884,11 @@ dependencies = [
  "prost",
  "prost-types",
  "protoc-bin-vendored",
+ "rcgen",
  "reqwest 0.12.28",
  "rustix 1.1.4",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "tar",
@@ -4091,6 +4096,7 @@ dependencies = [
  "nix 0.29.0",
  "oci-client",
  "openshell-core",
+ "openshell-driver-podman",
  "openshell-otel",
  "openshell-otel-test-support",
  "openshell-policy",
@@ -4136,6 +4142,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-gateway"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "hyper-util",
+ "miette",
+ "nix 0.29.0",
+ "openshell-core",
+ "openshell-driver-docker",
+ "openshell-driver-kubernetes",
+ "openshell-driver-mxc",
+ "openshell-driver-podman",
+ "openshell-otel",
+ "openshell-server",
+ "rustix 1.1.4",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tower 0.5.3",
+ "tracing",
+]
+
+[[package]]
 name = "openshell-gateway-interceptors"
 version = "0.0.0"
 dependencies = [
@@ -4171,6 +4201,7 @@ dependencies = [
 name = "openshell-otel"
 version = "0.0.0"
 dependencies = [
+ "futures",
  "http 1.4.0",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -4188,10 +4219,13 @@ dependencies = [
 name = "openshell-otel-test-support"
 version = "0.0.0"
 dependencies = [
+ "openshell-otel",
  "opentelemetry-proto",
  "tokio",
  "tokio-stream",
  "tonic",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4347,11 +4381,7 @@ dependencies = [
  "openshell-bootstrap",
  "openshell-core",
  "openshell-driver-db-credstore",
- "openshell-driver-docker",
- "openshell-driver-kubernetes",
  "openshell-driver-kubernetes-secrets",
- "openshell-driver-mxc",
- "openshell-driver-podman",
  "openshell-driver-vault",
  "openshell-extension-core",
  "openshell-gateway-interceptors",

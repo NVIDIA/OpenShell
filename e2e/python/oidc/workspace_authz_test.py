@@ -248,7 +248,7 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
                             name="authz-test", workspace=WS
                         ),
                         type="claude",
-                        credentials={"K": "v"},
+                        credentials={"ANTHROPIC_API_KEY": "v"},
                     ),
                 ),
                 metadata=m,
@@ -277,7 +277,7 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
                             name="nonexistent", workspace=WS
                         ),
                         type="claude",
-                        credentials={"K": "v"},
+                        credentials={"ANTHROPIC_API_KEY": "v"},
                     ),
                 ),
                 metadata=m,
@@ -666,7 +666,7 @@ class TestWorkspaceAuthorization:
                             name=prov_name, workspace=workspace
                         ),
                         type="claude",
-                        credentials={"API_KEY": "test"},
+                        credentials={"ANTHROPIC_API_KEY": "test"},
                     ),
                 ),
                 metadata=metadata,
@@ -977,7 +977,7 @@ class TestWorkspaceAuthorization:
                                 name="user-blocked", workspace=WS
                             ),
                             type="claude",
-                            credentials={"K": "v"},
+                            credentials={"ANTHROPIC_API_KEY": "v"},
                         ),
                     ),
                     metadata=user_md,
@@ -1046,7 +1046,7 @@ class TestWorkspaceAuthorization:
                     provider=datamodel_pb2.Provider(
                         metadata=datamodel_pb2.ObjectMeta(name=prov_name, workspace=WS),
                         type="claude",
-                        credentials={"K": "v"},
+                        credentials={"ANTHROPIC_API_KEY": "v"},
                     ),
                 ),
                 metadata=user_md,

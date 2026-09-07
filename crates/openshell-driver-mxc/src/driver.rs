@@ -177,13 +177,6 @@ pub struct MxcComputeBackend {
     registry: Arc<Mutex<HashMap<String, SandboxEntry>>>,
     watch_tx: Arc<broadcast::Sender<WatchSandboxesEvent>>,
     policy_mapper: Arc<dyn PolicyMapper>,
-    /// Out-of-band side channel for the `SandboxPolicy` (A1). The proto driver
-    /// contract has no `policy` field and there is no driver-side
-    /// `GetSandboxConfig`, so `ComputeRuntime::create_sandbox` stages the policy
-    /// here keyed by sandbox id (mirroring the `sandbox_token` injection),
-    /// immediately before dispatching to this backend's `create_sandbox`, which
-    /// removes/consumes it.
-    pending_policies: Arc<Mutex<HashMap<String, SandboxPolicy>>>,
 }
 
 impl std::fmt::Debug for MxcComputeBackend {
@@ -279,15 +272,7 @@ impl MxcComputeBackend {
             // Production policy translation is always handled by the embedded
             // mapper before any MXC lifecycle side effects begin.
             policy_mapper: Arc::new(EmbeddedPolicyMapper),
-            pending_policies: Arc::new(Mutex::new(HashMap::new())),
         }
-    }
-
-    /// Returns a clone of the `pending_policies` side channel so the gateway's
-    /// `ComputeRuntime` can stage the typed `SandboxPolicy` by sandbox id right
-    /// before dispatching `create_sandbox` (A1 wiring).
-    pub fn policy_sink(&self) -> Arc<Mutex<HashMap<String, SandboxPolicy>>> {
-        self.pending_policies.clone()
     }
 
     /// Test-only constructor wiring the in-process mock `wxc-exec` shim.
@@ -304,10 +289,12 @@ impl MxcComputeBackend {
             driver_version: DRIVER_VERSION.to_string(),
             default_image: DEFAULT_IMAGE_SENTINEL.to_string(),
             gateway_manages_lifecycle: false,
+            supports_sandbox_authentication: false,
+            driver_reports_runtime_readiness: true,
         }
     }
 
-    pub fn validate_sandbox_create(&self, sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
+    fn validate_sandbox_fields(&self, sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
         if let Some(spec) = &sandbox.spec {
             if effective_driver_gpu_count(driver_gpu_requirements(
                 spec.resource_requirements.as_ref(),
@@ -330,6 +317,29 @@ impl MxcComputeBackend {
         sandbox_config(sandbox)?;
         Ok(())
     }
+
+    fn map_sandbox_policy(
+        &self,
+        sandbox_id: &str,
+        policy: Option<&SandboxPolicy>,
+    ) -> Result<MappedConfig, tonic::Status> {
+        self.policy_mapper
+            .map(
+                policy,
+                &MapCtx {
+                    sandbox_id: sandbox_id.to_string(),
+                    egress: None,
+                },
+            )
+            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))
+    }
+
+    pub fn validate_sandbox_create(&self, sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
+        self.validate_sandbox_fields(sandbox)?;
+        let policy = sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref());
+        self.map_sandbox_policy(&sandbox.id, policy)?;
+        Ok(())
+    }
     pub async fn get_sandbox(&self, sandbox_name: &str) -> Option<DriverSandbox> {
         let registry = self.registry.lock().await;
         registry
@@ -346,25 +356,14 @@ impl MxcComputeBackend {
     pub async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
         let sandbox_id = sandbox.id.clone();
 
-        // Consume the out-of-band policy staged by `ComputeRuntime::create_sandbox`
-        // (A1). Always remove so rejected creates cannot leak policy state.
-        let policy = self.pending_policies.lock().await.remove(&sandbox_id);
-        self.validate_sandbox_create(sandbox)?;
+        self.validate_sandbox_fields(sandbox)?;
         let sandbox_config = sandbox_config(sandbox)?;
 
         // Policy translation is deterministic and side-effect free. Do it before
         // inserting the registry entry or launching MXC so invalid requests fail
         // synchronously at the CreateSandbox boundary.
-        let mapped = self
-            .policy_mapper
-            .map(
-                policy.as_ref(),
-                &MapCtx {
-                    sandbox_id: sandbox_id.clone(),
-                    egress: None,
-                },
-            )
-            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+        let policy = sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref());
+        let mapped = self.map_sandbox_policy(&sandbox_id, policy)?;
 
         if sandbox
             .spec
@@ -941,6 +940,11 @@ mod lifecycle_tests {
         }
     }
 
+    fn with_policy(mut sandbox: DriverSandbox, policy: SandboxPolicy) -> DriverSandbox {
+        sandbox.spec.as_mut().unwrap().policy = Some(policy);
+        sandbox
+    }
+
     fn ready_condition(sb: &DriverSandbox) -> Option<DriverCondition> {
         sb.status
             .as_ref()?
@@ -1027,13 +1031,8 @@ mod lifecycle_tests {
         ];
         let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
 
-        // Stage the policy via the A1 side channel (as ComputeRuntime would).
-        let sink = backend.policy_sink();
-        sink.lock()
-            .await
-            .insert("sb-pos".into(), fs_policy(&[&share]));
-
-        let sb = driver_sandbox_with_command("sb-pos", &share, cmd);
+        let policy = fs_policy(&[&share]);
+        let sb = with_policy(driver_sandbox_with_command("sb-pos", &share, cmd), policy);
         backend.create_sandbox(&sb).await.expect("create accepted");
 
         // Self-reported Ready=True (no supervisor) once the agent exec launches.
@@ -1085,12 +1084,8 @@ mod lifecycle_tests {
         ];
         let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
 
-        let sink = backend.policy_sink();
-        sink.lock()
-            .await
-            .insert("sb-pc".into(), fs_policy(&[&share]));
-
-        let sb = driver_sandbox_with_command("sb-pc", &share, cmd);
+        let policy = fs_policy(&[&share]);
+        let sb = with_policy(driver_sandbox_with_command("sb-pc", &share, cmd), policy);
         backend.create_sandbox(&sb).await.expect("create accepted");
 
         let ready = wait_for(&backend, "sb-pc", |s| {
@@ -1142,12 +1137,10 @@ mod lifecycle_tests {
         // Subscribe to the watch stream BEFORE create so we catch the denial event.
         let mut stream = backend.watch_sandboxes().await;
 
-        let sink = backend.policy_sink();
-        sink.lock()
-            .await
-            .insert("sb-neg".into(), fs_policy(&[&share]));
+        let policy = fs_policy(&[&share]);
+        let sandbox = with_policy(driver_sandbox_with_command("sb-neg", &share, cmd), policy);
         backend
-            .create_sandbox(&driver_sandbox_with_command("sb-neg", &share, cmd))
+            .create_sandbox(&sandbox)
             .await
             .expect("create accepted");
 
@@ -1199,13 +1192,10 @@ mod lifecycle_tests {
             format!("$null = '{share}'; Start-Sleep -Seconds 60"),
         ];
         let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
+        let policy = fs_policy(&[&share]);
+        let sandbox = with_policy(driver_sandbox_with_command("sb-stop", "", command), policy);
         backend
-            .policy_sink()
-            .lock()
-            .await
-            .insert("sb-stop".into(), fs_policy(&[&share]));
-        backend
-            .create_sandbox(&driver_sandbox_with_command("sb-stop", "", command))
+            .create_sandbox(&sandbox)
             .await
             .expect("create accepted");
         wait_for(&backend, "sb-stop", |sandbox| {
@@ -1245,13 +1235,9 @@ mod lifecycle_tests {
                 binaries: Vec::new(),
             },
         );
-        backend
-            .policy_sink()
-            .lock()
-            .await
-            .insert("sb-net".into(), policy);
+        let sandbox = with_policy(driver_sandbox("sb-net"), policy);
         let error = backend
-            .create_sandbox(&driver_sandbox("sb-net"))
+            .create_sandbox(&sandbox)
             .await
             .expect_err("unmappable policy must fail CreateSandbox synchronously");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);

@@ -54,6 +54,38 @@ pub fn contains_reserved_credential_marker(value: &str) -> bool {
     contains_raw_reserved_marker(&decoded)
 }
 
+/// Return whether an HTTP header value contains syntax reserved for credential
+/// placeholder rewriting, including the decoded value of Basic authentication.
+pub fn header_value_contains_reserved_credential_marker(value: &str) -> bool {
+    let trimmed = value.trim();
+    if contains_reserved_credential_marker(trimmed) {
+        return true;
+    }
+
+    let Some(decoded) = decode_basic_auth_value(trimmed) else {
+        return false;
+    };
+    contains_raw_reserved_marker(&decoded)
+}
+
+fn basic_auth_token(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("Basic ")
+        .or_else(|| value.strip_prefix("basic "))
+        .map(str::trim)
+}
+
+fn decode_basic_auth_value(value: &str) -> Option<String> {
+    decode_basic_auth_token(basic_auth_token(value)?)
+}
+
+fn decode_basic_auth_token(encoded: &str) -> Option<String> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    String::from_utf8(decoded).ok()
+}
+
 pub fn contains_reserved_credential_marker_bytes(value: &[u8]) -> bool {
     if value.is_empty() {
         return false;
@@ -494,10 +526,7 @@ impl SecretResolver {
 
         // Basic auth decoding: `Basic <base64>` where the decoded content
         // contains a placeholder (e.g. `user:openshell:resolve:env:PASS`).
-        if let Some(encoded) = trimmed
-            .strip_prefix("Basic ")
-            .or_else(|| trimmed.strip_prefix("basic "))
-            .map(str::trim)
+        if let Some(encoded) = basic_auth_token(trimmed)
             && let Some(rewritten) = self.rewrite_basic_auth_token(encoded)?
         {
             return Ok(Some(format!("Basic {rewritten}")));
@@ -633,18 +662,15 @@ impl SecretResolver {
         encoded: &str,
     ) -> Result<Option<String>, UnresolvedPlaceholderError> {
         let b64 = base64::engine::general_purpose::STANDARD;
-        let Some(decoded_bytes) = b64.decode(encoded.trim()).ok() else {
-            return Ok(None);
-        };
-        let Some(decoded) = std::str::from_utf8(&decoded_bytes).ok() else {
+        let Some(decoded) = decode_basic_auth_token(encoded.trim()) else {
             return Ok(None);
         };
 
-        if !contains_raw_reserved_marker(decoded) {
+        if !contains_raw_reserved_marker(&decoded) {
             return Ok(None);
         }
 
-        let mut rewritten = decoded.to_string();
+        let mut rewritten = decoded;
         let replacements = self.rewrite_text_placeholders(&mut rewritten, "header")?;
 
         if replacements == 0 {
@@ -1411,6 +1437,28 @@ mod tests {
         assert!(!contains_reserved_credential_marker_bytes(&[
             0xff, 0x00, 0x01, 0x02
         ]));
+    }
+
+    #[test]
+    fn header_value_marker_detection_covers_rewrite_forms() {
+        let basic =
+            base64::engine::general_purpose::STANDARD.encode("user:openshell:resolve:env:API_KEY");
+
+        for value in [
+            "openshell:resolve:env:API_KEY".to_string(),
+            "Bearer openshell:resolve:env:API_KEY".to_string(),
+            "provider-OPENSHELL-RESOLVE-ENV-API_KEY".to_string(),
+            "openshell%3Aresolve%3Aenv%3AAPI_KEY".to_string(),
+            format!("Basic {basic}"),
+        ] {
+            assert!(
+                header_value_contains_reserved_credential_marker(&value),
+                "reserved credential marker in {value:?}"
+            );
+        }
+        assert!(!header_value_contains_reserved_credential_marker(
+            "Bearer ordinary-token"
+        ));
     }
 
     fn fully_percent_encoded(marker: &str) -> String {

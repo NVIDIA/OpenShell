@@ -104,7 +104,9 @@ data:
     [openshell.gateway.tls]
     cert_path             = "/etc/openshell-tls/server/tls.crt"
     key_path              = "/etc/openshell-tls/server/tls.key"
+    {{- if eq (include "openshell.gatewayClientCaEnabled" .) "true" }}
     client_ca_path        = "/etc/openshell-tls/client-ca/ca.crt"
+    {{- end }}
     {{- if .Values.certManager.serverIssuerRef.name }}
     external_cert_path    = "/etc/openshell-tls/server-external/tls.crt"
     external_key_path     = "/etc/openshell-tls/server-external/tls.key"

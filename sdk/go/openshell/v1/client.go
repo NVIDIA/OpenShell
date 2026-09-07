@@ -4,6 +4,7 @@
 package v1
 
 import (
+	"context"
 	"sync"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
@@ -18,6 +19,8 @@ type Config = types.Config
 // ClientInterface defines the top-level SDK surface.
 type ClientInterface interface {
 	Sandboxes() SandboxInterface
+	SandboxTemplates() SandboxTemplateInterface
+	CreateSandboxFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
 	Providers() ProviderInterface
 	Services() ServiceInterface
 	Exec() ExecInterface
@@ -49,18 +52,20 @@ type Client struct {
 	closeOnce sync.Once
 	closeErr  error
 
-	sandboxes  SandboxInterface
-	providers  ProviderInterface
-	services   ServiceInterface
-	exec       ExecInterface
-	files      FileInterface
-	health     HealthInterface
-	ssh        SSHInterface
-	tcp        TCPInterface
-	cfg        ConfigInterface
-	policy     PolicyInterface
-	workspaces WorkspaceInterface
-	inference  InferenceInterface
+	sandboxes      SandboxInterface
+	templateCreate SandboxTemplateCreateInterface
+	templates      SandboxTemplateInterface
+	providers      ProviderInterface
+	services       ServiceInterface
+	exec           ExecInterface
+	files          FileInterface
+	health         HealthInterface
+	ssh            SSHInterface
+	tcp            TCPInterface
+	cfg            ConfigInterface
+	policy         PolicyInterface
+	workspaces     WorkspaceInterface
+	inference      InferenceInterface
 }
 
 // NewClient creates a new SDK client connected to the given gateway.
@@ -93,7 +98,10 @@ func NewClient(cfg Config) (*Client, error) {
 		config: cfg,
 	}
 
-	c.sandboxes = newSandboxClient(conn)
+	sandboxes := newSandboxClient(conn)
+	c.sandboxes = sandboxes
+	c.templateCreate = sandboxes
+	c.templates = newSandboxTemplateClient(conn)
 	c.providers = newProviderClient(conn)
 	c.services = newServiceClient(conn)
 	c.exec = newExecClient(conn, c.sandboxes)
@@ -111,6 +119,15 @@ func NewClient(cfg Config) (*Client, error) {
 
 // Sandboxes returns the sandbox sub-client.
 func (c *Client) Sandboxes() SandboxInterface { return c.sandboxes }
+
+// SandboxTemplates returns the reusable sandbox template sub-client.
+func (c *Client) SandboxTemplates() SandboxTemplateInterface { return c.templates }
+
+// CreateSandboxFromTemplate creates a sandbox from a named workload template
+// without changing the legacy Sandboxes() interface.
+func (c *Client) CreateSandboxFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error) {
+	return c.templateCreate.CreateFromTemplate(ctx, workspace, name, templateName, spec, labels, opts...)
+}
 
 // Providers returns the provider sub-client.
 func (c *Client) Providers() ProviderInterface { return c.providers }

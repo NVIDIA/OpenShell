@@ -11,9 +11,12 @@ use openshell_e2e::harness::sandbox::SandboxGuard;
 
 #[tokio::test]
 async fn vm_overlay() {
-    let mut sandbox = SandboxGuard::create(&["--", "echo", "vm-sandbox-ready"])
-        .await
-        .expect("sandbox create should succeed");
+    let mut sandbox = SandboxGuard::create_keep(
+        &["sh", "-c", "echo vm-sandbox-ready; exec sleep infinity"],
+        "vm-sandbox-ready",
+    )
+    .await
+    .expect("sandbox create should start a durable main process");
 
     let script = concat!(
         "set -eu; ",

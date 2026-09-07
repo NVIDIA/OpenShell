@@ -37,6 +37,9 @@ chrono = "0.4"
 clap = { workspace = true }
 clap_complete = { workspace = true }
 crossterm = { workspace = true }
+# Styling backend shared by dialoguer and indicatif; `color` overrides its
+# global switch so both follow the CLI's --color setting.
+console = "0.15"
 dialoguer = "0.11"
 indicatif = { workspace = true }
 owo-colors = { workspace = true }

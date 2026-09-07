@@ -51,6 +51,16 @@ pub struct SandboxGuard {
 }
 
 impl SandboxGuard {
+    /// Manage the cleanup of a sandbox created outside this helper.
+    pub fn manage_existing(name: String) -> Self {
+        Self {
+            name,
+            create_output: String::new(),
+            child: None,
+            cleaned_up: false,
+        }
+    }
+
     /// Create a persistent scratch sandbox and optionally run a command in it.
     ///
     /// Arguments before `--` are forwarded to `sandbox create`; arguments after
@@ -73,14 +83,17 @@ impl SandboxGuard {
             (&args[..index], &args[index + 1..])
         });
 
+        if create_args.contains(&"--no-keep") {
+            return Err(
+                "SandboxGuard::create makes a persistent scratch sandbox; use the CLI directly to test --no-keep semantics"
+                    .to_string(),
+            );
+        }
+
         let mut cmd = openshell_cmd();
         cmd.arg("sandbox").arg("create").arg("--detach");
         for arg in create_args {
-            // `--no-keep` described the old disposable-exec create flow and
-            // conflicts with the detached scratch sandbox used by this helper.
-            if *arg != "--no-keep" {
-                cmd.arg(arg);
-            }
+            cmd.arg(arg);
         }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 

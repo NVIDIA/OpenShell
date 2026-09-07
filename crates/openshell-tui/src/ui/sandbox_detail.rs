@@ -8,6 +8,37 @@ use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
 use crate::app::App;
 
+const BASE_CONTENT_ROWS: u16 = 6;
+const BORDER_ROWS: u16 = 2;
+
+fn pending_draft_count(app: &App) -> usize {
+    let cached = app
+        .sandbox_draft_counts
+        .get(app.sandbox_selected)
+        .copied()
+        .unwrap_or(0);
+    if cached > 0 {
+        cached
+    } else {
+        app.draft_chunks
+            .iter()
+            .filter(|chunk| chunk.status == "pending")
+            .count()
+    }
+}
+
+/// Return the rows needed to render every metadata line without clipping.
+pub(super) fn required_height(app: &App) -> u16 {
+    let policy_rows = u16::from(app.sandbox_policy_is_global);
+    let action_rows = if app.confirm_delete {
+        2 // spacer plus confirmation
+    } else {
+        u16::from(pending_draft_count(app) > 0)
+    };
+
+    BASE_CONTENT_ROWS + policy_rows + action_rows + BORDER_ROWS
+}
+
 /// Draw a compact metadata pane for the currently selected sandbox.
 ///
 /// This is non-interactive (no focus state) — always rendered with the
@@ -37,16 +68,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     };
 
     // Count pending draft recommendations for this sandbox.
-    let pending_count = app.sandbox_draft_counts.get(idx).copied().unwrap_or(0);
-    // Also check the live draft_chunks when on the sandbox screen (more up-to-date).
-    let pending_count = if pending_count > 0 {
-        pending_count
-    } else {
-        app.draft_chunks
-            .iter()
-            .filter(|c| c.status == "pending")
-            .count()
-    };
+    // Fall back to the live chunks when the dashboard cache has no pending count.
+    let pending_count = pending_draft_count(app);
 
     // Row 1: Name + Status + optional draft badge
     let mut row1_spans = vec![

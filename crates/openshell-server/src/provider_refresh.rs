@@ -835,23 +835,6 @@ pub async fn refresh_provider_credential(
         "provider credential refresh started"
     );
 
-    // Enforce the providers_v2 gate on every mint, not just at configure time.
-    // Otherwise disabling providers_v2_enabled leaves already-configured refresh
-    // states that the worker and manual rotation keep minting from.
-    if let Err(err) = ensure_refresh_providers_v2_gate(store, &state).await {
-        let failure = RefreshFailure::from_status(&err);
-        persist_refresh_failure_state(store, &mut state, expected_version, &failure).await?;
-        warn!(
-            provider = %state.provider_name,
-            credential_key = %state.credential_key,
-            strategy = %refresh_strategy_name(state.strategy),
-            status = %state.status,
-            error = %err,
-            "provider credential refresh gate rejected"
-        );
-        return Err(err);
-    }
-
     let mint_result = match resolve_refresh_material(Some(credentials), &state).await {
         Ok(transient_state) => mint_credential(&transient_state).await,
         Err(err) => Err(err.into()),
@@ -1274,31 +1257,6 @@ async fn cleanup_staged_refresh_handles(
             "failed to clean up staged provider credentials after refresh failure"
         );
     }
-}
-
-/// Reject minting for strategies that require `providers_v2_enabled` when the
-/// setting is off. Runs on every refresh (worker sweep and manual rotation), so
-/// disabling the setting halts further mints from already-configured states.
-async fn ensure_refresh_providers_v2_gate(
-    store: &Store,
-    state: &StoredProviderCredentialRefreshState,
-) -> Result<(), Status> {
-    let strategy = ProviderCredentialRefreshStrategy::try_from(state.strategy)
-        .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
-    if strategy != ProviderCredentialRefreshStrategy::AwsStsAssumeRole {
-        return Ok(());
-    }
-    if !crate::grpc::policy::global_bool_setting_enabled(
-        store,
-        openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-    )
-    .await?
-    {
-        return Err(Status::failed_precondition(
-            "aws_sts_assume_role requires providers_v2_enabled=true",
-        ));
-    }
-    Ok(())
 }
 
 async fn mint_credential(
@@ -2519,62 +2477,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_provider_gate_requires_configuration_and_retries_hourly() {
-        let store = test_store().await;
-        let provider = provider("disabled-provider-gate", "aws-s3");
-        store.put_message(&provider).await.unwrap();
-        let state = new_refresh_state(
-            &provider,
-            "default",
-            "AWS_ACCESS_KEY_ID",
-            NewRefreshStateConfig {
-                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
-                material: HashMap::from([(
-                    "role_arn".to_string(),
-                    "arn:aws:iam::123456789012:role/test".to_string(),
-                )]),
-                secret_material_keys: Vec::new(),
-                expires_at_ms: 0,
-                token_url: String::new(),
-                scopes: Vec::new(),
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
-                additional_output_keys: HashMap::new(),
-            },
-        )
-        .unwrap();
-        put_refresh_state(&store, &state).await.unwrap();
-
-        let err = refresh_provider_credential(
-            &store,
-            "default",
-            &test_credentials(),
-            None,
-            "disabled-provider-gate",
-            "AWS_ACCESS_KEY_ID",
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        let stored =
-            get_refresh_state(&store, "default", provider.object_id(), "AWS_ACCESS_KEY_ID")
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(stored.status, "configuration_required");
-        assert_eq!(
-            stored.recovery_action,
-            ProviderCredentialRefreshRecoveryAction::FixConfiguration as i32
-        );
-        assert_eq!(stored.failure_code, "refresh_configuration_invalid");
-        assert_eq!(
-            stored.next_refresh_at_ms - stored.last_error_at_ms,
-            60 * 60 * 1000
-        );
-    }
-
-    #[tokio::test]
     async fn oauth_invalid_grant_persists_terminal_reauthorization_status() {
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -3590,13 +3492,6 @@ mod tests {
             .await;
 
         let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
         let prov = provider("aws-sts-test", "aws");
         store.put_message(&prov).await.unwrap();
 
@@ -3695,13 +3590,6 @@ mod tests {
             .await;
 
         let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
         let prov = provider("aws-sts-custom", "aws");
         store.put_message(&prov).await.unwrap();
 
@@ -3779,13 +3667,6 @@ mod tests {
     #[tokio::test]
     async fn aws_sts_mint_rejects_partial_source_credentials() {
         let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
         let prov = provider("aws-sts-partial", "aws");
         store.put_message(&prov).await.unwrap();
 
@@ -4110,13 +3991,6 @@ mod tests {
             .await;
 
         let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
         let prov = provider("aws-sts-session", "aws");
         store.put_message(&prov).await.unwrap();
 
@@ -4194,13 +4068,6 @@ mod tests {
     #[tokio::test]
     async fn aws_sts_mint_rejects_session_token_without_source_pair() {
         let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
         let prov = provider("aws-sts-lonesession", "aws");
         store.put_message(&prov).await.unwrap();
 
@@ -4279,13 +4146,6 @@ mod tests {
             .await;
 
         let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
         let prov = provider("aws-race", "aws");
         store.put_message(&prov).await.unwrap();
         let provider_id = prov.object_id().to_string();
@@ -4407,13 +4267,6 @@ mod tests {
             .await;
 
         let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
         let prov = provider("aws-superseded", "aws");
         store.put_message(&prov).await.unwrap();
         let provider_id = prov.object_id().to_string();

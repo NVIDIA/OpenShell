@@ -7,6 +7,7 @@ package openshell.compute.v1;
 
 import "google/protobuf/struct.proto";
 import "options.proto";
+import "sandbox.proto";
 
 // Gateway/compute-driver extension contract.
 //
@@ -86,6 +87,10 @@ message GetCapabilitiesResponse {
   bool gateway_manages_lifecycle = 6;
   // Whether AuthenticateSandbox is implemented by this driver.
   bool supports_sandbox_authentication = 7;
+  // Whether the driver reports runtime readiness itself. When false, the
+  // gateway waits for the standard OpenShell supervisor session in addition
+  // to the driver's platform-ready observation.
+  bool driver_reports_runtime_readiness = 8;
 }
 
 message AuthenticateSandboxRequest {
@@ -154,6 +159,10 @@ message DriverSandboxSpec {
   map<string, string> environment = 5;
   // Runtime template consumed by the driver during provisioning.
   DriverSandboxTemplate template = 6;
+  // Canonical effective policy supplied to the driver for validation and
+  // provisioning. Drivers that enforce policy outside the standard supervisor
+  // use GetSandboxConfig to fetch later revisions.
+  openshell.sandbox.v1.SandboxPolicy policy = 7;
   // Portable resource requirements used by the gateway for driver selection
   // and by drivers for provisioning.
   ResourceRequirements resource_requirements = 9;
@@ -214,6 +223,10 @@ message DriverSandboxTemplate {
   // This is the inner block selected from public SandboxTemplate.driver_config.
   // The selected driver owns nested schema validation.
   google.protobuf.Struct driver_config = 12;
+  // Enable Linux user namespace isolation for the sandbox workload. Drivers
+  // map this portable intent to their compute platform; when unset, the
+  // driver's configured default applies.
+  optional bool user_namespaces = 13;
 }
 
 // Typed compute-resource requirements.

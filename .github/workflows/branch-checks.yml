@@ -41,6 +41,7 @@ jobs:
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -65,6 +66,7 @@ jobs:
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -84,6 +86,7 @@ jobs:
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     defaults:
       run:
         shell: nix develop .#devShells.x86_64-linux.default -c bash -euo pipefail {0}
@@ -117,6 +120,7 @@ jobs:
           - runner: macos-15-xlarge
             system: aarch64-darwin
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     defaults:
       run:
         shell: nix develop .#devShells.${{ matrix.system }}.default -c bash -euo pipefail {0}
@@ -154,18 +158,44 @@ jobs:
           cargo fmt --all -- --check
           cargo fmt --manifest-path e2e/rust/Cargo.toml --all -- --check
           cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all -- --check
+          cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all -- --check
 
       - name: Lint
         run: |
           cargo clippy --workspace --all-targets -- -D warnings
           cargo clippy --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings
           cargo check --manifest-path examples/governance-interceptor/Cargo.toml --all-targets
+          cargo check --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets
 
       - name: Test
         env:
           OPENSHELL_TELEMETRY_ENABLED: "false"
         run: |
           cargo nextest run --profile ci --workspace --features openshell-server/test-support
+
+      - name: Verify telemetry can be compiled out
+        run: |
+          cargo build -p openshell-gateway --bin openshell-gateway
+          tasks/scripts/verify-telemetry-compiled-out.sh present target/debug/openshell-gateway
+          cargo build -p openshell-gateway --bin openshell-gateway --no-default-features --features defaults-without-telemetry
+          tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway
+          cargo build -p openshell-sandbox --bin openshell-sandbox --no-default-features --features defaults-without-telemetry
+          tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-sandbox
+
+      - name: Verify the defaults-without-telemetry feature alias tracks the default feature set
+        run: tasks/scripts/verify-defaults-without-telemetry.sh
+
+      - name: Verify system CA roots build mode compiles and excludes bundled Mozilla roots
+        run: |
+          cargo check -p openshell-sandbox --all-targets --no-default-features --features system-ca-roots
+          if cargo tree -p openshell-sandbox -i webpki-roots --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-roots; then
+            echo "ERROR: webpki-roots found in system CA roots build" >&2
+            exit 1
+          fi
+          if cargo tree -p openshell-sandbox -i webpki-root-certs --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-root-certs; then
+            echo "ERROR: webpki-root-certs found in system CA roots build" >&2
+            exit 1
+          fi
 
   python:
     name: Python (${{ matrix.runner }})
@@ -176,6 +206,7 @@ jobs:
       matrix:
         runner: [linux-amd64-cpu8, linux-arm64-cpu8]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -207,6 +238,7 @@ jobs:
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -226,6 +258,7 @@ jobs:
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -245,6 +278,7 @@ jobs:
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:

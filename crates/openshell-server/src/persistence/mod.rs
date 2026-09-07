@@ -26,6 +26,12 @@ pub const DRAFT_CHUNK_OBJECT_TYPE: &str = "draft_policy_chunk";
 
 pub type PersistenceResult<T> = Result<T, PersistenceError>;
 
+/// Maximum number of object ids sent in one set-based delete statement.
+///
+/// Keep this well below `SQLite`'s bind-variable limit. Backends split larger
+/// requests into independently retryable, bounded write statements.
+pub const DELETE_MANY_BATCH_SIZE: usize = 128;
+
 /// Persistence-layer error type.
 #[derive(Debug, Error, Clone)]
 pub enum PersistenceError {
@@ -99,6 +105,30 @@ pub struct ObjectRecord {
     /// Optimistic concurrency control version.
     /// Incremented on each update for compare-and-swap operations.
     pub resource_version: u64,
+}
+
+/// Stable position in the global object-listing order.
+///
+/// Keyset consumers must use the matching store method for the order encoded
+/// here: workspace-scoped lists use `created_at_ms`, `name`, and `id`; global
+/// lists additionally include `workspace`.
+#[derive(Debug, Clone)]
+pub struct ObjectCursor {
+    pub created_at_ms: i64,
+    pub name: String,
+    pub workspace: String,
+    pub id: String,
+}
+
+impl From<&ObjectRecord> for ObjectCursor {
+    fn from(record: &ObjectRecord) -> Self {
+        Self {
+            created_at_ms: record.created_at_ms,
+            name: record.name.clone(),
+            workspace: record.workspace.clone(),
+            id: record.id.clone(),
+        }
+    }
 }
 
 /// Write condition for compare-and-swap operations.
@@ -371,6 +401,39 @@ impl Store {
         ))
     }
 
+    /// Atomically insert a named object only if its workspace has fewer than
+    /// `max_count` objects of the same type.
+    ///
+    /// Returns `Ok(None)` when the quota is already full. A duplicate id or
+    /// `(object_type, workspace, name)` still returns
+    /// [`PersistenceError::UniqueViolation`].
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(otel.name = "store.create_if_workspace_count_below", otel.status_code = tracing::field::Empty, object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace, max_count = max_count)
+    )]
+    pub async fn create_if_workspace_count_below(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+        max_count: u64,
+    ) -> PersistenceResult<Option<WriteResult>> {
+        store_dispatch_traced!(self.create_if_workspace_count_below(
+            object_type,
+            id,
+            name,
+            workspace,
+            payload,
+            labels,
+            max_count
+        ))
+    }
+
     /// Fetch an object by id.
     #[tracing::instrument(
         name = "store",
@@ -413,6 +476,22 @@ impl Store {
     )]
     pub async fn delete(&self, object_type: &str, id: &str) -> PersistenceResult<bool> {
         store_dispatch_traced!(self.delete(object_type, id))
+    }
+
+    /// Delete objects of one type by id in bounded, set-based statements.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(
+            otel.name = "store.delete_many",
+            otel.status_code = tracing::field::Empty,
+            object_type = %object_type,
+            object_count = ids.len(),
+            batch_count = ids.len().div_ceil(DELETE_MANY_BATCH_SIZE),
+        )
+    )]
+    pub async fn delete_many(&self, object_type: &str, ids: &[String]) -> PersistenceResult<u64> {
+        store_dispatch_traced!(self.delete_many(object_type, ids))
     }
 
     /// Count objects of a given type within a workspace.
@@ -497,6 +576,46 @@ impl Store {
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
         store_dispatch_traced!(self.list_by_type(object_type, limit, offset))
+    }
+
+    /// List workspace objects after a stable cursor, without offset drift.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(
+            otel.name = "store.list_after",
+            otel.status_code = tracing::field::Empty,
+            object_type = %object_type,
+            workspace = %workspace,
+        )
+    )]
+    pub async fn list_after(
+        &self,
+        object_type: &str,
+        workspace: &str,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        store_dispatch_traced!(self.list_after(object_type, workspace, after, limit))
+    }
+
+    /// List objects across workspaces after a stable cursor, without offset drift.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(
+            otel.name = "store.list_by_type_after",
+            otel.status_code = tracing::field::Empty,
+            object_type = %object_type,
+        )
+    )]
+    pub async fn list_by_type_after(
+        &self,
+        object_type: &str,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        store_dispatch_traced!(self.list_by_type_after(object_type, after, limit))
     }
 
     /// List objects by type and application-owned scope.

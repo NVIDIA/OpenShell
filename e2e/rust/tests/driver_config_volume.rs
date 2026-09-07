@@ -145,7 +145,6 @@ async fn sandbox_mounts_existing_driver_config_volume() {
         volume.name
     );
     let mut sandbox = SandboxGuard::create(&[
-        "--no-keep",
         "--driver-config-json",
         &driver_config,
         "--",
@@ -269,7 +268,6 @@ async fn sandbox_mounts_enabled_driver_config_bind() {
     let policy = write_bind_mount_policy().expect("write bind mount policy");
     let policy_path = policy.path().to_str().expect("policy path must be utf-8");
     let mut sandbox = SandboxGuard::create(&[
-        "--no-keep",
         "--policy",
         policy_path,
         "--driver-config-json",

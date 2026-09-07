@@ -22,7 +22,7 @@ fn ctx() -> SandboxContext {
     SandboxContext {
         sandbox_id: "sb-7f3a9c2e14b8".to_string(),
         sandbox_name: "agent-workspace-01".to_string(),
-        container_image: "ghcr.io/nvidia/openshell/sandbox:0.42.1".to_string(),
+        container_image: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string(),
         hostname: "openshell-sb-7f3a9c2e14b8".to_string(),
         product_version: "0.42.1".to_string(),
         proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),

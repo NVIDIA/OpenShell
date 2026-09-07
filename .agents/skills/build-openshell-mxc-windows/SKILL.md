@@ -1,6 +1,8 @@
 ---
 name: build-openshell-mxc-windows
 description: Maintain and validate OpenShell's build-only Windows MSVC lane for x64 and ARM64. Use when working on Windows compilation, `windows:*` mise tasks, unsupported Windows compute-driver contracts, or Windows build reports. This skill does not implement Docker, Kubernetes, Podman, VM, MXC driver, policy translation, MSI, service, or supervisor runtime support on Windows.
+metadata:
+  internal: true
 ---
 
 # Build OpenShell-MXC for Windows
@@ -231,7 +233,7 @@ crypto dependency builds.
 | `windows:build:arm64` | Release-builds `openshell-gateway.exe` and `openshell.exe` for ARM64. |
 | `windows:test:x64` | Runs native x64 workspace tests with `--no-fail-fast`, excluding unsupported Windows packages as top-level workspace targets. |
 | `windows:test:arm64` | Runs native ARM64 workspace tests with `--no-fail-fast` and the same package exclusions. Rejects non-ARM64 hosts. |
-| `windows:test:unsupported:x64` | Re-runs focused `openshell-server` tests for unsupported Windows driver behavior. |
+| `windows:test:unsupported:x64` | Re-runs focused `openshell-gateway` tests for unsupported Windows driver behavior. |
 | `windows:test:unsupported:arm64` | Re-runs the same focused contracts natively on ARM64. Rejects non-ARM64 hosts. |
 | `windows:artifacts` | Reports size and SHA256 for release artifacts that exist. |
 | `windows:ci` | Runs the full ordered x64-host Windows CI lane, plus ARM64 check/build when not skipped. |
@@ -248,10 +250,10 @@ Windows must continue to reject unsupported compute drivers clearly.
 
 | Driver | Windows build behavior | Runtime behavior |
 |---|---|---|
-| Docker | Driver crate excluded; server config contract retained. | Gateway construction returns unsupported. |
-| Kubernetes | Driver crate excluded; server config contract retained. | Gateway construction returns unsupported. |
-| Podman | Driver crate excluded; server config contract retained. | Gateway construction returns unsupported. |
-| VM | Driver crate excluded from workspace validation. | Gateway construction returns unsupported. |
+| Docker | Driver crate excluded; gateway registration stub retained. | Gateway construction returns unsupported. |
+| Kubernetes | Driver crate excluded; gateway registration stub retained. | Gateway construction returns unsupported. |
+| Podman | Driver crate excluded; gateway registration stub retained. | Gateway construction returns unsupported. |
+| VM | Driver crate excluded; gateway registration stub retained. | Gateway construction returns unsupported. |
 
 The focused contract tasks for either native architecture run:
 

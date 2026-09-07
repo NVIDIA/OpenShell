@@ -6,7 +6,8 @@
 //! Two layers:
 //!
 //! - [`OpenShellClient`] — the high-level sandbox-focused MVP surface:
-//!   health, sandbox CRUD, readiness/deletion waits, non-streaming exec.
+//!   health, sandbox CRUD, reusable sandbox templates, readiness/deletion
+//!   waits, and non-streaming exec.
 //! - [`raw`] — direct access to the generated tonic clients for RPCs the
 //!   curated surface doesn't yet cover (inference, providers, policy, logs,
 //!   settings, SSH, forwarding).
@@ -47,5 +48,8 @@ pub use error::SdkError;
 pub use refresh::{Refresh, RefreshError, RefreshedToken, TokenSource};
 pub use types::{
     ExecOptions, ExecResult, Health, ListOptions, LogLine, PlatformEvent, SandboxPhase, SandboxRef,
-    SandboxSpec, ServiceStatus, WatchEvent, WatchOptions, WorkspaceRef,
+    SandboxResources, SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplateCreateSpec,
+    SandboxTemplateListOptions, SandboxWorkloadConfig, SandboxWorkloadTemplate,
+    SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec, ServiceStatus, WatchEvent,
+    WatchOptions, WorkspaceRef,
 };

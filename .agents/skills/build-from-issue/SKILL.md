@@ -1,6 +1,8 @@
 ---
 name: build-from-issue
 description: Given a GitHub issue number, plan and implement the work described in the issue. Supports direct user requests and unattended queue processing through the `agent:*` workflow labels. Includes tests, documentation updates, and PR creation. Trigger keywords - build from issue, implement issue, work on issue, build issue, start issue.
+metadata:
+  internal: true
 ---
 
 # Build From Issue

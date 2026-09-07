@@ -575,6 +575,7 @@ impl KubernetesComputeDriver {
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: false,
             supports_sandbox_authentication: true,
+            driver_reports_runtime_readiness: false,
         })
     }
 
@@ -1427,10 +1428,10 @@ impl KubernetesComputeDriver {
 
     #[allow(clippy::similar_names)]
     #[tracing::instrument(
-        name = "kubernetes.create_sandbox",
+        name = "kubernetes.provision",
         skip(self, sandbox),
         fields(
-            otel.name = "kubernetes.create_sandbox",
+            otel.name = "kubernetes.provision",
             otel.status_code = tracing::field::Empty,
             sandbox.id = %sandbox.id,
             sandbox.name = %sandbox.name,
@@ -3864,9 +3865,14 @@ fn sandbox_template_to_k8s_with_validated_config(
     }
     apply_pod_driver_config(&mut spec, &driver_config.pod);
 
-    // Per-sandbox platform_config.host_users overrides the cluster-wide default.
-    let use_user_namespaces = platform_config_bool(template, "host_users")
-        .map_or(params.enable_user_namespaces, |host_users| !host_users);
+    // Per-sandbox portable intent overrides the cluster-wide default. This
+    // driver owns the Kubernetes-specific `hostUsers` translation. Accept the
+    // former platform_config encoding during rolling upgrades from gateways
+    // that predate the typed field.
+    let use_user_namespaces = template
+        .user_namespaces
+        .or_else(|| platform_config_bool(template, "host_users").map(|host_users| !host_users))
+        .unwrap_or(params.enable_user_namespaces);
 
     if use_user_namespaces {
         spec.insert("hostUsers".to_string(), serde_json::json!(false));
@@ -4482,7 +4488,7 @@ fn platform_config_bool(template: &SandboxTemplate, key: &str) -> Option<bool> {
     let config = template.platform_config.as_ref()?;
     let value = config.fields.get(key)?;
     match value.kind.as_ref() {
-        Some(prost_types::value::Kind::BoolValue(b)) => Some(*b),
+        Some(prost_types::value::Kind::BoolValue(value)) => Some(*value),
         _ => None,
     }
 }
@@ -4939,12 +4945,13 @@ mod tests {
         use tracing::instrument::WithSubscriber as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let _tracing_lock = crate::otel_tracing::test_lock().await;
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
         let exporter = InMemorySpanExporterBuilder::new().build();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber = tracing_subscriber::registry().with(crate::otel_tracing::layer(&provider));
+        let subscriber =
+            tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider));
         let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
 
         driver
@@ -4957,7 +4964,7 @@ mod tests {
         let spans = exporter.get_finished_spans().unwrap();
         let span = spans
             .iter()
-            .find(|span| span.name == "kubernetes.create_sandbox")
+            .find(|span| span.name == "kubernetes.provision")
             .expect("create operation span");
         assert!(matches!(
             span.status,
@@ -4971,15 +4978,16 @@ mod tests {
         use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let _tracing_lock = crate::otel_tracing::test_lock().await;
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
         let exporter = InMemorySpanExporterBuilder::new().build();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter)
             .build();
-        let subscriber = tracing_subscriber::registry().with(crate::otel_tracing::layer(&provider));
+        let subscriber =
+            tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider));
 
         let annotations = tracing::subscriber::with_default(subscriber, || {
-            let span = tracing::info_span!("kubernetes.create_sandbox");
+            let span = tracing::info_span!("kubernetes.provision");
             let _entered = span.enter();
             let mut annotations = BTreeMap::new();
             add_trace_context_annotation(&mut annotations);
@@ -7610,15 +7618,7 @@ mod tests {
     #[test]
     fn user_namespaces_per_sandbox_override_enables() {
         let template = SandboxTemplate {
-            platform_config: Some(Struct {
-                fields: std::iter::once((
-                    "host_users".to_string(),
-                    Value {
-                        kind: Some(Kind::BoolValue(false)),
-                    },
-                ))
-                .collect(),
-            }),
+            user_namespaces: Some(true),
             ..SandboxTemplate::default()
         };
 
@@ -7634,7 +7634,7 @@ mod tests {
         assert_eq!(
             pod_template["spec"]["hostUsers"],
             serde_json::json!(false),
-            "per-sandbox host_users: false must enable user namespaces"
+            "per-sandbox user namespace intent must set hostUsers: false"
         );
         let caps = pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"]
             .as_array()
@@ -7645,15 +7645,7 @@ mod tests {
     #[test]
     fn user_namespaces_per_sandbox_override_disables() {
         let template = SandboxTemplate {
-            platform_config: Some(Struct {
-                fields: std::iter::once((
-                    "host_users".to_string(),
-                    Value {
-                        kind: Some(Kind::BoolValue(true)),
-                    },
-                ))
-                .collect(),
-            }),
+            user_namespaces: Some(false),
             ..SandboxTemplate::default()
         };
 
@@ -7671,7 +7663,7 @@ mod tests {
 
         assert!(
             pod_template["spec"]["hostUsers"].is_null(),
-            "per-sandbox host_users: true must disable user namespaces even when cluster default is on"
+            "per-sandbox user namespace intent must override the cluster default"
         );
         let caps = pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"]
             .as_array()
@@ -7680,6 +7672,37 @@ mod tests {
             caps.len(),
             4,
             "extra capabilities must not be added when user namespaces are disabled"
+        );
+    }
+
+    #[test]
+    fn user_namespaces_accepts_legacy_host_users_encoding() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "host_users".to_string(),
+                    Value {
+                        kind: Some(Kind::BoolValue(false)),
+                    },
+                ))
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let params = SandboxPodParams::default();
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["hostUsers"],
+            serde_json::json!(false),
+            "legacy host_users: false must still enable user namespaces"
         );
     }
 
@@ -7864,43 +7887,6 @@ mod tests {
             pod_template["metadata"]["labels"][LABEL_MANAGED_BY],
             serde_json::json!(LABEL_MANAGED_BY_VALUE)
         );
-    }
-
-    #[test]
-    fn platform_config_bool_extracts_value() {
-        let template = SandboxTemplate {
-            platform_config: Some(Struct {
-                fields: std::iter::once((
-                    "my_bool".to_string(),
-                    Value {
-                        kind: Some(Kind::BoolValue(true)),
-                    },
-                ))
-                .collect(),
-            }),
-            ..SandboxTemplate::default()
-        };
-
-        assert_eq!(platform_config_bool(&template, "my_bool"), Some(true));
-        assert_eq!(platform_config_bool(&template, "missing"), None);
-    }
-
-    #[test]
-    fn platform_config_bool_returns_none_for_non_bool() {
-        let template = SandboxTemplate {
-            platform_config: Some(Struct {
-                fields: std::iter::once((
-                    "a_string".to_string(),
-                    Value {
-                        kind: Some(Kind::StringValue("hello".to_string())),
-                    },
-                ))
-                .collect(),
-            }),
-            ..SandboxTemplate::default()
-        };
-
-        assert_eq!(platform_config_bool(&template, "a_string"), None);
     }
 
     #[test]

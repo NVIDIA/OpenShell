@@ -67,3 +67,9 @@ type SandboxInterface interface {
 	Watch(ctx context.Context, workspace, name string, opts ...WatchOptions) (WatchInterface[*Sandbox], error)
 	GetLogs(ctx context.Context, workspace, sandboxName string, opts ...LogOption) (*LogResult, error)
 }
+
+// SandboxTemplateCreateInterface defines additive sandbox creation from named
+// workload templates without widening SandboxInterface.
+type SandboxTemplateCreateInterface interface {
+	CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
+}

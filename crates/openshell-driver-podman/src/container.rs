@@ -1114,8 +1114,6 @@ pub fn build_container_spec_for_image(
             "DAC_OVERRIDE".into(),
             // Not needed: the supervisor does not create setuid/setgid executables.
             "FSETID".into(),
-            // Not needed: the supervisor does not send signals to arbitrary processes.
-            "KILL".into(),
             // Not needed: the supervisor does not bind privileged ports (<1024).
             "NET_BIND_SERVICE".into(),
             // Not in Podman's default set but explicitly denied in case the image
@@ -1146,6 +1144,9 @@ pub fn build_container_spec_for_image(
             // Child setup clears the capability bounding set before exec, which
             // requires CAP_SETPCAP in the supervisor until drop_privileges().
             "SETPCAP".into(),
+            // Forwarding shutdown signals to the canonical workload process
+            // group after it drops to the sandbox UID requires CAP_KILL.
+            "KILL".into(),
         ],
         // SETUID, SETGID, SETPCAP, CHOWN, and FOWNER are intentionally kept from
         // Podman's default set and not dropped:
@@ -1885,6 +1886,7 @@ mod tests {
             "missing DAC_READ_SEARCH"
         );
         assert!(added.contains(&"SETPCAP"), "missing SETPCAP");
+        assert!(added.contains(&"KILL"), "missing KILL");
 
         // SETUID and SETGID are NOT in cap_add — they remain available from the
         // default bounding set because we no longer use cap_drop:ALL. Verify they
@@ -1915,6 +1917,10 @@ mod tests {
         assert!(
             !dropped.contains(&"SETPCAP"),
             "SETPCAP must not be dropped (needed for child bounding-set clear)"
+        );
+        assert!(
+            !dropped.contains(&"KILL"),
+            "KILL must not be dropped (needed to signal the sandbox workload on shutdown)"
         );
         assert!(
             !dropped.contains(&"ALL"),

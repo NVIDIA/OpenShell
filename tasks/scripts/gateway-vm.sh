@@ -311,7 +311,7 @@ fi
 
 echo "==> Building openshell-gateway and openshell-driver-vm"
 cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-  -p openshell-server -p openshell-driver-vm
+  -p openshell-gateway -p openshell-driver-vm
 
 if [ "$(uname -s)" = "Darwin" ]; then
   echo "==> Codesigning openshell-driver-vm (Hypervisor entitlement)"
@@ -351,7 +351,6 @@ signing_key_path = "${TLS_DIR}/jwt/signing.pem"
 public_key_path = "${TLS_DIR}/jwt/public.pem"
 kid_path = "${TLS_DIR}/jwt/kid"
 gateway_id = "${GATEWAY_NAME}"
-ttl_secs = 3600
 
 [openshell.drivers.vm]
 default_image = "${SANDBOX_IMAGE}"

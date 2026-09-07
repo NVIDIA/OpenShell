@@ -422,6 +422,94 @@ tests:
           path: data["gateway.toml"]
           pattern: '\[openshell\.gateway\.tls\]'
 
+  - it: renders client_ca_path for built-in PKI by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'client_ca_path\s*=\s*"/etc/openshell-tls/client-ca/ca\.crt"'
+
+  - it: omits client_ca_path when clientCaSecretName is empty for HTTPS-only mode
+    template: templates/gateway-config.yaml
+    set:
+      server.tls.clientCaSecretName: ""
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.tls\]'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'cert_path\s*=\s*"/etc/openshell-tls/server/tls\.crt"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'key_path\s*=\s*"/etc/openshell-tls/server/tls\.key"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'client_ca_path\s*='
+
+  - it: keeps external server certificate fields when clientCaSecretName is empty
+    template: templates/gateway-config.yaml
+    set:
+      certManager.enabled: true
+      certManager.serverIssuerRef.name: letsencrypt-prod
+      certManager.serverDnsNames:
+        - gateway.example.com
+      server.tls.clientCaSecretName: ""
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'client_ca_path\s*='
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'external_cert_path\s*=\s*"/etc/openshell-tls/server-external/tls\.crt"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'external_key_path\s*=\s*"/etc/openshell-tls/server-external/tls\.key"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'external_server_names\s*=\s*\["gateway\.example\.com"\]'
+
+  - it: omits client_ca_path for cert-manager shared CA when clientCaSecretName is empty
+    template: templates/gateway-config.yaml
+    set:
+      certManager.enabled: true
+      certManager.clientCaFromServerTlsSecret: true
+      server.tls.clientCaSecretName: ""
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.tls\]'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'cert_path\s*=\s*"/etc/openshell-tls/server/tls\.crt"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'key_path\s*=\s*"/etc/openshell-tls/server/tls\.key"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'client_ca_path\s*='
+
+  - it: omits client_ca_path when cert-manager owns TLS and no client CA secret is set
+    template: templates/gateway-config.yaml
+    set:
+      certManager.enabled: true
+      certManager.clientCaFromServerTlsSecret: false
+      pkiInitJob.enabled: true
+      server.tls.clientCaSecretName: ""
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.tls\]'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'cert_path\s*=\s*"/etc/openshell-tls/server/tls\.crt"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'key_path\s*=\s*"/etc/openshell-tls/server/tls\.key"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'client_ca_path\s*='
+
   - it: renders server_sans from certManager.serverDnsNames
     set:
       certManager.enabled: true
@@ -441,6 +529,14 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].args
           content: "sqlite:/var/openshell/openshell.db"
+
+  - it: fails when clientCaSecretName is null
+    template: templates/statefulset.yaml
+    set:
+      server.tls.clientCaSecretName: null
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.tls.clientCaSecretName cannot be null; omit the key to use the chart default (openshell-server-client-ca), or set to \"\" to disable client certificate verification for HTTPS-only mode"
 
   - it: fails when legacy postgres.enabled is set
     template: templates/statefulset.yaml

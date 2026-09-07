@@ -161,7 +161,7 @@ fi
 
 echo "Building openshell-gateway..."
 cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-  -p openshell-server --bin openshell-gateway
+  -p openshell-gateway --bin openshell-gateway
 
 TLS_DIR="${STATE_DIR}/tls"
 echo "Generating local gateway credentials..."
@@ -226,7 +226,6 @@ signing_key_path = "${TLS_DIR}/jwt/signing.pem"
 public_key_path = "${TLS_DIR}/jwt/public.pem"
 kid_path = "${TLS_DIR}/jwt/kid"
 gateway_id = "${GATEWAY_NAME}"
-ttl_secs = 3600
 
 [openshell.drivers.docker]
 default_image = "${SANDBOX_IMAGE}"

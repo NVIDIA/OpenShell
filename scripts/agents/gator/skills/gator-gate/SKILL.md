@@ -531,9 +531,9 @@ Validate small and concentrated work when it has clear motivation and one of the
 
 Documentation changes from non-maintainers must not reorder ToC items, change fundamental hierarchy, or restructure docs without a clear maintainer-approved reason.
 
-### Provider V2 and Credential Support
+### Provider Profiles and Credential Support
 
-Provider V2 work is a supported high-traction area, but require all of the following:
+Provider-profile work is a supported high-traction area, but requires all of the following:
 
 - Clear UX path for how users configure and use the provider feature in OpenShell
 - Clear statement of why the change is important
@@ -541,7 +541,13 @@ Provider V2 work is a supported high-traction area, but require all of the follo
 - Security boundary analysis for credential handling
 - Explanation of whether secrets remain hidden from the sandbox agent
 
-Provider additions and updates must use providers v2 through provider profiles. Treat any new or modified legacy `ProviderDiscoverySpec` entries as a blocking review finding unless a maintainer explicitly requests the legacy path. Do not ask contributors to update both systems for compatibility; the provider profile is the source of truth for new provider network policy, credentials, discovery, and refresh metadata.
+Provider profiles are the authoritative provider model. Provider additions and
+updates must define their network policy, credentials, discovery, refresh
+metadata, and user-facing semantics through a built-in or imported profile.
+Treat any new or modified legacy `ProviderDiscoverySpec` entries as a blocking
+review finding unless a maintainer explicitly requests the legacy path. Do not
+ask contributors to update both systems for compatibility or to enable a
+gateway feature switch; profile-backed behavior is always active.
 
 Be skeptical of changes that expose raw credentials to agents or weaken the credential proxy model, even if the user story is clear.
 

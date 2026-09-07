@@ -43,7 +43,7 @@ jobs:
             interpreter: ""
     uses: ./.github/workflows/build-binaries.yml
     with:
-      package: openshell-server
+      package: openshell-gateway
       binary: openshell-gateway
       triple: ${{ matrix.triple }}
       runner: ${{ matrix.runner }}

@@ -1,0 +1,11 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+openshell_development_cli_bin: /usr/local/bin/openshell
+openshell_development_gateway_bin: /usr/local/bin/openshell-gateway
+openshell_development_sandbox_archive: /usr/local/lib/openshell-sandbox.tar
+openshell_development_gateway_service: openshell-test-guest-gateway.service
+openshell_development_gateway_endpoint: http://127.0.0.1:8080
+openshell_development_state_root: /home/openshell/.local/share/openshell-test-guest
+openshell_development_supervisor_image: localhost/openshell/supervisor:test-guest

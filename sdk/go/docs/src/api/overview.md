@@ -1,6 +1,7 @@
 # API Overview
 
-The OpenShell Go SDK exposes 12 interfaces through the sub-client pattern. You access each interface through a typed accessor on the `Client`.
+The OpenShell Go SDK exposes typed interfaces through the sub-client pattern.
+You access each interface through a typed accessor on the concrete `Client`.
 
 ## Interface Summary
 
@@ -9,6 +10,7 @@ The OpenShell Go SDK exposes 12 interfaces through the sub-client pattern. You a
 | Interface | Accessor | Description |
 |-----------|----------|-------------|
 | [SandboxInterface](sandboxes.md) | `client.Sandboxes()` | Create, manage, and watch sandbox lifecycle |
+| [SandboxTemplateInterface](sandbox-templates.md) | `client.SandboxTemplates()` | Manage reusable sandbox templates |
 | [ExecInterface](exec.md) | `client.Exec()` | Run commands, stream output, interactive sessions |
 | [ProviderInterface](providers.md) | `client.Providers()` | Manage compute providers and their lifecycle |
 | [ServiceInterface](services.md) | `client.Services()` | Expose and manage HTTP services inside sandboxes |
@@ -39,6 +41,7 @@ These are accessed through `client.Providers()`:
 Each interface has a reference page with method signatures and usage examples:
 
 - **[Sandboxes](sandboxes.md)**: Create sandboxes, wait for readiness, watch state changes, manage providers, retrieve logs.
+- **[Sandbox Templates](sandbox-templates.md)**: Create reusable workload templates and launch sandboxes from them.
 - **[Exec](exec.md)**: Execute commands with one-shot, streaming, or interactive modes.
 - **[Providers](providers.md)**: Register and manage compute providers. Includes sub-clients for profiles and credential refresh.
 - **[Services](services.md)**: Expose and manage HTTP services inside sandboxes.

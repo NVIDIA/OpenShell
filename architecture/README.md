@@ -141,9 +141,13 @@ bridge networks, port mappings, NAT traversal, or bespoke tunnels. The common
 runtime requirement is narrower: the supervisor must be able to reach the
 gateway.
 
-The Windows MXC driver is an explicit exception. It launches and monitors a
-one-shot workload in the driver, self-reports readiness, and does not expose a
-supervisor session, interactive connect, live policy delivery, or governed egress.
+The compute-driver capability contract identifies whether a driver reports
+runtime readiness. Most drivers use the supervisor session model above. A
+driver that sets `driver_reports_runtime_readiness` may self-report readiness
+without a supervisor session. Every driver receives the canonical create-time
+policy in `DriverSandboxSpec`; drivers without a supervisor use the existing
+sandbox configuration API for later revisions. The Windows MXC driver reports
+its own readiness and does not expose interactive connect or governed egress.
 
 The gateway delivers desired state; the sandbox applies it locally. Policy,
 settings, credentials, and inference routes flow from the gateway to the

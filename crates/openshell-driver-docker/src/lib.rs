@@ -21,9 +21,7 @@ use bollard::query_parameters::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use openshell_core::config::{
-    DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_SANDBOX_PIDS_LIMIT, DEFAULT_STOP_TIMEOUT_SECS,
-};
+use openshell_core::config::{DEFAULT_SANDBOX_PIDS_LIMIT, DEFAULT_STOP_TIMEOUT_SECS};
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     CONDITION_EXITED, CONDITION_RUNTIME_RESTART, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
@@ -56,15 +54,13 @@ use openshell_core::proto::compute::v1::{
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
-use openshell_core::{Config, Error, Result as CoreResult};
+use openshell_core::{Error, Result as CoreResult};
 use opentelemetry::trace::TraceContextExt as _;
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -415,55 +411,15 @@ fn default_true() -> bool {
 type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send + 'static>>;
 
-struct TracedWatchStream {
-    inner: WatchStream,
-    span: tracing::Span,
-    finished: bool,
-}
-
-impl Stream for TracedWatchStream {
-    type Item = Result<WatchSandboxesEvent, Status>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let span = self.span.clone();
-        let _entered = span.enter();
-        let result = self.inner.as_mut().poll_next(cx);
-        if !self.finished {
-            match &result {
-                Poll::Ready(Some(Err(status))) => {
-                    openshell_otel::mark_error(&self.span);
-                    self.span
-                        .record("rpc.grpc.status_code", status.code() as i32);
-                    self.finished = true;
-                }
-                Poll::Ready(None) => {
-                    self.span
-                        .record("rpc.grpc.status_code", tonic::Code::Ok as i32);
-                    self.finished = true;
-                }
-                Poll::Pending | Poll::Ready(Some(Ok(_))) => {}
-            }
-        }
-        result
-    }
-}
-
-impl Drop for TracedWatchStream {
-    fn drop(&mut self) {
-        if !self.finished {
-            openshell_otel::mark_error(&self.span);
-            self.span
-                .record("rpc.grpc.status_code", tonic::Code::Cancelled as i32);
-        }
-    }
-}
+#[cfg(test)]
+type TracedWatchStream = openshell_otel::TracedGrpcStream<WatchStream>;
 
 /// Compute-driver service wrapper that preserves the standalone RPC trace
 /// boundary while Docker runs in the gateway process.
 #[derive(Clone)]
 pub struct ComputeDriverService {
     driver: DockerComputeDriver,
-    trace_in_process_rpc: bool,
+    rpc_tracer: openshell_otel::InProcessRpcTracer,
 }
 
 impl ComputeDriverService {
@@ -471,7 +427,7 @@ impl ComputeDriverService {
     pub fn new(driver: DockerComputeDriver) -> Self {
         Self {
             driver,
-            trace_in_process_rpc: false,
+            rpc_tracer: openshell_otel::InProcessRpcTracer::disabled(),
         }
     }
 
@@ -479,61 +435,50 @@ impl ComputeDriverService {
     pub fn new_in_process(driver: DockerComputeDriver) -> Self {
         Self {
             driver,
-            trace_in_process_rpc: true,
+            rpc_tracer: openshell_otel::InProcessRpcTracer::enabled(),
         }
-    }
-
-    fn in_process_rpc_span(
-        &self,
-        operation: &'static str,
-        method: &'static str,
-    ) -> Option<tracing::Span> {
-        self.trace_in_process_rpc.then(|| {
-            tracing::info_span!(
-                target: "openshell_driver_docker::otel_tracing",
-                "driver_rpc",
-                otel.name = operation,
-                otel.kind = "server",
-                otel.status_code = tracing::field::Empty,
-                rpc.system = "grpc",
-                rpc.service = "openshell.compute.v1.ComputeDriver",
-                rpc.method = method,
-                rpc.grpc.status_code = tracing::field::Empty,
-            )
-        })
-    }
-
-    async fn trace_rpc<T>(
-        &self,
-        operation: &'static str,
-        method: &'static str,
-        future: impl Future<Output = Result<T, Status>>,
-    ) -> Result<T, Status> {
-        use tracing::Instrument as _;
-
-        let Some(span) = self.in_process_rpc_span(operation, method) else {
-            return future.await;
-        };
-        let result = future.instrument(span.clone()).await;
-        match &result {
-            Ok(_) => {
-                span.record("rpc.grpc.status_code", tonic::Code::Ok as i32);
-            }
-            Err(status) => {
-                openshell_otel::mark_error(&span);
-                span.record("rpc.grpc.status_code", status.code() as i32);
-            }
-        }
-        result
     }
 }
 
+/// Return the first responsive local Docker API socket.
+#[must_use]
+pub fn detect_socket() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(host) = std::env::var("DOCKER_HOST")
+        && let Some(path) = host.trim().strip_prefix("unix://")
+        && !path.is_empty()
+    {
+        candidates.push(PathBuf::from(path));
+    }
+    candidates.push(PathBuf::from("/var/run/docker.sock"));
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join(".docker/run/docker.sock"));
+    }
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        candidates.push(PathBuf::from(runtime_dir).join("docker.sock"));
+    }
+    openshell_core::local_api_socket::first_responsive_socket(&candidates, |response| {
+        openshell_core::local_api_socket::http_response_is_success(response)
+            && openshell_core::local_api_socket::contains_ascii(response, b"Api-Version:")
+            && !openshell_core::local_api_socket::contains_ascii(response, b"Libpod-Api-Version:")
+    })
+}
+
+#[must_use]
+pub fn is_available() -> bool {
+    detect_socket().is_some()
+}
+
 impl DockerComputeDriver {
-    pub async fn new(config: &Config, docker_config: &DockerComputeConfig) -> CoreResult<Self> {
+    pub async fn new(
+        gateway_bind_address: SocketAddr,
+        gateway_log_level: &str,
+        docker_config: &DockerComputeConfig,
+    ) -> CoreResult<Self> {
         let socket_path = docker_config
             .socket_path
             .clone()
-            .or_else(openshell_core::config::detect_docker_socket)
+            .or_else(detect_socket)
             .unwrap_or_else(|| PathBuf::from("/var/run/docker.sock"));
         let socket_path_str = socket_path.to_str().ok_or_else(|| {
             Error::config(format!(
@@ -559,7 +504,7 @@ impl DockerComputeDriver {
         let cdi_gpu_inventory = docker_cdi_gpu_inventory(&info);
         let allow_all_default_gpu = docker_info_reports_wsl2(&info);
         validate_sandbox_pids_limit(docker_config.sandbox_pids_limit)?;
-        let gateway_port = config.bind_address.port();
+        let gateway_port = gateway_bind_address.port();
         if gateway_port == 0 {
             return Err(Error::config(
                 "docker compute driver requires a fixed non-zero gateway bind port",
@@ -571,7 +516,7 @@ impl DockerComputeDriver {
         let gateway_route =
             docker_gateway_route(&info, bridge_gateway_ip, gateway_port, host_gateway_ip);
         let gateway_callback_bind_address =
-            docker_gateway_callback_bind_address(&gateway_route, config.bind_address);
+            docker_gateway_callback_bind_address(&gateway_route, gateway_bind_address);
         let mut docker_config = docker_config.clone();
         if docker_config.grpc_endpoint.trim().is_empty() {
             let scheme = if docker_guest_tls_configured(&docker_config) {
@@ -603,7 +548,7 @@ impl DockerComputeDriver {
                 gateway_callback_bind_address,
                 ssh_socket_path: docker_config.ssh_socket_path.clone(),
                 stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
-                log_level: config.log_level.clone(),
+                log_level: gateway_log_level.to_string(),
                 supervisor_bin,
                 guest_tls,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
@@ -636,6 +581,7 @@ impl DockerComputeDriver {
             default_image: self.config.default_image.clone(),
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
+            driver_reports_runtime_readiness: false,
         }
     }
 
@@ -939,16 +885,6 @@ impl DockerComputeDriver {
         }
     }
 
-    #[tracing::instrument(
-        name = "docker.provision_sandbox",
-        skip(self, sandbox),
-        fields(
-            otel.name = "docker.provision_sandbox",
-            otel.status_code = tracing::field::Empty,
-            sandbox.id = %sandbox.id,
-            sandbox.name = %sandbox.name,
-        )
-    )]
     async fn provision_sandbox_inner(
         &self,
         sandbox: &DriverSandbox,
@@ -1737,6 +1673,9 @@ impl DockerComputeDriver {
     }
 }
 
+// Standalone and in-process servers both use this wrapper. Delegating to the
+// driver's canonical tonic implementation keeps request validation and Docker
+// operation spans identical across both deployment modes.
 #[tonic::async_trait]
 impl ComputeDriver for ComputeDriverService {
     type WatchSandboxesStream = WatchStream;
@@ -1746,169 +1685,159 @@ impl ComputeDriver for ComputeDriverService {
         request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
     ) -> Result<Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>, Status>
     {
-        self.trace_rpc(
-            "driver.authenticate_sandbox",
-            "authenticate_sandbox",
-            ComputeDriver::authenticate_sandbox(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::AUTHENTICATE_SANDBOX,
+                ComputeDriver::authenticate_sandbox(&self.driver, request),
+            )
+            .await
     }
 
     async fn get_capabilities(
         &self,
         request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
-        self.trace_rpc(
-            "driver.get_capabilities",
-            "get_capabilities",
-            ComputeDriver::get_capabilities(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::GET_CAPABILITIES,
+                ComputeDriver::get_capabilities(&self.driver, request),
+            )
+            .await
     }
 
     async fn get_gateway_listener_requirements(
         &self,
         request: Request<GetGatewayListenerRequirementsRequest>,
     ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
-        self.trace_rpc(
-            "driver.get_gateway_listener_requirements",
-            "get_gateway_listener_requirements",
-            ComputeDriver::get_gateway_listener_requirements(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::GET_GATEWAY_LISTENER_REQUIREMENTS,
+                ComputeDriver::get_gateway_listener_requirements(&self.driver, request),
+            )
+            .await
     }
 
     async fn validate_sandbox_create(
         &self,
         request: Request<ValidateSandboxCreateRequest>,
     ) -> Result<Response<ValidateSandboxCreateResponse>, Status> {
-        self.trace_rpc(
-            "driver.validate_sandbox_create",
-            "validate_sandbox_create",
-            ComputeDriver::validate_sandbox_create(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::VALIDATE_SANDBOX_CREATE,
+                ComputeDriver::validate_sandbox_create(&self.driver, request),
+            )
+            .await
     }
 
     async fn get_sandbox(
         &self,
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<GetSandboxResponse>, Status> {
-        self.trace_rpc(
-            "driver.get_sandbox",
-            "get_sandbox",
-            ComputeDriver::get_sandbox(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::GET_SANDBOX,
+                ComputeDriver::get_sandbox(&self.driver, request),
+            )
+            .await
     }
 
     async fn list_sandboxes(
         &self,
         request: Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
-        self.trace_rpc(
-            "driver.list_sandboxes",
-            "list_sandboxes",
-            ComputeDriver::list_sandboxes(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::LIST_SANDBOXES,
+                ComputeDriver::list_sandboxes(&self.driver, request),
+            )
+            .await
     }
 
     async fn create_sandbox(
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<CreateSandboxResponse>, Status> {
-        self.trace_rpc(
-            "driver.create_sandbox",
-            "create_sandbox",
-            ComputeDriver::create_sandbox(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::CREATE_SANDBOX,
+                ComputeDriver::create_sandbox(&self.driver, request),
+            )
+            .await
     }
 
     async fn stop_sandbox(
         &self,
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
-        self.trace_rpc(
-            "driver.stop_sandbox",
-            "stop_sandbox",
-            ComputeDriver::stop_sandbox(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::STOP_SANDBOX,
+                ComputeDriver::stop_sandbox(&self.driver, request),
+            )
+            .await
     }
 
     async fn start_sandbox(
         &self,
         request: Request<StartSandboxRequest>,
     ) -> Result<Response<StartSandboxResponse>, Status> {
-        self.trace_rpc(
-            "driver.start_sandbox",
-            "start_sandbox",
-            ComputeDriver::start_sandbox(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::START_SANDBOX,
+                ComputeDriver::start_sandbox(&self.driver, request),
+            )
+            .await
     }
 
     async fn delete_sandbox(
         &self,
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
-        self.trace_rpc(
-            "driver.delete_sandbox",
-            "delete_sandbox",
-            ComputeDriver::delete_sandbox(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::DELETE_SANDBOX,
+                ComputeDriver::delete_sandbox(&self.driver, request),
+            )
+            .await
     }
 
     async fn watch_sandboxes(
         &self,
         request: Request<WatchSandboxesRequest>,
     ) -> Result<Response<Self::WatchSandboxesStream>, Status> {
-        use tracing::Instrument as _;
-
-        let create_stream = ComputeDriver::watch_sandboxes(&self.driver, request);
-        let Some(span) = self.in_process_rpc_span("driver.watch_sandboxes", "watch_sandboxes")
-        else {
-            return create_stream.await;
+        let create_stream = async {
+            ComputeDriver::watch_sandboxes(&self.driver, request)
+                .await
+                .map(Response::into_inner)
         };
-        match create_stream.instrument(span.clone()).await {
-            Ok(response) => Ok(Response::new(Box::pin(TracedWatchStream {
-                inner: response.into_inner(),
-                span,
-                finished: false,
-            }))),
-            Err(status) => {
-                openshell_otel::mark_error(&span);
-                span.record("rpc.grpc.status_code", status.code() as i32);
-                Err(status)
-            }
-        }
+        self.rpc_tracer
+            .trace_stream(openshell_otel::rpc::WATCH_SANDBOXES, create_stream)
+            .await
+            .map(Response::new)
     }
 
     async fn ensure_workspace(
         &self,
         request: Request<EnsureWorkspaceRequest>,
     ) -> Result<Response<EnsureWorkspaceResponse>, Status> {
-        self.trace_rpc(
-            "driver.ensure_workspace",
-            "ensure_workspace",
-            ComputeDriver::ensure_workspace(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::ENSURE_WORKSPACE,
+                ComputeDriver::ensure_workspace(&self.driver, request),
+            )
+            .await
     }
 
     async fn delete_workspace(
         &self,
         request: Request<DeleteWorkspaceRequest>,
     ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
-        self.trace_rpc(
-            "driver.delete_workspace",
-            "delete_workspace",
-            ComputeDriver::delete_workspace(&self.driver, request),
-        )
-        .await
+        self.rpc_tracer
+            .trace(
+                openshell_otel::rpc::DELETE_WORKSPACE,
+                ComputeDriver::delete_workspace(&self.driver, request),
+            )
+            .await
     }
 }
 
@@ -4140,3 +4069,4 @@ fn internal_status(operation: &str, err: BollardError) -> Status {
 
 #[cfg(test)]
 mod tests;
+pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";

@@ -52,7 +52,7 @@ impl Authenticator for ComputeDriverAuthenticator {
         Ok(Some(Principal::Sandbox(SandboxPrincipal {
             sandbox_id,
             source: SandboxIdentitySource::ComputeDriver {
-                driver_name: self.compute.selected_driver_name().to_string(),
+                driver_name: self.compute.configured_driver_name().to_string(),
             },
             trust_domain: Some("openshell".to_string()),
         })))

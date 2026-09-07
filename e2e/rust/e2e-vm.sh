@@ -103,10 +103,10 @@ if [ -z "${OPENSHELL_GATEWAY_BIN:-}" ]; then
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     echo "==> Building driver-free openshell-gateway"
     cargo build \
-      -p openshell-server --bin openshell-gateway \
-      --no-default-features
+      -p openshell-gateway --bin openshell-gateway \
+      --no-default-features --features telemetry
   else
-    build_packages+=(-p openshell-server)
+    build_packages+=(-p openshell-gateway)
   fi
 else
   echo "==> Using prebuilt openshell-gateway at ${GATEWAY_BIN}"
@@ -409,4 +409,5 @@ else
   run_e2e_test host_gateway_alias
   run_e2e_test vm_overlay
   run_e2e_test vm_gateway_start
+  run_e2e_test vm_corporate_proxy
 fi

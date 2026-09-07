@@ -54,7 +54,7 @@ class TestRbac:
             provider=datamodel_pb2.Provider(
                 metadata=datamodel_pb2.ObjectMeta(name="e2e-oidc-admin-test"),
                 type="claude",
-                credentials={"API_KEY": "test-value"},
+                credentials={"ANTHROPIC_API_KEY": "test-value"},
             )
         )
         try:
@@ -78,7 +78,7 @@ class TestRbac:
             provider=datamodel_pb2.Provider(
                 metadata=datamodel_pb2.ObjectMeta(name="e2e-oidc-user-blocked"),
                 type="claude",
-                credentials={"API_KEY": "test-value"},
+                credentials={"ANTHROPIC_API_KEY": "test-value"},
             )
         )
         with pytest.raises(grpc.RpcError) as exc_info:

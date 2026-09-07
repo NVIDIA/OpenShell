@@ -192,7 +192,7 @@ Supported auth modes:
 | Plaintext | Local development or a trusted reverse proxy boundary. |
 | Unauthenticated local users | Trusted Kubernetes dev or fully trusted proxy deployments only. |
 | Cloudflare JWT | Edge-authenticated deployments where Cloudflare Access supplies identity. |
-| OIDC | Bearer-token auth for users, with browser or device-code PKCE and client credentials login. |
+| OIDC | Bearer-token auth for users, with browser or device-code PKCE and client credentials login. JWKS validation accepts RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, and EdDSA (Ed25519) signing keys. |
 
 The CLI persists the scopes requested during OIDC login in gateway metadata and
 reuses them when refreshing an access token. This preserves the intended API
@@ -367,6 +367,10 @@ This keeps the gateway data model portable across storage backends and leaves
 room for future stores that can provide the same object, label, version, and
 scope semantics.
 
+For in-memory SQLite, the adapter retains a dedicated keepalive connection for
+the store lifetime. Operational connection replacement therefore preserves the
+shared in-memory schema and objects instead of creating an empty database.
+
 The SQLite adapter tightens the on-disk database file to mode `0o600` on every
 connect so that provider API keys, SSH session tokens, and sandbox metadata are
 not readable by other local users on shared hosts. The same restriction is
@@ -375,23 +379,33 @@ default WAL journal mode), which mirror the same sensitive contents.
 
 Persisted state includes sandboxes, providers, provider credential refresh
 state, SSH sessions, policy revisions, settings, inference configuration, and
-deployment records. Provider refresh state is stored as a separate object
-scoped to the provider instance through `objects.scope`. Its non-secret
-configuration remains inline, while refresh tokens, client secrets, private
-keys, and other secret source material are stored through the active credential
-driver and represented by opaque handles. The provider record keeps only the
-current injectable credential handles and optional per-credential expiry
-timestamps. A refresh normally mints one credential, but a strategy may
-co-mint several (AWS STS mints the access key, secret key, and session token in
-one call); the refresh state pins the resolved set of env keys it owns so
-collision checks reserve all of them before the first mint. Provider records
-keep inline credential values only for legacy records created before credential
-driver storage. New provider and refresh-material writes keep driver-owned
-credential handles. When no external credential driver is configured, gateways
-use server-owned encrypted database credential storage for defense in depth.
-Multi-replica deployments can use that default with a shared database and
-shared key-encryption key, or opt into an external backend such as Vault or
-Kubernetes Secrets.
+deployment records, and reusable sandbox workload templates. Provider refresh
+state is stored as a separate object scoped to the provider instance through
+`objects.scope`. Its non-secret configuration remains inline, while refresh
+tokens, client secrets, private keys, and other secret source material are
+stored through the active credential driver and represented by opaque handles.
+The provider record keeps only the current injectable credential handles and
+optional per-credential expiry timestamps. A refresh normally mints one
+credential, but a strategy may co-mint several (AWS STS mints the access key,
+secret key, and session token in one call); the refresh state pins the resolved
+set of env keys it owns so collision checks reserve all of them before the
+first mint. Provider records keep inline credential values only for legacy
+records created before credential driver storage. New provider and
+refresh-material writes keep driver-owned credential handles. When no external
+credential driver is configured, gateways use server-owned encrypted database
+credential storage for defense in depth. Multi-replica deployments can use that
+default with a shared database and shared key-encryption key, or opt into an
+external backend such as Vault or Kubernetes Secrets.
+
+Sandbox workload templates are workspace-scoped gateway resources. Workspace
+admins create and delete them; workspace users can read and list them. A
+template owns reusable workload intent: image, environment, CPU and memory
+limits, GPU request, driver-specific config, and service-level hints. A sandbox
+created from a template resolves that resource once and persists an ordinary
+`SandboxSpec` snapshot. The create request still owns per-sandbox governance:
+name, labels, annotations, provider attachments, and policy. The sandbox stores
+template provenance as the template name and resource version used for the
+snapshot, so later template edits or deletes do not mutate existing sandboxes.
 
 OAuth refresh failures retain a gateway-owned recovery classification alongside
 the refresh state. The gateway reads only a bounded error response and maps
@@ -777,9 +791,22 @@ identity and configured compute driver.
 
 The gateway forwards OTLP configuration, its configured gateway name, and W3C
 trace context to managed external drivers. Built-in drivers use dedicated
-in-process providers that preserve the same RPC trace boundary. Each driver
+in-process providers that preserve the same RPC trace boundary. A shared
+compute-driver tracing descriptor derives provider layers and standalone
+installation from each driver's service identity, and routes both the shared
+RPC boundary target and that driver's crate target prefix. A shared RPC tracer
+owns unary and streaming boundary outcomes. Each driver
 exports to the configured collector under its own service name and carries the
-gateway name as a resource attribute.
+gateway name and configured compute driver as resource attributes.
+Compute-driver client and server spans share the fully qualified protobuf
+operation name, such as `openshell.compute.v1.ComputeDriver/CreateSandbox`,
+in both the span name and `rpc.method`; the current RPC semantic conventions
+integrate the service into that fully qualified method and do not emit
+`rpc.service`. `service.name` and span kind distinguish the two sides.
+Backend-prefixed spans describe implementation work beneath that boundary.
+Streaming `WatchSandboxes` spans remain open for the stream lifetime on both
+sides. A terminal stream status records its outcome;
+consumer teardown without a terminal status leaves the span status unset.
 
 Two invariants shape the failure behavior. Telemetry is diagnostic, so no OTLP
 failure stops the gateway from serving: a malformed endpoint is logged at

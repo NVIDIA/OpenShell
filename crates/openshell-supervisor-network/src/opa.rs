@@ -413,7 +413,21 @@ impl OpaEngine {
         entrypoint_pid: u32,
         require_binary_identity: bool,
     ) -> Result<Self> {
-        let ambiguities = openshell_policy::find_endpoint_ambiguities(proto);
+        // Protobuf cannot distinguish an omitted repeated MCP version field
+        // from an empty one. Canonicalize before any runtime consumer reads
+        // the policy so both representations select the pinned default.
+        let proto = openshell_policy::validate_and_canonicalize_sandbox_policy(proto.clone())
+            .map_err(|error| {
+                let errors = error
+                    .violations()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                miette::miette!("policy validation failed:\n{errors}")
+            })?;
+
+        let ambiguities = openshell_policy::find_endpoint_ambiguities(&proto);
         if !ambiguities.is_empty() {
             return Err(miette::miette!(
                 "network endpoint ambiguity validation failed:\n{}",
@@ -426,16 +440,7 @@ impl OpaEngine {
         }
 
         emit_binary_identity_mode(require_binary_identity, "proto");
-        if let Err(violations) = openshell_policy::validate_sandbox_policy(proto) {
-            let errors = violations
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Err(miette::miette!("policy validation failed:\n{errors}"));
-        }
-
-        let data_json_str = proto_to_opa_data_json(proto, entrypoint_pid);
+        let data_json_str = proto_to_opa_data_json(&proto, entrypoint_pid);
 
         // Parse back to Value for preprocessing, then re-serialize
         let mut data: serde_json::Value = serde_json::from_str(&data_json_str)
@@ -1931,29 +1936,48 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                             .iter()
                             .map(|r| {
                                 let a = r.allow.as_ref();
-                                let mut allow = serde_json::json!({
-                                    "method": a.map_or("", |a| &a.method),
-                                    "path": a.map_or("", |a| &a.path),
-                                    "command": a.map_or("", |a| &a.command),
-                                    "operation_type": a.map_or("", |a| &a.operation_type),
-                                    "operation_name": a.map_or("", |a| &a.operation_name),
-                                });
-                                if let Some(a) = a
-                                    && !a.fields.is_empty()
-                                {
-                                    allow["fields"] = a.fields.clone().into();
+                                let mut allow = serde_json::Map::new();
+                                if let Some(a) = a {
+                                    // Proto3 represents absent scalar selectors as empty
+                                    // strings. Omit them so protobuf and YAML rules expose
+                                    // the same selector families to runtime validation.
+                                    if !a.method.is_empty() {
+                                        allow.insert("method".to_string(), a.method.clone().into());
+                                    }
+                                    if !a.path.is_empty() {
+                                        allow.insert("path".to_string(), a.path.clone().into());
+                                    }
+                                    if !a.command.is_empty() {
+                                        allow
+                                            .insert("command".to_string(), a.command.clone().into());
+                                    }
+                                    if !a.operation_type.is_empty() {
+                                        allow.insert(
+                                            "operation_type".to_string(),
+                                            a.operation_type.clone().into(),
+                                        );
+                                    }
+                                    if !a.operation_name.is_empty() {
+                                        allow.insert(
+                                            "operation_name".to_string(),
+                                            a.operation_name.clone().into(),
+                                        );
+                                    }
+                                    if !a.fields.is_empty() {
+                                        allow.insert("fields".to_string(), a.fields.clone().into());
+                                    }
                                 }
                                 let query = a.map_or_else(serde_json::Map::new, |allow| {
                                     l7_matchers_to_json(&allow.query)
                                 });
                                 if !query.is_empty() {
-                                    allow["query"] = query.into();
+                                    allow.insert("query".to_string(), query.into());
                                 }
                                 let params = a.map_or_else(serde_json::Map::new, |allow| {
                                     l7_matchers_to_json(&allow.params)
                                 });
                                 if !params.is_empty() {
-                                    allow["params"] = params.into();
+                                    allow.insert("params".to_string(), params.into());
                                 }
                                 serde_json::json!({ "allow": allow })
                             })
@@ -2192,8 +2216,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
 mod tests {
     use super::*;
 
+    use openshell_core::mcp::DEFAULT_MCP_PROTOCOL_VERSION;
     use openshell_core::proto::{
-        FilesystemPolicy as ProtoFs, L7Allow, L7QueryMatcher, L7Rule, NetworkBinary,
+        FilesystemPolicy as ProtoFs, L7Allow, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
         NetworkEndpoint, NetworkMiddlewareConfig, NetworkPolicyRule, ProcessPolicy as ProtoProc,
         SandboxPolicy as ProtoSandboxPolicy,
     };
@@ -2261,6 +2286,109 @@ mod tests {
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         }
+    }
+
+    fn defaultable_mcp_proto(mcp: Option<McpOptions>) -> ProtoSandboxPolicy {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "mcp".to_string(),
+            NetworkPolicyRule {
+                name: "mcp".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "mcp.example.com".to_string(),
+                    port: 443,
+                    protocol: "mcp".to_string(),
+                    mcp,
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: "tools/list".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        policy
+    }
+
+    fn projected_allow(
+        protocol: &str,
+        allow: L7Allow,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            network_policies: std::collections::HashMap::from([(
+                "selector_projection".to_string(),
+                NetworkPolicyRule {
+                    name: "selector_projection".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        protocol: protocol.to_string(),
+                        rules: vec![L7Rule { allow: Some(allow) }],
+                        ..Default::default()
+                    }],
+                    binaries: vec![],
+                },
+            )]),
+            ..Default::default()
+        };
+        let projected: serde_json::Value = serde_json::from_str(&proto_to_opa_data_json(&proto, 0))
+            .expect("protobuf policy projection must produce JSON");
+        projected["network_policies"]["selector_projection"]["endpoints"][0]["rules"][0]["allow"]
+            .as_object()
+            .expect("projected allow rule must be an object")
+            .clone()
+    }
+
+    #[test]
+    fn proto_projection_omits_absent_allow_selectors() {
+        let allow = projected_allow(
+            "websocket",
+            L7Allow {
+                operation_type: "subscription".to_string(),
+                operation_name: "NewMessages".to_string(),
+                fields: vec!["messageAdded".to_string()],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            allow,
+            serde_json::json!({
+                "operation_type": "subscription",
+                "operation_name": "NewMessages",
+                "fields": ["messageAdded"],
+            })
+            .as_object()
+            .expect("expected object")
+            .clone()
+        );
+    }
+
+    #[test]
+    fn proto_projection_preserves_nonempty_allow_selectors() {
+        let allow = projected_allow(
+            "rest",
+            L7Allow {
+                method: "POST".to_string(),
+                path: "/repos/**".to_string(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            allow,
+            serde_json::json!({
+                "method": "POST",
+                "path": "/repos/**",
+            })
+            .as_object()
+            .expect("expected object")
+            .clone()
+        );
     }
 
     const POLICY_DNS_SNAPSHOT_DATA: &str = r#"
@@ -3898,6 +4026,10 @@ network_policies:
                     path: "/mcp".to_string(),
                     protocol: "mcp".to_string(),
                     enforcement: "enforce".to_string(),
+                    mcp: Some(McpOptions {
+                        versions: vec![DEFAULT_MCP_PROTOCOL_VERSION.as_str().to_string()],
+                        ..Default::default()
+                    }),
                     rules: vec![L7Rule {
                         allow: Some(L7Allow {
                             method: "tools/call".to_string(),
@@ -5264,6 +5396,35 @@ network_policies:
         assert!(message.contains("wildcard"));
         assert!(message.contains("exact"));
         assert!(message.contains("tls"));
+    }
+
+    #[test]
+    fn proto_load_accepts_defaultable_mcp_versions() {
+        for policy in [
+            defaultable_mcp_proto(None),
+            defaultable_mcp_proto(Some(McpOptions::default())),
+        ] {
+            OpaEngine::from_proto(&policy)
+                .expect("supervisor ingress must materialize the pinned MCP revision");
+        }
+    }
+
+    #[test]
+    fn proto_load_rejects_unsupported_mcp_versions() {
+        let policy = defaultable_mcp_proto(Some(McpOptions {
+            versions: vec!["latest".to_string()],
+            ..Default::default()
+        }));
+
+        let Err(error) = OpaEngine::from_proto(&policy) else {
+            panic!("canonicalization must not repair an unsupported MCP revision");
+        };
+        let error = error.to_string();
+        assert!(error.contains("policy validation failed"), "{error}");
+        assert!(
+            error.contains("unsupported protocol version 'latest'"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -7999,7 +8160,7 @@ network_policies:
         old_sessions
             .pop()
             .expect("old-generation session")
-            .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
             .await;
         let admitted = current_runner
             .preflight_websocket(

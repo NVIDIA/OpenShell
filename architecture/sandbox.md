@@ -157,6 +157,8 @@ support `params` matchers; generic JSON-RPC rules match only the method.
 JSON-RPC responses and server-to-client MCP messages on response or SSE streams
 are relayed but are not currently parsed for policy enforcement.
 
+Every `protocol: mcp` endpoint carries a canonical, nonempty `mcp.versions` allowlist drawn from OpenShell's exact revision registry: `2025-03-26`, `2025-06-18`, and `2025-11-25`. A policy author may omit the entire `mcp` object when using the other endpoint defaults, or omit `mcp.versions` while setting another MCP option. Both forms resolve immediately to the exact allowlist `["2025-11-25"]`; omission never means latest or all known revisions. Defaulting applies only when the corresponding YAML key is absent: `mcp: null`, `versions: null`, and an explicit `versions: []` are invalid. At protobuf ingress, an empty repeated field means omission and uses the same default because protobuf repeated fields do not preserve presence. Normalization stores and serializes the materialized allowlist in semantic order, so adding a supported revision to the registry never widens a previously normalized policy. An explicit nonempty allowlist remains available as an advanced compatibility or downgrade control. The registry is a closed set rather than a date range, so duplicate or padded values, unknown dates, and moving aliases such as `draft` or `latest` are rejected. The sessionless `2026-07-28` revision is not accepted until OpenShell supports its distinct per-request runtime contract. A version names a core protocol revision only; there is no policy syntax for layering a separately named SEP onto it. The registry owns immutable batch-shape metadata: `2025-03-26` permits nonempty same-side top-level JSON-RPC batches, which OpenShell's planned enforcement caps at 64 members, while `2025-06-18` and `2025-11-25` prohibit top-level arrays. These are declared profile facts, not current forwarding claims. The allowlist does not yet select request parsing or forwarding behavior. Later response-aware runtime state must observe the successful server response, require the selected revision to be in the allowlist, and apply that one exact profile without a union or fallback; OpenShell must not bind the client proposal in `initialize` as though it were the server-selected revision.
+
 For admitted HTTP requests, the proxy can run an ordered supervisor middleware
 chain after L7 policy evaluation and before credential injection. Destination
 host selectors choose the chain independently of the network rule that admitted
@@ -169,6 +171,10 @@ the remote adapter materializes an owned HTTP evaluation only when a request
 crosses that transport boundary. Both paths support bounded bidirectional
 WebSocket sessions, so a manifest advertises capabilities independently of
 transport.
+When a stage ends, the remote adapter sends its terminal event, half-closes the
+request stream, and briefly drains the response stream before releasing the
+transport. This keeps a queued terminal event from being canceled with the
+bidirectional RPC.
 The runtime keeps three states distinct: host selection attaches policy configs,
 manifest operation and phase bindings select the active chain, and the parsed
 message type determines whether that chain can inspect an individual payload.
@@ -200,8 +206,9 @@ polling runs far more frequently than credentials expire, so the loop rotates
 only when a credential is missing or has passed four fifths of its lifetime,
 and bounds its sleep by the soonest rotation deadline.
 
-Middleware cannot observe injected credentials or mutate supervisor-owned
-credential, routing, or framing headers. Body transformations are re-evaluated
+Middleware cannot observe injected credentials, introduce credential
+placeholders, or mutate supervisor-owned credential, routing, or framing
+headers. Body transformations are re-evaluated
 against body-aware L7 policy before later stages or the upstream can observe
 them. Requests, results, chain length, execution time, and diagnostics are
 bounded; external free-form diagnostic text is not exposed in responses or
@@ -259,6 +266,12 @@ own DNS view, e.g. DoH tunneled via CONNECT, is a possible future
 enhancement and out of scope.) The workload child's proxy variables are
 unaffected — they are always rewritten to point at the local policy proxy.
 
+Template environment is treated like user-provided sandbox environment. It can
+shape the workload child, but it cannot override driver-controlled identity,
+gateway callback, TLS, relay socket, proxy, provider, or supervisor coordination
+variables. Drivers and the supervisor rewrite those reserved values after image
+and template environment are considered.
+
 The configuration is fail-closed: a setting that is present but invalid — an
 empty value, an unsupported or malformed proxy URL, an unreadable auth file or
 CA bundle, a malformed credential, or an auth file, `NO_PROXY` list, or CA
@@ -293,6 +306,35 @@ that path on the supervisor's command line. The supervisor reads the
 file and builds the `Proxy-Authorization: Basic` header; a credential that is
 empty, contains control characters, or is not in `user:pass` form is fatal on
 both sides.
+
+The VM driver has no argv seam of its own: its guest init script runs as PID 1
+and execs a fixed supervisor command line, and the libkrun and QEMU launch
+backends both reach the supervisor through that script. Driver-owned
+supervisor arguments therefore travel in a per-sandbox file the driver writes
+into the overlay upperdir at a fixed guest path, one argument per line, which
+the guest reads verbatim (no word splitting or globbing) and appends to every
+supervisor exec. The file is written on **every** launch, including an empty
+file when there is nothing to pass: the upperdir copy always shadows the
+read-only image layer, so a sandbox image can neither supply its own
+supervisor arguments by baking a file at that path nor disable the operator's
+by omitting one. This mirrors the driver-authored `init.d` manifest, which
+solves the same trust problem for guest init drop-ins.
+
+A microVM has no bind mounts or container secrets, so the VM driver stages the
+credential and the CA bundle into the per-sandbox overlay disk instead — the
+credential root-only, the CA world-readable, both at fixed `/opt/openshell`
+paths and both removed with the sandbox state directory. The consequence,
+which differs from the Podman secret model, is that the credential is at rest
+inside that overlay image on the gateway host; the per-sandbox gateway JWT
+already travels the same path. Proxy reachability differs by VM backend. libkrun-backed
+sandboxes egress through gvproxy, so a proxy on the gateway host's loopback is
+reachable through the host alias `host.openshell.internal`, which gvproxy NATs
+to the host's `127.0.0.1`. QEMU/TAP sandboxes (GPU) have no equivalent: that
+alias resolves to the TAP host address, and the driver's nftables `input`
+chain accepts only the gateway port from the guest, so no gateway-host proxy
+is reachable. The driver rejects a gateway-host proxy URL on the QEMU path at
+launch rather than producing CONNECT timeouts. The guest's gateway callback is
+unaffected in both backends and never traverses the proxy.
 
 For Kubernetes sandboxes, the operator configures a Secret name and key rather
 than a gateway-host file path. Kubernetes projects that Secret only into the

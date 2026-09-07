@@ -113,6 +113,8 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
+    unimplemented_sandbox_template_rpcs!();
+
     async fn list_sandbox_providers(
         &self,
         _request: tonic::Request<openshell_core::proto::ListSandboxProvidersRequest>,

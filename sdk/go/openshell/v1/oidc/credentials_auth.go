@@ -36,25 +36,12 @@ func NewClientCredentialsAuth(opts ...LoginOption) (types.AuthProvider, error) {
 }
 
 func (a *clientCredentialsAuth) GetRequestMetadata(ctx context.Context, _ ...string) (map[string]string, error) {
-	a.mu.Lock()
-	if a.token != nil && time.Now().Add(clientCredentialsLeeway).Before(a.token.Expiry) {
-		accessToken := a.token.AccessToken
-		a.mu.Unlock()
+	if accessToken, ok := a.cachedAccessToken(); ok {
 		return map[string]string{"authorization": "Bearer " + accessToken}, nil
 	}
-	a.mu.Unlock()
 
 	result := a.group.DoChan("exchange", func() (any, error) {
-		exchangeCtx, cancel := context.WithTimeout(context.Background(), a.cfg.timeout)
-		defer cancel()
-		token, err := exchangeClientCredentials(exchangeCtx, a.cfg, true)
-		if err != nil {
-			return nil, err
-		}
-		a.mu.Lock()
-		a.token = token
-		a.mu.Unlock()
-		return token.AccessToken, nil
+		return a.accessTokenForExchange()
 	})
 	select {
 	case <-ctx.Done():
@@ -65,6 +52,35 @@ func (a *clientCredentialsAuth) GetRequestMetadata(ctx context.Context, _ ...str
 		}
 		return map[string]string{"authorization": "Bearer " + exchange.Val.(string)}, nil
 	}
+}
+
+func (a *clientCredentialsAuth) cachedAccessToken() (string, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.token != nil && time.Now().Add(clientCredentialsLeeway).Before(a.token.Expiry) {
+		return a.token.AccessToken, true
+	}
+	return "", false
+}
+
+func (a *clientCredentialsAuth) accessTokenForExchange() (string, error) {
+	// A caller can miss the initial cache check, then become the next flight
+	// leader after another exchange completes and singleflight removes it.
+	// Re-check here so that caller reuses the token instead of exchanging again.
+	if accessToken, ok := a.cachedAccessToken(); ok {
+		return accessToken, nil
+	}
+
+	exchangeCtx, cancel := context.WithTimeout(context.Background(), a.cfg.timeout)
+	defer cancel()
+	token, err := exchangeClientCredentials(exchangeCtx, a.cfg, true)
+	if err != nil {
+		return "", err
+	}
+	a.mu.Lock()
+	a.token = token
+	a.mu.Unlock()
+	return token.AccessToken, nil
 }
 
 func (*clientCredentialsAuth) RequireTransportSecurity() bool { return true }

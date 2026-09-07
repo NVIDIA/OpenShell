@@ -306,7 +306,7 @@ consumers import a single package. See the [Architecture](https://ro14nd.de/open
 
 ## Prerequisites
 
-- Go 1.25 or later
+- Go 1.25.13 or later
 - [mise](https://mise.jdx.dev) (recommended for reproducible builds)
 
 ## Build and Test

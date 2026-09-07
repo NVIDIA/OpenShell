@@ -22,11 +22,15 @@ pub use openshell_core::proto;
 pub use openshell_core::proto::inference_client::InferenceClient;
 pub use openshell_core::proto::open_shell_client::OpenShellClient as GrpcClient;
 pub use openshell_core::proto::{
-    CreateSandboxRequest, CreateWorkspaceRequest, DeleteSandboxRequest, DeleteWorkspaceRequest,
-    ExecSandboxRequest, GetSandboxRequest, GetWorkspaceRequest, HealthRequest,
-    ListProvidersRequest, ListSandboxesRequest, ListWorkspacesRequest, Sandbox,
-    SandboxPhase as ProtoSandboxPhase, SandboxSpec as ProtoSandboxSpec, SandboxTemplate,
-    ServiceStatus as ProtoServiceStatus, StartSandboxRequest, StopSandboxRequest, Workspace,
+    CreateSandboxRequest, CreateSandboxTemplateRequest, CreateWorkspaceRequest,
+    DeleteSandboxRequest, DeleteSandboxTemplateRequest, DeleteWorkspaceRequest, ExecSandboxRequest,
+    GetSandboxRequest, GetSandboxTemplateRequest, GetWorkspaceRequest, HealthRequest,
+    ListProvidersRequest, ListSandboxTemplatesRequest, ListSandboxesRequest, ListWorkspacesRequest,
+    Sandbox, SandboxPhase as ProtoSandboxPhase, SandboxResources, SandboxServiceLevel,
+    SandboxSpec as ProtoSandboxSpec, SandboxStartup, SandboxTemplate, SandboxTemplateResponse,
+    SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance,
+    SandboxWorkloadTemplateSpec, ServiceStatus as ProtoServiceStatus, StartSandboxRequest,
+    StopSandboxRequest, Workspace,
 };
 
 /// Type alias for the gRPC client wrapped in the SDK's auth interceptor.
