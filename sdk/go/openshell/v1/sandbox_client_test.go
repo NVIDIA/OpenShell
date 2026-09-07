@@ -343,6 +343,26 @@ func TestSandboxCreate(t *testing.T) {
 	assert.Equal(t, pb.ServiceAuthorizationMode_SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH, mock.createRequest.GetServiceExposures()[1].GetAuthorizationMode())
 }
 
+// Callers that passed nil for the old positional labels parameter still compile
+// against the variadic signature, so the nil option must be ignored rather than
+// invoked.
+func TestSandboxCreate_LegacyTrailingNil(t *testing.T) {
+	mock := newMockSandboxServer()
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	result, err := client.Create(context.Background(), "default", "legacy-sandbox", &SandboxSpec{}, nil)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	require.NotNil(t, mock.createRequest)
+	assert.Empty(t, mock.createRequest.Labels)
+	assert.Empty(t, mock.createRequest.Annotations)
+}
+
 func TestSandboxCreate_WithAnnotations(t *testing.T) {
 	mock := newMockSandboxServer()
 	client, cleanup := setupSandboxTest(t, mock)
