@@ -146,8 +146,9 @@ nix develop --command tasks/scripts/trivy-scan.sh gate
 ### Pull-request change gate
 
 `Trivy Changes` runs directly on pull requests and merge groups. It detects
-changes to Helm charts, release Dockerfiles, and the Trivy tooling, then scans
-both the base revision and the candidate with the same scanner logic. The check
+changes to Helm charts, release Dockerfiles, the raw Kubernetes manifests, and
+the Trivy tooling — deletions included — then scans both the base revision and
+the candidate with the same scanner logic. The check
 fails only when the candidate introduces a new `HIGH` or `CRITICAL`
 misconfiguration, so existing findings do not block unrelated work. Reports
 from both revisions are retained as workflow artifacts.

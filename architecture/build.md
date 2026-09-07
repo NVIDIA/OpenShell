@@ -478,7 +478,11 @@ Trivy has no OCI artifact target, and `trivy image` rejects the Helm config medi
 type, so a packaged chart has to be fetched with `helm pull` before it can be
 scanned. Trivy reports locations relative to the scanned target, so
 `tasks/scripts/trivy-scan.sh` rewrites SARIF URIs to repository-relative paths;
-without that, Code Scanning resolves alerts against files that do not exist. That
+without that, Code Scanning resolves alerts against files that do not exist. The
+prefix comes from whichever chart declares the published name rather than from a
+fixed directory, because a chart's published name is not its directory name and
+the two charts share template filenames: a hardcoded prefix would report
+`openshell-workspace` alerts against the gateway chart's `role.yaml`. That
 rewrite and the profile loop are the only repository-specific logic: severity
 filtering, the pass/fail decision and the summary table all come from
 `trivy convert --exit-code`, so nothing reimplements counting.
@@ -501,18 +505,27 @@ its findings are separate changes, in that order.
 `.github/workflows/trivy-changes.yml` gates changes rather than releases. It
 runs on `pull_request` and `merge_group`; `workflow_dispatch` takes explicit
 base and head SHAs for diagnostics. A detection job decides whether the change
-touches `deploy/docker/**`, `deploy/helm/**`, or the scanner inputs themselves
-(`.trivyignore.yaml`, `flake.nix`, `flake.lock`, `tasks/scripts/trivy-scan.sh`,
-and the workflow file).
+touches `deploy/docker/**`, `deploy/helm/**`, `deploy/kube/**`, or the scanner
+inputs themselves (`.trivyignore.yaml`, `flake.nix`, `flake.lock`,
+`tasks/scripts/trivy-scan.sh`, and the workflow file); the watched paths track
+what the scan covers, so a change to the raw manifests cannot land unscanned.
+Detection counts deletions and treats a failed diff as a
+failure, so removing the scanner, a value fixture, or the ignore file cannot skip
+the scan behind a passing status.
 
 When it does, the scan job checks out both the baseline and the candidate and
 runs the candidate's `trivy-scan.sh config` over each tree with the candidate's
 `.trivyignore.yaml`, so a scanner or ignore-policy change is judged by its own
 rules on both sides. `gate-config-diff` then compares semantic finding
 identities — rule ID, target, namespace, message, and cause
-provider/service/resource — and fails only on identities absent from the
-baseline. The four findings above therefore keep reporting without blocking
-every pull request, while a newly introduced `HIGH` or `CRITICAL`
+provider/service/resource — together with how many times each occurs. Line
+numbers stay out of the identity so that edits which merely move a finding do not
+look new, and the count stops a second offending block from hiding behind an
+identity the baseline already reports: `KSV-0041` covers two rules of the
+workspace-mode ClusterRole today, so a third fails. Counts are taken per report
+and reduced with `max`, never summed, so a new value fixture rendering the same
+templates adds no debt. The four findings above therefore keep reporting without
+blocking every pull request, while a newly introduced `HIGH` or `CRITICAL`
 misconfiguration fails the check. Both report sets are uploaded as workflow
 artifacts.
 

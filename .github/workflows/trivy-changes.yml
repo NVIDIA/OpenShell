@@ -33,7 +33,7 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      should_run: ${{ steps.default.outputs.should_run || steps.changed.outputs.any_changed }}
+      should_run: ${{ steps.default.outputs.should_run || steps.changed.outputs.any_modified }}
     steps:
       - id: default
         if: github.event_name != 'pull_request'
@@ -48,9 +48,15 @@ jobs:
         if: github.event_name == 'pull_request'
         uses: tj-actions/changed-files@aa08304bd477b800d468db44fe10f6c61f7f7b11 # v42.1.0
         with:
+          # `any_modified` covers deletions, which `any_changed` omits, and a
+          # failed diff has to fail the job: both otherwise report no relevant
+          # change, and removing the scanner or a value fixture would skip the
+          # scan behind a green status.
+          fail_on_initial_diff_error: true
           files: |
             deploy/docker/**
             deploy/helm/**
+            deploy/kube/**
             .trivyignore.yaml
             flake.nix
             flake.lock

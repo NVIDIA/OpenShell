@@ -96,12 +96,31 @@ scan_packaged_chart() {
     exit 2
   fi
 
-  local dir
+  # A published chart name is not its directory name — the gateway chart is
+  # `helm-chart` under deploy/helm/openshell — and both published charts share
+  # template filenames. Resolving the SARIF prefix and the report slug from the
+  # chart that declares the published name keeps `openshell-workspace` alerts off
+  # the gateway chart's `role.yaml` instead of silently reattributing them.
+  local repo chart_name chart_dir="" candidate dir
+  repo="${ref%:*}"
+  chart_name="${repo##*/}"
+  for candidate in deploy/helm/*/; do
+    [ -f "${candidate}Chart.yaml" ] || continue
+    [ "$(sed -n 's/^name:[[:space:]]*//p' "${candidate}Chart.yaml" | head -1)" \
+      = "${chart_name}" ] || continue
+    chart_dir="${candidate}"
+    break
+  done
+  if [ -z "${chart_dir}" ]; then
+    echo "Error: no chart under deploy/helm declares name '${chart_name}'" >&2
+    exit 2
+  fi
+
   dir="$(mktemp -d)"
   trap 'rm -rf "${dir}"' RETURN
 
-  helm pull "${ref%:*}" --version "${ref##*:}" --destination "${dir}"
-  scan config config-packaged-chart deploy/helm/openshell/ \
+  helm pull "${repo}" --version "${ref##*:}" --destination "${dir}"
+  scan config "config-packaged-${chart_name}" "${chart_dir}" \
     "${PREFLIGHT_OFF[@]}" "$(find "${dir}" -name '*.tgz' -print -quit)"
 }
 
@@ -173,35 +192,49 @@ collect_config_findings() {
     return 2
   fi
 
+  # One identity can cover several offending blocks: the key deliberately omits
+  # line numbers, so two rules in the same ClusterRole granting `secrets` are
+  # indistinguishable. Occurrences are therefore counted per report and reduced
+  # with `max`, never summed, because every value fixture scans the same tree and
+  # repeats its findings across reports while a template repeats them within one.
   jq -s --arg severities "${SEVERITY}" '
     [
       .[]
-      | .Results[]? as $result
-      | $result.Misconfigurations[]?
-      | .Severity as $severity
-      | select(($severities | split(",") | index($severity)) != null)
-      | {
-          key: ([
-            .ID,
-            $result.Target,
-            (.Namespace // ""),
-            (.Message // ""),
-            (.CauseMetadata.Provider // ""),
-            (.CauseMetadata.Service // ""),
-            (.CauseMetadata.Resource // "")
-          ] | @json),
-          severity: .Severity,
-          id: .ID,
-          target: $result.Target,
-          title: .Title
-        }
+      | [
+          .Results[]? as $result
+          | $result.Misconfigurations[]?
+          | .Severity as $severity
+          | select(($severities | split(",") | index($severity)) != null)
+          | {
+              key: ([
+                .ID,
+                $result.Target,
+                (.Namespace // ""),
+                (.Message // ""),
+                (.CauseMetadata.Provider // ""),
+                (.CauseMetadata.Service // ""),
+                (.CauseMetadata.Resource // "")
+              ] | @json),
+              severity: .Severity,
+              id: .ID,
+              target: $result.Target,
+              title: .Title
+            }
+        ]
+      | group_by(.key)
+      | map(.[0] + { count: length })
+      | .[]
     ]
-    | unique_by(.key)
+    | group_by(.key)
+    | map(max_by(.count))
   ' "${report_dir}"/*.json
 }
 
 # Compare semantic finding identities instead of line numbers, so unrelated
 # edits that move a finding do not make existing debt look newly introduced.
+# Identities carry an occurrence count rather than mere presence, so adding a
+# second offending block under an identity the baseline already reports still
+# fails.
 gate_config_diff() (
   set -euo pipefail
 
@@ -216,11 +249,16 @@ gate_config_diff() (
   collect_config_findings "${baseline_dir}" >"${baseline}"
   collect_config_findings "${candidate_dir}" >"${candidate}"
   jq --slurpfile baseline "${baseline}" '
-    ($baseline[0] | map(.key)) as $known
-    | [.[] | select(.key as $key | ($known | index($key)) == null)]
+    ($baseline[0] | map({ (.key): .count }) | add // {}) as $known
+    | [
+        .[]
+        | (($known[.key]) // 0) as $before
+        | select(.count > $before)
+        | . + { baseline_count: $before, new_count: (.count - $before) }
+      ]
   ' "${candidate}" >"${new_findings}"
 
-  finding_count="$(jq 'length' "${new_findings}")"
+  finding_count="$(jq '[.[].new_count] | add // 0' "${new_findings}")"
   if [ "${finding_count}" -eq 0 ]; then
     echo "No new configuration findings at ${SEVERITY}."
     if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
@@ -231,13 +269,17 @@ gate_config_diff() (
   fi
 
   echo "::error::Trivy reported ${finding_count} new configuration finding(s) at ${SEVERITY}."
-  jq -r '.[] | "::error::[\(.severity)] \(.id) in deploy/\(.target): \(.title)"' \
+  jq -r '.[]
+    | "::error::[\(.severity)] \(.id) in deploy/\(.target): \(.title)"
+      + " (\(.new_count) new, \(.baseline_count) in baseline)"' \
     "${new_findings}"
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     {
       echo "### New Trivy configuration findings"
       echo
-      jq -r '.[] | "- **\(.severity)** `\(.id)` in `deploy/\(.target)`: \(.title)"' \
+      jq -r '.[]
+        | "- **\(.severity)** `\(.id)` in `deploy/\(.target)`: \(.title)"
+          + " (\(.new_count) new, \(.baseline_count) in baseline)"' \
         "${new_findings}"
     } >>"${GITHUB_STEP_SUMMARY}"
   fi
