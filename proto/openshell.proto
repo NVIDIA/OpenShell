@@ -1176,6 +1176,15 @@ message ListSandboxesRequest {
   string workspace = 4;
   // List across all workspaces. Mutually exclusive with workspace.
   bool all_workspaces = 5;
+  // Opaque continuation token returned by the previous page.
+  string page_token = 6;
+}
+
+// List sandboxes response.
+message ListSandboxesResponse {
+  repeated Sandbox sandboxes = 1;
+  // Opaque continuation token for the next page, if more results exist.
+  string next_page_token = 2;
 }
 
 // List providers attached to a sandbox request.
@@ -1243,11 +1252,6 @@ message StartSandboxRequest {
 // Sandbox response.
 message SandboxResponse {
   Sandbox sandbox = 1;
-}
-
-// List sandboxes response.
-message ListSandboxesResponse {
-  repeated Sandbox sandboxes = 1;
 }
 
 // List providers attached to a sandbox response.
@@ -1621,6 +1625,8 @@ message ListProvidersRequest {
   string workspace = 3;
   // List across all workspaces. Mutually exclusive with workspace.
   bool all_workspaces = 4;
+  // Opaque continuation token returned by the previous page.
+  string page_token = 5;
 }
 
 // Update provider request.
@@ -1648,6 +1654,8 @@ message ProviderResponse {
 // List providers response.
 message ListProvidersResponse {
   repeated openshell.datamodel.v1.Provider providers = 1;
+  // Opaque continuation token for the next page, if more results exist.
+  string next_page_token = 2;
 }
 
 // List provider type profiles request.

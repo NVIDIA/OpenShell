@@ -13,6 +13,7 @@ use crate::ServerState;
 use crate::auth::workspace_authz::{
     MinWorkspaceRole, authorize_sandbox_workspace, authorize_workspace, require_platform_admin,
 };
+use crate::persistence::ObjectCursor;
 use crate::persistence::{ObjectLabels, ObjectType, WriteCondition, generate_name};
 use futures::future;
 use openshell_core::net::set_tcp_nodelay_best_effort;
@@ -62,7 +63,10 @@ use super::validation::{
     validate_exec_request_fields, validate_no_reserved_provider_policy_keys,
     validate_policy_safety, validate_sandbox_governance_spec, validate_sandbox_spec,
 };
-use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, clamp_limit};
+use super::{
+    MAX_PAGE_SIZE, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, clamp_limit, decode_list_page_token,
+    encode_list_page_token,
+};
 use crate::persistence::current_time_ms;
 
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
@@ -154,6 +158,19 @@ fn generate_routable_name() -> String {
     let mut truncated = &name[..name.len().min(MAX_ROUTABLE_NAME_LEN)];
     truncated = truncated.trim_end_matches('-');
     truncated.to_string()
+}
+
+fn sandbox_page_cursor(sandbox: &Sandbox) -> Result<ObjectCursor, Status> {
+    let metadata = sandbox
+        .metadata
+        .as_ref()
+        .ok_or_else(|| Status::internal("sandbox metadata missing"))?;
+    Ok(ObjectCursor {
+        created_at_ms: metadata.created_at_ms,
+        name: metadata.name.clone(),
+        workspace: metadata.workspace.clone(),
+        id: metadata.id.clone(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -621,10 +638,33 @@ pub(super) async fn handle_list_sandboxes(
         ));
     }
     let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
+    let page_token = request.page_token.trim();
+    if !page_token.is_empty() && !request.label_selector.is_empty() {
+        return Err(Status::invalid_argument(
+            "page_token is currently supported only for unfiltered sandbox listings",
+        ));
+    }
 
+    let use_cursor_pagination =
+        request.label_selector.is_empty() && (request.offset == 0 || !page_token.is_empty());
     let sandboxes: Vec<Sandbox> = if request.all_workspaces {
         require_platform_admin(&state.admin_role, &principal)?;
-        if request.label_selector.is_empty() {
+        if use_cursor_pagination {
+            let after = if !page_token.is_empty() {
+                Some(decode_list_page_token(
+                    "sandbox.list",
+                    "all_workspaces",
+                    page_token,
+                )?)
+            } else {
+                None
+            };
+            state
+                .store
+                .list_all_messages_after::<Sandbox>(after.as_ref(), limit)
+                .await
+                .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
+        } else if request.label_selector.is_empty() {
             state
                 .store
                 .list_all_messages(limit, request.offset)
@@ -650,30 +690,66 @@ pub(super) async fn handle_list_sandboxes(
         let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
             .await?
             .name;
-        if request.label_selector.is_empty() {
+        if use_cursor_pagination {
+            let after = if !page_token.is_empty() {
+                Some(decode_list_page_token(
+                    "sandbox.list",
+                    &format!("workspace:{workspace}"),
+                    page_token,
+                )?)
+            } else {
+                None
+            };
             state
                 .store
-                .list_messages(&workspace, limit, request.offset)
+                .list_messages_after::<Sandbox>(&workspace, after.as_ref(), limit)
                 .await
                 .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
         } else {
-            crate::grpc::validation::validate_label_selector(&request.label_selector)?;
-            state
-                .store
-                .list_messages_with_selector(
-                    &workspace,
-                    &request.label_selector,
-                    limit,
-                    request.offset,
-                )
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("list sandboxes with selector failed: {e}"))
-                })?
+            if !request.label_selector.is_empty() {
+                crate::grpc::validation::validate_label_selector(&request.label_selector)?;
+                state
+                    .store
+                    .list_messages_with_selector(
+                        &workspace,
+                        &request.label_selector,
+                        limit,
+                        request.offset,
+                    )
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!("list sandboxes with selector failed: {e}"))
+                    })?
+            } else {
+                state
+                    .store
+                    .list_messages(&workspace, limit, request.offset)
+                    .await
+                    .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
+            }
         }
     };
 
-    Ok(Response::new(ListSandboxesResponse { sandboxes }))
+    let next_page_token = if use_cursor_pagination {
+        match sandboxes.last() {
+            Some(sandbox) => {
+                let query = if request.all_workspaces {
+                    "all_workspaces".to_string()
+                } else {
+                    format!("workspace:{}", request.workspace)
+                };
+                encode_list_page_token("sandbox.list", &query, &sandbox_page_cursor(sandbox)?)?
+            }
+            None => String::new(),
+        }
+    } else {
+        String::new()
+    };
+
+    Ok(Response::new(ListSandboxesResponse {
+        sandboxes,
+        next_page_token,
+    }))
 }
 
 pub(super) async fn handle_create_sandbox_template(
@@ -6271,6 +6347,7 @@ mod tests {
                 limit: 100,
                 offset: 0,
                 label_selector: String::new(),
+                page_token: String::new(),
                 workspace: "default".to_string(),
                 all_workspaces: false,
             }),
@@ -6288,6 +6365,7 @@ mod tests {
                 limit: 100,
                 offset: 0,
                 label_selector: String::new(),
+                page_token: String::new(),
                 workspace: "beta".to_string(),
                 all_workspaces: false,
             }),
@@ -6312,6 +6390,7 @@ mod tests {
                 limit: 100,
                 offset: 0,
                 label_selector: String::new(),
+                page_token: String::new(),
                 workspace: "default".to_string(),
                 all_workspaces: false,
             }),
@@ -6354,6 +6433,7 @@ mod tests {
                 limit: 100,
                 offset: 0,
                 label_selector: String::new(),
+                page_token: String::new(),
                 workspace: String::new(),
                 all_workspaces: true,
             }),
@@ -6370,6 +6450,7 @@ mod tests {
                 limit: 100,
                 offset: 0,
                 label_selector: String::new(),
+                page_token: String::new(),
                 workspace: "default".to_string(),
                 all_workspaces: true,
             }),
@@ -6377,6 +6458,93 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn list_sandboxes_uses_stable_page_tokens_for_workspace_scope() {
+        use openshell_core::proto::datamodel::v1::ObjectMeta;
+
+        let state = test_server_state().await;
+
+        for (id, name, created_at_ms) in [
+            ("sbx-page-a", "page-a", 1_000_000_i64),
+            ("sbx-page-b", "page-b", 1_000_001_i64),
+            ("sbx-page-c", "page-c", 1_000_002_i64),
+        ] {
+            let mut sandbox = Sandbox {
+                metadata: Some(ObjectMeta {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    created_at_ms,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                spec: Some(SandboxSpec::default()),
+                status: None,
+                ..Sandbox::default()
+            };
+            sandbox.set_phase(SandboxPhase::Ready as i32);
+            state.store.put_message(&sandbox).await.unwrap();
+        }
+
+        let first_page = handle_list_sandboxes(
+            &state,
+            authed_request(ListSandboxesRequest {
+                limit: 1,
+                offset: 0,
+                label_selector: String::new(),
+                page_token: String::new(),
+                workspace: "default".to_string(),
+                all_workspaces: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(first_page.sandboxes.len(), 1);
+        assert_eq!(first_page.sandboxes[0].object_name(), "page-a");
+        assert!(!first_page.next_page_token.is_empty());
+
+        state
+            .store
+            .delete_by_name(Sandbox::object_type(), "default", "page-a")
+            .await
+            .unwrap();
+
+        let offset_page = handle_list_sandboxes(
+            &state,
+            authed_request(ListSandboxesRequest {
+                limit: 1,
+                offset: 1,
+                label_selector: String::new(),
+                page_token: String::new(),
+                workspace: "default".to_string(),
+                all_workspaces: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(offset_page.sandboxes[0].object_name(), "page-c");
+
+        let token_page = handle_list_sandboxes(
+            &state,
+            authed_request(ListSandboxesRequest {
+                limit: 1,
+                offset: 0,
+                label_selector: String::new(),
+                page_token: first_page.next_page_token.clone(),
+                workspace: "default".to_string(),
+                all_workspaces: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(token_page.sandboxes[0].object_name(), "page-b");
     }
 
     /// Non-members must receive `PERMISSION_DENIED` — never `NOT_FOUND` — when

@@ -8,7 +8,8 @@
 #[cfg(test)]
 use crate::credentials::RefreshMaterialScope;
 use crate::persistence::{
-    ObjectId, ObjectLabels, ObjectName, ObjectType, Store, WriteCondition, generate_name,
+    ObjectCursor, ObjectId, ObjectLabels, ObjectName, ObjectType, Store, WriteCondition,
+    generate_name,
 };
 use crate::provider_profile_sources::{
     EffectiveProviderProfileCatalog, ProviderProfileSources, profile_response_payload,
@@ -34,6 +35,7 @@ use tracing::warn;
 use super::validation::{validate_provider_fields, validate_provider_mutable_fields};
 use super::{
     MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN, MAX_PAGE_SIZE, MAX_PROVIDER_CONFIG_ENTRIES, clamp_limit,
+    decode_list_page_token, encode_list_page_token,
 };
 
 const GATEWAY_SPIFFE_WORKLOAD_API_SOCKET: &str = "OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET";
@@ -281,16 +283,37 @@ pub(super) async fn list_provider_records(
     workspace: &str,
     limit: u32,
     offset: u32,
+    after: Option<&ObjectCursor>,
 ) -> Result<Vec<Provider>, Status> {
-    let providers: Vec<Provider> = store
-        .list_messages(workspace, limit, offset)
-        .await
-        .map_err(|e| Status::internal(format!("list providers failed: {e}")))?;
+    let providers: Vec<Provider> = if let Some(after) = after {
+        store
+            .list_messages_after::<Provider>(workspace, Some(after), limit)
+            .await
+            .map_err(|e| Status::internal(format!("list providers failed: {e}")))?
+    } else {
+        store
+            .list_messages(workspace, limit, offset)
+            .await
+            .map_err(|e| Status::internal(format!("list providers failed: {e}")))?
+    };
 
     Ok(providers
         .into_iter()
         .map(redact_provider_credentials)
         .collect())
+}
+
+fn provider_page_cursor(provider: &Provider) -> Result<ObjectCursor, Status> {
+    let metadata = provider
+        .metadata
+        .as_ref()
+        .ok_or_else(|| Status::internal("provider metadata missing"))?;
+    Ok(ObjectCursor {
+        created_at_ms: metadata.created_at_ms,
+        name: metadata.name.clone(),
+        workspace: metadata.workspace.clone(),
+        id: metadata.id.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -2572,15 +2595,60 @@ pub(super) async fn handle_list_providers(
         ));
     }
     let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
+    let page_token = request.page_token.trim();
+    if !page_token.is_empty() && request.offset > 0 {
+        return Err(Status::invalid_argument(
+            "page_token cannot be combined with an explicit offset",
+        ));
+    }
 
-    let providers = if request.all_workspaces {
+    let use_cursor_pagination = request.offset == 0 || !page_token.is_empty();
+    let (providers, next_page_token) = if request.all_workspaces {
         require_platform_admin(&state.admin_role, &principal)?;
-        let all: Vec<Provider> = state
-            .store
-            .list_all_messages(limit, request.offset)
-            .await
-            .map_err(|e| Status::internal(format!("list providers failed: {e}")))?;
-        all.into_iter().map(redact_provider_credentials).collect()
+        if !request.workspace.is_empty() {
+            return Err(Status::invalid_argument(
+                "workspace is not supported with all_workspaces",
+            ));
+        }
+        let providers = if use_cursor_pagination {
+            let after = if !page_token.is_empty() {
+                Some(decode_list_page_token(
+                    "provider.list",
+                    "all_workspaces",
+                    page_token,
+                )?)
+            } else {
+                None
+            };
+            state
+                .store
+                .list_all_messages_after::<Provider>(after.as_ref(), limit)
+                .await
+                .map_err(|e| Status::internal(format!("list providers failed: {e}")))?
+        } else {
+            state
+                .store
+                .list_all_messages(limit, request.offset)
+                .await
+                .map_err(|e| Status::internal(format!("list providers failed: {e}")))?
+        };
+        let providers: Vec<Provider> = providers
+            .into_iter()
+            .map(redact_provider_credentials)
+            .collect();
+        let next = if use_cursor_pagination {
+            match providers.last() {
+                Some(provider) => encode_list_page_token(
+                    "provider.list",
+                    "all_workspaces",
+                    &provider_page_cursor(provider)?,
+                )?,
+                None => String::new(),
+            }
+        } else {
+            String::new()
+        };
+        (providers, next)
     } else {
         let authz = authorize_workspace(
             &state.store,
@@ -2593,10 +2661,53 @@ pub(super) async fn handle_list_providers(
         let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
             .await?
             .name;
-        list_provider_records(state.store.as_ref(), &workspace, limit, request.offset).await?
+        let providers = if use_cursor_pagination {
+            let after = if !page_token.is_empty() {
+                Some(decode_list_page_token(
+                    "provider.list",
+                    &format!("workspace:{workspace}"),
+                    page_token,
+                )?)
+            } else {
+                None
+            };
+            list_provider_records(
+                state.store.as_ref(),
+                &workspace,
+                limit,
+                request.offset,
+                after.as_ref(),
+            )
+            .await?
+        } else {
+            list_provider_records(
+                state.store.as_ref(),
+                &workspace,
+                limit,
+                request.offset,
+                None,
+            )
+            .await?
+        };
+        let next = if use_cursor_pagination {
+            match providers.last() {
+                Some(provider) => encode_list_page_token(
+                    "provider.list",
+                    &format!("workspace:{workspace}"),
+                    &provider_page_cursor(provider)?,
+                )?,
+                None => String::new(),
+            }
+        } else {
+            String::new()
+        };
+        (providers, next)
     };
 
-    Ok(Response::new(ListProvidersResponse { providers }))
+    Ok(Response::new(ListProvidersResponse {
+        providers,
+        next_page_token,
+    }))
 }
 
 /// Return provider profiles visible in the given workspace scope.
@@ -8017,7 +8128,7 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.object_id(), provider_id);
 
-        let listed = list_provider_records(&store, "default", 100, 0)
+        let listed = list_provider_records(&store, "default", 100, 0, None)
             .await
             .unwrap();
         assert_eq!(listed.len(), 1);
@@ -13009,6 +13120,7 @@ mod tests {
             authed_request(ListProvidersRequest {
                 limit: 100,
                 offset: 0,
+                page_token: String::new(),
                 workspace: "default".to_string(),
                 all_workspaces: false,
             }),
@@ -13024,6 +13136,7 @@ mod tests {
             authed_request(ListProvidersRequest {
                 limit: 100,
                 offset: 0,
+                page_token: String::new(),
                 workspace: "beta".to_string(),
                 all_workspaces: false,
             }),
@@ -13052,6 +13165,7 @@ mod tests {
             authed_request(ListProvidersRequest {
                 limit: 100,
                 offset: 0,
+                page_token: String::new(),
                 workspace: "default".to_string(),
                 all_workspaces: false,
             }),
@@ -13103,6 +13217,7 @@ mod tests {
             authed_request(ListProvidersRequest {
                 limit: 100,
                 offset: 0,
+                page_token: String::new(),
                 workspace: String::new(),
                 all_workspaces: true,
             }),
@@ -13118,6 +13233,7 @@ mod tests {
             authed_request(ListProvidersRequest {
                 limit: 100,
                 offset: 0,
+                page_token: String::new(),
                 workspace: "default".to_string(),
                 all_workspaces: true,
             }),
@@ -13125,6 +13241,99 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn list_providers_uses_stable_page_tokens_for_workspace_scope() {
+        use openshell_core::proto::datamodel::v1::ObjectMeta;
+
+        let state = test_server_state().await;
+
+        fn provider(name: &str, id: &str, created_at_ms: i64) -> Provider {
+            Provider {
+                metadata: Some(ObjectMeta {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    created_at_ms,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                r#type: "claude-code".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+                profile_workspace: String::new(),
+                credential_handles: HashMap::new(),
+            }
+        }
+
+        for (id, name, created_at_ms) in [
+            ("prov-page-a", "page-a", 1_000_000_i64),
+            ("prov-page-b", "page-b", 1_000_001_i64),
+            ("prov-page-c", "page-c", 1_000_002_i64),
+        ] {
+            state
+                .store
+                .put_message(&provider(name, id, created_at_ms))
+                .await
+                .unwrap();
+        }
+
+        let first_page = handle_list_providers(
+            &state,
+            authed_request(ListProvidersRequest {
+                limit: 1,
+                offset: 0,
+                page_token: String::new(),
+                workspace: "default".to_string(),
+                all_workspaces: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(first_page.providers.len(), 1);
+        assert_eq!(first_page.providers[0].object_name(), "page-a");
+        assert!(!first_page.next_page_token.is_empty());
+
+        state
+            .store
+            .delete_by_name(Provider::object_type(), "default", "page-a")
+            .await
+            .unwrap();
+
+        let offset_page = handle_list_providers(
+            &state,
+            authed_request(ListProvidersRequest {
+                limit: 1,
+                offset: 1,
+                page_token: String::new(),
+                workspace: "default".to_string(),
+                all_workspaces: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(offset_page.providers[0].object_name(), "page-c");
+
+        let token_page = handle_list_providers(
+            &state,
+            authed_request(ListProvidersRequest {
+                limit: 1,
+                offset: 0,
+                page_token: first_page.next_page_token.clone(),
+                workspace: "default".to_string(),
+                all_workspaces: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(token_page.providers[0].object_name(), "page-b");
     }
 
     #[tokio::test]

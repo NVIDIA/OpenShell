@@ -2144,6 +2144,7 @@ pub async fn sandbox_list(
             limit,
             offset,
             label_selector: label_selector.unwrap_or("").to_string(),
+            page_token: String::new(),
             workspace: if all_workspaces {
                 String::new()
             } else {
@@ -2931,6 +2932,7 @@ pub async fn sandbox_delete(
                 limit: 1000,
                 offset: 0,
                 label_selector: String::new(),
+                page_token: String::new(),
                 workspace: workspace.to_string(),
                 all_workspaces: false,
             })

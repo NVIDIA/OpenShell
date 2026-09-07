@@ -893,6 +893,20 @@ impl Store {
             .collect()
     }
 
+    /// List and decode protobuf messages by workspace after a stable cursor.
+    pub async fn list_messages_after<T: Message + Default + ObjectType + SetResourceVersion>(
+        &self,
+        workspace: &str,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<T>> {
+        self.list_after(T::object_type(), workspace, after, limit)
+            .await?
+            .into_iter()
+            .map(decode_record)
+            .collect()
+    }
+
     /// List and decode protobuf messages with label selector filtering,
     /// hydrating `resource_version` from the authoritative DB row.
     pub async fn list_messages_with_selector<

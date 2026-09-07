@@ -305,6 +305,7 @@ pub async fn ensure_required_providers(
                 .list_providers(ListProvidersRequest {
                     limit,
                     offset,
+                    page_token: String::new(),
                     workspace: workspace.to_string(),
                     all_workspaces: false,
                 })
@@ -1339,6 +1340,7 @@ pub async fn provider_list(
         .list_providers(ListProvidersRequest {
             limit,
             offset,
+            page_token: String::new(),
             workspace: if all_workspaces {
                 String::new()
             } else {

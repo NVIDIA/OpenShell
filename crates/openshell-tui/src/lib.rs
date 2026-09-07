@@ -2095,6 +2095,7 @@ async fn refresh_providers(app: &mut App) {
     let req = openshell_core::proto::ListProvidersRequest {
         limit: 100,
         offset: 0,
+        page_token: String::new(),
         workspace: if app.all_workspaces {
             String::new()
         } else {
@@ -2512,6 +2513,7 @@ async fn refresh_sandboxes(app: &mut App) {
         limit: 100,
         offset: 0,
         label_selector: String::new(),
+        page_token: String::new(),
         workspace: if app.all_workspaces {
             String::new()
         } else {

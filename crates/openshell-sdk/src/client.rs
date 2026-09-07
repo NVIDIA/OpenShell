@@ -265,6 +265,7 @@ impl OpenShellClient {
                     limit: opts.limit,
                     offset: opts.offset,
                     label_selector: opts.label_selector.clone().unwrap_or_default(),
+                    page_token: String::new(),
                     workspace: String::new(),
                     all_workspaces: false,
                 };
@@ -391,6 +392,7 @@ impl OpenShellClient {
                     limit: opts.limit,
                     offset: opts.offset,
                     label_selector: opts.label_selector.clone().unwrap_or_default(),
+                    page_token: String::new(),
                     workspace: String::new(),
                     all_workspaces: true,
                 };
@@ -762,6 +764,7 @@ impl WorkspaceScopedClient {
                     limit: opts.limit,
                     offset: opts.offset,
                     label_selector: opts.label_selector.clone().unwrap_or_default(),
+                    page_token: String::new(),
                     workspace: self.workspace.clone(),
                     all_workspaces: false,
                 };

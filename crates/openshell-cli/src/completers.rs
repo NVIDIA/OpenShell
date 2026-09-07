@@ -39,6 +39,7 @@ pub fn complete_sandbox_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
                 limit: 200,
                 offset: 0,
                 label_selector: String::new(),
+                page_token: String::new(),
                 workspace: workspace_from_args(),
                 all_workspaces: false,
             })
@@ -64,6 +65,7 @@ pub fn complete_provider_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
             .list_providers(ListProvidersRequest {
                 limit: 200,
                 offset: 0,
+                page_token: String::new(),
                 workspace: workspace_from_args(),
                 all_workspaces: false,
             })
