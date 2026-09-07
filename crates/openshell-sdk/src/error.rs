@@ -93,6 +93,14 @@ pub enum SdkError {
         /// Error message.
         message: String,
     },
+
+    /// Gateway could not honor a resume cursor because the requested position
+    /// was already trimmed from its buffer (gRPC `OutOfRange`). The stream is
+    /// terminated; restart observation and, if needed, read missing lines from
+    /// the sandbox log files.
+    #[error("out of range: {message}")]
+    #[diagnostic(code(openshell::sdk::out_of_range))]
+    OutOfRange { message: String },
 }
 
 impl SdkError {
@@ -133,6 +141,13 @@ impl SdkError {
         }
     }
 
+    /// Create an `OutOfrange` error.
+    pub fn out_of_range(message: impl Into<String>) -> Self {
+        Self::OutOfRange {
+            message: message.into(),
+        }
+    }
+
     /// Stable string code for cross-language binding consumers.
     ///
     /// Returns one of: `invalid_config`, `tls`, `connect`, `auth`, `io`,
@@ -165,6 +180,7 @@ impl SdkError {
             Self::NotFound { .. } => "not_found",
             Self::AlreadyExists { .. } => "already_exists",
             Self::Rpc { .. } => "rpc",
+            Self::OutOfRange { .. } => "out_of_range",
         }
     }
 }

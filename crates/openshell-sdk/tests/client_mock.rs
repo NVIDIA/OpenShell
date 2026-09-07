@@ -12,13 +12,15 @@ use openshell_core::proto;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_sdk::{
     AuthConfig, ClientConfig, ExecOptions, ListOptions, OpenShellClient, Refresh, RefreshError,
-    RefreshedToken, SandboxPhase, SandboxSpec, ServiceStatus as SdkServiceStatus,
+    RefreshedToken, SandboxPhase, SandboxSpec, ServiceStatus as SdkServiceStatus, WatchEvent,
+    WatchOptions,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tokio_stream::StreamExt;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Response, Status};
 
@@ -45,6 +47,25 @@ struct MockState {
     require_bearer: Option<String>,
     /// Count of requests rejected by the `require_bearer` gate.
     unauth_hits: AtomicU32,
+    last_watch_requests: Mutex<Vec<proto::WatchSandboxRequest>>,
+    watch_calls: AtomicU32,
+    // Per-dial script. Outer Vec index = dial number. Inner = events to send,
+    // then how to end that dial.
+    watch_script: Vec<WatchDial>,
+}
+
+#[derive(Debug, Clone)]
+struct WatchDial {
+    events: Vec<proto::SandboxStreamEvent>,
+    end: DialEnd,
+}
+
+#[derive(Debug, Clone)]
+enum DialEnd {
+    Clean,
+    Err(tonic::Code),
+    /// The dial itself fails before any stream opens (pre-stream RPC error).
+    FailDial(tonic::Code),
 }
 
 #[derive(Clone)]
@@ -77,6 +98,41 @@ fn sandbox_with_phase_ws(
             phase: phase.into(),
             ..Default::default()
         }),
+    }
+}
+
+fn log_event(cursor: u64, msg: &str) -> proto::SandboxStreamEvent {
+    proto::SandboxStreamEvent {
+        payload: Some(proto::sandbox_stream_event::Payload::Log(
+            proto::SandboxLogLine {
+                sandbox_id: "id-my-box".into(),
+                timestamp_ms: 0,
+                level: "INFO".into(),
+                target: "t".into(),
+                message: msg.into(),
+                source: "sandbox".into(),
+                fields: HashMap::new(),
+            },
+        )),
+        cursor,
+    }
+}
+
+fn warning_event(msg: &str) -> proto::SandboxStreamEvent {
+    proto::SandboxStreamEvent {
+        payload: Some(proto::sandbox_stream_event::Payload::Warning(
+            proto::SandboxStreamWarning {
+                message: msg.into(),
+            },
+        )),
+        cursor: 0,
+    }
+}
+
+fn watch_opts() -> WatchOptions {
+    WatchOptions {
+        follow_logs: true,
+        ..Default::default()
     }
 }
 
@@ -571,9 +627,37 @@ impl OpenShell for TestOpenShell {
 
     async fn watch_sandbox(
         &self,
-        _: tonic::Request<proto::WatchSandboxRequest>,
+        request: tonic::Request<proto::WatchSandboxRequest>,
     ) -> Result<Response<Self::WatchSandboxStream>, Status> {
-        Err(Status::unimplemented("unused"))
+        let dial = self.state.watch_calls.fetch_add(1, Ordering::SeqCst) as usize;
+        self.state
+            .last_watch_requests
+            .lock()
+            .await
+            .push(request.into_inner());
+
+        let script = self.state.watch_script.get(dial).cloned();
+        if let Some(WatchDial {
+            end: DialEnd::FailDial(code),
+            ..
+        }) = script
+        {
+            return Err(Status::new(code, "scripted dial failure"));
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            let Some(dial) = script else { return };
+            for ev in dial.events {
+                let _ = tx.send(Ok(ev)).await;
+            }
+            if let DialEnd::Err(code) = dial.end {
+                let _ = tx.send(Err(Status::new(code, "scripted"))).await;
+            }
+            // tx dropped here → stream ends
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     async fn submit_policy_analysis(
@@ -1327,4 +1411,138 @@ async fn raw_grpc_fresh_refreshes_before_raw_call() {
         1,
         "raw_grpc_fresh must refresh the near-expiry token exactly once"
     );
+}
+
+#[tokio::test]
+async fn watch_logs_forwards_logs_and_warnings() {
+    let state = Arc::new(MockState {
+        phase_sequence: vec![proto::SandboxPhase::Ready],
+        watch_script: vec![WatchDial {
+            events: vec![
+                log_event(1, "a"),
+                warning_event("lagged"),
+                log_event(2, "b"),
+            ],
+            end: DialEnd::Clean,
+        }],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let stream = client.watch_logs("my-box", watch_opts());
+    tokio::pin!(stream);
+
+    match stream.next().await.unwrap().unwrap() {
+        WatchEvent::Log { line, cursor } => {
+            assert_eq!(cursor, 1);
+            assert_eq!(line.message, "a");
+        }
+        e => panic!("expected log, got {e:?}"),
+    }
+
+    assert!(matches!(
+        stream.next().await.unwrap().unwrap(),
+        WatchEvent::Warning { .. }
+    ));
+    assert!(matches!(
+        stream.next().await.unwrap().unwrap(),
+        WatchEvent::Log { cursor: 2, .. }
+    ));
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn watch_logs_resumes_after_reconnect() {
+    let state = Arc::new(MockState {
+        phase_sequence: vec![proto::SandboxPhase::Ready],
+        watch_script: vec![
+            WatchDial {
+                events: vec![log_event(1, "a"), log_event(2, "b")],
+                end: DialEnd::Err(tonic::Code::Unavailable),
+            },
+            WatchDial {
+                events: vec![log_event(3, "c")],
+                end: DialEnd::Clean,
+            },
+        ],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let stream = client.watch_logs("my-box", watch_opts());
+    tokio::pin!(stream);
+    for want in [1u64, 2, 3] {
+        assert!(
+            matches!(stream.next().await.unwrap().unwrap(), WatchEvent::Log { cursor, .. } if cursor == want)
+        );
+    }
+    assert!(stream.next().await.is_none());
+
+    let reqs = state.last_watch_requests.lock().await;
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[0].resume_after_cursor, 0);
+    assert_eq!(reqs[1].resume_after_cursor, 2); // resumed from highest delivered
+}
+
+#[tokio::test]
+async fn watch_logs_retries_initial_dial_failure() {
+    let state = Arc::new(MockState {
+        phase_sequence: vec![proto::SandboxPhase::Ready],
+        watch_script: vec![
+            // First dial fails before the stream opens.
+            WatchDial {
+                events: vec![],
+                end: DialEnd::FailDial(tonic::Code::Unavailable),
+            },
+            // Second dial succeeds and delivers.
+            WatchDial {
+                events: vec![log_event(1, "a")],
+                end: DialEnd::Clean,
+            },
+        ],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let stream = client.watch_logs("my-box", watch_opts());
+    tokio::pin!(stream);
+    assert!(matches!(
+        stream.next().await.unwrap().unwrap(),
+        WatchEvent::Log { cursor: 1, .. }
+    ));
+    assert!(stream.next().await.is_none());
+
+    let reqs = state.last_watch_requests.lock().await;
+    assert_eq!(reqs.len(), 2); // dialed twice: failed, then reconnected
+    assert_eq!(reqs[0].resume_after_cursor, 0);
+    assert_eq!(reqs[1].resume_after_cursor, 0); // nothing delivered yet on retry
+}
+
+#[tokio::test]
+async fn watch_logs_gap_terminates_out_of_range() {
+    let state = Arc::new(MockState {
+        phase_sequence: vec![proto::SandboxPhase::Ready],
+        watch_script: vec![WatchDial {
+            events: vec![log_event(1, "a")],
+            end: DialEnd::Err(tonic::Code::OutOfRange),
+        }],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let stream = client.watch_logs("my-box", watch_opts());
+    tokio::pin!(stream);
+    assert!(matches!(
+        stream.next().await.unwrap().unwrap(),
+        WatchEvent::Log { cursor: 1, .. }
+    ));
+    let err = stream.next().await.unwrap().unwrap_err();
+    assert_eq!(err.code(), "out_of_range");
+    assert!(stream.next().await.is_none());
+
+    assert_eq!(state.last_watch_requests.lock().await.len(), 1); // no redial
 }

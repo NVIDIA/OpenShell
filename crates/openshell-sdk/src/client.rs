@@ -13,12 +13,12 @@ use crate::config::{AuthConfig, ClientConfig};
 use crate::error::{Result, SdkError};
 use crate::raw::{AuthedGrpcClient, AuthedInferenceClient};
 use crate::refresh::{RefreshedToken, TokenSource};
-use crate::transport;
 use crate::types::{
     ExecOptions, ExecResult, Health, ListOptions, SandboxPhase, SandboxRef, SandboxSpec,
     WorkspaceRef,
 };
-use futures::StreamExt;
+use crate::{WatchEvent, WatchOptions, transport};
+use futures::{Stream, StreamExt};
 use openshell_core::proto;
 use std::collections::HashMap;
 use std::future::Future;
@@ -452,6 +452,114 @@ impl OpenShellClient {
         })
     }
 
+    /// Watch a sandbox's logs and platform events with loss-aware resume.
+    ///
+    /// Reconnects transparently on transient stream errors, resuming from the
+    /// highest cursor already delivered. A trimmed resume cursor ends the stream
+    /// with [`SdkError::OutOfRange`]; a recoverable server lag surfaces as
+    /// [`WatchEvent::Warning`] and the stream continues.
+    pub fn watch_logs(
+        &self,
+        name: &str,
+        opts: WatchOptions,
+    ) -> impl Stream<Item = Result<WatchEvent>> + '_ {
+        let name = name.to_string();
+        async_stream::try_stream!(
+            let sandbox = self.get_sandbox(&name).await?;
+            for await event in self.watch_logs_by_id(sandbox.id, opts) {
+                yield event?;
+            }
+        )
+    }
+
+    /// Shared watch loop over an already-resolved sandbox id.
+    ///
+    /// Both [`OpenShellClient::watch_logs`] and
+    /// [`WorkspaceScopedClient::watch_logs`] resolve a name to an id under their
+    /// own workspace, then delegate here so the reconnect/resume logic lives in
+    /// one place.
+    fn watch_logs_by_id(
+        &self,
+        sandbox_id: String,
+        opts: WatchOptions,
+    ) -> impl Stream<Item = Result<WatchEvent>> + '_ {
+        async_stream::try_stream!(
+            let mut cursor = opts.resume_after_cursor;
+            let mut backoff = Duration::from_millis(100);
+            loop {
+                let request = proto::WatchSandboxRequest {
+                    id: sandbox_id.clone(),
+                    follow_status: false,
+                    follow_logs: opts.follow_logs,
+                    follow_events: opts.follow_events,
+                    log_tail_lines: opts.log_tail_lines,
+                    event_tail: opts.event_tail,
+                    log_sources: opts.log_sources.clone(),
+                    log_min_level: opts.log_min_level.clone().unwrap_or_default(),
+                    resume_after_cursor: cursor,
+                    ..Default::default()
+                };
+                // Apply the same reconnect policy to the initial dial: `unary`
+                // only retries `Unauthenticated`, so a pre-stream transient
+                // (e.g. `Unavailable`) would otherwise exit without resuming.
+                let mut stream = match self
+                    .unary(|mut grpc| {
+                        let req = request.clone();
+                        async move { grpc.watch_sandbox(req).await }
+                    })
+                    .await
+                {
+                    Ok(stream) => stream,
+                    // Transient — back off and redial from `cursor`.
+                    Err(err) if is_retryable_stream(&err) => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(2));
+                        continue;
+                    }
+                    // Trimmed cursor or any other error — terminal.
+                    Err(err) => Err(err)?,
+                };
+                let mut clean_eof = true;
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(event) => {
+                            // A delivered event means the connection is healthy
+                            // again; reset the reconnect backoff so a later drop
+                            // retries promptly instead of at the capped delay.
+                            backoff = Duration::from_millis(100);
+                            if let Some(ev) = convert_event(event, &mut cursor) {
+                                yield ev;
+                            }
+                        }
+                        Err(status) => {
+                            clean_eof = false;
+                            let err = map_status(status);
+                            match err {
+                                // Terminal gap — never silently restart.
+                                SdkError::OutOfRange { .. } => {
+                                    Err(err)?;
+                                }
+                                // Transient — back off and redial from `cursor`.
+                                _ if is_retryable_stream(&err) => {
+                                    tokio::time::sleep(backoff).await;
+                                    backoff = (backoff * 2).min(Duration::from_secs(2));
+                                }
+                                // Anything else is terminal.
+                                _ => {
+                                    Err(err)?;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                if clean_eof {
+                    break;
+                }
+            }
+        )
+    }
+
     /// Run a unary RPC with OIDC-aware auth: refresh proactively before the
     /// call (if the token is near expiry) and, on an `Unauthenticated`
     /// response, force a refresh and retry exactly once. No-op auth behaves
@@ -754,6 +862,26 @@ impl WorkspaceScopedClient {
             stderr,
         })
     }
+
+    /// Watch a sandbox's logs and platform events with loss-aware resume.
+    ///
+    /// Reconnects transparently on transient stream errors, resuming from the
+    /// highest cursor already delivered. A trimmed resume cursor ends the stream
+    /// with [`SdkError::OutOfRange`]; a recoverable server lag surfaces as
+    /// [`WatchEvent::Warning`] and the stream continues.
+    pub fn watch_logs(
+        &self,
+        name: &str,
+        opts: WatchOptions,
+    ) -> impl Stream<Item = Result<WatchEvent>> + '_ {
+        let name = name.to_string();
+        async_stream::try_stream!(
+            let sandbox = self.get_sandbox(&name).await?;
+            for await event in self.client.watch_logs_by_id(sandbox.id, opts) {
+                yield event?;
+            }
+        )
+    }
 }
 
 fn interceptor_from_config(config: &ClientConfig) -> Result<EdgeAuthInterceptor> {
@@ -852,12 +980,52 @@ fn map_status(status: tonic::Status) -> SdkError {
         tonic::Code::NotFound => SdkError::NotFound { message },
         tonic::Code::AlreadyExists => SdkError::AlreadyExists { message },
         tonic::Code::InvalidArgument => SdkError::invalid_config(message),
+        tonic::Code::OutOfRange => SdkError::OutOfRange { message },
         tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => SdkError::auth(message),
         _ => SdkError::Rpc {
             code: status.code() as i32,
             message,
         },
     }
+}
+
+/// Convert a wire watch event into the curated [`WatchEvent`], advancing
+/// `cursor` for resumable payloads.
+///
+/// Log and platform events carry the shared per-sandbox cursor and update it.
+/// Warnings are recoverable loss notices with no cursor, so they never advance
+/// it. Status snapshots and draft-policy updates are not part of the log/event
+/// stream and are dropped (`None`).
+fn convert_event(event: proto::SandboxStreamEvent, cursor: &mut u64) -> Option<WatchEvent> {
+    match event.payload? {
+        proto::sandbox_stream_event::Payload::Log(line) => {
+            *cursor = event.cursor;
+            Some(WatchEvent::Log {
+                line: line.into(),
+                cursor: event.cursor,
+            })
+        }
+        proto::sandbox_stream_event::Payload::Event(platform) => {
+            *cursor = event.cursor;
+            Some(WatchEvent::Event {
+                event: platform.into(),
+                cursor: event.cursor,
+            })
+        }
+        proto::sandbox_stream_event::Payload::Warning(warning) => Some(WatchEvent::Warning {
+            message: warning.message,
+        }),
+        proto::sandbox_stream_event::Payload::Sandbox(_)
+        | proto::sandbox_stream_event::Payload::DraftPolicyUpdate(_) => None,
+    }
+}
+
+/// Whether a mid-stream error is a transient condition worth reconnecting on.
+///
+/// Only `Unavailable` (connection drop, gateway restart) is retryable; every
+/// other status is terminal so the caller surfaces it instead of looping.
+fn is_retryable_stream(err: &SdkError) -> bool {
+    matches!(err, SdkError::Rpc { code, .. } if *code == tonic::Code::Unavailable as i32)
 }
 
 #[cfg(test)]
