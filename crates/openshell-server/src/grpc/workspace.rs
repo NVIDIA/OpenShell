@@ -97,6 +97,19 @@ fn workspace_page_cursor(workspace: &Workspace) -> Result<ObjectCursor, Status> 
     })
 }
 
+fn workspace_member_page_cursor(member: &WorkspaceMember) -> Result<ObjectCursor, Status> {
+    let metadata = member
+        .metadata
+        .as_ref()
+        .ok_or_else(|| Status::internal("workspace member metadata missing"))?;
+    Ok(ObjectCursor {
+        created_at_ms: metadata.created_at_ms,
+        name: metadata.name.clone(),
+        workspace: metadata.workspace.clone(),
+        id: metadata.id.clone(),
+    })
+}
+
 /// A resolved workspace name with its current lifecycle state.
 #[derive(Debug)]
 pub struct ResolvedWorkspace {
@@ -660,14 +673,54 @@ pub(super) async fn handle_list_workspace_members(
         .name;
 
     let limit = clamp_limit(req.limit, 100, MAX_PAGE_SIZE);
+    let page_token = req.page_token.trim();
+    if !page_token.is_empty() && req.offset > 0 {
+        return Err(Status::invalid_argument(
+            "page_token cannot be combined with an explicit offset",
+        ));
+    }
 
-    let members: Vec<WorkspaceMember> = state
-        .store
-        .list_messages(&workspace, limit, req.offset)
-        .await
-        .map_err(|e| Status::internal(format!("list workspace members failed: {e}")))?;
+    let use_cursor_pagination = req.offset == 0 || !page_token.is_empty();
+    let members: Vec<WorkspaceMember> = if use_cursor_pagination {
+        let after = if !page_token.is_empty() {
+            Some(decode_list_page_token(
+                "workspace.members.list",
+                &format!("workspace:{workspace}"),
+                page_token,
+            )?)
+        } else {
+            None
+        };
+        state
+            .store
+            .list_messages_after::<WorkspaceMember>(&workspace, after.as_ref(), limit)
+            .await
+            .map_err(|e| Status::internal(format!("list workspace members failed: {e}")))?
+    } else {
+        state
+            .store
+            .list_messages(&workspace, limit, req.offset)
+            .await
+            .map_err(|e| Status::internal(format!("list workspace members failed: {e}")))?
+    };
 
-    Ok(Response::new(ListWorkspaceMembersResponse { members }))
+    let next_page_token = if use_cursor_pagination {
+        match members.last() {
+            Some(member) => encode_list_page_token(
+                "workspace.members.list",
+                &format!("workspace:{workspace}"),
+                &workspace_member_page_cursor(member)?,
+            )?,
+            None => String::new(),
+        }
+    } else {
+        String::new()
+    };
+
+    Ok(Response::new(ListWorkspaceMembersResponse {
+        members,
+        next_page_token,
+    }))
 }
 
 #[cfg(test)]
@@ -1102,6 +1155,7 @@ mod tests {
                 workspace: "default".to_string(),
                 limit: 100,
                 offset: 0,
+                page_token: String::new(),
             }),
         )
         .await
@@ -1144,6 +1198,7 @@ mod tests {
                 workspace: "default".to_string(),
                 limit: 100,
                 offset: 0,
+                page_token: String::new(),
             }),
         )
         .await
@@ -1224,6 +1279,7 @@ mod tests {
                 workspace: "cleanup-test".to_string(),
                 limit: 100,
                 offset: 0,
+                page_token: String::new(),
             }),
         )
         .await
@@ -1252,6 +1308,91 @@ mod tests {
             remaining.is_empty(),
             "expected 0 orphaned members, found {}",
             remaining.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_workspace_members_uses_stable_page_tokens() {
+        let state = test_server_state().await;
+
+        for subject in [
+            "page-a@example.com",
+            "page-b@example.com",
+            "page-c@example.com",
+        ] {
+            handle_add_workspace_member(
+                &state,
+                authed_request(AddWorkspaceMemberRequest {
+                    workspace: "default".to_string(),
+                    principal_subject: subject.to_string(),
+                    role: WorkspaceRole::User.into(),
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let first_page = handle_list_workspace_members(
+            &state,
+            authed_request(ListWorkspaceMembersRequest {
+                workspace: "default".to_string(),
+                limit: 1,
+                offset: 0,
+                page_token: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(first_page.members.len(), 1);
+        assert_eq!(
+            first_page.members[0].principal_subject,
+            "page-a@example.com"
+        );
+        assert!(!first_page.next_page_token.is_empty());
+
+        state
+            .store
+            .delete_by_name(
+                WorkspaceMember::object_type(),
+                "default",
+                "page-a@example.com",
+            )
+            .await
+            .unwrap();
+
+        let offset_page = handle_list_workspace_members(
+            &state,
+            authed_request(ListWorkspaceMembersRequest {
+                workspace: "default".to_string(),
+                limit: 1,
+                offset: 1,
+                page_token: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            offset_page.members[0].principal_subject,
+            "page-c@example.com"
+        );
+
+        let token_page = handle_list_workspace_members(
+            &state,
+            authed_request(ListWorkspaceMembersRequest {
+                workspace: "default".to_string(),
+                limit: 1,
+                offset: 0,
+                page_token: first_page.next_page_token.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            token_page.members[0].principal_subject,
+            "page-b@example.com"
         );
     }
 
@@ -1709,6 +1850,7 @@ mod tests {
             &state,
             non_member_request(ListWorkspaceMembersRequest {
                 workspace: "no-such-ws".into(),
+                page_token: String::new(),
                 ..Default::default()
             }),
         )

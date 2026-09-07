@@ -2215,6 +2215,10 @@ enum ServiceCommands {
         #[arg(long, default_value_t = 0)]
         offset: u32,
 
+        /// Opaque continuation token returned by the previous service page.
+        #[arg(long)]
+        page_token: Option<String>,
+
         /// List services across all workspaces (overrides --workspace).
         #[arg(long)]
         all_workspaces: bool,
@@ -2350,6 +2354,10 @@ enum WorkspaceMemberCommands {
         /// Offset into the member list.
         #[arg(long, default_value_t = 0)]
         offset: u32,
+
+        /// Opaque continuation token returned by the previous member page.
+        #[arg(long)]
+        page_token: Option<String>,
 
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
@@ -2756,6 +2764,7 @@ async fn run_async() -> Result<()> {
                     sandbox,
                     limit,
                     offset,
+                    page_token,
                     all_workspaces,
                     output,
                 } => {
@@ -2764,6 +2773,7 @@ async fn run_async() -> Result<()> {
                         sandbox.as_deref(),
                         limit,
                         offset,
+                        page_token.as_deref().unwrap_or(""),
                         &cli.workspace,
                         all_workspaces,
                         output.as_str(),
@@ -3665,6 +3675,7 @@ async fn run_async() -> Result<()> {
                         workspace,
                         limit,
                         offset,
+                        page_token,
                         output,
                     } => {
                         run::workspace_member_list(
@@ -3672,6 +3683,7 @@ async fn run_async() -> Result<()> {
                             &workspace,
                             limit,
                             offset,
+                            page_token.as_deref().unwrap_or(""),
                             output.as_str(),
                             &tls,
                         )

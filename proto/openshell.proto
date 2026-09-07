@@ -1354,11 +1354,15 @@ message ListServicesRequest {
   string workspace = 4;
   // List across all workspaces. Mutually exclusive with workspace.
   bool all_workspaces = 5;
+  // Opaque continuation token returned by the previous page.
+  string page_token = 6;
 }
 
 // Response containing exposed sandbox service endpoints.
 message ListServicesResponse {
   repeated ServiceEndpointResponse services = 1;
+  // Opaque continuation token for the next page, if more results exist.
+  string next_page_token = 2;
 }
 
 // Request to delete an exposed sandbox service endpoint.
@@ -3089,11 +3093,15 @@ message ListWorkspaceMembersRequest {
   string workspace = 1;
   uint32 limit = 2;
   uint32 offset = 3;
+  // Opaque continuation token returned by the previous page.
+  string page_token = 4;
 }
 
 // List workspace members response.
 message ListWorkspaceMembersResponse {
   repeated WorkspaceMember members = 1;
+  // Opaque continuation token for the next page, if more results exist.
+  string next_page_token = 2;
 }
 
 // Short-lived credential for one policy-authorized extension service.

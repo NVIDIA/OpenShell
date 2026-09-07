@@ -3181,6 +3181,7 @@ pub async fn service_list(
     sandbox: Option<&str>,
     limit: u32,
     offset: u32,
+    page_token: &str,
     workspace: &str,
     all_workspaces: bool,
     output: &str,
@@ -3192,6 +3193,7 @@ pub async fn service_list(
             sandbox: sandbox.unwrap_or_default().to_string(),
             limit,
             offset,
+            page_token: page_token.to_string(),
             workspace: if all_workspaces {
                 String::new()
             } else {
@@ -3222,6 +3224,10 @@ pub async fn service_list(
     }
 
     print_service_endpoint_table(&response.services, server, all_workspaces);
+    if !response.next_page_token.is_empty() {
+        println!();
+        println!("Next page token: {}", response.next_page_token);
+    }
     Ok(())
 }
 
@@ -3728,6 +3734,7 @@ pub async fn workspace_member_list(
     workspace: &str,
     limit: u32,
     offset: u32,
+    page_token: &str,
     output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -3739,10 +3746,12 @@ pub async fn workspace_member_list(
             workspace: workspace.to_string(),
             limit,
             offset,
+            page_token: page_token.to_string(),
         })
         .await
         .into_diagnostic()?;
-    let members = response.into_inner().members;
+    let response = response.into_inner();
+    let members = response.members;
 
     if crate::output::print_output_collection(output, &members, workspace_member_to_json)? {
         return Ok(());
@@ -3765,6 +3774,11 @@ pub async fn workspace_member_list(
     for member in &members {
         let role_str = workspace_member_role_name(member.role);
         println!("{:<subject_width$}  {}", member.principal_subject, role_str);
+    }
+
+    if !response.next_page_token.is_empty() {
+        println!();
+        println!("Next page token: {}", response.next_page_token);
     }
 
     Ok(())

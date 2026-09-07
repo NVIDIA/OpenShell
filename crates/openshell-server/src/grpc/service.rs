@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::ServerState;
 use crate::auth::workspace_authz::{MinWorkspaceRole, authorize_workspace, require_platform_admin};
-use crate::persistence::{ObjectType, WriteCondition};
+use crate::persistence::{ObjectCursor, ObjectType, WriteCondition};
 use crate::service_routing;
 
 const MAX_SERVICE_NAME_LEN: usize = super::MAX_ROUTABLE_NAME_LEN;
@@ -182,8 +182,21 @@ pub(super) async fn handle_list_services(
     if !req.sandbox.is_empty() {
         validate_endpoint_name("sandbox", &req.sandbox, MAX_SANDBOX_NAME_LEN)?;
     }
+    let page_token = req.page_token.trim();
+    if !page_token.is_empty() && !req.sandbox.is_empty() {
+        return Err(Status::invalid_argument(
+            "page_token is currently supported only for unfiltered service listings",
+        ));
+    }
+    if !page_token.is_empty() && req.offset > 0 {
+        return Err(Status::invalid_argument(
+            "page_token cannot be combined with an explicit offset",
+        ));
+    }
 
     let limit = super::clamp_limit(req.limit, 100, super::MAX_PAGE_SIZE);
+    let use_cursor_pagination =
+        req.sandbox.is_empty() && (req.offset == 0 || !page_token.is_empty());
     let endpoints: Vec<ServiceEndpoint> = if req.all_workspaces {
         require_platform_admin(&state.admin_role, &principal)?;
         if !req.sandbox.is_empty() {
@@ -191,7 +204,23 @@ pub(super) async fn handle_list_services(
                 "sandbox filter is not supported with all_workspaces",
             ));
         }
-        state.store.list_all_messages(limit, req.offset).await
+        if use_cursor_pagination {
+            let after = if !page_token.is_empty() {
+                Some(super::decode_list_page_token(
+                    "service.list",
+                    "all_workspaces",
+                    page_token,
+                )?)
+            } else {
+                None
+            };
+            state
+                .store
+                .list_all_messages_after::<ServiceEndpoint>(after.as_ref(), limit)
+                .await
+        } else {
+            state.store.list_all_messages(limit, req.offset).await
+        }
     } else {
         let authz = authorize_workspace(
             &state.store,
@@ -204,31 +233,70 @@ pub(super) async fn handle_list_services(
         let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
             .await?
             .name;
-        if req.sandbox.is_empty() {
+        if use_cursor_pagination {
+            let after = if !page_token.is_empty() {
+                Some(super::decode_list_page_token(
+                    "service.list",
+                    &format!("workspace:{workspace}"),
+                    page_token,
+                )?)
+            } else {
+                None
+            };
             state
                 .store
-                .list_messages(&workspace, limit, req.offset)
+                .list_messages_after::<ServiceEndpoint>(&workspace, after.as_ref(), limit)
                 .await
         } else {
-            state
-                .store
-                .list_messages_with_selector(
-                    &workspace,
-                    &format!("sandbox={}", req.sandbox),
-                    limit,
-                    req.offset,
-                )
-                .await
+            if req.sandbox.is_empty() {
+                state
+                    .store
+                    .list_messages(&workspace, limit, req.offset)
+                    .await
+            } else {
+                state
+                    .store
+                    .list_messages_with_selector(
+                        &workspace,
+                        &format!("sandbox={}", req.sandbox),
+                        limit,
+                        req.offset,
+                    )
+                    .await
+            }
         }
     }
     .map_err(|e| Status::internal(format!("list endpoints failed: {e}")))?;
+
+    let next_page_token = if use_cursor_pagination {
+        match endpoints.last() {
+            Some(endpoint) => {
+                let query = if req.all_workspaces {
+                    "all_workspaces".to_string()
+                } else {
+                    format!("workspace:{}", req.workspace)
+                };
+                super::encode_list_page_token(
+                    "service.list",
+                    &query,
+                    &service_endpoint_page_cursor(endpoint)?,
+                )?
+            }
+            None => String::new(),
+        }
+    } else {
+        String::new()
+    };
 
     let services = endpoints
         .into_iter()
         .map(|ep| service_endpoint_response(state, ep))
         .collect();
 
-    Ok(Response::new(ListServicesResponse { services }))
+    Ok(Response::new(ListServicesResponse {
+        services,
+        next_page_token,
+    }))
 }
 
 pub(super) async fn handle_delete_service(
@@ -300,6 +368,19 @@ fn service_endpoint_response(
         endpoint: Some(endpoint),
         url,
     }
+}
+
+fn service_endpoint_page_cursor(endpoint: &ServiceEndpoint) -> Result<ObjectCursor, Status> {
+    let metadata = endpoint
+        .metadata
+        .as_ref()
+        .ok_or_else(|| Status::internal("service endpoint metadata missing"))?;
+    Ok(ObjectCursor {
+        created_at_ms: metadata.created_at_ms,
+        name: metadata.name.clone(),
+        workspace: metadata.workspace.clone(),
+        id: metadata.id.clone(),
+    })
 }
 
 #[allow(clippy::result_large_err)]
@@ -427,6 +508,7 @@ mod tests {
                 sandbox: "my-sandbox".to_string(),
                 limit: 0,
                 offset: 0,
+                page_token: String::new(),
                 workspace: "default".to_string(),
                 all_workspaces: false,
             }),
@@ -484,6 +566,7 @@ mod tests {
                 sandbox: "my-sandbox".to_string(),
                 limit: 0,
                 offset: 0,
+                page_token: String::new(),
                 workspace: "default".to_string(),
                 all_workspaces: false,
             }),
@@ -549,6 +632,7 @@ mod tests {
                 sandbox: "my-sandbox".to_string(),
                 limit: 0,
                 offset: 0,
+                page_token: String::new(),
                 workspace: "default".to_string(),
                 all_workspaces: false,
             }),
@@ -741,6 +825,7 @@ mod tests {
                 sandbox: "my-sandbox".to_string(),
                 limit: 100,
                 offset: 0,
+                page_token: String::new(),
                 workspace: "default".to_string(),
                 all_workspaces: false,
             }),
@@ -760,6 +845,7 @@ mod tests {
                 sandbox: "my-sandbox".to_string(),
                 limit: 100,
                 offset: 0,
+                page_token: String::new(),
                 workspace: "beta".to_string(),
                 all_workspaces: false,
             }),
@@ -793,6 +879,7 @@ mod tests {
                 sandbox: "my-sandbox".to_string(),
                 limit: 100,
                 offset: 0,
+                page_token: String::new(),
                 workspace: "default".to_string(),
                 all_workspaces: false,
             }),
@@ -836,6 +923,7 @@ mod tests {
                 sandbox: String::new(),
                 limit: 100,
                 offset: 0,
+                page_token: String::new(),
                 workspace: String::new(),
                 all_workspaces: true,
             }),
@@ -852,6 +940,7 @@ mod tests {
                 sandbox: String::new(),
                 limit: 100,
                 offset: 0,
+                page_token: String::new(),
                 workspace: "default".to_string(),
                 all_workspaces: true,
             }),
@@ -859,6 +948,129 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn list_services_uses_stable_page_tokens_for_workspace_scope() {
+        use openshell_core::proto::datamodel::v1::ObjectMeta;
+        use openshell_core::proto::{Sandbox, SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+
+        let mut sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "sbx-services".to_string(),
+                name: "my-sandbox".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                resource_version: 0,
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            spec: Some(SandboxSpec::default()),
+            status: None,
+            ..Sandbox::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        for service in ["page-a", "page-b", "page-c"] {
+            handle_expose_service(
+                &state,
+                authed_request(ExposeServiceRequest {
+                    sandbox: "my-sandbox".to_string(),
+                    service: service.to_string(),
+                    target_port: 8080,
+                    domain: true,
+                    workspace: "default".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let first_page = handle_list_services(
+            &state,
+            authed_request(ListServicesRequest {
+                sandbox: String::new(),
+                limit: 1,
+                offset: 0,
+                page_token: String::new(),
+                workspace: "default".to_string(),
+                all_workspaces: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(first_page.services.len(), 1);
+        assert_eq!(
+            first_page.services[0]
+                .endpoint
+                .as_ref()
+                .unwrap()
+                .service_name,
+            "page-a"
+        );
+        assert!(!first_page.next_page_token.is_empty());
+
+        handle_delete_service(
+            &state,
+            authed_request(DeleteServiceRequest {
+                sandbox: "my-sandbox".to_string(),
+                service: "page-a".to_string(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let offset_page = handle_list_services(
+            &state,
+            authed_request(ListServicesRequest {
+                sandbox: String::new(),
+                limit: 1,
+                offset: 1,
+                page_token: String::new(),
+                workspace: "default".to_string(),
+                all_workspaces: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            offset_page.services[0]
+                .endpoint
+                .as_ref()
+                .unwrap()
+                .service_name,
+            "page-c"
+        );
+
+        let token_page = handle_list_services(
+            &state,
+            authed_request(ListServicesRequest {
+                sandbox: String::new(),
+                limit: 1,
+                offset: 0,
+                page_token: first_page.next_page_token.clone(),
+                workspace: "default".to_string(),
+                all_workspaces: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            token_page.services[0]
+                .endpoint
+                .as_ref()
+                .unwrap()
+                .service_name,
+            "page-b"
+        );
     }
 
     /// Non-member callers must receive `PERMISSION_DENIED` — not `NOT_FOUND` —
@@ -922,6 +1134,7 @@ mod tests {
             &state,
             non_member_request(ListServicesRequest {
                 workspace: "no-such-ws".into(),
+                page_token: String::new(),
                 ..Default::default()
             }),
         )
