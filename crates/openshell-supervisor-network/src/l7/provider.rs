@@ -30,6 +30,7 @@ pub enum RelayOutcome {
     Upgraded {
         overflow: Vec<u8>,
         websocket_permessage_deflate: bool,
+        websocket_subprotocol: Option<String>,
     },
 }
 

@@ -37,7 +37,7 @@ trap cleanup_stray EXIT
 build_binaries() {
     echo "==> Ensuring binaries are built"
     if [ ! -x "$ROOT/target/debug/openshell-gateway" ] || [ ! -x "$ROOT/target/debug/openshell-driver-vm" ]; then
-        cargo build -p openshell-server -p openshell-driver-vm >&2
+        cargo build -p openshell-gateway -p openshell-driver-vm >&2
     fi
     if [ "$(uname -s)" = "Darwin" ]; then
         codesign \
@@ -77,7 +77,8 @@ EOF
     echo "gateway pid=$GATEWAY_PID"
 
     for _ in $(seq 1 60); do
-        if grep -q "Server listening" "$LOG" 2>/dev/null; then
+        if curl -sf --connect-timeout 1 \
+            "http://127.0.0.1:${health_port}/healthz" >/dev/null 2>&1; then
             return 0
         fi
         if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
@@ -87,13 +88,13 @@ EOF
         fi
         sleep 1
     done
-    echo "!! gateway never reported ready"
+    echo "!! gateway health endpoint never became healthy"
     tail -40 "$LOG" >&2
     return 1
 }
 
 create_sandbox() {
-    echo "==> Creating sandbox (--keep, long-running)"
+    echo "==> Creating sandbox (long-running)"
     mkdir -p "$XDG"
     XDG_CONFIG_HOME="$XDG" "$ROOT/scripts/bin/openshell" gateway add \
         --name vm-orphan http://127.0.0.1:"$PORT" >/dev/null
@@ -101,7 +102,7 @@ create_sandbox() {
 
     # Run the CLI in the background; it blocks waiting for sleep to finish.
     XDG_CONFIG_HOME="$XDG" "$ROOT/scripts/bin/openshell" sandbox create \
-        --name "orphan-$$" --keep -- sleep 99999 \
+        --name "orphan-$$" -- sleep 99999 \
         > "$LOG.create" 2>&1 &
     CLI_PID=$!
 

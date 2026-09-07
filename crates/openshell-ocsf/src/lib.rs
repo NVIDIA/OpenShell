@@ -3,7 +3,7 @@
 
 //! # openshell-ocsf
 //!
-//! OCSF v1.7.0 event types, formatters, and tracing layers for `OpenShell`
+//! OCSF v1.8.0 event types, formatters, and tracing layers for `OpenShell`
 //! sandbox logging.
 //!
 //! This crate provides:
@@ -22,7 +22,7 @@
 //!   tracing system
 
 /// OCSF schema version this crate implements.
-pub const OCSF_VERSION: &str = "1.7.0";
+pub const OCSF_VERSION: &str = "1.8.0";
 
 pub mod builders;
 pub mod ctx;
@@ -37,7 +37,7 @@ pub mod validation;
 
 // --- Core event types ---
 pub use events::{
-    ApplicationLifecycleEvent, BaseEvent, BaseEventData, DetectionFindingEvent,
+    ApiActivityEvent, ApplicationLifecycleEvent, BaseEvent, BaseEventData, DetectionFindingEvent,
     DeviceConfigStateChangeEvent, HttpActivityEvent, NetworkActivityEvent, OcsfEvent,
     ProcessActivityEvent, SshActivityEvent,
 };
@@ -50,16 +50,16 @@ pub use enums::{
 
 // --- Object types ---
 pub use objects::{
-    Actor, Attack, ConnectionInfo, Container, Device, Endpoint, Evidence, FindingInfo,
-    FirewallRule, HttpRequest, HttpResponse, Image, Metadata, OsInfo, Process, Product,
-    Remediation, Tactic, Technique, Url,
+    Actor, AiModel, Api, Attack, ConnectionInfo, Container, Device, Endpoint, Evidence,
+    FindingInfo, FirewallRule, HttpRequest, HttpResponse, Image, Metadata, OsInfo, Process,
+    Product, Remediation, Tactic, Technique, Url,
 };
 
 // --- Builders ---
 pub use builders::{
-    AppLifecycleBuilder, BaseEventBuilder, ConfigStateChangeBuilder, DetectionFindingBuilder,
-    HttpActivityBuilder, NetworkActivityBuilder, ProcessActivityBuilder, SandboxContext,
-    SshActivityBuilder,
+    ApiActivityBuilder, AppLifecycleBuilder, BaseEventBuilder, ConfigStateChangeBuilder,
+    DetectionFindingBuilder, HttpActivityBuilder, NetworkActivityBuilder, ProcessActivityBuilder,
+    SandboxContext, SshActivityBuilder,
 };
 
 // --- Tracing layers ---

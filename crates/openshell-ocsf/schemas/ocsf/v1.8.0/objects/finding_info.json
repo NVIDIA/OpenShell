@@ -1,0 +1,248 @@
+{
+    "attributes": {
+        "title": {
+            "type": "string_t",
+            "description": "A title or a brief phrase summarizing the reported finding.",
+            "requirement": "recommended",
+            "caption": "Title",
+            "type_name": "String"
+        },
+        "product": {
+            "type": "object_t",
+            "description": "Details about the product that reported the finding.",
+            "requirement": "optional",
+            "caption": "Product",
+            "object_type": "product",
+            "object_name": "Product"
+        },
+        "desc": {
+            "type": "string_t",
+            "description": "The description of the reported finding.",
+            "requirement": "optional",
+            "caption": "Description",
+            "type_name": "String"
+        },
+        "uid": {
+            "type": "string_t",
+            "description": "The unique identifier of the reported finding.",
+            "requirement": "required",
+            "caption": "Unique ID",
+            "type_name": "String"
+        },
+        "types": {
+            "type": "string_t",
+            "description": "One or more types of the reported finding.",
+            "is_array": true,
+            "requirement": "optional",
+            "caption": "Types",
+            "type_name": "String"
+        },
+        "tags": {
+            "type": "object_t",
+            "description": "The list of tags; <code>{key:value}</code> pairs associated with the finding.",
+            "is_array": true,
+            "requirement": "optional",
+            "caption": "Tags",
+            "object_type": "key_value_object",
+            "object_name": "Key:Value object"
+        },
+        "attacks": {
+            "type": "object_t",
+            "description": "The <a target='_blank' href='https://attack.mitre.org'>MITRE ATT&CK\u00ae</a> technique and associated tactics related to the finding.",
+            "is_array": true,
+            "references": [
+                {
+                    "description": "MITRE ATT&CK\u00ae",
+                    "url": "https://attack.mitre.org"
+                },
+                {
+                    "description": "MITRE ATLAS",
+                    "url": "https://atlas.mitre.org/matrices/ATLAS"
+                }
+            ],
+            "requirement": "optional",
+            "caption": "MITRE ATT&CK\u00ae and ATLAS\u2122 Details",
+            "object_type": "attack",
+            "object_name": "MITRE ATT&CK\u00ae & ATLAS\u2122"
+        },
+        "analytic": {
+            "type": "object_t",
+            "description": "The analytic technique used to analyze and derive insights from the data or information that led to the finding or conclusion.",
+            "requirement": "recommended",
+            "caption": "Analytic",
+            "object_type": "analytic",
+            "object_name": "Analytic"
+        },
+        "attack_graph": {
+            "type": "object_t",
+            "description": "An Attack Graph describes possible routes an attacker could take through an environment. It describes relationships between resources and their findings, such as malware detections, vulnerabilities, misconfigurations, and other security actions.",
+            "group": "context",
+            "references": [
+                {
+                    "description": "MS Defender description of Attack Path",
+                    "url": "https://learn.microsoft.com/en-us/azure/defender-for-cloud/how-to-manage-attack-path"
+                },
+                {
+                    "description": "SentinelOne Attack Path documentation",
+                    "url": "https://www.sentinelone.com/cybersecurity-101/cybersecurity/attack-path-analysis/"
+                }
+            ],
+            "requirement": "optional",
+            "caption": "Attack Graph",
+            "object_type": "graph",
+            "object_name": "Graph"
+        },
+        "created_time": {
+            "type": "timestamp_t",
+            "description": "The time when the finding was created.",
+            "requirement": "optional",
+            "caption": "Created Time",
+            "type_name": "Timestamp"
+        },
+        "data_sources": {
+            "type": "string_t",
+            "description": "A list of data sources utilized in generation of the finding.",
+            "is_array": true,
+            "requirement": "optional",
+            "caption": "Data Sources",
+            "type_name": "String"
+        },
+        "first_seen_time": {
+            "type": "timestamp_t",
+            "description": "The time when the finding was first observed. e.g. The time when a vulnerability was first observed. <p>It can differ from the <code>created_time</code> timestamp, which reflects the time this finding was created.</p>",
+            "requirement": "optional",
+            "caption": "First Seen",
+            "type_name": "Timestamp"
+        },
+        "kill_chain": {
+            "type": "object_t",
+            "description": "The <a target='_blank' href='https://www.lockheedmartin.com/en-us/capabilities/cyber/cyber-kill-chain.html'>Cyber Kill Chain\u00ae</a> provides a detailed description of each phase and its associated activities within the broader context of a cyber attack.",
+            "is_array": true,
+            "requirement": "optional",
+            "caption": "Kill Chain",
+            "object_type": "kill_chain_phase",
+            "object_name": "Kill Chain Phase"
+        },
+        "last_seen_time": {
+            "type": "timestamp_t",
+            "description": "The time when the finding was most recently observed. e.g. The time when a vulnerability was most recently observed. <p>It can differ from the <code>modified_time</code> timestamp, which reflects the time this finding was last modified.</p>",
+            "requirement": "optional",
+            "caption": "Last Seen",
+            "type_name": "Timestamp"
+        },
+        "modified_time": {
+            "type": "timestamp_t",
+            "description": "The time when the finding was last modified.",
+            "requirement": "optional",
+            "caption": "Modified Time",
+            "type_name": "Timestamp"
+        },
+        "product_uid": {
+            "type": "string_t",
+            "description": "The unique identifier of the product that reported the finding.",
+            "requirement": "optional",
+            "caption": "Product Identifier",
+            "type_name": "String",
+            "@deprecated": {
+                "message": "Use the <code>uid</code> attribute in the <code>product</code> object instead. See specific usage.",
+                "since": "1.4.0"
+            }
+        },
+        "related_analytics": {
+            "type": "object_t",
+            "description": "Other analytics related to this finding.",
+            "is_array": true,
+            "requirement": "optional",
+            "caption": "Related Analytics",
+            "object_type": "analytic",
+            "object_name": "Analytic"
+        },
+        "related_events": {
+            "type": "object_t",
+            "description": "Describes events and/or other findings related to the finding as identified by the security product. Note that these events may or may not be in OCSF.",
+            "is_array": true,
+            "requirement": "optional",
+            "caption": "Related Events/Findings",
+            "object_type": "related_event",
+            "object_name": "Related Event/Finding"
+        },
+        "related_events_count": {
+            "type": "integer_t",
+            "description": "Number of related events or findings.",
+            "requirement": "optional",
+            "caption": "Related Events/Findings Count",
+            "type_name": "Integer"
+        },
+        "src_url": {
+            "type": "url_t",
+            "description": "The URL pointing to the source of the finding.",
+            "requirement": "optional",
+            "caption": "Source URL",
+            "type_name": "URL String"
+        },
+        "traits": {
+            "type": "object_t",
+            "description": "The list of key traits or characteristics extracted from the finding.",
+            "is_array": true,
+            "requirement": "optional",
+            "caption": "Traits",
+            "object_type": "trait",
+            "object_name": "Trait"
+        },
+        "uid_alt": {
+            "type": "string_t",
+            "description": "The alternative unique identifier of the reported finding.",
+            "requirement": "optional",
+            "caption": "Alternate ID",
+            "type_name": "String"
+        },
+        "created_time_dt": {
+            "type": "datetime_t",
+            "description": "The time when the finding was created.",
+            "requirement": "optional",
+            "caption": "Created Time",
+            "profiles": [
+                "datetime"
+            ],
+            "type_name": "Datetime"
+        },
+        "first_seen_time_dt": {
+            "type": "datetime_t",
+            "description": "The time when the finding was first observed. e.g. The time when a vulnerability was first observed. <p>It can differ from the <code>created_time</code> timestamp, which reflects the time this finding was created.</p>",
+            "requirement": "optional",
+            "caption": "First Seen",
+            "profiles": [
+                "datetime"
+            ],
+            "type_name": "Datetime"
+        },
+        "last_seen_time_dt": {
+            "type": "datetime_t",
+            "description": "The time when the finding was most recently observed. e.g. The time when a vulnerability was most recently observed. <p>It can differ from the <code>modified_time</code> timestamp, which reflects the time this finding was last modified.</p>",
+            "requirement": "optional",
+            "caption": "Last Seen",
+            "profiles": [
+                "datetime"
+            ],
+            "type_name": "Datetime"
+        },
+        "modified_time_dt": {
+            "type": "datetime_t",
+            "description": "The time when the finding was last modified.",
+            "requirement": "optional",
+            "caption": "Modified Time",
+            "profiles": [
+                "datetime"
+            ],
+            "type_name": "Datetime"
+        }
+    },
+    "name": "finding_info",
+    "description": "The Finding Information object describes metadata related to a security finding generated by a security tool or system.",
+    "extends": "object",
+    "caption": "Finding Information",
+    "profiles": [
+        "data_classification",
+        "datetime"
+    ]
+}

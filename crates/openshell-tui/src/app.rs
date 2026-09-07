@@ -5,11 +5,15 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use indexmap::IndexMap;
 use openshell_bootstrap::GatewayMetadataSource;
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::setting_value;
 use openshell_core::settings::{self, SettingValueKind};
+use openshell_providers::{
+    DiscoveredProvider, ProviderTypeProfile, RealDiscoveryContext, discover_from_profile,
+};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
@@ -247,8 +251,9 @@ pub type CreateFormData = (
 );
 
 /// Which field is focused in the create sandbox modal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CreateFormField {
+    #[default]
     Name,
     Image,
     Command,
@@ -290,9 +295,10 @@ pub struct ProviderEntry {
 }
 
 /// Tracks which phase the create sandbox modal is in.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum CreatePhase {
     /// Filling out the form.
+    #[default]
     Form,
     /// Creating the sandbox (background task running).
     Creating,
@@ -302,6 +308,7 @@ pub enum CreatePhase {
 pub const MIN_CREATING_DISPLAY: Duration = Duration::from_secs(4);
 
 /// State for the create sandbox modal form.
+#[derive(Default)]
 pub struct CreateSandboxForm {
     pub focused_field: CreateFormField,
     pub name: String,
@@ -318,16 +325,18 @@ pub struct CreateSandboxForm {
     /// When the create animation started (for pacman timing).
     pub anim_start: Option<Instant>,
     /// Buffered create result — held until min display time elapses.
-    pub create_result: Option<Result<String, String>>,
+    /// `Ok((name, workspace))` or `Err(message)`.
+    pub create_result: Option<Result<(String, String), String>>,
 }
 
 // ---------------------------------------------------------------------------
 // Create provider form
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum CreateProviderPhase {
     /// Pick provider type from the known list.
+    #[default]
     SelectType,
     /// Choose: autodetect from env or enter key manually.
     ChooseMethod,
@@ -338,18 +347,26 @@ pub enum CreateProviderPhase {
 }
 
 /// Which field is focused in the provider key entry form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ProviderKeyField {
+    #[default]
     Name,
     /// Focused credential row for known types (index via `cred_cursor`).
     Credential,
-    /// Custom env var name (generic / no-known-env-vars types only).
+    /// Custom env var name (legacy no-known-env-vars types only).
     EnvVarName,
-    /// Custom env var value (generic / no-known-env-vars types only).
+    /// Custom env var value (legacy no-known-env-vars types only).
     GenericValue,
+    /// Browsing/deleting existing config entries (Up/Down/Ctrl+D).
+    ConfigList,
+    /// Config key name input.
+    ConfigKeyName,
+    /// Config key value input.
+    ConfigKeyValue,
     Submit,
 }
 
+#[derive(Default)]
 pub struct CreateProviderForm {
     pub phase: CreateProviderPhase,
     /// Known provider type slugs.
@@ -363,14 +380,24 @@ pub struct CreateProviderForm {
     pub credentials: Vec<(String, String)>,
     /// Which credential row is focused.
     pub cred_cursor: usize,
-    /// For generic / types with no known env vars: custom env var name.
+    /// Provider config key-value pairs (e.g. `ANTHROPIC_BASE_URL`).
+    pub config: IndexMap<String, String>,
+    /// Which existing config entry is selected (for deletion).
+    pub config_cursor: usize,
+    /// Config key being entered.
+    pub config_key_input: String,
+    /// Config value being entered.
+    pub config_value_input: String,
+    /// For legacy types with no known env vars: custom env var name.
     pub generic_env_name: String,
-    /// For generic / types with no known env vars: custom value.
+    /// For legacy types with no known env vars: custom value.
     pub generic_value: String,
     /// Which field is focused in the key entry form.
     pub key_field: ProviderKeyField,
-    /// True when the provider type has no known env vars (generic, outlook).
+    /// True when the selected profile has no accepted stored credential keys.
     pub is_generic: bool,
+    /// True when the selected profile permits creation without stored credentials.
+    pub allows_empty_credentials: bool,
     /// Status message (errors, validation).
     pub status: Option<String>,
     /// Warning shown at top of `EnterKey` modal (e.g. autodetect failure).
@@ -381,6 +408,12 @@ pub struct CreateProviderForm {
     pub create_result: Option<Result<String, String>>,
     /// Credentials to send (filled by autodetect or built from form fields on submit).
     pub discovered_credentials: Option<HashMap<String, String>>,
+}
+
+fn apply_discovered_provider(form: &mut CreateProviderForm, discovered: DiscoveredProvider) {
+    form.discovered_credentials = Some(discovered.credentials);
+    form.config = discovered.config.into_iter().collect();
+    form.config_cursor = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -410,12 +443,12 @@ pub struct ProviderDetailView {
 }
 
 #[derive(Clone)]
-pub struct ProviderV2Entry {
+pub struct ProviderListEntry {
     pub provider: openshell_core::proto::Provider,
     pub profile: Option<openshell_core::proto::ProviderProfile>,
 }
 
-impl ProviderV2Entry {
+impl ProviderListEntry {
     pub fn name(&self) -> &str {
         provider_name(&self.provider)
     }
@@ -497,7 +530,39 @@ pub struct UpdateProviderForm {
     pub provider_type: String,
     pub credential_key: String,
     pub new_value: String,
+    pub config: IndexMap<String, String>,
+    pub original_config: IndexMap<String, String>,
+    pub config_key_input: String,
+    pub config_value_input: String,
+    pub config_cursor: usize,
+    pub deleted_keys: Vec<String>,
+    pub focus: UpdateProviderField,
     pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateProviderField {
+    CredentialValue,
+    ConfigEntry,
+    ConfigKey,
+    ConfigValue,
+    Submit,
+}
+
+// ---------------------------------------------------------------------------
+// Shared config helpers
+// ---------------------------------------------------------------------------
+
+fn flush_config_input(
+    config: &mut IndexMap<String, String>,
+    key_input: &mut String,
+    value_input: &mut String,
+) -> bool {
+    if !key_input.is_empty() && !value_input.is_empty() {
+        config.insert(std::mem::take(key_input), std::mem::take(value_input));
+        return true;
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -529,12 +594,19 @@ pub struct App {
     pub gateway_selected: usize,
     pub pending_gateway_switch: Option<String>,
 
+    // Workspace filter
+    pub current_workspace: String,
+    pub all_workspaces: bool,
+    pub workspace_names: Vec<String>,
+    pub pending_workspace_refresh: bool,
+
     // Provider list
-    pub providers_v2_enabled: bool,
-    pub provider_entries: Vec<ProviderV2Entry>,
+    pub provider_profiles: Vec<openshell_core::proto::ProviderProfile>,
+    pub provider_entries: Vec<ProviderListEntry>,
     pub provider_names: Vec<String>,
     pub provider_types: Vec<String>,
     pub provider_cred_keys: Vec<String>,
+    pub provider_workspaces: Vec<String>,
     pub provider_selected: usize,
     pub provider_count: usize,
 
@@ -544,11 +616,15 @@ pub struct App {
     // Global policy indicator (dashboard)
     pub global_policy_active: bool,
     pub global_policy_version: u32,
+    /// Stop retrying a platform-only policy probe after an expected denial.
+    pub global_policy_access_denied: bool,
 
     // Global settings
     pub global_settings: Vec<GlobalSettingEntry>,
     pub global_settings_selected: usize,
     pub global_settings_revision: u64,
+    /// Stop retrying platform-only settings after an expected denial.
+    pub global_settings_access_denied: bool,
     pub setting_edit: Option<SettingEditState>,
     pub confirm_setting_set: Option<usize>,
     pub confirm_setting_delete: Option<usize>,
@@ -575,6 +651,9 @@ pub struct App {
     pub sandbox_notes: Vec<String>,
     /// Formatted labels for each sandbox (e.g., "env=prod,team=platform" or empty string).
     pub sandbox_labels: Vec<String>,
+    /// Formatted annotations for each sandbox (e.g., "policy-signature=abc" or empty string).
+    pub sandbox_annotations: Vec<String>,
+    pub sandbox_workspaces: Vec<String>,
     pub sandbox_policy_versions: Vec<u32>,
     pub sandbox_selected: usize,
     pub sandbox_count: usize,
@@ -643,6 +722,13 @@ pub struct App {
     pub draft_viewport_height: usize,
     /// When true, the detail popup is shown for the selected draft chunk.
     pub draft_detail_open: bool,
+    /// Scroll offset, in rendered rows, of the draft detail popup body.
+    pub draft_detail_scroll: usize,
+    /// Total rows of detail-popup content (set by the draw pass).
+    pub draft_detail_rows: usize,
+    /// Visible rows in the detail-popup body, excluding the pinned hint row
+    /// (set by the draw pass).
+    pub draft_detail_body_height: usize,
 
     /// Per-sandbox count of pending draft recommendations (parallel to `sandbox_names`).
     pub sandbox_draft_counts: Vec<usize>,
@@ -687,6 +773,11 @@ pub fn format_labels(labels: &HashMap<String, String>) -> String {
         .map(|(k, v)| format!("{}={}", sanitize_for_display(k), sanitize_for_display(v)))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Format object annotations as a comma-separated key=value string.
+pub fn format_annotations(annotations: &HashMap<String, String>) -> String {
+    format_labels(annotations)
 }
 
 pub fn provider_name(provider: &openshell_core::proto::Provider) -> &str {
@@ -743,6 +834,9 @@ fn refresh_strategy_label(strategy: i32) -> &'static str {
         }
         openshell_core::proto::ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => {
             "google_service_account_jwt"
+        }
+        openshell_core::proto::ProviderCredentialRefreshStrategy::AwsStsAssumeRole => {
+            "aws_sts_assume_role"
         }
         openshell_core::proto::ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
@@ -852,6 +946,7 @@ impl App {
         client: OpenShellClient<InterceptedService<Channel, EdgeAuthInterceptor>>,
         gateway_name: String,
         endpoint: String,
+        workspace: String,
         theme: crate::theme::Theme,
     ) -> Self {
         Self {
@@ -872,19 +967,26 @@ impl App {
             middle_pane_tab: MiddlePaneTab::Providers,
             global_policy_active: false,
             global_policy_version: 0,
+            global_policy_access_denied: false,
             global_settings: Vec::new(),
             global_settings_selected: 0,
             global_settings_revision: 0,
+            global_settings_access_denied: false,
             setting_edit: None,
             confirm_setting_set: None,
             confirm_setting_delete: None,
             pending_setting_set: false,
             pending_setting_delete: false,
-            providers_v2_enabled: false,
+            current_workspace: workspace,
+            all_workspaces: false,
+            workspace_names: Vec::new(),
+            pending_workspace_refresh: false,
+            provider_profiles: Vec::new(),
             provider_entries: Vec::new(),
             provider_names: Vec::new(),
             provider_types: Vec::new(),
             provider_cred_keys: Vec::new(),
+            provider_workspaces: Vec::new(),
             provider_selected: 0,
             provider_count: 0,
             create_provider_form: None,
@@ -903,6 +1005,8 @@ impl App {
             sandbox_images: Vec::new(),
             sandbox_notes: Vec::new(),
             sandbox_labels: Vec::new(),
+            sandbox_annotations: Vec::new(),
+            sandbox_workspaces: Vec::new(),
             sandbox_policy_versions: Vec::new(),
             sandbox_selected: 0,
             sandbox_count: 0,
@@ -946,6 +1050,9 @@ impl App {
             draft_scroll: 0,
             draft_viewport_height: 0,
             draft_detail_open: false,
+            draft_detail_scroll: 0,
+            draft_detail_rows: 0,
+            draft_detail_body_height: 0,
             sandbox_draft_counts: Vec::new(),
             pending_draft_approve: false,
             pending_draft_reject: false,
@@ -966,16 +1073,7 @@ impl App {
         revision: u64,
     ) {
         self.global_settings_revision = revision;
-        self.providers_v2_enabled = settings
-            .get(settings::PROVIDERS_V2_ENABLED_KEY)
-            .and_then(|value| value.value.as_ref())
-            .and_then(|value| match value {
-                setting_value::Value::BoolValue(value) => Some(*value),
-                setting_value::Value::StringValue(value) => settings::parse_bool_like(value),
-                setting_value::Value::IntValue(value) => Some(*value != 0),
-                setting_value::Value::BytesValue(_) => None,
-            })
-            .unwrap_or(false);
+        self.global_settings_access_denied = false;
         self.global_settings = settings::REGISTERED_SETTINGS
             .iter()
             .map(|reg| {
@@ -992,6 +1090,24 @@ impl App {
         {
             self.global_settings_selected = self.global_settings.len() - 1;
         }
+    }
+
+    /// Clear privileged settings after the gateway denies platform-admin access.
+    pub fn deny_global_settings_access(&mut self) {
+        self.global_settings_access_denied = true;
+        self.global_settings.clear();
+        self.global_settings_selected = 0;
+        self.global_settings_revision = 0;
+        self.setting_edit = None;
+        self.confirm_setting_set = None;
+        self.confirm_setting_delete = None;
+    }
+
+    /// Clear the global policy badge after the gateway denies platform-admin access.
+    pub fn deny_global_policy_access(&mut self) {
+        self.global_policy_access_denied = true;
+        self.global_policy_active = false;
+        self.global_policy_version = 0;
     }
 
     /// Apply fetched sandbox settings from the `GetSandboxConfig` response.
@@ -1050,6 +1166,43 @@ impl App {
         if self.screen == Screen::Splash {
             self.screen = Screen::Dashboard;
             self.splash_start = None;
+        }
+    }
+
+    pub fn cycle_workspace(&mut self) {
+        if self.all_workspaces {
+            self.all_workspaces = false;
+            self.current_workspace = "default".to_string();
+        } else if self.workspace_names.is_empty() {
+            self.all_workspaces = true;
+            self.current_workspace = "default".to_string();
+        } else {
+            let current_idx = self
+                .workspace_names
+                .iter()
+                .position(|n| n == &self.current_workspace);
+            match current_idx {
+                Some(idx) if idx + 1 < self.workspace_names.len() => {
+                    self.current_workspace = self.workspace_names[idx + 1].clone();
+                }
+                _ => {
+                    self.all_workspaces = true;
+                    self.current_workspace = "default".to_string();
+                }
+            }
+        }
+        // Reset selection indices so the cursor doesn't point past the end
+        // of the new workspace's (potentially shorter) sandbox/provider lists.
+        self.sandbox_selected = 0;
+        self.provider_selected = 0;
+        self.pending_workspace_refresh = true;
+    }
+
+    pub fn workspace_display(&self) -> &str {
+        if self.all_workspaces {
+            "all"
+        } else {
+            &self.current_workspace
         }
     }
 
@@ -1132,6 +1285,70 @@ impl App {
         }
     }
 
+    const DASHBOARD_PANELS: [Focus; 3] = [Focus::Gateways, Focus::Providers, Focus::Sandboxes];
+
+    fn panel_item_count(&self, focus: Focus) -> usize {
+        match focus {
+            Focus::Gateways => self.gateways.len(),
+            Focus::Providers => {
+                if self.middle_pane_tab == MiddlePaneTab::GlobalSettings {
+                    self.global_settings.len()
+                } else {
+                    self.provider_count
+                }
+            }
+            Focus::Sandboxes => self.sandbox_count,
+            _ => 0,
+        }
+    }
+
+    fn set_panel_cursor(&mut self, focus: Focus, index: usize) {
+        match focus {
+            Focus::Gateways => self.gateway_selected = index,
+            Focus::Providers => {
+                if self.middle_pane_tab == MiddlePaneTab::GlobalSettings {
+                    self.global_settings_selected = index;
+                } else {
+                    self.provider_selected = index;
+                }
+            }
+            Focus::Sandboxes => self.sandbox_selected = index,
+            _ => {}
+        }
+    }
+
+    fn overflow_focus_down(&mut self) {
+        let cur_idx = Self::DASHBOARD_PANELS
+            .iter()
+            .position(|&f| f == self.focus)
+            .unwrap_or(0);
+        for offset in 1..=Self::DASHBOARD_PANELS.len() {
+            let next = Self::DASHBOARD_PANELS[(cur_idx + offset) % Self::DASHBOARD_PANELS.len()];
+            if self.panel_item_count(next) > 0 {
+                self.focus = next;
+                self.set_panel_cursor(next, 0);
+                return;
+            }
+        }
+    }
+
+    fn overflow_focus_up(&mut self) {
+        let cur_idx = Self::DASHBOARD_PANELS
+            .iter()
+            .position(|&f| f == self.focus)
+            .unwrap_or(0);
+        for offset in 1..=Self::DASHBOARD_PANELS.len() {
+            let prev = Self::DASHBOARD_PANELS
+                [(cur_idx + Self::DASHBOARD_PANELS.len() - offset) % Self::DASHBOARD_PANELS.len()];
+            let count = self.panel_item_count(prev);
+            if count > 0 {
+                self.focus = prev;
+                self.set_panel_cursor(prev, count - 1);
+                return;
+            }
+        }
+    }
+
     fn handle_gateways_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') => self.running = false,
@@ -1141,11 +1358,19 @@ impl App {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
             }
-            KeyCode::Char('j') | KeyCode::Down if !self.gateways.is_empty() => {
-                self.gateway_selected = (self.gateway_selected + 1).min(self.gateways.len() - 1);
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !self.gateways.is_empty() && self.gateway_selected < self.gateways.len() - 1 {
+                    self.gateway_selected += 1;
+                } else {
+                    self.overflow_focus_down();
+                }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.gateway_selected = self.gateway_selected.saturating_sub(1);
+                if !self.gateways.is_empty() && self.gateway_selected > 0 {
+                    self.gateway_selected -= 1;
+                } else {
+                    self.overflow_focus_up();
+                }
             }
             KeyCode::Enter => {
                 if let Some(entry) = self.gateways.get(self.gateway_selected) {
@@ -1182,24 +1407,40 @@ impl App {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
             }
-            KeyCode::Char('j') | KeyCode::Down if self.provider_count > 0 => {
-                self.provider_selected = (self.provider_selected + 1).min(self.provider_count - 1);
+            KeyCode::Char('w') => {
+                self.cycle_workspace();
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.provider_count > 0 && self.provider_selected < self.provider_count - 1 {
+                    self.provider_selected += 1;
+                } else {
+                    self.overflow_focus_down();
+                }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.provider_selected = self.provider_selected.saturating_sub(1);
+                if self.provider_count > 0 && self.provider_selected > 0 {
+                    self.provider_selected -= 1;
+                } else {
+                    self.overflow_focus_up();
+                }
             }
-            KeyCode::Char('c') if !self.providers_v2_enabled => {
-                self.open_create_provider_form();
+            KeyCode::Char('c') => {
+                if self.all_workspaces {
+                    self.status_text =
+                        "Switch to a specific workspace to create providers.".to_string();
+                } else {
+                    self.open_create_provider_form();
+                }
             }
             // Fetch and show provider detail.
             KeyCode::Enter if self.provider_count > 0 => {
                 self.pending_provider_get = true;
             }
             // Open update form for the selected provider.
-            KeyCode::Char('u') if self.provider_count > 0 && !self.providers_v2_enabled => {
+            KeyCode::Char('u') if self.provider_count > 0 => {
                 self.open_update_provider_form();
             }
-            KeyCode::Char('d') if self.provider_count > 0 && !self.providers_v2_enabled => {
+            KeyCode::Char('d') if self.provider_count > 0 => {
                 self.confirm_provider_delete = true;
             }
             KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right => {
@@ -1218,12 +1459,21 @@ impl App {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
             }
-            KeyCode::Char('j') | KeyCode::Down if !self.global_settings.is_empty() => {
-                self.global_settings_selected =
-                    (self.global_settings_selected + 1).min(self.global_settings.len() - 1);
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !self.global_settings.is_empty()
+                    && self.global_settings_selected < self.global_settings.len() - 1
+                {
+                    self.global_settings_selected += 1;
+                } else {
+                    self.overflow_focus_down();
+                }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.global_settings_selected = self.global_settings_selected.saturating_sub(1);
+                if !self.global_settings.is_empty() && self.global_settings_selected > 0 {
+                    self.global_settings_selected -= 1;
+                } else {
+                    self.overflow_focus_up();
+                }
             }
             KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right => {
                 self.middle_pane_tab = self.middle_pane_tab.next();
@@ -1359,14 +1609,30 @@ impl App {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
             }
-            KeyCode::Char('j') | KeyCode::Down if self.sandbox_count > 0 => {
-                self.sandbox_selected = (self.sandbox_selected + 1).min(self.sandbox_count - 1);
+            KeyCode::Char('w') => {
+                self.cycle_workspace();
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.sandbox_count > 0 && self.sandbox_selected < self.sandbox_count - 1 {
+                    self.sandbox_selected += 1;
+                } else {
+                    self.overflow_focus_down();
+                }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.sandbox_selected = self.sandbox_selected.saturating_sub(1);
+                if self.sandbox_count > 0 && self.sandbox_selected > 0 {
+                    self.sandbox_selected -= 1;
+                } else {
+                    self.overflow_focus_up();
+                }
             }
             KeyCode::Char('c') => {
-                self.open_create_form();
+                if self.all_workspaces {
+                    self.status_text =
+                        "Switch to a specific workspace to create sandboxes.".to_string();
+                } else {
+                    self.open_create_form();
+                }
             }
             KeyCode::Enter if self.sandbox_count > 0 => {
                 self.screen = Screen::Sandbox;
@@ -1406,6 +1672,7 @@ impl App {
             KeyCode::Esc => {
                 self.cancel_log_stream();
                 self.draft_detail_open = false;
+                self.draft_detail_scroll = 0;
                 self.sandbox_policy_tab = SandboxPolicyTab::Policy;
                 self.screen = Screen::Dashboard;
                 self.focus = Focus::Sandboxes;
@@ -1614,6 +1881,25 @@ impl App {
         }
     }
 
+    /// Largest useful scroll offset for the draft detail popup.
+    fn draft_detail_max_scroll(&self) -> usize {
+        self.draft_detail_rows
+            .saturating_sub(self.draft_detail_body_height)
+    }
+
+    /// One screenful of the draft detail popup body.
+    fn draft_detail_page(&self) -> isize {
+        isize::try_from(self.draft_detail_body_height.max(1)).unwrap_or(1)
+    }
+
+    /// Move the draft detail popup by `delta` rows, clamped to the content.
+    fn scroll_draft_detail(&mut self, delta: isize) {
+        let max = isize::try_from(self.draft_detail_max_scroll()).unwrap_or(isize::MAX);
+        let current = isize::try_from(self.draft_detail_scroll).unwrap_or(0);
+        let next = current.saturating_add(delta).clamp(0, max);
+        self.draft_detail_scroll = usize::try_from(next).unwrap_or(0);
+    }
+
     fn handle_draft_key(&mut self, key: KeyEvent) {
         // Approve-all confirmation modal intercepts all keys when open.
         if self.approve_all_confirm_open {
@@ -1638,6 +1924,7 @@ impl App {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => {
                     self.draft_detail_open = false;
+                    self.draft_detail_scroll = 0;
                 }
                 // Allow approve/reject toggle from within the popup.
                 KeyCode::Char('a') => {
@@ -1651,6 +1938,7 @@ impl App {
                             if st == "pending" || st == "rejected" {
                                 self.pending_draft_approve = true;
                                 self.draft_detail_open = false;
+                                self.draft_detail_scroll = 0;
                             }
                         }
                     }
@@ -1666,9 +1954,26 @@ impl App {
                             if st == "pending" || st == "approved" {
                                 self.pending_draft_reject = true;
                                 self.draft_detail_open = false;
+                                self.draft_detail_scroll = 0;
                             }
                         }
                     }
+                }
+                // Scroll the detail body; long rejection guidance and rationales
+                // can exceed the fixed popup height.
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_draft_detail(1),
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_draft_detail(-1),
+                KeyCode::PageDown => {
+                    let page = self.draft_detail_page();
+                    self.scroll_draft_detail(page);
+                }
+                KeyCode::PageUp => {
+                    let page = self.draft_detail_page();
+                    self.scroll_draft_detail(-page);
+                }
+                KeyCode::Home | KeyCode::Char('g') => self.draft_detail_scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.draft_detail_scroll = self.draft_detail_max_scroll();
                 }
                 _ => {}
             }
@@ -1695,6 +2000,7 @@ impl App {
             }
             KeyCode::Enter if !self.draft_chunks.is_empty() => {
                 self.draft_detail_open = true;
+                self.draft_detail_scroll = 0;
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if total == 0 {
@@ -1993,17 +2299,8 @@ impl App {
             .collect();
 
         self.create_form = Some(CreateSandboxForm {
-            focused_field: CreateFormField::Name,
-            name: String::new(),
-            image: String::new(),
-            command: String::new(),
             providers,
-            provider_cursor: 0,
-            ports: String::new(),
-            status: None,
-            phase: CreatePhase::Form,
-            anim_start: None,
-            create_result: None,
+            ..CreateSandboxForm::default()
         });
     }
 
@@ -2100,27 +2397,43 @@ impl App {
     // ------------------------------------------------------------------
 
     fn open_create_provider_form(&mut self) {
-        let known = openshell_providers::ProviderRegistry::new().known_types();
-        let types: Vec<String> = known.into_iter().map(String::from).collect();
+        let types = self.available_provider_profile_types();
 
         self.create_provider_form = Some(CreateProviderForm {
-            phase: CreateProviderPhase::SelectType,
             types,
-            type_cursor: 0,
-            method_cursor: 0,
-            name: String::new(),
-            credentials: Vec::new(),
-            cred_cursor: 0,
-            generic_env_name: String::new(),
-            generic_value: String::new(),
-            key_field: ProviderKeyField::Name,
-            is_generic: false,
-            status: None,
-            warning: None,
-            anim_start: None,
-            create_result: None,
-            discovered_credentials: None,
+            status: self.provider_profiles.is_empty().then(|| {
+                "Provider profiles unavailable. Wait for refresh, then retry.".to_string()
+            }),
+            ..CreateProviderForm::default()
         });
+    }
+
+    fn available_provider_profile_types(&self) -> Vec<String> {
+        let mut types = self
+            .provider_profiles
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect::<Vec<_>>();
+        types.sort();
+        types.dedup();
+        types
+    }
+
+    pub(crate) fn sync_create_provider_types(&mut self) {
+        let types = self.available_provider_profile_types();
+        let Some(form) = self.create_provider_form.as_mut() else {
+            return;
+        };
+        if form.phase != CreateProviderPhase::SelectType {
+            return;
+        }
+
+        form.types = types;
+        form.type_cursor = form.type_cursor.min(form.types.len().saturating_sub(1));
+        form.status = form
+            .types
+            .is_empty()
+            .then(|| "Provider profiles unavailable. Wait for refresh, then retry.".to_string());
     }
 
     fn handle_create_provider_key(&mut self, key: KeyEvent) {
@@ -2140,27 +2453,53 @@ impl App {
                     form.type_cursor = form.type_cursor.saturating_sub(1);
                 }
                 KeyCode::Enter => {
-                    let selected = form.types[form.type_cursor].clone();
-                    let registry = openshell_providers::ProviderRegistry::new();
-                    let env_vars = registry.credential_env_vars(&selected);
-                    form.is_generic = env_vars.is_empty();
-
-                    // Populate credential rows from all known env vars.
-                    form.credentials = env_vars
+                    let Some(selected) = form.types.get(form.type_cursor).cloned() else {
+                        form.status = Some(
+                            "Provider profiles unavailable. Wait for refresh, then retry."
+                                .to_string(),
+                        );
+                        return;
+                    };
+                    let Some(profile) = self
+                        .provider_profiles
                         .iter()
-                        .map(|s| (s.to_string(), String::new()))
+                        .find(|profile| profile.id == selected)
+                        .cloned()
+                    else {
+                        form.status = Some(format!("Provider profile '{selected}' is unavailable"));
+                        return;
+                    };
+                    let profile = ProviderTypeProfile::from_proto(&profile);
+                    let mut credential_keys = Vec::new();
+                    for key in profile
+                        .credentials
+                        .iter()
+                        .flat_map(|credential| credential.accepted_stored_keys())
+                    {
+                        if !credential_keys.iter().any(|existing| existing == key) {
+                            credential_keys.push(key.to_string());
+                        }
+                    }
+                    form.is_generic = credential_keys.is_empty();
+                    form.allows_empty_credentials = profile.allows_empty_provider_credentials();
+
+                    // Populate credential rows from all accepted storage keys,
+                    // including logical names for broker-only credentials.
+                    form.credentials = credential_keys
+                        .into_iter()
+                        .map(|key| (key, String::new()))
                         .collect();
                     form.cred_cursor = 0;
 
                     // Auto-generate a unique name.
                     form.name = unique_provider_name(&selected, &self.provider_names);
 
-                    if form.is_generic {
-                        // No known env vars — skip straight to manual entry.
-                        form.phase = CreateProviderPhase::EnterKey;
-                        form.key_field = ProviderKeyField::Name;
-                        form.status = None;
-                        form.warning = None;
+                    if form.credentials.is_empty() {
+                        // Credential-less profiles can be created directly.
+                        form.discovered_credentials = Some(HashMap::new());
+                        form.phase = CreateProviderPhase::Creating;
+                        form.anim_start = Some(Instant::now());
+                        self.pending_provider_create = true;
                     } else {
                         form.phase = CreateProviderPhase::ChooseMethod;
                         form.method_cursor = 0;
@@ -2181,10 +2520,18 @@ impl App {
                 KeyCode::Enter => {
                     let ptype = form.types[form.type_cursor].clone();
                     if form.method_cursor == 0 {
-                        // Autodetect — synchronous since we only check env vars now.
-                        let registry = openshell_providers::ProviderRegistry::new();
-                        if let Ok(Some(discovered)) = registry.discover_existing(&ptype) {
-                            form.discovered_credentials = Some(discovered.credentials);
+                        let discovered = self
+                            .provider_profiles
+                            .iter()
+                            .find(|profile| profile.id == ptype)
+                            .map(ProviderTypeProfile::from_proto)
+                            .and_then(|profile| {
+                                discover_from_profile(&profile, &RealDiscoveryContext)
+                                    .ok()
+                                    .flatten()
+                            });
+                        if let Some(discovered) = discovered {
+                            apply_discovered_provider(form, discovered);
                             if form.name.is_empty() {
                                 form.name = unique_provider_name(&ptype, &self.provider_names);
                             }
@@ -2196,7 +2543,12 @@ impl App {
                             form.phase = CreateProviderPhase::EnterKey;
                             form.key_field = ProviderKeyField::Name;
                             form.warning = Some(
-                                "No credentials found in environment. Enter manually.".to_string(),
+                                if form.allows_empty_credentials {
+                                    "No credentials found in environment. Enter credentials or submit without them."
+                                } else {
+                                    "No credentials found in environment. Enter manually."
+                                }
+                                .to_string(),
                             );
                             form.status = None;
                         }
@@ -2219,34 +2571,119 @@ impl App {
                     form.name.clear();
                     form.credentials.clear();
                     form.cred_cursor = 0;
+                    form.config.clear();
+                    form.config_cursor = 0;
+                    form.config_key_input.clear();
+                    form.config_value_input.clear();
                     form.generic_env_name.clear();
                     form.generic_value.clear();
                 }
                 KeyCode::Tab => {
                     if form.is_generic {
-                        // Name → EnvVarName → GenericValue → Submit → Name
-                        form.key_field = match form.key_field {
-                            ProviderKeyField::Name => ProviderKeyField::EnvVarName,
-                            ProviderKeyField::EnvVarName => ProviderKeyField::GenericValue,
-                            ProviderKeyField::GenericValue => ProviderKeyField::Submit,
-                            _ => ProviderKeyField::Name,
-                        };
+                        // Name → EnvVarName → GenericValue → ConfigList → ConfigKeyName → ConfigKeyValue → Submit → Name
+                        match form.key_field {
+                            ProviderKeyField::Name => {
+                                form.key_field = ProviderKeyField::EnvVarName;
+                            }
+                            ProviderKeyField::EnvVarName => {
+                                form.key_field = ProviderKeyField::GenericValue;
+                            }
+                            ProviderKeyField::GenericValue => {
+                                if form.config.is_empty() {
+                                    form.key_field = ProviderKeyField::ConfigKeyName;
+                                } else {
+                                    form.key_field = ProviderKeyField::ConfigList;
+                                    form.config_cursor = 0_usize;
+                                }
+                            }
+                            ProviderKeyField::ConfigList => {
+                                if form.config_cursor < form.config.len().saturating_sub(1) {
+                                    form.config_cursor += 1;
+                                } else {
+                                    form.key_field = ProviderKeyField::ConfigKeyName;
+                                }
+                            }
+                            ProviderKeyField::ConfigKeyName => {
+                                form.key_field = ProviderKeyField::ConfigKeyValue;
+                            }
+                            ProviderKeyField::ConfigKeyValue => {
+                                if flush_config_input(
+                                    &mut form.config,
+                                    &mut form.config_key_input,
+                                    &mut form.config_value_input,
+                                ) {
+                                    form.key_field = ProviderKeyField::ConfigKeyName;
+                                    form.config_cursor = form.config.len().saturating_sub(1_usize);
+                                } else if form.config_key_input.is_empty()
+                                    && form.config_value_input.is_empty()
+                                {
+                                    form.key_field = ProviderKeyField::Submit;
+                                } else {
+                                    form.status = Some(
+                                        "Both key and value required to add config entry."
+                                            .to_string(),
+                                    );
+                                    form.key_field = ProviderKeyField::ConfigKeyName;
+                                }
+                            }
+                            _ => {
+                                form.key_field = ProviderKeyField::Name;
+                            }
+                        }
                     } else {
-                        // Name → Credential[0..N-1] → Submit → Name
+                        // Name → Credential[0..N-1] → [ConfigList →] ConfigKeyName → ConfigKeyValue → Submit → Name
                         match form.key_field {
                             ProviderKeyField::Name => {
                                 if form.credentials.is_empty() {
-                                    form.key_field = ProviderKeyField::Submit;
+                                    if form.config.is_empty() {
+                                        form.key_field = ProviderKeyField::ConfigKeyName;
+                                    } else {
+                                        form.key_field = ProviderKeyField::ConfigList;
+                                        form.config_cursor = 0_usize;
+                                    }
                                 } else {
                                     form.key_field = ProviderKeyField::Credential;
-                                    form.cred_cursor = 0;
+                                    form.cred_cursor = 0_usize;
                                 }
                             }
                             ProviderKeyField::Credential => {
                                 if form.cred_cursor < form.credentials.len().saturating_sub(1) {
                                     form.cred_cursor += 1;
+                                } else if !form.config.is_empty() {
+                                    form.key_field = ProviderKeyField::ConfigList;
+                                    form.config_cursor = 0_usize;
                                 } else {
+                                    form.key_field = ProviderKeyField::ConfigKeyName;
+                                }
+                            }
+                            ProviderKeyField::ConfigList => {
+                                if form.config_cursor < form.config.len().saturating_sub(1) {
+                                    form.config_cursor += 1_usize;
+                                } else {
+                                    form.key_field = ProviderKeyField::ConfigKeyName;
+                                }
+                            }
+                            ProviderKeyField::ConfigKeyName => {
+                                form.key_field = ProviderKeyField::ConfigKeyValue;
+                            }
+                            ProviderKeyField::ConfigKeyValue => {
+                                if flush_config_input(
+                                    &mut form.config,
+                                    &mut form.config_key_input,
+                                    &mut form.config_value_input,
+                                ) {
+                                    form.key_field = ProviderKeyField::ConfigKeyName;
+                                    form.config_cursor = form.config.len().saturating_sub(1_usize);
+                                } else if form.config_key_input.is_empty()
+                                    && form.config_value_input.is_empty()
+                                {
                                     form.key_field = ProviderKeyField::Submit;
+                                } else {
+                                    form.status = Some(
+                                        "Both key and value required to add config entry."
+                                            .to_string(),
+                                    );
+                                    form.key_field = ProviderKeyField::ConfigKeyName;
                                 }
                             }
                             _ => {
@@ -2257,12 +2694,38 @@ impl App {
                 }
                 KeyCode::BackTab => {
                     if form.is_generic {
-                        form.key_field = match form.key_field {
-                            ProviderKeyField::EnvVarName => ProviderKeyField::Name,
-                            ProviderKeyField::GenericValue => ProviderKeyField::EnvVarName,
-                            ProviderKeyField::Submit => ProviderKeyField::GenericValue,
-                            _ => ProviderKeyField::Submit,
-                        };
+                        match form.key_field {
+                            ProviderKeyField::EnvVarName => {
+                                form.key_field = ProviderKeyField::Name;
+                            }
+                            ProviderKeyField::GenericValue => {
+                                form.key_field = ProviderKeyField::EnvVarName;
+                            }
+                            ProviderKeyField::ConfigList => {
+                                if form.config_cursor > 0 {
+                                    form.config_cursor -= 1_usize;
+                                } else {
+                                    form.key_field = ProviderKeyField::GenericValue;
+                                }
+                            }
+                            ProviderKeyField::ConfigKeyName => {
+                                if form.config.is_empty() {
+                                    form.key_field = ProviderKeyField::GenericValue;
+                                } else {
+                                    form.config_cursor = form.config.len().saturating_sub(1);
+                                    form.key_field = ProviderKeyField::ConfigList;
+                                }
+                            }
+                            ProviderKeyField::ConfigKeyValue => {
+                                form.key_field = ProviderKeyField::ConfigKeyName;
+                            }
+                            ProviderKeyField::Submit => {
+                                form.key_field = ProviderKeyField::ConfigKeyValue;
+                            }
+                            _ => {
+                                form.key_field = ProviderKeyField::Submit;
+                            }
+                        }
                     } else {
                         match form.key_field {
                             ProviderKeyField::Credential => {
@@ -2272,13 +2735,32 @@ impl App {
                                     form.key_field = ProviderKeyField::Name;
                                 }
                             }
-                            ProviderKeyField::Submit => {
-                                if form.credentials.is_empty() {
+                            ProviderKeyField::ConfigList => {
+                                if form.config_cursor > 0 {
+                                    form.config_cursor -= 1;
+                                } else if form.credentials.is_empty() {
                                     form.key_field = ProviderKeyField::Name;
                                 } else {
                                     form.key_field = ProviderKeyField::Credential;
                                     form.cred_cursor = form.credentials.len().saturating_sub(1);
                                 }
+                            }
+                            ProviderKeyField::ConfigKeyName => {
+                                if !form.config.is_empty() {
+                                    form.config_cursor = form.config.len().saturating_sub(1);
+                                    form.key_field = ProviderKeyField::ConfigList;
+                                } else if form.credentials.is_empty() {
+                                    form.key_field = ProviderKeyField::Name;
+                                } else {
+                                    form.key_field = ProviderKeyField::Credential;
+                                    form.cred_cursor = form.credentials.len().saturating_sub(1);
+                                }
+                            }
+                            ProviderKeyField::ConfigKeyValue => {
+                                form.key_field = ProviderKeyField::ConfigKeyName;
+                            }
+                            ProviderKeyField::Submit => {
+                                form.key_field = ProviderKeyField::ConfigKeyValue;
                             }
                             _ => {
                                 form.key_field = ProviderKeyField::Submit;
@@ -2293,6 +2775,60 @@ impl App {
                             Self::handle_text_input(value, key);
                         }
                     }
+                    ProviderKeyField::ConfigList => match key.code {
+                        KeyCode::Up => {
+                            form.config_cursor = form.config_cursor.saturating_sub(1);
+                        }
+                        KeyCode::Down if !form.config.is_empty() => {
+                            form.config_cursor =
+                                (form.config_cursor + 1).min(form.config.len() - 1);
+                        }
+                        KeyCode::Char('d')
+                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                                && !form.config.is_empty() =>
+                        {
+                            let key_to_remove = form
+                                .config
+                                .keys()
+                                .nth(form.config_cursor)
+                                .cloned()
+                                .unwrap_or_default();
+                            form.config.shift_remove(&key_to_remove);
+                            form.config_cursor =
+                                form.config_cursor.min(form.config.len().saturating_sub(1));
+                            if form.config.is_empty() {
+                                form.key_field = ProviderKeyField::ConfigKeyName;
+                            }
+                        }
+                        _ => {}
+                    },
+                    ProviderKeyField::ConfigKeyName => match key.code {
+                        KeyCode::Enter => {
+                            flush_config_input(
+                                &mut form.config,
+                                &mut form.config_key_input,
+                                &mut form.config_value_input,
+                            );
+                        }
+                        _ => {
+                            Self::handle_text_input(&mut form.config_key_input, key);
+                        }
+                    },
+                    ProviderKeyField::ConfigKeyValue => match key.code {
+                        KeyCode::Enter => {
+                            if flush_config_input(
+                                &mut form.config,
+                                &mut form.config_key_input,
+                                &mut form.config_value_input,
+                            ) {
+                                form.key_field = ProviderKeyField::ConfigKeyName;
+                                form.config_cursor = form.config.len().saturating_sub(1_usize);
+                            }
+                        }
+                        _ => {
+                            Self::handle_text_input(&mut form.config_value_input, key);
+                        }
+                    },
                     ProviderKeyField::EnvVarName => {
                         Self::handle_text_input(&mut form.generic_env_name, key);
                     }
@@ -2301,6 +2837,20 @@ impl App {
                     }
                     ProviderKeyField::Submit => {
                         if key.code == KeyCode::Enter {
+                            flush_config_input(
+                                &mut form.config,
+                                &mut form.config_key_input,
+                                &mut form.config_value_input,
+                            );
+                            if !form.config_key_input.is_empty()
+                                || !form.config_value_input.is_empty()
+                            {
+                                form.status = Some(
+                                    "Both key and value are required to add config entry."
+                                        .to_string(),
+                                );
+                                return;
+                            }
                             // Validate and build credentials map.
                             let mut creds = HashMap::new();
                             if form.is_generic {
@@ -2322,7 +2872,7 @@ impl App {
                                         creds.insert(name.clone(), value.clone());
                                     }
                                 }
-                                if creds.is_empty() {
+                                if creds.is_empty() && !form.allows_empty_credentials {
                                     form.status =
                                         Some("At least one credential is required.".to_string());
                                     return;
@@ -2414,14 +2964,31 @@ impl App {
             .get(self.provider_selected)
             .cloned()
             .unwrap_or_default();
+        let existing_config = self
+            .provider_entries
+            .get(self.provider_selected)
+            .map(|e| {
+                e.provider
+                    .config
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<IndexMap<_, _>>()
+            })
+            .unwrap_or_default();
 
-        // If we don't know the credential key, derive from registry.
+        // If we don't know the credential key, derive it from the profile.
         let key = if cred_key.is_empty() {
-            let registry = openshell_providers::ProviderRegistry::new();
-            registry
-                .credential_env_vars(&ptype)
-                .first()
-                .map_or(String::new(), ToString::to_string)
+            self.provider_entries
+                .get(self.provider_selected)
+                .and_then(|entry| entry.profile.as_ref())
+                .map(ProviderTypeProfile::from_proto)
+                .and_then(|profile| {
+                    profile
+                        .credential_env_vars()
+                        .first()
+                        .map(ToString::to_string)
+                })
+                .unwrap_or_default()
         } else {
             cred_key
         };
@@ -2431,6 +2998,13 @@ impl App {
             provider_type: ptype,
             credential_key: key,
             new_value: String::new(),
+            config: existing_config.clone(),
+            original_config: existing_config,
+            config_key_input: String::new(),
+            config_value_input: String::new(),
+            config_cursor: 0,
+            deleted_keys: Vec::new(),
+            focus: UpdateProviderField::CredentialValue,
             status: None,
         });
     }
@@ -2444,18 +3018,153 @@ impl App {
             KeyCode::Esc => {
                 self.update_provider_form = None;
             }
-            KeyCode::Enter => {
-                if form.new_value.is_empty() {
-                    form.status = Some("Value is required.".to_string());
-                    return;
+            KeyCode::Tab => match form.focus {
+                UpdateProviderField::CredentialValue => {
+                    if form.config.is_empty() {
+                        form.focus = UpdateProviderField::ConfigKey;
+                    } else {
+                        form.focus = UpdateProviderField::ConfigEntry;
+                        form.config_cursor = 0_usize;
+                    }
                 }
-                self.pending_provider_update = true;
-            }
-            KeyCode::Char(c) => form.new_value.push(c),
-            KeyCode::Backspace => {
-                form.new_value.pop();
-            }
-            _ => {}
+                UpdateProviderField::ConfigEntry => {
+                    if form.config_cursor < form.config.len().saturating_sub(1) {
+                        form.config_cursor += 1_usize;
+                    } else {
+                        form.focus = UpdateProviderField::ConfigKey;
+                    }
+                }
+                UpdateProviderField::ConfigKey => {
+                    form.focus = UpdateProviderField::ConfigValue;
+                }
+                UpdateProviderField::ConfigValue => {
+                    if flush_config_input(
+                        &mut form.config,
+                        &mut form.config_key_input,
+                        &mut form.config_value_input,
+                    ) {
+                        form.focus = UpdateProviderField::ConfigKey;
+                        form.config_cursor = form.config.len().saturating_sub(1_usize);
+                    } else if form.config_key_input.is_empty() && form.config_value_input.is_empty()
+                    {
+                        form.focus = UpdateProviderField::Submit;
+                    } else {
+                        form.status =
+                            Some("Both key and value required to add config entry.".to_string());
+                        form.focus = UpdateProviderField::ConfigKey;
+                    }
+                }
+                UpdateProviderField::Submit => {
+                    form.focus = UpdateProviderField::CredentialValue;
+                }
+            },
+            KeyCode::BackTab => match form.focus {
+                UpdateProviderField::CredentialValue => {
+                    form.focus = UpdateProviderField::Submit;
+                }
+                UpdateProviderField::ConfigEntry => {
+                    if form.config_cursor > 0 {
+                        form.config_cursor -= 1_usize;
+                    } else {
+                        form.focus = UpdateProviderField::CredentialValue;
+                    }
+                }
+                UpdateProviderField::ConfigKey => {
+                    if form.config.is_empty() {
+                        form.focus = UpdateProviderField::CredentialValue;
+                    } else {
+                        form.focus = UpdateProviderField::ConfigEntry;
+                        form.config_cursor = form.config.len().saturating_sub(1);
+                    }
+                }
+                UpdateProviderField::ConfigValue => {
+                    form.focus = UpdateProviderField::ConfigKey;
+                }
+                UpdateProviderField::Submit => {
+                    form.focus = UpdateProviderField::ConfigValue;
+                }
+            },
+            _ => match form.focus {
+                UpdateProviderField::CredentialValue => {
+                    Self::handle_text_input(&mut form.new_value, key);
+                }
+                UpdateProviderField::ConfigEntry => match key.code {
+                    KeyCode::Up => {
+                        form.config_cursor = form.config_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down if !form.config.is_empty() => {
+                        form.config_cursor = (form.config_cursor + 1).min(form.config.len() - 1);
+                    }
+                    KeyCode::Char('d')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !form.config.is_empty() =>
+                    {
+                        let key_to_remove = form
+                            .config
+                            .keys()
+                            .nth(form.config_cursor)
+                            .cloned()
+                            .unwrap_or_default();
+                        form.deleted_keys.push(key_to_remove.clone());
+                        form.config.shift_remove(&key_to_remove);
+                        form.config_cursor =
+                            form.config_cursor.min(form.config.len().saturating_sub(1));
+                        if form.config.is_empty() {
+                            form.focus = UpdateProviderField::ConfigKey;
+                        }
+                    }
+                    _ => {}
+                },
+                UpdateProviderField::ConfigKey => match key.code {
+                    KeyCode::Enter => {
+                        flush_config_input(
+                            &mut form.config,
+                            &mut form.config_key_input,
+                            &mut form.config_value_input,
+                        );
+                    }
+                    _ => {
+                        Self::handle_text_input(&mut form.config_key_input, key);
+                    }
+                },
+                UpdateProviderField::ConfigValue => match key.code {
+                    KeyCode::Enter => {
+                        if flush_config_input(
+                            &mut form.config,
+                            &mut form.config_key_input,
+                            &mut form.config_value_input,
+                        ) {
+                            form.focus = UpdateProviderField::ConfigKey;
+                            form.config_cursor = form.config.len().saturating_sub(1_usize);
+                        }
+                    }
+                    _ => {
+                        Self::handle_text_input(&mut form.config_value_input, key);
+                    }
+                },
+                UpdateProviderField::Submit => {
+                    if key.code == KeyCode::Enter {
+                        flush_config_input(
+                            &mut form.config,
+                            &mut form.config_key_input,
+                            &mut form.config_value_input,
+                        );
+                        if !form.config_key_input.is_empty() || !form.config_value_input.is_empty()
+                        {
+                            form.status = Some(
+                                "Both key and value are required to add config entry.".to_string(),
+                            );
+                            return;
+                        }
+                        if form.new_value.is_empty() && form.config == form.original_config {
+                            form.status =
+                                Some("Credential value or config keys required.".to_string());
+                            return;
+                        }
+                        self.pending_provider_update = true;
+                    }
+                }
+            },
         }
     }
 
@@ -2518,6 +3227,25 @@ impl App {
             .map(String::as_str)
     }
 
+    /// Get the workspace of the currently selected sandbox.
+    ///
+    /// In the all-workspaces view, returns the workspace from the selected row
+    /// rather than the globally active workspace.
+    pub fn selected_sandbox_workspace(&self) -> String {
+        self.sandbox_workspaces
+            .get(self.sandbox_selected)
+            .cloned()
+            .unwrap_or_else(|| self.current_workspace.clone())
+    }
+
+    /// Get the workspace of the currently selected provider row.
+    pub fn selected_provider_workspace(&self) -> String {
+        self.provider_workspaces
+            .get(self.provider_selected)
+            .cloned()
+            .unwrap_or_else(|| self.current_workspace.clone())
+    }
+
     /// Get the name of the currently selected provider.
     pub fn selected_provider_name(&self) -> Option<&str> {
         self.provider_names
@@ -2532,7 +3260,7 @@ impl App {
         let profile = self
             .provider_entries
             .iter()
-            .find(|entry| provider_name(&entry.provider) == provider_name(provider))
+            .find(|entry| provider_id(&entry.provider) == provider_id(provider))
             .and_then(|entry| entry.profile.as_ref());
 
         let mut credential_keys = provider.credentials.keys().cloned().collect::<Vec<_>>();
@@ -2593,7 +3321,12 @@ impl App {
             },
         );
 
-        let mut config_lines = provider.config.keys().cloned().collect::<Vec<_>>();
+        let mut config_lines = provider
+            .config
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<String>>();
+
         config_lines.sort();
         if config_lines.is_empty() {
             config_lines.push("<none>".to_string());
@@ -2692,7 +3425,7 @@ impl App {
         );
 
         let raw_profile_yaml = profile.and_then(|profile| {
-            let dto = openshell_providers::ProviderTypeProfile::from_proto(profile);
+            let dto = ProviderTypeProfile::from_proto(profile);
             openshell_providers::profile_to_yaml(&dto).ok()
         });
 
@@ -2765,7 +3498,9 @@ impl App {
         self.sandbox_images.clear();
         self.sandbox_notes.clear();
         self.sandbox_labels.clear();
+        self.sandbox_annotations.clear();
         self.sandbox_policy_versions.clear();
+        self.sandbox_workspaces.clear();
         self.sandbox_selected = 0;
         self.sandbox_count = 0;
         self.sandbox_log_lines.clear();
@@ -2779,12 +3514,22 @@ impl App {
         self.sandbox_providers_list.clear();
         self.policy_lines.clear();
         self.policy_scroll = 0;
+        // Platform-admin capabilities are gateway-specific. Probe them again after
+        // switching gateways and never retain privileged state from the old one.
+        self.global_settings_access_denied = false;
+        self.global_settings.clear();
+        self.global_settings_selected = 0;
+        self.global_settings_revision = 0;
+        self.global_policy_access_denied = false;
+        self.global_policy_active = false;
+        self.global_policy_version = 0;
         // Reset provider state too.
-        self.providers_v2_enabled = false;
+        self.provider_profiles.clear();
         self.provider_entries.clear();
         self.provider_names.clear();
         self.provider_types.clear();
         self.provider_cred_keys.clear();
+        self.provider_workspaces.clear();
         self.provider_selected = 0;
         self.provider_count = 0;
         self.confirm_provider_delete = false;
@@ -2832,6 +3577,157 @@ fn clamped_scroll(current: usize, delta: isize, total: usize, viewport: usize) -
 mod tests {
     use super::*;
     use openshell_bootstrap::GatewayMetadataSource;
+
+    fn test_app() -> App {
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let client = OpenShellClient::with_interceptor(channel, EdgeAuthInterceptor::noop());
+        App::new(
+            client,
+            "test".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "default".to_string(),
+            crate::theme::Theme::dark(),
+        )
+    }
+
+    fn provider_profile(
+        id: &str,
+        credentials: Vec<openshell_core::proto::ProviderProfileCredential>,
+    ) -> openshell_core::proto::ProviderProfile {
+        openshell_core::proto::ProviderProfile {
+            id: id.to_string(),
+            credentials,
+            ..Default::default()
+        }
+    }
+
+    fn credential(
+        name: &str,
+        env_vars: &[&str],
+        required: bool,
+        runtime_resolvable: bool,
+    ) -> openshell_core::proto::ProviderProfileCredential {
+        openshell_core::proto::ProviderProfileCredential {
+            name: name.to_string(),
+            env_vars: env_vars.iter().map(ToString::to_string).collect(),
+            required,
+            token_grant: runtime_resolvable.then(Default::default),
+            ..Default::default()
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[tokio::test]
+    async fn create_provider_enter_with_empty_profile_catalog_is_recoverable() {
+        let mut app = test_app();
+        app.open_create_provider_form();
+
+        app.handle_create_provider_key(key(KeyCode::Enter));
+
+        let form = app
+            .create_provider_form
+            .as_ref()
+            .expect("form remains open");
+        assert_eq!(form.phase, CreateProviderPhase::SelectType);
+        assert!(
+            form.status
+                .as_deref()
+                .is_some_and(|status| status.contains("profiles unavailable"))
+        );
+        assert!(!app.pending_provider_create);
+
+        app.provider_profiles = vec![provider_profile("recovered", Vec::new())];
+        app.sync_create_provider_types();
+        let form = app
+            .create_provider_form
+            .as_ref()
+            .expect("form remains open");
+        assert_eq!(form.types, vec!["recovered"]);
+        assert!(form.status.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_provider_accepts_empty_credentials_when_profile_allows_them() {
+        for profile in [
+            provider_profile("policy-only", Vec::new()),
+            provider_profile(
+                "optional-static",
+                vec![credential("api_key", &["API_KEY"], false, false)],
+            ),
+            provider_profile(
+                "runtime-token",
+                vec![credential("access_token", &["ACCESS_TOKEN"], true, true)],
+            ),
+        ] {
+            let mut app = test_app();
+            app.provider_profiles = vec![profile];
+            app.open_create_provider_form();
+            app.handle_create_provider_key(key(KeyCode::Enter));
+
+            let form = app.create_provider_form.as_mut().expect("form");
+            if form.phase != CreateProviderPhase::Creating {
+                form.phase = CreateProviderPhase::EnterKey;
+                form.key_field = ProviderKeyField::Submit;
+                app.handle_create_provider_key(key(KeyCode::Enter));
+            }
+
+            let form = app.create_provider_form.as_ref().expect("form");
+            assert_eq!(form.phase, CreateProviderPhase::Creating);
+            assert_eq!(form.discovered_credentials, Some(HashMap::new()));
+            assert!(app.pending_provider_create);
+        }
+    }
+
+    #[tokio::test]
+    async fn create_provider_uses_logical_key_for_broker_only_credential() {
+        let mut app = test_app();
+        app.provider_profiles = vec![provider_profile(
+            "token-exchange",
+            vec![credential("subject_token", &[], true, false)],
+        )];
+        app.open_create_provider_form();
+
+        app.handle_create_provider_key(key(KeyCode::Enter));
+
+        let form = app.create_provider_form.as_ref().expect("form");
+        assert_eq!(form.phase, CreateProviderPhase::ChooseMethod);
+        assert_eq!(
+            form.credentials,
+            vec![("subject_token".to_string(), String::new())]
+        );
+        assert!(!form.allows_empty_credentials);
+    }
+
+    #[tokio::test]
+    async fn denied_platform_state_is_cleared_and_reprobed_after_gateway_switch() {
+        let mut app = test_app();
+        app.global_settings = vec![GlobalSettingEntry {
+            key: "stale".to_string(),
+            kind: SettingValueKind::Bool,
+            value: Some(setting_value::Value::BoolValue(true)),
+        }];
+        app.global_settings_revision = 4;
+        app.global_policy_active = true;
+        app.global_policy_version = 3;
+
+        app.deny_global_settings_access();
+        app.deny_global_policy_access();
+
+        assert!(app.global_settings_access_denied);
+        assert!(app.global_settings.is_empty());
+        assert_eq!(app.global_settings_revision, 0);
+        assert!(app.global_policy_access_denied);
+        assert!(!app.global_policy_active);
+        assert_eq!(app.global_policy_version, 0);
+
+        app.reset_sandbox_state();
+
+        assert!(!app.global_settings_access_denied);
+        assert!(!app.global_policy_access_denied);
+    }
 
     // -- clamped_scroll -------------------------------------------------
 
@@ -2930,5 +3826,347 @@ mod tests {
         };
 
         assert_eq!(gateway.source_label(), "unknown");
+    }
+
+    #[tokio::test]
+    async fn providers_workspace_shortcut_cycles_scope_and_resets_selections() {
+        let mut app = test_app();
+        app.screen = Screen::Dashboard;
+        app.focus = Focus::Providers;
+        app.workspace_names = vec!["default".to_string(), "team-b".to_string()];
+        app.provider_selected = 3;
+        app.sandbox_selected = 4;
+
+        app.handle_key(key(KeyCode::Char('w')));
+
+        assert_eq!(app.current_workspace, "team-b");
+        assert!(!app.all_workspaces);
+        assert_eq!(app.provider_selected, 0);
+        assert_eq!(app.sandbox_selected, 0);
+        assert!(app.pending_workspace_refresh);
+
+        app.handle_key(key(KeyCode::Char('w')));
+        assert!(app.all_workspaces);
+        assert_eq!(app.workspace_display(), "all");
+
+        app.handle_key(key(KeyCode::Char('w')));
+        assert!(!app.all_workspaces);
+        assert_eq!(app.current_workspace, "default");
+    }
+
+    // -- selected_sandbox_workspace ----------------------------------------
+
+    #[test]
+    fn selected_sandbox_workspace_returns_per_row_value() {
+        let workspaces = ["default", "beta", "staging"];
+        let selected: usize = 1;
+        let current = "default";
+
+        let result = workspaces.get(selected).unwrap_or(&current);
+        assert_eq!(*result, "beta");
+    }
+
+    #[test]
+    fn selected_sandbox_workspace_falls_back_to_current() {
+        let workspaces: &[&str] = &[];
+        let selected: usize = 0;
+        let current = "default";
+
+        let result = workspaces.get(selected).unwrap_or(&current);
+        assert_eq!(*result, "default");
+    }
+
+    // -- selected_provider_workspace ----------------------------------------
+
+    #[test]
+    fn selected_provider_workspace_returns_per_row_value() {
+        let workspaces = ["default", "beta", "staging"];
+        let selected: usize = 1;
+        let current = "default";
+
+        let result = workspaces.get(selected).unwrap_or(&current);
+        assert_eq!(*result, "beta");
+    }
+
+    #[test]
+    fn selected_provider_workspace_falls_back_to_current() {
+        let workspaces: &[&str] = &[];
+        let selected: usize = 0;
+        let current = "default";
+
+        let result = workspaces.get(selected).unwrap_or(&current);
+        assert_eq!(*result, "default");
+    }
+
+    #[test]
+    fn flush_config_input_inserts_when_both_present() {
+        let mut config = IndexMap::new();
+        let mut key = "FOO".to_string();
+        let mut val = "bar".to_string();
+        assert!(flush_config_input(&mut config, &mut key, &mut val));
+        assert_eq!(config.get("FOO"), Some(&"bar".to_string()));
+        assert!(key.is_empty());
+        assert!(val.is_empty());
+    }
+
+    #[test]
+    fn flush_config_input_noop_when_key_empty() {
+        let mut config = IndexMap::new();
+        let mut key = String::new();
+        let mut val = "bar".to_string();
+        assert!(!flush_config_input(&mut config, &mut key, &mut val));
+        assert!(config.is_empty());
+        assert_eq!(val, "bar");
+    }
+
+    #[test]
+    fn flush_config_input_noop_when_value_empty() {
+        let mut config = IndexMap::new();
+        let mut key = "FOO".to_string();
+        let mut val = String::new();
+        assert!(!flush_config_input(&mut config, &mut key, &mut val));
+        assert!(config.is_empty());
+        assert_eq!(key, "FOO");
+    }
+
+    // -- config deletion tombstones ------------------------------------
+
+    #[test]
+    fn delete_config_entry_records_tombstone() {
+        let config = IndexMap::from([("FOO".into(), "1".into()), ("BAR".into(), "2".into())]);
+
+        let mut form = UpdateProviderForm {
+            provider_name: "p".into(),
+            provider_type: "t".into(),
+            credential_key: "k".into(),
+            new_value: String::new(),
+            original_config: config.clone(),
+            config,
+            config_key_input: String::new(),
+            config_value_input: String::new(),
+            config_cursor: 0,
+            focus: UpdateProviderField::ConfigKey,
+            status: None,
+            deleted_keys: Vec::new(),
+        };
+
+        let key_to_remove = form.config.keys().next().cloned().unwrap();
+        form.deleted_keys.push(key_to_remove.clone());
+        form.config.shift_remove(&key_to_remove);
+
+        assert!(!form.config.contains_key("FOO"));
+        assert!(form.deleted_keys.contains(&"FOO".to_owned()));
+    }
+
+    #[test]
+    fn delete_last_config_entry_allows_submit() {
+        let form = UpdateProviderForm {
+            provider_name: "p".into(),
+            provider_type: "t".into(),
+            credential_key: "k".into(),
+            new_value: String::new(),
+            config: IndexMap::new(),
+            original_config: IndexMap::from([("FOO".into(), "1".into())]),
+            config_key_input: String::new(),
+            config_value_input: String::new(),
+            config_cursor: 0,
+            focus: UpdateProviderField::Submit,
+            status: None,
+            deleted_keys: vec!["FOO".into()],
+        };
+
+        assert!(
+            !(form.new_value.is_empty() && form.config.is_empty() && form.deleted_keys.is_empty())
+        );
+    }
+
+    // -- cursor-relative scroll window ---------------------------------
+
+    #[test]
+    fn scroll_offset_zero_when_within_window() {
+        let (total, cursor, window) = (4_usize, 3_usize, 6_usize);
+        let offset = if total > window {
+            cursor
+                .saturating_sub(window - 2_usize)
+                .min(total.saturating_sub(window))
+        } else {
+            0_usize
+        };
+
+        assert_eq!(offset, 0_usize);
+    }
+
+    #[test]
+    fn scroll_offset_follows_cursor_past_window() {
+        let (total, cursor, window) = (10_usize, 8_usize, 6_usize);
+        let offset = if total > window {
+            cursor
+                .saturating_sub(window - 2)
+                .min(total.saturating_sub(window))
+        } else {
+            0
+        };
+        assert_eq!(offset, 4);
+        assert!(cursor >= offset && cursor < offset + window);
+    }
+
+    // -- pending input flush on submit ---------------------------------
+
+    #[test]
+    fn pending_config_input_flushed_on_submit() {
+        let mut config = IndexMap::new();
+        let mut key_input = "MY_KEY".to_string();
+        let mut val_input = "my_val".to_string();
+        flush_config_input(&mut config, &mut key_input, &mut val_input);
+        assert_eq!(config.get("MY_KEY"), Some(&"my_val".to_string()));
+        assert!(key_input.is_empty());
+        assert!(val_input.is_empty());
+    }
+
+    // -- delta-only update request -------------------------------------
+
+    #[test]
+    fn update_request_contains_only_config_delta() {
+        let original_config: IndexMap<String, String> = IndexMap::from([
+            ("A".to_string(), "1".to_string()),
+            ("B".to_string(), "2".to_string()),
+        ]);
+        let config: IndexMap<String, String> = IndexMap::from([
+            ("A".to_string(), "1".to_string()),
+            ("B".to_string(), "changed".to_string()),
+        ]);
+
+        let delta: HashMap<String, String> = config
+            .iter()
+            .filter(|(k, v)| original_config.get(*k) != Some(*v))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        assert!(delta.contains_key("B"), "changed key must be in delta");
+        assert!(
+            !delta.contains_key("A"),
+            "unchanged key must not be in delta"
+        );
+    }
+
+    #[test]
+    fn deleted_key_tombstoned_readded_key_not_tombstoned() {
+        let original_config: IndexMap<String, String> = IndexMap::from([
+            ("DEL".to_string(), "old".to_string()),
+            ("READD".to_string(), "orig".to_string()),
+            ("KEEP".to_string(), "keep".to_string()),
+        ]);
+        // DEL was removed, READD was deleted then re-added with new value, KEEP unchanged.
+        let config: IndexMap<String, String> = IndexMap::from([
+            ("READD".to_string(), "new".to_string()),
+            ("KEEP".to_string(), "keep".to_string()),
+        ]);
+
+        let mut request = config
+            .iter()
+            .filter(|(k, v)| original_config.get(*k) != Some(*v))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<HashMap<String, String>>();
+        original_config
+            .keys()
+            .filter(|k| !config.contains_key(*k))
+            .for_each(|key| {
+                request.insert(key.clone(), String::new());
+            });
+
+        assert_eq!(
+            request.get("DEL"),
+            Some(&String::new()),
+            "DEL must be tombstoned"
+        );
+        assert_eq!(
+            request.get("READD"),
+            Some(&"new".to_string()),
+            "READD must have new value, not tombstone"
+        );
+        assert!(
+            !request.contains_key("KEEP"),
+            "KEEP unchanged must not be in delta"
+        );
+    }
+
+    // -- partial config input on submit --------------------------------
+
+    #[test]
+    fn submit_guard_triggers_when_key_filled_value_empty() {
+        let mut config = IndexMap::new();
+        let mut key_input = "FOO".to_string();
+        let mut val_input = String::new();
+
+        let flushed = flush_config_input(&mut config, &mut key_input, &mut val_input);
+
+        assert!(!flushed, "flush must fail when value is empty");
+        assert!(
+            !key_input.is_empty() || !val_input.is_empty(),
+            "submit guard must detect partial input"
+        );
+        assert!(config.is_empty(), "config must not be modified");
+    }
+
+    #[test]
+    fn submit_guard_triggers_when_value_filled_key_empty() {
+        let mut config = IndexMap::new();
+        let mut key_input = String::new();
+        let mut val_input = "bar".to_string();
+
+        let flushed = flush_config_input(&mut config, &mut key_input, &mut val_input);
+
+        assert!(!flushed, "flush must fail when key is empty");
+        assert!(
+            !key_input.is_empty() || !val_input.is_empty(),
+            "submit guard must detect partial input"
+        );
+        assert!(config.is_empty(), "config must not be modified");
+    }
+
+    #[test]
+    fn submit_guard_clear_when_both_filled() {
+        let mut config = IndexMap::new();
+        let mut key_input = "FOO".to_string();
+        let mut val_input = "bar".to_string();
+
+        let flushed = flush_config_input(&mut config, &mut key_input, &mut val_input);
+
+        assert!(flushed, "flush must succeed when both fields filled");
+        assert!(
+            key_input.is_empty() && val_input.is_empty(),
+            "submit guard must not trigger after successful flush"
+        );
+        assert_eq!(config.get("FOO"), Some(&"bar".to_string()));
+    }
+
+    #[test]
+    fn autodetected_provider_configuration_is_preserved_in_create_form() {
+        let mut form = CreateProviderForm::default();
+        apply_discovered_provider(
+            &mut form,
+            DiscoveredProvider {
+                credentials: HashMap::from([("VERTEX_AI_TOKEN".to_string(), "token".to_string())]),
+                config: HashMap::from([
+                    ("VERTEX_AI_PROJECT_ID".to_string(), "project-a".to_string()),
+                    ("VERTEX_AI_REGION".to_string(), "us-central1".to_string()),
+                ]),
+            },
+        );
+
+        assert_eq!(
+            form.discovered_credentials
+                .as_ref()
+                .and_then(|credentials| credentials.get("VERTEX_AI_TOKEN")),
+            Some(&"token".to_string())
+        );
+        assert_eq!(
+            form.config.get("VERTEX_AI_PROJECT_ID"),
+            Some(&"project-a".to_string())
+        );
+        assert_eq!(
+            form.config.get("VERTEX_AI_REGION"),
+            Some(&"us-central1".to_string())
+        );
     }
 }

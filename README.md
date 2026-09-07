@@ -1,4 +1,12 @@
-# NVIDIA OpenShell
+<!-- markdownlint-disable MD033 MD041 -->
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/brand/assets/openshell-banner-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/brand/assets/openshell-banner-light.png">
+  <img alt="OpenShell" src="docs/brand/assets/openshell-banner-light.png" width="430">
+</picture>
+
+<!-- markdownlint-enable MD033 MD041 -->
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue)](https://github.com/NVIDIA/OpenShell/blob/main/LICENSE)
 [![PyPI](https://img.shields.io/badge/PyPI-openshell-orange?logo=pypi)](https://pypi.org/project/openshell/)
@@ -8,15 +16,13 @@
 
 OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments that protect your data, credentials, and infrastructure — governed by declarative YAML policies that prevent unauthorized file access, data exfiltration, and uncontrolled network activity.
 
-OpenShell is built agent-first. The project ships with agent skills for everything from gateway troubleshooting to policy generation, and we expect contributors to use them.
-
-> **Alpha software — single-player mode.** OpenShell is proof-of-life: one developer, one environment, one gateway. We are building toward multi-tenant enterprise deployments, but the starting point is getting your own environment up and running. Expect rough edges. Bring your agent.
+OpenShell is built agent-first. It ships public agent skills for using and operating OpenShell, plus separate repository-aware workflows for contributors and maintainers.
 
 ## Quickstart
 
 ### Prerequisites
 
-- **A supported host** — macOS, Windows with WSL 2, or Linux.
+- **A supported host** — Linux, macOS (Apple Silicon), or Windows with WSL 2 (experimental).
 - **A local runtime** — Docker, Podman, or host virtualization enabled for MicroVM-backed sandboxes.
 
 ### Install
@@ -27,13 +33,13 @@ OpenShell is built agent-first. The project ships with agent skills for everythi
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 ```
 
-**From PyPI (requires [uv](https://docs.astral.sh/uv/)):**
+The installer installs the latest stable release by default. To install a specific version, set `OPENSHELL_VERSION`. A [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) is also available that tracks the latest commit on `main`.
+
+The `openshell` package on PyPI provides the Python SDK only. It does not install the `openshell` CLI. Add the SDK to a Python project with [uv](https://docs.astral.sh/uv/):
 
 ```bash
-uv tool install -U openshell
+uv add openshell
 ```
-
-Both methods install the latest stable release by default. To install a specific version, set `OPENSHELL_VERSION` (binary) or pin the version with `uv tool install openshell==<version>`. A [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) is also available that tracks the latest commit on `main`.
 
 **Helm chart:**
 
@@ -165,7 +171,7 @@ Docker-backed GPU sandboxes auto-select CDI when available and otherwise fall ba
 | `openshell sandbox create -- <agent>`                      | Create a sandbox and launch an agent.           |
 | `openshell sandbox connect [name]`                         | SSH into a running sandbox.                     |
 | `openshell sandbox list`                                   | List all sandboxes.                             |
-| `openshell provider create --type [type]] --from-existing` | Create a credential provider from env vars.     |
+| `openshell provider create --type [type] --from-existing`  | Create a credential provider from env vars.     |
 | `openshell policy set <name> --policy file.yaml`           | Apply or update a policy on a running sandbox.  |
 | `openshell policy get <name>`                              | Show the active policy.                         |
 | `openshell inference set --provider <p> --model <m>`       | Configure the `inference.local` endpoint.       |
@@ -198,43 +204,41 @@ openshell sandbox create --from ./my-sandbox-dir   # local Dockerfile
 openshell sandbox create --from registry.io/img:v1 # container image
 ```
 
-See the [community sandboxes](https://docs.nvidia.com/openshell/latest/sandboxes/community-sandboxes) catalog and the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for details.
+See the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog and the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for details.
 
-## Explore with Your Agent
+## Use OpenShell with Your Agent
 
-Clone the repo and point your coding agent at it. The project includes agent skills that can answer questions, walk you through workflows, and diagnose problems — no issue filing required.
+OpenShell provides four portable skills for users and operators: CLI workflows (`openshell-cli`), gateway troubleshooting (`debug-openshell-cluster`), inference troubleshooting (`debug-inference`), and policy generation (`generate-sandbox-policy`). Install them with the Agent Skills CLI:
 
 ```bash
-git clone https://github.com/NVIDIA/OpenShell.git   # or git@github.com:NVIDIA/OpenShell.git
-cd OpenShell
-# Point your agent here — it will discover the skills in .agents/skills/ automatically
+npx skills add NVIDIA/OpenShell
 ```
 
-Your agent can load skills for CLI usage (`openshell-cli`), gateway troubleshooting (`debug-openshell-cluster`), inference troubleshooting (`debug-inference`), policy generation (`generate-sandbox-policy`), and more. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full skills table.
+These public, installable skills live in [`skills/`](skills/) and use the installed CLI help and [published documentation](https://docs.nvidia.com/openshell/latest/index.html) as their sources of truth. They do not require an OpenShell source checkout.
 
 ## Built With Agents
 
-OpenShell is developed using the same agent-driven workflows it enables. The `.agents/skills/` directory contains workflow automation that powers the project's development cycle:
+OpenShell is developed using the same agent-driven workflows it enables. Contributor and maintainer skills live separately in [`.agents/skills/`](.agents/skills/); they automate work on the OpenShell repository and are not included when users install the public skills:
 
-- **Spike and build:** Investigate a problem with `create-spike`, then implement it with `build-from-issue` once a human approves.
-- **Triage and route:** Community issues are assessed with `triage-issue`, classified, and routed into the spike-build pipeline.
+- **Spike and build:** Investigate a problem with `create-spike`; a human accepts it with `state:accepted` or [roadmap](https://github.com/orgs/NVIDIA/projects/233) placement, or declines it. Accepted work can remain human-owned or enter the optional, human-gated `agent:*` planning and implementation workflow.
+- **Triage and route:** Community issues are assessed with `triage-issue`. Agents establish technical validity and impact; humans decide whether the project should act and where the work sits on the roadmap.
 - **Security review:** `review-security-issue` produces a severity assessment and remediation plan. `fix-security-issue` implements it.
-- **Policy authoring:** `generate-sandbox-policy` creates YAML policies from plain-language requirements or API documentation.
+- **Repository maintenance:** `sync-agent-infra`, `update-docs-from-commits`, and other internal workflows keep code, documentation, and agent infrastructure consistent.
 
-All implementation work is human-gated — agents propose plans, humans approve, agents build. See [AGENTS.md](AGENTS.md) for the full workflow chain documentation.
+Agent implementation is human-directed: a user may request a phase directly, or maintainers may use the optional `agent:*` workflow to queue and approve planning and implementation. See [AGENTS.md](AGENTS.md) for the full workflow chain documentation.
 
 ## Getting Help
 
 - **Questions and discussion:** [GitHub Discussions](https://github.com/NVIDIA/OpenShell/discussions)
 - **Bug reports:** [GitHub Issues](https://github.com/NVIDIA/OpenShell/issues) — use the bug report template
 - **Security vulnerabilities:** See [SECURITY.md](SECURITY.md) — do not use GitHub Issues
-- **Agent-assisted help:** Clone the repo and use the agent skills in `.agents/skills/` for self-service diagnostics
+- **Agent-assisted help:** Install the public OpenShell skills with `npx skills add NVIDIA/OpenShell`
 
 ## Learn More
 
 - [Full Documentation](https://docs.nvidia.com/openshell/latest/index.html) — overview, architecture, tutorials, and reference
 - [Quickstart](https://docs.nvidia.com/openshell/latest/get-started/quickstart) — detailed install and first sandbox walkthrough
-- [GitHub Sandbox Tutorial](https://docs.nvidia.com/openshell/latest/tutorials/github-sandbox) — end-to-end scoped GitHub repo access
+- [GitHub Sandbox Tutorial](https://docs.nvidia.com/openshell/latest/get-started/tutorials/github-sandbox) — end-to-end scoped GitHub repo access
 - [Architecture](https://github.com/NVIDIA/OpenShell/tree/main/architecture) — detailed architecture docs and design decisions
 - [Roadmap](https://github.com/orgs/NVIDIA/projects/233) — planned work and project priorities
 - [RFC Board](https://github.com/orgs/NVIDIA/projects/233/views/6) — RFC proposals tracked on the OpenShell Roadmap with the `rfc` label
@@ -244,19 +248,29 @@ All implementation work is human-gated — agents propose plans, humans approve,
 
 ## Contributing
 
-OpenShell is built agent-first — your agent is your first collaborator. Before opening issues or submitting code, point your agent at the repo and let it use the skills in `.agents/skills/` to investigate, diagnose, and prototype. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full agent skills table, contribution workflow, and development setup.
+OpenShell is built agent-first. Issues should include a user story, problem statement, impact, and acceptance criteria. The impact should explain the consequences of the current behavior and why existing workarounds are insufficient. Feature requests also require a workflow-level proposed design and alternatives; bug reports add reproduction steps, environment details, and relevant logs. Once work is authorized through the project workflow or a direct request, contributors should use the skills in `.agents/skills/` to investigate the current code and behavior, implement the change, and verify it. If an issue contains earlier diagnostics, verify them rather than relying on them. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full agent skills table, contribution workflow, and development setup.
 
 ## Telemetry
 
 OpenShell collects anonymous telemetry to help improve the project for developers. This data is not used to track individual user behavior. It helps us understand aggregate usage of sandbox, provider, and policy workflows so we can prioritize product improvements and share usage trends with the community.
 
-Disable telemetry at runtime by setting `OPENSHELL_TELEMETRY_ENABLED=false` on the gateway deployment. OpenShell propagates this deployment setting into sandbox supervisor environments so sandbox-side telemetry collection is disabled as well.
+Disable telemetry at runtime by setting `OPENSHELL_TELEMETRY_ENABLED=false` on the gateway deployment. For Helm installs, set `server.telemetryEnabled=false`. OpenShell propagates this deployment setting into sandbox supervisor environments so sandbox-side telemetry collection is disabled as well.
 
-You can also compile telemetry out entirely. Telemetry support is a default-on `telemetry` Cargo feature; building with `--no-default-features` produces binaries that contain no telemetry endpoint, no telemetry HTTP client, and no emission code. Build telemetry-free artifacts with, for example, `cargo build --release -p openshell-server --no-default-features` (gateway) and the equivalent for `openshell-sandbox` and `openshell-driver-vm`. With telemetry compiled out, the gateway emits nothing and reports telemetry disabled to the sandboxes it launches.
+You can also compile telemetry out entirely. Telemetry support is a default-on `telemetry` Cargo feature, and each crate that carries it also defines a `defaults-without-telemetry` alias covering every other default feature. Build telemetry-free artifacts with `--no-default-features --features defaults-without-telemetry`:
+
+```shell
+cargo build --release -p openshell-gateway --no-default-features --features defaults-without-telemetry
+cargo build --release -p openshell-sandbox --no-default-features --features defaults-without-telemetry
+cargo build --release -p openshell-driver-vm --no-default-features --features defaults-without-telemetry
+```
+
+The resulting binaries contain no telemetry endpoint, no telemetry HTTP client, and no emission code. With telemetry compiled out, the gateway emits nothing and reports telemetry disabled to the sandboxes it launches. Cargo has no way to subtract a single default feature, so `defaults-without-telemetry` must be paired with `--no-default-features`; passing it on its own leaves the defaults in place and fails the build rather than producing a binary that still emits.
 
 Telemetry events are limited to anonymous operational categories and counts, such as sandbox lifecycle outcomes, provider profile buckets, policy decision counts, and aggregate network activity denial categories. OpenShell telemetry does not collect sandbox names or IDs, hostnames, file paths, binary paths, prompts, credentials, provider names, model names, or user content.
 
 Opting out applies only to telemetry emitted by OpenShell. Third-party services, model providers, inference endpoints, agents, or tools that you configure and use with OpenShell may have their own terms and privacy practices.
+
+We publish aggregate usage trends from this telemetry every two weeks. See the [community telemetry reports](telemetry/README.md) for the latest summary.
 
 ## Notice and Disclaimer
 

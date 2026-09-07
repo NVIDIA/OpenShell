@@ -86,7 +86,6 @@ wait_for_ssh() {
 step "1/7  Creating sandbox \"${SANDBOX_NAME}\" (default-deny networking)"
 run openshell sandbox create \
     --name "$SANDBOX_NAME" \
-    --keep \
     --no-auto-providers \
     --no-tty \
     -- echo "sandbox ready"

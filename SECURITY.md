@@ -13,7 +13,7 @@ To report a potential security vulnerability in any NVIDIA product:
   - We encourage you to use the following PGP key for secure email communication: [NVIDIA public PGP Key for communication](https://www.nvidia.com/en-us/security/pgp-key)
   - Please include the following information:
     - Product/Driver name and version/branch that contains the vulnerability
-  - Type of vulnerability (code execution, denial of service, buffer overflow, etc.)
+    - Type of vulnerability (code execution, denial of service, buffer overflow, etc.)
     - Instructions to reproduce the vulnerability
     - Proof-of-concept or exploit code
     - Potential impact of the vulnerability, including how an attacker could exploit the vulnerability

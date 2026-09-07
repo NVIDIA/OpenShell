@@ -1,5 +1,5 @@
 name: Feature Request
-description: Propose a feature with a design. Not a "please build this" request.
+description: Propose a feature with a user story and design. Not a "please build this" request.
 type: Feature
 body:
   - type: markdown
@@ -7,15 +7,40 @@ body:
       value: |
         ## Design-First Feature Proposals
 
-        OpenShell feature requests must include a design proposal — describe the system behavior you want, not just the outcome. New features start here, not as RFC pull requests. If maintainers decide an RFC is necessary, they will request one from this issue and assign the RFC number.
+        OpenShell feature requests must include a user story and workflow-level design proposal. Describe who needs the feature, the problem it solves, why the current gap matters, the desired user-facing workflow, and the observable criteria for success. Leave implementation choices to the people building the feature. New features start here, not as RFC pull requests. If maintainers decide an RFC is necessary, they will request one from this issue and assign the RFC number.
 
         If your agent explored the codebase to assess feasibility (e.g., using the `create-spike` skill), include its findings.
+
+  - type: textarea
+    id: user-story
+    attributes:
+      label: User Story
+      description: Describe who needs this feature, what they need to do, and why it matters.
+      placeholder: |
+        As a <persona>,
+        I want <capability or outcome>,
+        so that <benefit or impact>.
+    validations:
+      required: true
 
   - type: textarea
     id: problem
     attributes:
       label: Problem Statement
-      description: What problem does this solve? Why does it matter?
+      description: Summarize the capability or behavior missing from OpenShell today. Focus on the gap itself; describe its consequences and current workarounds in Impact / Why This Matters.
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact / Why This Matters
+      description: |
+        Explain what users must do today and why that is insufficient. Describe the operational cost, security risk, blocked workflow, or adoption barrier caused by the problem. Include concrete evidence where available, but do not prescribe the solution.
+      placeholder: |
+        Without this feature, users must...
+        This results in...
+        This matters because...
     validations:
       required: true
 
@@ -24,7 +49,18 @@ body:
     attributes:
       label: Proposed Design
       description: |
-        How should this work? Describe the system behavior, components involved, and user-facing interface. This should be a design, not a wish list.
+        How should this work from the user's perspective? Describe the desired workflow and externally observable behavior. Avoid prescribing internal components or implementation unless they are essential constraints.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance Criteria
+      description: List specific, observable outcomes that would make this feature complete without prescribing how implementers achieve them.
+      placeholder: |
+        - [ ] <observable outcome>
+        - [ ] <observable outcome>
     validations:
       required: true
 
@@ -32,7 +68,7 @@ body:
     id: alternatives
     attributes:
       label: Alternatives Considered
-      description: What other approaches did you evaluate? Why is the proposed design better?
+      description: What other user-facing workflows or behaviors did you consider? Why does the proposed approach best satisfy the user story?
     validations:
       required: true
 

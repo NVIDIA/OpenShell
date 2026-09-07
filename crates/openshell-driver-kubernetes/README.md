@@ -3,8 +3,44 @@
 Kubernetes-backed compute driver for OpenShell cluster deployments.
 
 The driver uses the Kubernetes API to create, delete, fetch, and watch sandbox
-custom resources in the configured namespace. It runs in-process with the
-gateway server.
+custom resources. It runs in-process with the gateway server and supports three
+workspace namespace modes via `workspace_mode`:
+
+- **Shared** (default): All sandboxes render into a single static namespace.
+  Resource names use `{workspace}--{name}` for collision avoidance.
+- **Managed**: The driver auto-creates/deletes a K8s namespace per workspace
+  (`openshell-{gateway_id}-{workspace_name}`), creates a ServiceAccount in each,
+  and copies OpenShift SCC annotations from the gateway namespace when present.
+- **Operator**: Workspace names map 1:1 to pre-provisioned namespaces discovered
+  through exactly one source: either a label selector
+  (`operator_namespace_label`) or a drop-in allowlist file
+  (`operator_namespace_file`). Sandbox creation fails closed if the workspace
+  namespace is not in the current allowlist. Workspace deletion only removes
+  gateway state; it never deletes or otherwise accesses the operator-managed
+  Kubernetes namespace.
+
+When the gateway configures `[openshell.gateway.otlp]`, Kubernetes
+compute-driver spans export to the same OTLP/gRPC collector with the service
+name `openshell-driver-kubernetes`. The driver preserves the gateway trace
+context and uses the same compute-driver RPC span names in its in-process and
+standalone forms. Standalone deployments set `--gateway-name` or
+`OPENSHELL_GATEWAY_NAME` so exported spans carry the same
+`openshell.gateway.name` resource attribute as gateway spans.
+
+When it creates an Agent Sandbox resource, the driver serializes the active W3C
+trace context into the controller-reserved `opentelemetry.io/trace-context`
+annotation. An OTLP-enabled Agent Sandbox controller can therefore attach its
+asynchronous reconciliation spans to the originating OpenShell create trace.
+
+Workspace namespace modes assume exclusive control of the sandbox identity
+resource chain. In shared and managed modes, only the driver and its trusted
+Agent Sandbox controller may administer the sandbox namespace, Sandbox CRs,
+sandbox pods, or configured sandbox ServiceAccount. In operator mode, the
+platform operator owns namespace lifecycle but must prevent other principals
+from creating or mutating Sandbox CRs, creating sandbox pods with fabricated
+owner references, or using the configured sandbox ServiceAccount. Treat adding
+a namespace to the operator allowlist as granting this trust; the allowlist is
+not a tenant isolation boundary.
 
 ## Runtime Model
 
@@ -24,7 +60,9 @@ state and platform events into the shared compute-driver protobuf surface used
 by the gateway.
 
 Kubernetes API calls use explicit timeouts so gRPC handlers do not block
-indefinitely when the API server is slow or unavailable.
+indefinitely when the API server is slow or unavailable. Resource and Event
+watches recover in place with API-friendly backoff after transient watcher
+errors, avoiding a gateway-side watch restart and its associated watch gap.
 
 ## Workspace Persistence
 
@@ -36,6 +74,25 @@ This is a stopgap persistence model. It preserves user files across pod
 rescheduling but duplicates the base workspace and does not automatically apply
 image updates to existing PVCs. Future snapshotting should replace it.
 
+Stop preserves the Agent Sandbox resource and workspace PVC while stopping
+its pod. The driver sets `spec.operatingMode: Suspended` for `v1beta1` or
+`spec.replicas: 0` for `v1alpha1`. Start sets `Running` or one replica for the
+same resource, so the replacement pod mounts the existing claim. Delete is the
+only lifecycle operation that removes the Sandbox resource and its owned
+storage. The driver confirms the stop from both the published `Suspended`
+condition and deletion of the backing pod. Legacy `v1alpha1` controllers omit
+a usable stopped condition, so pod deletion alone confirms their stop.
+
+The workspace PVC size defaults to `workspace_default_storage_size`. Set
+`workspace_storage_class` to pin the PVC to a specific `StorageClass`; an empty
+value omits `storageClassName` so the cluster's default `StorageClass` applies.
+Clusters with no default `StorageClass` must set this, otherwise the PVC stays
+`Pending` and the sandbox never starts. Both fields can also be supplied at
+runtime via `OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE` and
+`OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS`. Both apply only to the workspace PVC
+that OpenShell provisions automatically; they have no effect when a `driver_config`
+mount attaches an existing PVC under `/sandbox`, which skips the default PVC.
+
 ## Credentials, TLS, and Relay
 
 The driver injects gateway callback configuration, sandbox identity, TLS client
@@ -46,16 +103,57 @@ Sandbox pods run as `service_account_name` and keep
 `automountServiceAccountToken: false`. The only Kubernetes token exposed to the
 supervisor is an explicit, audience-bound projected token mounted at
 `/var/run/secrets/openshell/token` for the one-shot `IssueSandboxToken`
-bootstrap exchange.
+bootstrap exchange. The Kubernetes driver authenticates that token through the
+compute-driver protocol using its own `service_account_name` and workspace-mode
+namespace policy; the gateway receives only the verified sandbox ID.
 
 The gateway uses the supervisor relay for connect, exec, and file sync. Sandbox
 pods do not need direct external ingress for SSH.
 
+The driver forwards the canonical main-process specification to the process
+supervisor and sets pod `restartPolicy: Never`. Main-process environment
+overrides stay local to that child; the sidecar bootstrap retains the unmodified
+provider environment used by later exec, editor, and SFTP sessions.
+
 ## Container Security Context
 
-The driver grants the sandbox agent container the Linux capabilities the
-supervisor needs for namespace setup and policy enforcement. It can also request
-a Kubernetes AppArmor profile through `app_armor_profile`.
+The default `combined` supervisor topology grants the sandbox agent container
+the Linux capabilities the supervisor needs for namespace setup and process,
+filesystem, and network policy enforcement.
+
+The `sidecar` supervisor topology moves pod-level network setup into a root init
+container. In the default process/binary-aware mode, the long-lived network
+sidecar runs as UID 0 with `allowPrivilegeEscalation: false`, drops default
+Linux capabilities, and adds only `SYS_PTRACE` plus `DAC_READ_SEARCH` for
+cross-UID workload `/proc` inspection. The agent container also runs as the
+resolved sandbox UID/GID with `allowPrivilegeEscalation: false` and
+`capabilities.drop: ["ALL"]`.
+Set `sidecar.process_binary_aware_network_policy = false` to run the network
+sidecar as the configured non-root `sidecar.proxy_uid`, omit the extra `/proc`
+inspection capabilities, and enforce endpoint/L7 network policy without
+matching `policy.binaries`.
+In this mode OpenShell preserves gateway session and SSH behavior, but the
+process supervisor does not perform root-to-sandbox privilege dropping or
+supervisor identity mount isolation. It still applies Landlock filesystem policy
+and child seccomp filters where the kernel/runtime supports them. Network
+endpoint and L7 policy remain enforced by the network sidecar, and
+sidecar pods use a shared process namespace so the network sidecar can resolve
+process/binary identity through `/proc/<entrypoint-pid>`.
+
+Sidecar mode keeps gateway credentials in the network sidecar. The agent
+container does not mount the projected service-account token used for sandbox
+token bootstrap, does not mount the sandbox client TLS secret, and does not get
+gateway callback environment variables. The process supervisor receives policy
+and provider environment state from the sidecar over a local control socket in
+the shared sidecar state volume. The sidecar accepts only the pre-workload
+process-supervisor connection, authenticates its UID/GID/PID with peer
+credentials, and removes the listener afterward. SSH relays use a Linux
+abstract socket whose peer PID must match that authenticated supervisor. Both
+supervisors exit if the control connection closes, coupling their container
+restart lifecycle before a new authoritative client can be established.
+
+The driver can request a Kubernetes AppArmor profile through
+`app_armor_profile`.
 
 Supported values are `Unconfined`, `RuntimeDefault`, and
 `Localhost/<profile-name>`. An empty or unset value omits
@@ -70,10 +168,11 @@ for `nvidia.com/gpu` and requests the configured GPU count in the workload spec.
 When no count is set, the driver requests one GPU resource. The sandbox image
 must provide the user-space libraries needed by the agent workload.
 
-## Driver Config POC
+## Driver Config
 
-The RFC 0005 POC accepts the selected `SandboxTemplate.driver_config.kubernetes`
-block as `DriverSandboxTemplate.driver_config`. The Kubernetes driver owns the
+Following RFC 0006, this driver accepts the selected
+`SandboxTemplate.driver_config.kubernetes` block as
+`DriverSandboxTemplate.driver_config`. The Kubernetes driver owns the
 nested schema and currently accepts:
 
 - `pod.node_selector`
@@ -82,6 +181,13 @@ nested schema and currently accepts:
 - `pod.priority_class_name`
 - `containers.agent.resources.requests`
 - `containers.agent.resources.limits`
+- `containers.agent.volume_mounts[].name`
+- `containers.agent.volume_mounts[].mount_path`
+- `containers.agent.volume_mounts[].sub_path`
+- `containers.agent.volume_mounts[].read_only`
+- `volumes[].name`
+- `volumes[].persistent_volume_claim.claim_name`
+- `volumes[].persistent_volume_claim.read_only`
 
 Nested keys inside the `kubernetes` block use snake_case. The top-level
 `driver_config` envelope is keyed by driver names, so `kubernetes` is not part
@@ -97,10 +203,57 @@ openshell sandbox create \
 ```
 
 Resource keys use native Kubernetes resource names and quantity strings. The
-POC parser renders the keys listed above and rejects unknown fields.
+parser renders the keys listed above and rejects unknown fields.
 `pod.runtime_class_name` maps to PodSpec `runtimeClassName` and overrides the
 driver's configured `default_runtime_class_name`; the typed public
 `SandboxTemplate.runtime_class_name` still takes precedence when set. Use the
 public `--gpu` flag for the default GPU request, pass a count to `--gpu` for
 counted GPU requests, and use `driver_config` only for additional driver-owned
 resource details.
+
+Use PVC volumes to mount existing Kubernetes PersistentVolumeClaims into the
+agent container. PVC volumes and mounts default to read-only unless
+`read_only: false` is set explicitly. Read-write access requires
+`read_only: false` on both the PVC volume and each writable mount. The driver
+rejects duplicate volume names, invalid DNS-1123 volume labels or PVC claim
+subdomain names, mounts that reference unknown volumes, non-normalized or
+protected mount paths, and absolute or parent-traversing `sub_path` values.
+
+Any explicit driver-config mount under `/sandbox` disables the driver's
+default `/sandbox` workspace PVC injection for that sandbox. Only the explicit
+mount paths persist through the external PVC; other `/sandbox` paths come from
+the current sandbox image.
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{
+    "kubernetes": {
+      "volumes": [{
+        "name": "user-data",
+        "persistent_volume_claim": {
+          "claim_name": "pvc-user-data-123",
+          "read_only": false
+        }
+      }],
+      "containers": {
+        "agent": {
+          "volume_mounts": [
+            {
+              "name": "user-data",
+              "mount_path": "/sandbox/.openshell/workspace",
+              "sub_path": "workspace",
+              "read_only": false
+            },
+            {
+              "name": "user-data",
+              "mount_path": "/sandbox/.openshell/memory",
+              "sub_path": "memory",
+              "read_only": false
+            }
+          ]
+        }
+      }
+    }
+  }' \
+  -- claude
+```

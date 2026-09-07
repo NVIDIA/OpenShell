@@ -28,6 +28,13 @@ enrichment adds existing GPU device nodes as read-write paths and promotes
 `/proc` to read-write because CUDA workloads write thread metadata under
 `/proc/<pid>/task/<tid>/comm`.
 
+Landlock rules are tailored to the inode type reported by the already-opened
+path descriptor. Directories retain the requested directory and file rights;
+regular files, device nodes, sockets, and other non-directories retain only
+file-compatible rights. This avoids rejecting valid mixed-path policies without
+weakening `hard_requirement`: genuine unsupported ABI capabilities and
+preparation failures still fail sandbox startup.
+
 ## Network Decisions
 
 Ordinary network traffic follows this order:
@@ -46,18 +53,21 @@ request is denied.
 ## Host Wildcards
 
 Network endpoint `host` patterns accept a `*` wildcard inside the first DNS
-label only. The OPA runtime matches with a `.` label boundary, so a wildcard
-never spans dots. The validator enforces the same boundary so that policy load
-fails fast instead of silently mismatching at the proxy.
+label and as an entire middle DNS label. The OPA runtime matches with a `.`
+label boundary, so a wildcard never spans dots. The validator enforces the same
+boundary so that policy load fails fast instead of silently mismatching at the
+proxy.
 
 | Pattern | Accepted | Example match | Notes |
 |---|---|---|---|
 | `*.example.com` | Yes | `api.example.com` | Single first label of any value. |
 | `**.example.com` | Yes | `a.b.example.com` | Recursive wildcard as the entire first label. |
 | `*-aiplatform.googleapis.com` | Yes | `us-central1-aiplatform.googleapis.com` | Intra-label wildcard inside the first DNS label. |
+| `*.s3.*.amazonaws.com` | Yes | `bucket.s3.us-east-1.amazonaws.com` | Middle-label `*` matches exactly one DNS label. |
 | `*` or `**` | No | — | Matches every host. |
 | `*.com`, `**.com` | No | — | TLD wildcards (`labels <= 2`). |
-| `foo.*.example.com` | No | — | Wildcard outside the first DNS label. |
+| `foo.us-*.example.com` | No | — | Partial middle-label wildcards are not allowed. |
+| `foo.**.example.com` | No | — | Recursive wildcard outside the first label is not allowed. |
 | `foo**.example.com` | No | — | Recursive `**` mixed inside a label; allowed only as the entire first label. |
 
 Validation rejects the disallowed patterns at policy load time with a message
@@ -71,13 +81,92 @@ with the sandbox's ephemeral CA and inspect method/path or protocol-specific
 metadata before forwarding. The proxy also supports credential injection on
 terminated HTTP streams when policy allows the endpoint.
 
+Static provider credentials have an independent endpoint-binding boundary.
+Provider profile endpoints define that boundary by default. An endpointless
+profile can delegate binding authority to sandbox policy through an endpoint
+that names the concrete attached provider instance. The gateway rejects
+unattached, profileless, endpointful, and gateway-global uses of that policy
+binding. Policy endpoint changes rotate the provider-environment revision so
+the supervisor installs policy and credential binding snapshots atomically.
+
 Raw streams and long-lived response bodies are connection scoped. Policy
-reloads affect the next connection or the next parsed HTTP request; they do not
-rewrite bytes already being relayed. HTTP upgrades switch to raw relay by
-default. A `protocol: rest` endpoint can opt in to
+generation changes close relays pinned to the previous generation instead of
+allowing them to continue under stale authorization. HTTP upgrades switch to
+raw relay by default. A `protocol: rest` endpoint can opt in to
 `websocket_credential_rewrite` for client-to-server WebSocket text messages
 after an allowed `101` upgrade; server-to-client traffic and all other upgraded
 protocols remain raw passthrough.
+
+A `protocol: tcp` hostname is a connection-routing constraint, not an
+application-authority boundary. Transparent capture validates the approved DNS
+name, pinned destination address, port, and calling binary before opening the
+stream, but it does not inspect TLS SNI, HTTP `Host`, or another protocol-level
+destination. Compatible shared infrastructure can therefore let a client
+select another tenant, virtual host, or service behind the approved front door.
+
+## Credentialed Endpoints
+
+OpenShell keeps provider credentials on paths it can inspect or rewrite by
+default. The gateway derives credential provenance from the attached providers
+and stamps it onto the effective policy at composition time. This provenance is
+internal, contains no credential identifiers or values, and is never trusted
+from user-authored policy.
+
+Every evaluation clears provenance across the whole policy and re-derives it
+from two sources:
+
+- the endpoints of attached provider profiles that carry credentials, and
+- the valid `credential_binding` entries of the sandbox policy that name an
+  attached provider whose profile is endpointless.
+
+A binding reduces to a host and port scope only. Dropping the path is
+deliberate: a path is not observable on an L4 or `tls: skip` endpoint, so a
+path-scoped derivation would omit the marker on exactly the surfaces the
+uninspected-credential gate exists to catch. A malformed binding — empty
+provider, missing host, or a port outside `1..=65535` — fails the evaluation
+instead of contributing a scope. Bindings naming an endpointful profile or an
+unattached provider contribute nothing; the gateway rejects those uses
+separately.
+
+Both sources merge into one deduplicated scope set, and each endpoint is
+stamped once per evaluation from that set, so binding-derived scopes reach the
+same gates as profile-derived ones. The stamp is an assignment, not an
+accumulation, so an endpoint that stops matching a credentialed scope — or
+whose binding was removed — loses its marker in the same pass. This must remain
+a full recomputation: a delta-based derivation would let a series of
+individually valid edits reach a state no single edit would have admitted.
+
+Credentialed L4-only and `tls: skip` endpoints fail policy validation unless the
+public `allow_uninspected_credentials` escape hatch is explicitly enabled. The
+flag defaults to `false` and is security-flagged in policy approval flows.
+Incremental merges only ever add the flag to a matching endpoint; clearing it
+requires removing the endpoint or replacing the policy.
+
+The network supervisor independently enforces the same boundary. Credentialed
+WebSocket upgrades use the parsed relay, binary frames fail closed, and text
+placeholders require rewrite. REST bodies can continue streaming when body
+rewrite is disabled, but the relay withholds enough trailing bytes to detect a
+placeholder split across reads before forwarding its marker. Explicitly opted-in
+endpoints retain raw passthrough behavior.
+
+Denials emit both the relevant network activity and a detection finding. Events
+identify only the destination, policy, and traffic surface; they never include
+credential names, placeholders, body content, or secret values.
+
+Credential provenance is gateway-derived and deliberately absent from the policy
+YAML schema, so it does not survive a policy that never transits the gateway.
+Gateway-delivered policy is the authoritative source for this control, and a
+policy without provenance applies neither the raw-tunnel refusal nor the
+WebSocket binary-frame refusal. The request-body backstop still applies, because
+it keys off the presence of a secret resolver rather than endpoint provenance.
+
+Two paths load a policy without provenance. A supervisor booting from a
+container-image policy is a bounded window: that policy is resynchronized to the
+gateway, which then serves a stamped effective policy. An explicit local Rego and
+data override is permanent, because gateway revisions are observed for settings
+and providers but never replace the local policy. When that override is combined
+with injected provider credentials, the supervisor emits a high-severity
+detection finding at startup naming the inactive controls.
 
 ## Live Updates
 
@@ -88,10 +177,37 @@ supervisor polls for config revisions and attempts to load new dynamic policy
 into the in-process OPA engine; CLI reads of the latest sandbox policy use the
 same effective configuration path.
 
-If a new policy fails validation or loading, the supervisor reports the failure
-and keeps the last-known-good policy. Static controls, such as filesystem
-allowlists and process identity, require a new sandbox because they are applied
-before the child process starts.
+The supervisor validates complete effective policy generations before
+activation. Overlapping endpoint selectors may contribute request allow and
+deny rules only when their connection and request-processing metadata agree;
+conflicting TLS, destination, credential, parser, or enforcement metadata
+rejects the complete generation. Plain L4 endpoints do not contribute
+request-processing metadata, so they may overlap an L7 endpoint when their
+connection metadata agrees. When request paths overlap, a path endpoint with a
+higher specificity rank deterministically overrides broader request-processing
+metadata. Equally specific overlapping endpoints must agree.
+
+Gateway mutation paths validate the complete effective candidate before
+persistence when the affected sandbox scope is known. Direct replacements,
+incremental merges and approvals, provider attachment, and profile fanout reject
+ambiguity atomically, without creating an invalid revision or partially
+activating an update. Supervisor validation remains the defense-in-depth
+boundary for startup, concurrent changes, and sources outside those mutations.
+
+The `[openshell.gateway] policy_validation_failure_mode` configuration controls
+candidates rejected by supervisor runtime validation. Gateway preflight
+rejections never become generations and leave the active policy unchanged. The
+runtime mode defaults to `fail_closed`, which publishes a quarantine generation,
+denies new egress, invalidates existing relays, and leaves the previous policy
+inactive. Operators may explicitly select
+`retain_last_valid`, which keeps the previous generation active. With no
+previous valid generation, the effective mode remains `fail_closed` regardless
+of the configured mode. The gateway distributes this startup configuration to
+sandbox supervisors with each effective policy snapshot. OCSF configuration and finding events state the
+candidate version, validation rationale, configured and effective modes, active
+generation, and whether the previous policy is active. Static controls,
+such as filesystem allowlists and process identity, require a new sandbox
+because they are applied before the child process starts.
 
 Gateway-global policy can override sandbox-scoped policy. Use it sparingly
 because it changes the effective access model for every sandbox on the gateway.
@@ -107,28 +223,103 @@ through the proposal loop instead of treating the denial as terminal.
 
 1. **Submit.** Both proposers POST through the same `SubmitPolicyAnalysis`
    path. Each chunk is persisted with its `analysis_mode` for audit provenance.
-2. **Validate.** The gateway runs the prover (`openshell-prover`) on every
-   chunk regardless of mode. The prover builds a Z3 model from the merged
-   policy plus the sandbox's attached-provider credential set, then computes
-   the delta of findings between the current baseline and the merged policy.
+   Agent-authored chunks cannot request `protocol: tcp` or `tls: skip`; the
+   sandbox-local API rejects those transport choices for immediate feedback,
+   and the gateway repeats the check before persistence.
+   Omitted-protocol endpoints remain available through the explicit proxy with
+   default TLS termination and HTTP authority checks. Administrators can still
+   author native TCP and raw TLS policy directly.
+2. **Build and validate the candidate.** The gateway first canonicalizes a
+   mechanistic proposal against the live effective policy. If an endpoint is
+   already governed by an inspected or provider-owned contract, the candidate
+   preserves that contract and adds only the proposed sandbox binary. Provider
+   rules are immutable inputs; the sandbox contribution is stored as an
+   overlay. The gateway then performs the same merge, policy validation,
+   provider composition, credential preflight, and prover evaluation that the
+   candidate would encounter when applied. Each chunk stores the resulting
+   effective candidate, its hashes, any application error, and a review token
+   derived from the candidate and its non-secret live inputs.
 3. **Auto-approval gate (proposer-agnostic, opt-in).** Auto-approval fires
-   when *both* (a) the prover delta is empty (`prover: no new findings`) AND
-   (b) the `proposal_approval_mode` setting resolves to `"auto"` — gateway
-   scope wins, sandbox scope is the per-sandbox override, default is
-   `"manual"`. When both hold, the gateway internally invokes the approve
-   path with actor identity `system:auto`. The audit event uses
-   `CONFIG:APPROVED` and carries `auto=true`, `source=<mode>`,
-   `prover_delta=empty`, and `resolved_from=<gateway|sandbox>` as unmapped
-   fields, with message text `"auto-approved: no new prover findings"` —
-   never `safe`. The opt-in gate preserves OpenShell's default-deny
-   posture: with no setting at either scope, every proposal lands in
-   `pending` for human review, even when the prover sees no findings.
+   only when *all three* conditions hold: (a) `proposal_approval_mode`
+   resolves to `"auto"` — gateway scope wins, sandbox scope is the
+   per-sandbox override, default is `"manual"`; (b) the prover delta is empty
+   (`prover: no new findings`); and (c) the security notes recomputed from
+   the chunk's current proposed rule are empty (see
+   [Security-notes gate](#security-notes-gate)). Before merging, the gateway
+   reloads the stored chunk and recomputes its candidate from live policy,
+   provider, and credential inputs. If the review token is unchanged, the
+   gateway reuses the persisted prover result. If it changed, the gateway
+   persists the refreshed candidate and requires a fresh review instead of
+   applying it. Decode, prover, merge, provider-composition, or credential
+   failures leave the chunk pending with an application error. The audit event uses `CONFIG:APPROVED` and carries
+   `auto=true`, `source=<mode>`, `prover_delta=empty`, and
+   `resolved_from=<gateway|sandbox>` as unmapped fields, with message text
+   `"auto-approved: no new prover findings"` — never `safe`. The opt-in gate
+   preserves OpenShell's default-deny posture: with no setting at either
+   scope, every proposal lands in `pending` for human review, even
+   when the prover sees no findings.
 4. **Implicit supersede.** On any successful submission, the gateway scans
    the sandbox's pending chunks for matches on `(host, port, binary)` and
    auto-rejects the older ones with reason `"superseded by chunk X"`. This
    gives the agent a refinement path (broad mechanistic L4 → narrow agent
    L7) without an explicit `supersedes_chunk_id` field.
-5. **Escalation.** Anything else lands in `pending` for human review.
+5. **Mechanistic dedup and self-reject.** Mechanistic submissions dedup on
+   `(host, port, binary)`: a repeat denial for an endpoint that already has a
+   draft row folds into that row (bumping `hit_count`) instead of creating a
+   new chunk. When the endpoint is already covered by a *different* approved
+   chunk, the redundant mechanistic submission self-rejects on arrival with
+   reason `"already covered by approved chunk X"`. This only ever acts on a
+   genuinely fresh, still-`pending` submission; it never rewrites the status
+   of an already-decided chunk. A dedup hit that resolves to an approved
+   row's own id leaves that chunk `approved` and merged — the self-reject
+   path does not un-merge a rule, so flipping an approved chunk to `rejected`
+   would leave the governance ledger disagreeing with the still-enforced
+   policy.
+6. **Escalation.** Anything else lands in `pending` for human review.
+
+After any successful policy write, pending chunks already covered by the new
+live effective policy are rejected as redundant. This keeps the review inbox
+aligned with what the sandbox currently enforces.
+
+Endpoint and binary advisor markers are provenance, not authorization or
+connection metadata. Provider- or user-authored declarations carry explicit
+provenance; `policy.local` declarations carry advisor provenance. A difference
+in endpoint provenance alone is compatible during effective-policy ambiguity
+validation. When identical endpoint or binary identities merge, an explicit
+declaration dominates an advisor declaration. Proposal coverage likewise
+ignores provenance so an approved overlay converges when an existing explicit
+declaration already supplies the same identity.
+
+This compatibility does not weaken SSRF classification. Exact-host trust
+requires one matching rule to contain both an exact explicit endpoint and an
+explicit binary identity. An advisor-only endpoint or binary cannot assemble
+that trust from unrelated rules. A provider rule may independently establish
+trust for its own explicit endpoint and binary pair, but an advisor overlay
+does not broaden that pair to a different binary.
+
+### Security-notes gate
+
+Separately from the prover, each chunk carries advisory `security_notes`.
+Reads, bulk approval, and auto-approval regenerate them from the current
+stored proposed rule instead of trusting a persisted value that may be stale
+after an edit. Non-empty notes block auto-approval and make
+`ApproveAllDraftChunks` skip the chunk unless `include_security_flagged` is
+set. The chunk stays `pending`; an explicit human approval can still merge a
+flagged chunk.
+
+Private/internal destinations are advisory, not blocking. A literal endpoint
+IP, `allowed_ips` entry, or CIDR intersection in RFC 1918, CGNAT
+`100.64.0.0/10`, IPv6 ULA `fc00::/7`, or another special-use range covered by
+`openshell-core` `net::is_internal_net` produces a note. A hostless rule
+carrying `allowed_ips` earns an extra note because it can match any hostname
+resolving into the range.
+
+Always-blocked destinations are separate from this advisory classification.
+Loopback, link-local, and unspecified IPs/CIDRs, plus `localhost` and known
+metadata endpoint hostnames, are excluded from security notes. Submit and edit
+may store such a draft, but existing merge validation rejects it when an
+approval attempts to add it to policy; runtime SSRF protections remain the
+final enforcement boundary.
 
 ## What the prover decides
 
@@ -179,6 +370,10 @@ Sandbox events that represent observable behavior use OCSF structured logs:
 
 Use plain tracing for internal plumbing such as retries, debug state, and
 intermediate steps where the final observable event is logged separately.
+Forward-proxy success is a final observable event: emit it only after
+middleware, token grants, credential rewriting, policy-generation checks, and
+the HTTP relay have succeeded so a later denial cannot coexist with an allowed
+record for the same request.
 
 Never log secrets, credentials, bearer tokens, or query parameters in OCSF
 messages. OCSF JSONL output may be shipped to external systems.

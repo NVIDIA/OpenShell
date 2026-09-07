@@ -6,17 +6,22 @@
 from __future__ import annotations
 
 from .sandbox import (
-    ClusterInferenceConfig,
+    ClientCredentialsAuth,
     ExecChunk,
     ExecResult,
     InferenceRouteClient,
+    InferenceRouteConfig,
     Sandbox,
     SandboxClient,
     SandboxError,
     SandboxRef,
     SandboxSession,
     SandboxStatusRef,
+    SandboxTemplateClient,
+    SandboxWorkloadTemplateProvenanceRef,
     TlsConfig,
+    WorkspaceClient,
+    WorkspaceRef,
 )
 
 try:
@@ -27,16 +32,21 @@ except Exception:
     __version__ = "0.0.0"
 
 __all__ = [
-    "ClusterInferenceConfig",
+    "ClientCredentialsAuth",
     "ExecChunk",
     "ExecResult",
     "InferenceRouteClient",
+    "InferenceRouteConfig",
     "Sandbox",
     "SandboxClient",
     "SandboxError",
     "SandboxRef",
     "SandboxSession",
     "SandboxStatusRef",
+    "SandboxTemplateClient",
+    "SandboxWorkloadTemplateProvenanceRef",
     "TlsConfig",
+    "WorkspaceClient",
+    "WorkspaceRef",
     "__version__",
 ]

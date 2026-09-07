@@ -67,3 +67,11 @@ Or manually against a running gateway with `agent_policy_proposals_enabled=true`
 ```bash
 OPENSHELL_BIN=target/debug/openshell bash e2e/policy-advisor/mechanistic-smoke.sh
 ```
+
+The #2821 regression additionally verifies that a denial on an existing
+inspected endpoint becomes a binary expansion, auto-approves, hot-reloads, and
+does not downgrade the endpoint to L4:
+
+```bash
+mise run e2e:mechanistic-existing-endpoint
+```

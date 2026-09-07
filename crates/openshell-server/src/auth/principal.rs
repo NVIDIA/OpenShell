@@ -70,7 +70,8 @@ pub enum SandboxIdentitySource {
     /// Per-sandbox client certificate. Reserved for channel-bound sandbox
     /// identity.
     BootstrapCert { fingerprint: String },
-    /// K8s `ServiceAccount` token used to bootstrap a gateway-minted JWT
-    /// via `IssueSandboxToken`. Populated only on that one RPC path.
-    K8sServiceAccount { pod_name: String, pod_uid: String },
+    /// Driver-native credential used to bootstrap a gateway-minted JWT via
+    /// `IssueSandboxToken`. The named compute driver authenticated only the
+    /// sandbox identity; the gateway still authorizes the exchange.
+    ComputeDriver { driver_name: String },
 }

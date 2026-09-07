@@ -8,21 +8,30 @@
 //! on every proxy CONNECT request.
 
 use miette::Result;
+use openshell_core::host_pattern::HostSelector;
 use openshell_core::policy::{
     FilesystemPolicy, LandlockCompatibility, LandlockPolicy, ProcessPolicy,
 };
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use openshell_policy::L7ConfigStanza;
+use openshell_supervisor_middleware::{ChainEntry, ChainRunner, MiddlewareRegistry};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, RwLock,
     atomic::{AtomicU64, Ordering},
 };
+use tokio::sync::watch;
+use tracing::info;
 
 /// Baked-in rego rules for OPA policy evaluation.
 /// These rules define the network access decision logic and static config
 /// passthroughs. They reference `data.sandbox.*` for policy data.
 const BAKED_POLICY_RULES: &str = include_str!("../data/sandbox-policy.rego");
+
+/// Implementation-owned middleware config validation supplied by the active
+/// in-process catalog for local policy files.
+pub type MiddlewareConfigValidator =
+    dyn Fn(&str, &prost_types::Struct) -> Result<(), String> + Send + Sync;
 
 /// Result of evaluating a network access request against OPA policy.
 pub struct PolicyDecision {
@@ -41,6 +50,34 @@ pub enum NetworkAction {
     Deny { reason: String },
 }
 
+/// Endpoint identity and metadata captured with one policy generation.
+#[derive(Debug, Clone)]
+pub struct MatchedEndpoint {
+    pub policy_name: String,
+    pub endpoint_index: usize,
+    pub endpoint: regorus::Value,
+}
+
+/// Policy-DNS eligible endpoint metadata captured from one policy generation.
+///
+/// This is policy data only. It deliberately contains no process identity or
+/// network authorization decision.
+#[derive(Debug, Clone)]
+pub struct PolicyDnsEligibilitySnapshot {
+    pub endpoints: Vec<MatchedEndpoint>,
+    pub generation: u64,
+}
+
+/// Atomic policy result used to authorize and materialize one egress request.
+#[derive(Debug, Clone)]
+pub struct EgressAuthorization {
+    pub action: NetworkAction,
+    pub endpoint_configs: Vec<regorus::Value>,
+    pub matched_endpoints: Vec<MatchedEndpoint>,
+    pub exact_declared_endpoint_host: bool,
+    pub generation: u64,
+}
+
 /// Input for a network access policy evaluation.
 pub struct NetworkInput {
     pub host: String,
@@ -53,6 +90,49 @@ pub struct NetworkInput {
     /// process and its ancestors. Captures script paths (e.g. `/usr/local/bin/claude`)
     /// that don't appear in `/proc/<pid>/exe` because the interpreter (node) is the exe.
     pub cmdline_paths: Vec<PathBuf>,
+}
+
+pub(crate) fn network_binary_identity_required() -> bool {
+    std::env::var(openshell_core::sandbox_env::NETWORK_BINARY_IDENTITY).map_or(true, |value| {
+        !matches!(
+            value.as_str(),
+            "relaxed" | "disabled" | "endpoint-only" | "false" | "0"
+        )
+    })
+}
+
+fn inject_runtime_policy_data(data: &mut serde_json::Value, require_binary_identity: bool) {
+    let Some(obj) = data.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "runtime".to_string(),
+        serde_json::json!({
+            "require_binary_identity": require_binary_identity,
+        }),
+    );
+}
+
+fn emit_binary_identity_mode(require_binary_identity: bool, source: &str) {
+    info!(
+        require_binary_identity,
+        source, "Configured OPA runtime binary identity mode"
+    );
+    openshell_ocsf::ocsf_emit!(
+        openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+            .severity(openshell_ocsf::SeverityId::Informational)
+            .status(openshell_ocsf::StatusId::Success)
+            .state(openshell_ocsf::StateId::Enabled, "configured")
+            .unmapped(
+                "require_binary_identity",
+                serde_json::json!(require_binary_identity)
+            )
+            .unmapped("source", serde_json::json!(source))
+            .message(format!(
+                "OPA runtime binary identity mode configured [source:{source} require_binary_identity:{require_binary_identity}]"
+            ))
+            .build()
+    );
 }
 
 /// Sandbox configuration extracted from OPA data at startup.
@@ -71,6 +151,28 @@ pub struct SandboxConfig {
 pub struct OpaEngine {
     engine: Mutex<regorus::Engine>,
     generation: Arc<AtomicU64>,
+    middleware_runner: RwLock<ChainRunner>,
+    websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
+    generation_tx: watch::Sender<u64>,
+    fail_closed_reason: RwLock<Option<String>>,
+}
+
+#[cfg(test)]
+static TEST_OPA_QUERY_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn record_test_opa_query() {
+    TEST_OPA_QUERY_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_opa_query_count() {
+    TEST_OPA_QUERY_COUNT.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn test_opa_query_count() -> u64 {
+    TEST_OPA_QUERY_COUNT.load(Ordering::SeqCst)
 }
 
 /// Generation guard captured when an HTTP tunnel or request path starts.
@@ -78,6 +180,7 @@ pub struct OpaEngine {
 pub struct PolicyGenerationGuard {
     captured_generation: u64,
     current_generation: Arc<AtomicU64>,
+    generation_rx: watch::Receiver<u64>,
 }
 
 impl PolicyGenerationGuard {
@@ -103,6 +206,19 @@ impl PolicyGenerationGuard {
         }
         Ok(())
     }
+
+    /// Wait until the policy generation changes.
+    ///
+    /// Relay boundaries use this to close even an idle or raw stream as soon
+    /// as a new generation (including fail-closed quarantine) is published.
+    pub async fn wait_until_stale(&self) {
+        let mut receiver = self.generation_rx.clone();
+        while !self.is_stale() {
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 /// Per-tunnel L7 policy evaluator bound to the engine generation captured when
@@ -110,6 +226,8 @@ impl PolicyGenerationGuard {
 pub struct TunnelPolicyEngine {
     engine: Mutex<regorus::Engine>,
     generation_guard: PolicyGenerationGuard,
+    middleware_runner: ChainRunner,
+    websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
 }
 
 impl TunnelPolicyEngine {
@@ -132,13 +250,67 @@ impl TunnelPolicyEngine {
     pub(crate) fn engine(&self) -> &Mutex<regorus::Engine> {
         &self.engine
     }
+
+    pub(crate) fn middleware_runner(&self) -> &ChainRunner {
+        &self.middleware_runner
+    }
+
+    pub(crate) fn websocket_assembly_budget(
+        &self,
+    ) -> crate::l7::websocket::WebSocketAssemblyBudget {
+        self.websocket_assembly_budget.clone()
+    }
+
+    /// Query the ordered middleware chain for a destination within this tunnel.
+    pub fn query_middleware_chain(&self, input: &NetworkInput) -> Result<Vec<ChainEntry>> {
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        query_middleware_chain_locked(&mut engine, input)
+    }
 }
 
 impl OpaEngine {
+    pub(crate) fn websocket_assembly_budget(
+        &self,
+    ) -> crate::l7::websocket::WebSocketAssemblyBudget {
+        self.websocket_assembly_budget.clone()
+    }
+
+    fn with_engine(engine: regorus::Engine) -> Self {
+        let generation = Arc::new(AtomicU64::new(0));
+        let (generation_tx, _) = watch::channel(0);
+        Self {
+            engine: Mutex::new(engine),
+            generation,
+            middleware_runner: RwLock::new(ChainRunner::default()),
+            websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
+            generation_tx,
+            fail_closed_reason: RwLock::new(None),
+        }
+    }
+
+    fn advance_generation(&self) -> u64 {
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.generation_tx.send_replace(generation);
+        generation
+    }
+
     /// Load policy from a `.rego` rules file and data from a YAML file.
     ///
     /// Preprocesses the YAML data to expand access presets and validate L7 config.
     pub fn from_files(policy_path: &Path, data_path: &Path) -> Result<Self> {
+        Self::from_files_with_middleware_config(policy_path, data_path, None)
+    }
+
+    /// Load local policy files and validate implementation-owned middleware
+    /// config through the catalog installed by the supervisor.
+    pub fn from_files_with_middleware_config(
+        policy_path: &Path,
+        data_path: &Path,
+        validate_middleware_config: Option<&MiddlewareConfigValidator>,
+    ) -> Result<Self> {
         let yaml_str = std::fs::read_to_string(data_path).map_err(|e| {
             miette::miette!("failed to read YAML data from {}: {e}", data_path.display())
         })?;
@@ -146,32 +318,68 @@ impl OpaEngine {
         engine
             .add_policy_from_file(policy_path)
             .map_err(|e| miette::miette!("{e}"))?;
-        let data_json = preprocess_yaml_data(&yaml_str)?;
+        let require_binary_identity = network_binary_identity_required();
+        emit_binary_identity_mode(require_binary_identity, "files");
+        let data_json = preprocess_yaml_data(
+            &yaml_str,
+            require_binary_identity,
+            validate_middleware_config,
+        )?;
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self {
-            engine: Mutex::new(engine),
-            generation: Arc::new(AtomicU64::new(0)),
-        })
+        Ok(Self::with_engine(engine))
     }
 
     /// Load policy rules and data from strings (data is YAML).
     ///
     /// Preprocesses the YAML data to expand access presets and validate L7 config.
     pub fn from_strings(policy: &str, data_yaml: &str) -> Result<Self> {
+        Self::from_strings_with_options(policy, data_yaml, network_binary_identity_required(), None)
+    }
+
+    pub fn from_strings_with_middleware_config(
+        policy: &str,
+        data_yaml: &str,
+        validate_middleware_config: Option<&MiddlewareConfigValidator>,
+    ) -> Result<Self> {
+        Self::from_strings_with_options(
+            policy,
+            data_yaml,
+            network_binary_identity_required(),
+            validate_middleware_config,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_strings_with_binary_identity_required(
+        policy: &str,
+        data_yaml: &str,
+        require_binary_identity: bool,
+    ) -> Result<Self> {
+        Self::from_strings_with_options(policy, data_yaml, require_binary_identity, None)
+    }
+
+    fn from_strings_with_options(
+        policy: &str,
+        data_yaml: &str,
+        require_binary_identity: bool,
+        validate_middleware_config: Option<&MiddlewareConfigValidator>,
+    ) -> Result<Self> {
         let mut engine = regorus::Engine::new();
         engine
             .add_policy("policy.rego".into(), policy.into())
             .map_err(|e| miette::miette!("{e}"))?;
-        let data_json = preprocess_yaml_data(data_yaml)?;
+        emit_binary_identity_mode(require_binary_identity, "strings");
+        let data_json = preprocess_yaml_data(
+            data_yaml,
+            require_binary_identity,
+            validate_middleware_config,
+        )?;
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self {
-            engine: Mutex::new(engine),
-            generation: Arc::new(AtomicU64::new(0)),
-        })
+        Ok(Self::with_engine(engine))
     }
 
     /// Create OPA engine from a typed proto policy.
@@ -193,25 +401,55 @@ impl OpaEngine {
     /// gap between user-specified symlink paths (e.g., `/usr/bin/python3`) and
     /// kernel-resolved canonical paths (e.g., `/usr/bin/python3.11`).
     pub fn from_proto_with_pid(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> Result<Self> {
-        let data_json_str = proto_to_opa_data_json(proto, entrypoint_pid);
+        Self::from_proto_with_pid_and_binary_identity_required(
+            proto,
+            entrypoint_pid,
+            network_binary_identity_required(),
+        )
+    }
+
+    fn from_proto_with_pid_and_binary_identity_required(
+        proto: &ProtoSandboxPolicy,
+        entrypoint_pid: u32,
+        require_binary_identity: bool,
+    ) -> Result<Self> {
+        // Protobuf cannot distinguish an omitted repeated MCP version field
+        // from an empty one. Canonicalize before any runtime consumer reads
+        // the policy so both representations select the pinned default.
+        let proto = openshell_policy::validate_and_canonicalize_sandbox_policy(proto.clone())
+            .map_err(|error| {
+                let errors = error
+                    .violations()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                miette::miette!("policy validation failed:\n{errors}")
+            })?;
+
+        let ambiguities = openshell_policy::find_endpoint_ambiguities(&proto);
+        if !ambiguities.is_empty() {
+            return Err(miette::miette!(
+                "network endpoint ambiguity validation failed:\n{}",
+                ambiguities
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+
+        emit_binary_identity_mode(require_binary_identity, "proto");
+        let data_json_str = proto_to_opa_data_json(&proto, entrypoint_pid);
 
         // Parse back to Value for preprocessing, then re-serialize
         let mut data: serde_json::Value = serde_json::from_str(&data_json_str)
             .map_err(|e| miette::miette!("internal: failed to parse proto JSON: {e}"))?;
+        inject_runtime_policy_data(&mut data, require_binary_identity);
 
         // Validate BEFORE expanding presets
         let (errors, warnings) = crate::l7::validate_l7_policies(&data);
-        for w in &warnings {
-            openshell_ocsf::ocsf_emit!(
-                openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                    .severity(openshell_ocsf::SeverityId::Medium)
-                    .status(openshell_ocsf::StatusId::Success)
-                    .state(openshell_ocsf::StateId::Enabled, "validated")
-                    .unmapped("warning", serde_json::json!(w.clone()))
-                    .message(format!("L7 policy validation warning: {w}"))
-                    .build()
-            );
-        }
+        emit_l7_config_warnings(&warnings, "L7 policy validation warning");
         if !errors.is_empty() {
             return Err(miette::miette!(
                 "L7 policy validation failed:\n{}",
@@ -222,7 +460,8 @@ impl OpaEngine {
         normalize_l7_policy_rule_aliases(&mut data);
 
         // Expand access presets to explicit rules after validation
-        crate::l7::expand_access_presets(&mut data);
+        let expansion_warnings = crate::l7::expand_access_presets(&mut data);
+        emit_l7_config_warnings(&expansion_warnings, "L7 access preset expansion warning");
 
         let data_json = data.to_string();
         let mut engine = regorus::Engine::new();
@@ -232,10 +471,7 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self {
-            engine: Mutex::new(engine),
-            generation: Arc::new(AtomicU64::new(0)),
-        })
+        Ok(Self::with_engine(engine))
     }
 
     /// Evaluate a network access request against the loaded policy.
@@ -244,36 +480,27 @@ impl OpaEngine {
     /// `allow_network` rule, and returns a `PolicyDecision` with the result,
     /// deny reason, and matched policy name.
     pub fn evaluate_network(&self, input: &NetworkInput) -> Result<PolicyDecision> {
-        let ancestor_strs: Vec<String> = input
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let cmdline_strs: Vec<String> = input
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let input_json = serde_json::json!({
-            "exec": {
-                "path": input.binary_path.to_string_lossy(),
-                "ancestors": ancestor_strs,
-                "cmdline_paths": cmdline_strs,
-            },
-            "network": {
-                "host": input.host,
-                "port": input.port,
-            }
-        });
+        let input_json = network_input_json(input);
 
         let mut engine = self
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
 
-        engine
-            .set_input_json(&input_json.to_string())
-            .map_err(|e| miette::miette!("{e}"))?;
+        let fail_closed_reason = self
+            .fail_closed_reason
+            .read()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
+            .clone();
+        if let Some(reason) = fail_closed_reason {
+            return Ok(PolicyDecision {
+                allowed: false,
+                reason,
+                matched_policy: None,
+            });
+        }
+
+        set_regorus_input(&mut engine, input_json)?;
 
         let allowed = engine
             .eval_rule("data.openshell.sandbox.allow_network".into())
@@ -314,27 +541,17 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(NetworkAction, u64)> {
-        let ancestor_strs: Vec<String> = input
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let cmdline_strs: Vec<String> = input
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let input_json = serde_json::json!({
-            "exec": {
-                "path": input.binary_path.to_string_lossy(),
-                "ancestors": ancestor_strs,
-                "cmdline_paths": cmdline_strs,
-            },
-            "network": {
-                "host": input.host,
-                "port": input.port,
-            }
-        });
+        let authorization = self.authorize_egress(input)?;
+        Ok((authorization.action, authorization.generation))
+    }
+
+    /// Authorize egress and return all connection metadata from one Rego result
+    /// evaluated against one policy generation.
+    pub fn authorize_egress(&self, input: &NetworkInput) -> Result<EgressAuthorization> {
+        #[cfg(test)]
+        record_test_opa_query();
+
+        let input_json = network_input_json(input);
 
         let mut engine = self
             .engine
@@ -342,33 +559,100 @@ impl OpaEngine {
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         let generation = self.current_generation();
 
-        engine
-            .set_input_json(&input_json.to_string())
-            .map_err(|e| miette::miette!("{e}"))?;
+        let fail_closed_reason = self
+            .fail_closed_reason
+            .read()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
+            .clone();
+        if let Some(reason) = fail_closed_reason {
+            return Ok(EgressAuthorization {
+                action: NetworkAction::Deny { reason },
+                endpoint_configs: Vec::new(),
+                matched_endpoints: Vec::new(),
+                exact_declared_endpoint_host: false,
+                generation,
+            });
+        }
 
-        let action_val = engine
-            .eval_rule("data.openshell.sandbox.network_action".into())
-            .map_err(|e| miette::miette!("{e}"))?;
-        let action_str = value_to_string(&action_val);
+        set_regorus_input(&mut engine, input_json)?;
 
-        let matched = engine
-            .eval_rule("data.openshell.sandbox.matched_network_policy".into())
+        let result = engine
+            .eval_rule("data.openshell.sandbox.egress_authorization".into())
             .map_err(|e| miette::miette!("{e}"))?;
-        let matched_policy = if matched == regorus::Value::Undefined {
-            None
+        let action_str = get_str(&result, "action").unwrap_or_default();
+        let matched_policy = get_str(&result, "matched_policy").filter(|name| !name.is_empty());
+        let endpoint_configs = match get_field(&result, "endpoint_configs") {
+            Some(regorus::Value::Array(values)) => values.to_vec(),
+            _ => Vec::new(),
+        };
+        let matched_endpoints = match get_field(&result, "matched_endpoints") {
+            Some(regorus::Value::Array(values)) => {
+                values.iter().filter_map(parse_matched_endpoint).collect()
+            }
+            _ => Vec::new(),
+        };
+        let exact_declared_endpoint_host =
+            get_bool(&result, "exact_declared_endpoint_host").unwrap_or(false);
+
+        let action = if action_str == "allow" {
+            NetworkAction::Allow { matched_policy }
         } else {
-            Some(value_to_string(&matched))
+            NetworkAction::Deny {
+                reason: get_str(&result, "deny_reason")
+                    .filter(|reason| !reason.is_empty())
+                    .unwrap_or_else(|| "network connections not allowed by policy".to_string()),
+            }
         };
 
-        if action_str == "allow" {
-            Ok((NetworkAction::Allow { matched_policy }, generation))
-        } else {
-            let reason_val = engine
-                .eval_rule("data.openshell.sandbox.deny_reason".into())
-                .map_err(|e| miette::miette!("{e}"))?;
-            let reason = value_to_string(&reason_val);
-            Ok((NetworkAction::Deny { reason }, generation))
+        Ok(EgressAuthorization {
+            action,
+            endpoint_configs,
+            matched_endpoints,
+            exact_declared_endpoint_host,
+            generation,
+        })
+    }
+
+    /// Return all explicit TCP endpoints eligible for policy DNS.
+    ///
+    /// The owned endpoint records and generation are captured while holding
+    /// the engine lock, so reloads cannot mix data from one generation with
+    /// the generation number of another. Fail-closed quarantine produces an
+    /// empty snapshot for its quarantine generation.
+    pub fn policy_dns_eligibility_snapshot(&self) -> Result<PolicyDnsEligibilitySnapshot> {
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let generation = self.current_generation();
+
+        if self
+            .fail_closed_reason
+            .read()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
+            .is_some()
+        {
+            return Ok(PolicyDnsEligibilitySnapshot {
+                endpoints: Vec::new(),
+                generation,
+            });
         }
+
+        let value = engine
+            .eval_rule("data.openshell.sandbox.policy_dns_eligible_endpoint_records".into())
+            .map_err(|error| miette::miette!("{error}"))?;
+        let endpoints = match value {
+            regorus::Value::Array(values) => {
+                values.iter().filter_map(parse_matched_endpoint).collect()
+            }
+            regorus::Value::Undefined => Vec::new(),
+            other => parse_matched_endpoint(&other).into_iter().collect(),
+        };
+
+        Ok(PolicyDnsEligibilitySnapshot {
+            endpoints,
+            generation,
+        })
     }
 
     /// Reload policy and data from strings (data is YAML).
@@ -388,7 +672,11 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         *engine = new_engine;
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        *self
+            .fail_closed_reason
+            .write()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
+        self.advance_generation();
         Ok(())
     }
 
@@ -423,13 +711,160 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         *engine = new_engine;
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        *self
+            .fail_closed_reason
+            .write()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
+        self.advance_generation();
         Ok(())
+    }
+
+    /// Reload the policy and middleware registry as one runtime generation.
+    ///
+    /// Both replacements are prepared before the live locks are acquired. The
+    /// engine and runner are then swapped while holding both locks, followed by
+    /// a single generation increment. A preparation or lock failure leaves the
+    /// live pair and generation untouched.
+    pub fn reload_policy_and_middleware_from_proto_with_pid(
+        &self,
+        proto: &ProtoSandboxPolicy,
+        entrypoint_pid: u32,
+        registry: MiddlewareRegistry,
+    ) -> Result<()> {
+        let new = Self::from_proto_with_pid(proto, entrypoint_pid)?;
+        let new_engine = new
+            .engine
+            .into_inner()
+            .map_err(|_| miette::miette!("lock poisoned on new engine"))?;
+        // Match clone_engine_for_tunnel's lock order (engine, then runner) so
+        // readers can observe only the old pair or the new pair.
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let mut runner = self
+            .middleware_runner
+            .write()
+            .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
+        let new_runner = runner.with_replacement_registry(registry);
+        *engine = new_engine;
+        *runner = new_runner;
+        *self
+            .fail_closed_reason
+            .write()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
+        self.advance_generation();
+        Ok(())
+    }
+
+    /// Publish a deny-all quarantine generation without activating any part
+    /// of the invalid candidate policy.
+    ///
+    /// The existing compiled engine remains available for an explicit
+    /// `retain_last_valid` posture or a later valid reload, but all new network
+    /// decisions deny with `reason` while the quarantine is active. Advancing
+    /// the generation invalidates and wakes every pinned relay.
+    pub fn enter_fail_closed(&self, reason: impl Into<String>) -> Result<u64> {
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        *self
+            .fail_closed_reason
+            .write()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? =
+            Some(reason.into());
+        Ok(self.advance_generation())
+    }
+
+    pub fn fail_closed_reason(&self) -> Option<String> {
+        self.fail_closed_reason
+            .read()
+            .ok()
+            .and_then(|reason| reason.clone())
+    }
+
+    /// Reactivate the compiled last-known-good engine after an operator
+    /// explicitly selects the availability-oriented retention posture.
+    pub fn exit_fail_closed(&self) -> Result<u64> {
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let was_fail_closed = self
+            .fail_closed_reason
+            .write()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
+            .take()
+            .is_some();
+        if was_fail_closed {
+            Ok(self.advance_generation())
+        } else {
+            Ok(self.current_generation())
+        }
     }
 
     /// Current policy generation. Successful reloads increment this value.
     pub fn current_generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    /// Run a short operation only while `expected_generation` is current.
+    ///
+    /// The engine mutex is also the policy reload mutex. Holding it across the
+    /// generation comparison and callback linearizes state derived from an OPA
+    /// snapshot with every policy reload and fail-closed transition. Callers
+    /// must not perform I/O or other long-running work in `operation`.
+    pub(crate) fn with_current_generation<T>(
+        &self,
+        expected_generation: u64,
+        operation: impl FnOnce(u64) -> T,
+    ) -> Result<Option<T>> {
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let current_generation = self.current_generation();
+        if current_generation != expected_generation {
+            return Ok(None);
+        }
+        Ok(Some(operation(current_generation)))
+    }
+
+    /// Replace the complete middleware service registry and invalidate
+    /// existing tunnels so subsequent requests use the new service set.
+    pub fn replace_middleware_registry(&self, registry: MiddlewareRegistry) -> Result<()> {
+        // Generation changes serialize through the engine lock so guarded
+        // publication cannot overlap any runtime generation transition.
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let mut runner = self
+            .middleware_runner
+            .write()
+            .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
+        *runner = runner.with_replacement_registry(registry);
+        self.advance_generation();
+        Ok(())
+    }
+
+    pub(crate) fn middleware_runner(&self) -> Result<ChainRunner> {
+        self.middleware_runner
+            .read()
+            .map(|runner| runner.clone())
+            .map_err(|_| miette::miette!("middleware runner lock poisoned"))
+    }
+
+    /// Test-only: swap the middleware runner without a connected registry, so
+    /// relay tests can inject scripted middleware services. Does not bump the
+    /// policy generation; call before capturing tunnel engines.
+    #[cfg(test)]
+    pub(crate) fn set_middleware_runner_for_tests(&self, runner: ChainRunner) {
+        *self
+            .middleware_runner
+            .write()
+            .expect("middleware runner lock") = runner;
     }
 
     /// Return a guard for a previously captured policy generation.
@@ -443,6 +878,7 @@ impl OpaEngine {
         Ok(PolicyGenerationGuard {
             captured_generation: generation,
             current_generation: Arc::clone(&self.generation),
+            generation_rx: self.generation_tx.subscribe(),
         })
     }
 
@@ -505,27 +941,10 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(Vec<regorus::Value>, u64)> {
-        let ancestor_strs: Vec<String> = input
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let cmdline_strs: Vec<String> = input
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let input_json = serde_json::json!({
-            "exec": {
-                "path": input.binary_path.to_string_lossy(),
-                "ancestors": ancestor_strs,
-                "cmdline_paths": cmdline_strs,
-            },
-            "network": {
-                "host": input.host,
-                "port": input.port,
-            }
-        });
+        #[cfg(test)]
+        record_test_opa_query();
+
+        let input_json = network_input_json(input);
 
         let mut engine = self
             .engine
@@ -533,9 +952,7 @@ impl OpaEngine {
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         let generation = self.current_generation();
 
-        engine
-            .set_input_json(&input_json.to_string())
-            .map_err(|e| miette::miette!("{e}"))?;
+        set_regorus_input(&mut engine, input_json)?;
 
         let val = engine
             .eval_rule("data.openshell.sandbox._matching_endpoint_configs".into())
@@ -546,6 +963,52 @@ impl OpaEngine {
             regorus::Value::Array(values) => Ok((values.to_vec(), generation)),
             other => Ok((vec![other], generation)),
         }
+    }
+
+    /// Query every matching endpoint for credential-provenance gating.
+    ///
+    /// Unlike [`Self::query_endpoint_configs_with_generation`], this includes
+    /// L4-only endpoints, which carry no extended L7 config. It is answered by
+    /// a dedicated Rego rule so credential gating cannot alter which endpoint
+    /// the TLS mode and SSRF allowlist are read from.
+    pub fn query_endpoint_credential_guards(
+        &self,
+        input: &NetworkInput,
+    ) -> Result<Vec<regorus::Value>> {
+        let input_json = network_input_json(input);
+
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+
+        engine
+            .set_input_json(&input_json.to_string())
+            .map_err(|e| miette::miette!("{e}"))?;
+
+        let val = engine
+            .eval_rule("data.openshell.sandbox.endpoint_credential_guards".into())
+            .map_err(|e| miette::miette!("{e}"))?;
+
+        match val {
+            regorus::Value::Undefined => Ok(Vec::new()),
+            regorus::Value::Array(values) => Ok(values.to_vec()),
+            other => Ok(vec![other]),
+        }
+    }
+
+    /// Query the ordered middleware chain for an admitted destination.
+    pub fn query_middleware_chain_with_generation(
+        &self,
+        input: &NetworkInput,
+    ) -> Result<(Vec<ChainEntry>, u64)> {
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let generation = self.current_generation();
+        let chain = query_middleware_chain_locked(&mut engine, input)?;
+        Ok((chain, generation))
     }
 
     /// Query `allowed_ips` from the matched endpoint config for a given request.
@@ -569,36 +1032,17 @@ impl OpaEngine {
     /// denial while preserving separate handling for `allowed_ips` and advisor
     /// proposals.
     pub fn query_exact_declared_endpoint_host(&self, input: &NetworkInput) -> Result<bool> {
-        let ancestor_strs: Vec<String> = input
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let cmdline_strs: Vec<String> = input
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let input_json = serde_json::json!({
-            "exec": {
-                "path": input.binary_path.to_string_lossy(),
-                "ancestors": ancestor_strs,
-                "cmdline_paths": cmdline_strs,
-            },
-            "network": {
-                "host": input.host,
-                "port": input.port,
-            }
-        });
+        #[cfg(test)]
+        record_test_opa_query();
+
+        let input_json = network_input_json(input);
 
         let mut engine = self
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
 
-        engine
-            .set_input_json(&input_json.to_string())
-            .map_err(|e| miette::miette!("{e}"))?;
+        set_regorus_input(&mut engine, input_json)?;
 
         let val = engine
             .eval_rule("data.openshell.sandbox.exact_declared_endpoint_host".into())
@@ -628,7 +1072,10 @@ impl OpaEngine {
             generation_guard: PolicyGenerationGuard {
                 captured_generation: generation,
                 current_generation: Arc::clone(&self.generation),
+                generation_rx: self.generation_tx.subscribe(),
             },
+            middleware_runner: self.middleware_runner()?,
+            websocket_assembly_budget: self.websocket_assembly_budget(),
         })
     }
 }
@@ -687,6 +1134,204 @@ fn get_str_array(val: &regorus::Value, key: &str) -> Vec<String> {
     }
 }
 
+fn network_input_json(input: &NetworkInput) -> serde_json::Value {
+    let ancestor_strs: Vec<String> = input
+        .ancestors
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let cmdline_strs: Vec<String> = input
+        .cmdline_paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    serde_json::json!({
+        "exec": {
+            "path": input.binary_path.to_string_lossy(),
+            "ancestors": ancestor_strs,
+            "cmdline_paths": cmdline_strs,
+        },
+        "network": {
+            "host": input.host,
+            "port": input.port,
+        }
+    })
+}
+
+/// Sets an already-built JSON value as Regorus input without encoding and reparsing JSON text.
+///
+/// The explicit fallible conversion preserves evaluator errors because Regorus's infallible
+/// `From<serde_json::Value>` conversion maps failures to [`regorus::Value::Undefined`].
+pub(crate) fn set_regorus_input(
+    engine: &mut regorus::Engine,
+    input: serde_json::Value,
+) -> Result<()> {
+    let input =
+        serde_json::from_value::<regorus::Value>(input).map_err(|e| miette::miette!("{e}"))?;
+    engine.set_input(input);
+    Ok(())
+}
+
+fn query_middleware_chain_locked(
+    engine: &mut regorus::Engine,
+    input: &NetworkInput,
+) -> Result<Vec<ChainEntry>> {
+    let configs_val = engine
+        .eval_rule("data.openshell.sandbox.network_middlewares".into())
+        .map_err(|e| miette::miette!("{e}"))?;
+    let configs = parse_middleware_configs(&configs_val)?;
+    if configs.is_empty() {
+        return Ok(Vec::new());
+    }
+    global_middleware_entries(&configs, &input.host)
+}
+
+fn parse_middleware_configs(value: &regorus::Value) -> Result<Vec<regorus::Value>> {
+    match value {
+        regorus::Value::Undefined => Ok(Vec::new()),
+        regorus::Value::Object(configs) => configs
+            .iter()
+            .map(|(name, config)| {
+                let regorus::Value::String(_) = name else {
+                    return Err(miette::miette!("network_middlewares keys must be strings"));
+                };
+                let regorus::Value::Object(fields) = config else {
+                    return Err(miette::miette!(
+                        "network middleware config {name:?} must be an object"
+                    ));
+                };
+                let fields = fields
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .chain(std::iter::once((
+                        regorus::Value::String("__openshell_policy_key".into()),
+                        name.clone(),
+                    )))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                Ok(fields.into())
+            })
+            .collect(),
+        other => Err(miette::miette!(
+            "network_middlewares must be an object, got {other:?}"
+        )),
+    }
+}
+
+fn global_middleware_entries(configs: &[regorus::Value], host: &str) -> Result<Vec<ChainEntry>> {
+    let mut entries = Vec::new();
+    for config in configs {
+        if middleware_selector_matches(config, host)? {
+            if entries.len() >= openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES {
+                return Err(miette::miette!(
+                    "selected middleware stage count exceeds platform maximum {}",
+                    openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES
+                ));
+            }
+            entries.push(chain_entry_from_value(config)?);
+        }
+    }
+    openshell_supervisor_middleware::sort_chain_entries(&mut entries);
+    Ok(entries)
+}
+
+fn middleware_selector_matches(config: &regorus::Value, host: &str) -> Result<bool> {
+    let Some(selector) = get_field(config, "endpoints") else {
+        return Ok(false);
+    };
+    let include = get_str_array(selector, "include");
+    let exclude = get_str_array(selector, "exclude");
+    let selector = HostSelector::new(&include, &exclude).map_err(|error| miette::miette!(error))?;
+    Ok(selector.matches(host))
+}
+
+fn chain_entry_from_value(value: &regorus::Value) -> Result<ChainEntry> {
+    let name = get_str(value, "__openshell_policy_key").unwrap_or_default();
+    let implementation = get_str(value, "middleware").unwrap_or_default();
+    Ok(ChainEntry {
+        name,
+        implementation,
+        order: get_field(value, "order")
+            .and_then(|value| match value {
+                regorus::Value::Number(number) => number.as_i64(),
+                _ => None,
+            })
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or_default(),
+        config: get_field(value, "config")
+            .map(regorus_value_to_struct)
+            .unwrap_or_default(),
+        on_error: openshell_supervisor_middleware::OnError::parse(
+            get_str(value, "on_error").as_deref().unwrap_or_default(),
+        )?,
+    })
+}
+
+fn get_field<'a>(val: &'a regorus::Value, key: &str) -> Option<&'a regorus::Value> {
+    let key_val = regorus::Value::String(key.into());
+    match val {
+        regorus::Value::Object(map) => map.get(&key_val),
+        _ => None,
+    }
+}
+
+fn parse_matched_endpoint(value: &regorus::Value) -> Option<MatchedEndpoint> {
+    let policy_name = get_str(value, "policy_name")?;
+    let endpoint_index = match get_field(value, "endpoint_index")? {
+        regorus::Value::Number(number) => usize::try_from(number.as_i64()?).ok()?,
+        _ => return None,
+    };
+    let endpoint = get_field(value, "endpoint")?.clone();
+
+    Some(MatchedEndpoint {
+        policy_name,
+        endpoint_index,
+        endpoint,
+    })
+}
+
+fn regorus_value_to_struct(value: &regorus::Value) -> prost_types::Struct {
+    let regorus::Value::Object(map) = value else {
+        return prost_types::Struct::default();
+    };
+    prost_types::Struct {
+        fields: map
+            .iter()
+            .filter_map(|(key, value)| match key {
+                regorus::Value::String(key) => {
+                    Some((key.to_string(), regorus_value_to_prost(value)))
+                }
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
+fn regorus_value_to_prost(value: &regorus::Value) -> prost_types::Value {
+    use prost_types::{ListValue, Struct, Value, value::Kind};
+    Value {
+        kind: Some(match value {
+            regorus::Value::Bool(value) => Kind::BoolValue(*value),
+            regorus::Value::Number(value) => Kind::NumberValue(value.as_f64().unwrap_or_default()),
+            regorus::Value::String(value) => Kind::StringValue(value.to_string()),
+            regorus::Value::Array(values) => Kind::ListValue(ListValue {
+                values: values.iter().map(regorus_value_to_prost).collect(),
+            }),
+            regorus::Value::Object(values) => Kind::StructValue(Struct {
+                fields: values
+                    .iter()
+                    .filter_map(|(key, value)| match key {
+                        regorus::Value::String(key) => {
+                            Some((key.to_string(), regorus_value_to_prost(value)))
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+            }),
+            _ => Kind::NullValue(0),
+        }),
+    }
+}
+
 fn parse_filesystem_policy(val: &regorus::Value) -> FilesystemPolicy {
     FilesystemPolicy {
         read_only: get_str_array(val, "read_only")
@@ -719,10 +1364,29 @@ fn parse_process_policy(val: &regorus::Value) -> ProcessPolicy {
     }
 }
 
+fn emit_l7_config_warnings(warnings: &[String], prefix: &str) {
+    for w in warnings {
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                .severity(openshell_ocsf::SeverityId::Medium)
+                .status(openshell_ocsf::StatusId::Success)
+                .state(openshell_ocsf::StateId::Enabled, "validated")
+                .unmapped("warning", serde_json::json!(w))
+                .message(format!("{prefix}: {w}"))
+                .build()
+        );
+    }
+}
+
 /// Preprocess YAML policy data: parse, normalize, validate, expand access presets, return JSON.
-fn preprocess_yaml_data(yaml_str: &str) -> Result<String> {
+fn preprocess_yaml_data(
+    yaml_str: &str,
+    require_binary_identity: bool,
+    validate_middleware_config: Option<&MiddlewareConfigValidator>,
+) -> Result<String> {
     let mut data: serde_json::Value = serde_yml::from_str(yaml_str)
         .map_err(|e| miette::miette!("failed to parse YAML data: {e}"))?;
+    inject_runtime_policy_data(&mut data, require_binary_identity);
 
     // Normalize port → ports for all endpoints so Rego always sees "ports" array.
     normalize_endpoint_ports(&mut data);
@@ -735,18 +1399,27 @@ fn preprocess_yaml_data(yaml_str: &str) -> Result<String> {
     }
 
     // Validate BEFORE expanding presets (catches user errors like rules+access)
-    let (errors, warnings) = crate::l7::validate_l7_policies(&data);
-    for w in &warnings {
-        openshell_ocsf::ocsf_emit!(
-            openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                .severity(openshell_ocsf::SeverityId::Medium)
-                .status(openshell_ocsf::StatusId::Success)
-                .state(openshell_ocsf::StateId::Enabled, "validated")
-                .unmapped("warning", serde_json::json!(w.clone()))
-                .message(format!("L7 policy validation warning: {w}"))
-                .build()
-        );
+    let middleware_errors = validate_middleware_config
+        .map_or_else(
+            || openshell_policy::validate_network_middleware_json(&data),
+            |validate| {
+                openshell_policy::validate_network_middleware_json_with_config(&data, validate)
+            },
+        )
+        .map_err(|error| miette::miette!(error))?;
+    if !middleware_errors.is_empty() {
+        return Err(miette::miette!(
+            "middleware policy validation failed:\n{}",
+            middleware_errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
     }
+
+    let (errors, warnings) = crate::l7::validate_l7_policies(&data);
+    emit_l7_config_warnings(&warnings, "L7 policy validation warning");
     if !errors.is_empty() {
         return Err(miette::miette!(
             "L7 policy validation failed:\n{}",
@@ -757,7 +1430,8 @@ fn preprocess_yaml_data(yaml_str: &str) -> Result<String> {
     normalize_l7_policy_rule_aliases(&mut data);
 
     // Expand access presets to explicit rules after validation
-    crate::l7::expand_access_presets(&mut data);
+    let expansion_warnings = crate::l7::expand_access_presets(&mut data);
+    emit_l7_config_warnings(&expansion_warnings, "L7 access preset expansion warning");
 
     serde_json::to_string(&data).map_err(|e| miette::miette!("failed to serialize data: {e}"))
 }
@@ -955,19 +1629,6 @@ fn normalize_l7_rule_aliases(
     }
 }
 
-/// Resolve a policy binary path through the container's root filesystem.
-///
-/// On Linux, `/proc/<pid>/root/` provides access to the container's mount
-/// namespace. If the policy path is a symlink inside the container
-/// (e.g., `/usr/bin/python3` → `/usr/bin/python3.11`), returns the
-/// canonical target path. Returns `None` if:
-/// - Not on Linux
-/// - `entrypoint_pid` is 0 (container not yet started)
-/// - Path contains glob characters
-/// - Path is not a symlink
-/// - Resolution fails (binary doesn't exist in container)
-/// - Resolved path equals the original
-///
 /// Normalize a path by resolving `.` and `..` components without touching
 /// the filesystem. Only works correctly for absolute paths.
 #[cfg(any(target_os = "linux", test))]
@@ -985,10 +1646,72 @@ fn normalize_path(path: &Path) -> PathBuf {
     result
 }
 
+// Only the Linux resolver constructs the non-`Literal` variants; on other
+// platforms the stub returns `Literal`, so the rest look dead there.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum BinaryResolution {
+    /// Symlink resolved to a different canonical target — add it to policy.
+    Resolved(String),
+    /// Nothing to add: glob, pid 0, not a symlink, or already canonical.
+    Literal,
+    /// Candidate absent under an accessible process root — expected, quiet.
+    Absent,
+    /// The process root `/proc/<pid>/root` itself is unreachable (pid gone or
+    /// denied) — actionable, and `CAP_SYS_PTRACE` guidance is relevant.
+    Inaccessible(std::io::ErrorKind),
+    /// The process root is reachable but the candidate path itself failed for a
+    /// non-NotFound reason (a parent component is permission-denied, or the path
+    /// forms a symlink loop) — actionable, but a target-path problem rather than
+    /// a process-root one, so `CAP_SYS_PTRACE` guidance does not apply.
+    CandidateInaccessible(std::io::ErrorKind),
+    /// A component mid symlink-chain failed to resolve.
+    ChainBroken(std::io::ErrorKind),
+}
+
+impl BinaryResolution {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    const fn classify_first_probe_error(kind: std::io::ErrorKind) -> Self {
+        // Callers reach this only after confirming the process root is
+        // reachable, so a non-NotFound failure here is specific to the
+        // candidate path, not the process root.
+        match kind {
+            std::io::ErrorKind::NotFound => Self::Absent,
+            _ => Self::CandidateInaccessible(kind),
+        }
+    }
+}
+
+/// Resolve a policy binary path through the container's root filesystem.
+///
+/// On Linux, `/proc/<pid>/root/` provides access to the container's mount
+/// namespace. If the policy path is a symlink inside the container
+/// (e.g., `/usr/bin/python3` → `/usr/bin/python3.11`), the canonical target is
+/// returned as [`BinaryResolution::Resolved`]. The outcome is classified as:
+/// - [`BinaryResolution::Literal`] — not on Linux, `entrypoint_pid` is 0
+///   (container not yet started), the path contains glob characters, it is not
+///   a symlink, or the resolved path equals the original.
+/// - [`BinaryResolution::Absent`] — the candidate does not exist under an
+///   otherwise reachable process root (expected; the caller logs it quietly).
+/// - [`BinaryResolution::Inaccessible`] — `/proc/<pid>/root` itself is
+///   unreachable (pid gone or access denied).
+/// - [`BinaryResolution::CandidateInaccessible`] — the process root is
+///   reachable but the candidate path failed for a non-NotFound reason.
+/// - [`BinaryResolution::ChainBroken`] — a component mid symlink-chain failed,
+///   or the chain forms a cycle / exceeds the kernel symlink limit.
 #[cfg(target_os = "linux")]
-fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> Option<String> {
+fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> BinaryResolution {
     if policy_path.contains('*') || entrypoint_pid == 0 {
-        return None;
+        return BinaryResolution::Literal;
+    }
+
+    // Confirm the process root itself is reachable before probing candidates.
+    // A leaf `ENOENT` (absent candidate) and an unreachable process root
+    // (pid gone -> `ENOENT`, or denied -> `EACCES`) are indistinguishable at
+    // the leaf path, so check the root first. Any failure here is an access
+    // problem, not an absent candidate, and must stay actionable.
+    if let Err(e) = std::fs::metadata(format!("/proc/{entrypoint_pid}/root")) {
+        return BinaryResolution::Inaccessible(e.kind());
     }
 
     // Walk the symlink chain inside the container filesystem using
@@ -997,6 +1720,11 @@ fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> Option
     // strips the prefix we need. read_link only reads the target of
     // the specified symlink, keeping us in the container's namespace.
     let mut resolved = PathBuf::from(policy_path);
+
+    // Set once the walk reaches a real (non-symlink) target or a terminal
+    // dead end. If the iteration cap is hit while every component is still a
+    // symlink, this stays false and the chain is treated as broken.
+    let mut reached_target = false;
 
     // Linux SYMLOOP_MAX is 40; stop before infinite loops
     for _ in 0..40 {
@@ -1009,76 +1737,93 @@ fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> Option
         let meta = match std::fs::symlink_metadata(&container_path) {
             Ok(m) => m,
             Err(e) => {
-                // Only warn on the first iteration (the original policy path).
-                // On subsequent iterations, the intermediate target may
-                // legitimately not exist (broken symlink chain).
+                // First iteration is the original policy path: an absent
+                // candidate (NotFound) is expected, any other error means the
+                // process root itself is unreachable. Later iterations are
+                // chain components, so a failure there is a broken symlink
+                // chain. Classify without logging; the caller emits the log at
+                // the appropriate level.
                 if resolved.as_os_str() == policy_path {
-                    tracing::warn!(
-                        "Cannot access container filesystem for symlink resolution: \
-                         path={policy_path} container_path={container_path} pid={entrypoint_pid} \
-                         error={e}. Binary paths in policy will be matched literally. \
-                         If this binary is a symlink (e.g., /usr/bin/python3 -> python3.11), \
-                         use the canonical path instead, or run with CAP_SYS_PTRACE."
-                    );
-                } else {
-                    tracing::warn!(
-                        "Symlink chain broken during resolution: \
-                         original={policy_path} current={} pid={entrypoint_pid} error={e}. \
-                         Binary will be matched by original path only.",
-                        resolved.display()
-                    );
+                    // The up-front root check and this probe are separate
+                    // syscalls; if the process exited in between, the whole
+                    // `/proc/<pid>` tree is gone and the leaf probe also
+                    // reports NotFound. Re-check the root so a vanished process
+                    // stays classified as Inaccessible (actionable) rather than
+                    // being masked as an absent candidate (quiet).
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        && let Err(root_error) =
+                            std::fs::metadata(format!("/proc/{entrypoint_pid}/root"))
+                    {
+                        return BinaryResolution::Inaccessible(root_error.kind());
+                    }
+                    return BinaryResolution::classify_first_probe_error(e.kind());
                 }
-                return None;
+                return BinaryResolution::ChainBroken(e.kind());
             }
         };
 
         if !meta.file_type().is_symlink() {
             // Reached a non-symlink — this is the final resolved target
+            reached_target = true;
             break;
         }
 
         let target = match std::fs::read_link(&container_path) {
             Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(
-                    "Symlink detected but read_link failed: \
-                     path={policy_path} current={} pid={entrypoint_pid} error={e}. \
-                     Binary will be matched by original path only.",
-                    resolved.display()
-                );
-                return None;
-            }
+            // A symlink whose target can't be read is a broken chain; the
+            // caller logs it.
+            Err(e) => return BinaryResolution::ChainBroken(e.kind()),
         };
 
         if target.is_absolute() {
             resolved = target;
-        } else {
+        } else if let Some(parent) = resolved.parent() {
             // Relative symlink: resolve against the containing directory
             // e.g., /usr/bin/python3 -> python3.11 becomes /usr/bin/python3.11
-            if let Some(parent) = resolved.parent() {
-                resolved = normalize_path(&parent.join(&target));
-            } else {
-                break;
+            resolved = normalize_path(&parent.join(&target));
+        } else {
+            // No parent to resolve a relative target against — terminal.
+            reached_target = true;
+            break;
+        }
+    }
+
+    if !reached_target {
+        // The cap was exhausted while following symlinks. Linux SYMLOOP_MAX is
+        // 40, so a chain of exactly 40 symlinks ending at a real file is still
+        // valid — after the 40th hop `resolved` may already point at that file.
+        // Inspect it once more without following another link: a non-symlink is
+        // the valid final target (fall through to the Literal/Resolved logic
+        // below), while another symlink (or an error) is a genuine cycle
+        // (a -> b -> a) or a chain deeper than the kernel allows. read_link
+        // resolves one hop at a time, so the kernel never surfaces ELOOP; treat
+        // those as a broken chain so the caller logs it and matches literally.
+        let container_path = format!("/proc/{entrypoint_pid}/root{}", resolved.display());
+
+        match std::fs::symlink_metadata(&container_path) {
+            Ok(meta) if !meta.file_type().is_symlink() => {}
+            Ok(_) => {
+                return BinaryResolution::ChainBroken(
+                    std::io::Error::from_raw_os_error(libc::ELOOP).kind(),
+                );
             }
+            Err(e) => return BinaryResolution::ChainBroken(e.kind()),
         }
     }
 
     let resolved_str = resolved.to_string_lossy().into_owned();
 
     if resolved_str == policy_path {
-        None
+        BinaryResolution::Literal
     } else {
-        tracing::info!(
-            "Resolved policy binary symlink via container filesystem: \
-             original={policy_path} resolved={resolved_str} pid={entrypoint_pid}"
-        );
-        Some(resolved_str)
+        // The caller logs the resolution at info level.
+        BinaryResolution::Resolved(resolved_str)
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn resolve_binary_in_container(_policy_path: &str, _entrypoint_pid: u32) -> Option<String> {
-    None
+fn resolve_binary_in_container(_policy_path: &str, _entrypoint_pid: u32) -> BinaryResolution {
+    BinaryResolution::Literal
 }
 
 fn l7_matchers_to_json(
@@ -1191,29 +1936,48 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                             .iter()
                             .map(|r| {
                                 let a = r.allow.as_ref();
-                                let mut allow = serde_json::json!({
-                                    "method": a.map_or("", |a| &a.method),
-                                    "path": a.map_or("", |a| &a.path),
-                                    "command": a.map_or("", |a| &a.command),
-                                    "operation_type": a.map_or("", |a| &a.operation_type),
-                                    "operation_name": a.map_or("", |a| &a.operation_name),
-                                });
-                                if let Some(a) = a
-                                    && !a.fields.is_empty()
-                                {
-                                    allow["fields"] = a.fields.clone().into();
+                                let mut allow = serde_json::Map::new();
+                                if let Some(a) = a {
+                                    // Proto3 represents absent scalar selectors as empty
+                                    // strings. Omit them so protobuf and YAML rules expose
+                                    // the same selector families to runtime validation.
+                                    if !a.method.is_empty() {
+                                        allow.insert("method".to_string(), a.method.clone().into());
+                                    }
+                                    if !a.path.is_empty() {
+                                        allow.insert("path".to_string(), a.path.clone().into());
+                                    }
+                                    if !a.command.is_empty() {
+                                        allow
+                                            .insert("command".to_string(), a.command.clone().into());
+                                    }
+                                    if !a.operation_type.is_empty() {
+                                        allow.insert(
+                                            "operation_type".to_string(),
+                                            a.operation_type.clone().into(),
+                                        );
+                                    }
+                                    if !a.operation_name.is_empty() {
+                                        allow.insert(
+                                            "operation_name".to_string(),
+                                            a.operation_name.clone().into(),
+                                        );
+                                    }
+                                    if !a.fields.is_empty() {
+                                        allow.insert("fields".to_string(), a.fields.clone().into());
+                                    }
                                 }
                                 let query = a.map_or_else(serde_json::Map::new, |allow| {
                                     l7_matchers_to_json(&allow.query)
                                 });
                                 if !query.is_empty() {
-                                    allow["query"] = query.into();
+                                    allow.insert("query".to_string(), query.into());
                                 }
                                 let params = a.map_or_else(serde_json::Map::new, |allow| {
                                     l7_matchers_to_json(&allow.params)
                                 });
                                 if !params.is_empty() {
-                                    allow["params"] = params.into();
+                                    allow.insert("params".to_string(), params.into());
                                 }
                                 serde_json::json!({ "allow": allow })
                             })
@@ -1272,6 +2036,12 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if e.request_body_credential_rewrite {
                         ep["request_body_credential_rewrite"] = true.into();
                     }
+                    if e.allow_uninspected_credentials {
+                        ep["allow_uninspected_credentials"] = true.into();
+                    }
+                    if e.provider_credentialed {
+                        ep["provider_credentialed"] = true.into();
+                    }
                     if !e.credential_signing.is_empty() {
                         ep["credential_signing"] = e.credential_signing.clone().into();
                     }
@@ -1280,6 +2050,11 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     }
                     if !e.signing_region.is_empty() {
                         ep["signing_region"] = e.signing_region.clone().into();
+                    }
+                    if let Some(binding) = &e.credential_binding {
+                        ep["credential_binding"] = serde_json::json!({
+                            "provider": binding.provider.clone(),
+                        });
                     }
                     if !e.persisted_queries.is_empty() {
                         ep["persisted_queries"] = e.persisted_queries.clone().into();
@@ -1335,20 +2110,88 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                         entry
                     };
                     let mut entries = vec![binary_entry(&b.path)];
-                    if let Some(resolved) = resolve_binary_in_container(&b.path, entrypoint_pid) {
-                        entries.push(binary_entry(&resolved));
+                    match resolve_binary_in_container(&b.path, entrypoint_pid) {
+                        BinaryResolution::Resolved(resolved) => {
+                            tracing::info!(
+                                "Resolved policy binary symlink: original={} resolved={resolved} pid={entrypoint_pid}",
+                                b.path
+                            );
+                            entries.push(binary_entry(&resolved));
+                        }
+                        BinaryResolution::Absent => {
+                            tracing::debug!(
+                                "Policy binary candidate not present in container: path={} pid={entrypoint_pid}. Matched literally.",
+                                b.path
+                            );
+                        }
+                        BinaryResolution::Inaccessible(kind) => {
+                            tracing::warn!(
+                                "Cannot access container filesystem for symlink resolution: path={} pid={entrypoint_pid} \
+                                error_kind={kind:?}. Binary paths in policy will be matched literally. \
+                                If this binary is a symlink (e.g., /usr/bin/python3 -> python3.11), \
+                                use the canonical path instead, or run with CAP_SYS_PTRACE.",
+                                b.path
+                            );
+                        }
+                        BinaryResolution::CandidateInaccessible(kind) => {
+                            tracing::warn!(
+                                "Cannot access policy binary candidate path: path={} pid={entrypoint_pid} \
+                                error_kind={kind:?}. Binary path will be matched literally. \
+                                A parent component is permission-denied or the path forms a symlink loop; \
+                                the process root itself is reachable.",
+                                b.path
+                            );
+                        }
+                        BinaryResolution::ChainBroken(kind) => {
+                            tracing::warn!(
+                                "Symlink chain broken during resolution: path={} pid={entrypoint_pid} error_kind={kind:?}. \
+                                Matched by original path only.",
+                                b.path
+                            );
+                        }
+                        BinaryResolution::Literal => {},
                     }
                     entries
                 })
                 .collect();
-            (
-                key.clone(),
-                serde_json::json!({
-                    "name": rule.name,
-                    "endpoints": endpoints,
-                    "binaries": binaries,
-                }),
-            )
+            let policy = serde_json::json!({
+                "name": rule.name,
+                "endpoints": endpoints,
+                "binaries": binaries,
+            });
+            (key.clone(), policy)
+        })
+        .collect();
+
+    let mut middleware_entries: Vec<_> = proto.network_middlewares.iter().collect();
+    middleware_entries.sort_by_key(|(name, _)| name.as_str());
+    let network_middlewares: serde_json::Map<String, serde_json::Value> = middleware_entries
+        .into_iter()
+        .map(|(name, mw)| {
+            let mut value = serde_json::json!({
+                "middleware": mw.middleware,
+                "order": mw.order,
+            });
+            if !mw.name.is_empty() {
+                value["name"] = mw.name.clone().into();
+            }
+            if let Some(config) = &mw.config {
+                value["config"] = openshell_core::proto_struct::struct_to_json_value(config);
+            }
+            if !mw.on_error.is_empty() {
+                value["on_error"] = mw.on_error.clone().into();
+            }
+            if let Some(selector) = &mw.endpoints {
+                let mut endpoints = serde_json::json!({});
+                if !selector.include.is_empty() {
+                    endpoints["include"] = selector.include.clone().into();
+                }
+                if !selector.exclude.is_empty() {
+                    endpoints["exclude"] = selector.exclude.clone().into();
+                }
+                value["endpoints"] = endpoints;
+            }
+            (name.clone(), value)
         })
         .collect();
 
@@ -1357,6 +2200,7 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
         "landlock": landlock,
         "process": process,
         "network_policies": network_policies,
+        "network_middlewares": network_middlewares,
     })
     .to_string()
 }
@@ -1372,9 +2216,10 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
 mod tests {
     use super::*;
 
+    use openshell_core::mcp::DEFAULT_MCP_PROTOCOL_VERSION;
     use openshell_core::proto::{
-        FilesystemPolicy as ProtoFs, L7Allow, L7QueryMatcher, L7Rule, NetworkBinary,
-        NetworkEndpoint, NetworkPolicyRule, ProcessPolicy as ProtoProc,
+        FilesystemPolicy as ProtoFs, L7Allow, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
+        NetworkEndpoint, NetworkMiddlewareConfig, NetworkPolicyRule, ProcessPolicy as ProtoProc,
         SandboxPolicy as ProtoSandboxPolicy,
     };
 
@@ -1439,7 +2284,183 @@ mod tests {
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: std::collections::HashMap::default(),
         }
+    }
+
+    fn defaultable_mcp_proto(mcp: Option<McpOptions>) -> ProtoSandboxPolicy {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "mcp".to_string(),
+            NetworkPolicyRule {
+                name: "mcp".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "mcp.example.com".to_string(),
+                    port: 443,
+                    protocol: "mcp".to_string(),
+                    mcp,
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: "tools/list".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        policy
+    }
+
+    fn projected_allow(
+        protocol: &str,
+        allow: L7Allow,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            network_policies: std::collections::HashMap::from([(
+                "selector_projection".to_string(),
+                NetworkPolicyRule {
+                    name: "selector_projection".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        protocol: protocol.to_string(),
+                        rules: vec![L7Rule { allow: Some(allow) }],
+                        ..Default::default()
+                    }],
+                    binaries: vec![],
+                },
+            )]),
+            ..Default::default()
+        };
+        let projected: serde_json::Value = serde_json::from_str(&proto_to_opa_data_json(&proto, 0))
+            .expect("protobuf policy projection must produce JSON");
+        projected["network_policies"]["selector_projection"]["endpoints"][0]["rules"][0]["allow"]
+            .as_object()
+            .expect("projected allow rule must be an object")
+            .clone()
+    }
+
+    #[test]
+    fn proto_projection_omits_absent_allow_selectors() {
+        let allow = projected_allow(
+            "websocket",
+            L7Allow {
+                operation_type: "subscription".to_string(),
+                operation_name: "NewMessages".to_string(),
+                fields: vec!["messageAdded".to_string()],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            allow,
+            serde_json::json!({
+                "operation_type": "subscription",
+                "operation_name": "NewMessages",
+                "fields": ["messageAdded"],
+            })
+            .as_object()
+            .expect("expected object")
+            .clone()
+        );
+    }
+
+    #[test]
+    fn proto_projection_preserves_nonempty_allow_selectors() {
+        let allow = projected_allow(
+            "rest",
+            L7Allow {
+                method: "POST".to_string(),
+                path: "/repos/**".to_string(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            allow,
+            serde_json::json!({
+                "method": "POST",
+                "path": "/repos/**",
+            })
+            .as_object()
+            .expect("expected object")
+            .clone()
+        );
+    }
+
+    const POLICY_DNS_SNAPSHOT_DATA: &str = r#"
+network_policies:
+  dns_transport:
+    name: dns_transport
+    endpoints:
+      - { host: resolver.example, ports: [53, 853], protocol: tcp }
+      - { host: web.example, port: 443, protocol: rest, access: full }
+      - { host: implicit.example, port: 443 }
+      - { host: "", port: 53, protocol: tcp, allowed_ips: [8.8.8.8] }
+      - { host: secondary.example, port: 5353, protocol: tcp }
+    binaries:
+      - { path: /usr/bin/one-process }
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#;
+
+    #[test]
+    fn policy_dns_snapshot_is_tcp_only_stable_and_generation_consistent() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, POLICY_DNS_SNAPSHOT_DATA).unwrap();
+
+        let snapshot = engine.policy_dns_eligibility_snapshot().unwrap();
+
+        assert_eq!(snapshot.generation, engine.current_generation());
+        assert_eq!(snapshot.endpoints.len(), 2);
+        assert_eq!(snapshot.endpoints[0].policy_name, "dns_transport");
+        assert_eq!(snapshot.endpoints[0].endpoint_index, 0);
+        assert_eq!(
+            get_str(&snapshot.endpoints[0].endpoint, "host").as_deref(),
+            Some("resolver.example")
+        );
+        let Some(regorus::Value::Array(ports)) =
+            get_field(&snapshot.endpoints[0].endpoint, "ports")
+        else {
+            panic!("eligible endpoint must retain concrete ports");
+        };
+        assert_eq!(ports.as_ref(), &[53.into(), 853.into()]);
+        assert_eq!(snapshot.endpoints[1].endpoint_index, 4);
+
+        engine
+            .reload(TEST_POLICY, POLICY_DNS_SNAPSHOT_DATA)
+            .unwrap();
+        let reloaded = engine.policy_dns_eligibility_snapshot().unwrap();
+        assert_eq!(reloaded.generation, snapshot.generation + 1);
+        assert_eq!(reloaded.endpoints.len(), 2);
+        assert_eq!(reloaded.endpoints[1].endpoint_index, 4);
+    }
+
+    #[test]
+    fn policy_dns_snapshot_is_empty_during_fail_closed_quarantine() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, POLICY_DNS_SNAPSHOT_DATA).unwrap();
+        let generation = engine.enter_fail_closed("invalid candidate").unwrap();
+
+        let snapshot = engine.policy_dns_eligibility_snapshot().unwrap();
+
+        assert_eq!(snapshot.generation, generation);
+        assert!(snapshot.endpoints.is_empty());
+    }
+
+    #[test]
+    fn policy_dns_snapshot_accepts_the_default_multi_policy_shape() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, TEST_DATA_YAML).unwrap();
+        let snapshot = engine.policy_dns_eligibility_snapshot().unwrap();
+        assert!(snapshot.endpoints.is_empty());
     }
 
     #[test]
@@ -1573,6 +2594,40 @@ mod tests {
         };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(!decision.allowed);
+    }
+
+    // -- wildcard host: malformed hostname regression tests --
+
+    #[test]
+    fn wildcard_host_nul_byte_causes_opa_error() {
+        let engine = wildcard_host_engine();
+        let result = engine.evaluate_network(&wildcard_input("sub\0.example.com"));
+        assert!(
+            result.is_err(),
+            "NUL byte is an internal glob placeholder — OPA rejects it (fail closed)"
+        );
+    }
+
+    #[test]
+    fn wildcard_host_nul_byte_extra_label_causes_opa_error() {
+        let engine = wildcard_host_engine();
+        let result = engine.evaluate_network(&wildcard_input("evil.com\0.example.com"));
+        assert!(
+            result.is_err(),
+            "NUL byte in hostname causes OPA evaluation failure (fail closed)"
+        );
+    }
+
+    #[test]
+    fn wildcard_host_percent_encoded_dot_no_match() {
+        let engine = wildcard_host_engine();
+        let decision = engine
+            .evaluate_network(&wildcard_input("evil%2eexample.com"))
+            .unwrap();
+        assert!(
+            !decision.allowed,
+            "percent-encoded dot should not be decoded by OPA glob"
+        );
     }
 
     #[test]
@@ -2080,6 +3135,7 @@ network_policies:
     name: l4_only
     endpoints:
       - { host: l4only.example.com, port: 443 }
+      - { host: explicit-tcp.example.com, port: 443, protocol: tcp }
     binaries:
       - { path: /usr/bin/curl }
 filesystem_policy:
@@ -2235,7 +3291,7 @@ process:
 
     fn eval_l7(engine: &OpaEngine, input: &serde_json::Value) -> bool {
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input.clone()).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -2250,7 +3306,7 @@ process:
         engine
             .add_data_json(&data.to_string())
             .expect("add raw data json");
-        engine.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut engine, input).unwrap();
         let val = engine
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -2261,6 +3317,89 @@ process:
     fn l7_get_allowed_by_rules() {
         let engine = l7_engine();
         let input = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_get_allowed_by_rules_when_binary_identity_relaxed() {
+        let engine =
+            OpaEngine::from_strings_with_binary_identity_required(TEST_POLICY, L7_TEST_DATA, false)
+                .expect("Failed to load relaxed L7 test data");
+        let mut input = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
+        input["exec"]["path"] = "".into();
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn relaxed_binary_identity_preserves_matched_policy_and_l7_for_proto() {
+        let mut network_policies = std::collections::HashMap::new();
+        network_policies.insert(
+            "test_l7".to_string(),
+            NetworkPolicyRule {
+                name: "test_l7".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "host.k3d.internal".to_string(),
+                    port: 56123,
+                    protocol: "rest".to_string(),
+                    enforcement: "enforce".to_string(),
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: "GET".to_string(),
+                            path: "/allowed".to_string(),
+                            command: String::new(),
+                            query: std::collections::HashMap::new(),
+                            operation_type: String::new(),
+                            operation_name: String::new(),
+                            fields: Vec::new(),
+                            params: std::collections::HashMap::new(),
+                        }),
+                    }],
+                    allowed_ips: vec!["192.168.0.0/16".to_string()],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(ProtoFs {
+                include_workdir: true,
+                read_only: vec![],
+                read_write: vec![],
+            }),
+            landlock: Some(openshell_core::proto::LandlockPolicy {
+                compatibility: "best_effort".to_string(),
+            }),
+            process: Some(ProtoProc {
+                run_as_user: "sandbox".to_string(),
+                run_as_group: "sandbox".to_string(),
+            }),
+            network_policies,
+            network_middlewares: std::collections::HashMap::default(),
+        };
+        let engine = OpaEngine::from_proto_with_pid_and_binary_identity_required(&proto, 0, false)
+            .expect("engine from relaxed proto");
+        let network_input = NetworkInput {
+            host: "host.k3d.internal".into(),
+            port: 56123,
+            binary_path: PathBuf::new(),
+            binary_sha256: String::new(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let action = engine.evaluate_network_action(&network_input).unwrap();
+        assert_eq!(
+            action,
+            NetworkAction::Allow {
+                matched_policy: Some("test_l7".to_string())
+            }
+        );
+
+        let mut input = l7_input("host.k3d.internal", 56123, "GET", "/allowed");
+        input["exec"]["path"] = "".into();
         assert!(eval_l7(&engine, &input));
     }
 
@@ -2444,7 +3583,7 @@ process:
             }]),
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.request_deny_reason".into())
             .unwrap();
@@ -2561,10 +3700,7 @@ network_policies:
             .expect("policy should load");
         rego.add_data_json(&data_json.to_string())
             .expect("data should load");
-        let engine = OpaEngine {
-            engine: Mutex::new(rego),
-            generation: Arc::new(AtomicU64::new(0)),
-        };
+        let engine = OpaEngine::with_engine(rego);
         let input = l7_websocket_graphql_input(
             "realtime.graphql.com",
             serde_json::json!([{
@@ -2781,6 +3917,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: std::collections::HashMap::default(),
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -2852,6 +3989,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: std::collections::HashMap::default(),
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -2888,6 +4026,10 @@ network_policies:
                     path: "/mcp".to_string(),
                     protocol: "mcp".to_string(),
                     enforcement: "enforce".to_string(),
+                    mcp: Some(McpOptions {
+                        versions: vec![DEFAULT_MCP_PROTOCOL_VERSION.as_str().to_string()],
+                        ..Default::default()
+                    }),
                     rules: vec![L7Rule {
                         allow: Some(L7Allow {
                             method: "tools/call".to_string(),
@@ -2924,6 +4066,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: std::collections::HashMap::default(),
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -3251,6 +4394,61 @@ network_policies:
         let mut get_with_method = l7_jsonrpc_input("jsonrpc.post.test", 8000, "/rpc", "initialize");
         get_with_method["request"]["method"] = serde_json::json!("GET");
         assert!(!eval_l7(&engine, &get_with_method));
+    }
+
+    // Mirrors the default GitHub provider's github.com git-transport endpoint
+    // (providers/github.yaml). Git smart HTTP clone/fetch performs a GET on
+    // */info/refs followed by a POST to */git-upload-pack; push uses
+    // */git-receive-pack, which must stay blocked. Regression test for #1769.
+    #[test]
+    fn l7_github_git_transport_allows_clone_blocks_push() {
+        let data = r#"
+network_policies:
+  github:
+    name: github
+    endpoints:
+      - host: github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "**" }
+          - allow: { method: HEAD, path: "**" }
+          - allow: { method: OPTIONS, path: "**" }
+          - allow: { method: POST, path: "/**/git-upload-pack" }
+    binaries:
+      # l7_input() issues requests as /usr/bin/curl.
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from yaml");
+
+        // Reference discovery (GET) is allowed.
+        let refs = l7_input("github.com", 443, "GET", "/NVIDIA/OpenShell.git/info/refs");
+        assert!(eval_l7(&engine, &refs), "GET info/refs should be allowed");
+
+        // Clone/fetch (POST git-upload-pack) is allowed.
+        let upload_pack = l7_input(
+            "github.com",
+            443,
+            "POST",
+            "/NVIDIA/OpenShell.git/git-upload-pack",
+        );
+        assert!(
+            eval_l7(&engine, &upload_pack),
+            "POST git-upload-pack should be allowed for clone/fetch"
+        );
+
+        // Push (POST git-receive-pack) is denied.
+        let receive_pack = l7_input(
+            "github.com",
+            443,
+            "POST",
+            "/NVIDIA/OpenShell.git/git-receive-pack",
+        );
+        assert!(
+            !eval_l7(&engine, &receive_pack),
+            "POST git-receive-pack (push) must be denied"
+        );
     }
 
     #[test]
@@ -3692,7 +4890,7 @@ network_policies:
         let engine = l7_engine();
         let input = l7_input("api.example.com", 8080, "DELETE", "/repos/myorg/foo");
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.request_deny_reason".into())
             .unwrap();
@@ -3723,6 +4921,26 @@ network_policies:
         let l7 = crate::l7::parse_l7_config(&config).unwrap();
         assert_eq!(l7.protocol, crate::l7::L7Protocol::Rest);
         assert_eq!(l7.enforcement, crate::l7::EnforcementMode::Enforce);
+    }
+
+    #[test]
+    fn explicit_tcp_authorizes_as_l4_without_endpoint_config() {
+        let engine = l7_engine();
+        let input = NetworkInput {
+            host: "explicit-tcp.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        assert!(matches!(
+            engine.evaluate_network_action(&input).unwrap(),
+            NetworkAction::Allow { .. }
+        ));
+        assert!(engine.query_endpoint_config(&input).unwrap().is_none());
+        assert!(engine.query_exact_declared_endpoint_host(&input).unwrap());
     }
 
     #[test]
@@ -3800,6 +5018,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: std::collections::HashMap::default(),
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -3857,6 +5076,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: std::collections::HashMap::default(),
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -3915,6 +5135,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: std::collections::HashMap::default(),
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -3975,6 +5196,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: std::collections::HashMap::default(),
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -4034,6 +5256,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: std::collections::HashMap::default(),
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -4081,7 +5304,7 @@ network_policies:
         // Verify the cloned engine can evaluate
         let input_json = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
         let mut eng = cloned.engine().lock().unwrap();
-        eng.set_input_json(&input_json.to_string()).unwrap();
+        set_regorus_input(&mut eng, input_json).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4123,11 +5346,131 @@ network_policies:
             .clone_engine_for_tunnel(engine.current_generation())
             .unwrap();
         let mut eng = cloned.engine().lock().unwrap();
-        eng.set_input_json(&input_json.to_string()).unwrap();
+        set_regorus_input(&mut eng, input_json).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
         assert_eq!(val, regorus::Value::from(true));
+    }
+
+    #[test]
+    fn proto_load_rejects_ambiguous_endpoint_metadata_with_rationale() {
+        let mut policy = ProtoSandboxPolicy::default();
+        policy.network_policies.insert(
+            "wildcard".to_string(),
+            NetworkPolicyRule {
+                name: "wildcard".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.example.com".to_string(),
+                    port: 443,
+                    tls: "skip".to_string(),
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        policy.network_policies.insert(
+            "exact".to_string(),
+            NetworkPolicyRule {
+                name: "exact".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/bash".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+
+        let Err(error) = OpaEngine::from_proto(&policy) else {
+            panic!("ambiguity must reject activation");
+        };
+        let message = error.to_string();
+        assert!(message.contains("ambiguity validation failed"));
+        assert!(message.contains("wildcard"));
+        assert!(message.contains("exact"));
+        assert!(message.contains("tls"));
+    }
+
+    #[test]
+    fn proto_load_accepts_defaultable_mcp_versions() {
+        for policy in [
+            defaultable_mcp_proto(None),
+            defaultable_mcp_proto(Some(McpOptions::default())),
+        ] {
+            OpaEngine::from_proto(&policy)
+                .expect("supervisor ingress must materialize the pinned MCP revision");
+        }
+    }
+
+    #[test]
+    fn proto_load_rejects_unsupported_mcp_versions() {
+        let policy = defaultable_mcp_proto(Some(McpOptions {
+            versions: vec!["latest".to_string()],
+            ..Default::default()
+        }));
+
+        let Err(error) = OpaEngine::from_proto(&policy) else {
+            panic!("canonicalization must not repair an unsupported MCP revision");
+        };
+        let error = error.to_string();
+        assert!(error.contains("policy validation failed"), "{error}");
+        assert!(
+            error.contains("unsupported protocol version 'latest'"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_closed_quarantine_denies_and_wakes_generation_guards() {
+        let engine = test_engine();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        let stale = guard.wait_until_stale();
+
+        let generation = engine
+            .enter_fail_closed("candidate policy validation failed: conflicting tls")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), stale)
+            .await
+            .expect("generation waiter should wake");
+        assert_eq!(generation, 1);
+        assert!(guard.is_stale());
+
+        let input = NetworkInput {
+            host: "api.anthropic.com".to_string(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: String::new(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let action = engine.evaluate_network_action(&input).unwrap();
+        assert_eq!(
+            action,
+            NetworkAction::Deny {
+                reason: "candidate policy validation failed: conflicting tls".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn valid_reload_exits_fail_closed_quarantine() {
+        let engine = test_engine();
+        engine.enter_fail_closed("invalid candidate").unwrap();
+        assert!(engine.fail_closed_reason().is_some());
+
+        engine.reload(TEST_POLICY, TEST_DATA_YAML).unwrap();
+
+        assert!(engine.fail_closed_reason().is_none());
+        assert_eq!(engine.current_generation(), 2);
     }
 
     #[test]
@@ -4232,7 +5575,7 @@ process:
             "/repos/myorg/pulls/123/reviews",
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4249,7 +5592,7 @@ process:
         // GET repos/issues is allowed and not denied
         let input = l7_input("api.github.com", 443, "GET", "/repos/myorg/issues");
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4266,7 +5609,7 @@ process:
         // POST to issues is allowed (deny only targets reviews)
         let input = l7_input("api.github.com", 443, "POST", "/repos/myorg/issues");
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4283,7 +5626,7 @@ process:
         // GET /repos/myorg/rulesets should be denied (method: "*")
         let input = l7_input("api.github.com", 443, "GET", "/repos/myorg/rulesets");
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4304,7 +5647,7 @@ process:
             "/repos/myorg/branches/main/protection",
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4325,7 +5668,7 @@ process:
             "/repos/myorg/pulls/123/reviews",
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.request_deny_reason".into())
             .unwrap();
@@ -4351,7 +5694,7 @@ process:
             serde_json::json!({"force": ["true"]}),
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4374,7 +5717,7 @@ process:
             serde_json::json!({"force": ["false"]}),
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4399,7 +5742,7 @@ process:
             serde_json::json!({"force": ["true", "false"]}),
         );
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4417,7 +5760,7 @@ process:
         // so no match (key not present) and request should be allowed
         let input = l7_input("api.restricted.com", 443, "POST", "/admin/settings");
         let mut eng = engine.engine.lock().unwrap();
-        eng.set_input_json(&input.to_string()).unwrap();
+        set_regorus_input(&mut eng, input).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
@@ -4457,6 +5800,7 @@ network_policies:
         port: 8567
         protocol: rest
         enforcement: enforce
+        tls: skip
         allowed_ips:
           - 192.168.1.100
         rules:
@@ -4495,7 +5839,7 @@ process:
     }
 
     #[test]
-    fn overlapping_policies_endpoint_config_returns_result() {
+    fn overlapping_policy_outputs_are_snapshotted_independently() {
         let engine = OpaEngine::from_strings(TEST_POLICY, OVERLAPPING_L7_TEST_DATA)
             .expect("engine should load overlapping data");
         let input = NetworkInput {
@@ -4506,12 +5850,41 @@ process:
             ancestors: vec![],
             cmdline_paths: vec![],
         };
-        // Should return config from one of the entries without error.
-        let config = engine.query_endpoint_config(&input).unwrap();
-        assert!(
-            config.is_some(),
-            "Expected endpoint config for overlapping policies"
+        assert_eq!(
+            engine.evaluate_network_action(&input).unwrap(),
+            NetworkAction::Allow {
+                matched_policy: Some("allow_192_168_1_100_8567".to_string())
+            }
         );
+
+        let authorization = engine.authorize_egress(&input).unwrap();
+        let mut endpoint_identities = authorization
+            .matched_endpoints
+            .iter()
+            .map(|matched| (matched.policy_name.as_str(), matched.endpoint_index))
+            .collect::<Vec<_>>();
+        endpoint_identities.sort_unstable();
+        assert_eq!(
+            endpoint_identities,
+            [("allow_192_168_1_100_8567", 0), ("test_server", 0),]
+        );
+
+        let (configs, generation) = engine
+            .query_endpoint_configs_with_generation(&input)
+            .unwrap();
+        assert_eq!(generation, engine.current_generation());
+        assert_eq!(configs.len(), 2);
+        assert_eq!(get_str(&configs[0], "tls").as_deref(), Some("skip"));
+        assert_eq!(get_str_array(&configs[0], "allowed_ips"), ["192.168.1.100"]);
+        assert_eq!(get_str(&configs[1], "tls"), None);
+
+        let selected = engine.query_endpoint_config(&input).unwrap().unwrap();
+        assert_eq!(
+            crate::l7::parse_tls_mode(&selected),
+            crate::l7::TlsMode::Skip
+        );
+        assert_eq!(engine.query_allowed_ips(&input).unwrap(), ["192.168.1.100"]);
+        assert!(engine.query_exact_declared_endpoint_host(&input).unwrap());
     }
 
     // ========================================================================
@@ -4589,6 +5962,46 @@ process:
             NetworkAction::Allow {
                 matched_policy: Some("claude_code".to_string())
             },
+        );
+    }
+
+    #[test]
+    fn relaxed_binary_identity_allows_declared_endpoint_without_binary_match() {
+        let engine = OpaEngine::from_strings_with_binary_identity_required(
+            TEST_POLICY,
+            INFERENCE_TEST_DATA,
+            false,
+        )
+        .expect("Failed to load relaxed binary identity test data");
+        let input = NetworkInput {
+            host: "api.anthropic.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/tmp/unlisted-agent"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let action = engine.evaluate_network_action(&input).unwrap();
+        assert_eq!(
+            action,
+            NetworkAction::Allow {
+                matched_policy: Some("claude_code".to_string())
+            },
+        );
+        assert!(
+            engine.query_exact_declared_endpoint_host(&input).unwrap(),
+            "relaxed identity should preserve exact declared endpoint handling"
+        );
+
+        let undeclared = NetworkInput {
+            host: "api.openai.com".into(),
+            ..input
+        };
+        let action = engine.evaluate_network_action(&undeclared).unwrap();
+        assert!(
+            matches!(action, NetworkAction::Deny { .. }),
+            "relaxed identity must not allow undeclared endpoints"
         );
     }
 
@@ -4797,6 +6210,87 @@ process:
             .expect("Failed to load allowed_ips test data")
     }
 
+    /// An L4-only credentialed endpoint must not join the shared endpoint-config
+    /// list: `query_endpoint_config` returns only its first element, so joining
+    /// it would let the L4 endpoint shadow the inspected endpoint's TLS mode and
+    /// SSRF allowlist on the same host:port.
+    #[test]
+    fn credential_guard_does_not_shadow_inspected_endpoint_config() {
+        const OVERLAPPING_DATA: &str = r#"
+network_policies:
+  telemetry_l4:
+    name: telemetry_l4
+    endpoints:
+      - host: api.example.com
+        port: 443
+        provider_credentialed: true
+        allow_uninspected_credentials: true
+    binaries:
+      - { path: /usr/bin/curl }
+  inspected_api:
+    name: inspected_api
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        access: full
+        tls: skip
+        allowed_ips: ["10.0.5.0/24"]
+    binaries:
+      - { path: /usr/bin/curl }
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, OVERLAPPING_DATA)
+            .expect("overlapping endpoint policy should load");
+        let input = NetworkInput {
+            host: "api.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let configs = engine
+            .query_endpoint_configs_with_generation(&input)
+            .unwrap()
+            .0;
+        assert_eq!(
+            configs.len(),
+            1,
+            "only the inspected endpoint carries extended config"
+        );
+        let config = crate::l7::parse_l7_config(&configs[0]).expect("inspected endpoint config");
+        assert_eq!(config.protocol, crate::l7::L7Protocol::Rest);
+        assert_eq!(config.tls, crate::l7::TlsMode::Skip);
+        assert_eq!(
+            engine.query_allowed_ips(&input).unwrap(),
+            vec!["10.0.5.0/24"],
+            "SSRF allowlist must still come from the inspected endpoint"
+        );
+
+        let guards = engine.query_endpoint_credential_guards(&input).unwrap();
+        assert_eq!(
+            guards.len(),
+            2,
+            "credential gating must still see the L4-only endpoint"
+        );
+        assert!(
+            guards
+                .iter()
+                .map(crate::l7::parse_endpoint_credential_guard)
+                .any(|guard| guard.provider_credentialed)
+        );
+    }
+
     #[test]
     fn allowed_ips_mode2_host_plus_ips_allows() {
         let engine = allowed_ips_engine();
@@ -4815,6 +6309,121 @@ process:
             decision.reason
         );
         assert_eq!(decision.matched_policy.as_deref(), Some("internal_api"));
+    }
+
+    #[test]
+    fn egress_authorization_returns_one_generation_consistent_snapshot() {
+        let engine = allowed_ips_engine();
+        let input = NetworkInput {
+            host: "my-service.corp.net".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let authorization = engine.authorize_egress(&input).unwrap();
+
+        assert_eq!(authorization.generation, engine.current_generation());
+        assert_eq!(
+            authorization.action,
+            NetworkAction::Allow {
+                matched_policy: Some("internal_api".to_string())
+            }
+        );
+        assert!(authorization.exact_declared_endpoint_host);
+        assert_eq!(authorization.endpoint_configs.len(), 1);
+        assert_eq!(
+            get_str_array(&authorization.endpoint_configs[0], "allowed_ips"),
+            vec!["10.0.5.0/24"]
+        );
+        assert_eq!(authorization.matched_endpoints.len(), 1);
+        assert_eq!(
+            authorization.matched_endpoints[0].policy_name,
+            "internal_api"
+        );
+        assert_eq!(authorization.matched_endpoints[0].endpoint_index, 0);
+        assert_eq!(
+            get_str(&authorization.matched_endpoints[0].endpoint, "host").as_deref(),
+            Some("my-service.corp.net")
+        );
+    }
+
+    #[test]
+    fn egress_authorization_preserves_explicit_tcp_endpoint_identity() {
+        let engine = OpaEngine::from_strings(
+            TEST_POLICY,
+            r#"
+network_policies:
+  native_tcp:
+    name: native_tcp
+    endpoints:
+      - host: database.example.com
+        port: 5432
+        protocol: tcp
+    binaries:
+      - path: /usr/bin/client
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#,
+        )
+        .expect("explicit TCP policy should load");
+        let input = NetworkInput {
+            host: "database.example.com".into(),
+            port: 5432,
+            binary_path: PathBuf::from("/usr/bin/client"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let authorization = engine.authorize_egress(&input).unwrap();
+
+        assert!(authorization.endpoint_configs.is_empty());
+        assert_eq!(authorization.matched_endpoints.len(), 1);
+        let matched = &authorization.matched_endpoints[0];
+        assert_eq!(matched.policy_name, "native_tcp");
+        assert_eq!(matched.endpoint_index, 0);
+        assert_eq!(
+            get_str(&matched.endpoint, "protocol").as_deref(),
+            Some("tcp")
+        );
+    }
+
+    #[test]
+    fn proto_activation_rejects_explicit_tcp_credential_binding() {
+        let proto = openshell_policy::parse_sandbox_policy(
+            r#"
+version: 1
+network_policies:
+  native_tcp:
+    name: native_tcp
+    endpoints:
+      - host: database.example.com
+        port: 5432
+        protocol: tcp
+        credential_binding:
+          provider: database
+    binaries:
+      - path: /usr/bin/client
+"#,
+        )
+        .expect("policy should parse before semantic validation");
+
+        let error = OpaEngine::from_proto(&proto)
+            .err()
+            .expect("explicit TCP must reject credential binding during activation");
+
+        assert!(error.to_string().contains("credential_binding"));
+        assert!(error.to_string().contains("protocol tcp"));
     }
 
     #[test]
@@ -4983,6 +6592,7 @@ process:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: std::collections::HashMap::default(),
         };
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
         let input = NetworkInput {
@@ -5037,6 +6647,7 @@ process:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: std::collections::HashMap::default(),
         };
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
         let input = NetworkInput {
@@ -5107,6 +6718,7 @@ process:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: std::collections::HashMap::default(),
         };
         let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
 
@@ -5337,6 +6949,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: std::collections::HashMap::default(),
         };
         let engine = OpaEngine::from_proto(&proto).unwrap();
         // Port 443
@@ -5575,6 +7188,88 @@ network_policies:
     }
 
     #[test]
+    fn wildcard_host_middle_label_matches_one_region_label() {
+        let data = r#"
+network_policies:
+  s3:
+    name: s3
+    endpoints:
+      - { host: "*.s3.*.amazonaws.com", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "my-bucket.s3.us-east-1.amazonaws.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            decision.allowed,
+            "*.s3.*.amazonaws.com should match one regional S3 label: {}",
+            decision.reason
+        );
+    }
+
+    #[test]
+    fn wildcard_host_middle_label_does_not_match_missing_bucket_label() {
+        let data = r#"
+network_policies:
+  s3:
+    name: s3
+    endpoints:
+      - { host: "*.s3.*.amazonaws.com", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "s3.us-east-1.amazonaws.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            !decision.allowed,
+            "*.s3.*.amazonaws.com should not match path-style S3 host"
+        );
+    }
+
+    #[test]
+    fn wildcard_host_middle_label_does_not_skip_dualstack_label() {
+        let data = r#"
+network_policies:
+  s3:
+    name: s3
+    endpoints:
+      - { host: "*.s3.*.amazonaws.com", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "my-bucket.s3.dualstack.us-east-1.amazonaws.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            !decision.allowed,
+            "*.s3.*.amazonaws.com should not match the extra dualstack label"
+        );
+    }
+
+    #[test]
     fn wildcard_host_multi_port() {
         let data = r#"
 network_policies:
@@ -5764,22 +7459,36 @@ process:
     #[test]
     fn resolve_binary_skips_glob_paths() {
         // Glob patterns should never be resolved — they're matched differently
-        assert!(resolve_binary_in_container("/usr/bin/*", 1).is_none());
-        assert!(resolve_binary_in_container("/usr/local/bin/**", 1).is_none());
+        assert_eq!(
+            resolve_binary_in_container("/usr/bin/*", 1),
+            BinaryResolution::Literal
+        );
+        assert_eq!(
+            resolve_binary_in_container("/usr/local/bin/**", 1),
+            BinaryResolution::Literal
+        );
     }
 
     #[test]
     fn resolve_binary_skips_pid_zero() {
         // pid=0 means the container hasn't started yet
-        assert!(resolve_binary_in_container("/usr/bin/python3", 0).is_none());
+        assert_eq!(
+            resolve_binary_in_container("/usr/bin/python3", 0),
+            BinaryResolution::Literal
+        );
     }
 
     #[test]
-    fn resolve_binary_returns_none_for_nonexistent_path() {
-        // A path that doesn't exist in any container should gracefully return None
+    fn resolve_binary_does_not_resolve_nonexistent_path() {
+        // A path that doesn't exist should never yield a Resolved target. The
+        // exact non-Resolved variant depends on platform/privilege (Absent when
+        // the process root is readable, Inaccessible when it is not, Literal on
+        // the non-Linux stub), so assert only that nothing is resolved.
+        let result =
+            resolve_binary_in_container("/nonexistent/binary/path/that/will/never/exist", 1);
         assert!(
-            resolve_binary_in_container("/nonexistent/binary/path/that/will/never/exist", 1)
-                .is_none()
+            !matches!(result, BinaryResolution::Resolved(_)),
+            "nonexistent path must not resolve, got: {result:?}"
         );
     }
 
@@ -5988,6 +7697,243 @@ network_policies:
     }
 
     #[test]
+    fn classify_not_found_is_absent() {
+        // A missing candidate under an accessible root is expected, not an error.
+        assert_eq!(
+            BinaryResolution::classify_first_probe_error(std::io::ErrorKind::NotFound),
+            BinaryResolution::Absent
+        );
+    }
+
+    #[test]
+    fn classify_permission_denied_is_candidate_inaccessible() {
+        // A non-NotFound failure at the candidate probe (root already confirmed
+        // reachable) is a target-path problem, not a process-root one, so it
+        // must not emit the CAP_SYS_PTRACE process-root guidance.
+        assert_eq!(
+            BinaryResolution::classify_first_probe_error(std::io::ErrorKind::PermissionDenied),
+            BinaryResolution::CandidateInaccessible(std::io::ErrorKind::PermissionDenied)
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn absent_candidate_resolves_to_absent() {
+        // Regression for #2883: a candidate path that does not exist under an
+        // accessible /proc/<pid>/root must classify as Absent (quiet), not as a
+        // container-filesystem-access failure.
+        if !procfs_root_accessible() {
+            eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
+            return;
+        }
+
+        // Use a path guaranteed absent: a real temp dir with an uncreated
+        // child. A hard-coded path like /app/.venv/bin/python could exist in a
+        // valid environment and make the resolver return Resolved/Literal.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-python");
+        let pid = std::process::id(); // our own live, accessible root
+        assert_eq!(
+            resolve_binary_in_container(missing.to_str().unwrap(), pid),
+            BinaryResolution::Absent
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unreachable_process_root_is_inaccessible() {
+        // A pid whose /proc/<pid>/root does not exist (process gone) must be
+        // reported as an access failure, not silently treated as an absent
+        // candidate — even though both surface as ENOENT at the leaf path.
+        // u32::MAX is far above /proc/sys/kernel/pid_max, so it never exists.
+        let dead_pid = u32::MAX;
+        assert!(
+            matches!(
+                resolve_binary_in_container("/usr/bin/python3", dead_pid),
+                BinaryResolution::Inaccessible(_)
+            ),
+            "an unreachable process root must classify as Inaccessible"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn symlink_cycle_exhausts_limit_as_chain_broken() {
+        // A symlink cycle (a -> b -> a) never resolves to a real target. The
+        // manual read_link walk resolves one hop at a time, so the kernel never
+        // raises ELOOP; exhausting the iteration cap must classify as
+        // ChainBroken, not silently pass as Resolved/Literal.
+        use std::os::unix::fs::symlink;
+
+        if !procfs_root_accessible() {
+            eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        symlink(&b, &a).unwrap(); // a -> b
+        symlink(&a, &b).unwrap(); // b -> a
+        let pid = std::process::id();
+        assert!(
+            matches!(
+                resolve_binary_in_container(a.to_str().unwrap(), pid),
+                BinaryResolution::ChainBroken(_)
+            ),
+            "a symlink cycle must classify as ChainBroken"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn symlink_chain_at_limit_resolves_to_target() {
+        // Linux SYMLOOP_MAX is 40: a chain of exactly 40 symlinks ending at a
+        // real file resolves successfully in the kernel. The manual walk must
+        // follow all 40 hops and accept the final target rather than exhausting
+        // the cap and reporting ChainBroken (off-by-one regression).
+        use std::os::unix::fs::symlink;
+
+        if !procfs_root_accessible() {
+            eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real");
+        std::fs::write(&target, b"").unwrap();
+
+        // link0 -> link1 -> ... -> link39 -> real (40 symlinks, absolute
+        // targets so the resolver takes the is_absolute() branch).
+        let link = |i: usize| dir.path().join(format!("link{i}"));
+        symlink(&target, link(39)).unwrap();
+        for i in (0..39).rev() {
+            symlink(link(i + 1), link(i)).unwrap();
+        }
+
+        let pid = std::process::id();
+        let result = resolve_binary_in_container(link(0).to_str().unwrap(), pid);
+        assert!(
+            matches!(result, BinaryResolution::Resolved(_)),
+            "a 40-link chain ending at a real file must resolve, got {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn symlink_chain_over_limit_is_chain_broken() {
+        // A chain of 41 symlinks exceeds SYMLOOP_MAX: the walk must give up and
+        // classify as ChainBroken, proving the 40-hop budget stays enforced.
+        use std::os::unix::fs::symlink;
+
+        if !procfs_root_accessible() {
+            eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real");
+        std::fs::write(&target, b"").unwrap();
+
+        // link0 -> ... -> link40 -> real (41 symlinks).
+        let link = |i: usize| dir.path().join(format!("link{i}"));
+        symlink(&target, link(40)).unwrap();
+        for i in (0..40).rev() {
+            symlink(link(i + 1), link(i)).unwrap();
+        }
+
+        let pid = std::process::id();
+        let result = resolve_binary_in_container(link(0).to_str().unwrap(), pid);
+        assert!(
+            matches!(result, BinaryResolution::ChainBroken(_)),
+            "a 41-link chain must classify as ChainBroken, got {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn absent_candidates_emit_no_warnings() {
+        // Regression for #2883: several expected-but-absent compatibility
+        // candidates under an accessible process root must not produce a burst
+        // of WARN-level noise. Logging now lives at the caller, so drive the
+        // real caller (proto_to_opa_data_json) and count WARN events.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+
+        #[derive(Clone)]
+        struct WarnCounter(Arc<AtomicUsize>);
+        impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for WarnCounter {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        if !procfs_root_accessible() {
+            eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
+            return;
+        }
+
+        let warns = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(WarnCounter(Arc::clone(&warns)));
+
+        // Candidates that do not exist under our accessible /proc/<pid>/root.
+        // Historically each absent candidate emitted its own WARN. Use uncreated
+        // children of a real temp dir so the paths are guaranteed absent (not
+        // merely conventional): a hard-coded path could exist on a runner and
+        // stop exercising the Absent branch, or be inaccessible and emit a
+        // legitimate warning that fails this test.
+        let dir = tempfile::tempdir().unwrap();
+        let candidates = [
+            dir.path().join("app-python"),
+            dir.path().join("sandbox-python"),
+            dir.path().join("opt-python"),
+        ];
+        let mut network_policies = std::collections::HashMap::new();
+        network_policies.insert(
+            "pypi".to_string(),
+            NetworkPolicyRule {
+                name: "pypi".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "pypi.org".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: candidates
+                    .iter()
+                    .map(|p| NetworkBinary {
+                        path: p.to_str().unwrap().to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            },
+        );
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: None,
+            landlock: None,
+            process: None,
+            network_policies,
+            network_middlewares: std::collections::HashMap::default(),
+        };
+
+        let pid = std::process::id(); // accessible root, leaf paths absent
+        tracing::subscriber::with_default(subscriber, || {
+            let _ = proto_to_opa_data_json(&proto, pid);
+        });
+
+        assert_eq!(
+            warns.load(Ordering::SeqCst),
+            0,
+            "absent compatibility candidates must not emit warnings"
+        );
+    }
+
+    #[test]
     fn hot_reload_preserves_symlink_expansion_behavior() {
         // Simulates the hot-reload path: initial load at pid=0, then reload
         // with a new proto that would have expanded binaries at a real PID.
@@ -6079,6 +8025,321 @@ network_policies:
         );
     }
 
+    #[tokio::test]
+    async fn policy_and_middleware_reload_commit_as_one_generation() {
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).expect("initial load should succeed");
+        let mut new_proto = proto;
+        new_proto.network_policies.insert(
+            "python_api".to_string(),
+            NetworkPolicyRule {
+                name: "python_api".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "pypi.org".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/python3".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let registry = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("built-in registry");
+
+        engine
+            .reload_policy_and_middleware_from_proto_with_pid(&new_proto, 0, registry)
+            .expect("combined reload");
+
+        assert_eq!(engine.current_generation(), 1);
+        let python_input = NetworkInput {
+            host: "pypi.org".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/python3"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        assert!(engine.evaluate_network(&python_input).unwrap().allowed);
+
+        let entry = ChainEntry {
+            name: "regex".into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        };
+        let described = engine
+            .middleware_runner()
+            .expect("middleware runner")
+            .describe_chain(&[entry])
+            .await
+            .expect("describe chain");
+        assert!(described[0].is_resolved());
+    }
+
+    #[tokio::test]
+    async fn middleware_session_budget_survives_atomic_registry_reload() {
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).expect("initial load should succeed");
+        let registry = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("built-in registry");
+        engine
+            .replace_middleware_registry(registry)
+            .expect("install registry");
+        let old_runner = engine.middleware_runner().expect("old runner");
+        let entry = ChainEntry {
+            name: "regex".into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
+            order: 0,
+            config: prost_types::Struct {
+                fields: std::iter::once((
+                    "mode".into(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::StringValue("redact".into())),
+                    },
+                ))
+                .collect(),
+            },
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        };
+        let preflight_input =
+            |session_id: String| openshell_supervisor_middleware::WebSocketPreflightInput {
+                session_id,
+                request_id: "request".into(),
+                sandbox_id: "sandbox".into(),
+                sandbox_name: "sandbox-name".into(),
+                workspace: "workspace".into(),
+                scheme: "wss".into(),
+                host: "api.openai.com".into(),
+                port: 443,
+                path: "/v1/responses".into(),
+                requested_subprotocols: Vec::new(),
+            };
+        let mut old_sessions = Vec::new();
+        for index in 0..openshell_supervisor_middleware::MAX_CONCURRENT_MIDDLEWARE_SESSIONS {
+            let preflight = old_runner
+                .preflight_websocket(
+                    std::slice::from_ref(&entry),
+                    preflight_input(format!("old-generation-{index}")),
+                )
+                .await
+                .expect("admit old-generation session");
+            old_sessions.push(preflight.session.expect("built-in inspects session"));
+        }
+
+        let replacement = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("replacement registry");
+        engine
+            .reload_policy_and_middleware_from_proto_with_pid(&proto, 0, replacement)
+            .expect("atomic policy and registry reload");
+        let current_runner = engine.middleware_runner().expect("current runner");
+        let overflow = current_runner
+            .preflight_websocket(
+                std::slice::from_ref(&entry),
+                preflight_input("new-generation-overflow".into()),
+            )
+            .await
+            .expect("capacity exhaustion is a typed preflight outcome");
+        assert!(!overflow.allowed);
+        assert!(overflow.session_capacity_exhausted);
+
+        old_sessions
+            .pop()
+            .expect("old-generation session")
+            .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
+            .await;
+        let admitted = current_runner
+            .preflight_websocket(
+                std::slice::from_ref(&entry),
+                preflight_input("new-generation-admitted".into()),
+            )
+            .await
+            .expect("released capacity is reusable after reload");
+        assert!(admitted.allowed);
+        assert!(admitted.session.is_some());
+    }
+
+    #[tokio::test]
+    async fn websocket_assembly_budget_survives_policy_reload() {
+        use crate::l7::websocket::{
+            MAX_CONCURRENT_WEBSOCKET_ASSEMBLIES, WebSocketAssemblyAdmissionOutcome,
+        };
+
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).expect("initial policy");
+        let old_tunnel = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .expect("old tunnel");
+        let old_budget = old_tunnel.websocket_assembly_budget();
+        let mut old_admissions = Vec::new();
+        for _ in 0..MAX_CONCURRENT_WEBSOCKET_ASSEMBLIES {
+            match old_budget.reserve().await.expect("reserve old assembly") {
+                WebSocketAssemblyAdmissionOutcome::Admitted(admission) => {
+                    old_admissions.push(admission);
+                }
+                WebSocketAssemblyAdmissionOutcome::QueueExhausted => {
+                    panic!("active assembly capacity exhausted too early")
+                }
+            }
+        }
+
+        engine
+            .reload_from_proto_with_pid(&proto, 0)
+            .expect("policy reload");
+        let new_tunnel = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .expect("new tunnel");
+        let new_budget = new_tunnel.websocket_assembly_budget();
+        let waiting = tokio::spawn(async move { new_budget.reserve().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "new generation must share old generation assembly capacity"
+        );
+
+        drop(old_admissions.pop());
+        assert!(matches!(
+            waiting
+                .await
+                .expect("join waiting assembly")
+                .expect("waiting assembly result"),
+            WebSocketAssemblyAdmissionOutcome::Admitted(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn policy_only_reload_keeps_connected_middleware_registry() {
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).expect("initial load should succeed");
+        let registry = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("built-in registry");
+        engine
+            .replace_middleware_registry(registry)
+            .expect("install registry");
+        let generation_with_registry = engine.current_generation();
+
+        let mut new_proto = proto;
+        new_proto.network_policies.insert(
+            "python_api".to_string(),
+            NetworkPolicyRule {
+                name: "python_api".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "pypi.org".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/python3".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        engine
+            .reload_from_proto_with_pid(&new_proto, 0)
+            .expect("policy-only reload");
+
+        assert_eq!(engine.current_generation(), generation_with_registry + 1);
+        let python_input = NetworkInput {
+            host: "pypi.org".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/python3"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        assert!(engine.evaluate_network(&python_input).unwrap().allowed);
+
+        let entry = ChainEntry {
+            name: "regex".into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        };
+        let described = engine
+            .middleware_runner()
+            .expect("middleware runner")
+            .describe_chain(&[entry])
+            .await
+            .expect("describe chain");
+        assert!(described[0].is_resolved());
+    }
+
+    #[tokio::test]
+    async fn failed_combined_reload_preserves_policy_registry_and_generation() {
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).expect("initial load should succeed");
+        let builtins = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("built-in registry");
+        engine
+            .reload_policy_and_middleware_from_proto_with_pid(&proto, 0, builtins)
+            .expect("install last-known-good runtime");
+
+        let mut invalid = proto;
+        invalid.network_middlewares.insert(
+            String::new(),
+            NetworkMiddlewareConfig {
+                middleware: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
+                ..Default::default()
+            },
+        );
+        let empty_registry = MiddlewareRegistry::connect_services(Vec::new(), Vec::new())
+            .await
+            .expect("empty registry");
+
+        engine
+            .reload_policy_and_middleware_from_proto_with_pid(&invalid, 0, empty_registry)
+            .expect_err("invalid policy must reject the combined reload");
+
+        assert_eq!(engine.current_generation(), 1);
+        let claude_input = NetworkInput {
+            host: "api.anthropic.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/local/bin/claude"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        assert!(engine.evaluate_network(&claude_input).unwrap().allowed);
+
+        let entry = ChainEntry {
+            name: "regex".into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        };
+        let described = engine
+            .middleware_runner()
+            .expect("middleware runner")
+            .describe_chain(&[entry])
+            .await
+            .expect("describe chain");
+        assert!(described[0].is_resolved());
+    }
+
     #[test]
     fn deny_reason_includes_symlink_hint() {
         // Verify the deny reason includes an actionable symlink hint
@@ -6146,7 +8407,10 @@ network_policies:
         let pid = std::process::id();
         let link_path = link.to_string_lossy().to_string();
         // Actually attempt the same resolution our production code uses
-        resolve_binary_in_container(&link_path, pid).is_some()
+        matches!(
+            resolve_binary_in_container(&link_path, pid),
+            BinaryResolution::Resolved(_)
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -6175,11 +8439,9 @@ network_policies:
         let link_path = link.to_string_lossy().to_string();
         let result = resolve_binary_in_container(&link_path, our_pid);
 
-        assert!(
-            result.is_some(),
-            "Should resolve symlink via /proc/<pid>/root/"
-        );
-        let resolved = result.unwrap();
+        let BinaryResolution::Resolved(resolved) = result else {
+            panic!("Should resolve symlink via /proc/<pid>/root/, got: {result:?}");
+        };
         assert!(
             resolved.ends_with("python3.11"),
             "Resolved path should point to target: {resolved}"
@@ -6205,9 +8467,10 @@ network_policies:
         let path = tmp.path().to_string_lossy().to_string();
         let result = resolve_binary_in_container(&path, our_pid);
 
-        assert!(
-            result.is_none(),
-            "Non-symlink file should return None, got: {result:?}"
+        assert_eq!(
+            result,
+            BinaryResolution::Literal,
+            "Non-symlink file should not expand, got: {result:?}"
         );
     }
 
@@ -6235,8 +8498,9 @@ network_policies:
         let link_path = top_link.to_string_lossy().to_string();
         let result = resolve_binary_in_container(&link_path, our_pid);
 
-        assert!(result.is_some(), "Should resolve multi-level symlink chain");
-        let resolved = result.unwrap();
+        let BinaryResolution::Resolved(resolved) = result else {
+            panic!("Should resolve multi-level symlink chain, got: {result:?}");
+        };
         assert!(
             resolved.ends_with("cpython3.11"),
             "Should resolve to final target: {resolved}"
@@ -6296,6 +8560,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: std::collections::HashMap::default(),
         };
 
         // Build engine with our PID (symlink resolution will work via /proc/self/root/)
@@ -6373,6 +8638,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: std::collections::HashMap::default(),
         };
 
         // Initial load at pid=0 — no symlink expansion
@@ -6416,6 +8682,387 @@ network_policies:
     }
 
     #[test]
+    fn middleware_chain_uses_configured_order() {
+        let data = r#"
+network_middlewares:
+  global-redactor:
+    middleware: openshell/regex
+    order: 20
+    endpoints:
+      include: ["api.example.com"]
+  policy-redactor:
+    middleware: openshell/regex
+    order: 10
+    endpoints:
+      include: ["api.example.com"]
+  endpoint-redactor:
+    middleware: openshell/regex
+    order: 5
+    endpoints:
+      include: ["api.example.com"]
+network_policies:
+  api:
+    name: api
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: POST, path: "/v1/**" }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "api.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (chain, _) = engine
+            .query_middleware_chain_with_generation(&input)
+            .unwrap();
+        let names: Vec<_> = chain.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["endpoint-redactor", "policy-redactor", "global-redactor"]
+        );
+    }
+
+    fn matching_middleware_configs(count: usize) -> Vec<regorus::Value> {
+        (0..count)
+            .map(|index| {
+                regorus::Value::from(serde_json::json!({
+                    "name": format!("stage-{index}"),
+                    "middleware": "openshell/regex",
+                    "endpoints": {"include": ["api.example.com"]}
+                }))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn middleware_chain_accepts_maximum_selected_stages() {
+        let configs = matching_middleware_configs(
+            openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES,
+        );
+
+        let chain =
+            global_middleware_entries(&configs, "api.example.com").expect("maximum selected chain");
+        assert_eq!(
+            chain.len(),
+            openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES
+        );
+    }
+
+    #[test]
+    fn middleware_chain_rejects_selected_stages_over_capacity() {
+        let configs = matching_middleware_configs(
+            openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES + 1,
+        );
+
+        let error = global_middleware_entries(&configs, "api.example.com")
+            .expect_err("selected chain over capacity");
+        assert!(
+            error
+                .to_string()
+                .contains("selected middleware stage count exceeds platform maximum 10")
+        );
+    }
+
+    #[test]
+    fn middleware_chain_uses_dns_label_glob_semantics() {
+        let data = r#"
+network_middlewares:
+  single-label:
+    middleware: openshell/regex
+    order: 10
+    endpoints:
+      include: ["*.Example.COM"]
+      exclude: ["trusted.example.com"]
+  recursive:
+    middleware: openshell/regex
+    order: 20
+    endpoints:
+      include: ["**.example.com"]
+  intra-label:
+    middleware: openshell/regex
+    order: 30
+    endpoints:
+      include: ["*-api.example.com"]
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let names_for = |host: &str| {
+            let input = NetworkInput {
+                host: host.into(),
+                port: 443,
+                binary_path: PathBuf::from("/usr/bin/curl"),
+                binary_sha256: "unused".into(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            engine
+                .query_middleware_chain_with_generation(&input)
+                .unwrap()
+                .0
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            names_for("api.example.com"),
+            vec!["single-label", "recursive"]
+        );
+        assert_eq!(names_for("deep.api.example.com"), vec!["recursive"]);
+        assert_eq!(names_for("trusted.example.com"), vec!["recursive"]);
+        assert_eq!(
+            names_for("tenant-api.example.com"),
+            vec!["single-label", "recursive", "intra-label"]
+        );
+    }
+
+    #[test]
+    fn host_pattern_matches_rego_endpoint_host_semantics() {
+        // Middleware selectors and the tls-skip overlap validation promise the
+        // same host semantics as endpoint admission, which is decided by the
+        // endpoint_allowed branches in sandbox-policy.rego. Pin parity by
+        // running one table through openshell_core::host_pattern and through
+        // regorus with those branches verbatim.
+        let policy = r#"
+package test
+
+default host_match = false
+
+host_match if {
+	not contains(input.pattern, "*")
+	lower(input.pattern) == lower(input.host)
+}
+
+host_match if {
+	contains(input.pattern, "*")
+	glob.match(lower(input.pattern), ["."], lower(input.host))
+}
+"#;
+        let mut engine = regorus::Engine::new();
+        engine
+            .add_policy("test.rego".into(), policy.into())
+            .unwrap();
+
+        let cases = [
+            ("api.example.com", "api.example.com"),
+            ("api.example.com", "API.EXAMPLE.COM"),
+            ("api.example.com", "api.example.org"),
+            ("*.example.com", "api.example.com"),
+            ("*.example.com", "example.com"),
+            ("*.example.com", "deep.api.example.com"),
+            ("*-api.example.com", "tenant-api.example.com"),
+            ("*-api.example.com", "api.example.com"),
+            ("*.a?i.example.com", "x.abi.example.com"),
+            ("**.example.com", "example.com"),
+            ("**.example.com", "api.example.com"),
+            ("**.example.com", "deep.api.example.com"),
+            ("api.**.com", "api.com"),
+            ("api.**.com", "api.x.com"),
+            ("api.**.com", "api.x.y.com"),
+            ("api.**", "api"),
+            ("api.**", "api.com"),
+            ("*", "com"),
+            ("*", "example.com"),
+            ("**", "com"),
+            ("**", "deep.api.example.com"),
+        ];
+        for (pattern, host) in cases {
+            let rust = openshell_core::host_pattern::host_matches(pattern, host).unwrap();
+            set_regorus_input(
+                &mut engine,
+                serde_json::json!({ "pattern": pattern, "host": host }),
+            )
+            .unwrap();
+            let rego = engine.eval_rule("data.test.host_match".into()).unwrap()
+                == regorus::Value::from(true);
+            assert_eq!(
+                rust, rego,
+                "host pattern parity mismatch: pattern={pattern} host={host} rust={rust} rego={rego}"
+            );
+        }
+    }
+
+    #[test]
+    fn middleware_policy_validation_rejects_bad_configs() {
+        let cases = [
+            (
+                "invalid on_error",
+                r#"
+network_middlewares:
+  redactor:
+    middleware: openshell/regex
+    on_error: maybe
+    endpoints:
+      include: ["api.example.com"]
+"#,
+                "invalid on_error",
+            ),
+            (
+                "duplicate order",
+                r#"
+network_middlewares:
+  alpha:
+    middleware: openshell/regex
+    order: 10
+    endpoints:
+      include: ["api.example.com"]
+  beta:
+    middleware: openshell/regex
+    order: 10
+    endpoints:
+      include: ["other.example.com"]
+"#,
+                "duplicate order 10",
+            ),
+            (
+                "missing selector",
+                r#"
+network_middlewares:
+  redactor:
+    middleware: openshell/regex
+"#,
+                "endpoint selector is required",
+            ),
+            (
+                "malformed selector",
+                r#"
+network_middlewares:
+  redactor:
+    middleware: openshell/regex
+    endpoints:
+      include: ["api[.example.com"]
+"#,
+                "invalid host pattern",
+            ),
+            (
+                "tls skip selector",
+                r#"
+network_middlewares:
+  redactor:
+    middleware: openshell/regex
+    endpoints:
+      include: ["api.example.com"]
+network_policies:
+  api:
+    endpoints:
+      - host: api.example.com
+        port: 443
+        tls: skip
+    binaries:
+      - { path: /usr/bin/curl }
+"#,
+                "tls: skip",
+            ),
+            (
+                "tls skip wildcard overlap",
+                r#"
+network_middlewares:
+  redactor:
+    middleware: openshell/regex
+    endpoints:
+      include: ["api.example.com"]
+network_policies:
+  api:
+    endpoints:
+      - host: "*.example.com"
+        port: 443
+        tls: skip
+    binaries:
+      - { path: /usr/bin/curl }
+"#,
+                "tls: skip",
+            ),
+        ];
+
+        for (name, data, expected) in cases {
+            let err = match OpaEngine::from_strings(TEST_POLICY, data) {
+                Ok(_) => panic!("{name}: expected policy validation failure"),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                err.contains(expected),
+                "{name}: expected {expected:?} in {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn middleware_catalog_validation_rejects_unknown_or_invalid_builtins() {
+        let validate = |implementation: &str, config: &prost_types::Struct| {
+            openshell_supervisor_middleware_builtins::validate_config(implementation, config)
+                .map_err(|error| error.to_string())
+        };
+        for (name, data, expected) in [
+            (
+                "unknown built-in",
+                r#"
+network_middlewares:
+  unknown:
+    middleware: openshell/unknown
+    endpoints:
+      include: ["api.example.com"]
+"#,
+                "not a registered OpenShell built-in",
+            ),
+            (
+                "invalid regex config",
+                r#"
+network_middlewares:
+  redactor:
+    middleware: openshell/regex
+    config:
+      mode: allow
+    endpoints:
+      include: ["api.example.com"]
+"#,
+                "supports only mode: redact",
+            ),
+        ] {
+            let error =
+                OpaEngine::from_strings_with_middleware_config(TEST_POLICY, data, Some(&validate))
+                    .err()
+                    .unwrap_or_else(|| panic!("{name}: expected catalog validation failure"))
+                    .to_string();
+            assert!(
+                error.contains(expected),
+                "{name}: expected {expected:?} in {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_proto_revalidates_middleware_policy() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_middlewares.insert(
+            "redactor".into(),
+            NetworkMiddlewareConfig {
+                middleware: "openshell/regex".into(),
+                endpoints: Some(openshell_core::proto::MiddlewareEndpointSelector {
+                    include: vec!["api[.example.com".into()],
+                    exclude: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        );
+
+        let error = OpaEngine::from_proto(&policy)
+            .err()
+            .expect("supervisor must reject invalid effective middleware policy")
+            .to_string();
+        assert!(error.contains("policy validation failed"), "{error}");
+        assert!(error.contains("invalid host pattern"), "{error}");
+    }
+
+    #[test]
     fn l7_head_denied_when_only_post_allowed() {
         let engine = OpaEngine::from_strings(
             TEST_POLICY,
@@ -6443,5 +9090,34 @@ network_policies:
         .unwrap();
         let input = l7_input("h.test", 80, "HEAD", "/protected");
         assert!(!eval_l7(&engine, &input));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test Utilities
+    // ---------------------------------------------------------------------------
+
+    fn wildcard_host_engine() -> OpaEngine {
+        let data = r#"
+network_policies:
+  wildcard_test:
+    name: wildcard_test
+    endpoints:
+      - host: "*.example.com"
+        port: 443
+    binaries:
+      - path: /usr/bin/test
+"#;
+        OpaEngine::from_strings(TEST_POLICY, data).expect("failed to load wildcard test policy")
+    }
+
+    fn wildcard_input(host: &str) -> NetworkInput {
+        NetworkInput {
+            host: host.into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/test"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        }
     }
 }

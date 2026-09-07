@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Once;
 
 /// Opaque handle to a prepared-but-not-yet-enforced sandbox.
-/// Holds the Landlock ruleset with `PathFds` opened as root.
+/// Holds the Landlock ruleset with `PathFds` opened before child exec.
 pub struct PreparedSandbox {
     landlock: Option<landlock::PreparedRuleset>,
     policy: SandboxPolicy,
@@ -24,6 +24,21 @@ pub struct PreparedSandbox {
 /// ensuring paths like mode-700 directories are accessible.
 pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<PreparedSandbox> {
     let landlock = landlock::prepare(policy, workdir)?;
+    Ok(PreparedSandbox {
+        landlock,
+        policy: policy.clone(),
+    })
+}
+
+/// Phase 1 for already-unprivileged workloads.
+///
+/// Opens Landlock `PathFds` as the current UID. This is used by Kubernetes
+/// sidecar mode, where the agent container already runs as the sandbox user.
+pub fn prepare_current_user(
+    policy: &SandboxPolicy,
+    workdir: Option<&str>,
+) -> Result<PreparedSandbox> {
+    let landlock = landlock::prepare_current_user(policy, workdir)?;
     Ok(PreparedSandbox {
         landlock,
         policy: policy.clone(),

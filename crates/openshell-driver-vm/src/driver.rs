@@ -24,6 +24,7 @@ use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use oci_client::client::{Client as OciClient, ClientConfig};
+use oci_client::errors::{OciDistributionError, OciErrorCode};
 use oci_client::manifest::{
     ImageIndexEntry, OCI_IMAGE_MEDIA_TYPE, OciDescriptor, OciImageManifest,
 };
@@ -38,10 +39,13 @@ use openshell_core::progress::{
 };
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
-    DriverSandbox as Sandbox, DriverSandboxStatus as SandboxStatus,
-    DriverSandboxTemplate as SandboxTemplate, GetCapabilitiesRequest, GetCapabilitiesResponse,
-    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition as SandboxCondition,
+    DriverPlatformEvent as PlatformEvent, DriverSandbox as Sandbox,
+    DriverSandboxStatus as SandboxStatus, DriverSandboxTemplate as SandboxTemplate,
+    EnsureWorkspaceRequest, EnsureWorkspaceResponse, GetCapabilitiesRequest,
+    GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
+    ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
     StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
@@ -51,12 +55,14 @@ use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
 use openshell_vfio::SysfsRoot;
+use opentelemetry::trace::TraceContextExt as _;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::future::Future;
 use std::io::Read;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -71,7 +77,8 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{Instrument as _, info, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use url::{Host, Url};
 
 const DRIVER_NAME: &str = "openshell-driver-vm";
@@ -81,6 +88,9 @@ const DEFAULT_MEM_MIB: u32 = 2048;
 const DEFAULT_OVERLAY_DISK_MIB: u64 = 4096;
 const DEFAULT_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY: usize = 4;
 const MAX_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY: usize = 16;
+const REGISTRY_REQUEST_MAX_ATTEMPTS: usize = 4;
+const REGISTRY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const REGISTRY_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -127,7 +137,7 @@ impl VmSandboxDriverConfig {
 /// Code paths route via `GVPROXY_HOST_LOOPBACK_ALIAS` (DNS / /etc/hosts)
 /// instead so logs stay readable; this constant is kept for documentation
 /// and parity with the guest init script.
-#[allow(dead_code)]
+#[allow(dead_code)] // Documentation/parity anchor; all routing goes via the alias.
 const GVPROXY_HOST_LOOPBACK_IP: &str = "192.168.127.254";
 const OPENSHELL_HOST_GATEWAY_ALIAS: &str = "host.openshell.internal";
 /// Hostname gvproxy resolves (via its embedded DNS) to the host-loopback IP.
@@ -142,12 +152,12 @@ const OPENSHELL_HOST_GATEWAY_ALIAS: &str = "host.openshell.internal";
 /// Both names ultimately route through the gvproxy NAT path on
 /// `GVPROXY_HOST_LOOPBACK_IP` — they do **not** go through the gateway IP.
 const GVPROXY_HOST_LOOPBACK_ALIAS: &str = OPENSHELL_HOST_GATEWAY_ALIAS;
-const GUEST_SSH_SOCKET_PATH: &str = "/run/openshell/ssh.sock";
-const GUEST_TLS_CA_PATH: &str = "/opt/openshell/tls/ca.crt";
-const GUEST_TLS_CERT_PATH: &str = "/opt/openshell/tls/tls.crt";
-const GUEST_TLS_KEY_PATH: &str = "/opt/openshell/tls/tls.key";
-const GUEST_SANDBOX_TOKEN_PATH: &str = "/opt/openshell/auth/sandbox.jwt";
-const GUEST_INIT_DROPIN_DIR: &str = "/opt/openshell/init.d";
+const GUEST_SSH_SOCKET_PATH: &str = openshell_core::container_paths::SSH_SOCKET_PATH;
+const GUEST_TLS_CA_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CA_PATH;
+const GUEST_TLS_CERT_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CERT_PATH;
+const GUEST_TLS_KEY_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_KEY_PATH;
+const GUEST_SANDBOX_TOKEN_PATH: &str = openshell_core::container_paths::VM_GUEST_SANDBOX_TOKEN_PATH;
+const GUEST_INIT_DROPIN_DIR: &str = openshell_core::container_paths::VM_GUEST_INIT_DROPIN_DIR;
 /// Guest path of the driver-authored manifest enumerating which
 /// `init.d` drop-ins the guest init script is allowed to execute.
 ///
@@ -155,13 +165,31 @@ const GUEST_INIT_DROPIN_DIR: &str = "/opt/openshell/init.d";
 /// else found under `init.d` — e.g. files baked into a user-controlled
 /// guest image — is ignored. The driver writes this file into the overlay
 /// upperdir on every launch, so the image cannot forge or shadow it.
-const GUEST_INIT_DROPIN_MANIFEST: &str = "/opt/openshell/init.d.manifest";
+const GUEST_INIT_DROPIN_MANIFEST: &str =
+    openshell_core::container_paths::VM_GUEST_INIT_DROPIN_MANIFEST;
+/// Guest path of the root-only corporate proxy credential staged by the driver.
+const GUEST_UPSTREAM_PROXY_AUTH_PATH: &str =
+    openshell_core::container_paths::VM_GUEST_UPSTREAM_PROXY_AUTH_PATH;
+/// Guest path of the corporate proxy CA bundle staged by the driver.
+const GUEST_PROXY_CA_PATH: &str = openshell_core::container_paths::VM_GUEST_PROXY_CA_PATH;
+/// Guest path of the driver-authored supervisor argument list.
+///
+/// The counterpart of [`GUEST_INIT_DROPIN_MANIFEST`] for the supervisor's own
+/// command line: written into the overlay upperdir on every launch (empty
+/// when there is nothing to pass) so the guest appends exactly the arguments
+/// the driver chose and a sandbox image cannot forge or shadow them.
+const GUEST_SUPERVISOR_ARGS_PATH: &str =
+    openshell_core::container_paths::VM_GUEST_SUPERVISOR_ARGS_PATH;
 const IMAGE_CACHE_ROOT_DIR: &str = "images";
 const IMAGE_CACHE_ROOTFS_IMAGE: &str = "rootfs.ext4";
 const OVERLAY_TEMPLATE_CACHE_DIR: &str = "overlay-templates";
 const OVERLAY_TEMPLATE_CACHE_LAYOUT_VERSION: &str = "sandbox-overlay-ext4-v1";
 const SANDBOX_OVERLAY_IMAGE: &str = "overlay.ext4";
 const SANDBOX_REQUEST_FILE: &str = "sandbox.pb";
+const SANDBOX_STOPPED_FILE: &str = "stopped";
+/// Durable tombstone preventing driver restart from relaunching a sandbox
+/// whose canonical main process already terminated.
+const MAIN_PROCESS_EXITED_FILE: &str = "main-process-exited";
 const GUEST_IMAGE_CONFIG_DIR: &str = "openshell-image";
 const GUEST_IMAGE_OCI_LAYOUT_DIR: &str = "oci";
 const GUEST_IMAGE_OCI_REF: &str = "openshell";
@@ -207,7 +235,7 @@ enum GuestImagePayloadSource {
     LocalDocker { rootfs_archive: PathBuf },
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct VmDriverConfig {
     pub openshell_endpoint: String,
     pub state_dir: PathBuf,
@@ -233,6 +261,104 @@ pub struct VmDriverConfig {
     /// When empty, defaults to the resolved UID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_gid: Option<u32>,
+
+    /// Corporate forward proxy URL (`http://host:port` or `https://host:port`)
+    /// passed to the in-guest supervisor.
+    ///
+    /// The supervisor chains policy-approved TLS tunnels through this proxy
+    /// with HTTP CONNECT instead of dialing destinations directly. This is an
+    /// operator-owned egress boundary: it travels on the supervisor's argv,
+    /// which sandbox spec/template environment and image `ENV` cannot
+    /// influence. A proxy on the gateway host's loopback is reachable from the
+    /// guest only through the gvproxy host alias
+    /// (`host.openshell.internal`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https_proxy: Option<String>,
+
+    /// Comma-separated `NO_PROXY` list passed alongside the proxy URL.
+    ///
+    /// Matching destinations are dialed directly instead of through the
+    /// corporate proxy. This bypasses only the corporate proxy, never
+    /// `OpenShell` policy evaluation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_proxy: Option<String>,
+
+    /// Path (on the gateway host) to a file containing the corporate proxy
+    /// credential in `user:pass` form.
+    ///
+    /// The driver validates it at sandbox-create time and stages it into the
+    /// per-sandbox overlay at [`GUEST_UPSTREAM_PROXY_AUTH_PATH`], root-only.
+    /// Credentials are never embedded in the proxy URL and never reach the
+    /// guest environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_auth_file: Option<String>,
+
+    /// Explicit acknowledgement that proxy credentials are sent in cleartext.
+    ///
+    /// `Proxy-Authorization: Basic` over the plain-TCP connection to an
+    /// `http://` proxy is recoverable by anyone on the network path, so
+    /// [`Self::proxy_auth_file`] requires this acknowledgement. An `https://`
+    /// proxy carries the credential inside the verified TLS session and does
+    /// not need it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_auth_allow_insecure: Option<bool>,
+
+    /// Send the destination hostname in CONNECT requests instead of a
+    /// validated IP.
+    ///
+    /// The default binds the tunnel to an address that passed the sandbox's
+    /// SSRF and `allowed_ips` validation. Set this only when the proxy's ACLs
+    /// filter on hostnames and reject IP CONNECT targets: the proxy then
+    /// resolves the name itself and its own ACLs become the effective egress
+    /// control for proxied TLS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_connect_by_hostname: Option<bool>,
+
+    /// Path (on the gateway host) to a PEM CA bundle trusted for the
+    /// corporate proxy.
+    ///
+    /// The driver stages it into the per-sandbox overlay at
+    /// [`GUEST_PROXY_CA_PATH`] and passes that path via
+    /// `--upstream-proxy-ca-bundle`. It is trusted both for the handshake
+    /// with an `https://` proxy and for server certificates re-signed by a
+    /// TLS-intercepting proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_ca_bundle: Option<String>,
+}
+
+/// Redacting `Debug` so a proxy URL or credential path never reaches a log.
+///
+/// A validated proxy URL cannot embed credentials, but `Debug` can be emitted
+/// before validation runs, so presence is logged rather than the value.
+impl std::fmt::Debug for VmDriverConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VmDriverConfig")
+            .field("openshell_endpoint", &self.openshell_endpoint)
+            .field("state_dir", &self.state_dir)
+            .field("launcher_bin", &self.launcher_bin)
+            .field("default_image", &self.default_image)
+            .field("bootstrap_image", &self.bootstrap_image)
+            .field("log_level", &self.log_level)
+            .field("krun_log_level", &self.krun_log_level)
+            .field("vcpus", &self.vcpus)
+            .field("mem_mib", &self.mem_mib)
+            .field("overlay_disk_mib", &self.overlay_disk_mib)
+            .field("guest_tls_ca", &self.guest_tls_ca)
+            .field("guest_tls_cert", &self.guest_tls_cert)
+            .field("guest_tls_key", &self.guest_tls_key)
+            .field("gpu_enabled", &self.gpu_enabled)
+            .field("gpu_mem_mib", &self.gpu_mem_mib)
+            .field("gpu_vcpus", &self.gpu_vcpus)
+            .field("sandbox_uid", &self.sandbox_uid)
+            .field("sandbox_gid", &self.sandbox_gid)
+            .field("https_proxy", &self.https_proxy.is_some())
+            .field("no_proxy", &self.no_proxy)
+            .field("proxy_auth_file", &self.proxy_auth_file.is_some())
+            .field("proxy_auth_allow_insecure", &self.proxy_auth_allow_insecure)
+            .field("proxy_connect_by_hostname", &self.proxy_connect_by_hostname)
+            .field("proxy_ca_bundle", &self.proxy_ca_bundle)
+            .finish()
+    }
 }
 
 /// Default sandbox UID used by the VM driver when no config value is set.
@@ -259,6 +385,12 @@ impl Default for VmDriverConfig {
             gpu_vcpus: 4,
             sandbox_uid: None,
             sandbox_gid: None,
+            https_proxy: None,
+            no_proxy: None,
+            proxy_auth_file: None,
+            proxy_auth_allow_insecure: None,
+            proxy_connect_by_hostname: None,
+            proxy_ca_bundle: None,
         }
     }
 }
@@ -295,6 +427,29 @@ impl VmDriverConfig {
             ));
         }
         Ok(())
+    }
+
+    /// Validate the operator's corporate upstream-proxy settings, fail-closed.
+    ///
+    /// Delegates to the validator shared with the Podman and Kubernetes
+    /// drivers and with the in-guest supervisor, so a value accepted here is
+    /// never rejected inside the guest — and no misconfiguration can silently
+    /// degrade to a direct dial.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the offending key.
+    pub fn validate_proxy_config(&self) -> Result<(), String> {
+        openshell_core::driver_utils::validate_upstream_proxy_settings(
+            &openshell_core::driver_utils::UpstreamProxySettings {
+                url: self.https_proxy.as_deref(),
+                no_proxy: self.no_proxy.as_deref(),
+                auth_file: self.proxy_auth_file.as_deref(),
+                auth_allow_insecure: self.proxy_auth_allow_insecure,
+                connect_by_hostname: self.proxy_connect_by_hostname,
+                ca_bundle: self.proxy_ca_bundle.as_deref(),
+            },
+        )
     }
 
     fn requires_tls_materials(&self) -> bool {
@@ -391,6 +546,27 @@ enum OverlayPreparation {
     PreserveExisting,
 }
 
+fn provisioning_span(
+    parent: &opentelemetry::Context,
+    sandbox_id: &str,
+    image_ref: &str,
+) -> tracing::Span {
+    let span = tracing::info_span!(
+        parent: None,
+        "vm.provision",
+        otel.name = "vm.provision",
+        otel.status_code = tracing::field::Empty,
+        sandbox.id = %sandbox_id,
+        image.ref = %image_ref,
+    );
+    let parent_span_context = parent.span().span_context().clone();
+    if parent_span_context.is_valid() {
+        let parent = opentelemetry::Context::new().with_remote_span_context(parent_span_context);
+        let _ = span.set_parent(parent);
+    }
+    span
+}
+
 #[derive(Clone)]
 pub struct VmDriver {
     config: VmDriverConfig,
@@ -416,6 +592,7 @@ impl VmDriver {
             .validate()
             .map_err(|err| err.message().to_string())?;
         config.validate_sandbox_identity()?;
+        config.validate_proxy_config()?;
         if config.openshell_endpoint.trim().is_empty() {
             return Err("openshell endpoint is required".to_string());
         }
@@ -492,6 +669,9 @@ impl VmDriver {
             driver_name: DRIVER_NAME.to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
+            gateway_manages_lifecycle: true,
+            supports_sandbox_authentication: false,
+            driver_reports_runtime_readiness: false,
         }
     }
 
@@ -579,7 +759,7 @@ impl VmDriver {
             registry.remove(&sandbox.id);
             let _ = tokio::fs::remove_dir_all(&state_dir).await;
             return Err(Status::internal(format!(
-                "write sandbox resume metadata failed: {err}"
+                "write sandbox start metadata failed: {err}"
             )));
         }
 
@@ -599,17 +779,22 @@ impl VmDriver {
         let sandbox_id = sandbox.id.clone();
         let image_ref_for_task = image_ref.clone();
         let state_dir_for_task = state_dir.clone();
-        let task = tokio::spawn(async move {
-            driver
-                .provision_sandbox(
-                    sandbox_for_task,
-                    image_ref_for_task,
-                    state_dir_for_task,
-                    tls_paths,
-                    OverlayPreparation::Fresh,
-                )
-                .await;
-        });
+        let parent = tracing::Span::current().context();
+        let provisioning_span = provisioning_span(&parent, &sandbox_id, &image_ref);
+        let task = tokio::spawn(
+            async move {
+                driver
+                    .provision_sandbox(
+                        sandbox_for_task,
+                        image_ref_for_task,
+                        state_dir_for_task,
+                        tls_paths,
+                        OverlayPreparation::Fresh,
+                    )
+                    .await;
+            }
+            .instrument(provisioning_span),
+        );
 
         let mut registry = self.registry.lock().await;
         if let Some(record) = registry.get_mut(&sandbox_id) {
@@ -644,6 +829,7 @@ impl VmDriver {
             )
             .await
         {
+            tracing::Span::current().record("otel.status_code", "ERROR");
             if err.code() == tonic::Code::Cancelled {
                 if overlay_preparation == OverlayPreparation::Fresh {
                     let _ = tokio::fs::remove_dir_all(&state_dir).await;
@@ -868,6 +1054,16 @@ impl VmDriver {
             return Err(err);
         }
 
+        // Staged on every launch, including a restart onto a preserved
+        // overlay, so the driver's copy always shadows the image layer.
+        if let Err(err) = inject_guest_upstream_proxy(&overlay_disk, &self.config).await {
+            self.lifecycle_extensions
+                .after_launch_failed(&sandbox, &state_dir, LaunchAbortReason::GuestPrepareFailed)
+                .await;
+            self.release_gpu_and_subnet(&sandbox.id);
+            return Err(err);
+        }
+
         let endpoint_override = if plan.backend == VmBackend::Qemu {
             plan.host_ip.as_deref().map(|host_ip| {
                 guest_visible_openshell_endpoint_for_tap(&self.config.openshell_endpoint, host_ip)
@@ -941,7 +1137,7 @@ impl VmDriver {
             console_output = %console_output.display(),
             "vm driver: spawning VM launcher"
         );
-        let child = match command.spawn() {
+        let child = match spawn_vm_launcher(&mut command, &sandbox.id, &plan.backend) {
             Ok(child) => child,
             Err(err) => {
                 warn!(
@@ -982,7 +1178,6 @@ impl VmDriver {
                     record.process = Some(process.clone());
                     record.gpu_bdf.clone_from(&gpu_bdf);
                     record.qemu_network_allocated = plan.backend == VmBackend::Qemu;
-                    record.provisioning_task = None;
                     snapshot_to_publish = Some(record.snapshot.clone());
                 }
                 _ => {
@@ -1028,11 +1223,145 @@ impl VmDriver {
         Ok(())
     }
 
+    pub async fn stop_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), Status> {
+        if !sandbox_id.is_empty() {
+            validate_sandbox_id(sandbox_id)?;
+        }
+        let record_id = {
+            let registry = self.registry.lock().await;
+            if registry.contains_key(sandbox_id) {
+                Some(sandbox_id.to_string())
+            } else {
+                registry
+                    .iter()
+                    .find(|(_, record)| record.snapshot.name == sandbox_name)
+                    .map(|(id, _)| id.clone())
+            }
+        }
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+
+        let state_dir = {
+            let registry = self.registry.lock().await;
+            registry
+                .get(&record_id)
+                .ok_or_else(|| Status::not_found("sandbox not found"))?
+                .state_dir
+                .clone()
+        };
+
+        // Persist intent before detaching process handles or releasing host
+        // allocations. If this write fails, the live record remains intact.
+        tokio::fs::write(state_dir.join(SANDBOX_STOPPED_FILE), b"stopped\n")
+            .await
+            .map_err(|err| Status::internal(format!("persist stop marker failed: {err}")))?;
+
+        let (process, provisioning_task, has_gpu, has_qemu_network, snapshot) = {
+            let mut registry = self.registry.lock().await;
+            let record = registry
+                .get_mut(&record_id)
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            (
+                record.process.take(),
+                record.provisioning_task.take(),
+                record.gpu_bdf.take().is_some(),
+                std::mem::take(&mut record.qemu_network_allocated),
+                record.snapshot.clone(),
+            )
+        };
+
+        if let Some(task) = provisioning_task {
+            task.abort();
+        }
+        if let Some(process) = process {
+            let mut process = process.lock().await;
+            process.deleting = true;
+            terminate_vm_process(&mut process.child)
+                .await
+                .map_err(|err| Status::internal(format!("failed to stop vm: {err}")))?;
+        }
+        self.lifecycle_extensions
+            .after_launch_failed(&snapshot, &state_dir, LaunchAbortReason::Stopped)
+            .await;
+        self.release_allocations(&record_id, has_gpu, has_qemu_network);
+
+        if let Some(snapshot) = self
+            .set_snapshot_condition(&record_id, stopped_condition(), false)
+            .await
+        {
+            self.publish_snapshot(snapshot);
+        }
+        self.publish_platform_event(
+            record_id,
+            platform_event("vm", "Normal", "Stopped", "VM sandbox stopped".to_string()),
+        );
+        Ok(())
+    }
+
+    pub async fn start_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), Status> {
+        if !sandbox_id.is_empty() {
+            validate_sandbox_id(sandbox_id)?;
+        }
+        let (record_id, state_dir, already_running) = {
+            let registry = self.registry.lock().await;
+            let (id, record) = if let Some(entry) = registry.get_key_value(sandbox_id) {
+                entry
+            } else {
+                registry
+                    .iter()
+                    .find(|(_, record)| record.snapshot.name == sandbox_name)
+                    .ok_or_else(|| Status::not_found("sandbox not found"))?
+            };
+            (
+                id.clone(),
+                record.state_dir.clone(),
+                record.process.is_some() || record.provisioning_task.is_some(),
+            )
+        };
+        if already_running {
+            return Ok(());
+        }
+
+        let sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
+            .await
+            .map_err(|err| {
+                Status::internal(format!("read sandbox start metadata failed: {err}"))
+            })?;
+        let stopped_record = self
+            .registry
+            .lock()
+            .await
+            .remove(&record_id)
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let restored = self
+            .restore_persisted_sandbox(sandbox, state_dir, true, &tracing::Span::current())
+            .await;
+        if !restored {
+            self.registry
+                .lock()
+                .await
+                .entry(record_id)
+                .or_insert(stopped_record);
+            return Err(Status::internal("failed to start persisted VM sandbox"));
+        }
+        Ok(())
+    }
+
+    #[tracing::instrument(
+        name = "vm.teardown",
+        skip(self),
+        fields(
+            otel.name = "vm.teardown",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+            sandbox.name = %sandbox_name,
+        )
+    )]
     pub async fn delete_sandbox(
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<DeleteSandboxResponse, Status> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         if !sandbox_id.is_empty() {
             validate_sandbox_id(sandbox_id)?;
         }
@@ -1050,7 +1379,7 @@ impl VmDriver {
         };
 
         let Some(record_id) = record_id else {
-            return Ok(DeleteSandboxResponse { deleted: false });
+            return span_status.finish(Ok(DeleteSandboxResponse { deleted: false }));
         };
 
         let (
@@ -1063,7 +1392,7 @@ impl VmDriver {
         ) = {
             let mut registry = self.registry.lock().await;
             let Some(record) = registry.get_mut(&record_id) else {
-                return Ok(DeleteSandboxResponse { deleted: false });
+                return span_status.finish(Ok(DeleteSandboxResponse { deleted: false }));
             };
             record.deleting = true;
             (
@@ -1109,7 +1438,7 @@ impl VmDriver {
         }
 
         self.publish_deleted(record_id);
-        Ok(DeleteSandboxResponse { deleted: true })
+        span_status.finish(Ok(DeleteSandboxResponse { deleted: true }))
     }
 
     pub async fn get_sandbox(
@@ -1145,6 +1474,14 @@ impl VmDriver {
         snapshots
     }
 
+    #[tracing::instrument(
+        name = "reconcile",
+        skip_all,
+        fields(
+            otel.name = "reconcile.sandboxes",
+            driver.name = "vm",
+        )
+    )]
     async fn restore_persisted_sandboxes(&self) {
         let state_root = sandboxes_root_dir(&self.config.state_dir);
         let mut entries = match tokio::fs::read_dir(&state_root).await {
@@ -1215,18 +1552,81 @@ impl VmDriver {
                 continue;
             }
 
-            self.restore_persisted_sandbox(sandbox, state_dir).await;
+            if tokio::fs::metadata(state_dir.join(SANDBOX_STOPPED_FILE))
+                .await
+                .is_ok()
+            {
+                let snapshot = sandbox_snapshot(&sandbox, stopped_condition(), false);
+                let mut registry = self.registry.lock().await;
+                registry.entry(sandbox.id.clone()).or_insert(SandboxRecord {
+                    snapshot: snapshot.clone(),
+                    state_dir: state_dir.clone(),
+                    process: None,
+                    provisioning_task: None,
+                    gpu_bdf: None,
+                    qemu_network_allocated: false,
+                    deleting: false,
+                });
+                drop(registry);
+                self.publish_snapshot(snapshot);
+                info!(sandbox_id = %sandbox.id, "vm driver: restored stopped sandbox without launching compute");
+                continue;
+            }
+
+            if tokio::fs::try_exists(state_dir.join(MAIN_PROCESS_EXITED_FILE))
+                .await
+                .unwrap_or(false)
+            {
+                let snapshot = sandbox_snapshot(
+                    &sandbox,
+                    error_condition(
+                        "ProcessExited",
+                        "Canonical main process exited before VM driver restart",
+                    ),
+                    false,
+                );
+                let mut registry = self.registry.lock().await;
+                registry.entry(sandbox.id.clone()).or_insert(SandboxRecord {
+                    snapshot: snapshot.clone(),
+                    state_dir: state_dir.clone(),
+                    process: None,
+                    provisioning_task: None,
+                    gpu_bdf: None,
+                    qemu_network_allocated: false,
+                    deleting: false,
+                });
+                drop(registry);
+                self.publish_snapshot(snapshot);
+                info!(
+                    sandbox_id = %sandbox.id,
+                    "vm driver: preserved terminal sandbox without restarting canonical process"
+                );
+                continue;
+            }
+
+            self.restore_persisted_sandbox(sandbox, state_dir, false, &tracing::Span::current())
+                .await;
         }
     }
 
-    async fn restore_persisted_sandbox(&self, sandbox: Sandbox, state_dir: PathBuf) {
+    /// Restore a persisted sandbox and report whether the driver accepted it.
+    /// For explicit start, the stop marker is cleared only after all
+    /// restore preflight checks pass and the replacement registry record is
+    /// installed. A failed restore therefore remains durably stopped.
+    async fn restore_persisted_sandbox(
+        &self,
+        sandbox: Sandbox,
+        state_dir: PathBuf,
+        clear_stop_marker: bool,
+        reconciliation_span: &tracing::Span,
+    ) -> bool {
         let Some(image_ref) = self.resolved_sandbox_image(&sandbox) else {
             warn!(
                 sandbox_id = %sandbox.id,
                 sandbox_name = %sandbox.name,
                 "vm driver: cannot restore persisted sandbox without image"
             );
-            return;
+            return false;
         };
         let tls_paths = match self.config.tls_paths() {
             Ok(paths) => paths,
@@ -1237,7 +1637,7 @@ impl VmDriver {
                     error = %err,
                     "vm driver: cannot restore persisted sandbox TLS configuration"
                 );
-                return;
+                return false;
             }
         };
 
@@ -1249,7 +1649,7 @@ impl VmDriver {
                 error = %err.message(),
                 "vm driver: cannot restore persisted sandbox extension state"
             );
-            return;
+            return false;
         }
 
         let persisted = RestoreContext {
@@ -1264,14 +1664,14 @@ impl VmDriver {
                 error = %err,
                 "vm driver: lifecycle extension rejected persisted sandbox restore"
             );
-            return;
+            return false;
         }
 
         let snapshot = sandbox_snapshot(&sandbox, provisioning_condition(), false);
         {
             let mut registry = self.registry.lock().await;
             if registry.contains_key(&sandbox.id) {
-                return;
+                return false;
             }
             registry.insert(
                 sandbox.id.clone(),
@@ -1287,6 +1687,23 @@ impl VmDriver {
             );
         }
 
+        if clear_stop_marker {
+            match tokio::fs::remove_file(state_dir.join(SANDBOX_STOPPED_FILE)).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    self.registry.lock().await.remove(&sandbox.id);
+                    warn!(
+                        sandbox_id = %sandbox.id,
+                        state_dir = %state_dir.display(),
+                        error = %err,
+                        "vm driver: cannot clear stop marker for persisted sandbox restore"
+                    );
+                    return false;
+                }
+            }
+        }
+
         self.publish_platform_event(
             sandbox.id.clone(),
             platform_event(
@@ -1300,17 +1717,32 @@ impl VmDriver {
 
         let driver = self.clone();
         let sandbox_id = sandbox.id.clone();
-        let task = tokio::spawn(async move {
-            driver
-                .provision_sandbox(
-                    sandbox,
-                    image_ref,
-                    state_dir,
-                    tls_paths,
-                    OverlayPreparation::PreserveExisting,
-                )
-                .await;
-        });
+        let restoration_span = tracing::info_span!(
+            parent: reconciliation_span,
+            "vm.restore",
+            otel.name = "vm.restore",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+        );
+        let reconciliation_span = reconciliation_span.clone();
+        let provisioning_span =
+            provisioning_span(&restoration_span.context(), &sandbox_id, &image_ref);
+        let task = tokio::spawn(
+            async move {
+                driver
+                    .provision_sandbox(
+                        sandbox,
+                        image_ref,
+                        state_dir,
+                        tls_paths,
+                        OverlayPreparation::PreserveExisting,
+                    )
+                    .await;
+                drop(reconciliation_span);
+            }
+            .instrument(provisioning_span)
+            .instrument(restoration_span),
+        );
 
         let mut registry = self.registry.lock().await;
         if let Some(record) = registry.get_mut(&sandbox_id) {
@@ -1322,6 +1754,7 @@ impl VmDriver {
         } else {
             task.abort();
         }
+        true
     }
 
     fn release_gpu(&self, sandbox_id: &str) {
@@ -1417,26 +1850,44 @@ impl VmDriver {
         if plan.gpu_bdf.is_none() {
             plan.gpu_bdf = gpu_bdf;
         }
-        if has_complete_qemu_network(plan) {
-            return Ok(());
+        if !has_complete_qemu_network(plan) {
+            let subnet = self
+                .subnet_allocator
+                .lock()
+                .map_err(|e| Status::internal(format!("subnet allocator lock poisoned: {e}")))?
+                .allocate(sandbox_id)
+                .map_err(Status::failed_precondition)?;
+            let mac = mac_from_sandbox_id(sandbox_id);
+            plan.tap_device = Some(tap_device_name(sandbox_id));
+            plan.guest_ip = Some(subnet.guest_ip.to_string());
+            plan.host_ip = Some(subnet.host_ip.to_string());
+            plan.vsock_cid = Some(allocate_vsock_cid());
+            plan.guest_mac = Some(format!(
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            ));
+            plan.gateway_port = gateway_port_from_endpoint(&self.config.openshell_endpoint);
         }
 
-        let subnet = self
-            .subnet_allocator
-            .lock()
-            .map_err(|e| Status::internal(format!("subnet allocator lock poisoned: {e}")))?
-            .allocate(sandbox_id)
-            .map_err(Status::failed_precondition)?;
-        let mac = mac_from_sandbox_id(sandbox_id);
-        plan.tap_device = Some(tap_device_name(sandbox_id));
-        plan.guest_ip = Some(subnet.guest_ip.to_string());
-        plan.host_ip = Some(subnet.host_ip.to_string());
-        plan.vsock_cid = Some(allocate_vsock_cid());
-        plan.guest_mac = Some(format!(
-            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-        ));
-        plan.gateway_port = gateway_port_from_endpoint(&self.config.openshell_endpoint);
+        // The corporate-proxy host-loopback recipe is a libkrun/gvproxy
+        // property and has no QEMU/TAP equivalent (see
+        // `proxy_url_targets_gateway_host`). Run it here, after the subnet
+        // allocation above has settled `plan.host_ip`, because the address to
+        // compare against is this sandbox's own TAP host address. Fail the
+        // create with the reason rather than boot a sandbox whose
+        // policy-approved CONNECTs all time out against an unreachable proxy.
+        if let Some(url) = self.config.https_proxy.as_deref()
+            && proxy_url_targets_gateway_host(url, plan.host_ip.as_deref())
+        {
+            let tap_host = plan.host_ip.as_deref().unwrap_or("the TAP host address");
+            return Err(Status::failed_precondition(format!(
+                "https_proxy '{url}' addresses the gateway host, which a QEMU/TAP sandbox \
+                 (GPU sandboxes) cannot reach: host.openshell.internal resolves to this \
+                 sandbox's TAP host address {tap_host} and the driver's nftables rules allow \
+                 only the gateway port from the guest. Configure a proxy address routable \
+                 from the guest's masqueraded egress, or run this sandbox without a GPU"
+            )));
+        }
         Ok(())
     }
 
@@ -1604,6 +2055,21 @@ impl VmDriver {
         }
     }
 
+    #[cfg(test)]
+    async fn wait_for_provisioning_for_test(&self, sandbox_id: &str) {
+        let task = self
+            .registry
+            .lock()
+            .await
+            .get_mut(sandbox_id)
+            .and_then(|record| record.provisioning_task.take())
+            .unwrap_or_else(|| panic!("provisioning task for {sandbox_id}"));
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap_or_else(|_| panic!("provisioning task for {sandbox_id} timed out"))
+            .unwrap_or_else(|err| panic!("provisioning task for {sandbox_id} failed: {err}"));
+    }
+
     async fn assign_gpu_to_record(
         &self,
         sandbox_id: &str,
@@ -1657,7 +2123,6 @@ impl VmDriver {
                 return;
             }
             record.process = None;
-            record.provisioning_task = None;
             record.gpu_bdf = None;
             record.qemu_network_allocated = false;
             record.snapshot.status = Some(status_with_condition(
@@ -1685,11 +2150,22 @@ impl VmDriver {
         }
     }
 
+    #[tracing::instrument(
+        name = "vm.prepare_images",
+        skip(self),
+        fields(
+            otel.name = "vm.prepare_images",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+            image.ref = %image_ref,
+        )
+    )]
     async fn prepare_runtime_images(
         &self,
         sandbox_id: &str,
         image_ref: &str,
     ) -> Result<RuntimeImagePlan, Status> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         let bootstrap_image_ref = self.bootstrap_image_ref(image_ref);
         let bootstrap_image_identity = self
             .ensure_cached_bootstrap_rootfs_image(sandbox_id, &bootstrap_image_ref)
@@ -1697,23 +2173,23 @@ impl VmDriver {
         let root_disk = image_cache_rootfs_image(&self.config.state_dir, &bootstrap_image_identity);
 
         if image_ref.trim() == bootstrap_image_ref.trim() {
-            return Ok(RuntimeImagePlan {
+            return span_status.finish(Ok(RuntimeImagePlan {
                 root_disk,
                 image_disk: None,
                 image_identity: bootstrap_image_identity.clone(),
                 bootstrap_image_identity,
-            });
+            }));
         }
 
         let prepared = self
             .ensure_prepared_image_disk(sandbox_id, image_ref, &root_disk)
             .await?;
-        Ok(RuntimeImagePlan {
+        span_status.finish(Ok(RuntimeImagePlan {
             root_disk,
             image_disk: Some(prepared.disk_path),
             image_identity: prepared.image_identity,
             bootstrap_image_identity,
-        })
+        }))
     }
 
     fn bootstrap_image_ref(&self, sandbox_image_ref: &str) -> String {
@@ -1728,6 +2204,16 @@ impl VmDriver {
         sandbox_image_ref.to_string()
     }
 
+    #[tracing::instrument(
+        name = "vm.prepare_overlay",
+        skip_all,
+        fields(
+            otel.name = "vm.prepare_overlay",
+            otel.status_code = tracing::field::Empty,
+            overlay.path = %overlay_disk.display(),
+            preparation = ?preparation,
+        )
+    )]
     async fn prepare_runtime_overlay(
         &self,
         overlay_disk: &Path,
@@ -1735,6 +2221,7 @@ impl VmDriver {
         sandbox_token: Option<&str>,
         preparation: OverlayPreparation,
     ) -> Result<(), String> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         let tls_materials = match tls_paths {
             Some(paths) => Some(read_guest_tls_materials(paths).await?),
             None => None,
@@ -1763,7 +2250,7 @@ impl VmDriver {
             .map_err(|err| format!("overlay template preparation panicked: {err}"))??;
         }
 
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             prepare_sandbox_overlay_image(
                 &template_path,
                 &overlay_disk,
@@ -1774,7 +2261,8 @@ impl VmDriver {
             )
         })
         .await
-        .map_err(|err| format!("overlay image preparation panicked: {err}"))?
+        .map_err(|err| format!("overlay image preparation panicked: {err}"))?;
+        span_status.finish(result)
     }
 
     fn resolved_sandbox_image(&self, sandbox: &Sandbox) -> Option<String> {
@@ -1786,15 +2274,26 @@ impl VmDriver {
             })
     }
 
+    #[tracing::instrument(
+        name = "vm.resolve_bootstrap_image",
+        skip(self),
+        fields(
+            otel.name = "vm.resolve_bootstrap_image",
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+            image.ref = %image_ref,
+        )
+    )]
     async fn ensure_cached_bootstrap_rootfs_image(
         &self,
         sandbox_id: &str,
         image_ref: &str,
     ) -> Result<String, Status> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         if let Some((engine, image_identity)) =
             self.resolve_local_container_image(image_ref).await?
         {
-            return self
+            let result = self
                 .ensure_cached_local_image_rootfs_image(
                     sandbox_id,
                     image_ref,
@@ -1802,6 +2301,7 @@ impl VmDriver {
                     &image_identity,
                 )
                 .await;
+            return span_status.finish(result);
         }
 
         info!(image_ref = %image_ref, "vm driver: ensuring cached root disk image (registry)");
@@ -1818,14 +2318,15 @@ impl VmDriver {
                 ("image_source".to_string(), "registry".to_string()),
             ]),
         );
-        client
-            .auth(&reference, &auth, RegistryOperation::Pull)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to authenticate registry access for vm sandbox image '{image_ref}': {err}"
-                ))
-            })?;
+        retry_registry_request("authenticate with registry", || {
+            client.auth(&reference, &auth, RegistryOperation::Pull)
+        })
+        .await
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to authenticate registry access for vm sandbox image '{image_ref}': {err}"
+            ))
+        })?;
         info!(image_ref = %image_ref, "vm driver: fetching manifest digest");
         self.publish_vm_progress(
             sandbox_id,
@@ -1836,14 +2337,15 @@ impl VmDriver {
                 ("image_source".to_string(), "registry".to_string()),
             ]),
         );
-        let source_image_identity = client
-            .fetch_manifest_digest(&reference, &auth)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to resolve vm sandbox image '{image_ref}': {err}"
-                ))
-            })?;
+        let source_image_identity = retry_registry_request("fetch manifest digest", || {
+            client.fetch_manifest_digest(&reference, &auth)
+        })
+        .await
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to resolve vm sandbox image '{image_ref}': {err}"
+            ))
+        })?;
         info!(
             image_ref = %image_ref,
             image_identity = %source_image_identity,
@@ -1883,7 +2385,7 @@ impl VmDriver {
             );
             self.publish_pulled_event(sandbox_id, image_ref, &image_path)
                 .await;
-            return Ok(image_identity);
+            return span_status.finish(Ok(image_identity));
         }
 
         info!(
@@ -1933,7 +2435,7 @@ impl VmDriver {
             );
             self.publish_pulled_event(sandbox_id, image_ref, &image_path)
                 .await;
-            return Ok(image_identity);
+            return span_status.finish(Ok(image_identity));
         }
 
         self.build_cached_registry_image_rootfs_image(
@@ -1947,7 +2449,7 @@ impl VmDriver {
         .await?;
         self.publish_pulled_event(sandbox_id, image_ref, &image_path)
             .await;
-        Ok(image_identity)
+        span_status.finish(Ok(image_identity))
     }
 
     async fn resolve_local_container_image(
@@ -2220,14 +2722,15 @@ impl VmDriver {
                 ("image_source".to_string(), "registry".to_string()),
             ]),
         );
-        client
-            .auth(&reference, &auth, RegistryOperation::Pull)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to authenticate registry access for vm sandbox image '{image_ref}': {err}"
-                ))
-            })?;
+        retry_registry_request("authenticate with registry", || {
+            client.auth(&reference, &auth, RegistryOperation::Pull)
+        })
+        .await
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to authenticate registry access for vm sandbox image '{image_ref}': {err}"
+            ))
+        })?;
 
         self.publish_vm_progress(
             sandbox_id,
@@ -2238,14 +2741,15 @@ impl VmDriver {
                 ("image_source".to_string(), "registry".to_string()),
             ]),
         );
-        let source_image_identity = client
-            .fetch_manifest_digest(&reference, &auth)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to resolve vm sandbox image '{image_ref}': {err}"
-                ))
-            })?;
+        let source_image_identity = retry_registry_request("fetch manifest digest", || {
+            client.fetch_manifest_digest(&reference, &auth)
+        })
+        .await
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to resolve vm sandbox image '{image_ref}': {err}"
+            ))
+        })?;
         let cache_identity = prepared_image_cache_identity(&source_image_identity);
         let image_path = image_cache_rootfs_image(&self.config.state_dir, &cache_identity);
 
@@ -2271,14 +2775,15 @@ impl VmDriver {
         self.reset_image_staging_dir(&staging_dir).await?;
         let layout_dir = staging_dir.join(GUEST_IMAGE_OCI_LAYOUT_DIR);
 
-        let (manifest, _) = client
-            .pull_image_manifest(&reference, &auth)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to pull vm sandbox image manifest '{image_ref}': {err}"
-                ))
-            })?;
+        let (manifest, _) = retry_registry_request("pull image manifest", || {
+            client.pull_image_manifest(&reference, &auth)
+        })
+        .await
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to pull vm sandbox image manifest '{image_ref}': {err}"
+            ))
+        })?;
         tokio::fs::create_dir_all(oci_layout_blobs_dir(&layout_dir))
             .await
             .map_err(|err| Status::internal(format!("create guest OCI layout failed: {err}")))?;
@@ -2875,6 +3380,25 @@ impl VmDriver {
             };
 
             if let Some(status) = exit_status {
+                let state_dir = {
+                    let registry = self.registry.lock().await;
+                    registry
+                        .get(&sandbox_id)
+                        .map(|record| record.state_dir.clone())
+                };
+                if let Some(state_dir) = state_dir
+                    && let Err(error) = write_private_file(
+                        &state_dir.join(MAIN_PROCESS_EXITED_FILE),
+                        b"terminal\n".to_vec(),
+                    )
+                    .await
+                {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        %error,
+                        "vm driver: failed to persist canonical-process exit tombstone"
+                    );
+                }
                 let message = status.code().map_or_else(
                     || "VM process exited".to_string(),
                     |code| format!("VM process exited with status {code}"),
@@ -2982,11 +3506,30 @@ impl VmDriver {
 
 #[tonic::async_trait]
 impl ComputeDriver for VmDriver {
+    async fn authenticate_sandbox(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::AuthenticateSandboxResponse>, Status>
+    {
+        Err(Status::unimplemented(
+            "VM driver does not authenticate sandbox credentials",
+        ))
+    }
+
     async fn get_capabilities(
         &self,
         _request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
         Ok(Response::new(self.capabilities()))
+    }
+
+    async fn get_gateway_listener_requirements(
+        &self,
+        _request: Request<GetGatewayListenerRequirementsRequest>,
+    ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
+        Ok(Response::new(GetGatewayListenerRequirementsResponse {
+            requirements: Vec::new(),
+        }))
     }
 
     async fn validate_sandbox_create(
@@ -3051,11 +3594,22 @@ impl ComputeDriver for VmDriver {
 
     async fn stop_sandbox(
         &self,
-        _request: Request<StopSandboxRequest>,
+        request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
-        Err(Status::unimplemented(
-            "stop sandbox is not implemented by the vm compute driver",
-        ))
+        let request = request.into_inner();
+        self.stop_sandbox(&request.sandbox_id, &request.sandbox_name)
+            .await?;
+        Ok(Response::new(StopSandboxResponse {}))
+    }
+
+    async fn start_sandbox(
+        &self,
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        let request = request.into_inner();
+        self.start_sandbox(&request.sandbox_id, &request.sandbox_name)
+            .await?;
+        Ok(Response::new(StartSandboxResponse {}))
     }
 
     async fn delete_sandbox(
@@ -3099,7 +3653,11 @@ impl ComputeDriver for VmDriver {
             }
 
             loop {
-                match rx.recv().await {
+                let event = tokio::select! {
+                    () = tx.closed() => return,
+                    event = rx.recv() => event,
+                };
+                match event {
                     Ok(event) => {
                         if let Some(watch_sandboxes_event::Payload::Sandbox(sandbox_event)) =
                             &event.payload
@@ -3118,7 +3676,22 @@ impl ComputeDriver for VmDriver {
             }
         });
 
-        Ok(Response::new(Box::pin(ReceiverStream::new(out_rx))))
+        let stream: Self::WatchSandboxesStream = Box::pin(ReceiverStream::new(out_rx));
+        Ok(Response::new(stream))
+    }
+
+    async fn ensure_workspace(
+        &self,
+        _request: Request<EnsureWorkspaceRequest>,
+    ) -> Result<Response<EnsureWorkspaceResponse>, Status> {
+        Ok(Response::new(EnsureWorkspaceResponse {}))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: Request<DeleteWorkspaceRequest>,
+    ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
+        Ok(Response::new(DeleteWorkspaceResponse {}))
     }
 }
 
@@ -3270,10 +3843,9 @@ async fn connect_local_container_engine() -> Option<Docker> {
         return Some(docker);
     }
 
-    let podman_socket = podman_socket_path();
-    if podman_socket.exists()
-        && let Ok(docker) =
-            Docker::connect_with_unix(podman_socket.to_str()?, 120, bollard::API_DEFAULT_VERSION)
+    let podman_socket = detect_podman_socket()?;
+    if let Ok(docker) =
+        Docker::connect_with_unix(podman_socket.to_str()?, 120, bollard::API_DEFAULT_VERSION)
         && docker.ping().await.is_ok()
     {
         info!(
@@ -3286,23 +3858,8 @@ async fn connect_local_container_engine() -> Option<Docker> {
     None
 }
 
-/// Podman user socket path for the current platform.
-fn podman_socket_path() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home).join(".local/share/containers/podman/machine/podman.sock")
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::env::var("XDG_RUNTIME_DIR").map_or_else(
-            |_| {
-                let uid = nix::unistd::getuid();
-                PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))
-            },
-            |xdg| PathBuf::from(xdg).join("podman/podman.sock"),
-        )
-    }
+fn detect_podman_socket() -> Option<PathBuf> {
+    openshell_driver_podman::driver::detect_socket()
 }
 
 fn is_openshell_local_build_image_ref(image_ref: &str) -> bool {
@@ -3419,6 +3976,134 @@ fn registry_client() -> OciClient {
     })
 }
 
+async fn retry_registry_request<T, F, Fut>(
+    operation: &str,
+    request: F,
+) -> Result<T, OciDistributionError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, OciDistributionError>>,
+{
+    retry_registry_request_with_delay(operation, REGISTRY_RETRY_INITIAL_DELAY, request).await
+}
+
+async fn retry_registry_request_with_delay<T, F, Fut>(
+    operation: &str,
+    initial_delay: Duration,
+    mut request: F,
+) -> Result<T, OciDistributionError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, OciDistributionError>>,
+{
+    let mut delay = initial_delay;
+    for attempt in 1..=REGISTRY_REQUEST_MAX_ATTEMPTS {
+        match request().await {
+            Ok(value) => return Ok(value),
+            Err(err)
+                if attempt < REGISTRY_REQUEST_MAX_ATTEMPTS && registry_error_is_retryable(&err) =>
+            {
+                warn!(
+                    operation,
+                    attempt,
+                    max_attempts = REGISTRY_REQUEST_MAX_ATTEMPTS,
+                    retry_delay_ms = delay.as_millis(),
+                    error = %err,
+                    "vm driver: transient registry request failed; retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2).min(REGISTRY_RETRY_MAX_DELAY);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    unreachable!("registry request retry loop always returns")
+}
+
+fn registry_error_is_retryable(err: &OciDistributionError) -> bool {
+    match err {
+        OciDistributionError::AuthenticationFailure(message) => {
+            registry_message_is_retryable(message)
+        }
+        OciDistributionError::RegistryError { envelope, .. } => {
+            envelope.errors.iter().any(|error| {
+                error.code == OciErrorCode::Toomanyrequests
+                    || registry_message_is_retryable(&error.message)
+            })
+        }
+        OciDistributionError::RequestError(err) => {
+            err.is_connect()
+                || err.is_timeout()
+                || err
+                    .status()
+                    .is_some_and(|status| matches!(status.as_u16(), 408 | 425 | 429 | 500..=599))
+        }
+        OciDistributionError::ServerError { code, message, .. } => {
+            matches!(code, 408 | 425 | 429 | 500..=599) || registry_message_is_retryable(message)
+        }
+        OciDistributionError::IoError(err) => matches!(
+            err.kind(),
+            std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::WouldBlock
+        ),
+        _ => false,
+    }
+}
+
+fn registry_message_is_retryable(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("retry-after")
+        || message.contains("too many requests")
+        || message.contains("rate limit")
+}
+
+enum RegistryBlobPullError {
+    CreateFile(std::io::Error),
+    Registry(OciDistributionError),
+}
+
+async fn pull_registry_blob_file(
+    operation: &str,
+    client: &OciClient,
+    reference: &Reference,
+    descriptor: &OciDescriptor,
+    blob_path: &Path,
+) -> Result<tokio::fs::File, RegistryBlobPullError> {
+    let mut delay = REGISTRY_RETRY_INITIAL_DELAY;
+    for attempt in 1..=REGISTRY_REQUEST_MAX_ATTEMPTS {
+        let mut file = tokio::fs::File::create(blob_path)
+            .await
+            .map_err(RegistryBlobPullError::CreateFile)?;
+        match client.pull_blob(reference, descriptor, &mut file).await {
+            Ok(()) => return Ok(file),
+            Err(err)
+                if attempt < REGISTRY_REQUEST_MAX_ATTEMPTS && registry_error_is_retryable(&err) =>
+            {
+                warn!(
+                    operation,
+                    attempt,
+                    max_attempts = REGISTRY_REQUEST_MAX_ATTEMPTS,
+                    retry_delay_ms = delay.as_millis(),
+                    error = %err,
+                    "vm driver: transient registry request failed; retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2).min(REGISTRY_RETRY_MAX_DELAY);
+            }
+            Err(err) => return Err(RegistryBlobPullError::Registry(err)),
+        }
+    }
+
+    unreachable!("registry blob retry loop always returns")
+}
+
 fn linux_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
     let expected_arch = linux_oci_arch();
     manifests
@@ -3503,22 +4188,24 @@ impl VmDriver {
         staging_dir: &Path,
         rootfs: &Path,
     ) -> Result<(), Status> {
-        client
-            .auth(reference, auth, RegistryOperation::Pull)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to authenticate registry access for vm sandbox image '{image_ref}': {err}"
-                ))
-            })?;
-        let (manifest, _) = client
-            .pull_image_manifest(reference, auth)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to pull vm sandbox image manifest '{image_ref}': {err}"
-                ))
-            })?;
+        retry_registry_request("authenticate with registry", || {
+            client.auth(reference, auth, RegistryOperation::Pull)
+        })
+        .await
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to authenticate registry access for vm sandbox image '{image_ref}': {err}"
+            ))
+        })?;
+        let (manifest, _) = retry_registry_request("pull image manifest", || {
+            client.pull_image_manifest(reference, auth)
+        })
+        .await
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to pull vm sandbox image manifest '{image_ref}': {err}"
+            ))
+        })?;
 
         tokio::fs::create_dir_all(rootfs)
             .await
@@ -3557,6 +4244,8 @@ impl VmDriver {
         for layer in &layers {
             apply_registry_layer_blob(image_ref, rootfs, layer).await?;
         }
+
+        remove_registry_layer_staging(staging_dir).await?;
 
         Ok(())
     }
@@ -3636,18 +4325,23 @@ async fn download_registry_layer_blob(
         .join("layers")
         .join(format!("{index:02}-{digest_component}.root"));
 
-    let mut file = tokio::fs::File::create(&blob_path)
-        .await
-        .map_err(|err| Status::internal(format!("create layer blob failed: {err}")))?;
-    client
-        .pull_blob(reference, &layer, &mut file)
-        .await
-        .map_err(|err| {
-            Status::failed_precondition(format!(
-                "failed to download layer '{}' for vm sandbox image '{image_ref}': {err}",
-                layer.digest
-            ))
-        })?;
+    let mut file = pull_registry_blob_file(
+        "download image layer",
+        client,
+        reference,
+        &layer,
+        &blob_path,
+    )
+    .await
+    .map_err(|err| match err {
+        RegistryBlobPullError::CreateFile(err) => {
+            Status::internal(format!("create layer blob failed: {err}"))
+        }
+        RegistryBlobPullError::Registry(err) => Status::failed_precondition(format!(
+            "failed to download layer '{}' for vm sandbox image '{image_ref}': {err}",
+            layer.digest
+        )),
+    })?;
     file.flush()
         .await
         .map_err(|err| Status::internal(format!("flush layer blob failed: {err}")))?;
@@ -3708,6 +4402,16 @@ async fn apply_registry_layer_blob(
     })
 }
 
+async fn remove_registry_layer_staging(staging_dir: &Path) -> Result<(), Status> {
+    let layers_dir = staging_dir.join("layers");
+    tokio::fs::remove_dir_all(&layers_dir).await.map_err(|err| {
+        Status::internal(format!(
+            "remove registry layer staging dir '{}' failed: {err}",
+            layers_dir.display()
+        ))
+    })
+}
+
 async fn download_registry_descriptor_blob_file(
     client: &OciClient,
     reference: &Reference,
@@ -3724,18 +4428,23 @@ async fn download_registry_descriptor_blob_file(
             .map_err(|err| Status::internal(format!("create OCI blob dir failed: {err}")))?;
     }
 
-    let mut file = tokio::fs::File::create(&blob_path)
-        .await
-        .map_err(|err| Status::internal(format!("create OCI {kind} blob failed: {err}")))?;
-    client
-        .pull_blob(reference, descriptor, &mut file)
-        .await
-        .map_err(|err| {
-            Status::failed_precondition(format!(
-                "failed to download {kind} '{}' for vm sandbox image '{image_ref}': {err}",
-                descriptor.digest
-            ))
-        })?;
+    let mut file = pull_registry_blob_file(
+        "download image blob",
+        client,
+        reference,
+        descriptor,
+        &blob_path,
+    )
+    .await
+    .map_err(|err| match err {
+        RegistryBlobPullError::CreateFile(err) => {
+            Status::internal(format!("create OCI {kind} blob failed: {err}"))
+        }
+        RegistryBlobPullError::Registry(err) => Status::failed_precondition(format!(
+            "failed to download {kind} '{}' for vm sandbox image '{image_ref}': {err}",
+            descriptor.digest
+        )),
+    })?;
     file.flush()
         .await
         .map_err(|err| Status::internal(format!("flush OCI {kind} blob failed: {err}")))?;
@@ -4047,6 +4756,53 @@ fn guest_visible_openshell_endpoint(endpoint: &str) -> String {
     endpoint.to_string()
 }
 
+/// Whether a corporate proxy URL points at the gateway host itself, as seen
+/// from a QEMU/TAP guest whose TAP host address is `tap_host_ip`.
+///
+/// On the libkrun backend gvproxy NATs the host-loopback alias
+/// `host.openshell.internal` (and any loopback URL, which the driver rewrites
+/// to that alias) to the gateway host's `127.0.0.1`, so a proxy bound to host
+/// loopback is reachable from the guest. The QEMU/TAP backend used for GPU
+/// sandboxes has no equivalent: `host.openshell.internal` resolves to the TAP
+/// host address, and the driver's own nftables `input` chain accepts only the
+/// gateway port from the guest and drops the rest, so no proxy on the gateway
+/// host is reachable regardless of the address it binds.
+///
+/// The gateway host is therefore reached from a QEMU guest under exactly three
+/// spellings: the guest's own loopback (never the host's, but a configuration
+/// that plainly means the host), the documented host aliases that
+/// `write_host_gateway_aliases` seeds to the TAP host address, and that TAP
+/// host address written literally. `tap_host_ip` is this sandbox's allocated
+/// address, so the comparison must be made after the launch plan's subnet
+/// allocation; `None` means the plan carries no TAP host and only the
+/// address-independent spellings are classified.
+///
+/// gvproxy's `GVPROXY_HOST_LOOPBACK_IP` is deliberately **not** matched here.
+/// It is special only to libkrun; on QEMU/TAP it is an ordinary address that
+/// may well be routable through the guest's masqueraded egress, and rejecting
+/// it would refuse a working configuration.
+///
+/// Used to reject an unreachable configuration up front on the QEMU path
+/// instead of letting every policy-approved CONNECT time out.
+fn proxy_url_targets_gateway_host(url: &str, tap_host_ip: Option<&str>) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        // Unparseable URLs are rejected by shared validation before launch.
+        return false;
+    };
+    let tap_host = tap_host_ip.and_then(|ip| ip.parse::<IpAddr>().ok());
+    match parsed.host() {
+        Some(Host::Ipv4(ip)) => ip.is_loopback() || tap_host == Some(IpAddr::V4(ip)),
+        Some(Host::Ipv6(ip)) => ip.is_loopback() || tap_host == Some(IpAddr::V6(ip)),
+        Some(Host::Domain(host)) => {
+            host.eq_ignore_ascii_case("localhost")
+                || host.eq_ignore_ascii_case(OPENSHELL_HOST_GATEWAY_ALIAS)
+                || host.eq_ignore_ascii_case("host.containers.internal")
+                || host.eq_ignore_ascii_case("host.docker.internal")
+        }
+        None => false,
+    }
+}
+
 fn gateway_port_from_endpoint(endpoint: &str) -> Option<u16> {
     Url::parse(endpoint).ok().and_then(|url| url.port())
 }
@@ -4115,9 +4871,17 @@ fn build_guest_environment(
         openshell_core::sandbox_env::SSH_SOCKET_PATH.to_string(),
         GUEST_SSH_SOCKET_PATH.to_string(),
     );
+    // The libkrun guest environment path does not preserve spaces in values
+    // before guest startup. Use a whitespace-free base64url envelope so
+    // command arguments remain lossless.
+    let main_process =
+        openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec_base64url(
+            sandbox.spec.as_ref(),
+        )
+        .expect("main process config serialization cannot fail");
     environment.insert(
-        openshell_core::sandbox_env::SANDBOX_COMMAND.to_string(),
-        "tail -f /dev/null".to_string(),
+        openshell_core::sandbox_env::MAIN_PROCESS_SPEC.to_string(),
+        main_process,
     );
     environment.insert(
         openshell_core::sandbox_env::LOG_LEVEL.to_string(),
@@ -4141,8 +4905,19 @@ fn build_guest_environment(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),
     );
+    // Runtime capabilities are driver-owned. The VM driver does not yet
+    // provide policy DNS and transparent TCP interception.
+    environment.insert(
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+        String::new(),
+    );
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+    // Prevent user-supplied environment from overriding the TLS server name
+    // the supervisor verifies — a sandbox user who can redirect the gateway
+    // hostname could otherwise present a certificate for a name they control
+    // and intercept the sandbox JWT.
+    environment.remove(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME);
     if sandbox
         .spec
         .as_ref()
@@ -4675,10 +5450,21 @@ fn inject_guest_sandbox_token(overlay_disk: &Path, token: &str) -> Result<(), St
 }
 
 #[allow(clippy::result_large_err)]
+#[tracing::instrument(
+    name = "vm.prepare_guest",
+    skip(dropins),
+    fields(
+        otel.name = "vm.prepare_guest",
+        otel.status_code = tracing::field::Empty,
+        overlay.path = %overlay_disk.display(),
+        dropin.count = dropins.len(),
+    )
+)]
 fn inject_guest_init_dropins(
     overlay_disk: &Path,
     dropins: &[GuestInitDropin],
 ) -> Result<(), Status> {
+    let span_status = openshell_otel::ErrorStatusGuard::current();
     validate_guest_init_dropins(dropins).map_err(Status::failed_precondition)?;
 
     // Drop-ins are *executed* in a child shell by run_openshell_init_dropins
@@ -4707,6 +5493,182 @@ fn inject_guest_init_dropins(
     // explicitly injected this launch are eligible to run, and a guest
     // image cannot smuggle in extra `init.d` entries.
     write_guest_init_dropin_manifest(overlay_disk, dropins)?;
+    span_status.finish(Ok(()))
+}
+
+/// Build the corporate upstream-proxy arguments passed to the guest supervisor.
+///
+/// This operator-owned egress boundary travels on the supervisor's argv,
+/// which sandbox spec/template environment and image `ENV` cannot influence.
+/// Credentials are never on argv — only the root-only guest path is passed;
+/// the supervisor reads the credential from that file.
+fn upstream_proxy_cli_args(config: &VmDriverConfig) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(url) = &config.https_proxy {
+        args.push("--upstream-proxy".to_string());
+        args.push(url.clone());
+    }
+    if let Some(list) = &config.no_proxy {
+        args.push("--upstream-no-proxy".to_string());
+        args.push(list.clone());
+    }
+    if config.proxy_auth_file.is_some() {
+        args.push("--upstream-proxy-auth-file".to_string());
+        // The guest path, never the gateway-host path the operator configured.
+        args.push(GUEST_UPSTREAM_PROXY_AUTH_PATH.to_string());
+    }
+    // Config validation guarantees the acknowledgement is `true` whenever an
+    // auth file is configured against an http:// proxy; the supervisor
+    // independently refuses credentials without it.
+    if config.proxy_auth_allow_insecure == Some(true) {
+        args.push("--upstream-proxy-auth-allow-insecure".to_string());
+    }
+    // Absent means the default validated-IP CONNECT binding; only the
+    // explicit hostname opt-in is passed through.
+    if config.proxy_connect_by_hostname == Some(true) {
+        args.push("--upstream-proxy-connect-by-hostname".to_string());
+    }
+    if config.proxy_ca_bundle.is_some() {
+        args.push("--upstream-proxy-ca-bundle".to_string());
+        args.push(GUEST_PROXY_CA_PATH.to_string());
+    }
+    args
+}
+
+/// Render the supervisor argument list as newline-separated arguments.
+///
+/// One argument per line, verbatim: the guest reads the lines into an array
+/// without word splitting or globbing, so values containing spaces survive
+/// intact. An empty list renders an empty file, which the guest reads as "no
+/// extra arguments".
+fn render_guest_supervisor_args(args: &[String]) -> Vec<u8> {
+    let mut body = args.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    body.into_bytes()
+}
+
+/// Reject argument values the newline-delimited guest file cannot represent.
+///
+/// Every value here is operator-supplied config, so this is a guard against
+/// misconfiguration rather than an attack: a stray newline would otherwise
+/// split one value into two arguments in the guest.
+fn validate_guest_supervisor_args(args: &[String]) -> Result<(), String> {
+    for arg in args {
+        if arg.contains('\n') || arg.contains('\r') || arg.contains('\0') {
+            return Err(
+                "corporate proxy settings must not contain newline or NUL characters".to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Read and validate the corporate proxy credential from the gateway host.
+///
+/// Uses the validators shared with the supervisor, so a credential accepted
+/// here is never rejected inside the guest. The error never carries the file
+/// contents.
+async fn read_sandbox_proxy_credential(path: &str) -> Result<String, Status> {
+    let path_owned = path.to_string();
+    let raw = tokio::task::spawn_blocking(move || {
+        openshell_core::driver_utils::read_upstream_proxy_credential_file(&path_owned)
+    })
+    .await
+    .map_err(|err| Status::internal(format!("proxy_auth_file read task failed: {err}")))?
+    .map_err(Status::invalid_argument)?;
+    let credential = openshell_core::driver_utils::parse_upstream_proxy_credential(&raw)
+        .map_err(|err| Status::invalid_argument(format!("proxy_auth_file '{path}': {err}")))?;
+    Ok(credential.to_string())
+}
+
+/// Read and validate the corporate proxy CA bundle from the gateway host.
+///
+/// Uses the reader shared with the supervisor, so the bundle is bounded and
+/// non-regular files are rejected (an operator path such as `/dev/zero` can
+/// otherwise exhaust driver memory), and a bundle accepted here contributes at
+/// least one trust anchor rustls accepts rather than merely looking like PEM.
+/// Checked here rather than only in the guest so the operator gets an error
+/// attributable to `proxy_ca_bundle` instead of an opaque supervisor startup
+/// failure inside every sandbox. The error never carries the file contents.
+async fn read_sandbox_proxy_ca_bundle(path: &str) -> Result<Vec<u8>, Status> {
+    let path_owned = path.to_string();
+    let pem = tokio::task::spawn_blocking(move || {
+        openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(
+            &path_owned,
+            "proxy_ca_bundle",
+        )
+    })
+    .await
+    .map_err(|err| Status::internal(format!("proxy_ca_bundle read task failed: {err}")))?
+    .map_err(Status::invalid_argument)?;
+    Ok(pem.into_bytes())
+}
+
+/// Stage the corporate upstream-proxy configuration into the guest overlay.
+///
+/// Writes three files into the overlay upperdir the driver owns:
+///
+/// * the credential at [`GUEST_UPSTREAM_PROXY_AUTH_PATH`], mode `0600`;
+/// * the CA bundle at [`GUEST_PROXY_CA_PATH`], mode `0644` (a CA certificate
+///   is not secret);
+/// * the supervisor argument list at [`GUEST_SUPERVISOR_ARGS_PATH`], mode
+///   `0644`.
+///
+/// All three are written on every launch, empty when the corresponding
+/// setting is absent. Writing rather than skipping is what makes the channel
+/// unforgeable: the upperdir copy always shadows the read-only image layer, so
+/// a sandbox image cannot supply its own arguments or credential by baking a
+/// file at these paths, and cannot disable the operator's by omitting one. It
+/// also clears material a previous launch staged into a preserved overlay
+/// after the operator removed the setting.
+///
+/// A microVM has no bind mounts or container secrets, so the credential lives
+/// at rest inside the per-sandbox overlay disk on the host — the same
+/// delivery the per-sandbox gateway JWT already uses. It is removed with the
+/// sandbox when the state directory is deleted.
+#[allow(clippy::result_large_err)]
+async fn inject_guest_upstream_proxy(
+    overlay_disk: &Path,
+    config: &VmDriverConfig,
+) -> Result<(), Status> {
+    // Written whether or not they are configured. Writing empty files when
+    // the operator removed a setting clears material a previous launch staged
+    // into a preserved overlay, and shadows anything an image baked at these
+    // paths, so a staged file is only ever the one this launch produced.
+    let credential = match config.proxy_auth_file.as_deref() {
+        Some(path) => format!("{}\n", read_sandbox_proxy_credential(path).await?).into_bytes(),
+        None => Vec::new(),
+    };
+    let credential_path = overlay_upper_path(GUEST_UPSTREAM_PROXY_AUTH_PATH);
+    write_rootfs_image_file(overlay_disk, &credential_path, &credential)
+        .map_err(|err| Status::internal(format!("write VM guest proxy credential: {err}")))?;
+    set_rootfs_image_file_mode(overlay_disk, &credential_path, 0o600)
+        .map_err(|err| Status::internal(format!("set VM guest proxy credential mode: {err}")))?;
+
+    let ca_bundle = match config.proxy_ca_bundle.as_deref() {
+        Some(path) => read_sandbox_proxy_ca_bundle(path).await?,
+        None => Vec::new(),
+    };
+    let ca_path = overlay_upper_path(GUEST_PROXY_CA_PATH);
+    write_rootfs_image_file(overlay_disk, &ca_path, &ca_bundle)
+        .map_err(|err| Status::internal(format!("write VM guest proxy CA bundle: {err}")))?;
+    set_rootfs_image_file_mode(overlay_disk, &ca_path, 0o644)
+        .map_err(|err| Status::internal(format!("set VM guest proxy CA bundle mode: {err}")))?;
+
+    let args = upstream_proxy_cli_args(config);
+    validate_guest_supervisor_args(&args).map_err(Status::failed_precondition)?;
+    let guest_path = overlay_upper_path(GUEST_SUPERVISOR_ARGS_PATH);
+    write_rootfs_image_file(
+        overlay_disk,
+        &guest_path,
+        &render_guest_supervisor_args(&args),
+    )
+    .map_err(|err| Status::internal(format!("write VM guest supervisor arguments: {err}")))?;
+    set_rootfs_image_file_mode(overlay_disk, &guest_path, 0o644).map_err(|err| {
+        Status::internal(format!("set VM guest supervisor arguments mode: {err}"))
+    })?;
     Ok(())
 }
 
@@ -4977,11 +5939,30 @@ async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
     }
 }
 
+#[tracing::instrument(
+    name = "vm.launch",
+    skip(command),
+    fields(
+        otel.name = "vm.launch",
+        otel.status_code = tracing::field::Empty,
+        sandbox.id = %sandbox_id,
+        vm.backend = ?backend,
+    )
+)]
+fn spawn_vm_launcher(
+    command: &mut Command,
+    sandbox_id: &str,
+    backend: &VmBackend,
+) -> Result<Child, std::io::Error> {
+    openshell_otel::record_error_result(command.spawn())
+}
+
 fn sandbox_snapshot(sandbox: &Sandbox, condition: SandboxCondition, deleting: bool) -> Sandbox {
     Sandbox {
         id: sandbox.id.clone(),
         name: sandbox.name.clone(),
         namespace: sandbox.namespace.clone(),
+        workspace: sandbox.workspace.clone(),
         status: Some(SandboxStatus {
             sandbox_name: sandbox.name.clone(),
             instance_id: String::new(),
@@ -5025,6 +6006,16 @@ fn deleting_condition() -> SandboxCondition {
         status: "False".to_string(),
         reason: "Deleting".to_string(),
         message: "Sandbox is being deleted".to_string(),
+        last_transition_time: String::new(),
+    }
+}
+
+fn stopped_condition() -> SandboxCondition {
+    SandboxCondition {
+        r#type: "Stopped".to_string(),
+        status: "True".to_string(),
+        reason: "ComputeStopped".to_string(),
+        message: "VM compute is stopped and persistent state is retained".to_string(),
         last_transition_time: String::new(),
     }
 }
@@ -5152,12 +6143,640 @@ mod tests {
     use prost_types::{Struct, Value, value::Kind};
     use std::fs;
     use std::path::Path;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tonic::Code;
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    #[test]
+    fn registry_throttling_errors_are_retryable() {
+        let error = OciDistributionError::RegistryError {
+            envelope: oci_client::errors::OciEnvelope {
+                errors: vec![oci_client::errors::OciError {
+                    code: OciErrorCode::Toomanyrequests,
+                    message: "retry-after: 829.756µs, allowed: 44000/minute".to_string(),
+                    detail: serde_json::Value::Null,
+                }],
+            },
+            url: "https://ghcr.io/v2/example/manifests/latest".to_string(),
+        };
+
+        assert!(registry_error_is_retryable(&error));
+    }
+
+    #[test]
+    fn permanent_registry_errors_are_not_retryable() {
+        let error = OciDistributionError::UnauthorizedError {
+            url: "https://example.invalid/v2/image/manifests/latest".to_string(),
+        };
+
+        assert!(!registry_error_is_retryable(&error));
+    }
+
+    #[tokio::test]
+    async fn registry_request_retries_transient_errors_until_success() {
+        let attempts = AtomicUsize::new(0);
+        let result = retry_registry_request_with_delay("test request", Duration::ZERO, || async {
+            let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+            if attempt < 2 {
+                Err(OciDistributionError::ServerError {
+                    code: 503,
+                    url: "https://example.invalid/v2/".to_string(),
+                    message: "temporarily unavailable".to_string(),
+                })
+            } else {
+                Ok("success")
+            }
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), "success");
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    struct TestTracing {
+        exporter: opentelemetry_sdk::trace::InMemorySpanExporter,
+        _provider: opentelemetry_sdk::trace::SdkTracerProvider,
+        dispatch: tracing::Dispatch,
+    }
+
+    impl TestTracing {
+        fn new() -> Self {
+            use opentelemetry::trace::TracerProvider as _;
+            use tracing_subscriber::layer::SubscriberExt as _;
+
+            let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_simple_exporter(exporter.clone())
+                .build();
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_opentelemetry::layer().with_tracer(provider.tracer("vm-driver-test")),
+            );
+            Self {
+                exporter,
+                _provider: provider,
+                dispatch: tracing::Dispatch::new(subscriber),
+            }
+        }
+    }
+
+    fn assert_is_root(span: &opentelemetry_sdk::trace::SpanData) {
+        assert_eq!(
+            span.parent_span_id,
+            opentelemetry::trace::SpanId::INVALID,
+            "{:?} should be a trace root",
+            span.name
+        );
+    }
+
+    fn assert_has_parent(span: &opentelemetry_sdk::trace::SpanData) {
+        assert_ne!(
+            span.parent_span_id,
+            opentelemetry::trace::SpanId::INVALID,
+            "{:?} should have a parent",
+            span.name
+        );
+    }
+
+    fn request_with_traceparent<T>(message: T) -> Request<T> {
+        let mut request = Request::new(message);
+        request.metadata_mut().insert(
+            "traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+                .parse()
+                .unwrap(),
+        );
+        request
+    }
+
+    type TestDriverClient =
+        openshell_core::proto::compute::v1::compute_driver_client::ComputeDriverClient<
+            tonic::transport::Channel,
+        >;
+
+    struct TracedDriverClient {
+        client: TestDriverClient,
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        server: JoinHandle<Result<(), tonic::transport::Error>>,
+    }
+
+    impl std::ops::Deref for TracedDriverClient {
+        type Target = TestDriverClient;
+
+        fn deref(&self) -> &Self::Target {
+            &self.client
+        }
+    }
+
+    impl std::ops::DerefMut for TracedDriverClient {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.client
+        }
+    }
+
+    impl TracedDriverClient {
+        async fn shutdown(self) {
+            let Self {
+                client,
+                shutdown,
+                server,
+            } = self;
+            drop(client);
+            let _ = shutdown.send(());
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .expect("traced driver test server should stop")
+                .expect("traced driver test server task should not panic")
+                .expect("traced driver test server should stop cleanly");
+        }
+    }
+
+    async fn traced_driver_client(driver: VmDriver) -> TracedDriverClient {
+        use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .layer(openshell_otel::compute_driver_rpc_layer())
+                .add_service(ComputeDriverServer::new(driver))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async {
+                        let _ = shutdown_rx.await;
+                    },
+                )
+                .await
+        });
+
+        let client = TestDriverClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+        TracedDriverClient {
+            client,
+            shutdown,
+            server,
+        }
+    }
+
+    #[tokio::test]
+    async fn compute_driver_rpc_span_continues_the_gateway_trace() {
+        let traced = TestTracing::new();
+        let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
+        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        let mut client = traced_driver_client(driver).await;
+
+        client
+            .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {}))
+            .await
+            .unwrap();
+        client.shutdown().await;
+
+        let spans = traced.exporter.get_finished_spans().unwrap();
+        let rpc_spans = spans
+            .iter()
+            .filter(|span| span.name == "openshell.compute.v1.ComputeDriver/GetCapabilities")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rpc_spans.len(),
+            1,
+            "middleware should create exactly one VM driver RPC span, got {:?}",
+            spans.iter().map(|span| &span.name).collect::<Vec<_>>()
+        );
+        let span = rpc_spans[0];
+        assert_eq!(
+            span.span_context.trace_id().to_string(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_eq!(span.parent_span_id.to_string(), "00f067aa0ba902b7");
+    }
+
+    #[tokio::test]
+    async fn compute_driver_rpcs_record_server_spans_and_error_status() {
+        let traced = TestTracing::new();
+        let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
+        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        let mut client = traced_driver_client(driver).await;
+
+        client
+            .get_capabilities(request_with_traceparent(GetCapabilitiesRequest {}))
+            .await
+            .unwrap();
+        assert!(
+            client
+                .validate_sandbox_create(request_with_traceparent(ValidateSandboxCreateRequest {
+                    sandbox: None,
+                }))
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .create_sandbox(request_with_traceparent(CreateSandboxRequest {
+                    sandbox: None,
+                }))
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .get_sandbox(request_with_traceparent(GetSandboxRequest {
+                    sandbox_id: String::new(),
+                    sandbox_name: String::new(),
+                }))
+                .await
+                .is_err()
+        );
+        client
+            .list_sandboxes(request_with_traceparent(ListSandboxesRequest {}))
+            .await
+            .unwrap();
+        assert!(
+            client
+                .stop_sandbox(request_with_traceparent(StopSandboxRequest {
+                    sandbox_id: String::new(),
+                    sandbox_name: String::new(),
+                }))
+                .await
+                .is_err()
+        );
+        client
+            .delete_sandbox(request_with_traceparent(DeleteSandboxRequest {
+                sandbox_id: String::new(),
+                sandbox_name: String::new(),
+            }))
+            .await
+            .unwrap();
+        let watch = client
+            .watch_sandboxes(request_with_traceparent(WatchSandboxesRequest {}))
+            .await
+            .unwrap();
+        drop(watch);
+        client.shutdown().await;
+
+        let spans = traced.exporter.get_finished_spans().unwrap();
+        let expected = [
+            "openshell.compute.v1.ComputeDriver/GetCapabilities",
+            "openshell.compute.v1.ComputeDriver/ValidateSandboxCreate",
+            "openshell.compute.v1.ComputeDriver/CreateSandbox",
+            "openshell.compute.v1.ComputeDriver/GetSandbox",
+            "openshell.compute.v1.ComputeDriver/ListSandboxes",
+            "openshell.compute.v1.ComputeDriver/StopSandbox",
+            "openshell.compute.v1.ComputeDriver/DeleteSandbox",
+            "openshell.compute.v1.ComputeDriver/WatchSandboxes",
+        ];
+        for name in expected {
+            let span = spans
+                .iter()
+                .find(|span| span.name == name)
+                .unwrap_or_else(|| panic!("missing {name} span"));
+            assert_eq!(span.span_kind, opentelemetry::trace::SpanKind::Server);
+            assert_has_parent(span);
+        }
+        for name in [
+            "openshell.compute.v1.ComputeDriver/ValidateSandboxCreate",
+            "openshell.compute.v1.ComputeDriver/CreateSandbox",
+            "openshell.compute.v1.ComputeDriver/GetSandbox",
+            "openshell.compute.v1.ComputeDriver/StopSandbox",
+        ] {
+            let span = spans.iter().find(|span| span.name == name).unwrap();
+            assert!(
+                matches!(span.status, opentelemetry::trace::Status::Error { .. }),
+                "{name} should record an error status, got {:?}",
+                span.status
+            );
+        }
+        let delete_rpc = spans
+            .iter()
+            .find(|span| span.name == "openshell.compute.v1.ComputeDriver/DeleteSandbox")
+            .expect("delete RPC span");
+        let cleanup = spans
+            .iter()
+            .find(|span| {
+                span.name == "vm.teardown"
+                    && span.span_context.trace_id() == delete_rpc.span_context.trace_id()
+            })
+            .expect("delete cleanup span");
+        assert_has_parent(cleanup);
+    }
+
+    #[tokio::test]
+    async fn spawned_provisioning_and_phases_have_parents() {
+        let traced = TestTracing::new();
+        let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        let sandbox = Sandbox {
+            id: "sb-spawned-trace".to_string(),
+            name: "spawned-trace".to_string(),
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    image: "invalid image reference".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let request = request_with_traceparent(CreateSandboxRequest {
+            sandbox: Some(sandbox),
+        });
+
+        let mut client = traced_driver_client(driver.clone()).await;
+        client.create_sandbox(request).await.unwrap();
+        driver
+            .wait_for_provisioning_for_test("sb-spawned-trace")
+            .await;
+        client.shutdown().await;
+
+        let spans = traced.exporter.get_finished_spans().unwrap();
+        let provisioning = spans
+            .iter()
+            .find(|span| span.name == "vm.provision")
+            .expect("spawned provisioning span");
+        assert_has_parent(provisioning);
+        let prepare_images = spans
+            .iter()
+            .find(|span| span.name == "vm.prepare_images")
+            .expect("image preparation span");
+        assert_has_parent(prepare_images);
+        let resolve_bootstrap = spans
+            .iter()
+            .find(|span| span.name == "vm.resolve_bootstrap_image")
+            .expect("bootstrap image resolution span");
+        assert_has_parent(resolve_bootstrap);
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_is_root_and_restore_operations_have_parents() {
+        let traced = TestTracing::new();
+        let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        for suffix in ["a", "b"] {
+            let sandbox = Sandbox {
+                id: format!("sb-restored-trace-{suffix}"),
+                name: format!("restored-trace-{suffix}"),
+                spec: Some(SandboxSpec {
+                    template: Some(SandboxTemplate {
+                        image: "invalid image reference".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let state_dir = temp.path().join("sandboxes").join(&sandbox.id);
+            tokio::fs::create_dir_all(&state_dir).await.unwrap();
+            write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+        }
+
+        driver.restore_persisted_sandboxes().await;
+        for suffix in ["a", "b"] {
+            driver
+                .wait_for_provisioning_for_test(&format!("sb-restored-trace-{suffix}"))
+                .await;
+        }
+
+        let spans = traced.exporter.get_finished_spans().unwrap();
+
+        let reconciliations = spans
+            .iter()
+            .filter(|span| span.name == "reconcile.sandboxes")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reconciliations.len(),
+            1,
+            "startup should reconcile all persisted sandboxes in one trace"
+        );
+        let reconciliation = reconciliations[0];
+        assert_is_root(reconciliation);
+        let restorations = spans
+            .iter()
+            .filter(|span| span.name == "vm.restore")
+            .collect::<Vec<_>>();
+        assert_eq!(restorations.len(), 2);
+        for restoration in restorations {
+            assert_has_parent(restoration);
+        }
+        let provisioning = spans
+            .iter()
+            .filter(|span| span.name == "vm.provision")
+            .collect::<Vec<_>>();
+        assert_eq!(provisioning.len(), 2);
+        for span in provisioning {
+            assert_has_parent(span);
+        }
+        let prepare_images = spans
+            .iter()
+            .filter(|span| span.name == "vm.prepare_images")
+            .collect::<Vec<_>>();
+        assert_eq!(prepare_images.len(), 2);
+        for span in prepare_images {
+            assert_has_parent(span);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_does_not_restore_terminal_canonical_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        let sandbox = Sandbox {
+            id: "sb-terminal-main".to_string(),
+            name: "terminal-main".to_string(),
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    image: "unused-image".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let state_dir = temp.path().join("sandboxes").join(&sandbox.id);
+        tokio::fs::create_dir_all(&state_dir).await.unwrap();
+        write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+        write_private_file(
+            &state_dir.join(MAIN_PROCESS_EXITED_FILE),
+            b"terminal\n".to_vec(),
+        )
+        .await
+        .unwrap();
+
+        driver.restore_persisted_sandboxes().await;
+
+        let registry = driver.registry.lock().await;
+        let record = registry.get(&sandbox.id).expect("terminal record");
+        assert!(record.process.is_none());
+        assert!(record.provisioning_task.is_none());
+        let status = record.snapshot.status.as_ref().expect("terminal status");
+        assert!(status.conditions.iter().any(|condition| {
+            condition.reason == "ProcessExited" && condition.status == "False"
+        }));
+    }
+
+    #[tokio::test]
+    async fn background_provisioning_does_not_extend_the_rpc_span_lifetime() {
+        let traced = TestTracing::new();
+        let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
+        let rpc = tracing::info_span!("openshell.compute.v1.ComputeDriver/CreateSandbox");
+        let entered = rpc.enter();
+        let provisioning =
+            provisioning_span(&rpc.context(), "sb-lifetime", "invalid image reference");
+        drop(entered);
+        drop(rpc);
+
+        assert!(
+            traced
+                .exporter
+                .get_finished_spans()
+                .unwrap()
+                .iter()
+                .any(|span| span.name == "openshell.compute.v1.ComputeDriver/CreateSandbox"),
+            "the RPC span should finish while background provisioning is still active"
+        );
+        drop(provisioning);
+    }
+
+    #[tokio::test]
+    async fn overlay_preparation_records_a_provisioning_phase_span() {
+        let traced = TestTracing::new();
+        let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.overlay_disk_mib = u64::MAX;
+        let parent = tracing::info_span!("vm.provision");
+
+        let result = driver
+            .prepare_runtime_overlay(Path::new("/unused"), None, None, OverlayPreparation::Fresh)
+            .instrument(parent)
+            .await;
+        assert!(result.is_err(), "overflow should stop before disk I/O");
+
+        let spans = traced.exporter.get_finished_spans().unwrap();
+        let overlay = spans
+            .iter()
+            .find(|span| span.name == "vm.prepare_overlay")
+            .expect("overlay preparation span");
+        assert_has_parent(overlay);
+        assert!(
+            matches!(overlay.status, opentelemetry::trace::Status::Error { .. }),
+            "failed overlay preparation should mark its phase span, got {:?}",
+            overlay.status
+        );
+    }
+
+    #[tokio::test]
+    async fn post_overlay_provisioning_stages_record_child_spans() {
+        let traced = TestTracing::new();
+        let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
+        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::with(vec![Arc::new(
+            AlwaysFailsExtension,
+        )]));
+        let sandbox = Sandbox {
+            id: "sb-post-overlay".to_string(),
+            ..Default::default()
+        };
+        let mut plan = driver
+            .build_vm_launch_plan(&sandbox.id, false, false, None)
+            .unwrap();
+        let provisioning = tracing::info_span!("vm.provision");
+
+        async {
+            driver
+                .lifecycle_extensions
+                .configure_launch(&sandbox, Path::new("/unused"), &mut plan)
+                .await
+                .unwrap();
+            let before_launch = driver
+                .lifecycle_extensions
+                .before_launch(&sandbox, Path::new("/unused"), &mut plan)
+                .await;
+            assert!(
+                before_launch.is_err(),
+                "the lifecycle hook should reject launch"
+            );
+            let invalid_dropin = GuestInitDropin::new("../invalid", Vec::new());
+            assert!(
+                inject_guest_init_dropins(Path::new("/unused"), &[invalid_dropin]).is_err(),
+                "an invalid drop-in should fail after creating its span"
+            );
+        }
+        .instrument(provisioning)
+        .await;
+
+        let spans = traced.exporter.get_finished_spans().unwrap();
+        for name in [
+            "vm.configure_launch",
+            "vm.before_launch",
+            "vm.prepare_guest",
+        ] {
+            let span = spans
+                .iter()
+                .find(|span| span.name == name)
+                .unwrap_or_else(|| panic!("missing {name} span"));
+            assert_has_parent(span);
+        }
+        for name in ["vm.before_launch", "vm.prepare_guest"] {
+            let span = spans.iter().find(|span| span.name == name).unwrap();
+            assert!(
+                matches!(span.status, opentelemetry::trace::Status::Error { .. }),
+                "{name} should record an error status, got {:?}",
+                span.status
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn launcher_spawn_failure_records_a_failed_provisioning_phase_span() {
+        let traced = TestTracing::new();
+        let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
+        let provisioning = tracing::info_span!("vm.provision");
+        let mut command = Command::new("/openshell-test/nonexistent-vm-launcher");
+
+        let result =
+            async { spawn_vm_launcher(&mut command, "sb-launch-trace", &VmBackend::Libkrun) }
+                .instrument(provisioning)
+                .await;
+        assert!(result.is_err(), "the nonexistent launcher should fail");
+
+        let spans = traced.exporter.get_finished_spans().unwrap();
+        let launch = spans
+            .iter()
+            .find(|span| span.name == "vm.launch")
+            .expect("launcher span");
+        assert_has_parent(launch);
+        assert!(
+            matches!(launch.status, opentelemetry::trace::Status::Error { .. }),
+            "failed launcher spawn should mark its phase span, got {:?}",
+            launch.status
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_failure_marks_the_delete_span() {
+        let traced = TestTracing::new();
+        let _dispatch = tracing::dispatcher::set_default(&traced.dispatch);
+        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+
+        assert!(driver.delete_sandbox("../invalid", "").await.is_err());
+
+        let spans = traced.exporter.get_finished_spans().unwrap();
+        let deletion = spans
+            .iter()
+            .find(|span| span.name == "vm.teardown")
+            .expect("delete span");
+        assert!(
+            matches!(deletion.status, opentelemetry::trace::Status::Error { .. }),
+            "failed deletion should mark its span, got {:?}",
+            deletion.status
+        );
+    }
 
     fn gpu_device_ids_config(device_ids: &[&str]) -> Struct {
         list_string_driver_config("gpu_device_ids", device_ids)
@@ -5652,13 +7271,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_request_metadata_round_trips_for_resume() {
+    async fn sandbox_request_metadata_round_trips_for_start() {
         let base = unique_temp_dir();
         let state_dir = base.join("sandboxes").join("sandbox-123");
         std::fs::create_dir_all(&state_dir).unwrap();
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
-            name: "resume-sandbox".to_string(),
+            name: "start-sandbox".to_string(),
             namespace: "vm-dev".to_string(),
             spec: Some(SandboxSpec {
                 environment: HashMap::from([("KEY".to_string(), "value".to_string())]),
@@ -5698,8 +7317,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[tokio::test]
+    async fn failed_start_preserves_stopped_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        let sandbox = Sandbox {
+            id: "sandbox-stopped".to_string(),
+            name: "stopped".to_string(),
+            ..Default::default()
+        };
+        let state_dir = temp.path().join("sandboxes").join(&sandbox.id);
+        create_private_dir_all(&state_dir).await.unwrap();
+        write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+        tokio::fs::write(state_dir.join(SANDBOX_STOPPED_FILE), b"stopped\n")
+            .await
+            .unwrap();
+        let snapshot = sandbox_snapshot(&sandbox, stopped_condition(), false);
+        driver.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxRecord {
+                snapshot,
+                state_dir: state_dir.clone(),
+                process: None,
+                provisioning_task: None,
+                gpu_bdf: None,
+                qemu_network_allocated: false,
+                deleting: false,
+            },
+        );
+
+        let err = driver
+            .start_sandbox(&sandbox.id, &sandbox.name)
+            .await
+            .expect_err("start without an image should fail");
+
+        assert_eq!(err.code(), Code::Internal);
+        assert!(
+            tokio::fs::metadata(state_dir.join(SANDBOX_STOPPED_FILE))
+                .await
+                .is_ok(),
+            "failed start must retain its durable stop marker"
+        );
+        let restored = driver
+            .get_sandbox(&sandbox.id, &sandbox.name)
+            .await
+            .unwrap()
+            .expect("failed start must retain its stopped registry record");
+        let condition = restored
+            .status
+            .as_ref()
+            .and_then(|status| status.conditions.first())
+            .expect("stopped condition");
+        assert_eq!(condition.r#type, "Stopped");
+        assert_eq!(condition.status, "True");
+    }
+
     #[test]
-    fn prepare_sandbox_overlay_preserves_existing_overlay_on_resume() {
+    fn prepare_sandbox_overlay_preserves_existing_overlay_on_start() {
         let base = unique_temp_dir();
         std::fs::create_dir_all(&base).unwrap();
         let template = base.join("template.ext4");
@@ -5723,7 +7398,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_sandbox_overlay_creates_missing_overlay_on_resume() {
+    fn prepare_sandbox_overlay_creates_missing_overlay_on_start() {
         let base = unique_temp_dir();
         std::fs::create_dir_all(&base).unwrap();
         let template = base.join("template.ext4");
@@ -5988,6 +7663,87 @@ mod tests {
     }
 
     #[test]
+    fn validate_sandbox_identity_accepts_non_root_system_ids() {
+        let config = VmDriverConfig {
+            sandbox_uid: Some(500),
+            sandbox_gid: Some(30),
+            ..Default::default()
+        };
+        assert!(config.validate_sandbox_identity().is_ok());
+    }
+
+    #[test]
+    fn persisted_legacy_sandbox_without_command_uses_scratch_main() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        // Requests persisted before the canonical-main contract have a
+        // present DriverSandboxSpec but no command or tty fields.
+        let sandbox = Sandbox {
+            id: "legacy-sandbox".to_string(),
+            name: "legacy-sandbox".to_string(),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+
+        let env = build_guest_environment(&sandbox, &config, None);
+        let encoded = env
+            .iter()
+            .find_map(|entry| {
+                entry.strip_prefix(&format!(
+                    "{}=",
+                    openshell_core::sandbox_env::MAIN_PROCESS_SPEC
+                ))
+            })
+            .expect("main process environment");
+        let main = openshell_core::sandbox_env::MainProcessConfig::decode(encoded)
+            .expect("legacy persisted request should produce a valid main config");
+
+        assert_eq!(
+            main,
+            openshell_core::sandbox_env::MainProcessConfig::scratch()
+        );
+    }
+
+    #[test]
+    fn build_guest_environment_preserves_main_command_spaces() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "https://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        let command = vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            "echo ready; while true; do sleep 1; done".to_string(),
+        ];
+        let sandbox = Sandbox {
+            id: "space-command".to_string(),
+            name: "space-command".to_string(),
+            spec: Some(SandboxSpec {
+                command: command.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let env = build_guest_environment(&sandbox, &config, None);
+        let encoded = env
+            .iter()
+            .find_map(|entry| {
+                entry.strip_prefix(&format!(
+                    "{}=",
+                    openshell_core::sandbox_env::MAIN_PROCESS_SPEC
+                ))
+            })
+            .expect("main process environment");
+
+        assert!(!encoded.contains(char::is_whitespace));
+        let main = openshell_core::sandbox_env::MainProcessConfig::decode(encoded).unwrap();
+        assert_eq!(main.command, command);
+    }
+
+    #[test]
     fn build_guest_environment_uses_token_file_without_raw_token_env() {
         let config = VmDriverConfig {
             openshell_endpoint: "http://127.0.0.1:8080".to_string(),
@@ -6017,6 +7773,36 @@ mod tests {
             "{}={GUEST_SANDBOX_TOKEN_PATH}",
             openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
         )));
+    }
+
+    #[test]
+    fn build_guest_environment_strips_gateway_tls_server_name() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            name: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                environment: HashMap::from([(
+                    openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME.to_string(),
+                    "evil.attacker.example.com".to_string(),
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let env = build_guest_environment(&sandbox, &config, None);
+
+        assert!(
+            !env.iter().any(|v| v.starts_with(&format!(
+                "{}=",
+                openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME
+            ))),
+            "GATEWAY_TLS_SERVER_NAME must be stripped from the guest environment"
+        );
     }
 
     #[test]
@@ -6063,6 +7849,36 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn build_guest_environment_clears_unsupported_network_capabilities() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            name: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                environment: HashMap::from([(
+                    openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+                    openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.to_string(),
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let env = build_guest_environment(&sandbox, &config, None);
+        assert!(env.contains(&format!(
+            "{}=",
+            openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES
+        )));
+        assert!(!env.contains(&format!(
+            "{}={}",
+            openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
+            openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY
+        )));
     }
 
     #[test]
@@ -6634,6 +8450,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn remove_registry_layer_staging_preserves_merged_rootfs() {
+        let base = unique_temp_dir();
+        let layers_dir = base.join("layers");
+        let rootfs_dir = base.join("rootfs");
+        fs::create_dir_all(&layers_dir).unwrap();
+        fs::create_dir_all(&rootfs_dir).unwrap();
+        fs::write(layers_dir.join("layer.blob"), b"compressed layer").unwrap();
+        fs::write(rootfs_dir.join("merged.txt"), b"merged rootfs").unwrap();
+
+        remove_registry_layer_staging(&base)
+            .await
+            .expect("remove layer staging");
+
+        assert!(!layers_dir.exists());
+        assert_eq!(
+            fs::read(rootfs_dir.join("merged.txt")).unwrap(),
+            b"merged rootfs"
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
     #[test]
     fn sanitize_image_identity_rewrites_path_separators() {
         assert_eq!(
@@ -6822,6 +8661,12 @@ mod tests {
             ))),
             lifecycle_extensions: Arc::new(extensions),
         }
+    }
+
+    fn test_driver_with_proxy(https_proxy: &str) -> VmDriver {
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.https_proxy = Some(https_proxy.to_string());
+        driver
     }
 
     #[derive(Debug)]
@@ -7152,5 +8997,467 @@ mod tests {
             .expect_err("scripted pool exhaustion should surface");
         assert!(err.is_resource_exhausted());
         assert_eq!(err.message(), "pool empty");
+    }
+
+    /// A driver config carrying only corporate proxy settings.
+    fn proxy_config(
+        https_proxy: Option<&str>,
+        auth_file: Option<&str>,
+        ca_bundle: Option<&str>,
+    ) -> VmDriverConfig {
+        VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            https_proxy: https_proxy.map(ToString::to_string),
+            proxy_auth_file: auth_file.map(ToString::to_string),
+            proxy_auth_allow_insecure: auth_file.map(|_| true),
+            proxy_ca_bundle: ca_bundle.map(ToString::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn driver_config_debug_redacts_the_proxy_url_and_credential_path() {
+        // `Debug` can be emitted before validation runs, and an unvalidated
+        // proxy URL may still carry inline `user:pass@` credentials.
+        let rendered = format!(
+            "{:?}",
+            proxy_config(
+                Some("http://user:secret@proxy.corp.test:3128"),
+                Some("/etc/openshell/secrets/proxy-auth"),
+                Some("/etc/openshell/tls/corp-ca.pem"),
+            )
+        );
+        assert!(
+            !rendered.contains("secret") && !rendered.contains("proxy.corp.test"),
+            "the proxy URL must be logged as presence only: {rendered}"
+        );
+        assert!(
+            !rendered.contains("/etc/openshell/secrets/proxy-auth"),
+            "the credential path must be logged as presence only: {rendered}"
+        );
+        assert!(
+            rendered.contains("https_proxy: true") && rendered.contains("proxy_auth_file: true"),
+            "presence of each must still be visible for debugging: {rendered}"
+        );
+        // A CA path is not sensitive and stays readable.
+        assert!(
+            rendered.contains("corp-ca.pem"),
+            "the CA bundle path is not a secret and should stay legible: {rendered}"
+        );
+    }
+
+    #[test]
+    fn proxy_material_is_staged_inside_the_per_sandbox_overlay() {
+        // Everything the driver stages lands in the overlay upperdir, which
+        // lives in the sandbox's own state directory. That is what makes the
+        // credential removable with the sandbox (remove_sandbox_state_dir
+        // deletes the whole directory) and unforgeable by the guest image
+        // (the upperdir shadows the read-only image layer).
+        for guest_path in [
+            GUEST_UPSTREAM_PROXY_AUTH_PATH,
+            GUEST_PROXY_CA_PATH,
+            GUEST_SUPERVISOR_ARGS_PATH,
+        ] {
+            assert!(
+                guest_path.starts_with("/opt/openshell/"),
+                "{guest_path} must be under the reserved guest control root"
+            );
+            assert_eq!(
+                overlay_upper_path(guest_path),
+                format!("/upper{guest_path}"),
+                "{guest_path} must be staged into the overlay upperdir"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_proxy_args_are_empty_without_a_configured_proxy() {
+        assert!(upstream_proxy_cli_args(&VmDriverConfig::default()).is_empty());
+        // The file is still written, empty, so the guest cannot fall back to
+        // an image-baked argument list.
+        assert!(render_guest_supervisor_args(&[]).is_empty());
+    }
+
+    #[test]
+    fn upstream_proxy_args_pass_guest_paths_not_host_paths() {
+        let config = proxy_config(
+            Some("http://proxy.corp.test:3128"),
+            Some("/etc/openshell/secrets/proxy-auth"),
+            Some("/etc/openshell/tls/corp-ca.pem"),
+        );
+        let args = upstream_proxy_cli_args(&config);
+
+        // The credential and CA live at fixed guest paths; the gateway-host
+        // paths the operator configured must never reach the guest argv.
+        let auth = args
+            .iter()
+            .position(|arg| arg == "--upstream-proxy-auth-file")
+            .map(|i| args[i + 1].as_str());
+        assert_eq!(auth, Some(GUEST_UPSTREAM_PROXY_AUTH_PATH));
+        let ca = args
+            .iter()
+            .position(|arg| arg == "--upstream-proxy-ca-bundle")
+            .map(|i| args[i + 1].as_str());
+        assert_eq!(ca, Some(GUEST_PROXY_CA_PATH));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("/etc/openshell/secrets") || arg.contains("corp-ca.pem")),
+            "host paths leaked into the guest argv: {args:?}"
+        );
+    }
+
+    #[test]
+    fn upstream_proxy_args_pass_only_explicit_opt_ins() {
+        let mut config = proxy_config(Some("https://proxy.corp.test:3130"), None, None);
+        config.no_proxy = Some("10.0.0.0/8,.svc.cluster.local".to_string());
+        let args = upstream_proxy_cli_args(&config);
+        assert_eq!(
+            args,
+            vec![
+                "--upstream-proxy".to_string(),
+                "https://proxy.corp.test:3130".to_string(),
+                "--upstream-no-proxy".to_string(),
+                "10.0.0.0/8,.svc.cluster.local".to_string(),
+            ]
+        );
+
+        // `Some(false)` must not be passed as the presence flag it is on the
+        // supervisor side.
+        config.proxy_connect_by_hostname = Some(false);
+        assert!(
+            !upstream_proxy_cli_args(&config)
+                .iter()
+                .any(|arg| arg == "--upstream-proxy-connect-by-hostname")
+        );
+        config.proxy_connect_by_hostname = Some(true);
+        assert!(
+            upstream_proxy_cli_args(&config)
+                .iter()
+                .any(|arg| arg == "--upstream-proxy-connect-by-hostname")
+        );
+    }
+
+    #[test]
+    fn guest_supervisor_args_render_one_argument_per_line() {
+        let args = vec![
+            "--upstream-proxy".to_string(),
+            "http://proxy.corp.test:3128".to_string(),
+            "--upstream-no-proxy".to_string(),
+            "a.example, b.example".to_string(),
+        ];
+        // A value containing a space stays one line, so the guest reads it
+        // back as a single argument rather than word-splitting it.
+        assert_eq!(
+            String::from_utf8(render_guest_supervisor_args(&args)).unwrap(),
+            "--upstream-proxy\nhttp://proxy.corp.test:3128\n--upstream-no-proxy\na.example, b.example\n"
+        );
+    }
+
+    #[test]
+    fn guest_supervisor_args_reject_line_breaking_values() {
+        // A newline would split one operator value into two guest arguments.
+        for bad in ["a\nb", "a\rb", "a\0b"] {
+            assert!(
+                validate_guest_supervisor_args(&[bad.to_string()]).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        validate_guest_supervisor_args(&["--upstream-proxy".to_string()])
+            .expect("ordinary arguments are accepted");
+    }
+
+    #[test]
+    fn proxy_config_validation_rejects_settings_without_a_proxy_url() {
+        let config = VmDriverConfig {
+            no_proxy: Some("10.0.0.0/8".to_string()),
+            ..Default::default()
+        };
+        let err = config
+            .validate_proxy_config()
+            .expect_err("a bypass list without a proxy would hide a fail-open state");
+        assert!(err.contains("no_proxy"), "{err}");
+
+        let config = proxy_config(Some("http://proxy.corp.test:3128"), None, None);
+        config
+            .validate_proxy_config()
+            .expect("a lone proxy URL is a complete configuration");
+    }
+
+    #[test]
+    fn proxy_config_validation_requires_the_cleartext_acknowledgement() {
+        let mut config = proxy_config(
+            Some("http://proxy.corp.test:3128"),
+            Some("/etc/openshell/secrets/proxy-auth"),
+            None,
+        );
+        config.proxy_auth_allow_insecure = None;
+        let err = config
+            .validate_proxy_config()
+            .expect_err("Basic auth to an http:// proxy is cleartext on the wire");
+        assert!(err.contains("proxy_auth_allow_insecure"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn proxy_ca_bundle_without_a_certificate_fails_the_sandbox() {
+        let dir = std::env::temp_dir().join(format!("openshell-vm-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("not-a-ca.pem");
+        std::fs::write(&path, b"this is not a certificate\n").unwrap();
+
+        let err = read_sandbox_proxy_ca_bundle(path.to_str().unwrap())
+            .await
+            .expect_err("a certificate-free bundle must fail closed");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("no PEM certificate"), "{err}");
+
+        std::fs::write(&path, b"").unwrap();
+        let err = read_sandbox_proxy_ca_bundle(path.to_str().unwrap())
+            .await
+            .expect_err("an empty bundle must fail closed");
+        assert!(err.message().contains("no PEM certificate"), "{err}");
+
+        // PEM framing that base64-decodes but is not X.509 DER: accepted by
+        // `rustls_pemfile` alone, contributes zero trust anchors at runtime,
+        // and so would make every guest supervisor fail after boot.
+        std::fs::write(
+            &path,
+            b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let err = read_sandbox_proxy_ca_bundle(path.to_str().unwrap())
+            .await
+            .expect_err("a bundle with invalid DER must fail closed");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("no usable trust anchors"), "{err}");
+
+        let err = read_sandbox_proxy_ca_bundle(dir.join("missing.pem").to_str().unwrap())
+            .await
+            .expect_err("an unreadable bundle must fail closed");
+        assert!(err.message().contains("could not be read"), "{err}");
+
+        // A special file must be rejected on its type, not read: an
+        // unbounded read of /dev/zero would exhaust driver memory.
+        #[cfg(unix)]
+        {
+            let err = read_sandbox_proxy_ca_bundle("/dev/zero")
+                .await
+                .expect_err("a non-regular bundle path must fail closed");
+            assert_eq!(err.code(), Code::InvalidArgument);
+            assert!(err.message().contains("not a regular file"), "{err}");
+        }
+
+        // Oversized regular file: rejected on the stat'd length, again
+        // without reading it whole.
+        let oversized = dir.join("oversized.pem");
+        let bound = openshell_core::driver_utils::MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES;
+        std::fs::write(&oversized, vec![b'x'; usize::try_from(bound).unwrap() + 1]).unwrap();
+        let err = read_sandbox_proxy_ca_bundle(oversized.to_str().unwrap())
+            .await
+            .expect_err("an oversized bundle must fail closed");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("exceeds"), "{err}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn qemu_backend_rejects_a_gateway_host_proxy() {
+        // gvproxy's host-loopback NAT has no QEMU/TAP equivalent, so a proxy
+        // on the gateway host is unreachable from a GPU sandbox and must be
+        // rejected rather than time out on every CONNECT. The address that
+        // reaches the gateway host from a QEMU guest is this sandbox's own
+        // TAP host address, so the classifier is parameterized by it.
+        let tap_host = Some("10.0.128.1");
+        for url in [
+            "http://host.openshell.internal:8080",
+            "http://host.containers.internal:8080",
+            "http://host.docker.internal:8080",
+            "http://127.0.0.1:8080",
+            "http://localhost:8080",
+            "https://[::1]:8080",
+            // The address the aliases above resolve to inside the guest.
+            "http://10.0.128.1:8080",
+        ] {
+            assert!(proxy_url_targets_gateway_host(url, tap_host), "{url}");
+        }
+        for url in [
+            "http://proxy.corp.example:8080",
+            "https://10.1.2.3:3128",
+            // Special only to libkrun/gvproxy. On QEMU/TAP it is an ordinary
+            // address that may be routable through the guest's masqueraded
+            // egress, so rejecting it would refuse a working configuration.
+            "http://192.168.127.254:8080",
+            // Another sandbox's TAP host, not this one's.
+            "http://10.0.128.5:8080",
+            "not a url",
+        ] {
+            assert!(!proxy_url_targets_gateway_host(url, tap_host), "{url}");
+        }
+
+        // Without an allocated TAP host only the address-independent
+        // spellings classify; the loopback and alias guards still hold.
+        assert!(proxy_url_targets_gateway_host(
+            "http://127.0.0.1:8080",
+            None
+        ));
+        assert!(proxy_url_targets_gateway_host(
+            "http://host.openshell.internal:8080",
+            None
+        ));
+        assert!(!proxy_url_targets_gateway_host(
+            "http://10.0.128.1:8080",
+            None
+        ));
+    }
+
+    #[test]
+    fn qemu_launch_plan_rejects_a_proxy_at_the_allocated_tap_host() {
+        // The preflight has to run against the address this sandbox actually
+        // got, which only exists once the launch plan's subnet is allocated.
+        // A proxy there is what `host.openshell.internal` resolves to in the
+        // guest, and the driver's own nftables input chain drops the port.
+        let probe = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        let tap_host = probe
+            .build_vm_launch_plan("sandbox-proxy-tap", true, true, None)
+            .expect("gpu plan should build")
+            .host_ip
+            .expect("a QEMU plan carries a TAP host address");
+        probe.release_subnet("sandbox-proxy-tap");
+
+        let driver = test_driver_with_proxy(&format!("http://{tap_host}:8080"));
+        let mut plan = driver
+            .build_vm_launch_plan("sandbox-proxy-tap", true, true, None)
+            .expect("gpu plan should build");
+        assert_eq!(plan.host_ip.as_deref(), Some(tap_host.as_str()));
+
+        let err = driver
+            .resolve_launch_plan_backend("sandbox-proxy-tap", true, None, &mut plan)
+            .expect_err("a proxy at the TAP host address is unreachable from the guest");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains(&tap_host), "{err}");
+
+        driver.release_subnet("sandbox-proxy-tap");
+    }
+
+    #[test]
+    fn qemu_launch_plan_allows_a_proxy_at_the_gvproxy_host_loopback_address() {
+        // 192.168.127.254 carries no meaning on QEMU/TAP, so a launch must
+        // proceed rather than be refused for a libkrun-only reason.
+        let driver = test_driver_with_proxy(&format!("http://{GVPROXY_HOST_LOOPBACK_IP}:8080"));
+        let mut plan = driver
+            .build_vm_launch_plan("sandbox-proxy-gvproxy", true, true, None)
+            .expect("gpu plan should build");
+        assert_ne!(plan.host_ip.as_deref(), Some(GVPROXY_HOST_LOOPBACK_IP));
+
+        driver
+            .resolve_launch_plan_backend("sandbox-proxy-gvproxy", true, None, &mut plan)
+            .expect("a routable proxy address must not block a GPU launch");
+        assert_eq!(plan.backend, VmBackend::Qemu);
+
+        driver.release_subnet("sandbox-proxy-gvproxy");
+    }
+
+    #[tokio::test]
+    async fn proxy_credential_is_validated_against_the_supervisor_rules() {
+        let dir = std::env::temp_dir().join(format!("openshell-vm-cred-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("proxy-auth");
+
+        std::fs::write(&path, "proxyuser:proxypass\n").unwrap();
+        assert_eq!(
+            read_sandbox_proxy_credential(path.to_str().unwrap())
+                .await
+                .expect("a well-formed credential is accepted"),
+            "proxyuser:proxypass"
+        );
+
+        // Rejected here rather than inside every sandbox's supervisor.
+        std::fs::write(&path, "no-separator\n").unwrap();
+        let err = read_sandbox_proxy_credential(path.to_str().unwrap())
+            .await
+            .expect_err("a malformed credential must fail closed");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            !err.message().contains("no-separator"),
+            "the error must not echo credential file contents: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn guest_environment_carries_no_corporate_proxy_settings() {
+        // The egress boundary is argv-only: `build_guest_environment` merges
+        // user-supplied environment, so anything it emitted here would be
+        // attacker-influenced.
+        let config = proxy_config(
+            Some("http://proxy.corp.test:3128"),
+            Some("/etc/openshell/secrets/proxy-auth"),
+            Some("/etc/openshell/tls/corp-ca.pem"),
+        );
+        let sandbox = Sandbox {
+            id: "sb-proxy".to_string(),
+            name: "proxy".to_string(),
+            spec: Some(SandboxSpec {
+                environment: [
+                    (
+                        "HTTPS_PROXY".to_string(),
+                        "http://attacker:3128".to_string(),
+                    ),
+                    ("NO_PROXY".to_string(), "*".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let env = build_guest_environment(&sandbox, &config, None);
+        assert!(
+            !env.iter().any(|entry| entry.starts_with("--upstream")),
+            "driver environment must never carry supervisor arguments: {env:?}"
+        );
+        // A sandbox may still set the conventional variables for its own
+        // workload, but the supervisor ignores them on this path -- what
+        // matters is that the driver never derives the boundary from them.
+        assert!(
+            !env.iter()
+                .any(|entry| entry.contains("proxy.corp.test") || entry.contains("proxy-auth")),
+            "operator proxy settings must not reach the guest environment: {env:?}"
+        );
+    }
+
+    #[test]
+    fn sandbox_driver_config_cannot_carry_proxy_settings() {
+        // The upstream proxy is host network topology, not a per-sandbox
+        // setting: the caller-supplied envelope must reject it outright
+        // rather than silently ignoring it.
+        for key in [
+            "https_proxy",
+            "no_proxy",
+            "proxy_auth_file",
+            "proxy_auth_allow_insecure",
+            "proxy_connect_by_hostname",
+            "proxy_ca_bundle",
+        ] {
+            let template = SandboxTemplate {
+                driver_config: Some(Struct {
+                    fields: std::iter::once((
+                        key.to_string(),
+                        Value {
+                            kind: Some(Kind::StringValue("http://attacker:3128".to_string())),
+                        },
+                    ))
+                    .collect(),
+                }),
+                ..Default::default()
+            };
+            assert!(
+                VmSandboxDriverConfig::from_template(&template).is_err(),
+                "template.driver_config.vm must reject '{key}'"
+            );
+        }
     }
 }

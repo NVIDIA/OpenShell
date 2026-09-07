@@ -1,0 +1,62 @@
+{
+    "attributes": {
+        "version": {
+            "type": "string_t",
+            "description": "The version of the API service.",
+            "requirement": "optional",
+            "caption": "Version",
+            "type_name": "String"
+        },
+        "request": {
+            "type": "object_t",
+            "description": "Details pertaining to the API request.",
+            "requirement": "recommended",
+            "caption": "API Request Details",
+            "object_type": "request",
+            "object_name": "Request Elements"
+        },
+        "service": {
+            "type": "object_t",
+            "description": "The information pertaining to the API service.",
+            "requirement": "optional",
+            "caption": "Service",
+            "object_type": "service",
+            "object_name": "Service"
+        },
+        "group": {
+            "type": "object_t",
+            "description": "The information pertaining to the API group.",
+            "requirement": "optional",
+            "caption": "Group",
+            "object_type": "group",
+            "object_name": "Group"
+        },
+        "response": {
+            "type": "object_t",
+            "description": "Details pertaining to the API response.",
+            "requirement": "recommended",
+            "caption": "API Response Details",
+            "object_type": "response",
+            "object_name": "Response Elements"
+        },
+        "operation": {
+            "type": "string_t",
+            "description": "Verb/Operation associated with the request",
+            "requirement": "required",
+            "caption": "Operation",
+            "type_name": "String"
+        },
+        "token": {
+            "type": "object_t",
+            "description": "The API or client token used to authenticate or authorize the API request. This attribute contains the base <code>token</code> object that represents: (1) IdP-issued client tokens (type_id: 6) such as Okta API tokens or Microsoft Entra ID Application Registration client secrets, or (2) generic API tokens/keys (type_id: 7) used for SaaS application authentication. Use this attribute when the API request was authenticated using a token that should be tracked as part of the API activity event. Note: Protocol-specific authentication tokens (Kerberos, OIDC, SAML) should be represented using <code>authentication_token</code> in authentication events, not in API activity events.",
+            "requirement": "optional",
+            "caption": "Token",
+            "object_type": "token",
+            "object_name": "Token"
+        }
+    },
+    "name": "api",
+    "description": "The API, or Application Programming Interface, object represents  information pertaining to an API request and response.",
+    "extends": "object",
+    "caption": "API"
+}

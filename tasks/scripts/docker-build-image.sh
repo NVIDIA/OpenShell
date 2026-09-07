@@ -168,14 +168,19 @@ if [[ "${IS_FINAL_IMAGE}" == "1" ]]; then
 	TAG_ARGS=(-t "${IMAGE_NAME}:${IMAGE_TAG}")
 fi
 
+ATTESTATION_ARGS=(--provenance=false)
 OUTPUT_ARGS=()
 if [[ -n "${DOCKER_OUTPUT:-}" ]]; then
 	OUTPUT_ARGS=(--output "${DOCKER_OUTPUT}")
 elif [[ "${IS_FINAL_IMAGE}" == "1" ]]; then
-	if [[ "${DOCKER_PUSH:-}" == "1" ]]; then
-		OUTPUT_ARGS=(--push)
-	elif [[ "${DOCKER_PLATFORM:-}" == *","* ]]; then
-		OUTPUT_ARGS=(--push)
+	if [[ "${DOCKER_PUSH:-}" == "1" || "${DOCKER_PLATFORM:-}" == *","* ]]; then
+		if ce_is_docker; then
+			# Attestations require a registry-backed image index.
+			ATTESTATION_ARGS=(--provenance=mode=min --attest type=sbom)
+			OUTPUT_ARGS=(--output "type=image,push=true,oci-mediatypes=true,oci-artifact=true")
+		else
+			OUTPUT_ARGS=(--push)
+		fi
 	else
 		OUTPUT_ARGS=(--load)
 	fi
@@ -191,7 +196,7 @@ ce_build \
 	-f "${DOCKERFILE}" \
 	--target "${DOCKER_TARGET}" \
 	${TAG_ARGS[@]+"${TAG_ARGS[@]}"} \
-	--provenance=false \
+	${ATTESTATION_ARGS[@]+"${ATTESTATION_ARGS[@]}"} \
 	"$@" \
 	${OUTPUT_ARGS[@]+"${OUTPUT_ARGS[@]}"} \
 	.

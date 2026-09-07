@@ -23,8 +23,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
     from openshell import (
-        ClusterInferenceConfig,
         InferenceRouteClient,
+        InferenceRouteConfig,
         Sandbox,
         SandboxClient,
     )
@@ -78,7 +78,9 @@ def _upsert_managed_inference(
     for _ in range(5):
         try:
             sandbox_client._stub.UpdateProvider(
-                openshell_pb2.UpdateProviderRequest(provider=provider),
+                openshell_pb2.UpdateProviderRequest(
+                    provider=provider, workspace="default"
+                ),
                 timeout=timeout,
             )
             break
@@ -88,7 +90,9 @@ def _upsert_managed_inference(
 
             try:
                 sandbox_client._stub.CreateProvider(
-                    openshell_pb2.CreateProviderRequest(provider=provider),
+                    openshell_pb2.CreateProviderRequest(
+                        provider=provider, workspace="default"
+                    ),
                     timeout=timeout,
                 )
                 break
@@ -99,31 +103,33 @@ def _upsert_managed_inference(
     else:
         raise RuntimeError("failed to upsert managed e2e provider after retries")
 
-    inference_client.set_cluster(
+    inference_client.set_route(
+        workspace="default",
         provider_name=provider_name,
         model_id=model_id,
     )
 
 
-def _current_cluster_inference(
+def _current_route(
     inference_client: InferenceRouteClient,
-) -> ClusterInferenceConfig | None:
+) -> InferenceRouteConfig | None:
     try:
-        return inference_client.get_cluster()
+        return inference_client.get_route(workspace="default")
     except grpc.RpcError as exc:
         if exc.code() == grpc.StatusCode.NOT_FOUND:
             return None
         raise
 
 
-def _restore_cluster_inference(
+def _restore_route(
     inference_client: InferenceRouteClient,
-    previous: ClusterInferenceConfig | None,
+    previous: InferenceRouteConfig | None,
 ) -> None:
     if previous is None:
         return
 
-    inference_client.set_cluster(
+    inference_client.set_route(
+        workspace="default",
         provider_name=previous.provider_name,
         model_id=previous.model_id,
         # Teardown restores prior shared state as-is, even if the previous
@@ -148,7 +154,7 @@ def managed_openai_route(
     sandbox_client: SandboxClient,
 ) -> Iterator[str]:
     with _cluster_config_lock():
-        previous = _current_cluster_inference(inference_client)
+        previous = _current_route(inference_client)
         _upsert_managed_inference(
             inference_client,
             sandbox_client,
@@ -162,7 +168,7 @@ def managed_openai_route(
         try:
             yield _MANAGED_OPENAI_MODEL_ID
         finally:
-            _restore_cluster_inference(inference_client, previous)
+            _restore_route(inference_client, previous)
 
 
 def test_model_discovery_call_routed_to_backend(

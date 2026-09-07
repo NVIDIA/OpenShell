@@ -6,7 +6,9 @@ syntax = "proto3";
 package openshell.v1;
 
 import "datamodel.proto";
+import "google/protobuf/duration.proto";
 import "google/protobuf/struct.proto";
+import "options.proto";
 import "sandbox.proto";
 
 // OpenShell service provides sandbox, provider, and runtime management capabilities.
@@ -19,149 +21,475 @@ import "sandbox.proto";
 //   resource messages before persisting or returning them to clients.
 service OpenShell {
   // Check the health of the service.
-  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Health(HealthRequest) returns (HealthResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "unauthenticated"
+    };
+  }
+
+  // Return the authenticated caller identity established by the gateway.
+  rpc GetCurrentUser(GetCurrentUserRequest) returns (GetCurrentUserResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+    };
+  }
+
+  // Fetch elevated live gateway runtime metadata.
+  rpc GetGatewayInfo(GetGatewayInfoRequest) returns (GetGatewayInfoResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:read"
+      global_role: "platform_admin"
+    };
+  }
 
   // Create a new sandbox.
-  rpc CreateSandbox(CreateSandboxRequest) returns (SandboxResponse);
+  rpc CreateSandbox(CreateSandboxRequest) returns (SandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Fetch a sandbox by name.
-  rpc GetSandbox(GetSandboxRequest) returns (SandboxResponse);
+  rpc GetSandbox(GetSandboxRequest) returns (SandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
 
   // List sandboxes.
-  rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
+  rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
+  // Create a reusable sandbox workload template.
+  rpc CreateSandboxTemplate(CreateSandboxTemplateRequest)
+      returns (SandboxTemplateResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "admin"
+    };
+  }
+
+  // Fetch a reusable sandbox workload template by name.
+  rpc GetSandboxTemplate(GetSandboxTemplateRequest)
+      returns (SandboxTemplateResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
+  // List reusable sandbox workload templates.
+  rpc ListSandboxTemplates(ListSandboxTemplatesRequest)
+      returns (ListSandboxTemplatesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
+  // Delete a reusable sandbox workload template by name.
+  rpc DeleteSandboxTemplate(DeleteSandboxTemplateRequest)
+      returns (DeleteSandboxTemplateResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "admin"
+    };
+  }
 
   // List provider records attached to a sandbox.
   rpc ListSandboxProviders(ListSandboxProvidersRequest)
-      returns (ListSandboxProvidersResponse);
+      returns (ListSandboxProvidersResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
 
   // Attach a provider record to an existing sandbox.
   rpc AttachSandboxProvider(AttachSandboxProviderRequest)
-      returns (AttachSandboxProviderResponse);
+      returns (AttachSandboxProviderResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Detach a provider record from an existing sandbox.
   rpc DetachSandboxProvider(DetachSandboxProviderRequest)
-      returns (DetachSandboxProviderResponse);
+      returns (DetachSandboxProviderResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Delete a sandbox by name.
-  rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
+  rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
+  // Stop a sandbox while retaining its persistent state.
+  rpc StopSandbox(StopSandboxRequest) returns (SandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
+  // Start a previously stopped sandbox.
+  rpc StartSandbox(StartSandboxRequest) returns (SandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Create a short-lived SSH session for a sandbox.
-  rpc CreateSshSession(CreateSshSessionRequest) returns (CreateSshSessionResponse);
+  rpc CreateSshSession(CreateSshSessionRequest) returns (CreateSshSessionResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Create or update a sandbox HTTP service endpoint for local routing.
-  rpc ExposeService(ExposeServiceRequest) returns (ServiceEndpointResponse);
+  rpc ExposeService(ExposeServiceRequest) returns (ServiceEndpointResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Fetch one sandbox HTTP service endpoint.
-  rpc GetService(GetServiceRequest) returns (ServiceEndpointResponse);
+  rpc GetService(GetServiceRequest) returns (ServiceEndpointResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
 
   // List sandbox HTTP service endpoints.
-  rpc ListServices(ListServicesRequest) returns (ListServicesResponse);
+  rpc ListServices(ListServicesRequest) returns (ListServicesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
 
   // Delete one sandbox HTTP service endpoint.
-  rpc DeleteService(DeleteServiceRequest) returns (DeleteServiceResponse);
+  rpc DeleteService(DeleteServiceRequest) returns (DeleteServiceResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Revoke a previously issued SSH session.
-  rpc RevokeSshSession(RevokeSshSessionRequest) returns (RevokeSshSessionResponse);
+  rpc RevokeSshSession(RevokeSshSessionRequest) returns (RevokeSshSessionResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Execute a command in a ready sandbox and stream output.
-  rpc ExecSandbox(ExecSandboxRequest) returns (stream ExecSandboxEvent);
+  rpc ExecSandbox(ExecSandboxRequest) returns (stream ExecSandboxEvent) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Forward one CLI-side TCP connection to a loopback TCP target in a sandbox.
-  rpc ForwardTcp(stream TcpForwardFrame) returns (stream TcpForwardFrame);
+  rpc ForwardTcp(stream TcpForwardFrame) returns (stream TcpForwardFrame) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Execute an interactive command with bidirectional stdin/stdout streaming.
   // The first client message MUST carry an ExecSandboxInput with the start
   // variant. Subsequent messages carry stdin bytes or window resize events.
-  rpc ExecSandboxInteractive(stream ExecSandboxInput) returns (stream ExecSandboxEvent);
+  rpc ExecSandboxInteractive(stream ExecSandboxInput) returns (stream ExecSandboxEvent) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Create a provider.
-  rpc CreateProvider(CreateProviderRequest) returns (ProviderResponse);
+  rpc CreateProvider(CreateProviderRequest) returns (ProviderResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Fetch a provider by name.
-  rpc GetProvider(GetProviderRequest) returns (ProviderResponse);
+  rpc GetProvider(GetProviderRequest) returns (ProviderResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:read"
+      workspace_role: "user"
+    };
+  }
 
   // List providers.
-  rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse);
+  rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:read"
+      workspace_role: "user"
+    };
+  }
 
   // List available provider type profiles.
   rpc ListProviderProfiles(ListProviderProfilesRequest)
-      returns (ListProviderProfilesResponse);
+      returns (ListProviderProfilesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:read"
+      workspace_role: "user"
+    };
+  }
 
   // Fetch one provider type profile by id.
   rpc GetProviderProfile(GetProviderProfileRequest)
-      returns (ProviderProfileResponse);
+      returns (ProviderProfileResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:read"
+      workspace_role: "user"
+    };
+  }
 
   // Import custom provider type profiles.
   rpc ImportProviderProfiles(ImportProviderProfilesRequest)
-      returns (ImportProviderProfilesResponse);
+      returns (ImportProviderProfilesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Update an existing custom provider type profile.
   rpc UpdateProviderProfiles(UpdateProviderProfilesRequest)
-      returns (UpdateProviderProfilesResponse);
+      returns (UpdateProviderProfilesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Validate provider type profiles without registering them.
   rpc LintProviderProfiles(LintProviderProfilesRequest)
-      returns (LintProviderProfilesResponse);
+      returns (LintProviderProfilesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:read"
+      workspace_role: "user"
+    };
+  }
 
   // Update an existing provider by name.
-  rpc UpdateProvider(UpdateProviderRequest) returns (ProviderResponse);
+  rpc UpdateProvider(UpdateProviderRequest) returns (ProviderResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Fetch refresh status for one provider or provider credential.
   rpc GetProviderRefreshStatus(GetProviderRefreshStatusRequest)
-      returns (GetProviderRefreshStatusResponse);
+      returns (GetProviderRefreshStatusResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:read"
+      workspace_role: "user"
+    };
+  }
 
   // Configure gateway-owned refresh material for one provider credential.
   rpc ConfigureProviderRefresh(ConfigureProviderRefreshRequest)
-      returns (ConfigureProviderRefreshResponse);
+      returns (ConfigureProviderRefreshResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Record a gateway-owned refresh request for one provider credential.
   rpc RotateProviderCredential(RotateProviderCredentialRequest)
-      returns (RotateProviderCredentialResponse);
+      returns (RotateProviderCredentialResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Delete gateway-owned refresh configuration for one provider credential.
   rpc DeleteProviderRefresh(DeleteProviderRefreshRequest)
-      returns (DeleteProviderRefreshResponse);
+      returns (DeleteProviderRefreshResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Delete a provider by name.
-  rpc DeleteProvider(DeleteProviderRequest) returns (DeleteProviderResponse);
+  rpc DeleteProvider(DeleteProviderRequest) returns (DeleteProviderResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Delete a custom provider type profile by id.
   rpc DeleteProviderProfile(DeleteProviderProfileRequest)
-      returns (DeleteProviderProfileResponse);
+      returns (DeleteProviderProfileResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Get sandbox settings by id (called by sandbox entrypoint and poll loop).
   rpc GetSandboxConfig(openshell.sandbox.v1.GetSandboxConfigRequest)
-      returns (openshell.sandbox.v1.GetSandboxConfigResponse);
+      returns (openshell.sandbox.v1.GetSandboxConfigResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "dual"
+      scope: "config:read"
+      workspace_role: "user"
+    };
+  }
 
-  // Get gateway-global settings.
+  // Get gateway-global settings (read-only runtime configuration; any
+  // authenticated user may read these without requiring Platform Admin).
+  //
+  // Scope-only (no role): scopes are granted by the IdP at token issuance,
+  // orthogonal to workspace membership. Deployments that enable scope
+  // enforcement configure the IdP to grant config:read (or openshell:all)
+  // to all sandbox users, so this does not block least-privilege flows.
   rpc GetGatewayConfig(openshell.sandbox.v1.GetGatewayConfigRequest)
-      returns (openshell.sandbox.v1.GetGatewayConfigResponse);
+      returns (openshell.sandbox.v1.GetGatewayConfigResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:read"
+    };
+  }
 
   // Update settings or policy at sandbox or global scope.
   rpc UpdateConfig(UpdateConfigRequest)
-      returns (UpdateConfigResponse);
+      returns (UpdateConfigResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "dual"
+      scope: "config:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Get the load status of a specific policy version.
   rpc GetSandboxPolicyStatus(GetSandboxPolicyStatusRequest)
-      returns (GetSandboxPolicyStatusResponse);
+      returns (GetSandboxPolicyStatusResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
 
   // List policy history for a sandbox.
   rpc ListSandboxPolicies(ListSandboxPoliciesRequest)
-      returns (ListSandboxPoliciesResponse);
+      returns (ListSandboxPoliciesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
 
   // Report policy load result (called by sandbox after reload attempt).
   rpc ReportPolicyStatus(ReportPolicyStatusRequest)
-      returns (ReportPolicyStatusResponse);
+      returns (ReportPolicyStatusResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
 
   // Get provider environment for a sandbox (called by sandbox supervisor at startup).
   rpc GetSandboxProviderEnvironment(GetSandboxProviderEnvironmentRequest)
-      returns (GetSandboxProviderEnvironmentResponse);
+      returns (GetSandboxProviderEnvironmentResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
+  // Exchange a stored provider subject token for an intermediate token scoped
+  // to the calling supervisor's SPIFFE identity.
+  rpc ExchangeProviderSubjectToken(ExchangeProviderSubjectTokenRequest)
+      returns (ExchangeProviderSubjectTokenResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
 
   // Fetch recent sandbox logs (one-shot).
-  rpc GetSandboxLogs(GetSandboxLogsRequest) returns (GetSandboxLogsResponse);
+  rpc GetSandboxLogs(GetSandboxLogsRequest) returns (GetSandboxLogsResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
 
   // Push sandbox supervisor logs to the server (client-streaming).
-  rpc PushSandboxLogs(stream PushSandboxLogsRequest) returns (PushSandboxLogsResponse);
+  rpc PushSandboxLogs(stream PushSandboxLogsRequest) returns (PushSandboxLogsResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
 
   // Persistent supervisor-to-gateway session (bidirectional streaming).
   //
@@ -170,7 +498,26 @@ service OpenShell {
   // SSH connect, ExecSandbox, and targetable sandbox services. Raw service
   // bytes flow over RelayStream calls (separate HTTP/2 streams on the same
   // connection), not over this stream.
-  rpc ConnectSupervisor(stream SupervisorMessage) returns (stream GatewayMessage);
+  rpc ConnectSupervisor(stream SupervisorMessage) returns (stream GatewayMessage) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
+  // Persist the canonical main process result before the supervisor exits.
+  rpc ReportMainProcessExit(ReportMainProcessExitRequest) returns (ReportMainProcessExitResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
+  // Confirm that foreground terminal delivery completed naturally.
+  rpc FinalizeMainProcessExit(FinalizeMainProcessExitRequest)
+      returns (FinalizeMainProcessExitResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
 
   // Raw byte relay between supervisor and gateway.
   //
@@ -183,7 +530,11 @@ service OpenShell {
   //
   // This rides the same TCP+TLS+HTTP/2 connection as ConnectSupervisor —
   // no new TLS handshake, no reverse HTTP CONNECT.
-  rpc RelayStream(stream RelayFrame) returns (stream RelayFrame);
+  rpc RelayStream(stream RelayFrame) returns (stream RelayFrame) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
 
   // Watch a sandbox and stream updates.
   //
@@ -191,7 +542,13 @@ service OpenShell {
   // - Sandbox status snapshots (phase/status)
   // - OpenShell server process logs correlated by sandbox_id
   // - Platform events correlated to the sandbox
-  rpc WatchSandbox(WatchSandboxRequest) returns (stream SandboxStreamEvent);
+  rpc WatchSandbox(WatchSandboxRequest) returns (stream SandboxStreamEvent) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
 
   // ---------------------------------------------------------------------------
   // Draft policy recommendation RPCs
@@ -199,42 +556,98 @@ service OpenShell {
 
   // Submit denial analysis results from sandbox (summaries + proposed chunks).
   rpc SubmitPolicyAnalysis(SubmitPolicyAnalysisRequest)
-      returns (SubmitPolicyAnalysisResponse);
+      returns (SubmitPolicyAnalysisResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
 
   // Get draft policy recommendations for a sandbox.
-  rpc GetDraftPolicy(GetDraftPolicyRequest) returns (GetDraftPolicyResponse);
+  rpc GetDraftPolicy(GetDraftPolicyRequest) returns (GetDraftPolicyResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "dual"
+      scope: "config:read"
+      workspace_role: "user"
+    };
+  }
 
   // Approve a single draft policy chunk (merges into active policy).
   rpc ApproveDraftChunk(ApproveDraftChunkRequest)
-      returns (ApproveDraftChunkResponse);
+      returns (ApproveDraftChunkResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Reject a single draft policy chunk.
   rpc RejectDraftChunk(RejectDraftChunkRequest)
-      returns (RejectDraftChunkResponse);
+      returns (RejectDraftChunkResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Approve all pending draft chunks (skips security-flagged unless forced).
   rpc ApproveAllDraftChunks(ApproveAllDraftChunksRequest)
-      returns (ApproveAllDraftChunksResponse);
+      returns (ApproveAllDraftChunksResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Edit a pending draft chunk in-place (e.g. narrow allowed_ips).
-  rpc EditDraftChunk(EditDraftChunkRequest) returns (EditDraftChunkResponse);
+  rpc EditDraftChunk(EditDraftChunkRequest) returns (EditDraftChunkResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Reverse an approval (remove merged rule from active policy).
-  rpc UndoDraftChunk(UndoDraftChunkRequest) returns (UndoDraftChunkResponse);
+  rpc UndoDraftChunk(UndoDraftChunkRequest) returns (UndoDraftChunkResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Clear all pending draft chunks for a sandbox.
   rpc ClearDraftChunks(ClearDraftChunksRequest)
-      returns (ClearDraftChunksResponse);
+      returns (ClearDraftChunksResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Get decision history for a sandbox's draft policy.
-  rpc GetDraftHistory(GetDraftHistoryRequest) returns (GetDraftHistoryResponse);
+  rpc GetDraftHistory(GetDraftHistoryRequest) returns (GetDraftHistoryResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:read"
+      workspace_role: "user"
+    };
+  }
 
   // Exchange a sandbox-bootstrap credential (e.g. a Kubernetes projected
   // ServiceAccount token) for a gateway-minted JWT bound to the calling
   // sandbox's UUID. Used by the Kubernetes driver path; singleplayer
   // drivers receive the gateway JWT directly from the create-sandbox flow
   // and never call this RPC.
-  rpc IssueSandboxToken(IssueSandboxTokenRequest) returns (IssueSandboxTokenResponse);
+  rpc IssueSandboxToken(IssueSandboxTokenRequest) returns (IssueSandboxTokenResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
 
   // Renew the calling sandbox's gateway JWT. Older tokens remain valid
   // until their own expiry; deployments should keep token TTLs short to
@@ -243,7 +656,78 @@ service OpenShell {
   // memory only — the on-disk bootstrap file is intentionally not
   // rewritten.
   rpc RefreshSandboxToken(RefreshSandboxTokenRequest)
-      returns (RefreshSandboxTokenResponse);
+      returns (RefreshSandboxTokenResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Workspace management RPCs
+  // ---------------------------------------------------------------------------
+
+  // Create a workspace.
+  rpc CreateWorkspace(CreateWorkspaceRequest) returns (CreateWorkspaceResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "workspace:write"
+      global_role: "platform_admin"
+    };
+  }
+
+  // Fetch a workspace by name.
+  rpc GetWorkspace(GetWorkspaceRequest) returns (GetWorkspaceResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "workspace:read"
+      workspace_role: "user"
+    };
+  }
+
+  // List workspaces.
+  rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "workspace:read"
+      workspace_role: "user"
+    };
+  }
+
+  // Delete a workspace by name.
+  rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "workspace:write"
+      global_role: "platform_admin"
+    };
+  }
+
+  // Add a member to a workspace.
+  rpc AddWorkspaceMember(AddWorkspaceMemberRequest) returns (AddWorkspaceMemberResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "workspace:write"
+      workspace_role: "admin"
+    };
+  }
+
+  // Remove a member from a workspace.
+  rpc RemoveWorkspaceMember(RemoveWorkspaceMemberRequest) returns (RemoveWorkspaceMemberResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "workspace:write"
+      workspace_role: "admin"
+    };
+  }
+
+  // List members of a workspace.
+  rpc ListWorkspaceMembers(ListWorkspaceMembersRequest) returns (ListWorkspaceMembersResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "workspace:read"
+      workspace_role: "user"
+    };
+  }
 }
 
 // IssueSandboxToken request. Empty body; identity is established by the
@@ -256,26 +740,36 @@ message IssueSandboxTokenRequest {}
 // gateway RPC.
 message IssueSandboxTokenResponse {
   // Gateway-minted JWT bound to the calling sandbox's UUID.
-  string token = 1;
+  string token = 1 [(openshell.options.v1.secret) = true];
   // Absolute expiry of the issued token, milliseconds since the epoch. 0 means
   // the token is non-expiring.
   int64 expires_at_ms = 2;
 }
 
-// RefreshSandboxToken request. Empty body; the calling principal must
-// already be a sandbox principal (i.e. the request carries a still-valid
-// gateway-minted JWT in its Authorization header).
-message RefreshSandboxTokenRequest {}
+// RefreshSandboxToken request. The calling principal must already be a
+// sandbox principal (i.e. the request carries a still-valid gateway-minted
+// JWT in its Authorization header). Extension service names are resolved
+// against server-owned registrations and the sandbox's effective policy;
+// callers never choose token audiences directly.
+message RefreshSandboxTokenRequest {
+  // Operator registration names for extension services selected by the
+  // sandbox's effective policy.
+  repeated string extension_service_names = 1;
+}
 
 // RefreshSandboxToken response. The new token replaces the supervisor's
 // in-memory bearer credential.
 message RefreshSandboxTokenResponse {
   // Fresh gateway-minted JWT bound to the same sandbox UUID.
-  string token = 1;
+  string token = 1 [(openshell.options.v1.secret) = true];
   // Absolute expiry of the new token, milliseconds since the epoch. 0 means
   // the token is non-expiring.
   int64 expires_at_ms = 2;
+  // Fresh credentials for the requested, policy-authorized extension
+  // services. These remain in supervisor memory and are never persisted.
+  repeated ExtensionServiceCredential extension_credentials = 3;
 }
+
 
 // Health check request.
 message HealthRequest {}
@@ -287,6 +781,62 @@ message HealthResponse {
 
   // Service version.
   string version = 2;
+}
+
+// Current-user request. The identity comes from the authenticated request.
+message GetCurrentUserRequest {}
+
+// Authenticated user identity as validated by the gateway.
+message GetCurrentUserResponse {
+  // Stable identity subject (for example, the OIDC `sub` claim).
+  string subject = 1;
+
+  // Human-readable identity name when supplied by the authentication provider.
+  string display_name = 2;
+
+  // Roles granted to the authenticated identity.
+  repeated string roles = 3;
+
+  // OAuth2 scopes granted to the authenticated identity.
+  repeated string scopes = 4;
+
+  // Authentication provider that established the identity.
+  string identity_provider = 5;
+}
+
+// Gateway info request.
+message GetGatewayInfoRequest {}
+
+// Gateway info response.
+message GetGatewayInfoResponse {
+  // Service status.
+  ServiceStatus status = 1;
+
+  // OpenShell gateway binary version.
+  string gateway_version = 2;
+
+  // Compute driver runtimes initialized by this gateway. Current gateways
+  // return exactly one entry.
+  repeated ComputeDriverInfo compute_drivers = 3;
+}
+
+// Info for one initialized compute driver runtime.
+message ComputeDriverInfo {
+  // Gateway-selected driver name used for routing and driver_config keys.
+  string name = 1;
+
+  // Capabilities reported by the driver during gateway runtime initialization.
+  ComputeDriverCapabilities capabilities = 2;
+}
+
+// Public compute driver capability snapshot.
+message ComputeDriverCapabilities {
+  // Driver-reported human-readable name from the startup capability snapshot.
+  string driver_name = 1;
+
+  // Driver-reported implementation version from the startup capability snapshot.
+  string driver_version = 2;
+
 }
 
 // Public sandbox resource exposed by the OpenShell API.
@@ -304,6 +854,8 @@ message Sandbox {
   SandboxSpec spec = 2;
   // Latest user-facing observed status derived by the gateway.
   SandboxStatus status = 3;
+  // Read-only provenance for sandboxes created from a reusable workload template.
+  SandboxWorkloadTemplateProvenance created_from_workload_template = 20;
 
   reserved 4, 5;
   reserved "phase", "current_policy_version";
@@ -332,6 +884,12 @@ message SandboxSpec {
   // managed fleet-wide.
   reserved 11;
   reserved "proposal_approval_mode";
+  // Canonical command launched once by the sandbox supervisor. No shell
+  // parsing is performed. The gateway normalizes an omitted command to the
+  // portable scratch login shell before persistence.
+  repeated string command = 12;
+  // Allocate a retained pseudo-terminal for the main process.
+  bool tty = 13;
 }
 
 message ResourceRequirements {
@@ -346,7 +904,12 @@ message GpuResourceRequirements {
   optional uint32 count = 1;
 }
 
-// Public sandbox template mapped onto compute-driver template inputs.
+// Historical inline compute template mapped onto compute-driver template inputs.
+//
+// Despite its name, this is not a reusable named sandbox template resource. It
+// is an inline part of `SandboxSpec` kept for v1 compatibility. A future
+// breaking API cleanup may rename this message to free `SandboxTemplate` for
+// the reusable template resource now represented by `SandboxWorkloadTemplate`.
 message SandboxTemplate {
   // Fully-qualified OCI image reference used to boot the sandbox.
   string image = 1;
@@ -377,6 +940,62 @@ message SandboxTemplate {
   google.protobuf.Struct driver_config = 11;
 }
 
+// Reusable named sandbox workload template resource.
+//
+// This is the actual workspace-scoped template resource used to create
+// sandboxes by reference. It uses the longer name in v1 to avoid colliding with
+// the historical inline `SandboxTemplate` message. A future breaking API
+// cleanup may rename this resource to `SandboxTemplate`.
+message SandboxWorkloadTemplate {
+  // Kubernetes-style metadata (id, name, labels, timestamps, resource version).
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  // Desired reusable workload shape and template-owned driver config.
+  SandboxWorkloadTemplateSpec spec = 2;
+}
+
+message SandboxWorkloadTemplateSpec {
+  // Portable workload shape.
+  SandboxWorkloadConfig workload = 1;
+  // Driver-keyed opaque config envelope supplied by the template owner.
+  google.protobuf.Struct driver_config = 2;
+  // Desired service level associated with this template.
+  SandboxServiceLevel desired_service_level = 3;
+}
+
+message SandboxWorkloadConfig {
+  // Fully-qualified OCI image reference used to boot the sandbox.
+  string image = 1;
+  // Environment variables injected into the sandbox runtime.
+  map<string, string> environment = 2;
+  // Portable resource requirements for sandboxes created from this workload.
+  SandboxResources resources = 3;
+}
+
+message SandboxResources {
+  // Portable CPU quantity, for example "500m" or "2".
+  string cpu = 1;
+  // Portable memory quantity, for example "512Mi" or "2Gi".
+  string memory = 2;
+  // GPU requirements for the sandbox workload. Presence indicates a GPU
+  // request. When count is omitted, the request uses the selected driver's
+  // default GPU assignment behavior.
+  GpuResourceRequirements gpu = 3;
+}
+
+message SandboxServiceLevel {
+  SandboxStartup startup = 1;
+}
+
+message SandboxStartup {
+  google.protobuf.Duration ready_within = 1;
+  uint32 max_burst = 2;
+}
+
+message SandboxWorkloadTemplateProvenance {
+  string name = 1;
+  string resource_version = 2;
+}
+
 // User-facing sandbox status derived by the gateway from compute-driver observations.
 //
 // Public status does not embed driver-only flags such as `deleting`.
@@ -395,6 +1014,13 @@ message SandboxStatus {
   SandboxPhase phase = 6;
   // Currently active policy version (updated when sandbox reports loaded).
   uint32 current_policy_version = 7;
+  // Supervisor instance currently associated with the canonical main process.
+  // The gateway uses this to reject stale exit reports after a restart.
+  string main_process_instance_id = 8;
+  // Normalized main process result. Signal exits use 128 + signal number.
+  // Presence indicates that the canonical main process exited. Exit code 0
+  // produces Completed; nonzero and signal-normalized exits produce Error.
+  optional int32 exit_code = 9;
 }
 
 // User-facing sandbox condition derived from driver-native conditions.
@@ -422,6 +1048,11 @@ enum SandboxPhase {
   SANDBOX_PHASE_ERROR = 3;
   SANDBOX_PHASE_DELETING = 4;
   SANDBOX_PHASE_UNKNOWN = 5;
+  SANDBOX_PHASE_STOPPING = 6;
+  SANDBOX_PHASE_STOPPED = 7;
+  SANDBOX_PHASE_STARTING = 8;
+  // The canonical main process exited successfully and its result is final.
+  SANDBOX_PHASE_COMPLETED = 9;
 }
 
 // Public platform event exposed on the sandbox watch stream.
@@ -447,12 +1078,65 @@ message CreateSandboxRequest {
   string name = 2;
   // Optional labels for the sandbox (key-value metadata).
   map<string, string> labels = 3;
+  // Optional annotations for the sandbox (non-selector metadata).
+  map<string, string> annotations = 4;
+  // Workspace for the sandbox. Empty defaults to "default".
+  string workspace = 5;
+  // One-shot launch hint indicating that the creating client will attach to
+  // the canonical main process. The supervisor keeps the terminal transport
+  // alive until that attachment connects and closes naturally.
+  bool await_main_process_attachment = 6;
+  // Workspace-scoped SandboxWorkloadTemplate name to resolve at creation time.
+  string workload_template_name = 7;
+}
+
+message CreateSandboxTemplateRequest {
+  SandboxWorkloadTemplate template = 1;
+  // Workspace for the template. Empty defaults to "default".
+  string workspace = 2;
+}
+
+message GetSandboxTemplateRequest {
+  string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
+}
+
+message ListSandboxTemplatesRequest {
+  uint32 limit = 1;
+  uint32 offset = 2;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 3;
+  // List across all workspaces. Mutually exclusive with workspace.
+  bool all_workspaces = 4;
+  // Optional label selector in key=value comma-separated form.
+  string label_selector = 5;
+}
+
+message DeleteSandboxTemplateRequest {
+  string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
+}
+
+message SandboxTemplateResponse {
+  SandboxWorkloadTemplate template = 1;
+}
+
+message ListSandboxTemplatesResponse {
+  repeated SandboxWorkloadTemplate templates = 1;
+}
+
+message DeleteSandboxTemplateResponse {
+  bool deleted = 1;
 }
 
 // Get sandbox request.
 message GetSandboxRequest {
   // Sandbox name (canonical lookup key).
   string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
 }
 
 // List sandboxes request.
@@ -461,12 +1145,18 @@ message ListSandboxesRequest {
   uint32 offset = 2;
   // Optional label selector for filtering (format: "key1=value1,key2=value2").
   string label_selector = 3;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 4;
+  // List across all workspaces. Mutually exclusive with workspace.
+  bool all_workspaces = 5;
 }
 
 // List providers attached to a sandbox request.
 message ListSandboxProvidersRequest {
   // Sandbox name (canonical lookup key).
   string sandbox_name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
 }
 
 // Attach provider to sandbox request.
@@ -480,6 +1170,8 @@ message AttachSandboxProviderRequest {
   // If non-zero, the server validates that the sandbox's current resource_version
   // matches this value before applying the mutation, returning ABORTED on mismatch.
   uint64 expected_resource_version = 3;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 4;
 }
 
 // Detach provider from sandbox request.
@@ -493,12 +1185,32 @@ message DetachSandboxProviderRequest {
   // If non-zero, the server validates that the sandbox's current resource_version
   // matches this value before applying the mutation, returning ABORTED on mismatch.
   uint64 expected_resource_version = 3;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 4;
 }
 
 // Delete sandbox request.
 message DeleteSandboxRequest {
   // Sandbox name (canonical lookup key).
   string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
+}
+
+// Stop sandbox request.
+message StopSandboxRequest {
+  // Sandbox name (canonical lookup key).
+  string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
+}
+
+// Start sandbox request.
+message StartSandboxRequest {
+  // Sandbox name (canonical lookup key).
+  string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
 }
 
 // Sandbox response.
@@ -555,7 +1267,7 @@ message CreateSshSessionResponse {
   // Session token for the gateway tunnel. URL-safe ASCII
   // ([A-Za-z0-9._~+/=-]) up to 4096 bytes. No shell metacharacters or
   // whitespace.
-  string token = 2;
+  string token = 2 [(openshell.options.v1.secret) = true];
 
   // Gateway host for SSH proxy connection. IPv4 address, bracketed IPv6
   // address, or DNS hostname (Punycode-encoded for IDN). Alphanumeric plus
@@ -585,6 +1297,8 @@ message ExposeServiceRequest {
   uint32 target_port = 3;
   // Whether to print/use the browser-facing service URL.
   bool domain = 4;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 5;
 }
 
 // Request to fetch an exposed sandbox service endpoint.
@@ -593,6 +1307,8 @@ message GetServiceRequest {
   string sandbox = 1;
   // Service name within the sandbox. Empty selects the unnamed endpoint.
   string service = 2;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 3;
 }
 
 // Request to list exposed sandbox service endpoints.
@@ -603,6 +1319,10 @@ message ListServicesRequest {
   uint32 limit = 2;
   // Page offset.
   uint32 offset = 3;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 4;
+  // List across all workspaces. Mutually exclusive with workspace.
+  bool all_workspaces = 5;
 }
 
 // Response containing exposed sandbox service endpoints.
@@ -616,6 +1336,8 @@ message DeleteServiceRequest {
   string sandbox = 1;
   // Service name within the sandbox. Empty selects the unnamed endpoint.
   string service = 2;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 3;
 }
 
 // Response for deleting an exposed sandbox service endpoint.
@@ -649,7 +1371,7 @@ message ServiceEndpointResponse {
 // Revoke SSH session request.
 message RevokeSshSessionRequest {
   // Session token to revoke.
-  string token = 1;
+  string token = 1 [(openshell.options.v1.secret) = true];
 }
 
 // Revoke SSH session response.
@@ -686,6 +1408,13 @@ message ExecSandboxRequest {
 
   // Initial terminal rows (used when tty=true, 0 = use default).
   uint32 rows = 9;
+
+  // Skip sourcing shell login/profile startup files before running the command.
+  // When false (the default), the command runs through a login shell
+  // (`bash -lc`) so user startup files (.bash_profile/.profile, and .bashrc if
+  // sourced by them) are applied. When true, the command runs without those
+  // files (`bash -c`), for automation that needs predictable startup behavior.
+  bool no_login_shell = 10;
 }
 
 // One stdout chunk from a sandbox exec.
@@ -725,7 +1454,7 @@ message TcpForwardInit {
   }
   // Optional target-specific authorization token. SSH targets use this as the
   // short-lived SSH session token issued by CreateSshSession.
-  string authorization_token = 7;
+  string authorization_token = 7 [(openshell.options.v1.secret) = true];
 }
 
 // A single frame on the CLI-to-gateway TCP forward stream.
@@ -764,7 +1493,7 @@ message SshSession {
   string sandbox_id = 2;
 
   // Session token.
-  string token = 3;
+  string token = 3 [(openshell.options.v1.secret) = true];
 
   // Expiry timestamp in milliseconds since epoch. 0 means no expiry
   // (backward-compatible default for sessions created before this field existed).
@@ -794,7 +1523,8 @@ message WatchSandboxRequest {
   // Replay the last N platform events (best-effort) before following.
   uint32 event_tail = 6;
 
-  // Stop streaming once the sandbox reaches a terminal phase (READY or ERROR).
+  // Stop streaming once the sandbox reaches READY or a terminal result phase
+  // (COMPLETED, STOPPED, or ERROR).
   bool stop_on_terminal = 7;
 
   // Only include log lines with timestamp >= this value (milliseconds since epoch).
@@ -845,17 +1575,25 @@ message SandboxStreamWarning {
 // Create provider request.
 message CreateProviderRequest {
   openshell.datamodel.v1.Provider provider = 1;
+  // Workspace for the provider. Empty defaults to "default".
+  string workspace = 2;
 }
 
 // Get provider request.
 message GetProviderRequest {
   string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
 }
 
 // List providers request.
 message ListProvidersRequest {
   uint32 limit = 1;
   uint32 offset = 2;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 3;
+  // List across all workspaces. Mutually exclusive with workspace.
+  bool all_workspaces = 4;
 }
 
 // Update provider request.
@@ -864,11 +1602,15 @@ message UpdateProviderRequest {
   // Optional per-credential expiry timestamps to merge into the provider.
   // A zero value removes the expiry for that credential.
   map<string, int64> credential_expires_at_ms = 2;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 3;
 }
 
 // Delete provider request.
 message DeleteProviderRequest {
   string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
 }
 
 // Provider response.
@@ -885,11 +1627,18 @@ message ListProvidersResponse {
 message ListProviderProfilesRequest {
   uint32 limit = 1;
   uint32 offset = 2;
+  // Workspace scope. When set, returns workspace-scoped + built-in profiles.
+  // When empty, returns platform-scoped + built-in only.
+  string workspace = 3;
 }
 
 // Fetch provider type profile request.
 message GetProviderProfileRequest {
   string id = 1;
+  // Workspace scope for two-tier profile resolution. When set, checks
+  // workspace-scoped profiles first, then platform-scoped, then built-in.
+  // When empty, checks platform-scoped then built-in only.
+  string workspace = 2;
 }
 
 // Provider profile payload with optional source metadata for diagnostics.
@@ -927,6 +1676,25 @@ message ProviderCredentialTokenGrantAudienceOverride {
 
 // Provider credential token grant configuration.
 // When present, the credential is obtained dynamically via OAuth2 grant when needed.
+enum ProviderCredentialTokenGrantType {
+  PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_UNSPECIFIED = 0;
+  PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_CLIENT_CREDENTIALS = 1;
+  PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_TOKEN_EXCHANGE = 2;
+}
+
+message ProviderCredentialTokenGrantSubjectToken {
+  // Source for the token exchange subject token. Phase one supports
+  // "provider_credential".
+  string source = 1;
+
+  // Provider credential key that stores the subject token.
+  string credential = 2;
+
+  // OAuth2 subject_token_type. If omitted, OpenShell uses
+  // urn:ietf:params:oauth:token-type:access_token.
+  string subject_token_type = 3;
+}
+
 message ProviderCredentialTokenGrant {
   // OAuth2 token endpoint URL (e.g., https://keycloak.example.com/realms/my-realm/protocol/openid-connect/token)
   string token_endpoint = 1;
@@ -951,6 +1719,17 @@ message ProviderCredentialTokenGrant {
   // Optional: OAuth2 client_assertion_type value. If omitted, OpenShell uses
   // urn:ietf:params:oauth:client-assertion-type:jwt-bearer.
   string client_assertion_type = 7;
+
+  // Grant type. If omitted/unspecified, OpenShell treats this as client_credentials
+  // for backwards compatibility.
+  ProviderCredentialTokenGrantType grant_type = 8;
+
+  // Subject token metadata for token_exchange grants.
+  ProviderCredentialTokenGrantSubjectToken subject_token = 9;
+
+  // OAuth2 requested_token_type. If omitted for token_exchange, OpenShell uses
+  // urn:ietf:params:oauth:token-type:access_token.
+  string requested_token_type = 10;
 }
 
 // Provider credential declaration.
@@ -974,6 +1753,7 @@ enum ProviderCredentialRefreshStrategy {
   PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_REFRESH_TOKEN = 3;
   PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_CLIENT_CREDENTIALS = 4;
   PROVIDER_CREDENTIAL_REFRESH_STRATEGY_GOOGLE_SERVICE_ACCOUNT_JWT = 5;
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE = 6;
 }
 
 message ProviderCredentialRefreshMaterial {
@@ -983,6 +1763,15 @@ message ProviderCredentialRefreshMaterial {
   bool secret = 4;
 }
 
+// Declares that a single refresh operation mints more than one credential.
+// The refresh is attached to a primary credential; each additional output
+// maps a strategy-defined semantic output id to a sibling credential whose
+// env_vars receive the minted value.
+message ProviderCredentialRefreshOutput {
+  string output = 1;      // strategy-defined semantic output id (e.g. "session_token")
+  string credential = 2;  // sibling credential name whose env_vars receive this output
+}
+
 message ProviderCredentialRefresh {
   ProviderCredentialRefreshStrategy strategy = 1;
   string token_url = 2;
@@ -990,6 +1779,7 @@ message ProviderCredentialRefresh {
   int64 refresh_before_seconds = 4;
   int64 max_lifetime_seconds = 5;
   repeated ProviderCredentialRefreshMaterial material = 6;
+  repeated ProviderCredentialRefreshOutput additional_outputs = 7;
 }
 
 message ProviderCredentialRefreshStatus {
@@ -999,9 +1789,23 @@ message ProviderCredentialRefreshStatus {
   ProviderCredentialRefreshStrategy strategy = 4;
   string status = 5;
   int64 expires_at_ms = 6;
+  // Next automatic refresh time in Unix epoch milliseconds. A value of
+  // 9223372036854775807 (int64 max) means no automatic retry is scheduled;
+  // consumers should render it as unset and use recovery_action to determine
+  // the required recovery workflow.
   int64 next_refresh_at_ms = 7;
   int64 last_refresh_at_ms = 8;
   string last_error = 9;
+  ProviderCredentialRefreshRecoveryAction recovery_action = 10;
+  // Stable gateway-owned failure identifier, for example
+  // "oauth_invalid_grant". This is not provider-controlled prose and
+  // incorporates any recognized top-level OAuth error classification.
+  string failure_code = 11;
+  // A bounded, recognized provider subtype that refines failure_code; clients
+  // do not need a separate provider_error field. Unknown provider-controlled
+  // values are not persisted or returned.
+  string provider_error_subtype = 12;
+  int64 last_error_at_ms = 13;
 }
 
 // Provider profile local discovery declaration.
@@ -1016,9 +1820,13 @@ message StoredProviderCredentialRefreshState {
   string provider_name = 3;
   string credential_key = 4;
   ProviderCredentialRefreshStrategy strategy = 5;
-  map<string, string> material = 6;
+  map<string, string> material = 6 [(openshell.options.v1.secret) = true];
+  // Material names classified as secret. Newly configured values live in the
+  // active credential driver and are absent from material. Legacy inline values
+  // are not automatically migrated before OpenShell 0.1.0.
   repeated string secret_material_keys = 7;
   int64 expires_at_ms = 8;
+  // int64 max parks the refresh until an explicit rotation or reconfiguration.
   int64 next_refresh_at_ms = 9;
   int64 last_refresh_at_ms = 10;
   string status = 11;
@@ -1027,11 +1835,46 @@ message StoredProviderCredentialRefreshState {
   repeated string scopes = 14;
   int64 refresh_before_seconds = 15;
   int64 max_lifetime_seconds = 16;
+  // Resolved mapping of strategy-defined output id -> concrete env key, pinned
+  // at configure time from the profile's additional_outputs. Read by minting,
+  // collision reservation, and env-key surfacing so later profile edits cannot
+  // silently redirect writes.
+  map<string, string> additional_output_keys = 17;
+  // Opaque gateway-owned authorization epoch for the configured refresh
+  // grant. Explicit refresh configuration creates a new epoch; automatic and
+  // manual token rotation preserve it. It is never derived from or exposed
+  // with refresh material.
+  string authorization_epoch = 18;
+  // Secret refresh material is stored through the gateway's active credential
+  // driver. The persisted refresh state keeps only opaque handles; resolved
+  // values exist in gateway memory for the duration of one mint operation.
+  map<string, openshell.datamodel.v1.CredentialHandle> secret_material_handles = 19;
+  // Handles replaced by reconfiguration or issuer-driven refresh-token
+  // rotation. This is a repeated entry rather than a material-keyed map so
+  // multiple superseded generations of the same material remain recoverable.
+  // Cleanup is retried by the refresh worker so a gateway crash or temporary
+  // credential-backend outage does not lose the deletion reference.
+  repeated StoredRefreshMaterialDeletion pending_secret_deletions = 20;
+  // Structured recovery details for the most recent refresh failure. These
+  // fields contain only gateway-owned codes and recognized bounded values.
+  ProviderCredentialRefreshRecoveryAction recovery_action = 21;
+  string failure_code = 22;
+  string provider_error_subtype = 23;
+  int64 last_error_at_ms = 24;
+}
+
+message StoredRefreshMaterialDeletion {
+  // Original material name used to derive the credential driver's storage key.
+  string material_key = 1;
+  // Opaque handle for the superseded secret object.
+  openshell.datamodel.v1.CredentialHandle handle = 2;
 }
 
 message GetProviderRefreshStatusRequest {
   string provider = 1;
   string credential_key = 2;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 3;
 }
 
 message GetProviderRefreshStatusResponse {
@@ -1042,9 +1885,14 @@ message ConfigureProviderRefreshRequest {
   string provider = 1;
   string credential_key = 2;
   ProviderCredentialRefreshStrategy strategy = 3;
-  map<string, string> material = 4;
+  map<string, string> material = 4 [(openshell.options.v1.secret) = true];
+  // Additional material names the caller requests be stored as secrets. Every
+  // name must be present in material. The server also classifies secrets from
+  // the authoritative provider profile and refresh strategy.
   repeated string secret_material_keys = 5;
   optional int64 expires_at_ms = 6;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 7;
 }
 
 message ConfigureProviderRefreshResponse {
@@ -1054,6 +1902,8 @@ message ConfigureProviderRefreshResponse {
 message RotateProviderCredentialRequest {
   string provider = 1;
   string credential_key = 2;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 3;
 }
 
 message RotateProviderCredentialResponse {
@@ -1063,6 +1913,8 @@ message RotateProviderCredentialResponse {
 message DeleteProviderRefreshRequest {
   string provider = 1;
   string credential_key = 2;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 3;
 }
 
 message DeleteProviderRefreshResponse {
@@ -1096,6 +1948,14 @@ message ProviderProfile {
   // profile files use 0. Gateway responses set this for stored custom profiles.
   // Update calls use this for optimistic concurrency.
   uint64 resource_version = 10;
+  // Optional non-secret annotations attached by profile sources or importers.
+  map<string, string> annotations = 11;
+  // Server-set provenance: "builtin", "user", or "interceptor/{name}".
+  // Ignored on import/update payloads.
+  string source = 12;
+  // Server-set visibility: "platform", "workspace", or empty for
+  // non-scoped sources. Ignored on import/update payloads.
+  string scope = 13;
 }
 
 // Stored custom provider profile object.
@@ -1117,6 +1977,9 @@ message ListProviderProfilesResponse {
 // Import custom provider profiles request.
 message ImportProviderProfilesRequest {
   repeated ProviderProfileImportItem profiles = 1;
+  // Workspace scope. When set, profiles are workspace-scoped (Workspace Admin).
+  // When empty, profiles are platform-scoped (Platform Admin).
+  string workspace = 2;
 }
 
 // Import custom provider profiles response.
@@ -1136,6 +1999,9 @@ message UpdateProviderProfilesRequest {
   uint64 expected_resource_version = 2;
   // Existing custom provider profile ID to update. The payload ID must match.
   string id = 3;
+  // Workspace scope. When set, targets workspace-scoped profile. When empty,
+  // targets platform-scoped profile.
+  string workspace = 4;
 }
 
 // Update one custom provider profile response.
@@ -1148,6 +2014,9 @@ message UpdateProviderProfilesResponse {
 // Lint provider profiles request.
 message LintProviderProfilesRequest {
   repeated ProviderProfileImportItem profiles = 1;
+  // Workspace scope. Used to check for conflicts against existing profiles
+  // in the target workspace.
+  string workspace = 2;
 }
 
 // Lint provider profiles response.
@@ -1164,6 +2033,9 @@ message DeleteProviderResponse {
 // Delete custom provider profile request.
 message DeleteProviderProfileRequest {
   string id = 1;
+  // Workspace scope. When set, targets workspace-scoped profile. When empty,
+  // targets platform-scoped profile.
+  string workspace = 2;
 }
 
 // Delete custom provider profile response.
@@ -1175,12 +2047,38 @@ message DeleteProviderProfileResponse {
 message GetSandboxProviderEnvironmentRequest {
   // The sandbox ID.
   string sandbox_id = 1;
+  // Whether the requesting supervisor enforces endpoint bindings for static
+  // provider credentials. Gateways withhold static credential material when
+  // this capability is absent.
+  bool supports_static_credential_bindings = 2;
+}
+
+// One network endpoint at which a static provider credential may be resolved.
+message StaticCredentialEndpointBinding {
+  string host = 1;
+  uint32 port = 2;
+  string path = 3;
+}
+
+// Endpoint allowlist for one static provider credential environment variable.
+message StaticCredentialBinding {
+  repeated StaticCredentialEndpointBinding endpoints = 1;
+  // Stable identity of the provider credential that produced this binding.
+  // Supervisors use it to retain old revision placeholders only across
+  // rotations of the same provider credential.
+  string credential_identity = 2;
+  // Opaque gateway-issued handle for a refresh-managed credential identity
+  // epoch. When non-empty, supervisors keep the workload placeholder stable
+  // across access-token rotations and replace only the resolver value. The
+  // handle changes when the sandbox, provider, credential key, refresh
+  // authorization epoch, or endpoint authorization boundary changes.
+  string workload_credential_handle = 3;
 }
 
 // Get sandbox provider environment response.
 message GetSandboxProviderEnvironmentResponse {
   // Provider credential environment variables.
-  map<string, string> environment = 1;
+  map<string, string> environment = 1 [(openshell.options.v1.secret) = true];
   // Fingerprint for the provider credential inputs that produced environment.
   uint64 provider_env_revision = 2;
   // Expiration timestamps for returned environment variables.
@@ -1189,6 +2087,35 @@ message GetSandboxProviderEnvironmentResponse {
   // Maps endpoint-bound provider metadata to credential metadata.
   // Supervisor uses this to inject Authorization headers for token grant credentials.
   map<string, ProviderProfileCredential> dynamic_credentials = 4;
+  // Endpoint allowlists for static credential environment variables. Metadata
+  // can be incomplete when a provider profile is invalid; capable supervisors
+  // reject all static material in that snapshot while preserving independently
+  // endpoint-bound dynamic credentials.
+  map<string, StaticCredentialBinding> static_credential_bindings = 5;
+  // Environment variables that contain provider configuration rather than
+  // credentials and therefore do not require endpoint-scoped resolution.
+  repeated string non_secret_environment_keys = 6;
+}
+
+message ExchangeProviderSubjectTokenRequest {
+  // The sandbox ID. Must match the authenticated sandbox principal.
+  string sandbox_id = 1;
+
+  // Attached provider record holding the configured subject token credential.
+  string provider = 2;
+
+  // Provider profile credential that declares the token_exchange grant.
+  string credential_key = 3;
+
+  // Supervisor JWT-SVID. The gateway verifies this and uses its `sub` claim
+  // as the requested audience for the intermediate token.
+  string supervisor_jwt_svid = 4 [(openshell.options.v1.secret) = true];
+}
+
+message ExchangeProviderSubjectTokenResponse {
+  string access_token = 1 [(openshell.options.v1.secret) = true];
+  int64 expires_in = 2;
+  string token_type = 3;
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,6 +2153,15 @@ message UpdateConfigRequest {
   // matches this value before applying the mutation, returning ABORTED on mismatch.
   // Ignored for global-scoped updates.
   uint64 expected_resource_version = 8;
+  // Caller-provided annotations associated with a sandbox-scoped update. Values
+  // must not contain secrets; the gateway treats them as opaque metadata and does
+  // not interpret or verify their semantics. For policy updates, the gateway
+  // stores the annotations immutably with the revision and merges them into
+  // sandbox metadata as a convenience projection. For setting-only updates, it
+  // only merges them into sandbox metadata.
+  map<string, string> annotations = 9;
+  // Workspace scope. Empty defaults to "default". Ignored for global-scoped updates.
+  string workspace = 10;
 }
 
 message PolicyMergeOperation {
@@ -1281,6 +2217,8 @@ message UpdateConfigResponse {
   uint64 settings_revision = 3;
   // True when a setting delete operation removed an existing key.
   bool deleted = 4;
+  // Sandbox metadata annotations after the update. Empty for global updates.
+  map<string, string> annotations = 5;
 }
 
 // Get sandbox policy status request.
@@ -1291,6 +2229,8 @@ message GetSandboxPolicyStatusRequest {
   uint32 version = 2;
   // Query global policy revisions instead of a sandbox-scoped one.
   bool global = 3;
+  // Workspace scope. Empty defaults to "default". Ignored when global is true.
+  string workspace = 4;
 }
 
 // Get sandbox policy status response.
@@ -1309,10 +2249,14 @@ message ListSandboxPoliciesRequest {
   uint32 offset = 3;
   // List global policy revisions instead of sandbox-scoped ones.
   bool global = 4;
+  // Workspace scope. Empty defaults to "default". Ignored when global is true.
+  string workspace = 5;
 }
 
 // List sandbox policies response.
 message ListSandboxPoliciesResponse {
+  // Invalid historical payloads remain visible as failed projections so one
+  // legacy row cannot hide the rest of the policy history.
   repeated SandboxPolicyRevision revisions = 1;
 }
 
@@ -1335,11 +2279,16 @@ message ReportPolicyStatusResponse {}
 message SandboxPolicyRevision {
   // Policy version (monotonically increasing per sandbox).
   uint32 version = 1;
-  // SHA-256 hash of the serialized policy payload.
+  // SHA-256 hash of the canonical serialized policy payload. Empty in a
+  // ListSandboxPolicies projection when the stored payload is invalid under
+  // the current schema and therefore has no trusted canonical identity.
   string policy_hash = 2;
-  // Load status of this revision.
+  // Load status of this revision. ListSandboxPolicies reports FAILED when a
+  // stored historical payload is invalid under the current schema, regardless
+  // of its persisted sandbox load status.
   PolicyStatus status = 3;
-  // Error message if status is FAILED.
+  // Sandbox load error, or the schema-validation diagnostic for an invalid
+  // historical row returned by ListSandboxPolicies.
   string load_error = 4;
   // Milliseconds since epoch when this revision was created.
   int64 created_at_ms = 5;
@@ -1347,6 +2296,8 @@ message SandboxPolicyRevision {
   int64 loaded_at_ms = 6;
   // The full policy (only populated when explicitly requested).
   openshell.sandbox.v1.SandboxPolicy policy = 7;
+  // Immutable provenance supplied with this policy revision.
+  map<string, string> provenance = 8;
 }
 
 // Policy load status.
@@ -1357,6 +2308,8 @@ enum PolicyStatus {
   // Sandbox successfully applied this policy version.
   POLICY_STATUS_LOADED = 2;
   // Sandbox attempted to apply but failed; LKG policy remains active.
+  // ListSandboxPolicies also uses FAILED for historical payloads that are
+  // invalid under the current schema; load_error contains the diagnostic.
   POLICY_STATUS_FAILED = 3;
   // A newer version was persisted before the sandbox loaded this one.
   POLICY_STATUS_SUPERSEDED = 4;
@@ -1378,6 +2331,8 @@ message GetSandboxLogsRequest {
   repeated string sources = 4;
   // Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
   string min_level = 5;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 6;
 }
 
 // Batch of log lines pushed from sandbox to server.
@@ -1451,6 +2406,26 @@ message SupervisorHeartbeat {}
 
 // Gateway heartbeat.
 message GatewayHeartbeat {}
+
+// Terminal result reported before the supervisor shuts down. A successful RPC
+// response confirms that the result was durably handled by the gateway.
+message ReportMainProcessExitRequest {
+  string sandbox_id = 1;
+  string instance_id = 2;
+  // Normalized process result. Signal exits use 128 + signal number.
+  int32 exit_code = 3;
+}
+
+message ReportMainProcessExitResponse {}
+
+// Terminal-delivery completion reported after all expected foreground SSH
+// attachments close. A successful response permits ephemeral cleanup.
+message FinalizeMainProcessExitRequest {
+  string sandbox_id = 1;
+  string instance_id = 2;
+}
+
+message FinalizeMainProcessExitResponse {}
 
 // Gateway requests the supervisor to open a relay channel.
 //
@@ -1645,6 +2620,20 @@ message PolicyChunk {
   // back to the in-sandbox agent so it can revise the proposal.
   // Empty for non-rejected chunks.
   string rejection_reason = 18;
+  // Gateway-side merge/application preflight failure. Kept separate from
+  // prover output and operator rejection so clients can explain why a
+  // prover-clean proposal is not currently applicable.
+  string application_error = 19;
+  // Opaque digest binding review to the exact live inputs and complete
+  // effective candidate evaluated by the gateway.
+  string review_token = 20;
+  // Deterministic hashes for compact candidate display and diagnostics.
+  string current_effective_policy_hash = 21;
+  string candidate_effective_policy_hash = 22;
+  // Complete effective policies used for review. These contain policy
+  // configuration only; credential secret values are never materialized.
+  openshell.sandbox.v1.SandboxPolicy current_effective_policy = 23;
+  openshell.sandbox.v1.SandboxPolicy candidate_effective_policy = 24;
 }
 
 // Notification that the draft policy was updated.
@@ -1677,6 +2666,8 @@ message SubmitPolicyAnalysisRequest {
   string name = 4;
   // Anonymous network activity counters.
   repeated NetworkActivitySummary network_activity_summaries = 5;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 6;
 }
 
 message SubmitPolicyAnalysisResponse {
@@ -1698,6 +2689,8 @@ message GetDraftPolicyRequest {
   string name = 1;
   // Optional status filter: "pending", "approved", "rejected", or "" for all.
   string status_filter = 2;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 3;
 }
 
 message GetDraftPolicyResponse {
@@ -1717,6 +2710,11 @@ message ApproveDraftChunkRequest {
   string name = 1;
   // Chunk ID to approve.
   string chunk_id = 2;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 3;
+  // Token returned with the reviewed PolicyChunk. Approval fails with
+  // FAILED_PRECONDITION if live decision inputs no longer match it.
+  string review_token = 4;
 }
 
 message ApproveDraftChunkResponse {
@@ -1734,16 +2732,28 @@ message RejectDraftChunkRequest {
   string chunk_id = 2;
   // Optional reason for rejection (fed to LLM context in future analysis).
   string reason = 3;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 4;
 }
 
 message RejectDraftChunkResponse {}
 
 // Approve all pending chunks.
+message DraftChunkApproval {
+  string chunk_id = 1;
+  string review_token = 2;
+}
+
 message ApproveAllDraftChunksRequest {
   // Sandbox name.
   string name = 1;
   // Include chunks with security_notes (default false: skips them).
   bool include_security_flagged = 2;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 3;
+  // Exact reviewed chunks and tokens. The server validates them against one
+  // live snapshot, stages compatible operations in order, and writes once.
+  repeated DraftChunkApproval approvals = 4;
 }
 
 message ApproveAllDraftChunksResponse {
@@ -1753,7 +2763,8 @@ message ApproveAllDraftChunksResponse {
   string policy_hash = 2;
   // Number of chunks approved.
   uint32 chunks_approved = 3;
-  // Number of chunks skipped (security-flagged).
+  // Number of chunks skipped for any reason, including security flags,
+  // stale or invalid candidates, and conflicts within the staged batch.
   uint32 chunks_skipped = 4;
 }
 
@@ -1765,6 +2776,8 @@ message EditDraftChunkRequest {
   string chunk_id = 2;
   // The modified rule (replaces existing proposed_rule).
   openshell.sandbox.v1.NetworkPolicyRule proposed_rule = 3;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 4;
 }
 
 message EditDraftChunkResponse {}
@@ -1775,6 +2788,8 @@ message UndoDraftChunkRequest {
   string name = 1;
   // Chunk ID to undo.
   string chunk_id = 2;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 3;
 }
 
 message UndoDraftChunkResponse {
@@ -1788,6 +2803,8 @@ message UndoDraftChunkResponse {
 message ClearDraftChunksRequest {
   // Sandbox name.
   string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
 }
 
 message ClearDraftChunksResponse {
@@ -1799,6 +2816,8 @@ message ClearDraftChunksResponse {
 message GetDraftHistoryRequest {
   // Sandbox name.
   string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
 }
 
 message DraftHistoryEntry {
@@ -1828,6 +2847,8 @@ message PolicyRevisionPayload {
   string load_error = 3;
   // When the policy version was reported as loaded (ms since epoch). 0 if unset.
   int64 loaded_at_ms = 4;
+  // Immutable provenance supplied when this revision was created.
+  map<string, string> provenance = 5;
 }
 
 // Stored payload for a draft policy chunk row in the generic objects table.
@@ -1858,6 +2879,12 @@ message DraftChunkPayload {
   // Operator-supplied free-form rejection text; empty for non-rejected
   // chunks. Mirrors PolicyChunk.rejection_reason.
   string rejection_reason = 12;
+  string application_error = 13;
+  string review_token = 14;
+  string current_effective_policy_hash = 15;
+  string candidate_effective_policy_hash = 16;
+  openshell.sandbox.v1.SandboxPolicy current_effective_policy = 17;
+  openshell.sandbox.v1.SandboxPolicy candidate_effective_policy = 18;
 }
 
 // Internal stored policy revision row materialized from the generic objects table.
@@ -1871,6 +2898,7 @@ message StoredPolicyRevision {
   optional string load_error = 7;
   int64 created_at_ms = 8;
   optional int64 loaded_at_ms = 9;
+  map<string, string> provenance = 10;
 }
 
 // Internal stored draft chunk row materialized from the generic objects table.
@@ -1896,4 +2924,148 @@ message StoredDraftChunk {
   string validation_result = 18;
   // Operator-supplied free-form rejection text. See PolicyChunk.
   string rejection_reason = 19;
+  string application_error = 20;
+  string review_token = 21;
+  string current_effective_policy_hash = 22;
+  string candidate_effective_policy_hash = 23;
+  openshell.sandbox.v1.SandboxPolicy current_effective_policy = 24;
+  openshell.sandbox.v1.SandboxPolicy candidate_effective_policy = 25;
+}
+
+// ---------------------------------------------------------------------------
+// Workspace messages
+// ---------------------------------------------------------------------------
+
+// Create workspace request.
+message CreateWorkspaceRequest {
+  // Workspace name. Must be a valid DNS-1123 label.
+  string name = 1;
+  // Optional labels for the workspace (key-value metadata).
+  map<string, string> labels = 2;
+}
+
+// Create workspace response.
+message CreateWorkspaceResponse {
+  openshell.datamodel.v1.Workspace workspace = 1;
+}
+
+// Get workspace request.
+message GetWorkspaceRequest {
+  // Workspace name (canonical lookup key).
+  string name = 1;
+}
+
+// Get workspace response.
+message GetWorkspaceResponse {
+  openshell.datamodel.v1.Workspace workspace = 1;
+}
+
+// List workspaces request.
+message ListWorkspacesRequest {
+  uint32 limit = 1;
+  uint32 offset = 2;
+  // Optional label selector for filtering (format: "key1=value1,key2=value2").
+  string label_selector = 3;
+}
+
+// List workspaces response.
+message ListWorkspacesResponse {
+  repeated openshell.datamodel.v1.Workspace workspaces = 1;
+}
+
+// Delete workspace request.
+message DeleteWorkspaceRequest {
+  // Workspace name (canonical lookup key).
+  string name = 1;
+}
+
+// Delete workspace response.
+message DeleteWorkspaceResponse {
+  bool deleted = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Workspace membership messages
+// ---------------------------------------------------------------------------
+
+// Workspace-scoped role for members.
+enum WorkspaceRole {
+  WORKSPACE_ROLE_UNSPECIFIED = 0;
+  WORKSPACE_ROLE_USER = 1;
+  WORKSPACE_ROLE_ADMIN = 2;
+}
+
+// Stable recovery action for the most recent provider credential refresh
+// failure. Kept after the pre-existing enums so adding it does not renumber
+// their generated descriptors. Clients should use this field instead of
+// parsing last_error.
+enum ProviderCredentialRefreshRecoveryAction {
+  PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_UNSPECIFIED = 0;
+  PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_RETRY = 1;
+  PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_REAUTHORIZE = 2;
+  PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_FIX_CONFIGURATION = 3;
+  PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_INVESTIGATE = 4;
+}
+
+// Workspace membership record.
+message WorkspaceMember {
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  // OIDC subject claim identifying the principal.
+  string principal_subject = 2;
+  // Role assigned to the principal within the workspace.
+  WorkspaceRole role = 3;
+}
+
+// Add workspace member request.
+message AddWorkspaceMemberRequest {
+  // Workspace name.
+  string workspace = 1;
+  // OIDC subject claim identifying the principal.
+  string principal_subject = 2;
+  // Role to assign.
+  WorkspaceRole role = 3;
+}
+
+// Add workspace member response.
+message AddWorkspaceMemberResponse {
+  WorkspaceMember member = 1;
+}
+
+// Remove workspace member request.
+message RemoveWorkspaceMemberRequest {
+  // Workspace name.
+  string workspace = 1;
+  // OIDC subject claim identifying the principal to remove.
+  string principal_subject = 2;
+}
+
+// Remove workspace member response.
+message RemoveWorkspaceMemberResponse {
+  bool removed = 1;
+}
+
+// List workspace members request.
+message ListWorkspaceMembersRequest {
+  // Workspace name.
+  string workspace = 1;
+  uint32 limit = 2;
+  uint32 offset = 3;
+}
+
+// List workspace members response.
+message ListWorkspaceMembersResponse {
+  repeated WorkspaceMember members = 1;
+}
+
+// Short-lived credential for one policy-authorized extension service.
+// Kept at the end of the file so adding it does not renumber existing
+// generated message descriptors.
+message ExtensionServiceCredential {
+  // Operator registration name used to correlate the credential with the
+  // stable service registration delivered by GetSandboxConfig.
+  string service_name = 1;
+  // Gateway-minted JWT with an audience derived from the registration.
+  string token = 2 [(openshell.options.v1.secret) = true];
+  // Absolute expiry of the token, milliseconds since the epoch.
+  int64 expires_at_ms = 3;
 }

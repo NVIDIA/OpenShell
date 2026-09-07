@@ -6,18 +6,36 @@ syntax = "proto3";
 package openshell.compute.v1;
 
 import "google/protobuf/struct.proto";
+import "options.proto";
+import "sandbox.proto";
 
-// Internal compute-driver contract used by the gateway.
+// Gateway/compute-driver extension contract.
 //
 // Conventions:
 // - This file owns driver-native request, response, and observation types.
 // - Compute drivers must not import or return the public `openshell.v1.Sandbox`
 //   resource model.
-// - The gateway translates between these internal driver-native messages and
+// - The gateway translates between these driver-native messages and
 //   the public OpenShell API resource model.
+// - Capability fields are additive. Drivers and gateways must ignore unknown
+//   fields so independently versioned external drivers remain
+//   forward-compatible.
 service ComputeDriver {
   // Report driver capabilities and defaults.
   rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
+
+  // Authenticate a driver-native bootstrap credential and return the stable
+  // sandbox identity it represents. The gateway remains responsible for
+  // checking that the sandbox exists and minting gateway credentials.
+  rpc AuthenticateSandbox(AuthenticateSandboxRequest)
+      returns (AuthenticateSandboxResponse);
+
+  // Report additional gateway listeners required by this driver instance.
+  //
+  // A requirement is not authorization to expose the gateway. The gateway
+  // owns validation, authorization, and the authoritative bind.
+  rpc GetGatewayListenerRequirements(GetGatewayListenerRequirementsRequest)
+      returns (GetGatewayListenerRequirementsResponse);
 
   // Validate a sandbox before create-time provisioning.
   rpc ValidateSandboxCreate(ValidateSandboxCreateRequest)
@@ -32,14 +50,24 @@ service ComputeDriver {
   // Provision platform resources for a sandbox.
   rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
 
-  // Stop platform resources for a sandbox without deleting its record.
+  // Idempotently stop platform resources without deleting persistent state.
   rpc StopSandbox(StopSandboxRequest) returns (StopSandboxResponse);
+
+  // Idempotently start platform resources for a stopped sandbox.
+  rpc StartSandbox(StartSandboxRequest) returns (StartSandboxResponse);
 
   // Tear down platform resources for a sandbox.
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
 
   // Stream sandbox observations from the platform.
   rpc WatchSandboxes(WatchSandboxesRequest) returns (stream WatchSandboxesEvent);
+
+  // Ensure platform resources for a workspace exist (e.g. namespace).
+  // Idempotent: succeeds if resources already exist.
+  rpc EnsureWorkspace(EnsureWorkspaceRequest) returns (EnsureWorkspaceResponse);
+
+  // Tear down platform resources for a workspace.
+  rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
 }
 
 message GetCapabilitiesRequest {}
@@ -54,6 +82,51 @@ message GetCapabilitiesResponse {
   string driver_version = 2;
   // Default sandbox image recommended by the driver.
   string default_image = 3;
+  // Whether the gateway should stop running sandbox compute during graceful
+  // shutdown and restart the retained running intent on startup.
+  bool gateway_manages_lifecycle = 6;
+  // Whether AuthenticateSandbox is implemented by this driver.
+  bool supports_sandbox_authentication = 7;
+  // Whether the driver reports runtime readiness itself. When false, the
+  // gateway waits for the standard OpenShell supervisor session in addition
+  // to the driver's platform-ready observation.
+  bool driver_reports_runtime_readiness = 8;
+}
+
+message AuthenticateSandboxRequest {
+  // Opaque credential whose format and verification are owned by the driver.
+  string credential = 1 [(openshell.options.v1.secret) = true];
+}
+
+message AuthenticateSandboxResponse {
+  // Stable gateway-assigned sandbox ID authenticated by the driver.
+  string sandbox_id = 1;
+}
+
+message GetGatewayListenerRequirementsRequest {}
+
+message GatewayListenerRequirement {
+  // Untrusted human-readable driver rationale for diagnostics.
+  string reason = 1;
+
+  oneof selector {
+    // Concrete IP:port address requested by the driver. The port must match
+    // the gateway's configured primary listener port.
+    string exact_bind_address = 2;
+    // Ask the gateway to bind the IPv4 address selected by its default route.
+    // This matches rootless pasta's default upstream-interface selection.
+    GatewayDefaultRouteInterfaceRequirement default_route_interface = 3;
+    // Ask the gateway to ensure an IPv4 loopback listener is present. This
+    // covers runtimes whose host forwarder terminates on gateway loopback.
+    GatewayLoopbackInterfaceRequirement loopback_interface = 4;
+  }
+}
+
+message GatewayDefaultRouteInterfaceRequirement {}
+message GatewayLoopbackInterfaceRequirement {}
+
+message GetGatewayListenerRequirementsResponse {
+  repeated GatewayListenerRequirement requirements = 1;
 }
 
 // Driver-owned sandbox model used for create requests and platform observations.
@@ -73,6 +146,9 @@ message DriverSandbox {
   DriverSandboxSpec spec = 4;
   // Raw platform-observed status.
   DriverSandboxStatus status = 5;
+  // Workspace the sandbox belongs to. Used by drivers to construct
+  // collision-safe resource names and labels in shared-namespace mode.
+  string workspace = 6;
 }
 
 // Driver-owned provisioning inputs required to create a sandbox.
@@ -83,6 +159,10 @@ message DriverSandboxSpec {
   map<string, string> environment = 5;
   // Runtime template consumed by the driver during provisioning.
   DriverSandboxTemplate template = 6;
+  // Canonical effective policy supplied to the driver for validation and
+  // provisioning. Drivers that enforce policy outside the standard supervisor
+  // use GetSandboxConfig to fetch later revisions.
+  openshell.sandbox.v1.SandboxPolicy policy = 7;
   // Portable resource requirements used by the gateway for driver selection
   // and by drivers for provisioning.
   ResourceRequirements resource_requirements = 9;
@@ -94,7 +174,14 @@ message DriverSandboxSpec {
   // the Kubernetes driver ignores this field and relies on its projected
   // ServiceAccount token bootstrap instead). Never echoed to the public
   // Sandbox proto.
-  string sandbox_token = 11;
+  string sandbox_token = 11 [(openshell.options.v1.secret) = true];
+  // Exact canonical command forwarded to the supervisor without shell parsing.
+  repeated string command = 12;
+  // Allocate a retained pseudo-terminal for the canonical process.
+  bool tty = 13;
+  // One-shot launch hint forwarded by the gateway when the creating client
+  // will attach to the canonical main process.
+  bool await_main_process_attachment = 14;
 }
 
 message ResourceRequirements {
@@ -136,6 +223,10 @@ message DriverSandboxTemplate {
   // This is the inner block selected from public SandboxTemplate.driver_config.
   // The selected driver owns nested schema validation.
   google.protobuf.Struct driver_config = 12;
+  // Enable Linux user namespace isolation for the sandbox workload. Drivers
+  // map this portable intent to their compute platform; when unset, the
+  // driver's configured default applies.
+  optional bool user_namespaces = 13;
 }
 
 // Typed compute-resource requirements.
@@ -249,6 +340,15 @@ message StopSandboxRequest {
 
 message StopSandboxResponse {}
 
+message StartSandboxRequest {
+  // Stable sandbox ID stored by the gateway.
+  string sandbox_id = 1;
+  // Compute-runtime name used by the driver.
+  string sandbox_name = 2;
+}
+
+message StartSandboxResponse {}
+
 message DeleteSandboxRequest {
   // Stable sandbox ID stored by the gateway.
   string sandbox_id = 1;
@@ -290,3 +390,17 @@ message WatchSandboxesEvent {
     WatchSandboxesPlatformEvent platform_event = 3;
   }
 }
+
+message EnsureWorkspaceRequest {
+  // Workspace identifier used by the gateway.
+  string workspace = 1;
+}
+
+message EnsureWorkspaceResponse {}
+
+message DeleteWorkspaceRequest {
+  // Workspace identifier used by the gateway.
+  string workspace = 1;
+}
+
+message DeleteWorkspaceResponse {}

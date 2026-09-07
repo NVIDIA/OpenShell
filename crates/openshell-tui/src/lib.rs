@@ -8,6 +8,7 @@ pub mod theme;
 mod ui;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -20,12 +21,13 @@ use crossterm::terminal::{
 use miette::{IntoDiagnostic, Result};
 use openshell_bootstrap::list_gateways_with_source;
 use openshell_core::auth::EdgeAuthInterceptor;
-use openshell_core::metadata::{ObjectId, ObjectLabels, ObjectName};
+use openshell_core::metadata::{ObjectId, ObjectLabels, ObjectName, ObjectWorkspace};
 use openshell_core::proto::SandboxPhase;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
+use tonic::Code;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 use app::{App, Focus, GatewayEntry, LogLine, Screen};
@@ -33,6 +35,10 @@ use event::{Event, EventHandler};
 
 /// Duration to show the splash screen before auto-dismissing.
 const SPLASH_DURATION: Duration = Duration::from_secs(3);
+const PROVIDER_PROFILE_SCOPE_WORKSPACE: &str = "workspace";
+const PROVIDER_PROFILE_PAGE_SIZE: u32 = 100;
+
+type ProviderProfileCache = HashMap<(String, String), openshell_core::proto::ProviderProfile>;
 
 // Re-export for use by the CLI crate.
 pub use theme::ThemeMode;
@@ -47,6 +53,7 @@ pub async fn run(
     interceptor: EdgeAuthInterceptor,
     gateway_name: &str,
     endpoint: &str,
+    workspace: &str,
     theme_mode: ThemeMode,
 ) -> Result<()> {
     // Detect theme *before* entering raw/alternate-screen mode.
@@ -59,6 +66,7 @@ pub async fn run(
         client,
         gateway_name.to_string(),
         endpoint.to_string(),
+        workspace.to_string(),
         detected_theme,
     );
 
@@ -142,8 +150,7 @@ pub async fn run(
                 }
                 if app.pending_shell_connect {
                     app.pending_shell_connect = false;
-                    handle_shell_connect(&mut app, &mut terminal, &events).await;
-                    refresh_data(&mut app).await;
+                    handle_shell_connect(&mut app, &mut terminal, &mut events).await?;
                 }
                 // --- Draft actions ---
                 if app.pending_draft_approve {
@@ -158,6 +165,11 @@ pub async fn run(
                     app.pending_draft_approve_all = false;
                     let snapshot = std::mem::take(&mut app.approve_all_confirm_chunks);
                     spawn_draft_approve_all(&app, snapshot, events.sender());
+                }
+                if app.pending_workspace_refresh {
+                    app.pending_workspace_refresh = false;
+                    refresh_providers(&mut app).await;
+                    refresh_sandboxes(&mut app).await;
                 }
             }
             Some(Event::LogLines(lines)) => {
@@ -235,7 +247,7 @@ pub async fn run(
                     app.apply_global_settings(settings, revision);
                 }
                 Err(msg) => {
-                    tracing::warn!("failed to fetch global settings: {msg}");
+                    app.status_text = format!("failed to fetch global settings: {msg}");
                 }
             },
             Some(Event::GlobalSettingSetResult(result)) => {
@@ -284,6 +296,9 @@ pub async fn run(
                     }
                 }
                 fetch_sandbox_detail(&mut app).await;
+            }
+            Some(Event::ForwardWarnings(warnings)) => {
+                app.status_text = format!("port forward issues: {}", warnings.join("; "));
             }
             Some(Event::Mouse(mouse)) => match mouse.kind {
                 MouseEventKind::ScrollUp if app.focus == Focus::SandboxLogs => {
@@ -341,7 +356,7 @@ pub async fn run(
                             h.abort();
                         }
                         match result {
-                            Some(Ok(name)) => {
+                            Some(Ok((name, create_workspace))) => {
                                 app.create_form = None;
                                 let ports = std::mem::take(&mut app.pending_forward_ports);
                                 let command = std::mem::take(&mut app.pending_exec_command);
@@ -363,11 +378,12 @@ pub async fn run(
                                     handle_exec_command(
                                         &mut app,
                                         &mut terminal,
-                                        &events,
+                                        &mut events,
                                         &name,
                                         &command,
+                                        &create_workspace,
                                     )
-                                    .await;
+                                    .await?;
                                 }
                             }
                             Some(Err(msg)) => {
@@ -485,7 +501,6 @@ async fn handle_gateway_switch(app: &mut App) {
             app.gateway_name = name;
             app.endpoint = endpoint;
             app.reset_sandbox_state();
-            // Immediately refresh data for the new gateway.
             refresh_data(app).await;
         }
         Err(e) => {
@@ -623,6 +638,7 @@ fn spawn_log_stream(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
     };
 
     let mut client = app.client.clone();
+    let workspace = app.selected_sandbox_workspace();
 
     let handle = tokio::spawn(async move {
         // Phase 1: Fetch initial history via unary RPC.
@@ -632,6 +648,7 @@ fn spawn_log_stream(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             since_ms: 0,
             sources: vec![],
             min_level: String::new(),
+            workspace,
         };
 
         match tokio::time::timeout(Duration::from_secs(5), client.get_sandbox_logs(req)).await {
@@ -722,13 +739,20 @@ async fn handle_sandbox_delete(app: &mut App) {
     };
 
     // Stop any active port forwards before deleting (mirrors CLI behavior).
-    if let Ok(stopped) = openshell_core::forward::stop_forwards_for_sandbox(&sandbox_name) {
-        for port in &stopped {
-            tracing::info!("stopped forward of port {port} for sandbox {sandbox_name}");
-        }
+    if let Ok(stopped) = openshell_core::forward::stop_forwards_for_sandbox(&sandbox_name)
+        && !stopped.is_empty()
+    {
+        let ports: Vec<String> = stopped.iter().map(ToString::to_string).collect();
+        app.status_text = format!(
+            "stopped port forwards [{}] for sandbox {sandbox_name}",
+            ports.join(", ")
+        );
     }
 
-    let req = openshell_core::proto::DeleteSandboxRequest { name: sandbox_name };
+    let req = openshell_core::proto::DeleteSandboxRequest {
+        name: sandbox_name,
+        workspace: app.selected_sandbox_workspace(),
+    };
     match app.client.delete_sandbox(req).await {
         Ok(_) => {
             app.cancel_log_stream();
@@ -760,6 +784,7 @@ async fn fetch_sandbox_detail(app: &mut App) {
 
     let req = openshell_core::proto::GetSandboxRequest {
         name: sandbox_name.clone(),
+        workspace: app.selected_sandbox_workspace(),
     };
 
     // Step 1: Fetch sandbox metadata (providers, sandbox ID).
@@ -777,11 +802,11 @@ async fn fetch_sandbox_detail(app: &mut App) {
                 }
             }
             Ok(Err(e)) => {
-                tracing::warn!("failed to fetch sandbox detail: {}", e.message());
+                app.status_text = format!("failed to fetch sandbox detail: {}", e.message());
                 None
             }
             Err(_) => {
-                tracing::warn!("sandbox detail request timed out");
+                app.status_text = "sandbox detail request timed out".to_string();
                 None
             }
         };
@@ -812,10 +837,10 @@ async fn fetch_sandbox_detail(app: &mut App) {
                 app.apply_sandbox_settings(inner.settings);
             }
             Ok(Err(e)) => {
-                tracing::warn!("failed to fetch sandbox policy: {}", e.message());
+                app.status_text = format!("failed to fetch sandbox policy: {}", e.message());
             }
             Err(_) => {
-                tracing::warn!("sandbox policy request timed out");
+                app.status_text = "sandbox policy request timed out".to_string();
             }
         }
     }
@@ -834,17 +859,18 @@ async fn fetch_sandbox_detail(app: &mut App) {
 async fn handle_shell_connect(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    events: &EventHandler,
-) {
+    events: &mut EventHandler,
+) -> Result<()> {
     let sandbox_name = match app.selected_sandbox_name() {
         Some(n) => n.to_string(),
-        None => return,
+        None => return Ok(()),
     };
 
     // Step 1: Get sandbox ID.
     let sandbox_id = {
         let req = openshell_core::proto::GetSandboxRequest {
             name: sandbox_name.clone(),
+            workspace: app.selected_sandbox_workspace(),
         };
         match tokio::time::timeout(Duration::from_secs(5), app.client.get_sandbox(req)).await {
             Ok(Ok(resp)) => {
@@ -852,16 +878,16 @@ async fn handle_shell_connect(
                     s.object_id().to_string()
                 } else {
                     app.status_text = "sandbox not found".to_string();
-                    return;
+                    return Ok(());
                 }
             }
             Ok(Err(e)) => {
                 app.status_text = format!("failed to get sandbox: {}", e.message());
-                return;
+                return Ok(());
             }
             Err(_) => {
                 app.status_text = "get sandbox timed out".to_string();
-                return;
+                return Ok(());
             }
         }
     };
@@ -876,17 +902,17 @@ async fn handle_shell_connect(
             Ok(Ok(resp)) => resp.into_inner(),
             Ok(Err(e)) => {
                 app.status_text = format!("SSH session failed: {}", e.message());
-                return;
+                return Ok(());
             }
             Err(_) => {
                 app.status_text = "SSH session request timed out".to_string();
-                return;
+                return Ok(());
             }
         }
     };
     if let Err(err) = validate_ssh_session_response(&session) {
         app.status_text = format!("gateway returned invalid SSH session response: {err}");
-        return;
+        return Ok(());
     }
 
     // Step 3: Resolve gateway address (handle loopback override).
@@ -901,7 +927,7 @@ async fn handle_shell_connect(
         Ok(p) => p,
         Err(e) => {
             app.status_text = format!("failed to find executable: {e}");
-            return;
+            return Ok(());
         }
     };
     let proxy_command = build_proxy_command(
@@ -941,12 +967,13 @@ async fn handle_shell_connect(
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Step 7: Suspend TUI — leave alternate screen, disable raw mode.
-    let _ = execute!(
+    execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture
-    );
-    let _ = disable_raw_mode();
+    )
+    .into_diagnostic()?;
+    disable_raw_mode().into_diagnostic()?;
 
     // Step 8: Spawn SSH as child process and wait.
     let status = tokio::task::spawn_blocking(move || command.status()).await;
@@ -965,15 +992,22 @@ async fn handle_shell_connect(
         }
     }
 
-    // Step 9: Resume TUI — re-enter alternate screen, enable raw mode, unpause events.
-    let _ = enable_raw_mode();
-    let _ = execute!(
+    // Step 9: Resume and draw the TUI before accepting new terminal input.
+    enable_raw_mode().into_diagnostic()?;
+    execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
         EnableMouseCapture
-    );
-    let _ = terminal.clear();
+    )
+    .into_diagnostic()?;
+    terminal.clear().into_diagnostic()?;
+    terminal
+        .draw(|frame| ui::draw(frame, app))
+        .into_diagnostic()?;
+    events.discard_pending();
     events.resume();
+
+    Ok(())
 }
 
 /// Suspend the TUI, execute a command on a sandbox via SSH, then resume.
@@ -984,14 +1018,16 @@ async fn handle_shell_connect(
 async fn handle_exec_command(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    events: &EventHandler,
+    events: &mut EventHandler,
     sandbox_name: &str,
     command: &str,
-) {
+    workspace: &str,
+) -> Result<()> {
     // Step 1: Resolve sandbox → SSH session (same as handle_shell_connect).
     let sandbox_id = {
         let req = openshell_core::proto::GetSandboxRequest {
             name: sandbox_name.to_string(),
+            workspace: workspace.to_string(),
         };
         match tokio::time::timeout(Duration::from_secs(5), app.client.get_sandbox(req)).await {
             Ok(Ok(resp)) => {
@@ -999,16 +1035,16 @@ async fn handle_exec_command(
                     s.object_id().to_string()
                 } else {
                     app.status_text = format!("exec: sandbox {sandbox_name} not found");
-                    return;
+                    return Ok(());
                 }
             }
             Ok(Err(e)) => {
                 app.status_text = format!("exec: failed to get sandbox: {}", e.message());
-                return;
+                return Ok(());
             }
             Err(_) => {
                 app.status_text = "exec: get sandbox timed out".to_string();
-                return;
+                return Ok(());
             }
         }
     };
@@ -1022,17 +1058,17 @@ async fn handle_exec_command(
             Ok(Ok(resp)) => resp.into_inner(),
             Ok(Err(e)) => {
                 app.status_text = format!("exec: SSH session failed: {}", e.message());
-                return;
+                return Ok(());
             }
             Err(_) => {
                 app.status_text = "exec: SSH session timed out".to_string();
-                return;
+                return Ok(());
             }
         }
     };
     if let Err(err) = validate_ssh_session_response(&session) {
         app.status_text = format!("exec: gateway returned invalid SSH session response: {err}");
-        return;
+        return Ok(());
     }
 
     // Step 2: Resolve gateway and build ProxyCommand (same as handle_shell_connect).
@@ -1046,7 +1082,7 @@ async fn handle_exec_command(
         Ok(p) => p,
         Err(e) => {
             app.status_text = format!("exec: failed to find executable: {e}");
-            return;
+            return Ok(());
         }
     };
     let proxy_command = build_proxy_command(
@@ -1092,12 +1128,13 @@ async fn handle_exec_command(
     events.pause();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let _ = execute!(
+    execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture
-    );
-    let _ = disable_raw_mode();
+    )
+    .into_diagnostic()?;
+    disable_raw_mode().into_diagnostic()?;
 
     // Step 5: Run command — blocks until user Ctrl-C's or command exits.
     let status = tokio::task::spawn_blocking(move || ssh.status()).await;
@@ -1117,14 +1154,18 @@ async fn handle_exec_command(
     }
 
     // Step 6: Resume TUI.
-    let _ = enable_raw_mode();
-    let _ = execute!(
+    enable_raw_mode().into_diagnostic()?;
+    execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
         EnableMouseCapture
-    );
-    let _ = terminal.clear();
+    )
+    .into_diagnostic()?;
+    terminal.clear().into_diagnostic()?;
+    events.discard_pending();
     events.resume();
+
+    Ok(())
 }
 
 // SSH utility functions are shared via openshell_core::forward.
@@ -1328,6 +1369,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
     let endpoint = app.endpoint.clone();
     let gateway_name = app.gateway_name.clone();
     let need_ready = !ports.is_empty() || !app.pending_exec_command.is_empty();
+    let workspace = app.current_workspace.clone();
 
     tokio::spawn(async move {
         let has_custom_image = !image.is_empty();
@@ -1360,6 +1402,10 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                 ..Default::default()
             }),
             labels: HashMap::new(),
+            annotations: HashMap::new(),
+            workspace: workspace.clone(),
+            await_main_process_attachment: false,
+            workload_template_name: String::new(),
         };
 
         let sandbox_name =
@@ -1400,6 +1446,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
 
                 let req = openshell_core::proto::GetSandboxRequest {
                     name: sandbox_name.clone(),
+                    workspace: workspace.clone(),
                 };
                 // Retry on transient errors.
                 if let Ok(resp) = client.get_sandbox(req).await
@@ -1419,7 +1466,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
 
             // Start port forwards if requested.
             if !ports.is_empty() {
-                start_port_forwards(
+                let forward_warnings = start_port_forwards(
                     &mut client,
                     &endpoint,
                     &gateway_name,
@@ -1428,10 +1475,13 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                     &ports,
                 )
                 .await;
+                if !forward_warnings.is_empty() {
+                    let _ = tx.send(Event::ForwardWarnings(forward_warnings));
+                }
             }
         }
 
-        let _ = tx.send(Event::CreateResult(Ok(sandbox_name)));
+        let _ = tx.send(Event::CreateResult(Ok((sandbox_name, workspace))));
     });
 }
 
@@ -1448,7 +1498,9 @@ async fn start_port_forwards(
     sandbox_name: &str,
     sandbox_id: &str,
     specs: &[openshell_core::forward::ForwardSpec],
-) {
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+
     // Create SSH session.
     let session = {
         let req = openshell_core::proto::CreateSshSessionRequest {
@@ -1457,18 +1509,20 @@ async fn start_port_forwards(
         match tokio::time::timeout(Duration::from_secs(10), client.create_ssh_session(req)).await {
             Ok(Ok(resp)) => resp.into_inner(),
             Ok(Err(e)) => {
-                tracing::warn!("SSH session failed for forwards: {}", e.message());
-                return;
+                warnings.push(format!("SSH session failed for forwards: {}", e.message()));
+                return warnings;
             }
             Err(_) => {
-                tracing::warn!("SSH session timed out for forwards");
-                return;
+                warnings.push("SSH session timed out for forwards".to_string());
+                return warnings;
             }
         }
     };
     if let Err(err) = validate_ssh_session_response(&session) {
-        tracing::warn!("gateway returned invalid SSH session response for forwards: {err}");
-        return;
+        warnings.push(format!(
+            "gateway returned invalid SSH session response for forwards: {err}"
+        ));
+        return warnings;
     }
 
     // Resolve gateway address.
@@ -1482,8 +1536,8 @@ async fn start_port_forwards(
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!("failed to find executable for forwards: {e}");
-            return;
+            warnings.push(format!("failed to find executable for forwards: {e}"));
+            return warnings;
         }
     };
     let proxy_command = build_proxy_command(
@@ -1563,16 +1617,18 @@ async fn start_port_forwards(
                 }
             }
             Ok(Ok(false)) => {
-                tracing::warn!("SSH forward exited with error for port {port_val}");
+                warnings.push(format!("SSH forward exited with error for port {port_val}"));
             }
             Ok(Err(e)) => {
-                tracing::warn!("forward failed for port {port_val}: {e}");
+                warnings.push(format!("forward failed for port {port_val}: {e}"));
             }
             Err(e) => {
-                tracing::warn!("forward task panicked for port {port_val}: {e}");
+                warnings.push(format!("forward task panicked for port {port_val}: {e}"));
             }
         }
     }
+
+    warnings
 }
 
 // ---------------------------------------------------------------------------
@@ -1597,6 +1653,12 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
         form.name.clone()
     };
     let credentials = form.discovered_credentials.clone().unwrap_or_default();
+    let workspace = app.current_workspace.clone();
+    let config: HashMap<String, String> = form
+        .config
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
     tokio::spawn(async move {
         // Try with the chosen name, retry with suffix on collision.
@@ -1615,12 +1677,18 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                         created_at_ms: 0,
                         labels: HashMap::new(),
                         resource_version: 0,
+                        annotations: HashMap::new(),
+                        workspace: workspace.clone(),
+                        deletion_timestamp_ms: 0,
                     }),
                     r#type: ptype.clone(),
                     credentials: credentials.clone(),
-                    config: HashMap::default(),
+                    config: config.clone(),
                     credential_expires_at_ms: HashMap::default(),
+                    profile_workspace: workspace.clone(),
+                    credential_handles: HashMap::default(),
                 }),
+                workspace: workspace.clone(),
             };
 
             match client.create_provider(req).await {
@@ -1636,7 +1704,7 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                     let _ = tx.send(Event::ProviderCreateResult(Ok(final_name)));
                     return;
                 }
-                Err(status) if status.code() == tonic::Code::AlreadyExists => {
+                Err(status) if status.code() == Code::AlreadyExists => {
                     // Retry with a different name.
                 }
                 Err(e) => {
@@ -1658,9 +1726,10 @@ fn spawn_get_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
         Some(n) => n.to_string(),
         None => return,
     };
+    let workspace = app.selected_provider_workspace();
 
     tokio::spawn(async move {
-        let req = openshell_core::proto::GetProviderRequest { name };
+        let req = openshell_core::proto::GetProviderRequest { name, workspace };
         match tokio::time::timeout(Duration::from_secs(5), client.get_provider(req)).await {
             Ok(Ok(resp)) => {
                 if let Some(provider) = resp.into_inner().provider {
@@ -1694,10 +1763,25 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let ptype = form.provider_type.clone();
     let cred_key = form.credential_key.clone();
     let new_value = form.new_value.clone();
+    let workspace = app.selected_provider_workspace();
+    let mut config: HashMap<String, String> = form
+        .config
+        .iter()
+        .filter(|(k, v)| form.original_config.get(*k) != Some(*v))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    form.original_config
+        .keys()
+        .filter(|k| !form.config.contains_key(*k))
+        .for_each(|key| {
+            config.insert(key.clone(), String::new());
+        });
 
     tokio::spawn(async move {
         let mut credentials = HashMap::new();
-        credentials.insert(cred_key, new_value);
+        if !new_value.is_empty() {
+            credentials.insert(cred_key, new_value);
+        }
 
         let req = openshell_core::proto::UpdateProviderRequest {
             provider: Some(openshell_core::proto::Provider {
@@ -1707,13 +1791,19 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: workspace.clone(),
+                    deletion_timestamp_ms: 0,
                 }),
                 r#type: ptype,
                 credentials,
-                config: HashMap::default(),
+                config,
                 credential_expires_at_ms: HashMap::default(),
+                profile_workspace: String::new(),
+                credential_handles: HashMap::default(),
             }),
             credential_expires_at_ms: HashMap::default(),
+            workspace,
         };
 
         match tokio::time::timeout(Duration::from_secs(5), client.update_provider(req)).await {
@@ -1739,9 +1829,10 @@ fn spawn_delete_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
         Some(n) => n.to_string(),
         None => return,
     };
+    let workspace = app.selected_provider_workspace();
 
     tokio::spawn(async move {
-        let req = openshell_core::proto::DeleteProviderRequest { name };
+        let req = openshell_core::proto::DeleteProviderRequest { name, workspace };
         match tokio::time::timeout(Duration::from_secs(5), client.delete_provider(req)).await {
             Ok(Ok(resp)) => {
                 let _ = tx.send(Event::ProviderDeleteResult(Ok(resp.into_inner().deleted)));
@@ -1770,17 +1861,23 @@ fn spawn_draft_approve(app: &App, tx: mpsc::UnboundedSender<Event>) {
         None => return,
     };
     let abs = app.draft_scroll + app.draft_selected;
-    let chunk_id = match app.draft_chunks.get(abs) {
-        Some(c) => c.id.clone(),
+    let (chunk_id, review_token) = match app.draft_chunks.get(abs) {
+        Some(c) => (c.id.clone(), c.review_token.clone()),
         None => return,
     };
     let rule_name = app
         .draft_chunks
         .get(abs)
         .map_or_else(String::new, |c| c.rule_name.clone());
+    let workspace = app.selected_sandbox_workspace();
 
     tokio::spawn(async move {
-        let req = openshell_core::proto::ApproveDraftChunkRequest { name, chunk_id };
+        let req = openshell_core::proto::ApproveDraftChunkRequest {
+            name,
+            chunk_id,
+            workspace,
+            review_token,
+        };
         match tokio::time::timeout(Duration::from_secs(5), client.approve_draft_chunk(req)).await {
             Ok(Ok(resp)) => {
                 let inner = resp.into_inner();
@@ -1817,12 +1914,14 @@ fn spawn_draft_reject(app: &App, tx: mpsc::UnboundedSender<Event>) {
         .draft_chunks
         .get(abs)
         .map_or_else(String::new, |c| c.rule_name.clone());
+    let workspace = app.selected_sandbox_workspace();
 
     tokio::spawn(async move {
         let req = openshell_core::proto::RejectDraftChunkRequest {
             name,
             chunk_id,
             reason: String::new(),
+            workspace,
         };
         match tokio::time::timeout(Duration::from_secs(5), client.reject_draft_chunk(req)).await {
             Ok(Ok(_)) => {
@@ -1850,7 +1949,7 @@ fn spawn_draft_reject(app: &App, tx: mpsc::UnboundedSender<Event>) {
 /// modal count display but is not iterated for per-chunk approval.
 fn spawn_draft_approve_all(
     app: &App,
-    _snapshot: Vec<openshell_core::proto::PolicyChunk>,
+    snapshot: Vec<openshell_core::proto::PolicyChunk>,
     tx: mpsc::UnboundedSender<Event>,
 ) {
     let mut client = app.client.clone();
@@ -1858,11 +1957,21 @@ fn spawn_draft_approve_all(
         Some(n) => n.to_string(),
         None => return,
     };
+    let workspace = app.selected_sandbox_workspace();
 
     tokio::spawn(async move {
+        let approvals = snapshot
+            .into_iter()
+            .map(|chunk| openshell_core::proto::DraftChunkApproval {
+                chunk_id: chunk.id,
+                review_token: chunk.review_token,
+            })
+            .collect();
         let req = openshell_core::proto::ApproveAllDraftChunksRequest {
             name,
             include_security_flagged: false,
+            workspace,
+            approvals,
         };
         match tokio::time::timeout(
             Duration::from_secs(30),
@@ -1872,17 +1981,7 @@ fn spawn_draft_approve_all(
         {
             Ok(Ok(resp)) => {
                 let inner = resp.into_inner();
-                let msg = if inner.chunks_skipped > 0 {
-                    format!(
-                        "Approved {} chunks, skipped {} security-flagged -> policy v{}",
-                        inner.chunks_approved, inner.chunks_skipped, inner.policy_version
-                    )
-                } else {
-                    format!(
-                        "Approved {} chunks -> policy v{}",
-                        inner.chunks_approved, inner.policy_version
-                    )
-                };
+                let msg = format_draft_approve_all_result(&inner);
                 let _ = tx.send(Event::DraftActionResult(Ok(msg)));
             }
             Ok(Err(e)) => {
@@ -1897,6 +1996,22 @@ fn spawn_draft_approve_all(
     });
 }
 
+fn format_draft_approve_all_result(
+    result: &openshell_core::proto::ApproveAllDraftChunksResponse,
+) -> String {
+    if result.chunks_skipped > 0 {
+        format!(
+            "Approved {} chunks, skipped {}; review remaining pending chunks -> policy v{}",
+            result.chunks_approved, result.chunks_skipped, result.policy_version
+        )
+    } else {
+        format!(
+            "Approved {} chunks -> policy v{}",
+            result.chunks_approved, result.policy_version
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Data refresh
 // ---------------------------------------------------------------------------
@@ -1904,129 +2019,262 @@ fn spawn_draft_approve_all(
 async fn refresh_data(app: &mut App) {
     refresh_health(app).await;
     refresh_global_settings(app).await;
+    refresh_workspaces(app).await;
     refresh_providers(app).await;
     refresh_sandboxes(app).await;
 }
 
-async fn refresh_providers(app: &mut App) {
-    let profiles = if app.providers_v2_enabled {
-        let req = openshell_core::proto::ListProviderProfilesRequest {
-            limit: 100,
-            offset: 0,
-        };
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            app.client.list_provider_profiles(req),
-        )
-        .await
-        {
-            Ok(Ok(resp)) => resp
-                .into_inner()
-                .profiles
-                .into_iter()
-                .map(|profile| (profile.id.clone(), profile))
-                .collect::<HashMap<_, _>>(),
-            Ok(Err(e)) => {
-                tracing::warn!("failed to list provider profiles: {}", e.message());
-                HashMap::new()
-            }
-            Err(_) => {
-                tracing::warn!("list provider profiles timed out");
-                HashMap::new()
-            }
-        }
-    } else {
-        HashMap::new()
-    };
-
-    let req = openshell_core::proto::ListProvidersRequest {
+async fn refresh_workspaces(app: &mut App) {
+    let req = openshell_core::proto::ListWorkspacesRequest {
         limit: 100,
         offset: 0,
+        label_selector: String::new(),
     };
-    let result = tokio::time::timeout(Duration::from_secs(5), app.client.list_providers(req)).await;
-    match result {
+    match tokio::time::timeout(Duration::from_secs(5), app.client.list_workspaces(req)).await {
+        Ok(Ok(resp)) => {
+            app.workspace_names = resp
+                .into_inner()
+                .workspaces
+                .into_iter()
+                .filter_map(|w| w.metadata.map(|m| m.name))
+                .collect();
+        }
         Ok(Err(e)) => {
-            tracing::warn!("failed to list providers: {}", e.message());
+            app.status_text = format!("failed to list workspaces: {}", e.message());
         }
         Err(_) => {
-            tracing::warn!("list providers timed out");
-        }
-        Ok(Ok(resp)) => {
-            let providers = resp.into_inner().providers;
-            app.provider_count = providers.len();
-            app.provider_entries = if app.providers_v2_enabled {
-                providers
-                    .iter()
-                    .cloned()
-                    .map(|provider| app::ProviderV2Entry {
-                        profile: profiles.get(&provider.r#type).cloned(),
-                        provider,
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            app.provider_names = providers
-                .iter()
-                .map(|p| app::provider_name(p).to_string())
-                .collect();
-            app.provider_types = providers.iter().map(|p| p.r#type.clone()).collect();
-            app.provider_cred_keys = providers
-                .iter()
-                .map(|p| {
-                    p.credentials
-                        .keys()
-                        .next()
-                        .cloned()
-                        .unwrap_or_else(|| "-".to_string())
-                })
-                .collect();
-            if app.provider_selected >= app.provider_count && app.provider_count > 0 {
-                app.provider_selected = app.provider_count - 1;
-            }
+            app.status_text = "list workspaces timed out".to_string();
         }
     }
 }
 
+fn provider_profile_query_workspace(provider: &openshell_core::proto::Provider) -> &str {
+    if provider.profile_workspace.is_empty() {
+        provider.object_workspace()
+    } else {
+        &provider.profile_workspace
+    }
+}
+
+fn provider_profile_cache_workspace<'a>(
+    query_workspace: &'a str,
+    profile: &openshell_core::proto::ProviderProfile,
+) -> &'a str {
+    if profile.scope == PROVIDER_PROFILE_SCOPE_WORKSPACE {
+        query_workspace
+    } else {
+        ""
+    }
+}
+
+fn cache_provider_profile(
+    profiles: &mut ProviderProfileCache,
+    query_workspace: &str,
+    profile: openshell_core::proto::ProviderProfile,
+) {
+    let profile_workspace = provider_profile_cache_workspace(query_workspace, &profile).to_string();
+    profiles.insert((profile_workspace, profile.id.clone()), profile);
+}
+
+fn cached_provider_profile(
+    profiles: &ProviderProfileCache,
+    provider: &openshell_core::proto::Provider,
+) -> Option<openshell_core::proto::ProviderProfile> {
+    let profile_id = provider.r#type.clone();
+    profiles
+        .get(&(
+            provider_profile_query_workspace(provider).to_string(),
+            profile_id.clone(),
+        ))
+        .or_else(|| profiles.get(&(String::new(), profile_id)))
+        .cloned()
+}
+
+async fn refresh_providers(app: &mut App) {
+    let req = openshell_core::proto::ListProvidersRequest {
+        limit: 100,
+        offset: 0,
+        workspace: if app.all_workspaces {
+            String::new()
+        } else {
+            app.current_workspace.clone()
+        },
+        all_workspaces: app.all_workspaces,
+    };
+    let response =
+        match tokio::time::timeout(Duration::from_secs(5), app.client.list_providers(req)).await {
+            Ok(Ok(resp)) => resp.into_inner(),
+            Ok(Err(e)) => {
+                app.status_text = format!("failed to list providers: {}", e.message());
+                return;
+            }
+            Err(_) => {
+                app.status_text = "list providers timed out".to_string();
+                return;
+            }
+        };
+    let providers = response.providers;
+
+    let mut workspaces: std::collections::HashSet<String> = providers
+        .iter()
+        .map(|provider| provider_profile_query_workspace(provider).to_string())
+        // Legacy provider records can decode without an object workspace. Do not
+        // turn that missing context into a platform-scoped profile request.
+        .filter(|workspace| !workspace.is_empty())
+        .collect();
+    if !app.all_workspaces {
+        workspaces.insert(app.current_workspace.clone());
+    }
+    let mut profiles = HashMap::new();
+    app.provider_profiles.clear();
+    for ws in &workspaces {
+        let client = app.client.clone();
+        let workspace = ws.clone();
+        if let Some(listed) = collect_provider_profile_pages(move |offset| {
+            let mut client = client.clone();
+            let workspace = workspace.clone();
+            async move {
+                let req = openshell_core::proto::ListProviderProfilesRequest {
+                    limit: PROVIDER_PROFILE_PAGE_SIZE,
+                    offset,
+                    workspace,
+                };
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client.list_provider_profiles(req),
+                )
+                .await
+                {
+                    Ok(Ok(response)) => Some(response.into_inner().profiles),
+                    _ => None,
+                }
+            }
+        })
+        .await
+        {
+            if !app.all_workspaces && ws == &app.current_workspace {
+                app.provider_profiles.clone_from(&listed);
+            }
+            for profile in listed {
+                cache_provider_profile(&mut profiles, ws, profile);
+            }
+        }
+    }
+    app.sync_create_provider_types();
+
+    app.provider_count = providers.len();
+    app.provider_entries = providers
+        .iter()
+        .cloned()
+        .map(|provider| app::ProviderListEntry {
+            profile: cached_provider_profile(&profiles, &provider),
+            provider,
+        })
+        .collect();
+    app.provider_names = providers
+        .iter()
+        .map(|p| app::provider_name(p).to_string())
+        .collect();
+    app.provider_types = providers.iter().map(|p| p.r#type.clone()).collect();
+    app.provider_cred_keys = providers
+        .iter()
+        .map(|p| {
+            p.credentials
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "-".to_string())
+        })
+        .collect();
+    app.provider_workspaces = providers
+        .iter()
+        .map(|p| p.object_workspace().to_string())
+        .collect();
+    if app.provider_selected >= app.provider_count && app.provider_count > 0 {
+        app.provider_selected = app.provider_count - 1;
+    }
+}
+
+async fn collect_provider_profile_pages<F, Fut>(
+    mut fetch_page: F,
+) -> Option<Vec<openshell_core::proto::ProviderProfile>>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = Option<Vec<openshell_core::proto::ProviderProfile>>>,
+{
+    let mut profiles = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = fetch_page(offset).await?;
+        let page_len = page.len();
+        profiles.extend(page);
+        if page_len < PROVIDER_PROFILE_PAGE_SIZE as usize {
+            return Some(profiles);
+        }
+        offset = offset.saturating_add(PROVIDER_PROFILE_PAGE_SIZE);
+    }
+}
+
 async fn refresh_global_settings(app: &mut App) {
-    let req = openshell_core::proto::GetGatewayConfigRequest {};
-    let result =
-        tokio::time::timeout(Duration::from_secs(5), app.client.get_gateway_config(req)).await;
-    match result {
-        Ok(Err(e)) => {
-            tracing::warn!("failed to fetch global settings: {}", e.message());
-        }
-        Err(_) => {
-            tracing::warn!("get gateway settings timed out");
-        }
-        Ok(Ok(resp)) => {
-            let inner = resp.into_inner();
-            app.apply_global_settings(inner.settings, inner.settings_revision);
+    if !app.global_settings_access_denied {
+        let req = openshell_core::proto::GetGatewayConfigRequest {};
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), app.client.get_gateway_config(req)).await;
+        match result {
+            Ok(Err(status)) if status.code() == Code::PermissionDenied => {
+                app.deny_global_settings_access();
+            }
+            Ok(Err(status)) => {
+                app.status_text = format!("failed to fetch global settings: {}", status.message());
+            }
+            Err(_) => {
+                app.status_text = "get gateway settings timed out".to_string();
+            }
+            Ok(Ok(resp)) => {
+                let inner = resp.into_inner();
+                app.apply_global_settings(inner.settings, inner.settings_revision);
+            }
         }
     }
 
-    // Check for active global policy.
+    if app.global_policy_access_denied {
+        return;
+    }
+
+    // Check for an active global policy only while the caller can read it.
     let policy_req = openshell_core::proto::ListSandboxPoliciesRequest {
         name: String::new(),
         limit: 1,
         offset: 0,
         global: true,
+        workspace: String::new(),
     };
-    if let Ok(Ok(resp)) = tokio::time::timeout(
+    match tokio::time::timeout(
         Duration::from_secs(5),
         app.client.list_sandbox_policies(policy_req),
     )
     .await
     {
-        let revisions = resp.into_inner().revisions;
-        if let Some(latest) = revisions.first() {
-            let status =
-                openshell_core::proto::PolicyStatus::try_from(latest.status).unwrap_or_default();
-            app.global_policy_active = status == openshell_core::proto::PolicyStatus::Loaded;
-            app.global_policy_version = latest.version;
-        } else {
-            app.global_policy_active = false;
-            app.global_policy_version = 0;
+        Ok(Err(status)) if status.code() == Code::PermissionDenied => {
+            app.deny_global_policy_access();
+        }
+        Ok(Err(status)) => {
+            app.status_text = format!("failed to fetch global policy: {}", status.message());
+        }
+        Err(_) => {
+            app.status_text = "list global policies timed out".to_string();
+        }
+        Ok(Ok(resp)) => {
+            let revisions = resp.into_inner().revisions;
+            if let Some(latest) = revisions.first() {
+                let status = openshell_core::proto::PolicyStatus::try_from(latest.status)
+                    .unwrap_or_default();
+                app.global_policy_active = status == openshell_core::proto::PolicyStatus::Loaded;
+                app.global_policy_version = latest.version;
+            } else {
+                app.global_policy_active = false;
+                app.global_policy_version = 0;
+            }
         }
     }
 }
@@ -2076,13 +2324,11 @@ fn spawn_set_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
         let req = UpdateConfigRequest {
             name: String::new(),
-            policy: None,
             setting_key: key,
             setting_value: Some(SettingValue { value: Some(value) }),
-            delete_setting: false,
             global: true,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            workspace: String::new(),
+            ..Default::default()
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2112,13 +2358,11 @@ fn spawn_delete_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
         let req = UpdateConfigRequest {
             name: String::new(),
-            policy: None,
             setting_key: key,
-            setting_value: None,
             delete_setting: true,
             global: true,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            workspace: String::new(),
+            ..Default::default()
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2150,6 +2394,7 @@ fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let raw = edit.input.trim().to_string();
     let kind = entry.kind;
     let mut client = app.client.clone();
+    let workspace = app.selected_sandbox_workspace();
 
     tokio::spawn(async move {
         use openshell_core::proto::{SettingValue, UpdateConfigRequest, setting_value};
@@ -2182,13 +2427,10 @@ fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
         let req = UpdateConfigRequest {
             name,
-            policy: None,
             setting_key: key,
             setting_value: Some(SettingValue { value: Some(value) }),
-            delete_setting: false,
-            global: false,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            workspace,
+            ..Default::default()
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2216,19 +2458,17 @@ fn spawn_delete_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let name = sandbox_name.to_string();
     let key = entry.key.clone();
     let mut client = app.client.clone();
+    let workspace = app.selected_sandbox_workspace();
 
     tokio::spawn(async move {
         use openshell_core::proto::UpdateConfigRequest;
 
         let req = UpdateConfigRequest {
             name,
-            policy: None,
             setting_key: key,
-            setting_value: None,
             delete_setting: true,
-            global: false,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            workspace,
+            ..Default::default()
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2271,14 +2511,20 @@ async fn refresh_sandboxes(app: &mut App) {
         limit: 100,
         offset: 0,
         label_selector: String::new(),
+        workspace: if app.all_workspaces {
+            String::new()
+        } else {
+            app.current_workspace.clone()
+        },
+        all_workspaces: app.all_workspaces,
     };
     let result = tokio::time::timeout(Duration::from_secs(5), app.client.list_sandboxes(req)).await;
     match result {
         Ok(Err(e)) => {
-            tracing::warn!("failed to list sandboxes: {}", e.message());
+            app.status_text = format!("failed to list sandboxes: {}", e.message());
         }
         Err(_) => {
-            tracing::warn!("list sandboxes timed out");
+            app.status_text = "list sandboxes timed out".to_string();
         }
         Ok(Ok(resp)) => {
             let sandboxes = resp.into_inner().sandboxes;
@@ -2347,6 +2593,21 @@ async fn refresh_sandboxes(app: &mut App) {
                 })
                 .collect();
 
+            app.sandbox_annotations = sandboxes
+                .iter()
+                .map(|s| {
+                    s.metadata
+                        .as_ref()
+                        .map(|metadata| app::format_annotations(&metadata.annotations))
+                        .unwrap_or_default()
+                })
+                .collect();
+
+            app.sandbox_workspaces = sandboxes
+                .iter()
+                .map(|s| s.object_workspace().to_string())
+                .collect();
+
             if app.sandbox_selected >= app.sandbox_count && app.sandbox_count > 0 {
                 app.sandbox_selected = app.sandbox_count - 1;
             }
@@ -2387,10 +2648,10 @@ async fn refresh_sandbox_policy(app: &mut App) {
             app.apply_sandbox_settings(inner.settings);
         }
         Ok(Err(e)) => {
-            tracing::warn!("failed to refresh sandbox policy: {}", e.message());
+            app.status_text = format!("failed to refresh sandbox policy: {}", e.message());
         }
         Err(_) => {
-            tracing::warn!("sandbox policy refresh timed out");
+            app.status_text = "sandbox policy refresh timed out".to_string();
         }
     }
 }
@@ -2404,22 +2665,17 @@ async fn refresh_draft_chunks(app: &mut App) {
     let req = openshell_core::proto::GetDraftPolicyRequest {
         name: sandbox_name,
         status_filter: String::new(),
+        workspace: app.selected_sandbox_workspace(),
     };
 
-    match tokio::time::timeout(Duration::from_secs(5), app.client.get_draft_policy(req)).await {
-        Ok(Ok(resp)) => {
-            let inner = resp.into_inner();
-            app.draft_chunks = inner.chunks;
-            app.draft_version = inner.draft_version;
-            if app.draft_selected >= app.draft_chunks.len() && !app.draft_chunks.is_empty() {
-                app.draft_selected = app.draft_chunks.len() - 1;
-            }
-        }
-        Ok(Err(e)) => {
-            tracing::debug!("draft chunks refresh: {}", e.message());
-        }
-        Err(_) => {
-            tracing::debug!("draft chunks refresh timed out");
+    if let Ok(Ok(resp)) =
+        tokio::time::timeout(Duration::from_secs(5), app.client.get_draft_policy(req)).await
+    {
+        let inner = resp.into_inner();
+        app.draft_chunks = inner.chunks;
+        app.draft_version = inner.draft_version;
+        if app.draft_selected >= app.draft_chunks.len() && !app.draft_chunks.is_empty() {
+            app.draft_selected = app.draft_chunks.len() - 1;
         }
     }
 }
@@ -2430,11 +2686,17 @@ async fn refresh_draft_chunks(app: &mut App) {
 /// badges without entering the sandbox detail view.
 async fn refresh_sandbox_draft_counts(app: &mut App) {
     let names: Vec<String> = app.sandbox_names.clone();
+    let workspaces: Vec<String> = app.sandbox_workspaces.clone();
     let mut counts = vec![0usize; names.len()];
     for (i, name) in names.iter().enumerate() {
+        let ws = workspaces
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| app.current_workspace.clone());
         let req = openshell_core::proto::GetDraftPolicyRequest {
             name: name.clone(),
             status_filter: "pending".to_string(),
+            workspace: ws,
         };
         if let Ok(Ok(resp)) =
             tokio::time::timeout(Duration::from_secs(2), app.client.get_draft_policy(req)).await
@@ -2451,6 +2713,10 @@ fn phase_label(phase: i32) -> String {
         x if x == SandboxPhase::Ready as i32 => "Ready",
         x if x == SandboxPhase::Error as i32 => "Error",
         x if x == SandboxPhase::Deleting as i32 => "Deleting",
+        x if x == SandboxPhase::Stopping as i32 => "Stopping",
+        x if x == SandboxPhase::Stopped as i32 => "Stopped",
+        x if x == SandboxPhase::Starting as i32 => "Starting",
+        x if x == SandboxPhase::Completed as i32 => "Completed",
         _ => "Unknown",
     }
     .to_string()
@@ -2477,6 +2743,42 @@ fn format_age(epoch_ms: i64) -> String {
         format!("{}h {}m", diff / 3600, (diff % 3600) / 60)
     } else {
         format!("{}d {}h", diff / 86400, (diff % 86400) / 3600)
+    }
+}
+
+#[cfg(test)]
+mod draft_approve_all_message_tests {
+    use super::*;
+
+    #[test]
+    fn skipped_chunks_are_not_assumed_to_be_security_flagged() {
+        let message = format_draft_approve_all_result(
+            &openshell_core::proto::ApproveAllDraftChunksResponse {
+                policy_version: 7,
+                chunks_approved: 2,
+                chunks_skipped: 1,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            message,
+            "Approved 2 chunks, skipped 1; review remaining pending chunks -> policy v7"
+        );
+        assert!(!message.contains("security-flagged"));
+    }
+}
+
+#[cfg(test)]
+mod phase_label_tests {
+    use super::*;
+
+    #[test]
+    fn phase_label_covers_stop_and_start_lifecycle() {
+        assert_eq!(phase_label(SandboxPhase::Stopping as i32), "Stopping");
+        assert_eq!(phase_label(SandboxPhase::Stopped as i32), "Stopped");
+        assert_eq!(phase_label(SandboxPhase::Starting as i32), "Starting");
+        assert_eq!(phase_label(SandboxPhase::Completed as i32), "Completed");
     }
 }
 
@@ -2509,4 +2811,110 @@ fn days_to_ymd(days: i64) -> (i64, i64, i64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+#[cfg(test)]
+mod provider_profile_workspace_tests {
+    use super::*;
+    use openshell_core::proto::datamodel::v1::ObjectMeta;
+    use openshell_core::proto::{Provider, ProviderProfile};
+
+    #[test]
+    fn platform_profile_queries_through_provider_workspace() {
+        let provider = Provider {
+            metadata: Some(ObjectMeta {
+                workspace: "team-a".to_string(),
+                ..ObjectMeta::default()
+            }),
+            profile_workspace: String::new(),
+            ..Provider::default()
+        };
+
+        assert_eq!(provider_profile_query_workspace(&provider), "team-a");
+    }
+
+    #[test]
+    fn cached_profile_round_trip_covers_static_platform_and_workspace_scopes() {
+        let cases = [
+            ("", "", "static profile with platform provider scope"),
+            ("team-a", "", "static profile with workspace provider scope"),
+            ("", "platform", "platform profile"),
+            ("team-a", "workspace", "workspace profile"),
+            (
+                "",
+                "workspace",
+                "legacy provider with empty profile_workspace and workspace-scoped profile",
+            ),
+        ];
+
+        for (provider_workspace, response_scope, label) in cases {
+            let provider = Provider {
+                metadata: Some(ObjectMeta {
+                    workspace: "team-a".to_string(),
+                    ..ObjectMeta::default()
+                }),
+                r#type: "claude-code".to_string(),
+                profile_workspace: provider_workspace.to_string(),
+                ..Provider::default()
+            };
+            let profile = ProviderProfile {
+                id: "claude-code".to_string(),
+                scope: response_scope.to_string(),
+                ..ProviderProfile::default()
+            };
+            let mut profiles = ProviderProfileCache::new();
+
+            cache_provider_profile(&mut profiles, "team-a", profile);
+
+            assert!(
+                cached_provider_profile(&profiles, &provider).is_some(),
+                "{label} did not survive cache insertion and lookup"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod provider_profile_pagination_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn profile_fetch_continues_until_page_two_is_collected() {
+        let requested_offsets = Arc::new(Mutex::new(Vec::new()));
+        let offsets = Arc::clone(&requested_offsets);
+
+        let profiles = collect_provider_profile_pages(move |offset| {
+            let offsets = Arc::clone(&offsets);
+            async move {
+                offsets.lock().unwrap().push(offset);
+                match offset {
+                    0 => Some(
+                        (0..PROVIDER_PROFILE_PAGE_SIZE)
+                            .map(|index| openshell_core::proto::ProviderProfile {
+                                id: format!("profile-{index}"),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    ),
+                    PROVIDER_PROFILE_PAGE_SIZE => {
+                        Some(vec![openshell_core::proto::ProviderProfile {
+                            id: "page-two-profile".to_string(),
+                            ..Default::default()
+                        }])
+                    }
+                    _ => panic!("unexpected profile page offset {offset}"),
+                }
+            }
+        })
+        .await
+        .expect("all pages should load");
+
+        assert_eq!(
+            *requested_offsets.lock().unwrap(),
+            vec![0, PROVIDER_PROFILE_PAGE_SIZE]
+        );
+        assert_eq!(profiles.len(), PROVIDER_PROFILE_PAGE_SIZE as usize + 1);
+        assert_eq!(profiles.last().unwrap().id, "page-two-profile");
+    }
 }

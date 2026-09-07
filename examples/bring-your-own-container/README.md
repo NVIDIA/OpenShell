@@ -59,16 +59,16 @@ key requirements are:
 - **Pass your start command explicitly** — use `-- <command>` on the CLI.
   The image's `CMD` / `ENTRYPOINT` is replaced by the sandbox supervisor
   at runtime.
-- **Create a `sandbox` user** (uid/gid 1000660000) for non-root execution.
-  Use a high UID (1000000000+) to avoid conflicts with host users when running
-  without user namespace remapping.
-- **Make your application workdir writable by `sandbox`**. This example creates
-  `/sandbox` with `sandbox:sandbox` ownership before copying `app.py`.
+- **Declare a non-root OCI `USER`** for Docker and Podman. Use a named account
+  such as `app`, a numeric UID with a passwd entry that supplies its primary
+  GID, or a numeric pair such as `1500:1500`. You can instead set both
+  `process.run_as_user` and `process.run_as_group` explicitly in policy.
+- **Prepare `/sandbox` as the workspace.** Until OCI working-directory support
+  is added, create `/sandbox` and make it writable by the selected identity.
+  The example does this with `install -d -o app -g app /sandbox`.
 - **Install `iproute2`** for full network namespace isolation.
 - **Use a standard Linux base image** — distroless and `FROM scratch`
   images are not supported.
-
-TODO(#70): Remove the sandbox user note once custom images are secure by default without requiring manual setup.
 
 ## How it works
 

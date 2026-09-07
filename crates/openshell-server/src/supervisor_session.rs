@@ -3,19 +3,22 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use openshell_core::proto::{
-    GatewayMessage, RelayFrame, RelayInit, RelayOpen, Sandbox, SessionAccepted, SshRelayTarget,
+    GatewayMessage, RelayFrame, RelayInit, RelayOpen, ReportMainProcessExitRequest,
+    ReportMainProcessExitResponse, Sandbox, SandboxPhase, SessionAccepted, SshRelayTarget,
     SupervisorMessage, gateway_message, relay_open, supervisor_message,
 };
+use openshell_core::transport_errors::is_expected_transport_close_status;
 
 use crate::ServerState;
 use crate::auth::principal::Principal;
@@ -55,6 +58,9 @@ struct LiveSession {
     /// the old session's `tx` just before supersede could still enqueue a
     /// `RelayOpen` onto the stale stream and sit until the relay timeout.
     shutdown: oneshot::Sender<()>,
+    /// Set after the supervisor confirms that every expected foreground
+    /// attachment has closed and terminal output delivery is complete.
+    terminal_delivery_finalized: bool,
     #[allow(dead_code)]
     connected_at: Instant,
 }
@@ -62,12 +68,6 @@ struct LiveSession {
 /// Holds a oneshot sender that will deliver the upgraded relay stream or a
 /// target-open failure reported by the supervisor.
 type RelayStreamSender = oneshot::Sender<Result<tokio::io::DuplexStream, Status>>;
-
-impl openshell_driver_docker::SupervisorReadiness for SupervisorSessionRegistry {
-    fn is_supervisor_connected(&self, sandbox_id: &str) -> bool {
-        Self::is_connected(self, sandbox_id)
-    }
-}
 
 /// Registry of active supervisor sessions and pending relay channels.
 #[derive(Default)]
@@ -83,6 +83,12 @@ struct PendingRelay {
     sandbox_id: String,
     relay_open: RelayOpen,
     created_at: Instant,
+}
+
+#[derive(Debug)]
+pub struct ClaimedRelay {
+    pub stream: tokio::io::DuplexStream,
+    pub sandbox_id: String,
 }
 
 impl std::fmt::Debug for SupervisorSessionRegistry {
@@ -122,6 +128,7 @@ impl SupervisorSessionRegistry {
                 session_id,
                 tx,
                 shutdown,
+                terminal_delivery_finalized: false,
                 connected_at: Instant::now(),
             },
         );
@@ -135,17 +142,23 @@ impl SupervisorSessionRegistry {
         }
     }
 
-    /// Report whether a live supervisor session is registered for a sandbox.
-    ///
-    /// Used by compute drivers that need to surface "supervisor relay ready"
-    /// through the Ready condition without polling the sandbox runtime.
-    pub fn is_connected(&self, sandbox_id: &str) -> bool {
-        self.sessions.lock().unwrap().contains_key(sandbox_id)
-    }
-
     /// Remove the session for a sandbox.
     fn remove(&self, sandbox_id: &str) {
         self.sessions.lock().unwrap().remove(sandbox_id);
+    }
+
+    /// Disconnect the current supervisor session for a sandbox.
+    ///
+    /// Lifecycle stop uses this to ensure a later start must establish
+    /// a fresh session before the sandbox can return to Ready.
+    pub fn disconnect(&self, sandbox_id: &str) -> bool {
+        let session = self.sessions.lock().unwrap().remove(sandbox_id);
+        if let Some(session) = session {
+            let _ = session.shutdown.send(());
+            true
+        } else {
+            false
+        }
     }
 
     /// Remove the session only if its `session_id` matches the one we are
@@ -154,15 +167,17 @@ impl SupervisorSessionRegistry {
     /// This guards against the supersede race: an old session's task may
     /// finish long after a new session has taken its place. The old task's
     /// cleanup must not evict the new registration.
-    fn remove_if_current(&self, sandbox_id: &str, session_id: &str) -> bool {
+    fn remove_if_current(&self, sandbox_id: &str, session_id: &str) -> Option<bool> {
         let mut sessions = self.sessions.lock().unwrap();
         let is_current = sessions
             .get(sandbox_id)
             .is_some_and(|s| s.session_id == session_id);
         if is_current {
-            sessions.remove(sandbox_id);
+            return sessions
+                .remove(sandbox_id)
+                .map(|session| session.terminal_delivery_finalized);
         }
-        is_current
+        None
     }
 
     /// Look up the sender for a supervisor session, waiting up to `timeout`
@@ -199,6 +214,31 @@ impl SupervisorSessionRegistry {
 
     pub fn has_session(&self, sandbox_id: &str) -> bool {
         self.sessions.lock().unwrap().contains_key(sandbox_id)
+    }
+
+    pub fn terminal_delivery_finalized(&self, sandbox_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .is_some_and(|session| session.terminal_delivery_finalized)
+    }
+
+    pub fn finalize_main_process_exit(&self, sandbox_id: &str) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(session) = sessions.get_mut(sandbox_id) else {
+            return false;
+        };
+        session.terminal_delivery_finalized = true;
+        true
+    }
+
+    pub fn is_current_session(&self, sandbox_id: &str, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(sandbox_id)
+            .is_some_and(|session| session.session_id == session_id)
     }
 
     fn pending_channel_ids(&self, sandbox_id: &str) -> Vec<String> {
@@ -342,7 +382,7 @@ impl SupervisorSessionRegistry {
         &self,
         channel_id: &str,
         principal: Option<&Principal>,
-    ) -> Result<tokio::io::DuplexStream, Status> {
+    ) -> Result<ClaimedRelay, Status> {
         let pending = {
             let mut map = self.pending_relays.lock().unwrap();
             let pending = map
@@ -381,7 +421,10 @@ impl SupervisorSessionRegistry {
             return Err(Status::internal("relay requester dropped"));
         }
 
-        Ok(supervisor_stream)
+        Ok(ClaimedRelay {
+            stream: supervisor_stream,
+            sandbox_id: pending.sandbox_id,
+        })
     }
 
     /// Remove all pending relays that have exceeded the timeout.
@@ -458,6 +501,10 @@ async fn require_persisted_sandbox(
 /// bytes back to the supervisor over the gRPC response stream.
 const RELAY_STREAM_CHUNK_SIZE: usize = 16 * 1024;
 
+type RelayStreamResponse = Response<
+    Pin<Box<dyn tokio_stream::Stream<Item = Result<RelayFrame, Status>> + Send + 'static>>,
+>;
+
 /// Handle a `RelayStream` RPC from a supervisor.
 ///
 /// The first inbound `RelayFrame` must carry a `RelayInit` identifying the
@@ -467,12 +514,22 @@ const RELAY_STREAM_CHUNK_SIZE: usize = 16 * 1024;
 pub async fn handle_relay_stream(
     registry: &SupervisorSessionRegistry,
     request: Request<tonic::Streaming<RelayFrame>>,
-) -> Result<
-    Response<
-        Pin<Box<dyn tokio_stream::Stream<Item = Result<RelayFrame, Status>> + Send + 'static>>,
-    >,
-    Status,
-> {
+) -> Result<RelayStreamResponse, Status> {
+    handle_relay_stream_inner(registry, None, request).await
+}
+
+pub async fn handle_relay_stream_for_state(
+    state: &Arc<ServerState>,
+    request: Request<tonic::Streaming<RelayFrame>>,
+) -> Result<RelayStreamResponse, Status> {
+    handle_relay_stream_inner(&state.supervisor_sessions, Some(Arc::clone(state)), request).await
+}
+
+async fn handle_relay_stream_inner(
+    registry: &SupervisorSessionRegistry,
+    state: Option<Arc<ServerState>>,
+    request: Request<tonic::Streaming<RelayFrame>>,
+) -> Result<RelayStreamResponse, Status> {
     let principal = request.extensions().get::<Principal>().cloned();
     let mut inbound = request.into_inner();
 
@@ -495,13 +552,17 @@ pub async fn handle_relay_stream(
     };
 
     // Claim the pending relay. Consumes the entry — it cannot be reused.
-    let supervisor_side = registry.claim_relay(&channel_id, principal.as_ref())?;
-    info!(channel_id = %channel_id, "relay stream: claimed pending relay, bridging");
+    let claimed = registry.claim_relay(&channel_id, principal.as_ref())?;
+    let sandbox_id = claimed.sandbox_id;
+    let supervisor_side = claimed.stream;
+    info!(channel_id = %channel_id, sandbox_id = %sandbox_id, "relay stream: claimed pending relay, bridging");
 
     let (mut read_half, mut write_half) = tokio::io::split(supervisor_side);
 
     // Supervisor → gateway: drain `inbound` and write to the DuplexStream.
     let channel_id_in = channel_id.clone();
+    let sandbox_id_in = sandbox_id;
+    let state_in = state.clone();
     tokio::spawn(async move {
         loop {
             match inbound.message().await {
@@ -524,7 +585,23 @@ pub async fn handle_relay_stream(
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    warn!(channel_id = %channel_id_in, error = %e, "relay stream: inbound errored");
+                    if let Some(state) = state_in.as_ref()
+                        && expected_transport_close_during_sandbox_teardown(
+                            state,
+                            &sandbox_id_in,
+                            &e,
+                        )
+                        .await
+                    {
+                        info!(
+                            sandbox_id = %sandbox_id_in,
+                            channel_id = %channel_id_in,
+                            error = %e,
+                            "relay stream: expected transport close during sandbox teardown"
+                        );
+                    } else {
+                        warn!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %e, "relay stream: inbound errored");
+                    }
                     break;
                 }
             }
@@ -564,6 +641,73 @@ pub async fn handle_relay_stream(
         Box<dyn tokio_stream::Stream<Item = Result<RelayFrame, Status>> + Send + 'static>,
     > = Box::pin(stream);
     Ok(Response::new(stream))
+}
+
+fn expected_transport_close_during_shutdown(status: &Status, terminating: bool) -> bool {
+    terminating && is_expected_transport_close_status(status)
+}
+
+fn sandbox_proto_is_terminating(sandbox: &Sandbox) -> bool {
+    SandboxPhase::try_from(sandbox.phase()).ok() == Some(SandboxPhase::Deleting)
+        || sandbox
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.deletion_timestamp_ms != 0)
+}
+
+async fn sandbox_is_terminating_or_gone(state: &Arc<ServerState>, sandbox_id: &str) -> bool {
+    match state.store.get_message::<Sandbox>(sandbox_id).await {
+        Ok(Some(sandbox)) => sandbox_proto_is_terminating(&sandbox),
+        Ok(None) => true,
+        Err(err) => {
+            debug!(
+                sandbox_id,
+                error = %err,
+                "failed to inspect sandbox state while classifying transport close"
+            );
+            false
+        }
+    }
+}
+
+async fn expected_transport_close_during_sandbox_teardown(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    status: &Status,
+) -> bool {
+    expected_transport_close_during_shutdown(
+        status,
+        sandbox_is_terminating_or_gone(state, sandbox_id).await,
+    )
+}
+
+async fn expected_transport_close_during_session_teardown(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    session_id: &str,
+    status: &Status,
+) -> bool {
+    let session_no_longer_current = !state
+        .supervisor_sessions
+        .is_current_session(sandbox_id, session_id);
+    expected_transport_close_during_session_state(
+        status,
+        state.gateway_shutting_down.load(Ordering::Acquire),
+        session_no_longer_current,
+        sandbox_is_terminating_or_gone(state, sandbox_id).await,
+    )
+}
+
+fn expected_transport_close_during_session_state(
+    status: &Status,
+    gateway_shutting_down: bool,
+    session_no_longer_current: bool,
+    sandbox_terminating_or_gone: bool,
+) -> bool {
+    expected_transport_close_during_shutdown(
+        status,
+        gateway_shutting_down || session_no_longer_current || sandbox_terminating_or_gone,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -608,7 +752,7 @@ pub async fn handle_connect_supervisor(
         "supervisor session: accepted"
     );
 
-    // Step 2: Create the outbound channel and register the session.
+    // Step 2: Create and register the outbound channel.
     let (tx, rx) = mpsc::channel::<GatewayMessage>(64);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let superseded = state.supervisor_sessions.register(
@@ -650,7 +794,7 @@ pub async fn handle_connect_supervisor(
 
     if let Err(err) = state
         .compute
-        .supervisor_session_connected(&sandbox_id)
+        .supervisor_session_connected(&sandbox_id, &hello.instance_id)
         .await
     {
         warn!(
@@ -676,17 +820,17 @@ pub async fn handle_connect_supervisor(
             shutdown_rx,
         )
         .await;
-        let still_ours = state_clone
+        let terminal_finalized = state_clone
             .supervisor_sessions
             .remove_if_current(&sandbox_id_clone, &session_id);
-        if still_ours {
+        if let Some(terminal_finalized) = terminal_finalized {
             info!(sandbox_id = %sandbox_id_clone, session_id = %session_id, "supervisor session: ended");
             state_clone
                 .telemetry
                 .sandbox_session_disconnected(&sandbox_id_clone);
             if let Err(err) = state_clone
                 .compute
-                .supervisor_session_disconnected(&sandbox_id_clone)
+                .supervisor_session_disconnected(&sandbox_id_clone, terminal_finalized)
                 .await
             {
                 warn!(
@@ -708,6 +852,62 @@ pub async fn handle_connect_supervisor(
     > = Box::pin(tokio_stream::StreamExt::map(stream, Ok));
 
     Ok(Response::new(stream))
+}
+
+pub async fn handle_report_main_process_exit(
+    state: &Arc<ServerState>,
+    request: Request<ReportMainProcessExitRequest>,
+) -> Result<Response<ReportMainProcessExitResponse>, Status> {
+    let principal = request.extensions().get::<Principal>().cloned();
+    let report = request.into_inner();
+    if report.sandbox_id.is_empty() {
+        return Err(Status::invalid_argument("sandbox_id is required"));
+    }
+    if report.instance_id.is_empty() {
+        return Err(Status::invalid_argument("instance_id is required"));
+    }
+    if let Some(principal) = principal.as_ref() {
+        crate::auth::guard::ensure_sandbox_principal_scope(principal, &report.sandbox_id)?;
+    }
+    state
+        .compute
+        .report_main_process_exit(&report.sandbox_id, &report.instance_id, report.exit_code)
+        .await
+        .map_err(Status::failed_precondition)?;
+    Ok(Response::new(ReportMainProcessExitResponse {}))
+}
+
+pub async fn handle_finalize_main_process_exit(
+    state: &Arc<ServerState>,
+    request: Request<openshell_core::proto::FinalizeMainProcessExitRequest>,
+) -> Result<Response<openshell_core::proto::FinalizeMainProcessExitResponse>, Status> {
+    let principal = request.extensions().get::<Principal>().cloned();
+    let report = request.into_inner();
+    if report.sandbox_id.is_empty() {
+        return Err(Status::invalid_argument("sandbox_id is required"));
+    }
+    if report.instance_id.is_empty() {
+        return Err(Status::invalid_argument("instance_id is required"));
+    }
+    if let Some(principal) = principal.as_ref() {
+        crate::auth::guard::ensure_sandbox_principal_scope(principal, &report.sandbox_id)?;
+    }
+    state
+        .compute
+        .finalize_main_process_exit(&report.sandbox_id, &report.instance_id)
+        .await
+        .map_err(Status::failed_precondition)?;
+    if !state
+        .supervisor_sessions
+        .finalize_main_process_exit(&report.sandbox_id)
+    {
+        return Err(Status::failed_precondition(
+            "supervisor session is not connected",
+        ));
+    }
+    Ok(Response::new(
+        openshell_core::proto::FinalizeMainProcessExitResponse {},
+    ))
 }
 
 async fn run_session_loop(
@@ -739,7 +939,23 @@ async fn run_session_loop(
                         break;
                     }
                     Err(e) => {
-                        warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %e, "supervisor session: stream error");
+                        if expected_transport_close_during_session_teardown(
+                            state,
+                            sandbox_id,
+                            session_id,
+                            &e,
+                        )
+                        .await
+                        {
+                            info!(
+                                sandbox_id = %sandbox_id,
+                                session_id = %session_id,
+                                error = %e,
+                                "supervisor session: expected transport close during teardown"
+                            );
+                        } else {
+                            warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %e, "supervisor session: stream error");
+                        }
                         break;
                     }
                 }
@@ -841,6 +1057,9 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
             }),
             ..Default::default()
         }
@@ -945,7 +1164,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         registry.register("sbx".to_string(), "s1".to_string(), tx, make_shutdown());
 
-        assert!(registry.remove_if_current("sbx", "s1"));
+        assert_eq!(registry.remove_if_current("sbx", "s1"), Some(false));
         assert!(!registry.sessions.lock().unwrap().contains_key("sbx"));
     }
 
@@ -971,7 +1190,7 @@ mod tests {
 
         // Cleanup from the old session task runs late. It must NOT evict the
         // newly registered session.
-        assert!(!registry.remove_if_current("sbx", "s-old"));
+        assert_eq!(registry.remove_if_current("sbx", "s-old"), None);
         let sessions = registry.sessions.lock().unwrap();
         assert!(
             sessions.contains_key("sbx"),
@@ -983,7 +1202,18 @@ mod tests {
     #[test]
     fn remove_if_current_unknown_sandbox_is_noop() {
         let registry = SupervisorSessionRegistry::new();
-        assert!(!registry.remove_if_current("sbx-does-not-exist", "s1"));
+        assert_eq!(registry.remove_if_current("sbx-does-not-exist", "s1"), None);
+    }
+
+    #[test]
+    fn remove_if_current_returns_terminal_finalization_state() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, _rx) = mpsc::channel(1);
+        registry.register("sbx".to_string(), "s1".to_string(), tx, make_shutdown());
+
+        assert!(registry.finalize_main_process_exit("sbx"));
+        assert!(registry.terminal_delivery_finalized("sbx"));
+        assert_eq!(registry.remove_if_current("sbx", "s1"), Some(true));
     }
 
     // ---- open_relay: happy path and wait semantics ----
@@ -1284,6 +1514,55 @@ mod tests {
             .expect("persisted sandbox should be accepted");
     }
 
+    #[test]
+    fn expected_transport_close_is_nonfatal_only_during_shutdown() {
+        let status = Status::unknown("h2 protocol error: error reading a body from connection");
+
+        assert!(expected_transport_close_during_shutdown(&status, true));
+        assert!(!expected_transport_close_during_shutdown(&status, false));
+    }
+
+    #[test]
+    fn unexpected_transport_error_stays_fatal_during_shutdown() {
+        let status = Status::internal("policy evaluation failed");
+
+        assert!(!expected_transport_close_during_shutdown(&status, true));
+    }
+
+    #[test]
+    fn gateway_shutdown_makes_session_transport_close_nonfatal() {
+        let status =
+            Status::unknown("h2 protocol error: error reading a body from connection: broken pipe");
+
+        assert!(expected_transport_close_during_session_state(
+            &status, true, false, false,
+        ));
+    }
+
+    #[test]
+    fn sandbox_proto_terminating_detects_deleting_phase() {
+        let mut sandbox = sandbox_record("sbx-1", "sandbox-one");
+        sandbox.set_phase(SandboxPhase::Deleting as i32);
+
+        assert!(sandbox_proto_is_terminating(&sandbox));
+    }
+
+    #[test]
+    fn sandbox_proto_terminating_detects_deletion_timestamp() {
+        let mut sandbox = sandbox_record("sbx-1", "sandbox-one");
+        sandbox.metadata.as_mut().unwrap().deletion_timestamp_ms = 1;
+
+        assert!(sandbox_proto_is_terminating(&sandbox));
+    }
+
+    #[test]
+    fn sandbox_proto_running_is_not_terminating() {
+        let mut sandbox = sandbox_record("sbx-1", "sandbox-one");
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+
+        assert!(!sandbox_proto_is_terminating(&sandbox));
+    }
+
     // ---- claim_relay: expiry, drop, wiring ----
 
     #[test]
@@ -1430,7 +1709,8 @@ mod tests {
 
         let mut supervisor_side = registry
             .claim_relay("ch-io", Some(&sandbox_principal("sbx-test")))
-            .expect("claim should succeed");
+            .expect("claim should succeed")
+            .stream;
         let mut gateway_side = relay_rx
             .await
             .expect("gateway side should receive result")

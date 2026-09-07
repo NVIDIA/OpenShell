@@ -282,7 +282,7 @@ fn draw_creating(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     // Header — changes once result arrives.
     let (header, header_style) = match &form.create_result {
-        Some(Ok(name)) => (format!("Created sandbox: {name}"), t.status_ok),
+        Some(Ok((name, _workspace))) => (format!("Created sandbox: {name}"), t.status_ok),
         Some(Err(msg)) => (format!("Failed: {msg}"), t.status_err),
         None => ("Creating sandbox...".to_string(), t.text),
     };

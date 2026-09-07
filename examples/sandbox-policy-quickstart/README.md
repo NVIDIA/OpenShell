@@ -22,11 +22,10 @@ while writes are blocked — all without restarting anything.
 ### 1. Create a sandbox
 
 ```bash
-openshell sandbox create --name demo --keep --no-auto-providers
+openshell sandbox create --name demo --no-auto-providers
 ```
 
-`--keep` keeps the sandbox running after you exit so you can reconnect
-later. `--no-auto-providers` skips the provider setup prompt since this
+`--no-auto-providers` skips the provider setup prompt since this
 demo doesn't use an AI agent.
 
 You'll land in an interactive shell inside the sandbox:
@@ -50,7 +49,7 @@ The sandbox proxy intercepted the HTTPS CONNECT request to
 curl: (56) Received HTTP code 403 from proxy after CONNECT
 ```
 
-Exit the sandbox (the sandbox stays alive thanks to `--keep`):
+Exit the sandbox (sandboxes are kept running by default; pass `--no-keep` at creation time to delete on exit):
 
 ```bash
 exit
@@ -82,8 +81,8 @@ cat examples/sandbox-policy-quickstart/policy.yaml
 ```yaml
 version: 1
 
-# Default sandbox filesystem and process settings.
-# These static fields are required when using `openshell policy set`
+# Default sandbox filesystem settings.
+# These filesystem fields are required when using `openshell policy set`
 # because it replaces the entire policy.
 filesystem_policy:
   include_workdir: true
@@ -91,9 +90,6 @@ filesystem_policy:
   read_write: [/sandbox, /tmp, /dev/null]
 landlock:
   compatibility: best_effort
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
 
 network_policies:
   github_api:
@@ -109,8 +105,10 @@ network_policies:
       - { path: /usr/bin/curl }
 ```
 
-The top section preserves the default sandbox filesystem and process
-settings (required because `policy set` replaces the entire policy).
+The top section preserves the default sandbox filesystem and Landlock
+settings while omitting process identity so the active compute driver can
+select it. These settings are required because `policy set` replaces the
+entire policy.
 The `network_policies` section is the interesting part: **curl may make
 GET, HEAD, and OPTIONS requests to `api.github.com` over HTTPS.
 Everything else is denied.** The proxy terminates TLS (`tls: terminate`)

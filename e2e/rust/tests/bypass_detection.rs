@@ -58,16 +58,10 @@ async fn bypass_attempt_is_rejected_fast() {
         .create_output
         .lines()
         .find(|l| l.contains("bypass_result"))
-        .unwrap_or_else(|| {
-            panic!(
-                "no bypass_result JSON in output:\n{}",
-                guard.create_output
-            )
-        });
+        .unwrap_or_else(|| panic!("no bypass_result JSON in output:\n{}", guard.create_output));
 
-    let parsed: serde_json::Value = serde_json::from_str(json_line.trim()).unwrap_or_else(|e| {
-        panic!("failed to parse JSON '{json_line}': {e}")
-    });
+    let parsed: serde_json::Value = serde_json::from_str(json_line.trim())
+        .unwrap_or_else(|e| panic!("failed to parse JSON '{json_line}': {e}"));
 
     let result = parsed["bypass_result"].as_str().unwrap();
     let elapsed_ms = parsed["elapsed_ms"].as_u64().unwrap();

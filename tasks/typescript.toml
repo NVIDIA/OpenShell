@@ -1,0 +1,111 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# TypeScript SDK tasks (sdk/typescript). Codegen runs `buf generate` (buf and
+# the connect-es plugin come from the package's own devDependencies); buf
+# self-compiles proto/, so no protoc is required.
+
+["sdk:ts:install"]
+description = "Install TypeScript SDK dependencies"
+dir = "sdk/typescript"
+run = "npm ci"
+hide = true
+
+["sdk:ts:proto"]
+description = "Generate TypeScript protobuf stubs for the SDK"
+depends = ["sdk:ts:install"]
+dir = "sdk/typescript"
+run = "npm run gen"
+
+# Lints the repo-level proto module (buf.yaml at the root) against STANDARD.
+# buf ships only in the SDK's devDependencies today, so this depends on the
+# SDK install and runs buf from there; the target is all of proto/, not just
+# the SDK's client-surface subset.
+["proto:lint"]
+description = "Lint proto/ with buf (repo-level buf.yaml)"
+depends = ["sdk:ts:install"]
+run = "./sdk/typescript/node_modules/.bin/buf lint"
+
+["sdk:ts:typecheck"]
+description = "Type-check the TypeScript SDK"
+depends = ["sdk:ts:proto"]
+dir = "sdk/typescript"
+run = "npm run typecheck"
+
+["sdk:ts:lint"]
+description = "Lint + format-check the TypeScript SDK (Biome, read-only)"
+depends = ["sdk:ts:install"]
+dir = "sdk/typescript"
+run = "npm run lint"
+
+["sdk:ts:format"]
+description = "Format the TypeScript SDK and apply safe fixes (Biome, writes)"
+depends = ["sdk:ts:install"]
+dir = "sdk/typescript"
+run = "npm run format"
+
+["sdk:ts:build"]
+description = "Build the TypeScript SDK (emit dist/)"
+depends = ["sdk:ts:proto"]
+dir = "sdk/typescript"
+run = "npm run build"
+
+["sdk:ts:test"]
+description = "Run TypeScript SDK unit tests (Vitest, in-memory transport)"
+depends = ["sdk:ts:proto"]
+dir = "sdk/typescript"
+run = "npm test"
+
+["sdk:ts:ci"]
+description = "TypeScript SDK checks (proto lint, Biome lint, codegen, typecheck, test, build)"
+depends = [
+  "proto:lint",
+  "sdk:ts:lint",
+  "sdk:ts:typecheck",
+  "sdk:ts:test",
+  "sdk:ts:build",
+]
+hide = true
+
+# Publish to the registry in package.json publishConfig. Set OPENSHELL_NPM_VERSION
+# to stamp the version from the release tag (release.py get-version --npm); the
+# package.json placeholder 0.0.0 is restored afterward, mirroring the Cargo
+# version stamping in tasks/python.toml. Auth is expected via a .npmrc the caller
+# writes (CI) or the user's own npm login.
+#
+# Prerelease versions (e.g. 0.0.37-dev.N.gSHA from an off-tag build) must not
+# claim the `latest` dist-tag, so they publish under `next` instead — npm also
+# refuses a bare `npm publish` for a prerelease. Set OPENSHELL_NPM_PUBLISH_ARGS
+# (e.g. `--dry-run`) to pass extra flags through; CI uses this to validate the
+# publishable artifact on PRs without uploading.
+["sdk:ts:publish"]
+description = "Publish the TypeScript SDK to its configured registry"
+depends = ["sdk:ts:build"]
+dir = "sdk/typescript"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+ORIGINAL_PKG=""
+cleanup() {
+  if [ -n "$ORIGINAL_PKG" ] && [ -f "$ORIGINAL_PKG" ]; then
+    cp "$ORIGINAL_PKG" package.json
+    rm -f "$ORIGINAL_PKG"
+  fi
+}
+trap cleanup EXIT
+
+DIST_TAG="latest"
+if [ -n "${OPENSHELL_NPM_VERSION:-}" ]; then
+  ORIGINAL_PKG=$(mktemp)
+  cp package.json "$ORIGINAL_PKG"
+  npm pkg set version="$OPENSHELL_NPM_VERSION"
+  # A hyphen means a SemVer prerelease (X.Y.Z-dev.N...) -> publish off `latest`.
+  case "$OPENSHELL_NPM_VERSION" in
+    *-*) DIST_TAG="next" ;;
+  esac
+fi
+
+npm publish --tag "$DIST_TAG" ${OPENSHELL_NPM_PUBLISH_ARGS:-}
+"""
+hide = true

@@ -5,27 +5,386 @@ from __future__ import annotations
 
 import json
 import os
+import pickle
 import threading
 import time
+from copy import deepcopy
+from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
+
+import openshell.sandbox as sandbox_module
 from openshell._proto import openshell_pb2
 from openshell.sandbox import (
+    _OIDC_TOKEN_EXPIRY_GRACE_SECONDS,
     _PYTHON_CLOUDPICKLE_BOOTSTRAP,
     _SANDBOX_PYTHON_BIN,
+    ClientCredentialsAuth,
     InferenceRouteClient,
     Sandbox,
     SandboxClient,
     SandboxError,
+    SandboxRef,
+    SandboxStatusRef,
+    SandboxTemplateClient,
     TlsConfig,
+    _atomic_replace,
     _BearerAuthInterceptor,
     _load_cluster_bearer_token,
     _make_cluster_bearer_provider,
     _normalize_bearer,
     _OidcRefresher,
     _read_oidc_token_bundle,
+    _sandbox_ref,
+    _validate_oauth_url,
 )
+
+
+def _client_credentials_fixture() -> dict[str, Any]:
+    return json.loads(
+        (
+            Path(__file__).parents[2] / "sdk/conformance/oauth-client-credentials.json"
+        ).read_text()
+    )
+
+
+def test_oauth_client_credentials_conformance_fixture() -> None:
+    fixture = _client_credentials_fixture()
+    assert fixture["expiry"]["leeway_seconds"] == _OIDC_TOKEN_EXPIRY_GRACE_SECONDS
+    for value in fixture["urls"]["allowed"]:
+        assert _validate_oauth_url("issuer", value) == value
+    for value in fixture["urls"]["rejected"]:
+        with pytest.raises(SandboxError):
+            _validate_oauth_url("issuer", value)
+
+
+def test_client_credentials_auth_exact_form_cache_and_redaction() -> None:
+    fixture = _client_credentials_fixture()
+    seen: list[tuple[str, bytes]] = []
+
+    def handler(request: Any) -> Any:
+        import httpx
+
+        seen.append((str(request.url), bytes(request.content)))
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://issuer.example.com/",
+                    "token_endpoint": "https://issuer.example.com/token",
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "service-token",
+                "expires_in": fixture["expiry"]["valid_expires_in"],
+            },
+        )
+
+    import httpx
+
+    auth = ClientCredentialsAuth(
+        issuer="https://issuer.example.com",
+        client_id="service-client",
+        client_secret="conformance-secret",
+        scopes=("sandbox:read", "sandbox:write"),
+        audience="openshell-gateway",
+        _transport=httpx.MockTransport(handler),
+    )
+    assert auth() == "service-token"
+    assert auth() == "service-token"
+    assert len(seen) == 2
+    form = dict(__import__("urllib.parse").parse.parse_qsl(seen[1][1].decode()))
+    assert form == {
+        field: fixture["request"][field]
+        for field in (
+            "grant_type",
+            "client_id",
+            "client_secret",
+            "scope",
+            "audience",
+        )
+    }
+    assert "conformance-secret" not in repr(auth)
+
+
+def test_client_credentials_auth_preserves_explicit_empty_scopes() -> None:
+    import httpx
+
+    form: dict[str, str] = {}
+
+    def handler(request: Any) -> Any:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://issuer.example.com",
+                    "token_endpoint": "https://issuer.example.com/token",
+                },
+            )
+        form.update(
+            __import__("urllib.parse").parse.parse_qsl(request.content.decode())
+        )
+        return httpx.Response(200, json={"access_token": "token", "expires_in": 120})
+
+    auth = ClientCredentialsAuth(
+        issuer="https://issuer.example.com",
+        client_id="client",
+        client_secret="secret",
+        scopes=(),
+        _transport=httpx.MockTransport(handler),
+    )
+    auth._apply_gateway_metadata({"oidc_scopes": "sandbox:read sandbox:write"})
+
+    assert auth() == "token"
+    assert auth._scopes == ()
+    assert "scope" not in form
+
+
+@pytest.mark.parametrize(
+    "expires_in", _client_credentials_fixture()["expiry"]["invalid_expires_in"]
+)
+def test_client_credentials_auth_rejects_invalid_expiry(expires_in: object) -> None:
+    import httpx
+
+    fixture = _client_credentials_fixture()
+
+    def handler(request: Any) -> Any:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": fixture["discovery"]["matching_issuer"],
+                    "token_endpoint": "https://issuer.example.com/token",
+                },
+            )
+        return httpx.Response(
+            200, json={"access_token": "token", "expires_in": expires_in}
+        )
+
+    auth = ClientCredentialsAuth(
+        issuer=fixture["discovery"]["configured_issuer"],
+        client_id="client",
+        client_secret="secret",
+        _transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(SandboxError, match="positive finite expires_in"):
+        auth()
+
+
+@pytest.mark.parametrize(
+    "status", _client_credentials_fixture()["discovery"]["redirect_statuses"]
+)
+def test_client_credentials_auth_refuses_discovery_redirect(status: int) -> None:
+    import httpx
+
+    requests = 0
+
+    def handler(_request: Any) -> Any:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            status,
+            headers={"location": "https://attacker.example.com/discovery"},
+        )
+
+    auth = ClientCredentialsAuth(
+        issuer="https://issuer.example.com",
+        client_id="client",
+        client_secret="secret",
+        _transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(SandboxError, match=f"HTTP {status}"):
+        auth()
+    assert requests == 1
+
+
+@pytest.mark.parametrize(
+    "status", _client_credentials_fixture()["discovery"]["redirect_statuses"]
+)
+def test_client_credentials_auth_refuses_token_redirect(status: int) -> None:
+    import httpx
+
+    requests: list[str] = []
+
+    def handler(request: Any) -> Any:
+        requests.append(str(request.url))
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://issuer.example.com",
+                    "token_endpoint": "https://issuer.example.com/token",
+                },
+            )
+        return httpx.Response(
+            status,
+            headers={"location": "https://attacker.example.com/token"},
+        )
+
+    auth = ClientCredentialsAuth(
+        issuer="https://issuer.example.com",
+        client_id="client",
+        client_secret="secret",
+        _transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(SandboxError, match=f"HTTP {status}"):
+        auth()
+    assert requests == [
+        "https://issuer.example.com/.well-known/openid-configuration",
+        "https://issuer.example.com/token",
+    ]
+
+
+def test_client_credentials_auth_rejects_discovery_issuer_mismatch() -> None:
+    import httpx
+
+    fixture = _client_credentials_fixture()
+    auth = ClientCredentialsAuth(
+        issuer=fixture["discovery"]["configured_issuer"],
+        client_id="client",
+        client_secret="secret",
+        _transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "issuer": fixture["discovery"]["mismatched_issuer"],
+                    "token_endpoint": "https://attacker.example.com/token",
+                },
+            )
+        ),
+    )
+    with pytest.raises(SandboxError, match="issuer mismatch"):
+        auth()
+
+
+def test_client_credentials_auth_rejects_oversized_response() -> None:
+    import httpx
+
+    fixture = _client_credentials_fixture()
+    auth = ClientCredentialsAuth(
+        issuer="https://issuer.example.com",
+        client_id="client",
+        client_secret="secret",
+        _transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200, content=b"x" * (fixture["limits"]["max_response_bytes"] + 1)
+            )
+        ),
+    )
+    with pytest.raises(SandboxError, match="too large"):
+        auth()
+
+
+def test_client_credentials_auth_single_flight_and_retry() -> None:
+    import httpx
+
+    token_calls = 0
+    release = threading.Event()
+
+    def handler(request: Any) -> Any:
+        nonlocal token_calls
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "http://127.0.0.1:8080",
+                    "token_endpoint": "http://127.0.0.1:8080/token",
+                },
+            )
+        token_calls += 1
+        release.wait(timeout=2)
+        return httpx.Response(200, json={"access_token": "shared", "expires_in": 120})
+
+    auth = ClientCredentialsAuth(
+        issuer="http://127.0.0.1:8080",
+        client_id="client",
+        client_secret="secret",
+        _transport=httpx.MockTransport(handler),
+    )
+    results: list[str] = []
+    threads = [
+        threading.Thread(target=lambda: results.append(auth())) for _ in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    while token_calls == 0:
+        time.sleep(0.001)
+    release.set()
+    for thread in threads:
+        thread.join()
+    assert results == ["shared"] * 8
+    assert token_calls == 1
+
+
+def test_client_credentials_auth_fails_closed_and_redacts_errors() -> None:
+    import httpx
+
+    def supplier() -> str:
+        raise RuntimeError("supplier-sensitive-detail")
+
+    auth = ClientCredentialsAuth(
+        issuer="http://localhost:8080",
+        client_id="client",
+        client_secret=supplier,
+        _transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "issuer": "http://localhost:8080",
+                    "token_endpoint": "http://localhost:8080/token",
+                },
+            )
+        ),
+    )
+    with pytest.raises(SandboxError, match="supplier failed") as exc_info:
+        auth()
+    assert "supplier-sensitive-detail" not in str(exc_info.value)
+    with pytest.raises(SandboxError, match="must use HTTPS"):
+        ClientCredentialsAuth(
+            issuer="http://remote.example.com",
+            client_id="client",
+            client_secret="secret",
+        )()
+
+
+def test_client_credentials_auth_does_not_use_stale_token_after_renewal_failure() -> (
+    None
+):
+    import httpx
+
+    exchanges = 0
+
+    def handler(request: Any) -> Any:
+        nonlocal exchanges
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "http://localhost:8080",
+                    "token_endpoint": "http://localhost:8080/token",
+                },
+            )
+        exchanges += 1
+        if exchanges == 1:
+            return httpx.Response(200, json={"access_token": "stale", "expires_in": 30})
+        return httpx.Response(503, json={"error": "provider-sensitive-detail"})
+
+    auth = ClientCredentialsAuth(
+        issuer="http://localhost:8080",
+        client_id="client",
+        client_secret="secret",
+        _transport=httpx.MockTransport(handler),
+    )
+    assert auth() == "stale"
+    with pytest.raises(SandboxError, match="HTTP 503") as exc_info:
+        auth()
+    assert "stale" not in str(exc_info.value)
+    assert "provider-sensitive-detail" not in str(exc_info.value)
 
 
 class _FakeStub:
@@ -46,10 +405,11 @@ class _FakeStub:
 
 class _FakeInferenceStub:
     def __init__(self) -> None:
-        self.request = None
+        self.set_request = None
+        self.get_request = None
 
-    def SetClusterInference(self, request: Any, timeout: float | None = None) -> Any:
-        self.request = request
+    def SetInferenceRoute(self, request: Any, timeout: float | None = None) -> Any:
+        self.set_request = request
         _ = timeout
 
         class _Response:
@@ -59,9 +419,27 @@ class _FakeInferenceStub:
 
         return _Response()
 
+    def GetInferenceRoute(self, request: Any, timeout: float | None = None) -> Any:
+        self.get_request = request
+        _ = timeout
 
-def _client_with_fake_stub(stub: _FakeStub) -> SandboxClient:
+        class _Response:
+            provider_name = "openai-dev"
+            model_id = "gpt-4.1"
+            version = 2
+
+        return _Response()
+
+
+def _client_with_fake_stub(stub: object) -> SandboxClient:
     client = cast("SandboxClient", object.__new__(SandboxClient))
+    client._timeout = 30.0
+    client._stub = cast("Any", stub)
+    return client
+
+
+def _template_client_with_fake_stub(stub: object) -> SandboxTemplateClient:
+    client = cast("SandboxTemplateClient", object.__new__(SandboxTemplateClient))
     client._timeout = 30.0
     client._stub = cast("Any", stub)
     return client
@@ -1164,6 +1542,113 @@ def test_sandbox_client_close_invokes_bearer_close() -> None:
     assert closed[0] == 1
 
 
+def test_from_active_cluster_fills_client_credentials_from_metadata(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    gateway_dir = _setup_gateway_dir(tmp_path, monkeypatch, auth_mode="oidc")
+    metadata_path = gateway_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update(
+        {
+            "oidc_issuer": "https://issuer.example.com",
+            "oidc_client_id": "service-client",
+            "oidc_audience": "gateway",
+            "oidc_scopes": "sandbox:read sandbox:write",
+        }
+    )
+    metadata_path.write_text(json.dumps(metadata))
+    auth = ClientCredentialsAuth(client_secret="secret")
+    client = SandboxClient.from_active_cluster(
+        client_credentials=auth,
+        insecure=True,
+    )
+    try:
+        assert auth._issuer == "https://issuer.example.com"
+        assert auth._client_id == "service-client"
+        assert auth._audience == "gateway"
+        assert auth._scopes == ("sandbox:read", "sandbox:write")
+        assert auth._insecure is True
+    finally:
+        client.close()
+
+
+def test_sandbox_client_rejects_client_credentials_on_remote_plaintext(
+    monkeypatch: Any,
+) -> None:
+    channel_opened = False
+
+    def insecure_channel(_endpoint: str) -> Any:
+        nonlocal channel_opened
+        channel_opened = True
+        raise AssertionError("plaintext channel must not be opened")
+
+    monkeypatch.setattr(sandbox_module.grpc, "insecure_channel", insecure_channel)
+    auth = ClientCredentialsAuth(
+        issuer="https://issuer.example.com",
+        client_id="client",
+        client_secret="secret",
+    )
+    with pytest.raises(SandboxError, match="require TLS"):
+        SandboxClient("gateway.example.com:50051", client_credentials=auth)
+    assert not channel_opened
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ["localhost:50051", "127.42.0.1:50051", "[::1]:50051"],
+)
+def test_sandbox_client_allows_client_credentials_on_plaintext_loopback(
+    endpoint: str,
+) -> None:
+    auth = ClientCredentialsAuth(
+        issuer="https://issuer.example.com",
+        client_id="client",
+        client_secret="secret",
+    )
+    client = SandboxClient(endpoint, client_credentials=auth)
+    client.close()
+
+
+def test_from_active_cluster_rejects_client_credentials_on_remote_plaintext(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    gateway_dir = _setup_gateway_dir(
+        tmp_path,
+        monkeypatch,
+        endpoint="http://gateway.example.com:8080",
+        auth_mode="oidc",
+    )
+    metadata_path = gateway_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update(
+        {
+            "oidc_issuer": "https://issuer.example.com",
+            "oidc_client_id": "service-client",
+        }
+    )
+    metadata_path.write_text(json.dumps(metadata))
+
+    auth = ClientCredentialsAuth(client_secret="secret")
+    with pytest.raises(SandboxError, match="require TLS"):
+        SandboxClient.from_active_cluster(client_credentials=auth)
+
+
+def test_sandbox_client_rejects_ambiguous_bearer_configuration() -> None:
+    auth = ClientCredentialsAuth(
+        issuer="https://issuer.example.com",
+        client_id="client",
+        client_secret="secret",
+    )
+    with pytest.raises(SandboxError, match="mutually exclusive"):
+        SandboxClient(
+            "localhost:50051",
+            bearer_token="static",
+            client_credentials=auth,
+        )
+
+
 def test_sandbox_client_close_releases_refresher_http_client(
     tmp_path: Path,
     monkeypatch: Any,
@@ -1260,6 +1745,65 @@ def test_refresher_concurrent_write_back_does_not_trample(tmp_path: Path) -> Non
         r.close()
 
 
+class _WindowsPermissionError(PermissionError):
+    winerror: int
+
+
+def test_atomic_replace_retries_windows_sharing_violations(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_text("new")
+    destination.write_text("old")
+    attempts = 0
+    delays: list[float] = []
+    real_replace = Path.replace
+
+    def replace(path: Path, target: Path) -> Path:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            error = _WindowsPermissionError("destination is busy")
+            error.winerror = 32
+            raise error
+        return real_replace(path, target)
+
+    monkeypatch.setattr(sandbox_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(Path, "replace", replace)
+    monkeypatch.setattr(time, "sleep", delays.append)
+
+    _atomic_replace(source, destination)
+
+    assert attempts == 3
+    assert delays == [0.005, 0.01]
+    assert destination.read_text() == "new"
+
+
+def test_atomic_replace_does_not_retry_permanent_windows_errors(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_text("new")
+    attempts = 0
+
+    def replace(_path: Path, _target: Path) -> Path:
+        nonlocal attempts
+        attempts += 1
+        error = _WindowsPermissionError("access denied")
+        error.winerror = 13
+        raise error
+
+    monkeypatch.setattr(sandbox_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(Path, "replace", replace)
+
+    with pytest.raises(PermissionError, match="access denied"):
+        _atomic_replace(source, destination)
+
+    assert attempts == 1
+
+
 def test_sandbox_wrapper_forwards_auth_kwargs_to_from_active_cluster(
     monkeypatch: Any,
 ) -> None:
@@ -1284,6 +1828,7 @@ def test_sandbox_wrapper_forwards_auth_kwargs_to_from_active_cluster(
     )
 
     sandbox = Sandbox(
+        workspace="default",
         cluster="my-gw",
         timeout=42.0,
         auto_refresh=False,
@@ -1325,27 +1870,44 @@ def test_sandbox_wrapper_defaults_match_from_active_cluster(
     import pytest as _pytest
 
     with _pytest.raises(_Sentinel):
-        Sandbox().__enter__()
+        Sandbox(workspace="default").__enter__()
 
     assert captured["auto_refresh"] is True
     assert captured["write_back"] is True
     assert captured["insecure"] is False
 
 
-def test_inference_set_cluster_forwards_no_verify_flag() -> None:
+def test_inference_set_route_forwards_workspace_and_no_verify() -> None:
     stub = _FakeInferenceStub()
     client = cast("InferenceRouteClient", object.__new__(InferenceRouteClient))
     client._timeout = 30.0
     client._stub = cast("Any", stub)
 
-    client.set_cluster(
+    client.set_route(
+        workspace="production",
         provider_name="openai-dev",
         model_id="gpt-4.1",
         no_verify=True,
     )
 
-    assert stub.request is not None
-    assert stub.request.no_verify is True
+    assert stub.set_request is not None
+    assert stub.set_request.no_verify is True
+    assert stub.set_request.workspace == "production"
+
+
+def test_inference_get_route_forwards_workspace() -> None:
+    stub = _FakeInferenceStub()
+    client = cast("InferenceRouteClient", object.__new__(InferenceRouteClient))
+    client._timeout = 30.0
+    client._stub = cast("Any", stub)
+
+    config = client.get_route(workspace="staging")
+
+    assert stub.get_request is not None
+    assert stub.get_request.workspace == "staging"
+    assert config.provider_name == "openai-dev"
+    assert config.model_id == "gpt-4.1"
+    assert config.version == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1413,3 +1975,900 @@ def test_from_active_cluster_reads_utf8_bytes_from_active_gateway_and_metadata(
         assert client._endpoint == "tést.example:8080"
     finally:
         client.close()
+
+
+# ---- Sandbox label / selector API tests ----
+
+
+def _make_sandbox_proto(
+    id_: str,
+    name: str,
+    labels: dict[str, str] | None = None,
+    phase: openshell_pb2.SandboxPhase = openshell_pb2.SANDBOX_PHASE_READY,
+    version: int = 0,
+    workspace: str = "default",
+) -> openshell_pb2.Sandbox:
+    sandbox = openshell_pb2.Sandbox()
+    sandbox.metadata.id = id_
+    sandbox.metadata.name = name
+    sandbox.metadata.workspace = workspace
+    for key, value in (labels or {}).items():
+        sandbox.metadata.labels[key] = value
+    sandbox.status.phase = phase
+    sandbox.status.current_policy_version = version
+    return sandbox
+
+
+def _make_workload_template_proto(
+    name: str,
+    *,
+    workspace: str = "default",
+) -> openshell_pb2.SandboxWorkloadTemplate:
+    template = openshell_pb2.SandboxWorkloadTemplate()
+    template.metadata.name = name
+    template.metadata.workspace = workspace
+    template.spec.workload.image = f"ghcr.io/test/{name}:latest"
+    template.spec.workload.resources.cpu = "1"
+    template.spec.workload.resources.memory = "512Mi"
+    return template
+
+
+class _FakeSandboxStub:
+    def __init__(self, listed: list[openshell_pb2.Sandbox] | None = None) -> None:
+        self.create_request: openshell_pb2.CreateSandboxRequest | None = None
+        self.list_request: openshell_pb2.ListSandboxesRequest | None = None
+        self.get_request: openshell_pb2.GetSandboxRequest | None = None
+        self.delete_request: openshell_pb2.DeleteSandboxRequest | None = None
+        self.stop_request: openshell_pb2.StopSandboxRequest | None = None
+        self.start_request: openshell_pb2.StartSandboxRequest | None = None
+        self.create_template_request: (
+            openshell_pb2.CreateSandboxTemplateRequest | None
+        ) = None
+        self.get_template_request: openshell_pb2.GetSandboxTemplateRequest | None = None
+        self.list_template_request: openshell_pb2.ListSandboxTemplatesRequest | None = (
+            None
+        )
+        self.delete_template_request: (
+            openshell_pb2.DeleteSandboxTemplateRequest | None
+        ) = None
+        self._listed = listed or []
+        self._templates: list[openshell_pb2.SandboxWorkloadTemplate] = []
+
+    def GetSandbox(
+        self,
+        request: openshell_pb2.GetSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.get_request = request
+        _ = timeout
+        return SimpleNamespace(
+            sandbox=_make_sandbox_proto(
+                "sandbox-1", request.name, workspace=request.workspace or "default"
+            )
+        )
+
+    def DeleteSandbox(
+        self,
+        request: openshell_pb2.DeleteSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.delete_request = request
+        _ = timeout
+        return SimpleNamespace(deleted=True)
+
+    def StopSandbox(
+        self,
+        request: openshell_pb2.StopSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.stop_request = request
+        _ = timeout
+        return SimpleNamespace(
+            sandbox=_make_sandbox_proto(
+                "sandbox-1",
+                request.name,
+                phase=openshell_pb2.SANDBOX_PHASE_STOPPED,
+                workspace=request.workspace,
+            )
+        )
+
+    def StartSandbox(
+        self,
+        request: openshell_pb2.StartSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.start_request = request
+        _ = timeout
+        return SimpleNamespace(
+            sandbox=_make_sandbox_proto(
+                "sandbox-1",
+                request.name,
+                phase=openshell_pb2.SANDBOX_PHASE_STARTING,
+                workspace=request.workspace,
+            )
+        )
+
+    def CreateSandbox(
+        self,
+        request: openshell_pb2.CreateSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.create_request = request
+        _ = timeout
+        return SimpleNamespace(
+            sandbox=_make_sandbox_proto(
+                "sandbox-1",
+                request.name or "generated",
+                dict(request.labels),
+                workspace=request.workspace or "default",
+            )
+        )
+
+    def ListSandboxes(
+        self,
+        request: openshell_pb2.ListSandboxesRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.list_request = request
+        _ = timeout
+        return SimpleNamespace(sandboxes=list(self._listed))
+
+    def CreateSandboxTemplate(
+        self,
+        request: openshell_pb2.CreateSandboxTemplateRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.create_template_request = request
+        _ = timeout
+        self._templates.append(request.template)
+        return SimpleNamespace(template=request.template)
+
+    def GetSandboxTemplate(
+        self,
+        request: openshell_pb2.GetSandboxTemplateRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.get_template_request = request
+        _ = timeout
+        return SimpleNamespace(
+            template=_make_workload_template_proto(
+                request.name,
+                workspace=request.workspace or "default",
+            )
+        )
+
+    def ListSandboxTemplates(
+        self,
+        request: openshell_pb2.ListSandboxTemplatesRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.list_template_request = request
+        _ = timeout
+        return SimpleNamespace(templates=list(self._templates))
+
+    def DeleteSandboxTemplate(
+        self,
+        request: openshell_pb2.DeleteSandboxTemplateRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.delete_template_request = request
+        _ = timeout
+        return SimpleNamespace(deleted=True)
+
+
+class _RecordingHighLevelClient:
+    """A stand-in for SandboxClient used to observe high-level forwarding."""
+
+    def __init__(self) -> None:
+        self.create_kwargs: dict[str, Any] | None = None
+        self.create_template_kwargs: dict[str, Any] | None = None
+
+    def create_session(
+        self,
+        *,
+        workspace: str,
+        spec: Any = None,
+        name: str | None = None,
+        labels: Any = None,
+    ) -> Any:
+        self.create_kwargs = {
+            "workspace": workspace,
+            "spec": spec,
+            "name": name,
+            "labels": labels,
+        }
+        return SimpleNamespace(sandbox=SimpleNamespace(name=name or "generated"))
+
+    def create_session_from_template(
+        self,
+        *,
+        workspace: str,
+        template_name: str,
+        spec: Any = None,
+        name: str | None = None,
+        labels: Any = None,
+    ) -> Any:
+        self.create_template_kwargs = {
+            "workspace": workspace,
+            "template_name": template_name,
+            "spec": spec,
+            "name": name,
+            "labels": labels,
+        }
+        return SimpleNamespace(sandbox=SimpleNamespace(name=name or "generated"))
+
+    def wait_ready(
+        self, name: str, *, workspace: str, timeout_seconds: float = 300.0
+    ) -> SandboxRef:
+        _ = timeout_seconds
+        return SandboxRef(
+            id="sandbox-1",
+            name=name,
+            workspace=workspace,
+            status=SandboxStatusRef(phase=2, current_policy_version=0),
+        )
+
+
+def test_create_forwards_name_and_labels() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    ref = client.create(
+        workspace="default", name="job-1", labels={"aiq": "deep-research"}
+    )
+
+    assert stub.create_request is not None
+    assert stub.create_request.name == "job-1"
+    assert dict(stub.create_request.labels) == {"aiq": "deep-research"}
+    assert dict(ref.labels) == {"aiq": "deep-research"}
+
+
+def test_create_from_template_forwards_workload_template_name() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+    spec = openshell_pb2.SandboxSpec(
+        providers=["github"],
+        command=["/opt/worker", "--serve"],
+        tty=True,
+    )
+
+    ref = client.create_from_template(
+        workspace="default",
+        template_name="gpu-kata",
+        spec=spec,
+        name="job-1",
+        labels={"team": "runtime"},
+    )
+
+    assert stub.create_request is not None
+    assert stub.create_request.name == "job-1"
+    assert stub.create_request.workload_template_name == "gpu-kata"
+    assert dict(stub.create_request.labels) == {"team": "runtime"}
+    assert list(stub.create_request.spec.providers) == ["github"]
+    assert list(stub.create_request.spec.command) == ["/opt/worker", "--serve"]
+    assert stub.create_request.spec.tty is True
+    assert dict(ref.labels) == {"team": "runtime"}
+
+
+def test_create_from_template_rejects_empty_template_name() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    with pytest.raises(SandboxError):
+        client.create_from_template(workspace="default", template_name=" ")
+
+    assert stub.create_request is None
+
+
+def test_sandbox_template_create_builds_template_from_public_fields() -> None:
+    stub = _FakeSandboxStub()
+    client = _template_client_with_fake_stub(stub)
+
+    created = client.create(
+        workspace="default",
+        name="gpu-kata",
+        image="ghcr.io/test/gpu-kata:latest",
+        labels={"team": "runtime"},
+        annotations={"owner": "platform"},
+        environment={"FEATURE_FLAG": "on"},
+        cpu="1",
+        memory="512Mi",
+        gpu_count=2,
+        driver_config={"kubernetes": {"runtime_class_name": "kata"}},
+    )
+
+    assert created.metadata.name == "gpu-kata"
+    assert stub.create_template_request is not None
+    assert stub.create_template_request.workspace == "default"
+    template = stub.create_template_request.template
+    assert template.metadata.name == "gpu-kata"
+    assert dict(template.metadata.labels) == {"team": "runtime"}
+    assert dict(template.metadata.annotations) == {"owner": "platform"}
+    assert template.spec.workload.image == "ghcr.io/test/gpu-kata:latest"
+    assert dict(template.spec.workload.environment) == {"FEATURE_FLAG": "on"}
+    assert template.spec.workload.resources.cpu == "1"
+    assert template.spec.workload.resources.memory == "512Mi"
+    assert template.spec.workload.resources.gpu.count == 2
+    assert template.spec.driver_config["kubernetes"]["runtime_class_name"] == "kata"
+
+
+def test_sandbox_template_create_materializes_default_workload() -> None:
+    stub = _FakeSandboxStub()
+    client = _template_client_with_fake_stub(stub)
+
+    client.create(workspace="default", name="base")
+
+    assert stub.create_template_request is not None
+    template = stub.create_template_request.template
+    assert template.HasField("spec")
+    assert template.spec.HasField("workload")
+    assert template.spec.workload.image == ""
+
+
+def test_sandbox_template_create_materializes_workload_with_driver_config_only() -> (
+    None
+):
+    stub = _FakeSandboxStub()
+    client = _template_client_with_fake_stub(stub)
+
+    client.create(
+        workspace="default",
+        name="kata-default-image",
+        driver_config={"kubernetes": {"runtime_class_name": "kata"}},
+    )
+
+    assert stub.create_template_request is not None
+    template = stub.create_template_request.template
+    assert template.HasField("spec")
+    assert template.spec.HasField("workload")
+    assert template.spec.workload.image == ""
+    assert template.spec.driver_config["kubernetes"]["runtime_class_name"] == "kata"
+
+
+def test_sandbox_template_create_rejects_missing_public_name() -> None:
+    stub = _FakeSandboxStub()
+    client = _template_client_with_fake_stub(stub)
+
+    with pytest.raises(SandboxError):
+        client.create(workspace="default", image="ghcr.io/test/python:latest")
+
+    assert stub.create_template_request is None
+
+
+def test_sandbox_template_create_rejects_template_and_builder_fields() -> None:
+    stub = _FakeSandboxStub()
+    client = _template_client_with_fake_stub(stub)
+    template = _make_workload_template_proto("gpu-kata")
+
+    with pytest.raises(SandboxError):
+        client.create(workspace="default", template=template, image="override")
+
+    assert stub.create_template_request is None
+
+
+@pytest.mark.parametrize(
+    "builder_kwargs",
+    (
+        {"labels": {}},
+        {"annotations": {}},
+        {"environment": {}},
+        {"driver_config": {}},
+    ),
+)
+def test_sandbox_template_create_allows_template_and_empty_builder_mappings(
+    builder_kwargs: dict[str, Any],
+) -> None:
+    stub = _FakeSandboxStub()
+    client = _template_client_with_fake_stub(stub)
+    template = _make_workload_template_proto("gpu-kata")
+
+    created = client.create(
+        workspace="default",
+        template=template,
+        **builder_kwargs,
+    )
+
+    assert created.metadata.name == "gpu-kata"
+    assert stub.create_template_request is not None
+    assert stub.create_template_request.template.metadata.name == template.metadata.name
+    assert (
+        stub.create_template_request.template.spec.workload.image
+        == template.spec.workload.image
+    )
+
+
+@pytest.mark.parametrize(
+    "builder_kwargs",
+    (
+        {"labels": {"team": "runtime"}},
+        {"annotations": {"owner": "platform"}},
+        {"environment": {"FEATURE_FLAG": "on"}},
+        {"driver_config": {"kubernetes": {"runtime_class_name": "kata"}}},
+    ),
+)
+def test_sandbox_template_create_rejects_template_and_non_empty_builder_mappings(
+    builder_kwargs: dict[str, Any],
+) -> None:
+    stub = _FakeSandboxStub()
+    client = _template_client_with_fake_stub(stub)
+    template = _make_workload_template_proto("gpu-kata")
+
+    with pytest.raises(SandboxError):
+        client.create(
+            workspace="default",
+            template=template,
+            **builder_kwargs,
+        )
+
+    assert stub.create_template_request is None
+
+
+def test_sandbox_template_create_rejects_non_positive_gpu_count() -> None:
+    stub = _FakeSandboxStub()
+    client = _template_client_with_fake_stub(stub)
+
+    with pytest.raises(SandboxError):
+        client.create(workspace="default", name="gpu-kata", gpu_count=0)
+
+    assert stub.create_template_request is None
+
+
+def test_sandbox_template_client_crud_forwards_requests() -> None:
+    stub = _FakeSandboxStub()
+    client = _template_client_with_fake_stub(stub)
+    template = _make_workload_template_proto("gpu-kata")
+    template.spec.driver_config.update({"kubernetes": {"runtime_class_name": "kata"}})
+
+    created = client.create(workspace="default", template=template)
+
+    assert created.metadata.name == "gpu-kata"
+    assert stub.create_template_request is not None
+    assert stub.create_template_request.workspace == "default"
+    assert (
+        stub.create_template_request.template.spec.workload.image
+        == "ghcr.io/test/gpu-kata:latest"
+    )
+    assert (
+        stub.create_template_request.template.spec.driver_config["kubernetes"][
+            "runtime_class_name"
+        ]
+        == "kata"
+    )
+
+    got = client.get("gpu-kata", workspace="default")
+    assert got.metadata.name == "gpu-kata"
+    assert stub.get_template_request is not None
+    assert stub.get_template_request.name == "gpu-kata"
+    assert stub.get_template_request.workspace == "default"
+
+    listed = client.list(
+        workspace="default", limit=50, offset=10, label_selector="team=runtime"
+    )
+    assert len(listed) == 1
+    assert stub.list_template_request is not None
+    assert stub.list_template_request.workspace == "default"
+    assert stub.list_template_request.limit == 50
+    assert stub.list_template_request.offset == 10
+    assert stub.list_template_request.label_selector == "team=runtime"
+    assert not stub.list_template_request.all_workspaces
+
+    assert client.delete("gpu-kata", workspace="default") is True
+    assert stub.delete_template_request is not None
+    assert stub.delete_template_request.name == "gpu-kata"
+    assert stub.delete_template_request.workspace == "default"
+
+
+def test_sandbox_template_list_for_all_workspaces_clears_workspace() -> None:
+    stub = _FakeSandboxStub()
+    client = _template_client_with_fake_stub(stub)
+
+    client.list_for_all_workspaces(limit=100, offset=5, label_selector="team=runtime")
+
+    assert stub.list_template_request is not None
+    assert stub.list_template_request.all_workspaces
+    assert stub.list_template_request.workspace == ""
+    assert stub.list_template_request.limit == 100
+    assert stub.list_template_request.offset == 5
+    assert stub.list_template_request.label_selector == "team=runtime"
+
+
+def test_stop_and_start_forward_workspace_and_return_phase() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    stopped = client.stop("job-1", workspace="team-a")
+    assert stub.stop_request is not None
+    assert stub.stop_request.name == "job-1"
+    assert stub.stop_request.workspace == "team-a"
+    assert stopped.phase == openshell_pb2.SANDBOX_PHASE_STOPPED
+
+    starting = client.start("job-1", workspace="team-a")
+    assert stub.start_request is not None
+    assert stub.start_request.name == "job-1"
+    assert stub.start_request.workspace == "team-a"
+    assert starting.phase == openshell_pb2.SANDBOX_PHASE_STARTING
+
+
+@pytest.mark.parametrize(
+    ("phase", "should_succeed"),
+    [
+        (openshell_pb2.SANDBOX_PHASE_COMPLETED, True),
+        (openshell_pb2.SANDBOX_PHASE_ERROR, False),
+    ],
+)
+def test_wait_ready_handles_terminal_main_process_results(
+    phase: openshell_pb2.SandboxPhase, should_succeed: bool
+) -> None:
+    class TerminalStub(_FakeSandboxStub):
+        def GetSandbox(
+            self,
+            request: openshell_pb2.GetSandboxRequest,
+            timeout: float | None = None,
+        ) -> Any:
+            _ = timeout
+            return SimpleNamespace(
+                sandbox=_make_sandbox_proto(
+                    "sandbox-1",
+                    request.name,
+                    phase=phase,
+                    workspace=request.workspace,
+                )
+            )
+
+    client = _client_with_fake_stub(TerminalStub())
+    if should_succeed:
+        result = client.wait_ready("job-1", workspace="default", timeout_seconds=0.1)
+        assert result.phase == openshell_pb2.SANDBOX_PHASE_COMPLETED
+    else:
+        with pytest.raises(SandboxError, match="entered error phase"):
+            client.wait_ready("job-1", workspace="default", timeout_seconds=0.1)
+
+
+def test_create_without_args_sends_empty_metadata() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    client.create(workspace="default")
+
+    assert stub.create_request is not None
+    assert stub.create_request.name == ""
+    assert dict(stub.create_request.labels) == {}
+    assert stub.create_request.workspace == "default"
+
+
+def test_create_copies_caller_labels() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    caller_labels = {"aiq": "deep-research"}
+    client.create(workspace="default", labels=caller_labels)
+    caller_labels["aiq"] = "mutated"
+
+    assert stub.create_request is not None
+    assert dict(stub.create_request.labels) == {"aiq": "deep-research"}
+
+
+def test_create_session_forwards_name_and_labels() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    session = client.create_session(
+        workspace="default", name="job-2", labels={"team": "aiq"}
+    )
+
+    assert stub.create_request is not None
+    assert stub.create_request.name == "job-2"
+    assert dict(stub.create_request.labels) == {"team": "aiq"}
+    assert session.sandbox.name == "job-2"
+
+
+def test_list_forwards_label_selector() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    client.list(workspace="default", label_selector="aiq=deep-research")
+
+    assert stub.list_request is not None
+    assert stub.list_request.label_selector == "aiq=deep-research"
+    assert stub.list_request.workspace == "default"
+
+
+def test_list_without_selector_sends_empty_string() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    client.list(workspace="default")
+
+    assert stub.list_request is not None
+    assert stub.list_request.label_selector == ""
+
+
+def test_list_ids_forwards_label_selector() -> None:
+    stub = _FakeSandboxStub(listed=[_make_sandbox_proto("sandbox-1", "job-1")])
+    client = _client_with_fake_stub(stub)
+
+    ids = client.list_ids(workspace="default", label_selector="aiq=deep-research")
+
+    assert stub.list_request is not None
+    assert stub.list_request.label_selector == "aiq=deep-research"
+    assert ids == ["sandbox-1"]
+
+
+def test_sandbox_ref_retains_gateway_labels() -> None:
+    proto = _make_sandbox_proto(
+        "sandbox-1", "job-1", {"aiq": "deep-research", "env": "dev"}
+    )
+
+    ref = _sandbox_ref(proto)
+
+    assert dict(ref.labels) == {"aiq": "deep-research", "env": "dev"}
+
+
+def test_sandbox_ref_includes_main_process_result() -> None:
+    proto = _make_sandbox_proto("sandbox-1", "job-1")
+    proto.status.exit_code = 0
+
+    status = _sandbox_ref(proto).status
+
+    assert status.exit_code == 0
+
+
+def test_returned_labels_are_immutable() -> None:
+    proto = _make_sandbox_proto("sandbox-1", "job-1", {"aiq": "deep-research"})
+    ref = _sandbox_ref(proto)
+
+    with pytest.raises(TypeError):
+        ref.labels["mutated"] = "nope"  # type: ignore[index]
+
+
+def test_direct_sandbox_ref_construction_defaults_labels() -> None:
+    ref = SandboxRef(
+        id="sandbox-1",
+        name="job-1",
+        workspace="default",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+    )
+
+    assert dict(ref.labels) == {}
+
+
+def test_sandbox_ref_stays_hashable_with_labels_excluded_from_identity() -> None:
+    ref_a = _sandbox_ref(_make_sandbox_proto("sandbox-1", "job-1", {"aiq": "a"}))
+    ref_b = _sandbox_ref(_make_sandbox_proto("sandbox-1", "job-1", {"aiq": "b"}))
+
+    # Frozen dataclass must remain hashable despite the immutable labels field.
+    assert hash(ref_a) == hash(ref_b)
+    # Labels are excluded from identity: same (id, name, status) compares equal.
+    assert ref_a == ref_b
+    assert {ref_a, ref_b} == {ref_a}
+
+
+def test_sandbox_ref_labels_support_standard_serialization() -> None:
+    ref = _sandbox_ref(
+        _make_sandbox_proto("sandbox-1", "job-1", {"aiq": "deep-research"})
+    )
+
+    assert asdict(ref)["labels"] == {"aiq": "deep-research"}
+    assert dict(deepcopy(ref).labels) == {"aiq": "deep-research"}
+    assert dict(pickle.loads(pickle.dumps(ref)).labels) == {"aiq": "deep-research"}
+
+
+def test_default_sandbox_ref_labels_support_standard_serialization() -> None:
+    ref = SandboxRef(
+        id="sandbox-1",
+        name="job-1",
+        workspace="default",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+    )
+
+    assert asdict(ref)["labels"] == {}
+    assert dict(deepcopy(ref).labels) == {}
+    assert dict(pickle.loads(pickle.dumps(ref)).labels) == {}
+
+
+def test_direct_sandbox_ref_copies_and_freezes_labels() -> None:
+    labels = {"aiq": "deep-research"}
+    ref = SandboxRef(
+        id="sandbox-1",
+        name="job-1",
+        workspace="default",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+        labels=labels,
+    )
+    labels["aiq"] = "mutated"
+
+    assert dict(ref.labels) == {"aiq": "deep-research"}
+    with pytest.raises(TypeError):
+        ref.labels["mutated"] = "nope"  # type: ignore[index]
+
+
+def test_high_level_creation_forwards_name_and_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recording = _RecordingHighLevelClient()
+    monkeypatch.setattr(
+        SandboxClient,
+        "from_active_cluster",
+        classmethod(lambda _cls, **_kwargs: recording),
+    )
+
+    sandbox = Sandbox(
+        workspace="staging",
+        name="job-1",
+        labels={"aiq": "deep-research"},
+        delete_on_exit=False,
+    )
+    sandbox.__enter__()
+
+    assert recording.create_kwargs == {
+        "workspace": "staging",
+        "spec": None,
+        "name": "job-1",
+        "labels": {"aiq": "deep-research"},
+    }
+
+
+def test_high_level_template_creation_forwards_template_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recording = _RecordingHighLevelClient()
+    monkeypatch.setattr(
+        SandboxClient,
+        "from_active_cluster",
+        classmethod(lambda _cls, **_kwargs: recording),
+    )
+
+    spec = openshell_pb2.SandboxSpec(
+        providers=["github"],
+        command=["/opt/worker", "--serve"],
+        tty=True,
+    )
+    sandbox = Sandbox(
+        workspace="staging",
+        template_name="gpu-kata",
+        spec=spec,
+        name="job-1",
+        labels={"team": "runtime"},
+        delete_on_exit=False,
+    )
+    sandbox.__enter__()
+
+    assert recording.create_template_kwargs == {
+        "workspace": "staging",
+        "template_name": "gpu-kata",
+        "spec": spec,
+        "name": "job-1",
+        "labels": {"team": "runtime"},
+    }
+    assert recording.create_template_kwargs is not None
+    forwarded_spec = recording.create_template_kwargs["spec"]
+    assert list(forwarded_spec.command) == ["/opt/worker", "--serve"]
+    assert forwarded_spec.tty is True
+
+
+def test_high_level_attach_rejects_name() -> None:
+    sandbox = Sandbox(workspace="default", sandbox="existing-sandbox", name="job-1")
+
+    with pytest.raises(SandboxError):
+        sandbox.__enter__()
+
+
+def test_high_level_attach_rejects_labels() -> None:
+    ref = SandboxRef(
+        id="sandbox-1",
+        name="existing",
+        workspace="default",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+    )
+    sandbox = Sandbox(workspace="default", sandbox=ref, labels={"aiq": "deep-research"})
+
+    with pytest.raises(SandboxError):
+        sandbox.__enter__()
+
+
+def test_high_level_attach_rejects_template_name() -> None:
+    sandbox = Sandbox(
+        workspace="default", sandbox="existing-sandbox", template_name="gpu-kata"
+    )
+
+    with pytest.raises(SandboxError):
+        sandbox.__enter__()
+
+
+# ---------------------------------------------------------------------------
+# Workspace support
+# ---------------------------------------------------------------------------
+
+
+def test_create_passes_workspace_to_proto() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    ref = client.create(workspace="staging", name="job-1")
+
+    assert stub.create_request is not None
+    assert stub.create_request.workspace == "staging"
+    assert ref.workspace == "staging"
+
+
+def test_get_passes_workspace_to_proto() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    ref = client.get("job-1", workspace="production")
+
+    assert stub.get_request is not None
+    assert stub.get_request.workspace == "production"
+    assert ref.workspace == "production"
+
+
+def test_delete_passes_workspace_to_proto() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    result = client.delete("job-1", workspace="staging")
+
+    assert result is True
+    assert stub.delete_request is not None
+    assert stub.delete_request.workspace == "staging"
+
+
+def test_list_for_all_workspaces_sets_flag() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    client.list_for_all_workspaces()
+
+    assert stub.list_request is not None
+    assert stub.list_request.all_workspaces is True
+    assert stub.list_request.workspace == ""
+
+
+def test_list_with_workspace_passes_workspace() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    client.list(workspace="staging")
+
+    assert stub.list_request is not None
+    assert stub.list_request.workspace == "staging"
+    assert stub.list_request.all_workspaces is False
+
+
+def test_sandbox_ref_includes_workspace_from_proto() -> None:
+    proto = _make_sandbox_proto("sandbox-1", "job-1", workspace="production")
+
+    ref = _sandbox_ref(proto)
+
+    assert ref.workspace == "production"
+
+
+def test_sandbox_ref_includes_workload_template_provenance() -> None:
+    proto = _make_sandbox_proto("sandbox-1", "job-1")
+    proto.created_from_workload_template.name = "gpu-kata"
+    proto.created_from_workload_template.resource_version = "7"
+
+    ref = _sandbox_ref(proto)
+
+    assert ref.created_from_workload_template is not None
+    assert ref.created_from_workload_template.name == "gpu-kata"
+    assert ref.created_from_workload_template.resource_version == "7"
+
+
+def test_sandbox_session_delete_passes_workspace() -> None:
+    from openshell.sandbox import SandboxSession
+
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+    ref = SandboxRef(
+        id="sandbox-1",
+        name="job-1",
+        workspace="staging",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+    )
+    session = SandboxSession(client, ref)
+
+    session.delete()
+
+    assert stub.delete_request is not None
+    assert stub.delete_request.workspace == "staging"

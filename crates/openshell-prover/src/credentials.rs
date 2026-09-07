@@ -186,26 +186,39 @@ fn host_pattern_covers(pattern: &str, host: &str) -> bool {
         return false;
     };
 
+    // A leading `**` matches one or more leading labels; the remaining labels
+    // match the tail of the host label-for-label, mirroring the runtime.
     if first_pattern_label == "**" {
         let suffix = &pattern_labels[1..];
-        let host_suffix = host_labels
-            .len()
-            .checked_sub(suffix.len())
-            .map(|start| &host_labels[start..]);
-        return !suffix.is_empty()
-            && host_labels.len() > suffix.len()
-            && matches!(host_suffix, Some(host_suffix) if host_suffix == suffix);
+        if suffix.is_empty() || host_labels.len() <= suffix.len() {
+            return false;
+        }
+        let start = host_labels.len() - suffix.len();
+        return labels_match(suffix, &host_labels[start..]);
     }
 
-    if !first_pattern_label.contains('*') {
-        return false;
-    }
+    // Otherwise the pattern matches exactly one label per position. A `*` (or a
+    // partial `*` glob) matches a single label, literal labels must be equal, and
+    // wildcards may appear in any label — not just the first — to match the
+    // runtime's whole-middle-label wildcards (e.g. `*.s3.*.amazonaws.com`).
+    labels_match(&pattern_labels, &host_labels)
+}
 
-    // Runtime host wildcards only apply in the first DNS label. Wildcards in
-    // later labels are not treated as policy globs here.
+/// Match `pattern_labels` against `host_labels` positionally: equal label counts,
+/// each `*`-bearing pattern label matched as a single-label glob and every other
+/// label compared literally.
+fn labels_match(pattern_labels: &[&str], host_labels: &[&str]) -> bool {
     pattern_labels.len() == host_labels.len()
-        && pattern_labels[1..] == host_labels[1..]
-        && wildcard_label_matches(first_pattern_label, host_labels[0])
+        && pattern_labels
+            .iter()
+            .zip(host_labels)
+            .all(|(pattern, host)| {
+                if pattern.contains('*') {
+                    wildcard_label_matches(pattern, host)
+                } else {
+                    pattern == host
+                }
+            })
 }
 
 fn wildcard_label_matches(pattern: &str, label: &str) -> bool {
@@ -419,9 +432,37 @@ mod tests {
             "api-*.github.com",
             "uploads.github.com"
         ));
-        assert!(!host_patterns_overlap(
+    }
+
+    #[test]
+    fn host_patterns_overlap_matches_whole_middle_label_wildcard() {
+        // A `*` matches exactly one label in any position, mirroring the runtime
+        // (e.g. the aws-s3 profile's `*.s3.*.amazonaws.com`).
+        assert!(host_patterns_overlap(
             "api.*.github.com",
             "api.v3.github.com"
+        ));
+        assert!(host_patterns_overlap(
+            "*.s3.*.amazonaws.com",
+            "bucket.s3.us-east-1.amazonaws.com"
+        ));
+        assert!(host_patterns_overlap(
+            "s3.*.amazonaws.com",
+            "s3.eu-west-1.amazonaws.com"
+        ));
+        // A single `*` label matches exactly one label — not zero, not several.
+        assert!(!host_patterns_overlap(
+            "s3.*.amazonaws.com",
+            "s3.amazonaws.com"
+        ));
+        assert!(!host_patterns_overlap(
+            "*.s3.*.amazonaws.com",
+            "bucket.s3.dualstack.us-east-1.amazonaws.com"
+        ));
+        // A literal middle label must still match literally.
+        assert!(!host_patterns_overlap(
+            "api.*.github.com",
+            "api.v3.gitlab.com"
         ));
     }
 

@@ -15,6 +15,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=e2e/support/gateway-common.sh
+source "${ROOT}/e2e/support/gateway-common.sh"
+
 CHART_PATH="${CHART_PATH:-./deploy/helm/openshell}"
 NAMESPACE="openshell"
 RELEASE="openshell"
@@ -119,6 +122,7 @@ oc adm policy add-scc-to-user privileged -z "${RELEASE}-sandbox" -n "$NAMESPACE"
 
 OPENSHIFT_FLAGS=(
   --set server.disableTls=true
+  --set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}"
   --set podSecurityContext.fsGroup=null
   --set securityContext.runAsUser=null
   --set image.tag="$IMAGE_TAG"

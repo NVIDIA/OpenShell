@@ -1,0 +1,62 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# PROTOTYPE: Ensure SELinux is enforcing in a disposable test guest.
+
+- name: Configure SELinux
+  hosts: test_vm
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Validate SELinux support
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.os_family == "RedHat"
+        fail_msg: >-
+          SELinux configuration is supported only on CentOS, Fedora, and Rocky,
+          not {{ ansible_facts.distribution }}.
+
+    - name: Install SELinux tools
+      ansible.builtin.package:
+        name: policycoreutils
+        state: present
+
+    - name: Read the current SELinux mode
+      ansible.builtin.command:
+        cmd: getenforce
+      register: selinux_current
+      changed_when: false
+
+    - name: Reject a fully disabled SELinux system
+      ansible.builtin.assert:
+        that:
+          - selinux_current.stdout != "Disabled"
+        fail_msg: >-
+          SELinux is disabled and cannot be enabled live. Set SELINUX=enforcing
+          and reboot the guest before applying this configuration.
+
+    - name: Persist enforcing mode
+      ansible.builtin.lineinfile:
+        path: /etc/selinux/config
+        regexp: ^SELINUX=
+        line: SELINUX=enforcing
+
+    - name: Enable enforcing mode now
+      ansible.builtin.command:
+        cmd: setenforce 1
+      when: selinux_current.stdout != "Enforcing"
+      changed_when: true
+
+    - name: Read the resulting SELinux mode
+      ansible.builtin.command:
+        cmd: getenforce
+      register: selinux_result
+      changed_when: false
+
+    - name: Verify enforcing mode
+      ansible.builtin.assert:
+        that:
+          - selinux_result.stdout == "Enforcing"
+        fail_msg: SELinux did not enter enforcing mode.

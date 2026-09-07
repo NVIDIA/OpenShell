@@ -10,9 +10,8 @@ use openshell_core::proto::{SandboxLogLine, SandboxStreamEvent};
 use openshell_ocsf::OCSF_TARGET;
 use tokio::sync::broadcast;
 use tracing::{Event, Subscriber};
+use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
-use tracing_subscriber::prelude::*;
-use tracing_subscriber::{EnvFilter, Layer};
 
 /// Bus that publishes server log lines keyed by sandbox id.
 #[derive(Debug, Clone)]
@@ -45,18 +44,11 @@ impl TracingLogBus {
         }
     }
 
-    /// Install a tracing subscriber that logs to stdout and publishes events into this bus.
-    pub fn install_subscriber(&self, env_filter: EnvFilter) {
-        let layer = SandboxLogLayer {
+    pub(crate) fn layer<S: Subscriber>(&self) -> impl Layer<S> {
+        SandboxLogLayer {
             bus: self.clone(),
             default_tail: Self::DEFAULT_TAIL,
-        };
-
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(tracing_subscriber::fmt::layer())
-            .with(layer)
-            .init();
+        }
     }
 
     fn sender_for(&self, sandbox_id: &str) -> broadcast::Sender<SandboxStreamEvent> {

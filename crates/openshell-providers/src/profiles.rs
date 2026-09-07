@@ -5,23 +5,34 @@
 
 #![allow(deprecated)] // NetworkBinary::harness remains in the public proto for compatibility.
 
+use openshell_core::mcp::{DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion};
 use openshell_core::proto::{
     GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
     NetworkEndpoint, NetworkPolicyRule, ProviderCredentialRefresh,
-    ProviderCredentialRefreshMaterial, ProviderCredentialRefreshStrategy, ProviderProfile,
-    ProviderProfileCategory, ProviderProfileCredential, ProviderProfileDiscovery,
+    ProviderCredentialRefreshMaterial, ProviderCredentialRefreshOutput,
+    ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantSubjectToken,
+    ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileCategory,
+    ProviderProfileCredential, ProviderProfileDiscovery,
 };
 use openshell_core::secrets::uses_reserved_revision_namespace;
+use openshell_policy::{
+    L7EndpointFields, L7Protocol, validate_explicit_tcp_additional_fields,
+    validate_l7_endpoint_semantics,
+};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::OnceLock;
 
 const PATH_TEMPLATE_CREDENTIAL_PLACEHOLDER: &str = "{credential}";
+const MCP_VERSION_REMEDIATION: &str = "omit mcp.versions to use the pinned default revision; use an exact supported revision; or omit protocol and mcp for deliberate uninspected L4 passthrough only when that weaker boundary is acceptable";
 
 const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
+    include_str!("../../../providers/aws.yaml"),
     include_str!("../../../providers/aws-bedrock.yaml"),
+    include_str!("../../../providers/aws-s3.yaml"),
+    include_str!("../../../providers/anthropic.yaml"),
     include_str!("../../../providers/claude-code.yaml"),
     include_str!("../../../providers/codex.yaml"),
     include_str!("../../../providers/copilot.yaml"),
@@ -31,6 +42,7 @@ const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
     include_str!("../../../providers/google-cloud.yaml"),
     include_str!("../../../providers/google-vertex-ai.yaml"),
     include_str!("../../../providers/nvidia.yaml"),
+    include_str!("../../../providers/openai.yaml"),
     include_str!("../../../providers/pypi.yaml"),
 ];
 
@@ -46,8 +58,21 @@ pub enum ProfileError {
     DuplicateId(String),
     #[error("provider profile '{id}' has invalid endpoint '{host}:{port}'")]
     InvalidEndpoint { id: String, host: String, port: u32 },
+    /// An MCP endpoint declared a malformed exact revision allowlist.
+    #[error("provider profile '{id}' has invalid MCP configuration in '{field}': {message}")]
+    InvalidMcpConfiguration {
+        id: String,
+        field: String,
+        message: String,
+    },
     #[error("provider profile '{id}' has duplicate credential env var '{env_var}'")]
     DuplicateCredentialEnvVar { id: String, env_var: String },
+    #[error("provider profile '{id}' validation error: {field}: {message}")]
+    ValidationError {
+        id: String,
+        field: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +126,13 @@ pub struct CredentialProfile {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TokenGrantProfile {
+    #[serde(
+        default = "default_token_grant_type",
+        deserialize_with = "deserialize_token_grant_type",
+        serialize_with = "serialize_token_grant_type",
+        skip_serializing_if = "is_client_credentials_grant"
+    )]
+    pub grant_type: ProviderCredentialTokenGrantType,
     pub token_endpoint: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub audience: String,
@@ -114,6 +146,18 @@ pub struct TokenGrantProfile {
     pub cache_ttl_seconds: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audience_overrides: Vec<TokenGrantAudienceOverrideProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_token: Option<TokenGrantSubjectTokenProfile>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub requested_token_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TokenGrantSubjectTokenProfile {
+    pub source: String,
+    pub credential: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subject_token_type: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -147,6 +191,11 @@ pub struct CredentialRefreshProfile {
     pub max_lifetime_seconds: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub material: Vec<CredentialRefreshMaterialProfile>,
+    /// Additional credentials this refresh mints beyond its primary credential.
+    /// Each entry maps a strategy-defined semantic output id to a sibling
+    /// credential whose `env_vars` receive the minted value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_outputs: Vec<CredentialRefreshOutputProfile>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -160,6 +209,14 @@ pub struct CredentialRefreshMaterialProfile {
     pub secret: bool,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CredentialRefreshOutputProfile {
+    /// Strategy-defined semantic output id (e.g. `session_token`).
+    pub output: String,
+    /// Sibling credential name whose `env_vars` receive this output.
+    pub credential: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DiscoveryProfile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -171,59 +228,249 @@ pub struct DiscoveryProfile {
 // is added to NetworkEndpoint, L7Rule, L7Allow, L7DenyRule, L7QueryMatcher,
 // GraphqlOperation, or NetworkBinary, add it here and in both conversion
 // directions unless the import/lint path explicitly rejects it.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Endpoint profile mirrors independent policy schema toggles."
+)]
 pub struct EndpointProfile {
     pub host: String,
-    #[serde(default, skip_serializing_if = "is_zero")]
     pub port: u32,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub protocol: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tls: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub access: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub enforcement: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rules: Vec<L7RuleProfile>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Option<Vec<L7RuleProfile>>,
     pub allowed_ips: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<u32>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub deny_rules: Vec<L7DenyRuleProfile>,
-    #[serde(default, skip_serializing_if = "is_false")]
+    pub deny_rules: Option<Vec<L7DenyRuleProfile>>,
     pub allow_encoded_slash: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
     pub websocket_credential_rewrite: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
     pub request_body_credential_rewrite: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub allow_uninspected_credentials: bool,
     pub persisted_queries: String,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub graphql_persisted_queries: HashMap<String, GraphqlOperationProfile>,
-    #[serde(default, skip_serializing_if = "is_zero")]
     pub graphql_max_body_bytes: u32,
-    #[serde(default, skip_serializing_if = "is_zero")]
     pub json_rpc_max_body_bytes: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// MCP-specific policy options for endpoints whose protocol is `mcp`.
+    ///
+    /// Omission materializes [`DEFAULT_MCP_PROTOCOL_VERSION`], while an
+    /// explicitly null value is rejected as an ambiguous authored contract.
+    /// Declaring an allowlist does not yet select or enforce a runtime wire
+    /// profile; later runtime configuration owns that boundary.
     pub mcp: Option<McpOptionsProfile>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub credential_signing: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub signing_service: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub signing_region: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+// EndpointProfile needs the complete endpoint before it can decide whether an
+// omitted MCP object is meaningful. Keep this remote Serde shape field-for-
+// field with EndpointProfile so every direct and nested parsing route applies
+// the same protocol-aware materialization after the wire shape is decoded.
+#[derive(Deserialize, Serialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Endpoint profile mirror preserves independent policy schema toggles."
+)]
+#[serde(remote = "EndpointProfile")]
+struct EndpointProfileSerde {
+    host: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    port: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    protocol: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    tls: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    access: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    enforcement: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rules: Option<Vec<L7RuleProfile>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    allowed_ips: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ports: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deny_rules: Option<Vec<L7DenyRuleProfile>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    allow_encoded_slash: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    websocket_credential_rewrite: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    request_body_credential_rewrite: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    allow_uninspected_credentials: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    persisted_queries: String,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    graphql_persisted_queries: HashMap<String, GraphqlOperationProfile>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    graphql_max_body_bytes: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    json_rpc_max_body_bytes: u32,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_mcp_options",
+        skip_serializing_if = "Option::is_none"
+    )]
+    mcp: Option<McpOptionsProfile>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    credential_signing: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    signing_service: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    signing_region: String,
+}
+
+impl<'de> Deserialize<'de> for EndpointProfile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut endpoint = EndpointProfileSerde::deserialize(deserializer)?;
+        materialize_mcp_endpoint_defaults(&mut endpoint);
+        Ok(endpoint)
+    }
+}
+
+impl Serialize for EndpointProfile {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut endpoint = self.clone();
+        materialize_mcp_endpoint_defaults(&mut endpoint);
+        EndpointProfileSerde::serialize(&endpoint, serializer)
+    }
+}
+
+/// Version-aware policy metadata for one MCP provider endpoint.
+///
+/// Omitted versions materialize the pinned `OpenShell` default. Explicit values
+/// must contain exact, supported, unique revisions, and deserialization stores
+/// them in canonical semantic order. Runtime profile selection and enforcement
+/// are deliberately outside this schema-only contract.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct McpOptionsProfile {
+    /// Exact MCP protocol revisions this provider endpoint permits.
+    ///
+    /// Omission selects [`DEFAULT_MCP_PROTOCOL_VERSION`]. An explicitly empty
+    /// authored list is rejected so a likely authoring mistake cannot silently
+    /// become the default.
+    #[serde(
+        default = "default_mcp_profile_versions",
+        deserialize_with = "deserialize_mcp_profile_versions",
+        serialize_with = "serialize_mcp_profile_versions"
+    )]
+    pub versions: Vec<String>,
+    /// Whether runtime inspection should enforce recommended MCP tool names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict_tool_names: Option<bool>,
+    /// Whether known MCP methods are allowed without explicit method rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_all_known_mcp_methods: Option<bool>,
+}
+
+impl Default for McpOptionsProfile {
+    fn default() -> Self {
+        Self {
+            versions: default_mcp_profile_versions(),
+            strict_tool_names: None,
+            allow_all_known_mcp_methods: None,
+        }
+    }
+}
+
+fn deserialize_non_null_mcp_options<'de, D>(
+    deserializer: D,
+) -> Result<Option<McpOptionsProfile>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<McpOptionsProfile>::deserialize(deserializer)?
+        .map(Some)
+        .ok_or_else(|| de::Error::custom("mcp must be an object when present"))
+}
+
+fn default_mcp_profile_versions() -> Vec<String> {
+    vec![DEFAULT_MCP_PROTOCOL_VERSION.as_str().to_string()]
+}
+
+fn validate_mcp_profile_versions(
+    values: &[String],
+) -> Result<BTreeSet<McpProtocolVersion>, String> {
+    if values.is_empty() {
+        return Err(
+            "mcp.versions must contain at least one supported protocol version".to_string(),
+        );
+    }
+
+    let mut versions = BTreeSet::new();
+    for value in values {
+        let version = value
+            .parse::<McpProtocolVersion>()
+            .map_err(|error| format!("{error}; {MCP_VERSION_REMEDIATION}"))?;
+        if !versions.insert(version) {
+            return Err(format!("duplicate MCP protocol version '{value}'"));
+        }
+    }
+
+    Ok(versions)
+}
+
+fn deserialize_mcp_profile_versions<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    let versions = validate_mcp_profile_versions(&values).map_err(de::Error::custom)?;
+    Ok(versions
+        .into_iter()
+        .map(|version| version.as_str().to_string())
+        .collect())
+}
+
+fn serialize_mcp_profile_versions<S>(values: &[String], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let default_versions;
+    let values = if values.is_empty() {
+        // Programmatic and protobuf callers cannot preserve authored field
+        // presence. Treat their empty representation as omission at the
+        // checked serialization boundary and emit the pinned explicit value.
+        default_versions = default_mcp_profile_versions();
+        default_versions.as_slice()
+    } else {
+        values
+    };
+    let versions =
+        validate_mcp_profile_versions(values).map_err(<S::Error as serde::ser::Error>::custom)?;
+    versions
+        .into_iter()
+        .map(McpProtocolVersion::as_str)
+        .collect::<Vec<_>>()
+        .serialize(serializer)
+}
+
+fn materialize_mcp_endpoint_defaults(endpoint: &mut EndpointProfile) {
+    if !is_mcp_protocol(&endpoint.protocol) {
+        return;
+    }
+
+    let options = endpoint.mcp.get_or_insert_with(McpOptionsProfile::default);
+    if options.versions.is_empty() {
+        // Empty protobuf and programmatic values cannot encode whether the
+        // author omitted the field. Normalize them to the same fixed contract
+        // as an omitted authored value before persistence or lowering.
+        options.versions = default_mcp_profile_versions();
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -248,6 +495,25 @@ pub struct L7AllowProfile {
     pub operation_name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub params: HashMap<String, L7QueryMatcherProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<L7QueryMatcherProfile>,
+}
+
+impl L7AllowProfile {
+    fn has_tool_selector(&self) -> bool {
+        self.params.contains_key("name") || self.tool.is_some()
+    }
+
+    fn is_effectively_empty(&self) -> bool {
+        self.method.is_empty()
+            && self.path.is_empty()
+            && self.command.is_empty()
+            && self.operation_type.is_empty()
+            && self.operation_name.is_empty()
+            && !self.has_tool_selector()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -266,14 +532,50 @@ pub struct L7DenyRuleProfile {
     pub operation_name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub params: HashMap<String, L7QueryMatcherProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<L7QueryMatcherProfile>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+impl L7DenyRuleProfile {
+    fn has_tool_selector(&self) -> bool {
+        self.params.contains_key("name") || self.tool.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct L7QueryMatcherProfile {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub glob: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub any: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for L7QueryMatcherProfile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StringOrObject {
+            Scalar(String),
+            Object {
+                #[serde(default)]
+                glob: String,
+                #[serde(default)]
+                any: Vec<String>,
+            },
+        }
+        match StringOrObject::deserialize(deserializer)? {
+            StringOrObject::Scalar(s) => Ok(Self {
+                glob: s,
+                any: vec![],
+            }),
+            StringOrObject::Object { glob, any } => Ok(Self { glob, any }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -297,6 +599,8 @@ pub struct ProviderTypeProfile {
     pub id: String,
     #[serde(default, skip_serializing_if = "is_u64_zero")]
     pub resource_version: u64,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub annotations: HashMap<String, String>,
     pub display_name: String,
     #[serde(default)]
     pub description: String,
@@ -316,6 +620,10 @@ pub struct ProviderTypeProfile {
     pub inference_capable: bool,
     #[serde(default, skip_serializing_if = "discovery_is_empty")]
     pub discovery: DiscoveryProfile,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope: String,
 }
 
 // Provider profile import/export is expected to be lossless for the network
@@ -328,6 +636,7 @@ impl ProviderTypeProfile {
         Self {
             id: profile.id.clone(),
             resource_version: profile.resource_version,
+            annotations: profile.annotations.clone(),
             display_name: profile.display_name.clone(),
             description: profile.description.clone(),
             category: ProviderProfileCategory::try_from(profile.category)
@@ -359,6 +668,8 @@ impl ProviderTypeProfile {
                 .as_ref()
                 .map(discovery_from_proto)
                 .unwrap_or_default(),
+            source: profile.source.clone(),
+            scope: profile.scope.clone(),
         }
     }
 
@@ -377,21 +688,98 @@ impl ProviderTypeProfile {
 
     /// Whether this profile can be created without initial static credentials.
     ///
-    /// Empty provider creation is allowed when at least one credential can be
-    /// resolved at runtime, and every required credential can be resolved at
-    /// runtime. Runtime-resolvable credentials are either gateway-mintable
-    /// refresh credentials or sandbox-side dynamic token grants.
+    /// Empty provider creation is allowed when every required credential can
+    /// be resolved at runtime. This includes profiles with no credentials and
+    /// profiles whose credentials are all optional.
     #[must_use]
     pub fn allows_empty_provider_credentials(&self) -> bool {
+        let co_minted = self.co_minted_credential_names();
+        self.credentials.iter().all(|credential| {
+            let is_runtime_resolvable =
+                credential.is_runtime_resolvable() || co_minted.contains(credential.name.as_str());
+            !credential.required || is_runtime_resolvable
+        })
+    }
+
+    /// Whether `--runtime-credentials` is meaningful for this profile.
+    ///
+    /// At least one credential must be runtime-resolvable and every required
+    /// credential must be resolvable without an initial static value.
+    #[must_use]
+    pub fn allows_runtime_provider_credentials(&self) -> bool {
+        let co_minted = self.co_minted_credential_names();
         let mut has_runtime_resolvable_credential = false;
         for credential in &self.credentials {
-            let is_runtime_resolvable = credential.is_runtime_resolvable();
+            let is_runtime_resolvable =
+                credential.is_runtime_resolvable() || co_minted.contains(credential.name.as_str());
             if credential.required && !is_runtime_resolvable {
                 return false;
             }
             has_runtime_resolvable_credential |= is_runtime_resolvable;
         }
         has_runtime_resolvable_credential
+    }
+
+    /// Required credentials that must have an initial static value.
+    #[must_use]
+    pub fn required_static_credentials(&self) -> Vec<&CredentialProfile> {
+        let co_minted = self.co_minted_credential_names();
+        self.credentials
+            .iter()
+            .filter(|credential| {
+                credential.required
+                    && !credential.is_runtime_resolvable()
+                    && !co_minted.contains(credential.name.as_str())
+            })
+            .collect()
+    }
+
+    /// Names of credentials produced as `additional_outputs` of a
+    /// gateway-mintable refresh on some other credential.
+    fn co_minted_credential_names(&self) -> HashSet<&str> {
+        self.credentials
+            .iter()
+            .filter_map(|credential| credential.refresh.as_ref())
+            .filter(|refresh| refresh.is_gateway_mintable())
+            .flat_map(|refresh| refresh.additional_outputs.iter())
+            .map(|output| output.credential.as_str())
+            .collect()
+    }
+
+    /// For the credential resolved by `credential_key` (matched by name or env
+    /// var) that carries a refresh with `additional_outputs`, resolve each
+    /// output to the concrete env key of its target credential. Returns a map
+    /// of semantic output id -> env key (empty when there is no such refresh or
+    /// no additional outputs). Skips outputs whose target credential is missing
+    /// or does not declare exactly one env var; `validate_profile_set` reports
+    /// those as errors.
+    #[must_use]
+    pub fn resolved_additional_output_keys(&self, credential_key: &str) -> HashMap<String, String> {
+        let Some(refresh) = self
+            .credentials
+            .iter()
+            .find(|credential| {
+                credential.name == credential_key
+                    || credential.env_vars.iter().any(|env| env == credential_key)
+            })
+            .and_then(|credential| credential.refresh.as_ref())
+        else {
+            return HashMap::new();
+        };
+        refresh
+            .additional_outputs
+            .iter()
+            .filter_map(|output| {
+                let target = self
+                    .credentials
+                    .iter()
+                    .find(|credential| credential.name == output.credential)?;
+                let [env_key] = target.env_vars.as_slice() else {
+                    return None;
+                };
+                Some((output.output.clone(), env_key.clone()))
+            })
+            .collect()
     }
 
     /// Returns the credential suitable for `--from-gcloud-adc` bootstrap, if any.
@@ -418,6 +806,7 @@ impl ProviderTypeProfile {
         ProviderProfile {
             id: self.id.clone(),
             resource_version: self.resource_version,
+            annotations: self.annotations.clone(),
             display_name: self.display_name.clone(),
             description: self.description.clone(),
             category: self.category as i32,
@@ -442,6 +831,8 @@ impl ProviderTypeProfile {
             inference_capable: self.inference_capable,
             discovery: (!discovery_is_empty(&self.discovery))
                 .then(|| discovery_to_proto(&self.discovery)),
+            source: self.source.clone(),
+            scope: self.scope.clone(),
         }
     }
 
@@ -453,6 +844,79 @@ impl ProviderTypeProfile {
             binaries: self.binaries.iter().map(binary_to_proto).collect(),
         }
     }
+
+    pub fn validate_before_lowering(&self, source: &str) -> Vec<ProfileValidationDiagnostic> {
+        let mut diagnostics = Vec::new();
+        for (index, endpoint) in self.endpoints.iter().enumerate() {
+            collect_mcp_profile_diagnostics(source, &self.id, index, endpoint, &mut diagnostics);
+            if endpoint.rules.as_ref().is_some_and(Vec::is_empty) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    &self.id,
+                    format!("endpoints[{index}]"),
+                    "rules list cannot be empty (would deny all traffic). \
+                     Use `access: full` or remove rules.",
+                ));
+            }
+            if endpoint.deny_rules.as_ref().is_some_and(Vec::is_empty) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    &self.id,
+                    format!("endpoints[{index}]"),
+                    "deny_rules list cannot be empty (would have no effect). \
+                     Remove it if no denials are needed.",
+                ));
+            }
+
+            if !is_mcp_protocol(&endpoint.protocol) {
+                continue;
+            }
+            if let Some(rules) = &endpoint.rules {
+                for (rule_idx, rule) in rules.iter().enumerate() {
+                    if rule
+                        .allow
+                        .as_ref()
+                        .is_some_and(|a| a.tool.is_some() && a.params.contains_key("name"))
+                    {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            &self.id,
+                            format!("endpoints[{index}].rules[{rule_idx}].allow"),
+                            "MCP rules must use either tool or params.name, not both",
+                        ));
+                    }
+                }
+            }
+            if let Some(deny_rules) = &endpoint.deny_rules {
+                for (deny_idx, deny_rule) in deny_rules.iter().enumerate() {
+                    if deny_rule.tool.is_some() && deny_rule.params.contains_key("name") {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            &self.id,
+                            format!("endpoints[{index}].deny_rules[{deny_idx}]"),
+                            "MCP rules must use either tool or params.name, not both",
+                        ));
+                    }
+                }
+            }
+        }
+        diagnostics
+    }
+
+    /// Whether attaching this profile makes its network endpoints credentialed.
+    ///
+    /// Profiles do not currently map individual credentials to individual
+    /// endpoints, so the safe interpretation is that any declared credential
+    /// can be used with every endpoint in the same profile. Endpoint signing is
+    /// also credential-bearing even when placement metadata is implicit.
+    #[must_use]
+    pub fn has_credentialed_endpoints(&self) -> bool {
+        !self.credentials.is_empty()
+            || self
+                .endpoints
+                .iter()
+                .any(|endpoint| !endpoint.credential_signing.trim().is_empty())
+    }
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -461,6 +925,21 @@ fn is_u64_zero(value: &u64) -> bool {
 }
 
 impl CredentialProfile {
+    /// Keys accepted when storing this credential on a provider.
+    ///
+    /// Workload-injectable credentials use their declared environment aliases.
+    /// Broker-only credentials have no environment aliases and use their
+    /// logical profile name instead.
+    #[must_use]
+    pub fn accepted_stored_keys(&self) -> Vec<&str> {
+        if self.env_vars.is_empty() {
+            let name = self.name.trim();
+            return (!name.is_empty()).then_some(name).into_iter().collect();
+        }
+
+        self.env_vars.iter().map(String::as_str).collect()
+    }
+
     #[must_use]
     pub fn is_runtime_resolvable(&self) -> bool {
         self.token_grant.is_some()
@@ -474,12 +953,73 @@ impl CredentialProfile {
 impl CredentialRefreshProfile {
     #[must_use]
     pub fn is_gateway_mintable(&self) -> bool {
-        matches!(
-            self.strategy,
-            ProviderCredentialRefreshStrategy::Oauth2RefreshToken
-                | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
-                | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
-        )
+        is_gateway_mintable_strategy(self.strategy)
+    }
+}
+
+/// Whether the gateway can mint credentials for this refresh strategy (as
+/// opposed to strategies resolved elsewhere, e.g. `Static`/`External`).
+///
+/// Single source of truth shared with `openshell-server`; keep in sync with the
+/// dispatch in `provider_refresh::mint_credential`.
+#[must_use]
+pub fn is_gateway_mintable_strategy(strategy: ProviderCredentialRefreshStrategy) -> bool {
+    matches!(
+        strategy,
+        ProviderCredentialRefreshStrategy::Oauth2RefreshToken
+            | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
+            | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
+            | ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+    )
+}
+
+/// Semantic output ids a refresh strategy can produce **in addition** to its
+/// primary credential, split into required and optional.
+///
+/// Drives `additional_outputs` validation. Strategies not listed here produce
+/// only a single (primary) credential and reject any `additional_outputs`.
+#[must_use]
+pub fn strategy_output_spec(
+    strategy: ProviderCredentialRefreshStrategy,
+) -> (&'static [&'static str], &'static [&'static str]) {
+    match strategy {
+        ProviderCredentialRefreshStrategy::AwsStsAssumeRole => {
+            (&["secret_access_key", "session_token"], &[])
+        }
+        _ => (&[], &[]),
+    }
+}
+
+/// Expected primary env key for strategies that constrain it, or `None` when the
+/// strategy accepts any caller-chosen primary key.
+///
+/// AWS `SigV4` signing looks up `AWS_ACCESS_KEY_ID` by name, so STS pins the
+/// primary key.
+#[must_use]
+pub fn strategy_primary_env_key(
+    strategy: ProviderCredentialRefreshStrategy,
+) -> Option<&'static str> {
+    match strategy {
+        ProviderCredentialRefreshStrategy::AwsStsAssumeRole => Some("AWS_ACCESS_KEY_ID"),
+        _ => None,
+    }
+}
+
+/// Expected concrete env key for a given strategy output, when the strategy
+/// constrains it (the `SigV4` signer resolves these by name).
+#[must_use]
+pub fn strategy_output_env_key(
+    strategy: ProviderCredentialRefreshStrategy,
+    output: &str,
+) -> Option<&'static str> {
+    match (strategy, output) {
+        (ProviderCredentialRefreshStrategy::AwsStsAssumeRole, "secret_access_key") => {
+            Some("AWS_SECRET_ACCESS_KEY")
+        }
+        (ProviderCredentialRefreshStrategy::AwsStsAssumeRole, "session_token") => {
+            Some("AWS_SESSION_TOKEN")
+        }
+        _ => None,
     }
 }
 
@@ -557,6 +1097,26 @@ fn default_refresh_strategy() -> ProviderCredentialRefreshStrategy {
     ProviderCredentialRefreshStrategy::Unspecified
 }
 
+fn default_token_grant_type() -> ProviderCredentialTokenGrantType {
+    ProviderCredentialTokenGrantType::ClientCredentials
+}
+
+fn effective_token_grant_type(
+    grant_type: ProviderCredentialTokenGrantType,
+) -> ProviderCredentialTokenGrantType {
+    match grant_type {
+        ProviderCredentialTokenGrantType::Unspecified => {
+            ProviderCredentialTokenGrantType::ClientCredentials
+        }
+        other => other,
+    }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_client_credentials_grant(value: &ProviderCredentialTokenGrantType) -> bool {
+    effective_token_grant_type(*value) == ProviderCredentialTokenGrantType::ClientCredentials
+}
+
 fn deserialize_category<'de, D>(deserializer: D) -> Result<ProviderProfileCategory, D::Error>
 where
     D: Deserializer<'de>,
@@ -599,6 +1159,28 @@ where
     serializer.serialize_str(provider_refresh_strategy_to_yaml(*strategy))
 }
 
+fn deserialize_token_grant_type<'de, D>(
+    deserializer: D,
+) -> Result<ProviderCredentialTokenGrantType, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    provider_token_grant_type_from_yaml(&raw)
+        .ok_or_else(|| de::Error::custom(format!("unsupported provider token grant type: {raw}")))
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn serialize_token_grant_type<S>(
+    grant_type: &ProviderCredentialTokenGrantType,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(provider_token_grant_type_to_yaml(*grant_type))
+}
+
 #[must_use]
 pub fn provider_profile_category_from_yaml(raw: &str) -> Option<ProviderProfileCategory> {
     match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
@@ -639,6 +1221,7 @@ pub fn provider_refresh_strategy_from_yaml(raw: &str) -> Option<ProviderCredenti
         "google_service_account_jwt" => {
             Some(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
         }
+        "aws_sts_assume_role" => Some(ProviderCredentialRefreshStrategy::AwsStsAssumeRole),
         _ => None,
     }
 }
@@ -653,7 +1236,28 @@ pub fn provider_refresh_strategy_to_yaml(
         ProviderCredentialRefreshStrategy::Oauth2RefreshToken => "oauth2_refresh_token",
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
+        ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
+    }
+}
+
+#[must_use]
+pub fn provider_token_grant_type_from_yaml(raw: &str) -> Option<ProviderCredentialTokenGrantType> {
+    match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "" | "client_credentials" => Some(ProviderCredentialTokenGrantType::ClientCredentials),
+        "token_exchange" => Some(ProviderCredentialTokenGrantType::TokenExchange),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub fn provider_token_grant_type_to_yaml(
+    grant_type: ProviderCredentialTokenGrantType,
+) -> &'static str {
+    match grant_type {
+        ProviderCredentialTokenGrantType::TokenExchange => "token_exchange",
+        ProviderCredentialTokenGrantType::ClientCredentials
+        | ProviderCredentialTokenGrantType::Unspecified => "client_credentials",
     }
 }
 
@@ -673,6 +1277,14 @@ fn credential_refresh_from_proto(refresh: &ProviderCredentialRefresh) -> Credent
                 description: material.description.clone(),
                 required: material.required,
                 secret: material.secret,
+            })
+            .collect(),
+        additional_outputs: refresh
+            .additional_outputs
+            .iter()
+            .map(|output| CredentialRefreshOutputProfile {
+                output: output.output.clone(),
+                credential: output.credential.clone(),
             })
             .collect(),
     }
@@ -695,6 +1307,14 @@ fn credential_refresh_to_proto(refresh: &CredentialRefreshProfile) -> ProviderCr
                 secret: material.secret,
             })
             .collect(),
+        additional_outputs: refresh
+            .additional_outputs
+            .iter()
+            .map(|output| ProviderCredentialRefreshOutput {
+                output: output.output.clone(),
+                credential: output.credential.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -702,6 +1322,10 @@ fn token_grant_from_proto(
     token_grant: &openshell_core::proto::ProviderCredentialTokenGrant,
 ) -> TokenGrantProfile {
     TokenGrantProfile {
+        grant_type: effective_token_grant_type(
+            ProviderCredentialTokenGrantType::try_from(token_grant.grant_type)
+                .unwrap_or(ProviderCredentialTokenGrantType::ClientCredentials),
+        ),
         token_endpoint: token_grant.token_endpoint.clone(),
         audience: token_grant.audience.clone(),
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
@@ -713,6 +1337,11 @@ fn token_grant_from_proto(
             .iter()
             .map(token_grant_audience_override_from_proto)
             .collect(),
+        subject_token: token_grant
+            .subject_token
+            .as_ref()
+            .map(token_grant_subject_token_from_proto),
+        requested_token_type: token_grant.requested_token_type.clone(),
     }
 }
 
@@ -720,6 +1349,7 @@ fn token_grant_to_proto(
     token_grant: &TokenGrantProfile,
 ) -> openshell_core::proto::ProviderCredentialTokenGrant {
     openshell_core::proto::ProviderCredentialTokenGrant {
+        grant_type: token_grant.grant_type as i32,
         token_endpoint: token_grant.token_endpoint.clone(),
         audience: token_grant.audience.clone(),
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
@@ -731,6 +1361,31 @@ fn token_grant_to_proto(
             .iter()
             .map(token_grant_audience_override_to_proto)
             .collect(),
+        subject_token: token_grant
+            .subject_token
+            .as_ref()
+            .map(token_grant_subject_token_to_proto),
+        requested_token_type: token_grant.requested_token_type.clone(),
+    }
+}
+
+fn token_grant_subject_token_from_proto(
+    subject_token: &ProviderCredentialTokenGrantSubjectToken,
+) -> TokenGrantSubjectTokenProfile {
+    TokenGrantSubjectTokenProfile {
+        source: subject_token.source.clone(),
+        credential: subject_token.credential.clone(),
+        subject_token_type: subject_token.subject_token_type.clone(),
+    }
+}
+
+fn token_grant_subject_token_to_proto(
+    subject_token: &TokenGrantSubjectTokenProfile,
+) -> ProviderCredentialTokenGrantSubjectToken {
+    ProviderCredentialTokenGrantSubjectToken {
+        source: subject_token.source.clone(),
+        credential: subject_token.credential.clone(),
+        subject_token_type: subject_token.subject_token_type.clone(),
     }
 }
 
@@ -778,13 +1433,27 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         tls: endpoint.tls.clone(),
         enforcement: endpoint.enforcement.clone(),
         access: endpoint.access.clone(),
-        rules: endpoint.rules.iter().map(rule_to_proto).collect(),
+        rules: endpoint
+            .rules
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(rule_to_proto)
+            .collect(),
         allowed_ips: endpoint.allowed_ips.clone(),
         ports: endpoint.ports.clone(),
-        deny_rules: endpoint.deny_rules.iter().map(deny_rule_to_proto).collect(),
+        deny_rules: endpoint
+            .deny_rules
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(deny_rule_to_proto)
+            .collect(),
         allow_encoded_slash: endpoint.allow_encoded_slash,
         websocket_credential_rewrite: endpoint.websocket_credential_rewrite,
         request_body_credential_rewrite: endpoint.request_body_credential_rewrite,
+        allow_uninspected_credentials: endpoint.allow_uninspected_credentials,
+        provider_credentialed: false,
         advisor_proposed: false,
         persisted_queries: endpoint.persisted_queries.clone(),
         graphql_persisted_queries: endpoint
@@ -794,33 +1463,47 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
             .collect(),
         graphql_max_body_bytes: endpoint.graphql_max_body_bytes,
         json_rpc_max_body_bytes: endpoint.json_rpc_max_body_bytes,
-        mcp: endpoint.mcp.as_ref().map(mcp_options_to_proto),
+        mcp: endpoint_mcp_options_to_proto(endpoint),
         path: endpoint.path.clone(),
         credential_signing: endpoint.credential_signing.clone(),
         signing_service: endpoint.signing_service.clone(),
         signing_region: endpoint.signing_region.clone(),
+        // Credential bindings reference a concrete sandbox provider instance
+        // and therefore cannot be authored by a reusable provider profile.
+        credential_binding: None,
     }
 }
 
 fn endpoint_from_proto(endpoint: &NetworkEndpoint) -> EndpointProfile {
-    EndpointProfile {
+    let mut profile = EndpointProfile {
         host: endpoint.host.clone(),
         port: endpoint.port,
         protocol: endpoint.protocol.clone(),
         tls: endpoint.tls.clone(),
         access: endpoint.access.clone(),
         enforcement: endpoint.enforcement.clone(),
-        rules: endpoint.rules.iter().map(rule_from_proto).collect(),
+        rules: if endpoint.rules.is_empty() {
+            None
+        } else {
+            Some(endpoint.rules.iter().map(rule_from_proto).collect())
+        },
         allowed_ips: endpoint.allowed_ips.clone(),
         ports: endpoint.ports.clone(),
-        deny_rules: endpoint
-            .deny_rules
-            .iter()
-            .map(deny_rule_from_proto)
-            .collect(),
+        deny_rules: if endpoint.deny_rules.is_empty() {
+            None
+        } else {
+            Some(
+                endpoint
+                    .deny_rules
+                    .iter()
+                    .map(deny_rule_from_proto)
+                    .collect(),
+            )
+        },
         allow_encoded_slash: endpoint.allow_encoded_slash,
         websocket_credential_rewrite: endpoint.websocket_credential_rewrite,
         request_body_credential_rewrite: endpoint.request_body_credential_rewrite,
+        allow_uninspected_credentials: endpoint.allow_uninspected_credentials,
         persisted_queries: endpoint.persisted_queries.clone(),
         graphql_persisted_queries: endpoint
             .graphql_persisted_queries
@@ -829,26 +1512,68 @@ fn endpoint_from_proto(endpoint: &NetworkEndpoint) -> EndpointProfile {
             .collect(),
         graphql_max_body_bytes: endpoint.graphql_max_body_bytes,
         json_rpc_max_body_bytes: endpoint.json_rpc_max_body_bytes,
-        mcp: endpoint.mcp.map(mcp_options_from_proto),
+        mcp: endpoint.mcp.as_ref().map(mcp_options_from_proto),
         path: endpoint.path.clone(),
         credential_signing: endpoint.credential_signing.clone(),
         signing_service: endpoint.signing_service.clone(),
         signing_region: endpoint.signing_region.clone(),
+    };
+    materialize_mcp_endpoint_defaults(&mut profile);
+    profile
+}
+
+fn endpoint_mcp_options_to_proto(endpoint: &EndpointProfile) -> Option<McpOptions> {
+    match endpoint.mcp.as_ref() {
+        Some(options) => Some(mcp_options_to_proto(options)),
+        None if is_mcp_protocol(&endpoint.protocol) => {
+            Some(mcp_options_to_proto(&McpOptionsProfile::default()))
+        }
+        None => None,
     }
 }
 
 fn mcp_options_to_proto(options: &McpOptionsProfile) -> McpOptions {
+    let mut versions = options.versions.clone();
+    materialize_and_canonicalize_mcp_profile_versions(&mut versions);
     McpOptions {
+        versions,
         strict_tool_names: options.strict_tool_names,
         allow_all_known_mcp_methods: options.allow_all_known_mcp_methods,
     }
 }
 
-fn mcp_options_from_proto(options: McpOptions) -> McpOptionsProfile {
+fn mcp_options_from_proto(options: &McpOptions) -> McpOptionsProfile {
+    let mut versions = options.versions.clone();
+    materialize_and_canonicalize_mcp_profile_versions(&mut versions);
     McpOptionsProfile {
+        versions,
         strict_tool_names: options.strict_tool_names,
         allow_all_known_mcp_methods: options.allow_all_known_mcp_methods,
     }
+}
+
+fn materialize_and_canonicalize_mcp_profile_versions(versions: &mut Vec<String>) {
+    if versions.is_empty() {
+        *versions = default_mcp_profile_versions();
+    } else {
+        canonicalize_mcp_profile_versions(versions);
+    }
+}
+
+fn canonicalize_mcp_profile_versions(versions: &mut [String]) {
+    // Preserve unsupported and duplicate values so subsequent validation can
+    // reject them; sorting must never repair malformed protobuf input.
+    versions.sort_by(|left, right| {
+        match (
+            left.parse::<McpProtocolVersion>(),
+            right.parse::<McpProtocolVersion>(),
+        ) {
+            (Ok(left), Ok(right)) => left.cmp(&right),
+            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+            (Err(_), Err(_)) => left.cmp(right),
+        }
+    });
 }
 
 fn binary_to_proto(binary: &BinaryProfile) -> NetworkBinary {
@@ -877,7 +1602,65 @@ fn rule_from_proto(rule: &L7Rule) -> L7RuleProfile {
     }
 }
 
+fn glob_uses_wildcard(s: &str) -> bool {
+    s.contains('*') || s.contains('?') || s.contains('[') || s.contains('{')
+}
+
+fn matcher_uses_glob_wildcard(matcher: &L7QueryMatcherProfile) -> bool {
+    glob_uses_wildcard(&matcher.glob) || matcher.any.iter().any(|s| glob_uses_wildcard(s))
+}
+
+fn validate_mcp_matcher(
+    diagnostics: &mut Vec<ProfileValidationDiagnostic>,
+    source: &str,
+    profile_id: &str,
+    field: &str,
+    matcher: &L7QueryMatcherProfile,
+    strict_tool_names: bool,
+) {
+    if !matcher.glob.is_empty() && !matcher.any.is_empty() {
+        diagnostics.push(ProfileValidationDiagnostic::error(
+            source,
+            profile_id,
+            field.to_string(),
+            "matcher cannot specify both glob and any",
+        ));
+    }
+    if matcher.glob.is_empty() && matcher.any.is_empty() {
+        diagnostics.push(ProfileValidationDiagnostic::error(
+            source,
+            profile_id,
+            field.to_string(),
+            "matcher must specify glob or any",
+        ));
+    }
+    if !strict_tool_names && matcher_uses_glob_wildcard(matcher) {
+        diagnostics.push(ProfileValidationDiagnostic::error(
+            source,
+            profile_id,
+            field.to_string(),
+            "wildcard tool-name matchers require mcp.strict_tool_names to remain enabled",
+        ));
+    }
+}
+
+fn method_matcher_matches_tools_call(method: &str) -> bool {
+    method == "tools/call"
+        || method == "*"
+        || glob::Pattern::new(method).is_ok_and(|pattern| pattern.matches("tools/call"))
+}
+
 fn allow_to_proto(allow: &L7AllowProfile) -> L7Allow {
+    let mut params: HashMap<String, L7QueryMatcher> = allow
+        .params
+        .iter()
+        .map(|(name, matcher)| (name.clone(), query_matcher_to_proto(matcher)))
+        .collect();
+    if let Some(tool) = &allow.tool {
+        params
+            .entry("name".to_string())
+            .or_insert_with(|| query_matcher_to_proto(tool));
+    }
     L7Allow {
         method: allow.method.clone(),
         path: allow.path.clone(),
@@ -890,7 +1673,7 @@ fn allow_to_proto(allow: &L7AllowProfile) -> L7Allow {
         operation_type: allow.operation_type.clone(),
         operation_name: allow.operation_name.clone(),
         fields: allow.fields.clone(),
-        params: HashMap::new(),
+        params,
     }
 }
 
@@ -907,10 +1690,26 @@ fn allow_from_proto(allow: &L7Allow) -> L7AllowProfile {
         operation_type: allow.operation_type.clone(),
         operation_name: allow.operation_name.clone(),
         fields: allow.fields.clone(),
+        params: allow
+            .params
+            .iter()
+            .map(|(name, matcher)| (name.clone(), query_matcher_from_proto(matcher)))
+            .collect(),
+        tool: None,
     }
 }
 
 fn deny_rule_to_proto(rule: &L7DenyRuleProfile) -> L7DenyRule {
+    let mut params: HashMap<String, L7QueryMatcher> = rule
+        .params
+        .iter()
+        .map(|(name, matcher)| (name.clone(), query_matcher_to_proto(matcher)))
+        .collect();
+    if let Some(tool) = &rule.tool {
+        params
+            .entry("name".to_string())
+            .or_insert_with(|| query_matcher_to_proto(tool));
+    }
     L7DenyRule {
         method: rule.method.clone(),
         path: rule.path.clone(),
@@ -923,7 +1722,7 @@ fn deny_rule_to_proto(rule: &L7DenyRuleProfile) -> L7DenyRule {
         operation_type: rule.operation_type.clone(),
         operation_name: rule.operation_name.clone(),
         fields: rule.fields.clone(),
-        params: HashMap::new(),
+        params,
     }
 }
 
@@ -940,6 +1739,12 @@ fn deny_rule_from_proto(rule: &L7DenyRule) -> L7DenyRuleProfile {
         operation_type: rule.operation_type.clone(),
         operation_name: rule.operation_name.clone(),
         fields: rule.fields.clone(),
+        params: rule
+            .params
+            .iter()
+            .map(|(name, matcher)| (name.clone(), query_matcher_from_proto(matcher)))
+            .collect(),
+        tool: None,
     }
 }
 
@@ -1009,6 +1814,10 @@ pub fn parse_profile_catalog_yamls(
     Ok(profiles)
 }
 
+fn is_mcp_diagnostic_field(field: &str) -> bool {
+    field.split('.').any(|segment| segment == "mcp")
+}
+
 fn validate_profiles(profiles: &[ProviderTypeProfile]) -> Result<(), ProfileError> {
     let diagnostics = validate_profile_set(
         &profiles
@@ -1016,45 +1825,56 @@ fn validate_profiles(profiles: &[ProviderTypeProfile]) -> Result<(), ProfileErro
             .map(|profile| (String::new(), profile.clone()))
             .collect::<Vec<_>>(),
     );
-    if let Some(diagnostic) = diagnostics.first() {
-        if diagnostic.field == "id" && diagnostic.message == "provider profile id is required" {
-            return Err(ProfileError::MissingId);
-        }
-        if diagnostic.field == "id"
-            && diagnostic
-                .message
-                .starts_with("duplicate provider profile id")
-        {
-            return Err(ProfileError::DuplicateId(diagnostic.profile_id.clone()));
-        }
-        if diagnostic.field.starts_with("credentials.env_vars") {
-            return Err(ProfileError::DuplicateCredentialEnvVar {
-                id: diagnostic.profile_id.clone(),
-                env_var: diagnostic
-                    .message
-                    .trim_start_matches("duplicate credential env var '")
-                    .trim_end_matches('\'')
-                    .to_string(),
-            });
-        }
-        if diagnostic.field.starts_with("endpoints")
-            && let Some(profile) = profiles
-                .iter()
-                .find(|profile| profile.id == diagnostic.profile_id)
-            && let Some(endpoint) = profile
-                .endpoints
-                .iter()
-                .find(|endpoint| !endpoint_is_valid(endpoint))
-        {
-            return Err(ProfileError::InvalidEndpoint {
-                id: profile.id.clone(),
-                host: endpoint.host.clone(),
-                port: endpoint.port,
-            });
-        }
+    let Some(diagnostic) = diagnostics.first() else {
+        return Ok(());
+    };
+    if diagnostic.field == "id" && diagnostic.message == "provider profile id is required" {
+        return Err(ProfileError::MissingId);
     }
-
-    Ok(())
+    if diagnostic.field == "id"
+        && diagnostic
+            .message
+            .starts_with("duplicate provider profile id")
+    {
+        return Err(ProfileError::DuplicateId(diagnostic.profile_id.clone()));
+    }
+    if diagnostic.field.starts_with("credentials.env_vars") {
+        return Err(ProfileError::DuplicateCredentialEnvVar {
+            id: diagnostic.profile_id.clone(),
+            env_var: diagnostic
+                .message
+                .trim_start_matches("duplicate credential env var '")
+                .trim_end_matches('\'')
+                .to_string(),
+        });
+    }
+    if is_mcp_diagnostic_field(&diagnostic.field) {
+        return Err(ProfileError::InvalidMcpConfiguration {
+            id: diagnostic.profile_id.clone(),
+            field: diagnostic.field.clone(),
+            message: diagnostic.message.clone(),
+        });
+    }
+    if diagnostic.field.starts_with("endpoints")
+        && let Some(profile) = profiles
+            .iter()
+            .find(|profile| profile.id == diagnostic.profile_id)
+        && let Some(endpoint) = profile
+            .endpoints
+            .iter()
+            .find(|endpoint| !endpoint_is_valid(endpoint))
+    {
+        return Err(ProfileError::InvalidEndpoint {
+            id: profile.id.clone(),
+            host: endpoint.host.clone(),
+            port: endpoint.port,
+        });
+    }
+    Err(ProfileError::ValidationError {
+        id: diagnostic.profile_id.clone(),
+        field: diagnostic.field.clone(),
+        message: diagnostic.message.clone(),
+    })
 }
 
 #[must_use]
@@ -1157,6 +1977,10 @@ pub fn validate_profile_set(
                 ));
             }
         }
+
+        diagnostics.extend(validate_broker_only_subject_credentials(
+            source, profile_id, profile,
+        ));
 
         let mut env_vars = HashSet::new();
         for credential in &profile.credentials {
@@ -1287,6 +2111,136 @@ pub fn validate_profile_set(
                         ));
                     }
                 }
+
+                let strategy_name = provider_refresh_strategy_to_yaml(refresh.strategy);
+                let (required_outputs, optional_outputs) = strategy_output_spec(refresh.strategy);
+                let known_outputs: HashSet<&str> = required_outputs
+                    .iter()
+                    .chain(optional_outputs.iter())
+                    .copied()
+                    .collect();
+
+                if known_outputs.is_empty() && !refresh.additional_outputs.is_empty() {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.refresh.additional_outputs",
+                        format!("strategy {strategy_name} does not support additional_outputs"),
+                    ));
+                }
+
+                let mut seen_outputs = HashSet::new();
+                let mut mapped_required = HashSet::new();
+                for output in &refresh.additional_outputs {
+                    let output_id = output.output.trim();
+                    let cred_name = output.credential.trim();
+
+                    if output_id.is_empty() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.additional_outputs.output",
+                            "refresh additional output id is required",
+                        ));
+                        continue;
+                    }
+                    if !seen_outputs.insert(output_id.to_string()) {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.additional_outputs.output",
+                            format!("duplicate refresh additional output: {output_id}"),
+                        ));
+                    }
+                    if known_outputs.contains(output_id) {
+                        if required_outputs.contains(&output_id) {
+                            mapped_required.insert(output_id.to_string());
+                        }
+                    } else if !known_outputs.is_empty() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.additional_outputs.output",
+                            format!(
+                                "strategy {strategy_name} does not produce output '{output_id}'"
+                            ),
+                        ));
+                    }
+
+                    let Some(sibling) = profile.credentials.iter().find(|c| c.name == cred_name)
+                    else {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.additional_outputs.credential",
+                            format!(
+                                "refresh additional output '{output_id}' references unknown credential '{cred_name}'"
+                            ),
+                        ));
+                        continue;
+                    };
+                    if sibling.refresh.is_some() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.additional_outputs.credential",
+                            format!(
+                                "credential '{cred_name}' is a refresh output and must not declare its own refresh"
+                            ),
+                        ));
+                    }
+                    if sibling.env_vars.len() != 1 {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.additional_outputs.credential",
+                            format!(
+                                "refresh output credential '{cred_name}' must declare exactly one env var"
+                            ),
+                        ));
+                        continue;
+                    }
+                    let resolved = sibling.env_vars[0].as_str();
+                    if let Some(expected) = strategy_output_env_key(refresh.strategy, output_id)
+                        && resolved != expected
+                    {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.additional_outputs.credential",
+                            format!(
+                                "refresh output '{output_id}' must map to env var {expected}, found {resolved}"
+                            ),
+                        ));
+                    }
+                }
+
+                for required in required_outputs {
+                    if !mapped_required.contains(*required) {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.additional_outputs",
+                            format!(
+                                "strategy {strategy_name} requires additional output '{required}'"
+                            ),
+                        ));
+                    }
+                }
+
+                if let Some(expected_primary) = strategy_primary_env_key(refresh.strategy)
+                    && (credential.env_vars.len() != 1
+                        || credential.env_vars[0] != expected_primary)
+                {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.env_vars",
+                        format!(
+                            "strategy {strategy_name} requires primary credential to map to env var {expected_primary}"
+                        ),
+                    ));
+                }
             }
 
             if let Some(token_grant) = credential.token_grant.as_ref()
@@ -1299,6 +2253,12 @@ pub fn validate_profile_set(
                     message,
                 ));
             }
+            diagnostics.extend(validate_token_grant_subject_token(
+                source,
+                profile_id,
+                credential,
+                &credential_names,
+            ));
             diagnostics.extend(validate_token_grant_audience_overrides(
                 source,
                 profile_id,
@@ -1336,6 +2296,367 @@ pub fn validate_profile_set(
                     format!("invalid endpoint '{}:{}'", endpoint.host, endpoint.port),
                 ));
             }
+            collect_mcp_profile_diagnostics(source, profile_id, index, endpoint, &mut diagnostics);
+
+            if endpoint.rules.as_ref().is_some_and(Vec::is_empty) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}]"),
+                    "rules list cannot be empty (would deny all traffic). Use `access: full` or remove rules.",
+                ));
+            }
+
+            if endpoint.deny_rules.as_ref().is_some_and(Vec::is_empty) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}]"),
+                    "deny_rules list cannot be empty (would have no effect). Remove it if no denials are needed.",
+                ));
+            }
+
+            let l7_fields = L7EndpointFields {
+                protocol: &endpoint.protocol,
+                access: &endpoint.access,
+                has_rules: endpoint.rules.as_ref().is_some_and(|r| !r.is_empty()),
+                has_deny_rules: endpoint.deny_rules.as_ref().is_some_and(|r| !r.is_empty()),
+                rules_would_deny_all: endpoint.rules.as_ref().is_some_and(|r| {
+                    !r.is_empty()
+                        && r.iter().all(|rule| {
+                            rule.allow
+                                .as_ref()
+                                .is_none_or(L7AllowProfile::is_effectively_empty)
+                        })
+                }),
+                allow_all_known_mcp_methods: endpoint
+                    .mcp
+                    .as_ref()
+                    .and_then(|opts| opts.allow_all_known_mcp_methods)
+                    .unwrap_or(false),
+            };
+            for msg in validate_l7_endpoint_semantics(&l7_fields) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}]"),
+                    msg,
+                ));
+            }
+            for msg in validate_explicit_tcp_additional_fields(
+                &endpoint.protocol,
+                &additional_l7_profile_fields(endpoint),
+            ) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}]"),
+                    msg,
+                ));
+            }
+
+            if is_mcp_protocol(&endpoint.protocol) {
+                let strict_tool_names = endpoint
+                    .mcp
+                    .as_ref()
+                    .and_then(|opts| opts.strict_tool_names)
+                    .unwrap_or(true);
+
+                if let Some(rules) = &endpoint.rules {
+                    for (rule_idx, rule) in rules.iter().enumerate() {
+                        if let Some(allow) = &rule.allow {
+                            let allow_loc = format!("endpoints[{index}].rules[{rule_idx}].allow");
+                            if allow.tool.is_some() && allow.params.contains_key("name") {
+                                diagnostics.push(ProfileValidationDiagnostic::error(
+                                    source,
+                                    profile_id,
+                                    &allow_loc,
+                                    "MCP rules must use either tool or params.name, not both",
+                                ));
+                            }
+                            if allow.has_tool_selector()
+                                && !allow.method.is_empty()
+                                && allow.method != "tools/call"
+                            {
+                                diagnostics.push(ProfileValidationDiagnostic::error(
+                                    source,
+                                    profile_id,
+                                    &allow_loc,
+                                    "method must be tools/call when an MCP rule uses \
+                                     tool or params.name",
+                                ));
+                            }
+                            if allow.method.is_empty() && !l7_fields.allow_all_known_mcp_methods {
+                                diagnostics.push(ProfileValidationDiagnostic::error(
+                                    source,
+                                    profile_id,
+                                    &allow_loc,
+                                    "method is required when \
+                                     mcp.allow_all_known_mcp_methods is false",
+                                ));
+                            }
+                            if glob_uses_wildcard(&allow.method)
+                                && !allow.method.starts_with("tools/")
+                            {
+                                diagnostics.push(ProfileValidationDiagnostic::error(
+                                    source,
+                                    profile_id,
+                                    format!("{allow_loc}.method"),
+                                    "MCP method globs are only valid for the tools/ \
+                                     method family; omit method to use the endpoint \
+                                     method profile",
+                                ));
+                            }
+                            if !allow.path.is_empty() || !allow.query.is_empty() {
+                                diagnostics.push(ProfileValidationDiagnostic::error(
+                                    source,
+                                    profile_id,
+                                    &allow_loc,
+                                    "mcp L7 rules must use method/tool, not path/query",
+                                ));
+                            }
+                            for key in allow.params.keys() {
+                                if key != "name" {
+                                    diagnostics.push(ProfileValidationDiagnostic::error(
+                                        source,
+                                        profile_id,
+                                        format!("{allow_loc}.params.{key}"),
+                                        "MCP tool argument matching is not supported yet",
+                                    ));
+                                }
+                            }
+                            if let Some(tool) = &allow.tool {
+                                validate_mcp_matcher(
+                                    &mut diagnostics,
+                                    source,
+                                    profile_id,
+                                    &format!("{allow_loc}.tool"),
+                                    tool,
+                                    strict_tool_names,
+                                );
+                            }
+                            if let Some(params_name) = allow.params.get("name") {
+                                validate_mcp_matcher(
+                                    &mut diagnostics,
+                                    source,
+                                    profile_id,
+                                    &format!("{allow_loc}.params.name"),
+                                    params_name,
+                                    strict_tool_names,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if let Some(deny_rules) = &endpoint.deny_rules {
+                    for (deny_idx, deny_rule) in deny_rules.iter().enumerate() {
+                        let deny_loc = format!("endpoints[{index}].deny_rules[{deny_idx}]");
+                        if deny_rule.tool.is_some() && deny_rule.params.contains_key("name") {
+                            diagnostics.push(ProfileValidationDiagnostic::error(
+                                source,
+                                profile_id,
+                                &deny_loc,
+                                "MCP rules must use either tool or params.name, not both",
+                            ));
+                        }
+                        if deny_rule.has_tool_selector()
+                            && !deny_rule.method.is_empty()
+                            && deny_rule.method != "tools/call"
+                        {
+                            diagnostics.push(ProfileValidationDiagnostic::error(
+                                source,
+                                profile_id,
+                                &deny_loc,
+                                "method must be tools/call when an MCP rule uses \
+                                 tool or params.name",
+                            ));
+                        }
+                        if deny_rule.method.is_empty() && !l7_fields.allow_all_known_mcp_methods {
+                            diagnostics.push(ProfileValidationDiagnostic::error(
+                                source,
+                                profile_id,
+                                &deny_loc,
+                                "method is required when \
+                                 mcp.allow_all_known_mcp_methods is false",
+                            ));
+                        }
+                        if glob_uses_wildcard(&deny_rule.method)
+                            && !deny_rule.method.starts_with("tools/")
+                        {
+                            diagnostics.push(ProfileValidationDiagnostic::error(
+                                source,
+                                profile_id,
+                                format!("{deny_loc}.method"),
+                                "MCP method globs are only valid for the tools/ \
+                                 method family; omit method to use the endpoint \
+                                 method profile",
+                            ));
+                        }
+                        if !deny_rule.path.is_empty() || !deny_rule.query.is_empty() {
+                            diagnostics.push(ProfileValidationDiagnostic::error(
+                                source,
+                                profile_id,
+                                &deny_loc,
+                                "mcp L7 rules must use method/tool, not path/query",
+                            ));
+                        }
+                        for key in deny_rule.params.keys() {
+                            if key != "name" {
+                                diagnostics.push(ProfileValidationDiagnostic::error(
+                                    source,
+                                    profile_id,
+                                    format!("{deny_loc}.params.{key}"),
+                                    "MCP tool argument matching is not supported yet",
+                                ));
+                            }
+                        }
+                        if let Some(tool) = &deny_rule.tool {
+                            validate_mcp_matcher(
+                                &mut diagnostics,
+                                source,
+                                profile_id,
+                                &format!("{deny_loc}.tool"),
+                                tool,
+                                strict_tool_names,
+                            );
+                        }
+                        if let Some(params_name) = deny_rule.params.get("name") {
+                            validate_mcp_matcher(
+                                &mut diagnostics,
+                                source,
+                                profile_id,
+                                &format!("{deny_loc}.params.name"),
+                                params_name,
+                                strict_tool_names,
+                            );
+                        }
+                    }
+                }
+
+                let has_tool_allow_selectors = endpoint.rules.as_ref().is_some_and(|r| {
+                    r.iter().any(|rule| {
+                        rule.allow
+                            .as_ref()
+                            .is_some_and(L7AllowProfile::has_tool_selector)
+                    })
+                });
+
+                if has_tool_allow_selectors {
+                    if let Some(rules) = &endpoint.rules {
+                        for (rule_idx, rule) in rules.iter().enumerate() {
+                            if let Some(allow) = &rule.allow {
+                                if !allow.has_tool_selector() {
+                                    let method = allow.method.as_str();
+                                    if method_matcher_matches_tools_call(method)
+                                        || (method.is_empty()
+                                            && l7_fields.allow_all_known_mcp_methods)
+                                    {
+                                        diagnostics.push(ProfileValidationDiagnostic::error(
+                                            source,
+                                            profile_id,
+                                            format!("endpoints[{index}].rules[{rule_idx}].allow"),
+                                            "method matcher allows every tool call and conflicts \
+                                             with MCP tool allow rules; add tool or params.name \
+                                             to narrow tools/call, or remove the tool allow rules",
+                                        ));
+                                    }
+                                }
+                            } else if l7_fields.allow_all_known_mcp_methods {
+                                diagnostics.push(ProfileValidationDiagnostic::error(
+                                    source,
+                                    profile_id,
+                                    format!("endpoints[{index}].rules[{rule_idx}].allow"),
+                                    "method matcher allows every tool call and conflicts \
+                                     with MCP tool allow rules; add tool or params.name \
+                                     to narrow tools/call, or remove the tool allow rules",
+                                ));
+                            }
+                        }
+                    }
+
+                    if let Some(deny_rules) = &endpoint.deny_rules {
+                        for (deny_idx, deny_rule) in deny_rules.iter().enumerate() {
+                            if !deny_rule.has_tool_selector()
+                                && method_matcher_matches_tools_call(&deny_rule.method)
+                            {
+                                diagnostics.push(ProfileValidationDiagnostic::error(
+                                    source,
+                                    profile_id,
+                                    format!("endpoints[{index}].deny_rules[{deny_idx}]"),
+                                    "method matcher denies every tool call and conflicts \
+                                     with MCP tool allow rules; add tool or params.name to \
+                                     deny specific tools, or remove the tool allow rules",
+                                ));
+                            }
+                        }
+                    }
+                }
+            } else {
+                if let Some(rules) = &endpoint.rules {
+                    for (rule_idx, rule) in rules.iter().enumerate() {
+                        if let Some(allow) = &rule.allow {
+                            if allow.tool.is_some() {
+                                diagnostics.push(ProfileValidationDiagnostic::error(
+                                    source,
+                                    profile_id,
+                                    format!("endpoints[{index}].rules[{rule_idx}].allow.tool"),
+                                    "MCP tool matching is only valid for protocol mcp",
+                                ));
+                            }
+                            if !allow.params.is_empty() {
+                                diagnostics.push(ProfileValidationDiagnostic::error(
+                                    source,
+                                    profile_id,
+                                    format!("endpoints[{index}].rules[{rule_idx}].allow.params"),
+                                    "params matching is only valid for protocol mcp",
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Some(deny_rules) = &endpoint.deny_rules {
+                    for (deny_idx, deny_rule) in deny_rules.iter().enumerate() {
+                        if deny_rule.tool.is_some() {
+                            diagnostics.push(ProfileValidationDiagnostic::error(
+                                source,
+                                profile_id,
+                                format!("endpoints[{index}].deny_rules[{deny_idx}].tool"),
+                                "MCP tool matching is only valid for protocol mcp",
+                            ));
+                        }
+                        if !deny_rule.params.is_empty() {
+                            diagnostics.push(ProfileValidationDiagnostic::error(
+                                source,
+                                profile_id,
+                                format!("endpoints[{index}].deny_rules[{deny_idx}].params"),
+                                "params matching is only valid for protocol mcp",
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if profile.has_credentialed_endpoints()
+                && !endpoint.allow_uninspected_credentials
+                && (endpoint.protocol.trim().is_empty()
+                    || endpoint.tls.trim().eq_ignore_ascii_case("skip"))
+            {
+                let mode = if endpoint.protocol.trim().is_empty() {
+                    "L4-only"
+                } else {
+                    "tls: skip"
+                };
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}].allow_uninspected_credentials"),
+                    format!(
+                        "credentialed endpoint '{}:{}' uses {mode}; configure L7 inspection or explicitly set allow_uninspected_credentials: true",
+                        endpoint.host, endpoint.port
+                    ),
+                ));
+            }
         }
 
         for (index, binary) in profile.binaries.iter().enumerate() {
@@ -1352,6 +2673,66 @@ pub fn validate_profile_set(
     diagnostics
 }
 
+fn collect_mcp_profile_diagnostics(
+    source: &str,
+    profile_id: &str,
+    endpoint_index: usize,
+    endpoint: &EndpointProfile,
+    diagnostics: &mut Vec<ProfileValidationDiagnostic>,
+) {
+    let mcp_field = format!("endpoints[{endpoint_index}].mcp");
+    if !is_mcp_protocol(&endpoint.protocol) {
+        if endpoint.mcp.is_some() {
+            diagnostics.push(ProfileValidationDiagnostic::error(
+                source,
+                profile_id,
+                mcp_field,
+                "mcp options are only valid for protocol mcp",
+            ));
+        }
+        return;
+    }
+
+    let Some(options) = endpoint.mcp.as_ref() else {
+        // Programmatic callers may construct the pre-materialized shape.
+        // Lowering and serialization bind it to the pinned default.
+        return;
+    };
+    if options.versions.is_empty() {
+        // Protobuf repeated fields collapse omission and explicit emptiness.
+        // The conversion boundary materializes both as the pinned default.
+        return;
+    }
+
+    let versions_field = format!("{mcp_field}.versions");
+    let mut seen = HashSet::new();
+    for version in &options.versions {
+        if !seen.insert(version.as_str()) {
+            diagnostics.push(ProfileValidationDiagnostic::error(
+                source,
+                profile_id,
+                versions_field.clone(),
+                format!("duplicate MCP protocol version '{version}'"),
+            ));
+        }
+        if version.parse::<McpProtocolVersion>().is_err() {
+            diagnostics.push(ProfileValidationDiagnostic::error(
+                source,
+                profile_id,
+                versions_field.clone(),
+                format!("unsupported MCP protocol version '{version}'; {MCP_VERSION_REMEDIATION}"),
+            ));
+        }
+    }
+}
+
+// Protocol parsing is case-insensitive throughout the shared policy schema.
+// Provider validation must use the same predicate so preflight and lowering
+// cannot disagree about whether the MCP options are required or misplaced.
+fn is_mcp_protocol(protocol: &str) -> bool {
+    matches!(L7Protocol::parse(protocol), Some(L7Protocol::Mcp))
+}
+
 fn endpoint_is_valid(endpoint: &EndpointProfile) -> bool {
     if endpoint.host.trim().is_empty() {
         return false;
@@ -1365,6 +2746,49 @@ fn endpoint_is_valid(endpoint: &EndpointProfile) -> bool {
     (1..=65_535).contains(&endpoint.port)
 }
 
+fn additional_l7_profile_fields(endpoint: &EndpointProfile) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    for (name, present) in [
+        ("enforcement", !endpoint.enforcement.is_empty()),
+        ("path", !endpoint.path.is_empty()),
+        ("allow_encoded_slash", endpoint.allow_encoded_slash),
+        (
+            "websocket_credential_rewrite",
+            endpoint.websocket_credential_rewrite,
+        ),
+        (
+            "request_body_credential_rewrite",
+            endpoint.request_body_credential_rewrite,
+        ),
+        ("persisted_queries", !endpoint.persisted_queries.is_empty()),
+        (
+            "graphql_persisted_queries",
+            !endpoint.graphql_persisted_queries.is_empty(),
+        ),
+        (
+            "graphql_max_body_bytes",
+            endpoint.graphql_max_body_bytes > 0,
+        ),
+        (
+            "json_rpc_max_body_bytes",
+            endpoint.json_rpc_max_body_bytes > 0,
+        ),
+        ("mcp", endpoint.mcp.is_some()),
+        (
+            "credential_signing",
+            !endpoint.credential_signing.is_empty(),
+        ),
+        ("signing_service", !endpoint.signing_service.is_empty()),
+        ("signing_region", !endpoint.signing_region.is_empty()),
+    ] {
+        if present {
+            fields.push(name);
+        }
+    }
+
+    fields
+}
+
 #[derive(Debug, Clone)]
 struct TokenGrantOverrideBinding {
     override_index: usize,
@@ -1372,6 +2796,133 @@ struct TokenGrantOverrideBinding {
     port: u32,
     path: String,
     score: u32,
+}
+
+fn validate_token_grant_subject_token(
+    source: &str,
+    profile_id: &str,
+    credential: &CredentialProfile,
+    credential_names: &HashSet<String>,
+) -> Vec<ProfileValidationDiagnostic> {
+    let Some(token_grant) = credential.token_grant.as_ref() else {
+        return Vec::new();
+    };
+    let grant_type = effective_token_grant_type(token_grant.grant_type);
+    let mut diagnostics = Vec::new();
+
+    match grant_type {
+        ProviderCredentialTokenGrantType::ClientCredentials => {
+            if token_grant.subject_token.is_some() {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.token_grant.subject_token",
+                    "subject_token is only valid for token_exchange grants",
+                ));
+            }
+        }
+        ProviderCredentialTokenGrantType::TokenExchange => {
+            let Some(subject_token) = token_grant.subject_token.as_ref() else {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.token_grant.subject_token",
+                    "token_exchange grants require subject_token",
+                ));
+                return diagnostics;
+            };
+
+            let source_value = subject_token.source.trim();
+            if source_value != "provider_credential" {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.token_grant.subject_token.source",
+                    "subject_token.source must be provider_credential",
+                ));
+            }
+
+            let subject_credential = subject_token.credential.trim();
+            if subject_credential.is_empty() {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.token_grant.subject_token.credential",
+                    "subject_token.credential is required",
+                ));
+            } else if !credential_names.contains(subject_credential) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.token_grant.subject_token.credential",
+                    format!("unknown subject token credential: {subject_credential}"),
+                ));
+            }
+        }
+        ProviderCredentialTokenGrantType::Unspecified => {
+            unreachable!("effective_token_grant_type must normalize unspecified token grant type")
+        }
+    }
+
+    diagnostics
+}
+
+fn validate_broker_only_subject_credentials(
+    source: &str,
+    profile_id: &str,
+    profile: &ProviderTypeProfile,
+) -> Vec<ProfileValidationDiagnostic> {
+    let subject_credentials = token_exchange_subject_credential_names(profile);
+    if subject_credentials.is_empty() {
+        return Vec::new();
+    }
+
+    let mut diagnostics = Vec::new();
+    for credential in &profile.credentials {
+        let credential_name = credential.name.trim();
+        if !subject_credentials.contains(credential_name) {
+            continue;
+        }
+        if credential_has_workload_injection_metadata(credential) {
+            diagnostics.push(ProfileValidationDiagnostic::error(
+                source,
+                profile_id,
+                "credentials.token_grant.subject_token.credential",
+                format!(
+                    "subject token credential '{credential_name}' is broker-only and cannot declare workload injection metadata"
+                ),
+            ));
+        }
+    }
+    diagnostics
+}
+
+fn token_exchange_subject_credential_names(profile: &ProviderTypeProfile) -> HashSet<&str> {
+    profile
+        .credentials
+        .iter()
+        .filter_map(|credential| credential.token_grant.as_ref())
+        .filter(|token_grant| {
+            effective_token_grant_type(token_grant.grant_type)
+                == ProviderCredentialTokenGrantType::TokenExchange
+        })
+        .filter_map(|token_grant| token_grant.subject_token.as_ref())
+        .filter(|subject_token| subject_token.source.trim() == "provider_credential")
+        .filter_map(|subject_token| {
+            let credential = subject_token.credential.trim();
+            (!credential.is_empty()).then_some(credential)
+        })
+        .collect()
+}
+
+fn credential_has_workload_injection_metadata(credential: &CredentialProfile) -> bool {
+    !credential.env_vars.is_empty()
+        || !credential.auth_style.trim().is_empty()
+        || !credential.header_name.trim().is_empty()
+        || !credential.query_param.trim().is_empty()
+        || !credential.path_template.trim().is_empty()
+        || credential.refresh.is_some()
+        || credential.token_grant.is_some()
 }
 
 fn validate_token_grant_audience_overrides(
@@ -1589,16 +3140,7 @@ fn path_prefix_pattern(path: &str) -> Option<&str> {
 }
 
 fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
-    if path_matches_all(pattern) {
-        return true;
-    }
-    if pattern == path {
-        return true;
-    }
-    if let Some(prefix) = path_prefix_pattern(pattern) {
-        return path == prefix || path.starts_with(&format!("{prefix}/"));
-    }
-    glob::Pattern::new(pattern).is_ok_and(|glob| glob.matches(path))
+    openshell_core::endpoint_path::matches(pattern, path)
 }
 
 fn validate_token_grant_endpoint(token_endpoint: &str) -> Result<(), String> {
@@ -1696,11 +3238,11 @@ fn is_kubernetes_service_host(host: &str) -> bool {
     (is_service_name || is_cluster_local_service) && labels.iter().all(|label| !label.is_empty())
 }
 
-static DEFAULT_PROFILES: OnceLock<Vec<ProviderTypeProfile>> = OnceLock::new();
+static BUILTIN_PROFILES: OnceLock<Vec<ProviderTypeProfile>> = OnceLock::new();
 
 #[must_use]
-pub fn default_profiles() -> &'static [ProviderTypeProfile] {
-    DEFAULT_PROFILES
+pub fn builtin_profiles() -> &'static [ProviderTypeProfile] {
+    BUILTIN_PROFILES
         .get_or_init(|| {
             parse_profile_catalog_yamls(BUILT_IN_PROFILE_YAMLS)
                 .expect("built-in provider profiles must be valid YAML")
@@ -1708,26 +3250,30 @@ pub fn default_profiles() -> &'static [ProviderTypeProfile] {
         .as_slice()
 }
 
-#[must_use]
-pub fn get_default_profile(id: &str) -> Option<&'static ProviderTypeProfile> {
-    default_profiles()
-        .iter()
-        .find(|profile| profile.id.eq_ignore_ascii_case(id))
-}
-
 #[cfg(test)]
 mod tests {
-    use openshell_core::proto::ProviderProfileCategory;
+    use std::collections::HashMap;
+
+    use openshell_core::mcp::{DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion};
+    use openshell_core::proto::{ProviderCredentialTokenGrantType, ProviderProfileCategory};
 
     use super::{
-        DiscoveryProfile, ProfileError, ProviderTypeProfile, default_profiles, get_default_profile,
-        normalize_profile_id, parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml,
-        profile_to_json, profile_to_yaml, validate_profile_set,
+        DiscoveryProfile, EndpointProfile, L7AllowProfile, L7QueryMatcherProfile, ProfileError,
+        ProviderTypeProfile, builtin_profiles, is_mcp_diagnostic_field, normalize_profile_id,
+        parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml, profile_to_json,
+        profile_to_yaml, profiles_to_json, profiles_to_yaml, validate_profile_set,
     };
 
+    fn builtin_profile(id: &str) -> &'static ProviderTypeProfile {
+        builtin_profiles()
+            .iter()
+            .find(|profile| profile.id == id)
+            .unwrap_or_else(|| panic!("built-in profile {id} should exist"))
+    }
+
     #[test]
-    fn default_profiles_are_sorted_by_id() {
-        let ids = default_profiles()
+    fn builtin_profiles_are_sorted_by_id() {
+        let ids = builtin_profiles()
             .iter()
             .map(|profile| profile.id.as_str())
             .collect::<Vec<_>>();
@@ -1738,7 +3284,7 @@ mod tests {
 
     #[test]
     fn github_profile_materializes_policy_metadata() {
-        let profile = get_default_profile("github").expect("github profile");
+        let profile = builtin_profile("github");
         let proto = profile.to_proto();
 
         assert_eq!(proto.id, "github");
@@ -1757,18 +3303,84 @@ mod tests {
             "github profile should include read-only GraphQL endpoint"
         );
         assert!(
-            proto
-                .endpoints
-                .iter()
-                .all(|endpoint| endpoint.access == "read-only"),
-            "github profile endpoints should all be read-only"
+            proto.endpoints.iter().all(|endpoint| {
+                // The REST/GraphQL API endpoints stay read-only. The git
+                // transport endpoint (github.com) carries explicit rules
+                // instead so it can allow clone/fetch while blocking push.
+                if endpoint.host == "github.com" {
+                    endpoint.access.is_empty()
+                } else {
+                    endpoint.access == "read-only"
+                }
+            }),
+            "github API endpoints should be read-only; git transport uses explicit rules"
         );
         assert_eq!(proto.binaries.len(), 4);
     }
 
     #[test]
+    fn github_git_transport_allows_clone_but_not_push() {
+        let profile = builtin_profile("github");
+        let proto = profile.to_proto();
+
+        let git_transport = proto
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.host == "github.com" && endpoint.port == 443)
+            .expect("github.com git transport endpoint");
+
+        // The git transport carries explicit rules rather than an access preset
+        // (an empty preset would otherwise expand to GET/HEAD/OPTIONS).
+        assert!(
+            git_transport.access.is_empty(),
+            "git transport must use explicit rules, not an access preset"
+        );
+
+        // Assert the EXACT allowed rule set. Clone/fetch over git smart HTTP
+        // performs GET */info/refs (ref discovery) followed by POST
+        // */git-upload-pack. A substring check alone is not enough: a broader or
+        // additional POST rule (e.g. POST **) would also permit push via
+        // git-receive-pack while still passing a "some rule allows upload-pack"
+        // check. Pinning the whole set fails on any such regression. See #1769.
+        let mut allowed: Vec<(&str, &str)> = git_transport
+            .rules
+            .iter()
+            .map(|rule| {
+                let allow = rule
+                    .allow
+                    .as_ref()
+                    .expect("git transport rules must be allow rules");
+                (allow.method.as_str(), allow.path.as_str())
+            })
+            .collect();
+        allowed.sort_unstable();
+
+        let mut expected = vec![
+            ("GET", "**"),
+            ("HEAD", "**"),
+            ("OPTIONS", "**"),
+            ("POST", "/**/git-upload-pack"),
+        ];
+        expected.sort_unstable();
+
+        assert_eq!(
+            allowed, expected,
+            "git transport allow rules must be exactly the read-only methods \
+             plus POST */git-upload-pack (clone/fetch); a broader or extra POST \
+             rule would enable push (git-receive-pack)"
+        );
+
+        // Blocking push must not depend on a deny rule, which could mask an
+        // over-broad allow and hide a regression.
+        assert!(
+            git_transport.deny_rules.is_empty(),
+            "git transport should block push via its narrow allow set, not deny rules"
+        );
+    }
+
+    #[test]
     fn credential_env_vars_are_deduplicated_in_profile_order() {
-        let profile = get_default_profile("claude-code").expect("claude-code profile");
+        let profile = builtin_profile("claude-code");
         assert_eq!(
             profile.credential_env_vars(),
             vec!["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"]
@@ -1776,8 +3388,33 @@ mod tests {
     }
 
     #[test]
+    fn accepted_stored_keys_use_logical_name_for_broker_only_credentials() {
+        let profile = parse_profile_yaml(
+            r"
+id: token-exchange
+display_name: Token Exchange
+credentials:
+  - name: subject_token
+    required: true
+  - name: access_token
+    env_vars: [ACCESS_TOKEN, ACCESS_TOKEN_FALLBACK]
+",
+        )
+        .expect("profile");
+
+        assert_eq!(
+            profile.credentials[0].accepted_stored_keys(),
+            vec!["subject_token"]
+        );
+        assert_eq!(
+            profile.credentials[1].accepted_stored_keys(),
+            vec!["ACCESS_TOKEN", "ACCESS_TOKEN_FALLBACK"]
+        );
+    }
+
+    #[test]
     fn vertex_profile_declares_discovery_and_fallback_token_env_vars() {
-        let profile = get_default_profile("google-vertex-ai").expect("vertex profile");
+        let profile = builtin_profile("google-vertex-ai");
         let service_account_token = profile
             .credentials
             .iter()
@@ -1814,8 +3451,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_provider_credentials_require_a_runtime_resolvable_path_and_no_required_static_credentials()
-     {
+    fn empty_provider_credentials_require_no_required_static_credentials() {
         let optional_refresh_profile = parse_profile_yaml(
             r"
 id: optional-refresh
@@ -1829,6 +3465,7 @@ credentials:
         )
         .expect("profile");
         assert!(optional_refresh_profile.allows_empty_provider_credentials());
+        assert!(optional_refresh_profile.allows_runtime_provider_credentials());
 
         let token_grant_profile = parse_profile_yaml(
             r"
@@ -1843,6 +3480,7 @@ credentials:
         )
         .expect("profile");
         assert!(token_grant_profile.allows_empty_provider_credentials());
+        assert!(token_grant_profile.allows_runtime_provider_credentials());
 
         let mixed_required_profile = parse_profile_yaml(
             r"
@@ -1859,6 +3497,7 @@ credentials:
         )
         .expect("profile");
         assert!(!mixed_required_profile.allows_empty_provider_credentials());
+        assert!(!mixed_required_profile.allows_runtime_provider_credentials());
 
         let static_only_profile = parse_profile_yaml(
             r"
@@ -1870,18 +3509,32 @@ credentials:
 ",
         )
         .expect("profile");
-        assert!(!static_only_profile.allows_empty_provider_credentials());
+        assert!(static_only_profile.allows_empty_provider_credentials());
+        assert!(!static_only_profile.allows_runtime_provider_credentials());
+
+        let policy_only_profile = parse_profile_yaml(
+            r"
+id: policy-only
+display_name: Policy Only
+endpoints:
+  - host: example.com
+    port: 443
+",
+        )
+        .expect("profile");
+        assert!(policy_only_profile.allows_empty_provider_credentials());
+        assert!(!policy_only_profile.allows_runtime_provider_credentials());
     }
 
     #[test]
     fn adc_credential_returns_oauth2_refresh_token_credential_with_adc_material() {
-        let profile = get_default_profile("google-cloud").expect("google-cloud profile");
+        let profile = builtin_profile("google-cloud");
         let adc = profile
             .adc_credential()
             .expect("google-cloud should have an ADC credential");
         assert_eq!(adc.env_vars[0], "GCP_ADC_ACCESS_TOKEN");
 
-        let profile = get_default_profile("google-vertex-ai").expect("vertex profile");
+        let profile = builtin_profile("google-vertex-ai");
         let adc = profile
             .adc_credential()
             .expect("vertex should have an ADC credential");
@@ -1890,10 +3543,10 @@ credentials:
 
     #[test]
     fn adc_credential_returns_none_for_profiles_without_adc() {
-        let profile = get_default_profile("github").expect("github profile");
+        let profile = builtin_profile("github");
         assert!(profile.adc_credential().is_none());
 
-        let profile = get_default_profile("claude-code").expect("claude-code profile");
+        let profile = builtin_profile("claude-code");
         assert!(profile.adc_credential().is_none());
     }
 
@@ -1982,9 +3635,9 @@ discovery:
     }
 
     #[test]
-    fn mcp_endpoint_strict_tool_names_round_trips_through_proto_and_yaml() {
+    fn mcp_endpoint_contract_round_trips_through_policy_proto_and_yaml() {
         let profile = parse_profile_yaml(
-            r"
+            r#"
 id: mcp-example
 display_name: MCP Example
 endpoints:
@@ -1993,21 +3646,64 @@ endpoints:
     path: /mcp
     protocol: mcp
     mcp:
+      versions: ["2025-11-25", "2025-03-26", "2025-06-18"]
       strict_tool_names: false
 binaries:
   - /usr/bin/example-agent
-",
+"#,
         )
         .expect("profile should parse");
 
+        let expected_versions = ["2025-03-26", "2025-06-18", "2025-11-25"];
         assert_eq!(
             profile.endpoints[0]
                 .mcp
                 .as_ref()
-                .and_then(|options| options.strict_tool_names),
-            Some(false)
+                .expect("MCP options")
+                .versions,
+            expected_versions
         );
-        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        let mut proto = profile.to_proto();
+        assert_eq!(
+            proto.endpoints[0]
+                .mcp
+                .as_ref()
+                .expect("MCP options")
+                .versions,
+            expected_versions
+        );
+        proto.endpoints[0]
+            .mcp
+            .as_mut()
+            .expect("MCP options")
+            .versions
+            .reverse();
+        assert_eq!(
+            profile.network_policy_rule("provider").endpoints[0]
+                .mcp
+                .as_ref()
+                .expect("MCP options")
+                .versions,
+            expected_versions
+        );
+
+        let from_proto = ProviderTypeProfile::from_proto(&proto);
+        assert_eq!(
+            from_proto.endpoints[0]
+                .mcp
+                .as_ref()
+                .expect("MCP options")
+                .versions,
+            expected_versions
+        );
+        assert_eq!(
+            from_proto.to_proto().endpoints[0]
+                .mcp
+                .as_ref()
+                .expect("MCP options")
+                .versions,
+            expected_versions
+        );
         assert_eq!(
             from_proto.endpoints[0]
                 .mcp
@@ -2018,7 +3714,668 @@ binaries:
 
         let exported = profile_to_yaml(&from_proto).expect("yaml");
         assert!(exported.contains("mcp:"));
+        let positions = expected_versions.map(|version| {
+            exported
+                .find(version)
+                .expect("serialized version must be present")
+        });
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(exported.contains("strict_tool_names: false"));
+    }
+
+    fn mcp_profile_for_serialization() -> ProviderTypeProfile {
+        parse_profile_yaml(
+            r#"
+id: mcp-example
+display_name: MCP Example
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ["2025-03-26", "2025-11-25"]
+"#,
+        )
+        .expect("valid MCP profile")
+    }
+
+    #[test]
+    fn provider_serializers_canonicalize_programmatic_mcp_versions() {
+        let mut profile = mcp_profile_for_serialization();
+        profile.endpoints[0]
+            .mcp
+            .as_mut()
+            .expect("MCP options")
+            .versions
+            .reverse();
+
+        let outputs = [
+            profile_to_yaml(&profile).expect("single YAML"),
+            profile_to_json(&profile).expect("single JSON"),
+            profiles_to_yaml(std::slice::from_ref(&profile)).expect("catalog YAML"),
+            profiles_to_json(std::slice::from_ref(&profile)).expect("catalog JSON"),
+        ];
+
+        for output in outputs {
+            let legacy = output.find("2025-03-26").expect("legacy revision");
+            let current = output.find("2025-11-25").expect("current revision");
+            assert!(
+                legacy < current,
+                "serialized revisions were not canonical: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_serializers_reject_invalid_programmatic_mcp_versions() {
+        let mut profile = mcp_profile_for_serialization();
+
+        for invalid in [
+            vec!["2025-03-26".to_string(), "2025-03-26".to_string()],
+            vec!["latest".to_string()],
+        ] {
+            profile.endpoints[0]
+                .mcp
+                .as_mut()
+                .expect("MCP options")
+                .versions = invalid;
+
+            assert!(profile_to_yaml(&profile).is_err());
+            assert!(profile_to_json(&profile).is_err());
+            assert!(profiles_to_yaml(std::slice::from_ref(&profile)).is_err());
+            assert!(profiles_to_json(std::slice::from_ref(&profile)).is_err());
+        }
+    }
+
+    #[test]
+    fn provider_boundaries_materialize_programmatic_and_protobuf_empty_versions() {
+        let mut profile = mcp_profile_for_serialization();
+        profile.endpoints[0]
+            .mcp
+            .as_mut()
+            .expect("MCP options")
+            .versions
+            .clear();
+
+        let expected = [DEFAULT_MCP_PROTOCOL_VERSION.as_str()];
+        assert!(
+            profile
+                .validate_before_lowering("programmatic-empty.yaml")
+                .iter()
+                .all(|diagnostic| !is_mcp_diagnostic_field(&diagnostic.field)),
+            "programmatic emptiness must use the pinned default"
+        );
+        let yaml = profile_to_yaml(&profile).expect("single YAML");
+        let json = profile_to_json(&profile).expect("single JSON");
+        for reparsed in [
+            parse_profile_yaml(&yaml).expect("materialized YAML must parse"),
+            parse_profile_json(&json).expect("materialized JSON must parse"),
+        ] {
+            assert_eq!(
+                reparsed.endpoints[0]
+                    .mcp
+                    .as_ref()
+                    .expect("MCP options")
+                    .versions,
+                expected
+            );
+        }
+        for output in [
+            yaml,
+            json,
+            profiles_to_yaml(std::slice::from_ref(&profile)).expect("catalog YAML"),
+            profiles_to_json(std::slice::from_ref(&profile)).expect("catalog JSON"),
+        ] {
+            assert!(output.contains("versions"));
+            assert!(output.contains(DEFAULT_MCP_PROTOCOL_VERSION.as_str()));
+        }
+
+        let proto = profile.to_proto();
+        assert_eq!(
+            proto.endpoints[0]
+                .mcp
+                .as_ref()
+                .expect("MCP options")
+                .versions,
+            expected
+        );
+
+        let mut proto_with_empty_versions = proto;
+        proto_with_empty_versions.endpoints[0]
+            .mcp
+            .as_mut()
+            .expect("MCP options")
+            .versions
+            .clear();
+        let from_proto = ProviderTypeProfile::from_proto(&proto_with_empty_versions);
+        assert_eq!(
+            from_proto.endpoints[0]
+                .mcp
+                .as_ref()
+                .expect("materialized MCP options")
+                .versions,
+            expected
+        );
+    }
+
+    #[test]
+    fn mcp_allow_params_round_trips_through_proto() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-params
+display_name: MCP Params
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          params:
+            name:
+              glob: read_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let rules = profile.endpoints[0].rules.as_ref().expect("rules present");
+        assert_eq!(rules.len(), 1);
+        let allow = rules[0].allow.as_ref().expect("allow present");
+        assert!(
+            allow.params.contains_key("name"),
+            "params.name should be set"
+        );
+
+        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        let rt_rules = from_proto.endpoints[0]
+            .rules
+            .as_ref()
+            .expect("rules survive proto round-trip");
+        assert_eq!(rt_rules.len(), 1);
+        let rt_allow = rt_rules[0]
+            .allow
+            .as_ref()
+            .expect("allow survives proto round-trip");
+        assert!(
+            rt_allow.params.contains_key("name"),
+            "params.name should survive proto round-trip"
+        );
+    }
+
+    #[test]
+    fn mcp_endpoint_profile_direct_serde_materializes_and_emits_the_pinned_default() {
+        let endpoint_yaml = r"
+host: mcp.example.com
+port: 443
+protocol: mcp
+";
+        let endpoint = serde_yml::from_str::<EndpointProfile>(endpoint_yaml)
+            .expect("direct endpoint omission must default");
+        let yaml_vector = serde_yml::from_str::<Vec<EndpointProfile>>(&format!(
+            "- {}",
+            endpoint_yaml.trim_start().replace('\n', "\n  ")
+        ))
+        .expect("YAML endpoint vector omission must default");
+        let json_vector = serde_json::from_str::<Vec<EndpointProfile>>(
+            r#"[{"host":"mcp.example.com","port":443,"protocol":"mcp"},{"host":"mcp.example.com","port":443,"protocol":"mcp","mcp":{}}]"#,
+        )
+        .expect("JSON endpoint vector omissions must default");
+
+        let expected = [DEFAULT_MCP_PROTOCOL_VERSION.as_str()];
+        for parsed in [&endpoint, &yaml_vector[0], &json_vector[0], &json_vector[1]] {
+            assert_eq!(
+                parsed
+                    .mcp
+                    .as_ref()
+                    .expect("direct endpoint Serde must materialize MCP options")
+                    .versions,
+                expected
+            );
+        }
+
+        let mut programmatic = endpoint;
+        programmatic.mcp = None;
+        let emitted_yaml = serde_yml::to_string(&programmatic)
+            .expect("direct endpoint YAML serialization must materialize");
+        let emitted_json = serde_json::to_string(&vec![programmatic.clone()])
+            .expect("direct endpoint vector JSON serialization must materialize");
+        for emitted in [&emitted_yaml, &emitted_json] {
+            assert!(emitted.contains("mcp"));
+            assert!(emitted.contains("versions"));
+            assert!(emitted.contains(DEFAULT_MCP_PROTOCOL_VERSION.as_str()));
+        }
+
+        programmatic.mcp = Some(super::McpOptionsProfile {
+            versions: vec!["2025-11-25".to_string(), "2025-03-26".to_string()],
+            strict_tool_names: None,
+            allow_all_known_mcp_methods: None,
+        });
+        let canonical = serde_json::to_string(&programmatic)
+            .expect("direct endpoint serialization must canonicalize revisions");
+        assert!(
+            canonical.find("2025-03-26").expect("legacy revision")
+                < canonical.find("2025-11-25").expect("current revision")
+        );
+
+        for invalid in [
+            vec!["2025-03-26".to_string(), "2025-03-26".to_string()],
+            vec!["2025-03-26 ".to_string()],
+            vec!["draft".to_string()],
+        ] {
+            programmatic.mcp.as_mut().expect("MCP options").versions = invalid;
+            assert!(serde_yml::to_string(&programmatic).is_err());
+            assert!(serde_json::to_string(&vec![programmatic.clone()]).is_err());
+        }
+    }
+
+    #[test]
+    fn mcp_endpoint_profile_direct_vector_serde_rejects_malformed_presence_and_versions() {
+        for invalid_mcp in [
+            "null",
+            "{versions: null}",
+            "{versions: []}",
+            "{versions: ['2025-03-26', '2025-03-26']}",
+            "{versions: ['2025-03-26 ']}",
+            "{versions: [draft]}",
+            "{versions: [latest]}",
+        ] {
+            let yaml = format!(
+                "- host: mcp.example.com\n  port: 443\n  protocol: mcp\n  mcp: {invalid_mcp}\n"
+            );
+            assert!(
+                serde_yml::from_str::<Vec<EndpointProfile>>(&yaml).is_err(),
+                "direct endpoint vector unexpectedly accepted {invalid_mcp}"
+            );
+        }
+
+        for json in [
+            r#"[{"host":"mcp.example.com","protocol":"mcp","mcp":null}]"#,
+            r#"[{"host":"mcp.example.com","protocol":"mcp","mcp":{"versions":null}}]"#,
+            r#"[{"host":"mcp.example.com","protocol":"mcp","mcp":{"versions":[]}}]"#,
+            r#"[{"host":"mcp.example.com","protocol":"mcp","mcp":{"versions":["2025-03-26","2025-03-26"]}}]"#,
+            r#"[{"host":"mcp.example.com","protocol":"mcp","mcp":{"versions":["2025-03-26 "]}}]"#,
+            r#"[{"host":"mcp.example.com","protocol":"mcp","mcp":{"versions":["draft"]}}]"#,
+            r#"[{"host":"mcp.example.com","protocol":"mcp","mcp":{"versions":["latest"]}}]"#,
+        ] {
+            assert!(serde_json::from_str::<Vec<EndpointProfile>>(json).is_err());
+        }
+    }
+
+    #[test]
+    fn mcp_endpoint_profile_materializes_omitted_versions_to_the_pinned_default() {
+        let omitted_options = r"
+id: mcp-example
+display_name: MCP Example
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+";
+        let omitted_versions = r"
+id: mcp-example
+display_name: MCP Example
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp: {}
+";
+        let explicit_default = format!(
+            r"
+id: mcp-example
+display_name: MCP Example
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['{}']
+",
+            DEFAULT_MCP_PROTOCOL_VERSION.as_str()
+        );
+
+        let omitted_options =
+            parse_profile_yaml(omitted_options).expect("omitted MCP options must default");
+        let omitted_versions =
+            parse_profile_yaml(omitted_versions).expect("omitted versions must default");
+        let omitted_options_json = parse_profile_json(
+            r#"{"id":"mcp-example","display_name":"MCP Example","endpoints":[{"host":"mcp.example.com","port":443,"protocol":"mcp"}]}"#,
+        )
+        .expect("omitted JSON MCP options must default");
+        let omitted_versions_json = parse_profile_json(
+            r#"{"id":"mcp-example","display_name":"MCP Example","endpoints":[{"host":"mcp.example.com","port":443,"protocol":"mcp","mcp":{}}]}"#,
+        )
+        .expect("omitted JSON versions must default");
+        let explicit_default =
+            parse_profile_yaml(&explicit_default).expect("explicit default must parse");
+        assert_eq!(omitted_options, omitted_versions);
+        assert_eq!(omitted_options, omitted_options_json);
+        assert_eq!(omitted_options, omitted_versions_json);
+        assert_eq!(omitted_options, explicit_default);
+
+        let versions = &omitted_options.endpoints[0]
+            .mcp
+            .as_ref()
+            .expect("omitted MCP options must materialize")
+            .versions;
+        assert_eq!(
+            DEFAULT_MCP_PROTOCOL_VERSION,
+            McpProtocolVersion::V2025_11_25,
+            "provider omission must stay pinned to the declared default"
+        );
+        assert_eq!(versions, &[DEFAULT_MCP_PROTOCOL_VERSION.as_str()]);
+        assert_ne!(
+            versions.len(),
+            McpProtocolVersion::ALL.len(),
+            "the default must not expand to every known revision"
+        );
+        assert!(
+            omitted_options
+                .validate_before_lowering("omitted-options.yaml")
+                .iter()
+                .all(|diagnostic| !is_mcp_diagnostic_field(&diagnostic.field)),
+            "the materialized default must pass MCP validation"
+        );
+
+        let exported = profile_to_yaml(&omitted_options).expect("materialized YAML");
+        assert!(exported.contains("mcp:"));
+        assert!(exported.contains("versions:"));
+        assert!(exported.contains(DEFAULT_MCP_PROTOCOL_VERSION.as_str()));
+
+        let proto = omitted_options.to_proto();
+        assert_eq!(
+            proto.endpoints[0]
+                .mcp
+                .as_ref()
+                .expect("materialized MCP options")
+                .versions,
+            [DEFAULT_MCP_PROTOCOL_VERSION.as_str()]
+        );
+    }
+
+    #[test]
+    fn mcp_endpoint_profile_rejects_explicit_empty_or_invalid_versions() {
+        for invalid_mcp in [
+            "versions: []",
+            "versions: null",
+            "versions: [\"2025-03-26\", \"2025-03-26\"]",
+            "versions: [latest]",
+            "versions: [draft]",
+            "versions: ['2026-07-28']",
+            "versions: [\"2025-03-26 \"]",
+        ] {
+            let yaml = format!(
+                r"
+id: mcp-example
+display_name: MCP Example
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      {invalid_mcp}
+"
+            );
+            assert!(
+                parse_profile_yaml(&yaml).is_err(),
+                "invalid MCP profile unexpectedly parsed: {invalid_mcp}"
+            );
+        }
+
+        let misplaced_options = r"
+id: rest-example
+display_name: REST Example
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    mcp:
+      versions: ['2025-11-25']
+";
+        assert!(matches!(
+            parse_profile_catalog_yamls(&[misplaced_options]),
+            Err(ProfileError::InvalidMcpConfiguration { field, .. })
+                if field == "endpoints[0].mcp"
+        ));
+    }
+
+    #[test]
+    fn mcp_endpoint_profile_rejects_explicit_null_options_across_parsing_routes() {
+        let yaml = r"
+id: mcp-example
+display_name: MCP Example
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp: null
+";
+        assert!(parse_profile_yaml(yaml).is_err());
+        assert!(parse_profile_catalog_yamls(&[yaml]).is_err());
+
+        let value = serde_yml::from_str(yaml).expect("generic YAML value must parse");
+        assert!(serde_yml::from_value::<ProviderTypeProfile>(value).is_err());
+
+        for json in [
+            r#"{"id":"mcp-example","display_name":"MCP Example","endpoints":[{"host":"mcp.example.com","port":443,"protocol":"mcp","mcp":null}]}"#,
+            r#"{"id":"mcp-example","display_name":"MCP Example","endpoints":[{"host":"mcp.example.com","port":443,"protocol":"mcp","mcp":{"versions":null}}]}"#,
+        ] {
+            assert!(parse_profile_json(json).is_err());
+        }
+    }
+
+    #[test]
+    fn endpoint_profile_preserves_unknown_field_tolerance() {
+        let endpoint_yaml = r"
+host: api.example.com
+port: 443
+protocol: rest
+access: full
+future_endpoint_option: true
+";
+        let endpoint_json = r#"{"host":"api.example.com","port":443,"protocol":"rest","access":"full","future_endpoint_option":true}"#;
+
+        let yaml_endpoint = serde_yml::from_str::<EndpointProfile>(endpoint_yaml)
+            .expect("unknown endpoint fields remain forward-compatible in YAML");
+        let json_endpoint = serde_json::from_str::<EndpointProfile>(endpoint_json)
+            .expect("unknown endpoint fields remain forward-compatible in JSON");
+        assert_eq!(yaml_endpoint.host, "api.example.com");
+        assert_eq!(json_endpoint, yaml_endpoint);
+
+        let profile_yaml = format!(
+            "id: future-profile\ndisplay_name: Future profile\nendpoints:\n  - {}",
+            endpoint_yaml.trim_start().replace('\n', "\n    ")
+        );
+        parse_profile_yaml(&profile_yaml)
+            .expect("nested endpoint parsing must retain the prior unknown-field tolerance");
+    }
+
+    #[test]
+    fn mcp_options_profile_rejects_unknown_fields_across_parsing_routes() {
+        let endpoint_yaml = r"
+host: mcp.example.com
+port: 443
+protocol: mcp
+mcp:
+  version: ['2025-11-25']
+";
+        let endpoint_json = r#"{"host":"mcp.example.com","port":443,"protocol":"mcp","mcp":{"versionss":["2025-11-25"]}}"#;
+
+        assert!(serde_yml::from_str::<EndpointProfile>(endpoint_yaml).is_err());
+        assert!(serde_json::from_str::<EndpointProfile>(endpoint_json).is_err());
+
+        let endpoint_vector_yaml =
+            format!("- {}", endpoint_yaml.trim_start().replace('\n', "\n  "));
+        assert!(serde_yml::from_str::<Vec<EndpointProfile>>(&endpoint_vector_yaml).is_err());
+        assert!(
+            serde_json::from_str::<Vec<EndpointProfile>>(&format!("[{endpoint_json}]")).is_err()
+        );
+
+        let profile_yaml = format!(
+            "id: mcp-example\ndisplay_name: MCP Example\nendpoints:\n  - {}",
+            endpoint_yaml.trim_start().replace('\n', "\n    ")
+        );
+        assert!(parse_profile_yaml(&profile_yaml).is_err());
+        let value = serde_yml::from_str(&profile_yaml).expect("generic YAML value must parse");
+        assert!(serde_yml::from_value::<ProviderTypeProfile>(value).is_err());
+
+        let profile_json = format!(
+            r#"{{"id":"mcp-example","display_name":"MCP Example","endpoints":[{endpoint_json}]}}"#
+        );
+        assert!(parse_profile_json(&profile_json).is_err());
+    }
+
+    #[test]
+    fn unsupported_provider_mcp_version_explains_default_and_explicit_l4_escape_hatch() {
+        const DEFAULT_REMEDIATION: &str = "omit mcp.versions to use the pinned default revision";
+        const L4_REMEDIATION: &str =
+            "omit protocol and mcp for deliberate uninspected L4 passthrough";
+
+        let yaml = r"
+id: mcp-example
+display_name: MCP Example
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: [draft]
+";
+        let error = parse_profile_yaml(yaml)
+            .expect_err("moving draft aliases must fail closed")
+            .to_string();
+        assert!(error.contains(DEFAULT_REMEDIATION));
+        assert!(error.contains(L4_REMEDIATION));
+
+        let mut profile = parse_profile_yaml(&yaml.replace("draft", "2025-11-25"))
+            .expect("supported revision must parse");
+        profile.endpoints[0]
+            .mcp
+            .as_mut()
+            .expect("MCP options")
+            .versions = vec!["draft".to_string()];
+        let diagnostics = profile.validate_before_lowering("draft-version.yaml");
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "endpoints[0].mcp.versions"
+                && diagnostic.message.contains(DEFAULT_REMEDIATION)
+                && diagnostic.message.contains(L4_REMEDIATION)
+        }));
+    }
+
+    #[test]
+    fn mcp_profile_validation_uses_shared_case_insensitive_protocol_parsing() {
+        let uppercase_mcp = r"
+id: uppercase-mcp
+display_name: Uppercase MCP
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: MCP
+    mcp:
+      versions: ['2025-11-25', '2025-03-26']
+    rules:
+      - allow:
+          method: initialize
+";
+        let profiles = parse_profile_catalog_yamls(&[uppercase_mcp])
+            .expect("the shared protocol parser recognizes uppercase MCP");
+        assert_eq!(
+            profiles[0].endpoints[0]
+                .mcp
+                .as_ref()
+                .expect("MCP options")
+                .versions,
+            ["2025-03-26", "2025-11-25"]
+        );
+
+        let uppercase_missing = r"
+id: uppercase-mcp
+display_name: Uppercase MCP
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: MCP
+    rules:
+      - allow:
+          method: initialize
+";
+        let profiles = parse_profile_catalog_yamls(&[uppercase_missing])
+            .expect("uppercase MCP must receive the pinned default");
+        assert_eq!(
+            profiles[0].endpoints[0]
+                .mcp
+                .as_ref()
+                .expect("materialized MCP options")
+                .versions,
+            [DEFAULT_MCP_PROTOCOL_VERSION.as_str()]
+        );
+    }
+
+    #[test]
+    fn profile_catalog_rejects_mcp_contract_after_an_unrelated_diagnostic() {
+        let profiles = [
+            r"
+id: Invalid-Id
+display_name: MCP Example
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: rest
+    mcp:
+      versions: ['2025-11-25']
+",
+            r"
+id: Invalid-Id
+display_name: REST Example
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    mcp:
+      versions: ['2025-11-25']
+",
+        ];
+
+        for yaml in profiles {
+            let profile = parse_profile_yaml(yaml).expect("profile shape should parse");
+            let diagnostics = validate_profile_set(&[(String::new(), profile)]);
+            assert_eq!(diagnostics[0].field, "id");
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| is_mcp_diagnostic_field(&diagnostic.field))
+            );
+            assert!(matches!(
+                parse_profile_catalog_yamls(&[yaml]),
+                Err(ProfileError::ValidationError { ref field, .. }) if field == "id"
+            ));
+        }
+    }
+
+    #[test]
+    fn profile_catalog_reports_the_first_mcp_diagnostic_before_a_later_invalid_endpoint() {
+        let yaml = r#"
+id: mcp-priority
+display_name: MCP Priority
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: rest
+    mcp:
+      versions: ['2025-11-25']
+  - host: ""
+    port: 443
+"#;
+
+        assert!(matches!(
+            parse_profile_catalog_yamls(&[yaml]),
+            Err(ProfileError::InvalidMcpConfiguration { field, .. })
+                if field == "endpoints[0].mcp"
+        ));
     }
 
     #[test]
@@ -2178,6 +4535,204 @@ credentials:
         assert_eq!(
             reparsed_token_grant.audience_overrides,
             token_grant.audience_overrides
+        );
+    }
+
+    #[test]
+    fn token_exchange_grant_round_trips_through_proto_and_yaml() {
+        let profile = parse_profile_yaml(
+            r"
+id: keycloak-token-exchange
+display_name: Keycloak Token Exchange
+credentials:
+  - name: USER_OIDC_TOKEN
+    required: true
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: https://keycloak.example.com/realms/openshell/protocol/openid-connect/token
+      subject_token:
+        source: provider_credential
+        credential: USER_OIDC_TOKEN
+        subject_token_type: urn:ietf:params:oauth:token-type:access_token
+      jwt_svid_audience: https://keycloak.example.com/realms/openshell
+      client_assertion_type: urn:ietf:params:oauth:client-assertion-type:jwt-bearer
+      audience: https://graph.example.com
+      scopes: [graph.read]
+      requested_token_type: urn:ietf:params:oauth:token-type:access_token
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics =
+            validate_profile_set(&[("keycloak-token-exchange.yaml".to_string(), profile.clone())]);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+
+        let token_grant = profile.credentials[1]
+            .token_grant
+            .as_ref()
+            .expect("token grant should parse");
+        assert_eq!(
+            token_grant.grant_type,
+            ProviderCredentialTokenGrantType::TokenExchange
+        );
+        assert_eq!(
+            token_grant
+                .subject_token
+                .as_ref()
+                .map(|subject| subject.credential.as_str()),
+            Some("USER_OIDC_TOKEN")
+        );
+
+        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        assert_eq!(
+            from_proto.credentials[1].token_grant,
+            profile.credentials[1].token_grant
+        );
+
+        let exported = profile_to_yaml(&from_proto).expect("yaml");
+        assert!(exported.contains("grant_type: token_exchange"));
+        assert!(exported.contains("subject_token:"));
+        let reparsed = parse_profile_yaml(&exported).expect("re-parse");
+        assert_eq!(
+            reparsed.credentials[1].token_grant,
+            profile.credentials[1].token_grant
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_token_exchange_without_subject_token() {
+        let profile = parse_profile_yaml(
+            r"
+id: missing-subject-token
+display_name: Missing Subject Token
+credentials:
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: https://keycloak.example.com/realms/openshell/protocol/openid-connect/token
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("missing.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.field == "credentials.token_grant.subject_token")
+            .expect("expected subject_token diagnostic");
+        assert_eq!(
+            diagnostic.message,
+            "token_exchange grants require subject_token"
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_token_exchange_unknown_subject_credential() {
+        let profile = parse_profile_yaml(
+            r"
+id: unknown-subject-token
+display_name: Unknown Subject Token
+credentials:
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: https://keycloak.example.com/realms/openshell/protocol/openid-connect/token
+      subject_token:
+        source: provider_credential
+        credential: USER_OIDC_TOKEN
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("unknown.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.field == "credentials.token_grant.subject_token.credential"
+            })
+            .expect("expected subject token credential diagnostic");
+        assert!(
+            diagnostic
+                .message
+                .contains("unknown subject token credential: USER_OIDC_TOKEN")
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_injectable_token_exchange_subject_credential() {
+        let profile = parse_profile_yaml(
+            r"
+id: injectable-subject-token
+display_name: Injectable Subject Token
+credentials:
+  - name: USER_OIDC_TOKEN
+    auth_style: header
+    header_name: X-Subject-Token
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: https://keycloak.example.com/realms/openshell/protocol/openid-connect/token
+      subject_token:
+        source: provider_credential
+        credential: USER_OIDC_TOKEN
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("injectable.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.field == "credentials.token_grant.subject_token.credential"
+                    && diagnostic.message.contains("broker-only")
+            })
+            .expect("expected broker-only subject token diagnostic");
+        assert!(
+            diagnostic
+                .message
+                .contains("cannot declare workload injection metadata")
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_subject_token_on_client_credentials_grant() {
+        let profile = parse_profile_yaml(
+            r"
+id: misplaced-subject-token
+display_name: Misplaced Subject Token
+credentials:
+  - name: USER_OIDC_TOKEN
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      token_endpoint: https://keycloak.example.com/realms/openshell/protocol/openid-connect/token
+      subject_token:
+        source: provider_credential
+        credential: USER_OIDC_TOKEN
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("misplaced.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.field == "credentials.token_grant.subject_token")
+            .expect("expected subject_token diagnostic");
+        assert_eq!(
+            diagnostic.message,
+            "subject_token is only valid for token_exchange grants"
         );
     }
 
@@ -2379,6 +4934,8 @@ endpoints:
   - host: alpha.default.svc.cluster.local
     port: 80
     path: /v1/**
+    protocol: rest
+    access: full
 ",
         )
         .expect("profile should parse");
@@ -2419,6 +4976,8 @@ endpoints:
   - host: alpha.default.svc.cluster.local
     port: 80
     path: /v1/**
+    protocol: rest
+    access: full
 ",
         )
         .expect("profile should parse");
@@ -2433,13 +4992,45 @@ endpoints:
 
     #[test]
     fn profile_json_round_trip_preserves_compact_dto_shape() {
-        let profile = get_default_profile("github").expect("github profile");
+        let profile = builtin_profile("github");
         let json = profile_to_json(profile).expect("profile should serialize");
         let parsed = parse_profile_json(&json).expect("profile should parse");
 
         assert_eq!(parsed.id, "github");
         assert_eq!(parsed.category, ProviderProfileCategory::SourceControl);
         assert_eq!(parsed.binaries[0].path, "/usr/bin/gh");
+    }
+
+    #[test]
+    fn profile_annotations_round_trip_through_proto_and_yaml() {
+        let profile = parse_profile_yaml(
+            r"
+id: signed
+annotations:
+  openshell.nvidia.com/profile-hash: sha256:abc123
+  openshell.nvidia.com/profile-signature: signed-token
+display_name: Signed
+description: Signed provider profile
+credentials: []
+endpoints: []
+binaries: []
+",
+        )
+        .expect("profile should parse");
+
+        let proto = profile.to_proto();
+        assert_eq!(
+            proto
+                .annotations
+                .get("openshell.nvidia.com/profile-signature")
+                .map(String::as_str),
+            Some("signed-token")
+        );
+
+        let exported = profile_to_yaml(&ProviderTypeProfile::from_proto(&proto))
+            .expect("profile should serialize");
+        let reparsed = parse_profile_yaml(&exported).expect("exported profile should parse");
+        assert_eq!(reparsed.annotations, profile.annotations);
     }
 
     #[test]
@@ -2450,12 +5041,23 @@ id: advanced
 display_name: Advanced
 category: other
 endpoints:
+  - host: graphql.example.com
+    port: 443
+    protocol: graphql
+    access: read-only
+    persisted_queries: allow_registered
+    graphql_persisted_queries:
+      hash-a:
+        operation_type: query
+        operation_name: Viewer
+        fields: [viewer]
+    graphql_max_body_bytes: 131072
+    path: /graphql
   - host: api.example.com
     ports: [443, 8443]
     protocol: rest
     tls: terminate
     enforcement: enforce
-    access: read-only
     rules:
       - allow:
           method: GET
@@ -2468,14 +5070,7 @@ endpoints:
       - method: POST
         path: /admin/**
     allow_encoded_slash: true
-    persisted_queries: allow_registered
-    graphql_persisted_queries:
-      hash-a:
-        operation_type: query
-        operation_name: Viewer
-        fields: [viewer]
-    graphql_max_body_bytes: 131072
-    path: /graphql
+    allow_uninspected_credentials: true
 binaries:
   - path: /usr/bin/custom
     harness: true
@@ -2489,40 +5084,131 @@ binaries:
         );
 
         let proto = profile.to_proto();
-        let endpoint = proto.endpoints.first().expect("endpoint should exist");
-        assert_eq!(endpoint.port, 0);
-        assert_eq!(endpoint.ports, vec![443, 8443]);
-        assert_eq!(endpoint.tls, "terminate");
-        assert_eq!(endpoint.allowed_ips, vec!["10.0.0.0/24"]);
-        assert!(endpoint.allow_encoded_slash);
-        assert_eq!(endpoint.persisted_queries, "allow_registered");
-        assert_eq!(endpoint.graphql_max_body_bytes, 131_072);
-        assert_eq!(endpoint.path, "/graphql");
+
+        let graphql_ep = &proto.endpoints[0];
+        assert_eq!(graphql_ep.access, "read-only");
+        assert_eq!(graphql_ep.persisted_queries, "allow_registered");
+        assert_eq!(graphql_ep.graphql_max_body_bytes, 131_072);
+        assert_eq!(graphql_ep.path, "/graphql");
         assert_eq!(
-            endpoint
+            graphql_ep
+                .graphql_persisted_queries
+                .get("hash-a")
+                .map(|operation| operation.operation_name.as_str()),
+            Some("Viewer")
+        );
+
+        let rest_ep = &proto.endpoints[1];
+        assert_eq!(rest_ep.port, 0);
+        assert_eq!(rest_ep.ports, vec![443, 8443]);
+        assert_eq!(rest_ep.tls, "terminate");
+        assert_eq!(rest_ep.allowed_ips, vec!["10.0.0.0/24"]);
+        assert!(rest_ep.allow_encoded_slash);
+        assert!(rest_ep.allow_uninspected_credentials);
+        assert!(!rest_ep.provider_credentialed);
+        assert_eq!(
+            rest_ep
                 .rules
                 .first()
                 .and_then(|rule| rule.allow.as_ref())
                 .map(|allow| allow.method.as_str()),
             Some("GET")
         );
-        assert_eq!(endpoint.deny_rules[0].method, "POST");
-        assert_eq!(
-            endpoint
-                .graphql_persisted_queries
-                .get("hash-a")
-                .map(|operation| operation.operation_name.as_str()),
-            Some("Viewer")
-        );
+        assert_eq!(rest_ep.deny_rules[0].method, "POST");
         assert!(proto.binaries[0].harness);
 
         let reparsed = parse_profile_yaml(&profile_to_yaml(&profile).expect("serialize YAML"))
             .expect("serialized profile should parse");
         let reprotoo = reparsed.to_proto();
-        assert_eq!(reprotoo.endpoints[0].rules.len(), 1);
-        assert_eq!(reprotoo.endpoints[0].deny_rules.len(), 1);
-        assert_eq!(reprotoo.endpoints[0].ports, vec![443, 8443]);
+        assert_eq!(reprotoo.endpoints[0].access, "read-only");
+        assert_eq!(reprotoo.endpoints[1].rules.len(), 1);
+        assert_eq!(reprotoo.endpoints[1].deny_rules.len(), 1);
+        assert_eq!(reprotoo.endpoints[1].ports, vec![443, 8443]);
+        assert!(reprotoo.endpoints[1].allow_uninspected_credentials);
+        assert!(!reprotoo.endpoints[1].provider_credentialed);
         assert!(reprotoo.binaries[0].harness);
+    }
+
+    #[test]
+    fn profile_classifies_declared_credentials_and_signing_as_credentialed() {
+        let with_declared_credential = parse_profile_yaml(
+            r"
+id: credentialed
+display_name: Credentialed
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+endpoints:
+  - host: api.example.com
+    port: 443
+",
+        )
+        .expect("profile should parse");
+        assert!(with_declared_credential.has_credentialed_endpoints());
+
+        let with_signing = parse_profile_yaml(
+            r"
+id: signed
+display_name: Signed
+credentials: []
+endpoints:
+  - host: s3.example.com
+    port: 443
+    credential_signing: sigv4
+",
+        )
+        .expect("profile should parse");
+        assert!(with_signing.has_credentialed_endpoints());
+
+        let plain = parse_profile_yaml(
+            r"
+id: plain
+display_name: Plain
+credentials: []
+endpoints:
+  - host: pypi.org
+    port: 443
+",
+        )
+        .expect("profile should parse");
+        assert!(!plain.has_credentialed_endpoints());
+    }
+
+    #[test]
+    fn credentialed_profile_requires_opt_in_for_l4_endpoint() {
+        let profile = parse_profile_yaml(
+            r"
+id: raw
+display_name: Raw
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+endpoints:
+  - host: raw.example.com
+    port: 443
+",
+        )
+        .expect("profile should parse");
+        let diagnostics = validate_profile_set(&[("raw.yaml".to_string(), profile)]);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "endpoints[0].allow_uninspected_credentials"
+        }));
+
+        let opted_in = parse_profile_yaml(
+            r"
+id: raw
+display_name: Raw
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+endpoints:
+  - host: raw.example.com
+    port: 443
+    allow_uninspected_credentials: true
+",
+        )
+        .expect("profile should parse");
+        assert!(validate_profile_set(&[("raw.yaml".to_string(), opted_in)]).is_empty());
     }
 
     #[test]
@@ -2593,6 +5279,7 @@ binaries: ["", /usr/bin/broken]
                 ProviderTypeProfile {
                     id: " alex-api ".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Space".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other,
@@ -2601,6 +5288,8 @@ binaries: ["", /usr/bin/broken]
                     binaries: Vec::new(),
                     inference_capable: false,
                     discovery: DiscoveryProfile::default(),
+                    source: String::new(),
+                    scope: String::new(),
                 },
             ),
             (
@@ -2608,6 +5297,7 @@ binaries: ["", /usr/bin/broken]
                 ProviderTypeProfile {
                     id: "alex_api".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Underscore".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other,
@@ -2616,6 +5306,8 @@ binaries: ["", /usr/bin/broken]
                     binaries: Vec::new(),
                     inference_capable: false,
                     discovery: DiscoveryProfile::default(),
+                    source: String::new(),
+                    scope: String::new(),
                 },
             ),
             (
@@ -2623,6 +5315,7 @@ binaries: ["", /usr/bin/broken]
                 ProviderTypeProfile {
                     id: "Alex-API".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Case".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other,
@@ -2631,6 +5324,8 @@ binaries: ["", /usr/bin/broken]
                     binaries: Vec::new(),
                     inference_capable: false,
                     discovery: DiscoveryProfile::default(),
+                    source: String::new(),
+                    scope: String::new(),
                 },
             ),
         ];
@@ -2689,5 +5384,1925 @@ endpoints:
         .unwrap_err();
 
         assert!(matches!(err, ProfileError::InvalidEndpoint { id, .. } if id == "bad-endpoint"));
+    }
+
+    #[test]
+    fn parse_profile_catalog_yamls_rejects_l7_validation_errors() {
+        let err = parse_profile_catalog_yamls(&[r"
+id: bad-l7
+display_name: Bad L7
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: read-write
+    rules:
+      - allow:
+          method: GET
+          path: /v1/**
+binaries:
+  - /usr/bin/example-agent
+"])
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ProfileError::ValidationError { ref id, ref message, .. } if id == "bad-l7" && message.contains("mutually exclusive")),
+            "expected L7 validation error for access+rules, got: {err}"
+        );
+    }
+
+    #[test]
+    fn aws_sts_strategy_serde_roundtrip() {
+        use openshell_core::proto::ProviderCredentialRefreshStrategy;
+        assert_eq!(
+            super::provider_refresh_strategy_from_yaml("aws_sts_assume_role"),
+            Some(ProviderCredentialRefreshStrategy::AwsStsAssumeRole)
+        );
+        assert_eq!(
+            super::provider_refresh_strategy_to_yaml(
+                ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+            ),
+            "aws_sts_assume_role"
+        );
+    }
+
+    #[test]
+    fn aws_profile_parses_correctly() {
+        let aws = builtin_profile("aws");
+        assert_eq!(aws.display_name, "AWS");
+        assert_eq!(aws.credentials.len(), 3);
+        let access_key = aws
+            .credentials
+            .iter()
+            .find(|c| c.name == "access_key_id")
+            .unwrap();
+        assert!(access_key.refresh.is_some());
+        let refresh = access_key.refresh.as_ref().unwrap();
+        assert_eq!(
+            refresh.strategy,
+            openshell_core::proto::ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+        );
+        assert!(
+            refresh
+                .material
+                .iter()
+                .any(|m| m.name == "role_arn" && m.required)
+        );
+    }
+
+    #[test]
+    fn aws_s3_profile_parses_with_endpoints() {
+        let aws_s3 = builtin_profile("aws-s3");
+        assert_eq!(aws_s3.display_name, "AWS S3");
+        assert!(!aws_s3.endpoints.is_empty());
+        assert!(
+            !aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "**.amazonaws.com")
+        );
+        assert!(
+            aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "*.s3.amazonaws.com")
+        );
+        assert!(
+            aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "s3.amazonaws.com")
+        );
+        assert!(
+            aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "*.s3.*.amazonaws.com")
+        );
+        assert!(
+            aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "s3.*.amazonaws.com")
+        );
+        assert!(
+            aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "*.s3.dualstack.*.amazonaws.com")
+        );
+        assert!(
+            aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "s3.dualstack.*.amazonaws.com")
+        );
+    }
+
+    #[test]
+    fn aws_profile_declares_additional_outputs() {
+        for id in ["aws", "aws-s3"] {
+            let profile = builtin_profile(id);
+            let refresh = profile
+                .credentials
+                .iter()
+                .find(|c| c.name == "access_key_id")
+                .and_then(|c| c.refresh.as_ref())
+                .expect("access_key_id refresh should exist");
+            let outputs: Vec<(&str, &str)> = refresh
+                .additional_outputs
+                .iter()
+                .map(|o| (o.output.as_str(), o.credential.as_str()))
+                .collect();
+            assert_eq!(
+                outputs,
+                vec![
+                    ("secret_access_key", "secret_access_key"),
+                    ("session_token", "session_token"),
+                ],
+                "unexpected additional_outputs for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_profiles_are_runtime_resolvable() {
+        // With AwsStsAssumeRole recognized as gateway-mintable, all three
+        // required credentials are runtime-resolvable, so `--runtime-credentials`
+        // (empty provider creation) is allowed.
+        for id in ["aws", "aws-s3"] {
+            let profile = builtin_profile(id);
+            assert!(
+                profile.allows_empty_provider_credentials(),
+                "{id} should allow empty provider credentials"
+            );
+        }
+    }
+
+    #[test]
+    fn is_gateway_mintable_strategy_includes_aws_sts() {
+        assert!(super::is_gateway_mintable_strategy(
+            openshell_core::proto::ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+        ));
+    }
+
+    #[test]
+    fn additional_outputs_round_trip_through_proto_and_yaml() {
+        let profile = parse_profile_yaml(
+            r"
+id: aws-round-trip
+display_name: AWS Round Trip
+credentials:
+  - name: access_key_id
+    env_vars: [AWS_ACCESS_KEY_ID]
+    required: true
+    refresh:
+      strategy: aws_sts_assume_role
+      additional_outputs:
+        - output: secret_access_key
+          credential: secret_access_key
+        - output: session_token
+          credential: session_token
+      material:
+        - name: role_arn
+          required: true
+  - name: secret_access_key
+    env_vars: [AWS_SECRET_ACCESS_KEY]
+    required: true
+  - name: session_token
+    env_vars: [AWS_SESSION_TOKEN]
+    required: true
+",
+        )
+        .expect("profile should parse");
+
+        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        assert_eq!(
+            from_proto.credentials[0].refresh,
+            profile.credentials[0].refresh
+        );
+
+        let exported = profile_to_yaml(&from_proto).expect("yaml");
+        assert!(exported.contains("additional_outputs"));
+        assert!(exported.contains("session_token"));
+        let reparsed = parse_profile_yaml(&exported).expect("re-parse");
+        assert_eq!(
+            reparsed.credentials[0].refresh,
+            profile.credentials[0].refresh
+        );
+    }
+
+    fn aws_output_profile(additional_outputs: &str, credentials_tail: &str) -> ProviderTypeProfile {
+        parse_profile_yaml(&format!(
+            r"
+id: aws-outputs
+display_name: AWS Outputs
+credentials:
+  - name: access_key_id
+    env_vars: [AWS_ACCESS_KEY_ID]
+    required: true
+    refresh:
+      strategy: aws_sts_assume_role
+{additional_outputs}
+      material:
+        - name: role_arn
+          required: true
+{credentials_tail}
+"
+        ))
+        .expect("profile should parse")
+    }
+
+    const STANDARD_AWS_OUTPUT_TAIL: &str = "  - name: secret_access_key
+    env_vars: [AWS_SECRET_ACCESS_KEY]
+    required: true
+  - name: session_token
+    env_vars: [AWS_SESSION_TOKEN]
+    required: true";
+
+    #[test]
+    fn validate_rejects_additional_output_unknown_credential() {
+        let profile = aws_output_profile(
+            "      additional_outputs:
+        - output: secret_access_key
+          credential: nonexistent
+        - output: session_token
+          credential: session_token",
+            STANDARD_AWS_OUTPUT_TAIL,
+        );
+        let diagnostics = validate_profile_set(&[("aws.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d.field
+                == "credentials.refresh.additional_outputs.credential"
+                && d.message.contains("unknown credential 'nonexistent'")),
+            "diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_additional_output() {
+        let profile = aws_output_profile(
+            "      additional_outputs:
+        - output: secret_access_key
+          credential: secret_access_key
+        - output: secret_access_key
+          credential: secret_access_key
+        - output: session_token
+          credential: session_token",
+            STANDARD_AWS_OUTPUT_TAIL,
+        );
+        let diagnostics = validate_profile_set(&[("aws.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("duplicate refresh additional output")),
+            "diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_output_for_strategy() {
+        let profile = aws_output_profile(
+            "      additional_outputs:
+        - output: secret_access_key
+          credential: secret_access_key
+        - output: session_token
+          credential: session_token
+        - output: bogus
+          credential: session_token",
+            STANDARD_AWS_OUTPUT_TAIL,
+        );
+        let diagnostics = validate_profile_set(&[("aws.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("does not produce output 'bogus'")),
+            "diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_required_output() {
+        let profile = aws_output_profile(
+            "      additional_outputs:
+        - output: secret_access_key
+          credential: secret_access_key",
+            STANDARD_AWS_OUTPUT_TAIL,
+        );
+        let diagnostics = validate_profile_set(&[("aws.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("requires additional output 'session_token'")),
+            "diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_output_credential_with_own_refresh() {
+        let tail = "  - name: secret_access_key
+    env_vars: [AWS_SECRET_ACCESS_KEY]
+    required: true
+    refresh:
+      strategy: oauth2_client_credentials
+  - name: session_token
+    env_vars: [AWS_SESSION_TOKEN]
+    required: true";
+        let profile = aws_output_profile(
+            "      additional_outputs:
+        - output: secret_access_key
+          credential: secret_access_key
+        - output: session_token
+          credential: session_token",
+            tail,
+        );
+        let diagnostics = validate_profile_set(&[("aws.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("must not declare its own refresh")),
+            "diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_nonstandard_aws_output_env_key() {
+        let tail = "  - name: secret_access_key
+    env_vars: [WRONG_SECRET]
+    required: true
+  - name: session_token
+    env_vars: [AWS_SESSION_TOKEN]
+    required: true";
+        let profile = aws_output_profile(
+            "      additional_outputs:
+        - output: secret_access_key
+          credential: secret_access_key
+        - output: session_token
+          credential: session_token",
+            tail,
+        );
+        let diagnostics = validate_profile_set(&[("aws.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("must map to env var AWS_SECRET_ACCESS_KEY, found WRONG_SECRET")),
+            "diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_wrong_primary_env_key_for_aws_sts() {
+        let profile = parse_profile_yaml(
+            r"
+id: aws-wrong-primary
+display_name: AWS Wrong Primary
+credentials:
+  - name: access_key_id
+    env_vars: [NOT_AWS_ACCESS_KEY_ID]
+    required: true
+    refresh:
+      strategy: aws_sts_assume_role
+      additional_outputs:
+        - output: secret_access_key
+          credential: secret_access_key
+        - output: session_token
+          credential: session_token
+      material:
+        - name: role_arn
+          required: true
+  - name: secret_access_key
+    env_vars: [AWS_SECRET_ACCESS_KEY]
+    required: true
+  - name: session_token
+    env_vars: [AWS_SESSION_TOKEN]
+    required: true
+",
+        )
+        .expect("profile should parse");
+        let diagnostics = validate_profile_set(&[("aws.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("requires primary credential to map to env var AWS_ACCESS_KEY_ID")),
+            "diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_additional_outputs_on_unsupported_strategy() {
+        let profile = parse_profile_yaml(
+            r"
+id: oauth-with-outputs
+display_name: OAuth With Outputs
+credentials:
+  - name: access_token
+    env_vars: [ACCESS_TOKEN]
+    required: true
+    refresh:
+      strategy: oauth2_client_credentials
+      additional_outputs:
+        - output: extra
+          credential: other
+  - name: other
+    env_vars: [OTHER]
+    required: false
+",
+        )
+        .expect("profile should parse");
+        let diagnostics = validate_profile_set(&[("oauth.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("does not support additional_outputs")),
+            "diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_standard_aws_additional_outputs() {
+        let profile = aws_output_profile(
+            "      additional_outputs:
+        - output: secret_access_key
+          credential: secret_access_key
+        - output: session_token
+          credential: session_token",
+            STANDARD_AWS_OUTPUT_TAIL,
+        );
+        let diagnostics = validate_profile_set(&[("aws.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    // -- L7 endpoint semantic validation (shared with runtime) ----------------
+
+    #[test]
+    fn validate_rejects_protocol_without_rules_or_access() {
+        let profile = parse_profile_yaml(
+            r"
+id: opencode-openrouter
+display_name: OpenCode (OpenRouter)
+credentials:
+  - name: api_key
+    env_vars: [OPENROUTER_API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: openrouter.ai
+    port: 443
+    protocol: rest
+    enforcement: enforce
+binaries:
+  - /usr/bin/opencode
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("protocol requires rules or access")),
+            "expected lint to reject protocol without rules or access, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_protocol_with_access() {
+        let profile = parse_profile_yaml(
+            r"
+id: valid-rest
+display_name: Valid REST
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: read-write
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.severity == "error")
+            .collect();
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn validate_accepts_explicit_tcp_without_l7_fields() {
+        let profile = parse_profile_yaml(
+            r"
+id: valid-tcp
+display_name: Valid TCP
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: database.example.com
+    port: 5432
+    protocol: tcp
+    tls: skip
+    allow_uninspected_credentials: true
+    allowed_ips: [10.0.0.0/8]
+binaries:
+  - /usr/bin/psql
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == "error")
+            .collect();
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn validate_rejects_additional_l7_field_families_with_explicit_tcp() {
+        let profile = parse_profile_yaml(
+            r"
+id: invalid-tcp-l7
+display_name: Invalid TCP L7
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: database.example.com
+    port: 5432
+    protocol: tcp
+    enforcement: enforce
+    path: /query
+    allow_encoded_slash: true
+    websocket_credential_rewrite: true
+    request_body_credential_rewrite: true
+    persisted_queries: allow_registered
+    graphql_persisted_queries:
+      hash:
+        operation_type: query
+    graphql_max_body_bytes: 1024
+    json_rpc_max_body_bytes: 1024
+    mcp:
+      strict_tool_names: false
+    credential_signing: sigv4
+    signing_service: rds
+    signing_region: us-west-2
+binaries:
+  - /usr/bin/psql
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        let tcp_error = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("protocol tcp does not support L7-only fields")
+            })
+            .expect("explicit TCP should reject additional L7 fields");
+
+        for field in [
+            "enforcement",
+            "path",
+            "allow_encoded_slash",
+            "websocket_credential_rewrite",
+            "request_body_credential_rewrite",
+            "persisted_queries",
+            "graphql_persisted_queries",
+            "graphql_max_body_bytes",
+            "json_rpc_max_body_bytes",
+            "mcp",
+            "credential_signing",
+            "signing_service",
+            "signing_region",
+        ] {
+            assert!(
+                tcp_error.message.contains(field),
+                "missing {field}: {}",
+                tcp_error.message
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unknown_protocol() {
+        let profile = parse_profile_yaml(
+            r"
+id: bad-protocol
+display_name: Bad Protocol
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: ftp
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("unknown protocol")),
+            "expected lint to reject unknown protocol, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_rules_and_access_together() {
+        let profile = parse_profile_yaml(
+            r"
+id: both-rules-access
+display_name: Both
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: full
+    rules:
+      - allow:
+          method: GET
+          path: /api/**
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("mutually exclusive")),
+            "expected lint to reject rules + access, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_rules_list() {
+        let profile = parse_profile_yaml(
+            r"
+id: empty-rules
+display_name: Empty Rules
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: full
+    rules: []
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("rules list cannot be empty")),
+            "expected lint to reject empty rules list, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_allow_object_as_deny_all() {
+        let profile = parse_profile_yaml(
+            r"
+id: empty-allow
+display_name: Empty Allow
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    rules:
+      - allow: {}
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("would deny all traffic")),
+            "expected lint to reject empty allow object as deny-all, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_deny_rules_list() {
+        let profile = parse_profile_yaml(
+            r"
+id: empty-deny-rules
+display_name: Empty Deny Rules
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: full
+    deny_rules: []
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("deny_rules list cannot be empty")),
+            "expected lint to reject empty deny_rules list, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_params_selector_not_classified_as_deny_all() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-params
+display_name: MCP Params
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          params:
+            name:
+              glob: read_*
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("would deny all traffic")),
+            "MCP rule with params.name selector should not be classified as deny-all: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_empty_allow_with_allow_all_conflicts_with_tool_rules() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-wildcard
+display_name: MCP Wildcard
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          params:
+            name:
+              glob: read_*
+      - allow: {}
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("allows every tool call")
+                    && d.message.contains("conflicts with MCP tool allow rules")),
+            "empty allow with allow_all should conflict with tool-specific rules: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_unsupported_params_rejected() {
+        let profile = parse_profile_yaml(
+            r"
+id: unsupported-params
+display_name: Unsupported Params
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          params:
+            arguments:
+              glob: '*'
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("not supported yet")),
+            "unsupported params key should be rejected: {diagnostics:?}"
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("would deny all traffic")),
+            "MCP with allow_all_known_mcp_methods should not emit deny-all for empty method: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_deny_rule_params_round_trips_through_proto() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-deny-params
+display_name: MCP Deny Params
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+    deny_rules:
+      - method: tools/call
+        params:
+          name:
+            glob: dangerous_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let deny_rules = profile.endpoints[0]
+            .deny_rules
+            .as_ref()
+            .expect("deny_rules present");
+        assert!(
+            deny_rules[0].params.contains_key("name"),
+            "params.name should be set"
+        );
+
+        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        let rt_deny = from_proto.endpoints[0]
+            .deny_rules
+            .as_ref()
+            .expect("deny_rules survive proto round-trip");
+        assert!(
+            rt_deny[0].params.contains_key("name"),
+            "deny rule params.name should survive proto round-trip"
+        );
+    }
+
+    #[test]
+    fn mcp_tool_allow_round_trips_through_proto() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-tool
+display_name: MCP Tool
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          tool:
+            glob: read_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let rules = profile.endpoints[0].rules.as_ref().expect("rules present");
+        let allow = rules[0].allow.as_ref().expect("allow present");
+        assert!(allow.tool.is_some(), "tool should be parsed");
+        assert_eq!(allow.tool.as_ref().unwrap().glob, "read_*");
+
+        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        let rt_allow = from_proto.endpoints[0]
+            .rules
+            .as_ref()
+            .expect("rules survive")[0]
+            .allow
+            .as_ref()
+            .expect("allow survives");
+        assert!(
+            rt_allow.params.contains_key("name"),
+            "tool should be lowered to params.name in proto: {rt_allow:?}"
+        );
+        assert_eq!(rt_allow.params["name"].glob, "read_*");
+        assert!(
+            rt_allow.tool.is_none(),
+            "tool should be None after round-trip"
+        );
+    }
+
+    #[test]
+    fn mcp_tool_deny_round_trips_through_proto() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-deny-tool
+display_name: MCP Deny Tool
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+    deny_rules:
+      - method: 'tools/call'
+        tool:
+          glob: dangerous_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let deny_rules = profile.endpoints[0]
+            .deny_rules
+            .as_ref()
+            .expect("deny_rules present");
+        assert!(deny_rules[0].tool.is_some(), "tool should be parsed");
+
+        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        let rt_deny = from_proto.endpoints[0]
+            .deny_rules
+            .as_ref()
+            .expect("deny_rules survive")[0]
+            .clone();
+        assert!(
+            rt_deny.params.contains_key("name"),
+            "deny tool should be lowered to params.name in proto"
+        );
+        assert_eq!(rt_deny.params["name"].glob, "dangerous_*");
+    }
+
+    #[test]
+    fn validate_mcp_tool_and_params_name_rejected() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-both
+display_name: MCP Both
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          tool:
+            glob: read_*
+          params:
+            name:
+              glob: write_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("must use either tool or params.name, not both")),
+            "expected mutual exclusivity error, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_tool_prevents_classify_as_deny_all() {
+        let allow = L7AllowProfile {
+            method: String::new(),
+            path: String::new(),
+            command: String::new(),
+            query: HashMap::new(),
+            operation_type: String::new(),
+            operation_name: String::new(),
+            fields: vec![],
+            params: HashMap::new(),
+            tool: Some(L7QueryMatcherProfile {
+                glob: "read_*".to_string(),
+                any: vec![],
+            }),
+        };
+        assert!(
+            !allow.is_effectively_empty(),
+            "allow with tool selector should not be classified as deny-all"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_explicit_broad_method_without_allow_all() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-broad
+display_name: MCP Broad
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+    rules:
+      - allow:
+          method: 'tools/call'
+          params:
+            name:
+              glob: read_*
+      - allow:
+          method: 'tools/call'
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("allows every tool call and conflicts")),
+            "explicit broad method should be detected even without allow_all_known_mcp_methods: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_glob_broad_method_detected() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-glob
+display_name: MCP Glob
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          params:
+            name:
+              glob: read_*
+      - allow:
+          method: 'tools/*'
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("allows every tool call and conflicts")),
+            "glob method tools/* should be detected: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_deny_rule_broad_method_conflict() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-deny-broad
+display_name: MCP Deny Broad
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          params:
+            name:
+              glob: read_*
+    deny_rules:
+      - method: 'tools/call'
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("denies every tool call and conflicts")),
+            "deny rule with broad method should be detected: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_deny_rule_with_tool_selector_ok() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-deny-ok
+display_name: MCP Deny OK
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          params:
+            name:
+              glob: '*'
+    deny_rules:
+      - method: 'tools/call'
+        tool:
+          glob: dangerous_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("denies every tool call")),
+            "deny rule with tool selector should not trigger conflict: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_tool_scalar_matcher_round_trips_through_proto() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-scalar-tool
+display_name: MCP Scalar Tool
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+    rules:
+      - allow:
+          method: tools/call
+          tool: search_web
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("scalar tool matcher should parse");
+
+        let rules = profile.endpoints[0].rules.as_ref().expect("rules present");
+        let allow = rules[0].allow.as_ref().expect("allow present");
+        assert_eq!(
+            allow.tool.as_ref().unwrap().glob,
+            "search_web",
+            "scalar string should deserialize to glob field"
+        );
+
+        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        let rt_allow = from_proto.endpoints[0]
+            .rules
+            .as_ref()
+            .expect("rules survive")[0]
+            .allow
+            .as_ref()
+            .expect("allow survives");
+        assert_eq!(
+            rt_allow.params["name"].glob, "search_web",
+            "scalar tool should lower to params.name in proto"
+        );
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.severity == "error")
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "scalar tool matcher should produce no validation errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_deny_tool_and_params_name_rejected() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-deny-both
+display_name: MCP Deny Both
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+    deny_rules:
+      - method: tools/call
+        tool:
+          glob: dangerous_*
+        params:
+          name:
+            glob: also_dangerous_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("either tool or params.name")),
+            "deny rule with both tool and params.name should be rejected: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_method_must_be_tools_call_with_tool_selector() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-bad-method
+display_name: MCP Bad Method
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+    rules:
+      - allow:
+          method: resources/read
+          tool:
+            glob: read_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("method must be tools/call")),
+            "tool selector with wrong method should be rejected: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_deny_method_must_be_tools_call_with_tool_selector() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-deny-bad-method
+display_name: MCP Deny Bad Method
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+    deny_rules:
+      - method: resources/read
+        tool:
+          glob: dangerous_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("method must be tools/call")),
+            "deny rule with tool selector and wrong method should be rejected: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_method_required_without_allow_all() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-no-method
+display_name: MCP No Method
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+    rules:
+      - allow:
+          tool:
+            glob: read_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("method is required")),
+            "missing method without allow_all should be rejected: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_before_lowering_catches_tool_params_conflict() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-both
+display_name: MCP Both
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+    rules:
+      - allow:
+          method: tools/call
+          tool:
+            glob: read_*
+          params:
+            name:
+              glob: write_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = profile.validate_before_lowering("profile.yaml");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("either tool or params.name")),
+            "pre-lowering validation should catch tool + params.name conflict: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_before_lowering_ok_with_tool_only() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-tool-only
+display_name: MCP Tool Only
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+    rules:
+      - allow:
+          method: tools/call
+          tool:
+            glob: read_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = profile.validate_before_lowering("profile.yaml");
+        assert!(
+            diagnostics.is_empty(),
+            "tool-only rule should pass pre-lowering validation: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_before_lowering_deny_catches_conflict() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-deny-both
+display_name: MCP Deny Both
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+    deny_rules:
+      - method: tools/call
+        tool:
+          glob: dangerous_*
+        params:
+          name:
+            glob: also_dangerous_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = profile.validate_before_lowering("profile.yaml");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("either tool or params.name")),
+            "deny rule with both should be caught before lowering: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_deny_rules_without_protocol() {
+        let profile = parse_profile_yaml(
+            r"
+id: deny-no-protocol
+display_name: Deny No Protocol
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    deny_rules:
+      - method: POST
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("deny_rules require protocol")),
+            "expected lint to reject deny_rules without protocol, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_before_lowering_catches_empty_rules() {
+        let profile = parse_profile_yaml(
+            r"
+id: empty-rules
+display_name: Empty Rules
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+    rules: []
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = profile.validate_before_lowering("profile.yaml");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("rules list cannot be empty")),
+            "pre-lowering should catch empty rules list: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_before_lowering_catches_empty_deny_rules() {
+        let profile = parse_profile_yaml(
+            r"
+id: empty-deny-rules
+display_name: Empty Deny Rules
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          method: tools/call
+    deny_rules: []
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = profile.validate_before_lowering("profile.yaml");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("deny_rules list cannot be empty")),
+            "pre-lowering should catch empty deny_rules list: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_unsupported_params_key() {
+        let profile = parse_profile_yaml(
+            r"
+id: bad-params
+display_name: Bad Params
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          method: tools/call
+          params:
+            arguments:
+              glob: '*'
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("MCP tool argument matching is not supported yet")),
+            "expected unsupported params key error: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_matcher_glob_and_any_rejected() {
+        let profile = parse_profile_yaml(
+            r"
+id: glob-and-any
+display_name: Glob And Any
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          method: tools/call
+          tool:
+            glob: read_*
+            any:
+              - write_data
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("cannot specify both glob and any")),
+            "expected glob+any mutual exclusion error: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_matcher_empty_rejected() {
+        let yaml = r"
+id: empty-matcher
+display_name: Empty Matcher
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          method: tools/call
+          tool: ''
+binaries:
+  - /usr/bin/example-agent
+";
+        let profile = parse_profile_yaml(yaml).expect("profile should parse");
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("matcher must specify glob or any")),
+            "expected empty matcher error: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_wildcard_without_strict_tool_names() {
+        let profile = parse_profile_yaml(
+            r"
+id: wildcard-no-strict
+display_name: Wildcard No Strict
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+      strict_tool_names: false
+    rules:
+      - allow:
+          method: tools/call
+          tool:
+            glob: '*'
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("wildcard tool-name matchers require mcp.strict_tool_names")),
+            "expected wildcard policy error: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_wildcard_with_strict_tool_names_ok() {
+        let profile = parse_profile_yaml(
+            r"
+id: wildcard-strict
+display_name: Wildcard Strict
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+      strict_tool_names: true
+    rules:
+      - allow:
+          method: tools/call
+          tool:
+            glob: '*'
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            !diagnostics.iter().any(|d| d
+                .message
+                .contains("wildcard tool-name matchers require mcp.strict_tool_names")),
+            "wildcard with strict_tool_names enabled should be OK: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_method_glob_restricted_to_tools() {
+        let profile = parse_profile_yaml(
+            r"
+id: bad-method-glob
+display_name: Bad Method Glob
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          method: 'resources/*'
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("MCP method globs are only valid for the tools/ method family")),
+            "expected method glob restriction error: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_path_rejected() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-path
+display_name: MCP Path
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      versions: ['2025-11-25']
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          method: tools/call
+          path: /api/tools
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("must use method/tool, not path/query")),
+            "expected path rejection for MCP: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_tool_on_non_mcp_rejected() {
+        let profile = parse_profile_yaml(
+            r"
+id: rest-tool
+display_name: REST Tool
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    rules:
+      - allow:
+          method: GET
+          tool:
+            glob: read_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("MCP tool matching is only valid for protocol mcp")),
+            "expected tool-on-non-mcp rejection: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_options_on_non_mcp_rejected() {
+        let profile = parse_profile_yaml(
+            r"
+id: rest-mcp-opts
+display_name: REST MCP Options
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    mcp:
+      versions: ['2025-11-25']
+      strict_tool_names: true
+    rules:
+      - allow:
+          method: GET
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("mcp options are only valid for protocol mcp")),
+            "expected mcp-options-on-non-mcp rejection: {diagnostics:?}"
+        );
     }
 }

@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The Kubernetes corporate-proxy e2e wrapper supplies the generated proxy URL
+# and creates `openshell-e2e-proxy-auth` before Helm installs the gateway.
+supervisor:
+  topology: sidecar
+
+upstreamProxy:
+  authSecret:
+    name: openshell-e2e-proxy-auth
+    key: proxy-auth
+  authAllowInsecure: true

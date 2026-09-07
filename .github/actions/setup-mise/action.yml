@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Setup mise
+description: Install mise and the tools pinned by the repository
+
+inputs:
+  version:
+    description: mise release to install
+    required: false
+    default: v2026.4.25
+
+runs:
+  using: composite
+  steps:
+    - name: Restore mise cache
+      id: mise-cache
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      with:
+        path: ~/.local/share/mise
+        key: mise-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-${{ hashFiles('mise.toml', 'mise.lock') }}
+        restore-keys: |
+          mise-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-
+
+    - name: Install mise and tools
+      shell: bash
+      env:
+        MISE_VERSION: ${{ inputs.version }}
+      run: | # zizmor: ignore[github-env] PATH entries are fixed beneath the runner-controlled HOME
+        set -euo pipefail
+        curl https://mise.run | sh
+        export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
+        mise install --locked
+
+    - name: Save mise cache
+      if: steps.mise-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      with:
+        path: ~/.local/share/mise
+        key: ${{ steps.mise-cache.outputs.cache-primary-key }}

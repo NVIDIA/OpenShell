@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: Agent Sandbox preflight
+templates:
+  - templates/agent-sandbox-preflight.yaml
+
+tests:
+  - it: fails clearly by default without a supported Agent Sandbox API
+    asserts:
+      - failedTemplate:
+          errorPattern: "Agent Sandbox is required but neither agents.x-k8s.io/v1beta1 nor agents.x-k8s.io/v1alpha1 is served"

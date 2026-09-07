@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1.4
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+ARG GATEWAY_BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775
+FROM ${GATEWAY_BASE_IMAGE}
+
+ARG TARGETARCH
+ARG SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:latest
+COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /usr/local/bin/openshell-gateway
+COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-driver-kubernetes /usr/local/bin/openshell-driver-kubernetes
+
+ENV OPENSHELL_DRIVERS=kubernetes \
+    OPENSHELL_COMPUTE_DRIVER_SOCKET=/var/run/openshell-compute/driver/driver.sock \
+    OPENSHELL_GATEWAY_ID=openshell \
+    OPENSHELL_SANDBOX_NAMESPACE=openshell \
+    OPENSHELL_K8S_SANDBOX_SERVICE_ACCOUNT=openshell-sandbox \
+    OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest \
+    OPENSHELL_SANDBOX_IMAGE_PULL_POLICY=IfNotPresent \
+    OPENSHELL_GRPC_ENDPOINT=http://openshell.openshell.svc.cluster.local:8080 \
+    OPENSHELL_SUPERVISOR_IMAGE=${SUPERVISOR_IMAGE} \
+    OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY=IfNotPresent \
+    OPENSHELL_SUPERVISOR_SIDELOAD_METHOD=init-container \
+    OPENSHELL_K8S_TOPOLOGY=combined
+
+USER 1000:1000
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/openshell-gateway"]
+CMD ["--bind-address", "0.0.0.0", "--port", "8080"]

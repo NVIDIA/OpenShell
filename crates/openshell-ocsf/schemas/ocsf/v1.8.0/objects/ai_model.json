@@ -1,0 +1,52 @@
+{
+    "attributes": {
+        "name": {
+            "type": "string_t",
+            "description": "Human-readable model name. For example: <code>gpt-4o</code>, <code>claude-3-sonnet</code>, or <code>text-embedding-ada-002</code>.",
+            "requirement": "required",
+            "caption": "Name",
+            "type_name": "String"
+        },
+        "version": {
+            "type": "string_t",
+            "description": "Model version identifier. For example: <code>2024-05-13</code>, <code>v2.1.0</code>, or <code>beta</code>.",
+            "requirement": "recommended",
+            "caption": "Version",
+            "type_name": "String"
+        },
+        "uid": {
+            "type": "string_t",
+            "description": "The unique identifier of the AI model.",
+            "requirement": "recommended",
+            "caption": "Unique ID",
+            "type_name": "String"
+        },
+        "ai_provider": {
+            "type": "string_t",
+            "description": "AI service provider or organization name. For example: <code>OpenAI</code>, <code>Anthropic</code>, <code>Google</code>, or <code>Internal</code>.",
+            "requirement": "required",
+            "caption": "AI Provider",
+            "type_name": "String"
+        }
+    },
+    "name": "ai_model",
+    "description": "The AI Model object describes the characteristics of an AI/ML model. Examples include language models like GPT-4, embedding models like text-embedding-ada-002, and computer vision models like CLIP.",
+    "extends": "_entity",
+    "constraints": {
+        "at_least_one": [
+            "name",
+            "uid"
+        ]
+    },
+    "references": [
+        {
+            "description": "AI Model Registry and Documentation Standards",
+            "url": "https://huggingface.co/docs/hub/models"
+        },
+        {
+            "description": "OpenAI Model Documentation",
+            "url": "https://platform.openai.com/docs/models"
+        }
+    ],
+    "caption": "AI Model"
+}

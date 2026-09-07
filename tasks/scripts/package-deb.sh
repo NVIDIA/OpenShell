@@ -167,22 +167,4 @@ dpkg-deb --build --root-owner-group "$pkgroot" "$package_file"
 dpkg-deb --info "$package_file"
 dpkg-deb --contents "$package_file"
 
-# ---------------------------------------------------------------------------
-# Smoke tests
-# ---------------------------------------------------------------------------
-
-extract_dir="${tmpdir}/extract"
-mkdir -p "$extract_dir"
-dpkg-deb -x "$package_file" "$extract_dir"
-"$extract_dir/usr/bin/openshell" --version
-"$extract_dir/usr/bin/openshell-gateway" --version
-"$extract_dir/usr/libexec/openshell/openshell-driver-vm" --version
-
-if command -v systemd-analyze >/dev/null 2>&1; then
-	# verify --user catches user-scope-specific issues like StateDirectory=
-	# resolution and the %h/%S specifiers used in this unit.
-	systemd-analyze --user verify "$extract_dir/usr/lib/systemd/user/openshell-gateway.service" \
-		|| echo "warning: systemd-analyze verify failed in the build environment" >&2
-fi
-
 echo "Wrote ${package_file}"

@@ -74,7 +74,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
     frame.render_widget(table, area);
 
     if app.global_settings.is_empty() {
-        draw_empty_message(frame, area, " No settings available.", t.muted);
+        let message = if app.global_settings_access_denied {
+            " Platform Admin role required."
+        } else {
+            " No settings available."
+        };
+        draw_empty_message(frame, area, message, t.muted);
     }
 
     // Draw edit overlay if active.

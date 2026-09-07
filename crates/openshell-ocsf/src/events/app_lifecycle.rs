@@ -38,7 +38,7 @@ mod tests {
             "Start",
             SeverityId::Informational,
             Metadata {
-                version: "1.7.0".to_string(),
+                version: "1.8.0".to_string(),
                 product: Product::openshell_sandbox("0.1.0"),
                 profiles: vec!["container".to_string()],
                 uid: Some("sandbox-abc123".to_string()),

@@ -42,8 +42,10 @@ endpoints:
     enforcement: enforce
   - host: telemetry.enterprise.githubcopilot.com
     port: 443
+    allow_uninspected_credentials: true
   - host: default.exp-tas.com
     port: 443
+    allow_uninspected_credentials: true
 binaries:
   - /usr/bin/copilot
   - /usr/lib/node_modules/@github/copilot/node_modules/@github/**/copilot

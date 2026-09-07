@@ -29,10 +29,18 @@ endpoints:
     protocol: graphql
     access: read-only
     enforcement: enforce
-  # github.com is the git transport (clone / fetch by default).
+  # github.com is the git transport (clone / fetch by default). Git smart
+  # HTTP needs POST to */git-upload-pack for clone/fetch, which the
+  # read-only preset (GET/HEAD/OPTIONS) blocks. Spell the rules out so
+  # clone/fetch works while push (git-receive-pack) stays denied — enabling
+  # push requires an explicit policy proposal.
   - host: github.com
     port: 443
     protocol: rest
-    access: read-only
     enforcement: enforce
+    rules:
+      - allow: { method: GET, path: "**" }
+      - allow: { method: HEAD, path: "**" }
+      - allow: { method: OPTIONS, path: "**" }
+      - allow: { method: POST, path: "/**/git-upload-pack" }
 binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]

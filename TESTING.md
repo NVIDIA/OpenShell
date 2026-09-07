@@ -148,8 +148,15 @@ lifecycle management, output parsing, and cleanup.
 Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
-- Docker suite (`--features e2e-docker`) - common suite plus Docker-only coverage such as Dockerfile image builds, Docker preflight checks, and managed Docker gateway resume.
+- CLI conformance (`openshell-conformance`) - the portable deployment smoke
+  scenario plus focused tests for its reusable command runner.
+- Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or
+  `e2e-vm`) - CLI conformance plus the common and driver-specific coverage for
+  the selected deployment.
+- Docker suite (`--features e2e-docker`) - includes Docker-only coverage such as Dockerfile image builds, Docker preflight checks, and managed Docker gateway start.
 - Docker GPU suite (`--features e2e-docker-gpu`) - Docker suite plus GPU sandbox smoke coverage.
+- VM suite (`--features e2e-vm`) - runs e2e tests on a VM.
+- Kubernetes credential-driver suite (`--features e2e-kubernetes-credential-drivers`) - targeted Kubernetes Secrets and Vault provider credential storage coverage.
 
 GPU device-selection tests compare OpenShell sandboxes against a plain Docker or
 Podman container that requests `--device nvidia.com/gpu=all`. The probe image
@@ -164,13 +171,65 @@ key.
 Run the Docker-backed Rust CLI e2e suite:
 
 ```shell
-mise run e2e:rust
+mise run e2e:docker
 ```
 
-Run the Podman-backed Rust CLI e2e suite:
+Run the minimal portable CLI conformance profile against the gateway selected
+in your OpenShell CLI configuration:
+
+```shell
+mise run e2e:cli-conformance
+```
+
+The gateway must already be installed, reachable, and selected before the task
+starts. The task does not provision a gateway or select a compute driver. Set
+`OPENSHELL_BIN` to test a prebuilt CLI; otherwise, the task builds the CLI from
+the current checkout.
+
+The phase-1 scenario verifies the complete CLI-to-gateway-to-driver path without
+depending on how the gateway was installed or which driver is configured. It
+requires machine-readable gRPC status, creates a uniquely named detached
+sandbox with `--from base`, verifies the sandbox is `Ready` by finding its
+unique name in paginated JSON list output, executes `echo` with a run-specific
+marker, deletes the sandbox, and verifies that its name no longer appears.
+Driver suites enable the same profile
+instead of maintaining a separate smoke implementation. Sandbox lifecycle,
+label matrices, VM overlay, and TLS-key permission assertions remain regular
+E2E coverage.
+
+Each invocation prints a ten-character run ID before creating resources.
+Conformance sandboxes use names such as `ct-<run-id>-01`. The runner tracks the
+exact name and uses it for cleanup; phase 1 does not add ownership labels.
+
+The runner deletes owned resources after both success and failure. If the test
+process is interrupted before cleanup, locate leftovers without touching
+unrelated gateway state:
+
+```shell
+openshell sandbox list --output json
+openshell sandbox delete <sandbox-name>
+```
+
+Gateway-backed Rust E2E tasks build the standalone conformance CLI, run its
+registered scenarios against the configured gateway, then run any lane-specific
+Rust tests that still apply. Run the Podman-backed Rust CLI e2e suite:
 
 ```shell
 mise run e2e:podman
+```
+
+Run the VM-backed Rust CLI e2e suite:
+
+```shell
+mise run e2e:vm
+```
+
+Run the targeted Kubernetes credential-driver e2e suite. This deploys an
+OpenBao fixture for the Vault-compatible driver path and validates Kubernetes
+Secrets and Vault storage backends one at a time:
+
+```shell
+mise run e2e:kubernetes:credential-drivers
 ```
 
 Run a single test directly with cargo:
@@ -203,3 +262,4 @@ The harness (`e2e/rust/src/harness/`) provides:
 | `OPENSHELL_GATEWAY` | Override active gateway name for E2E tests |
 | `OPENSHELL_GATEWAY_ENDPOINT` | Run E2E tests against an existing plaintext HTTP gateway endpoint |
 | `OPENSHELL_E2E_DRIVER` | Driver name exported by the e2e gateway wrapper (`docker`, `podman`, or `vm`) |
+| `OPENSHELL_E2E_CREDENTIAL_DRIVERS` | Enables the Kubernetes credential-driver fixture path in `e2e/with-kube-gateway.sh` |

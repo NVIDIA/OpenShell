@@ -8,6 +8,37 @@ use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
 use crate::app::App;
 
+const BASE_CONTENT_ROWS: u16 = 6;
+const BORDER_ROWS: u16 = 2;
+
+fn pending_draft_count(app: &App) -> usize {
+    let cached = app
+        .sandbox_draft_counts
+        .get(app.sandbox_selected)
+        .copied()
+        .unwrap_or(0);
+    if cached > 0 {
+        cached
+    } else {
+        app.draft_chunks
+            .iter()
+            .filter(|chunk| chunk.status == "pending")
+            .count()
+    }
+}
+
+/// Return the rows needed to render every metadata line without clipping.
+pub(super) fn required_height(app: &App) -> u16 {
+    let policy_rows = u16::from(app.sandbox_policy_is_global);
+    let action_rows = if app.confirm_delete {
+        2 // spacer plus confirmation
+    } else {
+        u16::from(pending_draft_count(app) > 0)
+    };
+
+    BASE_CONTENT_ROWS + policy_rows + action_rows + BORDER_ROWS
+}
+
 /// Draw a compact metadata pane for the currently selected sandbox.
 ///
 /// This is non-interactive (no focus state) — always rendered with the
@@ -22,30 +53,23 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let age = app.sandbox_ages.get(idx).map_or("-", String::as_str);
 
     let phase_style = match phase {
-        "Ready" => t.status_ok,
-        "Provisioning" => t.status_warn,
+        "Ready" | "Completed" => t.status_ok,
+        "Provisioning" | "Stopping" | "Starting" => t.status_warn,
         "Error" => t.status_err,
         _ => t.muted,
     };
 
     let status_indicator = match phase {
         "Ready" => "●",
-        "Provisioning" => "◐",
-        "Error" => "○",
+        "Completed" => "✓",
+        "Provisioning" | "Stopping" | "Starting" => "◐",
+        "Error" | "Stopped" => "○",
         _ => "…",
     };
 
     // Count pending draft recommendations for this sandbox.
-    let pending_count = app.sandbox_draft_counts.get(idx).copied().unwrap_or(0);
-    // Also check the live draft_chunks when on the sandbox screen (more up-to-date).
-    let pending_count = if pending_count > 0 {
-        pending_count
-    } else {
-        app.draft_chunks
-            .iter()
-            .filter(|c| c.status == "pending")
-            .count()
-    };
+    // Fall back to the live chunks when the dashboard cache has no pending count.
+    let pending_count = pending_draft_count(app);
 
     // Row 1: Name + Status + optional draft badge
     let mut row1_spans = vec![
@@ -84,29 +108,40 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled(labels_str, t.text),
     ]);
 
-    // Row 4: Providers
+    // Row 4: Annotations
+    let annotations_str = app
+        .sandbox_annotations
+        .get(idx)
+        .filter(|s| !s.is_empty())
+        .map_or("none", String::as_str);
+    let row4 = Line::from(vec![
+        Span::styled("  Annotations: ", t.muted),
+        Span::styled(annotations_str, t.text),
+    ]);
+
+    // Row 5: Providers
     let providers_str = if app.sandbox_providers_list.is_empty() {
         "none".to_string()
     } else {
         app.sandbox_providers_list.join(", ")
     };
-    let row4 = Line::from(vec![
+    let row5 = Line::from(vec![
         Span::styled("  Providers: ", t.muted),
         Span::styled(providers_str, t.text),
     ]);
 
-    // Row 5: Forwarded Ports
+    // Row 6: Forwarded Ports
     let forwards_str = app
         .sandbox_notes
         .get(idx)
         .filter(|s| !s.is_empty())
         .map_or("none", String::as_str);
-    let row5 = Line::from(vec![
+    let row6 = Line::from(vec![
         Span::styled("  Forwards: ", t.muted),
         Span::styled(forwards_str, t.text),
     ]);
 
-    let mut lines = vec![Line::from(""), row1, row2, row3, row4, row5];
+    let mut lines = vec![row1, row2, row3, row4, row5, row6];
 
     // Show global policy indicator when the sandbox's policy is managed at
     // gateway scope.

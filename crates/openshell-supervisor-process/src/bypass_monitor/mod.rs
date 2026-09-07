@@ -77,6 +77,61 @@ pub fn parse_kmsg_line(line: &str, namespace_prefix: &str) -> Option<BypassEvent
     })
 }
 
+fn build_bypass_ocsf_events(
+    event: &BypassEvent,
+    binary: &str,
+    binary_pid: &str,
+    ancestors: &str,
+) -> (openshell_ocsf::OcsfEvent, openshell_ocsf::OcsfEvent) {
+    let hint = hint_for_event(event);
+    let reason = "direct connection bypassed HTTP CONNECT proxy";
+    let dst_port = event.dst_port.to_string();
+    let dst_ep = event.dst_addr.parse::<std::net::IpAddr>().map_or_else(
+        |_| Endpoint::from_domain(&event.dst_addr, event.dst_port),
+        |ip| Endpoint::from_ip(ip, event.dst_port),
+    );
+
+    let net_event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Refuse)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .dst_endpoint(dst_ep)
+        .actor_process(Process::from_bypass(binary, binary_pid, ancestors))
+        .firewall_rule("bypass-detect", "nftables")
+        .observation_point(3)
+        .message(format!(
+            "BYPASS_DETECT {}:{} proto={} binary={binary} action=reject reason={reason}",
+            event.dst_addr, event.dst_port, event.proto,
+        ))
+        .build();
+
+    let finding_event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .is_alert(true)
+        .confidence(ConfidenceId::High)
+        .finding_info(FindingInfo::new("bypass-detect", "Proxy Bypass Detected").with_desc(reason))
+        .remediation(hint)
+        .evidence_pairs(&[
+            ("dst_addr", event.dst_addr.as_str()),
+            ("dst_port", dst_port.as_str()),
+            ("proto", event.proto.as_str()),
+            ("binary", binary),
+            ("binary_pid", binary_pid),
+            ("ancestors", ancestors),
+        ])
+        .message(format!(
+            "BYPASS_DETECT {}:{} proto={} binary={binary} hint={hint}",
+            event.dst_addr, event.dst_port, event.proto,
+        ))
+        .build();
+
+    (net_event, finding_event)
+}
+
 /// Extract a single space-delimited field value from a nftables log line.
 ///
 /// Given `"DST="` and a string like `"...DST=93.184.216.34 LEN=60..."`,
@@ -207,60 +262,11 @@ pub fn spawn(
                     ("-".to_string(), "-".to_string(), "-".to_string())
                 };
 
-            let hint = hint_for_event(&event);
-            let reason = "direct connection bypassed HTTP CONNECT proxy";
-
             // Dual-emit: Network Activity [4001] + Detection Finding [2004]
-            {
-                let dst_ep = if let Ok(ip) = event.dst_addr.parse::<std::net::IpAddr>() {
-                    Endpoint::from_ip(ip, event.dst_port)
-                } else {
-                    Endpoint::from_domain(&event.dst_addr, event.dst_port)
-                };
-
-                let net_event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                    .activity(ActivityId::Refuse)
-                    .action(ActionId::Denied)
-                    .disposition(DispositionId::Blocked)
-                    .severity(SeverityId::Medium)
-                    .dst_endpoint(dst_ep.clone())
-                    .actor_process(Process::from_bypass(&binary, &binary_pid, &ancestors))
-                    .firewall_rule("bypass-detect", "nftables")
-                    .observation_point(3)
-                    .message(format!(
-                        "BYPASS_DETECT {}:{} proto={} binary={binary} action=reject reason={reason}",
-                        event.dst_addr, event.dst_port, event.proto,
-                    ))
-                    .build();
-                ocsf_emit!(net_event);
-
-                let finding_event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
-                    .activity(ActivityId::Open)
-                    .action(ActionId::Denied)
-                    .disposition(DispositionId::Blocked)
-                    .severity(SeverityId::Medium)
-                    .is_alert(true)
-                    .confidence(ConfidenceId::High)
-                    .finding_info(
-                        FindingInfo::new("bypass-detect", "Proxy Bypass Detected")
-                            .with_desc(reason),
-                    )
-                    .remediation(hint)
-                    .evidence_pairs(&[
-                        ("dst_addr", &event.dst_addr),
-                        ("dst_port", &event.dst_port.to_string()),
-                        ("proto", &event.proto),
-                        ("binary", &binary),
-                        ("binary_pid", &binary_pid),
-                        ("ancestors", &ancestors),
-                    ])
-                    .message(format!(
-                        "BYPASS_DETECT {}:{} proto={} binary={binary} hint={hint}",
-                        event.dst_addr, event.dst_port, event.proto,
-                    ))
-                    .build();
-                ocsf_emit!(finding_event);
-            }
+            let (net_event, finding_event) =
+                build_bypass_ocsf_events(&event, &binary, &binary_pid, &ancestors);
+            ocsf_emit!(net_event);
+            ocsf_emit!(finding_event);
 
             // Send to denial aggregator if available.
             if let Some(ref tx) = denial_tx {
@@ -486,6 +492,49 @@ mod tests {
             uid: None,
         };
         assert!(hint_for_event(&event).contains("UDP"));
+    }
+
+    #[test]
+    fn bypass_ocsf_contract_is_stable() {
+        let event = BypassEvent {
+            dst_addr: "93.184.216.34".to_string(),
+            dst_port: 443,
+            src_port: 48012,
+            proto: "tcp".to_string(),
+            uid: Some(1000),
+        };
+        let (network, finding) =
+            build_bypass_ocsf_events(&event, "/usr/bin/curl", "42", "/usr/bin/sh");
+        let network = serde_json::to_value(network).unwrap();
+        assert_eq!(network["class_name"], "Network Activity");
+        assert_eq!(network["activity_name"], "Refuse");
+        assert_eq!(network["action"], "Denied");
+        assert_eq!(network["disposition"], "Blocked");
+        assert_eq!(network["severity"], "Medium");
+        assert!(network.get("status").is_none());
+        assert_eq!(network["dst_endpoint"]["ip"], "93.184.216.34");
+        assert_eq!(network["dst_endpoint"]["port"], 443);
+        assert_eq!(network["actor"]["process"]["name"], "/usr/bin/curl");
+        assert_eq!(network["firewall_rule"]["name"], "bypass-detect");
+        assert_eq!(network["firewall_rule"]["type"], "nftables");
+        assert_eq!(network["observation_point_id"], 3);
+        assert!(
+            network["message"]
+                .as_str()
+                .unwrap()
+                .contains("action=reject")
+        );
+
+        let finding = serde_json::to_value(finding).unwrap();
+        assert_eq!(finding["class_name"], "Detection Finding");
+        assert_eq!(finding["action"], "Denied");
+        assert_eq!(finding["disposition"], "Blocked");
+        assert_eq!(finding["severity"], "Medium");
+        assert_eq!(finding["confidence"], "High");
+        assert_eq!(finding["is_alert"], true);
+        assert_eq!(finding["finding_info"]["uid"], "bypass-detect");
+        assert_eq!(finding["finding_info"]["title"], "Proxy Bypass Detected");
+        assert_eq!(finding["evidences"][0]["data"]["dst_port"], "443");
     }
 
     #[test]

@@ -11,6 +11,22 @@ release:
   namespace: my-namespace
 
 tests:
+  - it: identifies the gateway by chart fullname by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^name\s*=\s*"openshell"$'
+
+  - it: renders an explicit gateway name
+    template: templates/gateway-config.yaml
+    set:
+      server.name: production-us-west
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^name\s*=\s*"production-us-west"$'
+
   # Regression for Drew's P2: a ConfigMap-only mutation in `helm upgrade`
   # must roll the StatefulSet, otherwise pods keep running with stale config.
   - it: annotates the StatefulSet pod template with a ConfigMap checksum
@@ -41,6 +57,52 @@ tests:
       - equal:
           path: spec.template.spec.containers[0].name
           value: openshell-gateway
+
+  - it: enables anonymous telemetry by default
+    template: templates/statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_TELEMETRY_ENABLED
+            value: "true"
+
+  - it: disables anonymous telemetry when configured
+    template: templates/statefulset.yaml
+    set:
+      server.telemetryEnabled: false
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_TELEMETRY_ENABLED
+            value: "false"
+
+  - it: renders OTLP tracing configuration when configured
+    template: templates/gateway-config.yaml
+    set:
+      server.otlp.endpoint: http://otel-collector.observability.svc:4317
+      server.otlp.serviceName: production-gateway
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.otlp\].*?endpoint\s*=\s*"http://otel-collector\.observability\.svc:4317".*?service_name\s*=\s*"production-gateway"'
+
+  - it: omits OTLP tracing configuration by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.otlp\]'
+
+  - it: treats a null OTLP map as disabled
+    template: templates/gateway-config.yaml
+    set:
+      server.otlp: null
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.otlp\]'
 
   - it: mounts the OIDC CA bundle when TLS is disabled
     template: templates/statefulset.yaml
@@ -88,16 +150,112 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?supervisor_topology\s*=\s*"combined"'
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?topology\s*=\s*"combined"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor[_]topology\s*='
 
-  - it: renders explicit combined supervisor topology under [openshell.drivers.kubernetes]
+  - it: renders operator-owned upstream proxy settings under the Kubernetes driver
     template: templates/gateway-config.yaml
     set:
-      supervisor.topology: combined
+      upstreamProxy.url: http://proxy.corp.example:8080
+      upstreamProxy.noProxy: .svc.cluster.local,10.96.0.0/12
+      upstreamProxy.authSecret.name: corporate-proxy-auth
+      upstreamProxy.authSecret.key: credentials
+      upstreamProxy.authAllowInsecure: true
+      upstreamProxy.connectByHostname: true
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?supervisor_topology\s*=\s*"combined"'
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?https_proxy\s*=\s*"http://proxy\.corp\.example:8080"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_auth_secret_name\s*=\s*"corporate-proxy-auth"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_auth_secret_key\s*=\s*"credentials"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_auth_allow_insecure\s*=\s*true'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'no_proxy\s*=\s*"\.svc\.cluster\.local,10\.96\.0\.0/12"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_connect_by_hostname\s*=\s*true'
+
+  - it: uses the gateway built-in supervisor image by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor_image\s*='
+
+  - it: renders a supervisor tag override with the official repository
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.image.tag: 1.2.3
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor_image\s*=\s*"ghcr\.io/nvidia/openshell/supervisor:1\.2\.3"'
+
+  - it: renders a supervisor repository override with the effective gateway tag
+    template: templates/gateway-config.yaml
+    set:
+      image.tag: gateway-build
+      supervisor.image.repository: registry.example.com/openshell/supervisor
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor_image\s*=\s*"registry\.example\.com/openshell/supervisor:gateway-build"'
+
+  - it: renders complete supervisor repository and tag overrides
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.image.repository: registry.example.com/openshell/supervisor
+      supervisor.image.tag: supervisor-build
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor_image\s*=\s*"registry\.example\.com/openshell/supervisor:supervisor-build"'
+
+  - it: renders sidecar supervisor topology under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.topology: sidecar
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?topology\s*=\s*"sidecar"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor[_]topology\s*='
+
+  - it: renders proxy uid under [openshell.drivers.kubernetes.sidecar]
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.sidecar.proxyUid: 2200
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.sidecar\].*?proxy_uid\s*=\s*2200'
+
+  - it: renders process binary aware network policy under [openshell.drivers.kubernetes.sidecar]
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.sidecar.processBinaryAwareNetworkPolicy: false
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.sidecar\].*?process_binary_aware_network_policy\s*=\s*false'
+
+  - it: configures managed SSH isolation with the gateway peer
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.managed_ssh_ingress\].*?enabled\s*=\s*true.*?gateway_namespace\s*=\s*"my-namespace".*?gateway_pod_selector\s*=.*?app\.kubernetes\.io/name.*?openshell'
 
   - it: renders sandbox image pull secrets under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml
@@ -168,6 +326,22 @@ tests:
       - notMatchRegex:
           path: data["gateway.toml"]
           pattern: 'grpc_rate_limit_window_seconds\s*='
+
+  - it: renders fail-closed policy validation posture by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\].*?policy_validation_failure_mode\s*=\s*"fail_closed"'
+
+  - it: renders retain-last-valid policy validation posture
+    template: templates/gateway-config.yaml
+    set:
+      server.policyValidationFailureMode: retain_last_valid
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\].*?policy_validation_failure_mode\s*=\s*"retain_last_valid"'
 
   - it: renders the gRPC rate limit under [openshell.gateway] when both values are positive
     template: templates/gateway-config.yaml
@@ -248,6 +422,94 @@ tests:
           path: data["gateway.toml"]
           pattern: '\[openshell\.gateway\.tls\]'
 
+  - it: renders client_ca_path for built-in PKI by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'client_ca_path\s*=\s*"/etc/openshell-tls/client-ca/ca\.crt"'
+
+  - it: omits client_ca_path when clientCaSecretName is empty for HTTPS-only mode
+    template: templates/gateway-config.yaml
+    set:
+      server.tls.clientCaSecretName: ""
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.tls\]'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'cert_path\s*=\s*"/etc/openshell-tls/server/tls\.crt"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'key_path\s*=\s*"/etc/openshell-tls/server/tls\.key"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'client_ca_path\s*='
+
+  - it: keeps external server certificate fields when clientCaSecretName is empty
+    template: templates/gateway-config.yaml
+    set:
+      certManager.enabled: true
+      certManager.serverIssuerRef.name: letsencrypt-prod
+      certManager.serverDnsNames:
+        - gateway.example.com
+      server.tls.clientCaSecretName: ""
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'client_ca_path\s*='
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'external_cert_path\s*=\s*"/etc/openshell-tls/server-external/tls\.crt"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'external_key_path\s*=\s*"/etc/openshell-tls/server-external/tls\.key"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'external_server_names\s*=\s*\["gateway\.example\.com"\]'
+
+  - it: omits client_ca_path for cert-manager shared CA when clientCaSecretName is empty
+    template: templates/gateway-config.yaml
+    set:
+      certManager.enabled: true
+      certManager.clientCaFromServerTlsSecret: true
+      server.tls.clientCaSecretName: ""
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.tls\]'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'cert_path\s*=\s*"/etc/openshell-tls/server/tls\.crt"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'key_path\s*=\s*"/etc/openshell-tls/server/tls\.key"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'client_ca_path\s*='
+
+  - it: omits client_ca_path when cert-manager owns TLS and no client CA secret is set
+    template: templates/gateway-config.yaml
+    set:
+      certManager.enabled: true
+      certManager.clientCaFromServerTlsSecret: false
+      pkiInitJob.enabled: true
+      server.tls.clientCaSecretName: ""
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.tls\]'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'cert_path\s*=\s*"/etc/openshell-tls/server/tls\.crt"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'key_path\s*=\s*"/etc/openshell-tls/server/tls\.key"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'client_ca_path\s*='
+
   - it: renders server_sans from certManager.serverDnsNames
     set:
       certManager.enabled: true
@@ -267,6 +529,14 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].args
           content: "sqlite:/var/openshell/openshell.db"
+
+  - it: fails when clientCaSecretName is null
+    template: templates/statefulset.yaml
+    set:
+      server.tls.clientCaSecretName: null
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.tls.clientCaSecretName cannot be null; omit the key to use the chart default (openshell-server-client-ca), or set to \"\" to disable client certificate verification for HTTPS-only mode"
 
   - it: fails when legacy postgres.enabled is set
     template: templates/statefulset.yaml
@@ -290,6 +560,7 @@ tests:
       workload.kind: deployment
       replicaCount: 2
       server.externalDbSecret: my-pg-secret
+      server.credentialDrivers.kubernetesSecrets.enabled: true
     asserts:
       - equal:
           path: kind
@@ -337,6 +608,7 @@ tests:
       replicaCount: 2
       server.externalDbSecret: my-pg-secret
       workload.allowMultiReplicaStatefulSet: true
+      server.credentialDrivers.kubernetesSecrets.enabled: true
     asserts:
       - equal:
           path: kind
@@ -415,11 +687,48 @@ tests:
           path: data["gateway.toml"]
           pattern: '\[openshell\.gateway\.spiffe\]'
 
-  - it: keeps the gateway sandbox JWT secret mounted when provider SPIFFE grants are enabled
+  - it: mounts the gateway SPIFFE socket while keeping sandbox JWT auth
     set:
       server.providerTokenGrants.spiffe.enabled: true
     template: templates/statefulset.yaml
     asserts:
-      - matchRegex:
-          path: spec.template.spec.volumes[1].name
-          pattern: '^sandbox-jwt$'
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET
+            value: /spiffe-workload-api/spire-agent.sock
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: sandbox-jwt
+            mountPath: /etc/openshell-jwt
+            readOnly: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: spiffe-workload-api
+            mountPath: /spiffe-workload-api
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: sandbox-jwt
+            secret:
+              defaultMode: 256
+              secretName: openshell-jwt-keys
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: spiffe-workload-api
+            csi:
+              driver: csi.spiffe.io
+              readOnly: true
+
+  - it: fails when serverIssuerRef is set but certManager is disabled
+    template: templates/statefulset.yaml
+    set:
+      certManager.serverIssuerRef.name: letsencrypt-prod
+      certManager.enabled: false
+    asserts:
+      - failedTemplate:
+          errorMessage: "certManager.serverIssuerRef.name is set but certManager.enabled is false \u2014 the external server certificate, its Secret mount, and the gateway TLS configuration all require cert-manager to be enabled. Set certManager.enabled=true or remove certManager.serverIssuerRef.name."

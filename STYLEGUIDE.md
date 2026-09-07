@@ -1,4 +1,4 @@
-# STYLE_GUIDE
+# STYLEGUIDE
 
 ## License Headers
 

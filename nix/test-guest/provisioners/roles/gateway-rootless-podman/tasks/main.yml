@@ -1,0 +1,25 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Require an OpenShell installation
+  ansible.builtin.assert:
+    that:
+      - openshell_install_source is defined
+      - openshell_cli_bin is defined
+      - openshell_gateway_bin is defined
+      - openshell_gateway_service is defined
+      - openshell_gateway_endpoint is defined
+    fail_msg: >-
+      gateway-rootless-podman requires an earlier OpenShell source provisioner,
+      such as openshell-development or openshell-rpm.
+
+- name: Configure development gateway for rootless Podman
+  ansible.builtin.include_tasks: development-gateway.yml
+  when: openshell_install_source == 'development'
+
+- ansible.builtin.import_tasks: lifecycle.yml
+
+- name: Publish rootless Podman gateway runtime
+  ansible.builtin.set_fact:
+    openshell_gateway_runtime: rootless-podman

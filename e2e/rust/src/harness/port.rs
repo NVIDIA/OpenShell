@@ -51,10 +51,7 @@ pub async fn wait_for_port(host: &str, port: u16, max_wait: Duration) -> Result<
 pub fn find_free_port() -> u16 {
     let listener =
         TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind to port 0");
-    listener
-        .local_addr()
-        .expect("local_addr after bind")
-        .port()
+    listener.local_addr().expect("local_addr after bind").port()
 }
 
 #[cfg(test)]

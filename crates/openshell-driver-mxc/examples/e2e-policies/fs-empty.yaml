@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# fs-empty.yaml — Empty filesystem policy (default-deny) scenario.
+#
+# No paths are granted. With processcontainer (AppContainer), every write is
+# denied by the OS without any host ACL configuration — genuine default-deny.
+# This scenario is processcontainer-only (isolation_session has no deny primitive).
+# Used by the fs-default-deny-empty scenario in run-mxc-e2e.ps1.
+version: 1
+
+filesystem_policy:
+  include_workdir: false
+  read_only: []
+  read_write: []

@@ -1,0 +1,11 @@
+{{/*
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+*/}}
+{{- if .Values.agentSandbox.preflight.enabled }}
+{{- $v1beta1 := or (.Capabilities.APIVersions.Has "agents.x-k8s.io/v1beta1") (.Capabilities.APIVersions.Has "agents.x-k8s.io/v1beta1/Sandbox") }}
+{{- $v1alpha1 := or (.Capabilities.APIVersions.Has "agents.x-k8s.io/v1alpha1") (.Capabilities.APIVersions.Has "agents.x-k8s.io/v1alpha1/Sandbox") }}
+{{- if not (or $v1beta1 $v1alpha1) }}
+{{- fail "Agent Sandbox is required but neither agents.x-k8s.io/v1beta1 nor agents.x-k8s.io/v1alpha1 is served by this cluster. Install the Agent Sandbox CRDs and controller before deploying OpenShell; see deploy/helm/openshell/README.md. Set agentSandbox.preflight.enabled=false only for offline rendering." }}
+{{- end }}
+{{- end }}

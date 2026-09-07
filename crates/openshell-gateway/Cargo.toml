@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-gateway"
+description = "OpenShell gateway binary composition"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "openshell-gateway"
+path = "src/main.rs"
+
+[dependencies]
+openshell-core = { path = "../openshell-core", default-features = false }
+openshell-server = { path = "../openshell-server", default-features = false }
+openshell-otel = { path = "../openshell-otel", optional = true }
+async-trait = "0.1"
+miette = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+openshell-driver-docker = { path = "../openshell-driver-docker", optional = true }
+openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes", optional = true }
+openshell-driver-podman = { path = "../openshell-driver-podman", optional = true }
+hyper-util = { workspace = true, optional = true }
+nix = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+openshell-driver-mxc = { path = "../openshell-driver-mxc", optional = true }
+
+[features]
+default = ["telemetry", "in-tree-compute-drivers"]
+in-tree-compute-drivers = [
+    "dep:openshell-driver-docker",
+    "dep:openshell-driver-kubernetes",
+    "dep:openshell-driver-podman",
+    "dep:openshell-otel",
+    "dep:hyper-util",
+    "dep:nix",
+    "dep:serde",
+    "dep:rustix",
+    "dep:tonic",
+    "dep:tower",
+    "dep:tracing",
+    "dep:openshell-driver-mxc",
+]
+telemetry = ["openshell-core/telemetry", "openshell-server/telemetry"]
+## Convenience alias: every default feature except `telemetry`. Build a
+## telemetry-free gateway with
+## `--no-default-features --features defaults-without-telemetry` and stay
+## correct as new default features are added. Cargo cannot subtract a single
+## default feature, so this alias must be paired with `--no-default-features`;
+## enabling it alongside `telemetry` is a compile error rather than a silent
+## telemetry-on build. Kept in sync with `default` by
+## `rust:verify:defaults-without-telemetry`.
+defaults-without-telemetry = ["in-tree-compute-drivers"]
+bundled-z3 = ["openshell-server/bundled-z3"]
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3"

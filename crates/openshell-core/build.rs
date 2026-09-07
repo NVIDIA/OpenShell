@@ -4,16 +4,20 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+mod build_version;
+
 const PROTO_REL: &str = "../../proto";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Git-derived version ---
-    // Compute a version from `git describe` for local builds. In Docker/CI
-    // builds where .git is absent, this silently does nothing and the binary
-    // falls back to CARGO_PKG_VERSION (which is already sed-patched by the
-    // build pipeline).
+    // Compute a version from tags and commit metadata for local builds. In
+    // Docker/CI builds where .git is absent, this silently does nothing and
+    // the binary falls back to CARGO_PKG_VERSION (which is already sed-patched
+    // by the build pipeline).
     println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/logs/HEAD");
     println!("cargo:rerun-if-changed=../../.git/refs/tags");
+    println!("cargo:rerun-if-changed=../../.git/packed-refs");
 
     if let Some(version) = git_version() {
         println!("cargo:rustc-env=OPENSHELL_GIT_VERSION={version}");
@@ -22,20 +26,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Protobuf compilation ---
     // Re-run when anything under proto/ changes (including newly added .proto files).
     println!("cargo:rerun-if-changed={PROTO_REL}");
-    // Use bundled protoc from protobuf-src.  The system protoc (from apt-get)
-    // does not bundle the well-known type includes (google/protobuf/struct.proto
-    // etc.), so we must use protobuf-src which ships both the binary and the
-    // include tree.
+    // Use a vendored protoc binary and include tree. System protoc installs
+    // often omit the well-known type includes (google/protobuf/struct.proto,
+    // etc.), and protobuf-src requires autotools/sh which breaks MSVC builds.
     // SAFETY: This is run at build time in a single-threaded build script context.
     // No other threads are reading environment variables concurrently.
     #[allow(unsafe_code)]
     unsafe {
-        env::set_var("PROTOC", protobuf_src::protoc());
+        env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path()?);
+        env::set_var("PROTOC_INCLUDE", protoc_bin_vendored::include_path()?);
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let proto_root = manifest_dir.join(PROTO_REL);
-
     let mut proto_files = Vec::new();
     collect_proto_files(&proto_root, &mut proto_files)?;
     proto_files.sort();
@@ -47,6 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
+        .include_file("openshell.rs")
         // Emit a binary FileDescriptorSet so the server can enumerate every
         // RPC at runtime (used by the per-handler auth exhaustiveness test).
         .file_descriptor_set_path(&descriptor_path)
@@ -72,53 +76,43 @@ fn collect_proto_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()
     Ok(())
 }
 
-/// Derive a version string from `git describe --tags`.
+/// Derive the release or development version from git metadata.
 ///
 /// Implements the "guess-next-dev" convention used by the release pipeline
-/// (`setuptools-scm`): when there are commits past the last tag, the patch
-/// version is bumped and `-dev.<N>+g<sha>` is appended.
+/// (`tasks/scripts/release.py`): exact stable and prerelease tags retain their
+/// version. Otherwise, the latest merged stable release gets a patch bump and
+/// `-dev.<N>+g<sha>` is appended.
 ///
 /// Examples:
-///   on tag v0.0.3          → "0.0.3"
-///   3 commits past v0.0.3  → "0.0.4-dev.3+g2bf9969"
+///   on tag v0.1.0-pre.1    → "0.1.0-pre.1"
+///   3 commits past v0.0.3  → "0.0.4-dev.3+g2bf9969ab"
 ///
-/// Returns `None` when git is unavailable or the repo has no matching tags.
+/// Returns `None` when git metadata cannot be read.
 fn git_version() -> Option<String> {
-    // Match numeric release tags only (e.g. `v0.0.29`). The bare glob `v*`
-    // also matches non-release tags like `vm-dev` or `vm-prod`; when one of
-    // those lands on the same commit as a release tag, `git describe` picks
-    // it and the resulting version string collapses to `m-dev` after the
-    // leading `v` is stripped below. Requiring a digit after `v` excludes
-    // those development tags without losing any release tag.
-    let output = std::process::Command::new("git")
-        .args(["describe", "--tags", "--long", "--match", "v[0-9]*"])
-        .output()
-        .ok()?;
+    let exact_tags = git_output(&["tag", "--points-at", "HEAD"])?;
+    if let Some(version) = build_version::exact_release_version(exact_tags.lines()) {
+        return Some(version);
+    }
 
+    let merged_tags = git_output(&["tag", "--merged", "HEAD", "--list", "v*.*.*"])?;
+    let latest_tag = build_version::latest_stable_tag(merged_tags.lines());
+    let revision_range = latest_tag
+        .as_deref()
+        .map_or_else(|| "HEAD".to_string(), |tag| format!("{tag}..HEAD"));
+    let distance = git_output(&["rev-list", "--count", &revision_range])?
+        .parse()
+        .ok()?;
+    let sha = git_output(&["rev-parse", "--short=9", "HEAD"])?;
+
+    build_version::next_dev_version(latest_tag.as_deref(), distance, &sha)
+}
+
+fn git_output(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git").args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
-
-    let desc = String::from_utf8(output.stdout).ok()?;
-    let desc = desc.trim();
-    let desc = desc.strip_prefix('v').unwrap_or(desc);
-
-    // `git describe --long` format: <tag>-<N>-g<sha>
-    // Split from the right to handle tags that contain hyphens.
-    let (rest, sha) = desc.rsplit_once('-')?;
-    let (tag, commits_str) = rest.rsplit_once('-')?;
-    let commits: u32 = commits_str.parse().ok()?;
-
-    if commits == 0 {
-        // Exactly on a tag — use the tag version as-is.
-        return Some(tag.to_string());
-    }
-
-    // Bump patch version (guess-next-dev scheme).
-    let mut parts = tag.splitn(3, '.');
-    let major = parts.next()?;
-    let minor = parts.next()?;
-    let patch: u32 = parts.next()?.parse().ok()?;
-
-    Some(format!("{major}.{minor}.{}-dev.{commits}+{sha}", patch + 1))
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|output| output.trim().to_string())
 }

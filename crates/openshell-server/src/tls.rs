@@ -20,7 +20,8 @@ use openshell_ocsf::{
 use rustls::ServerConfig;
 use rustls::crypto::ring::sign;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::server::WebPkiClientVerifier;
+use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
+use rustls::sign::CertifiedKey;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
@@ -38,6 +39,9 @@ pub struct TlsAcceptor {
     key_path: PathBuf,
     client_ca_path: Option<PathBuf>,
     require_client_auth: bool,
+    external_cert_path: Option<PathBuf>,
+    external_key_path: Option<PathBuf>,
+    external_server_names: Vec<String>,
     reload_spawned: Arc<AtomicBool>,
 }
 
@@ -64,14 +68,28 @@ impl TlsAcceptor {
         key_path: &Path,
         client_ca_path: Option<&Path>,
         require_client_auth: bool,
+        external_cert_path: Option<&Path>,
+        external_key_path: Option<&Path>,
+        external_server_names: Vec<String>,
     ) -> Result<Self> {
-        let config = build_server_config(cert_path, key_path, client_ca_path, require_client_auth)?;
+        let config = build_server_config(
+            cert_path,
+            key_path,
+            client_ca_path,
+            require_client_auth,
+            external_cert_path,
+            external_key_path,
+            &external_server_names,
+        )?;
         Ok(Self {
             config: Arc::new(ArcSwap::from(config)),
             cert_path: cert_path.to_path_buf(),
             key_path: key_path.to_path_buf(),
             client_ca_path: client_ca_path.map(Path::to_path_buf),
             require_client_auth,
+            external_cert_path: external_cert_path.map(Path::to_path_buf),
+            external_key_path: external_key_path.map(Path::to_path_buf),
+            external_server_names,
             reload_spawned: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -87,6 +105,9 @@ impl TlsAcceptor {
             &self.key_path,
             self.client_ca_path.as_deref(),
             self.require_client_auth,
+            self.external_cert_path.as_deref(),
+            self.external_key_path.as_deref(),
+            &self.external_server_names,
         )?;
         self.config.store(new_config);
 
@@ -144,8 +165,20 @@ impl TlsAcceptor {
         }
         if let Some(ref ca) = self.client_ca_path {
             let ca_dir = ca.parent().unwrap_or_else(|| Path::new("."));
-            if ca_dir != cert_dir && ca_dir != key_dir {
+            if !dirs.contains(&ca_dir.to_path_buf()) {
                 dirs.push(ca_dir.to_path_buf());
+            }
+        }
+        if let Some(ref ext_cert) = self.external_cert_path {
+            let ext_dir = ext_cert.parent().unwrap_or_else(|| Path::new("."));
+            if !dirs.contains(&ext_dir.to_path_buf()) {
+                dirs.push(ext_dir.to_path_buf());
+            }
+        }
+        if let Some(ref ext_key) = self.external_key_path {
+            let ext_dir = ext_key.parent().unwrap_or_else(|| Path::new("."));
+            if !dirs.contains(&ext_dir.to_path_buf()) {
+                dirs.push(ext_dir.to_path_buf());
             }
         }
 
@@ -244,12 +277,102 @@ impl TlsAcceptor {
     }
 }
 
+/// SNI-based certificate resolver that presents an external (e.g. ACME)
+/// certificate for configured hostnames and the internal (chart CA) certificate
+/// for everything else, including connections with no SNI.
+struct DualCertResolver {
+    internal: Arc<CertifiedKey>,
+    external: Arc<CertifiedKey>,
+    external_names: Vec<String>,
+}
+
+/// Check whether `sni` matches a configured external name.
+///
+/// Supports exact matches and single-level wildcard matches per RFC 6125:
+/// `*.example.com` matches `foo.example.com` but not `bar.foo.example.com`
+/// or `example.com` itself.
+fn sni_matches(pattern: &str, sni: &str) -> bool {
+    pattern.strip_prefix("*.").map_or(pattern == sni, |suffix| {
+        // Wildcard: SNI must have exactly one label before the suffix.
+        // e.g. "foo." for "foo.example.com" against "*.example.com"
+        sni.strip_suffix(suffix).is_some_and(|prefix| {
+            prefix.ends_with('.') && !prefix[..prefix.len() - 1].contains('.')
+        })
+    })
+}
+
+impl ResolvesServerCert for DualCertResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        if let Some(name) = client_hello.server_name()
+            && self.external_names.iter().any(|n| sni_matches(n, name))
+        {
+            return Some(self.external.clone());
+        }
+        Some(self.internal.clone())
+    }
+}
+
+impl std::fmt::Debug for DualCertResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DualCertResolver")
+            .field("external_names", &self.external_names)
+            .finish()
+    }
+}
+
+/// Build a `CertifiedKey` from certificate and key file paths.
+fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<Arc<CertifiedKey>> {
+    let certs = load_certs(cert_path)?;
+    let key = load_key(key_path)?;
+    let signing_key = sign::any_supported_type(&key)
+        .map_err(|e| Error::tls(format!("unsupported private key type: {e}")))?;
+    Ok(Arc::new(CertifiedKey::new(certs, signing_key)))
+}
+
+/// Build an SNI-based cert resolver when an external certificate is configured.
+/// Returns `None` when no external cert is configured (single-cert mode).
+fn build_cert_resolver(
+    cert_path: &Path,
+    key_path: &Path,
+    external_cert_path: Option<&Path>,
+    external_key_path: Option<&Path>,
+    external_server_names: &[String],
+) -> Result<Option<Arc<dyn ResolvesServerCert>>> {
+    match (external_cert_path, external_key_path) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(Error::tls(
+            "external_cert_path is set but external_key_path is missing",
+        )),
+        (None, Some(_)) => Err(Error::tls(
+            "external_key_path is set but external_cert_path is missing",
+        )),
+        (Some(ext_cert_path), Some(ext_key_path)) => {
+            if external_server_names.is_empty() {
+                return Err(Error::tls(
+                    "external certificate is configured but external_server_names is empty — \
+                     the external cert would never be served",
+                ));
+            }
+            let internal = load_certified_key(cert_path, key_path)?;
+            let external = load_certified_key(ext_cert_path, ext_key_path)?;
+            Ok(Some(Arc::new(DualCertResolver {
+                internal,
+                external,
+                external_names: external_server_names.to_vec(),
+            })))
+        }
+    }
+}
+
 /// Build a `ServerConfig` from certificate, key, and optional client CA files.
 fn build_server_config(
     cert_path: &Path,
     key_path: &Path,
     client_ca_path: Option<&Path>,
     require_client_auth: bool,
+    external_cert_path: Option<&Path>,
+    external_key_path: Option<&Path>,
+    external_server_names: &[String],
 ) -> Result<Arc<ServerConfig>> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
@@ -258,6 +381,14 @@ fn build_server_config(
     // which produces a cryptic error. A bad key type surfaces clearly here.
     sign::any_supported_type(&key)
         .map_err(|e| Error::tls(format!("unsupported private key type: {e}")))?;
+
+    let resolver = build_cert_resolver(
+        cert_path,
+        key_path,
+        external_cert_path,
+        external_key_path,
+        external_server_names,
+    )?;
 
     let mut config = if let Some(ca_path) = client_ca_path {
         let ca_certs = load_certs(ca_path)?;
@@ -277,15 +408,23 @@ fn build_server_config(
         .build()
         .map_err(|e| Error::tls(format!("failed to build client verifier: {e}")))?;
 
-        ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(certs, key)
-            .map_err(|e| Error::tls(format!("failed to create TLS config: {e}")))?
+        let builder = ServerConfig::builder().with_client_cert_verifier(verifier);
+        if let Some(resolver) = resolver {
+            builder.with_cert_resolver(resolver)
+        } else {
+            builder
+                .with_single_cert(certs, key)
+                .map_err(|e| Error::tls(format!("failed to create TLS config: {e}")))?
+        }
     } else {
-        ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| Error::tls(format!("failed to create TLS config: {e}")))?
+        let builder = ServerConfig::builder().with_no_client_auth();
+        if let Some(resolver) = resolver {
+            builder.with_cert_resolver(resolver)
+        } else {
+            builder
+                .with_single_cert(certs, key)
+                .map_err(|e| Error::tls(format!("failed to create TLS config: {e}")))?
+        }
     };
 
     config
@@ -402,6 +541,9 @@ mod tests {
             &dir.path().join("server-key.pem"),
             Some(&dir.path().join("ca.pem")),
             false,
+            None,
+            None,
+            &[],
         )
         .expect("failed to build server config");
 
@@ -420,6 +562,9 @@ mod tests {
             &dir.path().join("server-key.pem"),
             Some(&dir.path().join("ca.pem")),
             false,
+            None,
+            None,
+            Vec::new(),
         )
         .expect("failed to build acceptor");
 
@@ -438,6 +583,9 @@ mod tests {
             &dir.path().join("server-key.pem"),
             Some(&dir.path().join("ca.pem")),
             false,
+            None,
+            None,
+            Vec::new(),
         )
         .expect("failed to build acceptor");
 
@@ -468,6 +616,9 @@ mod tests {
             &dir.path().join("server-key.pem"),
             Some(&dir.path().join("ca.pem")),
             false,
+            None,
+            None,
+            Vec::new(),
         )
         .expect("failed to build acceptor");
 
@@ -560,6 +711,9 @@ mod tests {
             &dir.path().join("server-key.pem"),
             Some(&dir.path().join("ca.pem")),
             false,
+            None,
+            None,
+            Vec::new(),
         )
         .expect("failed to build acceptor");
 
@@ -633,6 +787,9 @@ mod tests {
             &dir.path().join("server-key.pem"),
             Some(&dir.path().join("ca.pem")),
             false,
+            None,
+            None,
+            Vec::new(),
         )
         .expect("failed to build acceptor");
 
@@ -664,6 +821,9 @@ mod tests {
             &dir.path().join("server-key.pem"),
             Some(&dir.path().join("ca.pem")),
             false,
+            None,
+            None,
+            Vec::new(),
         )
         .expect("failed to build acceptor");
 
@@ -752,6 +912,9 @@ mod tests {
             &dir.path().join("server-key.pem"),
             Some(&dir.path().join("ca.pem")),
             true, // require mTLS
+            None,
+            None,
+            Vec::new(),
         )
         .expect("failed to build acceptor with mTLS");
 
@@ -904,5 +1067,276 @@ mod tests {
         let _ = connector.connect(server_name, tcp).await;
 
         server_task.await.expect("server task failed");
+    }
+
+    /// Generate a cert+key pair with given SANs, signed by the provided CA,
+    /// and write them to the specified files in `dir`.
+    fn generate_named_cert(
+        ca_cert: &rcgen::Certificate,
+        ca_key: &KeyPair,
+        dir: &Path,
+        cert_file: &str,
+        key_file: &str,
+        san: &str,
+    ) {
+        let params =
+            CertificateParams::new(vec![san.to_string()]).expect("failed to create cert params");
+        let key = KeyPair::generate().expect("failed to generate key");
+        let cert = params
+            .signed_by(&key, ca_cert, ca_key)
+            .expect("failed to sign cert");
+        write_test_file(dir, cert_file, cert.pem().as_bytes());
+        write_test_file(dir, key_file, key.serialize_pem().as_bytes());
+    }
+
+    #[test]
+    fn test_sni_matches_exact() {
+        assert!(sni_matches("example.com", "example.com"));
+        assert!(!sni_matches("example.com", "other.com"));
+        assert!(!sni_matches("example.com", "sub.example.com"));
+    }
+
+    #[test]
+    fn test_sni_matches_wildcard() {
+        assert!(sni_matches("*.example.com", "foo.example.com"));
+        assert!(sni_matches("*.example.com", "bar.example.com"));
+        // Must not match bare domain.
+        assert!(!sni_matches("*.example.com", "example.com"));
+        // Must not match nested subdomains (RFC 6125).
+        assert!(!sni_matches("*.example.com", "sub.foo.example.com"));
+        // Must not match unrelated domain with same suffix.
+        assert!(!sni_matches("*.example.com", "notexample.com"));
+    }
+
+    #[test]
+    fn test_build_cert_resolver_returns_none_when_no_external() {
+        install_rustls_provider();
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        generate_test_certs_with_ca(dir.path());
+
+        let result = build_cert_resolver(
+            &dir.path().join("server-cert.pem"),
+            &dir.path().join("server-key.pem"),
+            None,
+            None,
+            &[],
+        )
+        .expect("build_cert_resolver should succeed");
+        assert!(result.is_none(), "should return None when no external cert");
+    }
+
+    #[test]
+    fn test_build_cert_resolver_errors_on_cert_without_key() {
+        install_rustls_provider();
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        generate_test_certs_with_ca(dir.path());
+
+        let result = build_cert_resolver(
+            &dir.path().join("server-cert.pem"),
+            &dir.path().join("server-key.pem"),
+            Some(&dir.path().join("server-cert.pem")),
+            None,
+            &["example.com".to_string()],
+        );
+        let err = result.expect_err("should error when key is missing");
+        assert!(
+            err.to_string().contains("external_key_path is missing"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_cert_resolver_errors_on_key_without_cert() {
+        install_rustls_provider();
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        generate_test_certs_with_ca(dir.path());
+
+        let result = build_cert_resolver(
+            &dir.path().join("server-cert.pem"),
+            &dir.path().join("server-key.pem"),
+            None,
+            Some(&dir.path().join("server-key.pem")),
+            &["example.com".to_string()],
+        );
+        let err = result.expect_err("should error when cert is missing");
+        assert!(
+            err.to_string().contains("external_cert_path is missing"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_cert_resolver_errors_on_empty_server_names() {
+        install_rustls_provider();
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
+        generate_named_cert(
+            &ca_cert,
+            &ca_key,
+            dir.path(),
+            "ext-cert.pem",
+            "ext-key.pem",
+            "external.example.com",
+        );
+
+        let result = build_cert_resolver(
+            &dir.path().join("server-cert.pem"),
+            &dir.path().join("server-key.pem"),
+            Some(&dir.path().join("ext-cert.pem")),
+            Some(&dir.path().join("ext-key.pem")),
+            &[],
+        );
+        let err = result.expect_err("should error when server names are empty");
+        assert!(
+            err.to_string().contains("external_server_names is empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_dual_cert_resolver_returns_external_on_sni_match() {
+        install_rustls_provider();
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
+        generate_named_cert(
+            &ca_cert,
+            &ca_key,
+            dir.path(),
+            "ext-cert.pem",
+            "ext-key.pem",
+            "external.example.com",
+        );
+
+        let internal = load_certified_key(
+            &dir.path().join("server-cert.pem"),
+            &dir.path().join("server-key.pem"),
+        )
+        .expect("load internal");
+        let external = load_certified_key(
+            &dir.path().join("ext-cert.pem"),
+            &dir.path().join("ext-key.pem"),
+        )
+        .expect("load external");
+
+        let internal_der = internal.cert[0].as_ref().to_vec();
+        let external_der = external.cert[0].as_ref().to_vec();
+
+        // `ClientHello` cannot be constructed directly in tests, so
+        // SNI-based selection is exercised in the async integration test
+        // below. Here we verify the certs are distinct so the integration
+        // test's DER comparisons are meaningful.
+        assert_ne!(
+            internal_der, external_der,
+            "internal and external certs should be distinct"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_dual_cert_resolver_sni_selects_correct_cert() {
+        install_rustls_provider();
+
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
+        generate_named_cert(
+            &ca_cert,
+            &ca_key,
+            dir.path(),
+            "ext-cert.pem",
+            "ext-key.pem",
+            "external.example.com",
+        );
+
+        // Snapshot the DER of the internal and external leaf certs.
+        let internal_der = load_certs(&dir.path().join("server-cert.pem"))
+            .expect("load internal certs")[0]
+            .as_ref()
+            .to_vec();
+        let external_der = load_certs(&dir.path().join("ext-cert.pem"))
+            .expect("load external certs")[0]
+            .as_ref()
+            .to_vec();
+
+        let acceptor = TlsAcceptor::from_files(
+            &dir.path().join("server-cert.pem"),
+            &dir.path().join("server-key.pem"),
+            Some(&dir.path().join("ca.pem")),
+            false,
+            Some(&dir.path().join("ext-cert.pem")),
+            Some(&dir.path().join("ext-key.pem")),
+            vec!["external.example.com".to_string()],
+        )
+        .expect("failed to build acceptor");
+
+        let client_config = build_test_client_config(&dir.path().join("ca.pem"));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind");
+        let listen_addr = listener.local_addr().expect("failed to get local addr");
+
+        // --- Connection 1: SNI matches external name → external cert ---
+        let acceptor_srv = acceptor.clone();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept failed");
+            acceptor_srv
+                .acceptor()
+                .accept(stream)
+                .await
+                .expect("TLS accept failed")
+        });
+
+        let connector = tokio_rustls::TlsConnector::from(client_config.clone());
+        let tcp = TcpStream::connect(listen_addr)
+            .await
+            .expect("connect failed");
+        let server_name = "external.example.com"
+            .try_into()
+            .expect("invalid server name");
+        let tls = connector
+            .connect(server_name, tcp)
+            .await
+            .expect("TLS connect failed");
+
+        assert_eq!(
+            peer_cert_der(&tls),
+            external_der,
+            "SNI matching external name should serve external cert"
+        );
+        drop(tls);
+        let _ = server_task.await;
+
+        // --- Connection 2: SNI = "localhost" → internal cert ---
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind");
+        let listen_addr = listener.local_addr().expect("failed to get local addr");
+
+        let acceptor_srv = acceptor.clone();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept failed");
+            acceptor_srv
+                .acceptor()
+                .accept(stream)
+                .await
+                .expect("TLS accept failed")
+        });
+
+        let connector = tokio_rustls::TlsConnector::from(client_config);
+        let tcp = TcpStream::connect(listen_addr)
+            .await
+            .expect("connect failed");
+        let server_name = "localhost".try_into().expect("invalid server name");
+        let tls = connector
+            .connect(server_name, tcp)
+            .await
+            .expect("TLS connect failed");
+
+        assert_eq!(
+            peer_cert_der(&tls),
+            internal_der,
+            "SNI not matching external name should serve internal cert"
+        );
+        drop(tls);
+        let _ = server_task.await;
     }
 }

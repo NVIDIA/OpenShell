@@ -33,15 +33,13 @@ fn extract_sandbox_name(output: &str) -> Option<String> {
 
 async fn create_sandbox_with_labels(name: &str, labels: &[(&str, &str)]) -> String {
     let mut cmd = openshell_cmd();
-    cmd.args(["sandbox", "create", "--name", name]);
+    cmd.args(["sandbox", "create", "--detach", "--name", name]);
 
     for (key, value) in labels {
         cmd.arg("--label").arg(format!("{key}={value}"));
     }
 
-    cmd.args(["--", "echo", "test"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let output = cmd.output().await.expect("spawn openshell sandbox create");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -118,29 +116,22 @@ async fn delete_sandbox(name: &str) {
 #[allow(clippy::too_many_lines)] // end-to-end test exercises full label lifecycle
 async fn sandbox_labels_are_stored_and_filterable() {
     // Create sandboxes with different labels
-    let name1 = create_sandbox_with_labels(
-        "e2e-label-test-dev-backend",
-        &[("env", "dev"), ("team", "backend")],
-    )
-    .await;
+    let name1 =
+        create_sandbox_with_labels("e2e-lbl-dev-back", &[("env", "dev"), ("team", "backend")])
+            .await;
 
     let name2 = create_sandbox_with_labels(
-        "e2e-label-test-staging-backend",
+        "e2e-lbl-stg-back",
         &[("env", "staging"), ("team", "backend")],
     )
     .await;
 
-    let name3 = create_sandbox_with_labels(
-        "e2e-label-test-prod-frontend",
-        &[("env", "prod"), ("team", "frontend")],
-    )
-    .await;
+    let name3 =
+        create_sandbox_with_labels("e2e-lbl-prd-frnt", &[("env", "prod"), ("team", "frontend")])
+            .await;
 
-    let name4 = create_sandbox_with_labels(
-        "e2e-label-test-dev-data",
-        &[("env", "dev"), ("team", "data")],
-    )
-    .await;
+    let name4 =
+        create_sandbox_with_labels("e2e-lbl-dev-data", &[("env", "dev"), ("team", "data")]).await;
 
     // Test 1: Verify labels are stored in sandbox metadata
     let details = get_sandbox_details(&name1).await;

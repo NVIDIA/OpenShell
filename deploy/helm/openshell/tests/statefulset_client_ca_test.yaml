@@ -53,13 +53,14 @@ tests:
       certManager.enabled: true
       certManager.clientCaFromServerTlsSecret: false
       pkiInitJob.enabled: true
+      server.tls.clientCaSecretName: openshell-ca-tls
     asserts:
       - equal:
           path: spec.template.spec.volumes[3].name
           value: tls-client-ca
       - equal:
           path: spec.template.spec.volumes[3].secret.secretName
-          value: openshell-server-client-ca
+          value: openshell-ca-tls
       - notExists:
           path: spec.template.spec.volumes[3].secret.items
 
@@ -72,6 +73,42 @@ tests:
       certManager.enabled: true
       certManager.clientCaFromServerTlsSecret: false
       pkiInitJob.enabled: true
+      server.tls.clientCaSecretName: ""
+    asserts:
+      - lengthEqual:
+          path: spec.template.spec.volumes
+          count: 3
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: tls-client-ca
+            mountPath: /etc/openshell-tls/client-ca
+            readOnly: true
+
+  # Explicit HTTPS-only opt-out must suppress built-in PKI client-CA wiring even
+  # when pkiInitJob remains enabled (the default install path from #2095).
+  - it: omits the client CA volume for built-in PKI when clientCaSecretName is empty
+    template: templates/statefulset.yaml
+    set:
+      pkiInitJob.enabled: true
+      certManager.enabled: false
+      server.tls.clientCaSecretName: ""
+    asserts:
+      - lengthEqual:
+          path: spec.template.spec.volumes
+          count: 3
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: tls-client-ca
+            mountPath: /etc/openshell-tls/client-ca
+            readOnly: true
+
+  - it: omits the client CA volume when cert-manager shares server CA and clientCaSecretName is empty
+    template: templates/statefulset.yaml
+    set:
+      certManager.enabled: true
+      certManager.clientCaFromServerTlsSecret: true
       server.tls.clientCaSecretName: ""
     asserts:
       - lengthEqual:

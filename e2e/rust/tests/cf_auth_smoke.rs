@@ -136,8 +136,10 @@ async fn gateway_login_help_is_recognized() {
     let clean = strip_ansi(&output);
     // Should mention authenticating or Cloudflare
     assert!(
-        clean.to_lowercase().contains("authenticat") || clean.to_lowercase().contains("cloudflare")
-            || clean.to_lowercase().contains("login") || clean.to_lowercase().contains("browser"),
+        clean.to_lowercase().contains("authenticat")
+            || clean.to_lowercase().contains("cloudflare")
+            || clean.to_lowercase().contains("login")
+            || clean.to_lowercase().contains("browser"),
         "expected auth-related text in gateway login --help:\n{clean}"
     );
 }
@@ -210,10 +212,7 @@ async fn gateway_add_creates_cf_metadata() {
     );
 
     // Verify the gateway was set as active.
-    let active_path = tmpdir
-        .path()
-        .join("openshell")
-        .join("active_gateway");
+    let active_path = tmpdir.path().join("openshell").join("active_gateway");
     assert!(
         active_path.exists(),
         "active_gateway file should exist at {}",
@@ -241,18 +240,11 @@ async fn gateway_add_derives_name_from_hostname() {
 
     let (output, code) = run_with_config(
         tmpdir.path(),
-        &[
-            "gateway",
-            "add",
-            "https://my-special-gateway.brevlab.com",
-        ],
+        &["gateway", "add", "https://my-special-gateway.brevlab.com"],
     )
     .await;
 
-    assert_eq!(
-        code, 0,
-        "gateway add should exit 0:\n{output}"
-    );
+    assert_eq!(code, 0, "gateway add should exit 0:\n{output}");
 
     // The derived name should be the hostname.
     let metadata_path = tmpdir
@@ -344,10 +336,7 @@ async fn gateway_add_rejects_duplicate_name() {
         ],
     )
     .await;
-    assert_ne!(
-        code, 0,
-        "duplicate gateway add should fail:\n{output}"
-    );
+    assert_ne!(code, 0, "duplicate gateway add should fail:\n{output}");
 
     let clean = strip_ansi(&output);
     assert!(
@@ -363,18 +352,9 @@ async fn gateway_add_rejects_duplicate_name() {
 /// `ssh://` endpoint with `--local` should fail.
 #[tokio::test]
 async fn gateway_add_ssh_url_conflicts_with_local() {
-    let (output, code) = run_isolated(&[
-        "gateway",
-        "add",
-        "ssh://user@host:8080",
-        "--local",
-    ])
-    .await;
+    let (output, code) = run_isolated(&["gateway", "add", "ssh://user@host:8080", "--local"]).await;
 
-    assert_ne!(
-        code, 0,
-        "ssh:// with --local should fail:\n{output}"
-    );
+    assert_ne!(code, 0, "ssh:// with --local should fail:\n{output}");
 }
 
 /// `ssh://` endpoint with `--remote` should fail (redundant).
@@ -389,26 +369,15 @@ async fn gateway_add_ssh_url_conflicts_with_remote() {
     ])
     .await;
 
-    assert_ne!(
-        code, 0,
-        "ssh:// with --remote should fail:\n{output}"
-    );
+    assert_ne!(code, 0, "ssh:// with --remote should fail:\n{output}");
 }
 
 /// `ssh://` endpoint without a port should fail.
 #[tokio::test]
 async fn gateway_add_ssh_url_requires_port() {
-    let (output, code) = run_isolated(&[
-        "gateway",
-        "add",
-        "ssh://user@host",
-    ])
-    .await;
+    let (output, code) = run_isolated(&["gateway", "add", "ssh://user@host"]).await;
 
-    assert_ne!(
-        code, 0,
-        "ssh:// without port should fail:\n{output}"
-    );
+    assert_ne!(code, 0, "ssh:// without port should fail:\n{output}");
 
     let clean = strip_ansi(&output);
     assert!(

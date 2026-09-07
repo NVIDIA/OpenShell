@@ -3,7 +3,7 @@ title: OPENSHELL
 section: 1
 header: OpenShell Manual
 footer: openshell
-date: 2025
+date: 2026
 ---
 
 # NAME

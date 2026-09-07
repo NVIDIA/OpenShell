@@ -7,6 +7,7 @@
 //! is dropped, replacing the `trap cleanup EXIT` pattern from the bash tests.
 
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -20,8 +21,7 @@ use super::output::{extract_field, strip_ansi};
 /// The CLI prints `Created sandbox: <name>` (current format). Falls back to
 /// `Name: <name>` for compatibility with older output formats.
 fn extract_sandbox_name(output: &str) -> Option<String> {
-    extract_field(output, "Created sandbox")
-        .or_else(|| extract_field(output, "Name"))
+    extract_field(output, "Created sandbox").or_else(|| extract_field(output, "Name"))
 }
 
 /// Default timeout for waiting for a sandbox to become ready.
@@ -51,11 +51,22 @@ pub struct SandboxGuard {
 }
 
 impl SandboxGuard {
-    /// Create a sandbox that runs a command to completion (no `--keep`).
+    /// Manage the cleanup of a sandbox created outside this helper.
+    pub fn manage_existing(name: String) -> Self {
+        Self {
+            name,
+            create_output: String::new(),
+            child: None,
+            cleaned_up: false,
+        }
+    }
+
+    /// Create a persistent scratch sandbox and optionally run a command in it.
     ///
-    /// Captures the full CLI output and parses the sandbox name from it.
-    /// The sandbox is created synchronously (the CLI blocks until the command
-    /// finishes).
+    /// Arguments before `--` are forwarded to `sandbox create`; arguments after
+    /// `--` are run with `sandbox exec`. This keeps generic E2E tests focused on
+    /// the behavior of their one-shot payload now that a trailing create command
+    /// is the sandbox's canonical main process and its exit is terminal.
     ///
     /// # Arguments
     ///
@@ -67,18 +78,28 @@ impl SandboxGuard {
     /// Returns an error if the CLI exits with a non-zero status or the sandbox
     /// name cannot be parsed from the output.
     pub async fn create(args: &[&str]) -> Result<Self, String> {
+        let separator = args.iter().position(|arg| *arg == "--");
+        let (create_args, command) = separator.map_or((args, &[][..]), |index| {
+            (&args[..index], &args[index + 1..])
+        });
+
+        if create_args.contains(&"--no-keep") {
+            return Err(
+                "SandboxGuard::create makes a persistent scratch sandbox; use the CLI directly to test --no-keep semantics"
+                    .to_string(),
+            );
+        }
+
         let mut cmd = openshell_cmd();
-        cmd.arg("sandbox").arg("create");
-        for arg in args {
+        cmd.arg("sandbox").arg("create").arg("--detach");
+        for arg in create_args {
             cmd.arg(arg);
         }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let output = timeout(SANDBOX_READY_TIMEOUT, cmd.output())
             .await
-            .map_err(|_| {
-                format!("sandbox create timed out after {SANDBOX_READY_TIMEOUT:?}")
-            })?
+            .map_err(|_| format!("sandbox create timed out after {SANDBOX_READY_TIMEOUT:?}"))?
             .map_err(|e| format!("failed to spawn openshell: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -96,20 +117,32 @@ impl SandboxGuard {
             format!("could not parse sandbox name from create output:\n{combined}")
         })?;
 
-        Ok(Self {
+        let mut guard = Self {
             name,
             create_output: combined,
             child: None,
             cleaned_up: false,
-        })
+        };
+
+        if !command.is_empty() {
+            match guard.exec(command).await {
+                Ok(exec_output) => guard.create_output.push_str(&exec_output),
+                Err(err) => {
+                    guard.cleanup().await;
+                    return Err(err);
+                }
+            }
+        }
+
+        Ok(guard)
     }
 
-    /// Create a sandbox with `--keep` that runs a long-lived background
-    /// command.
+    /// Create a sandbox with a long-lived canonical main command and connect
+    /// to it in the background.
     ///
-    /// The CLI process runs in the background. This method polls its stdout
-    /// for `ready_marker` (a string the background command prints when it is
-    /// ready to accept work). Sandbox name is parsed from the output header.
+    /// Creation is detached because the harness captures output. This method
+    /// then runs `sandbox connect` and polls the retained main-process output
+    /// for `ready_marker`.
     ///
     /// # Arguments
     ///
@@ -123,27 +156,120 @@ impl SandboxGuard {
     /// Returns an error if the process exits prematurely, the ready marker is
     /// not seen within [`SANDBOX_READY_TIMEOUT`], or the sandbox name cannot
     /// be parsed.
-    pub async fn create_keep(
-        command: &[&str],
-        ready_marker: &str,
-    ) -> Result<Self, String> {
+    pub async fn create_keep(command: &[&str], ready_marker: &str) -> Result<Self, String> {
+        Self::create_keep_with_args(&[], command, ready_marker).await
+    }
+
+    /// Create a sandbox with a detached canonical main command.
+    ///
+    /// Unlike [`SandboxGuard::create_keep`], this does not open an attachment,
+    /// which lets tests control competing and reconnecting clients directly.
+    pub async fn create_detached_main(command: &[&str]) -> Result<Self, String> {
         let mut cmd = openshell_cmd();
         cmd.arg("sandbox")
             .arg("create")
-            .arg("--keep")
+            .arg("--detach")
             .arg("--")
-            .args(command);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            .args(command)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-        let mut child = cmd
-            .spawn()
+        let output = timeout(SANDBOX_READY_TIMEOUT, cmd.output())
+            .await
+            .map_err(|_| format!("sandbox create timed out after {SANDBOX_READY_TIMEOUT:?}"))?
             .map_err(|e| format!("failed to spawn openshell: {e}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let combined = format!("{stdout}{stderr}");
+
+        if !output.status.success() {
+            return Err(format!(
+                "sandbox create failed (exit {:?}):\n{combined}",
+                output.status.code()
+            ));
+        }
+
+        let name = extract_sandbox_name(&combined).ok_or_else(|| {
+            format!("could not parse sandbox name from create output:\n{combined}")
+        })?;
+        Ok(Self {
+            name,
+            create_output: combined,
+            child: None,
+            cleaned_up: false,
+        })
+    }
+
+    /// Like [`SandboxGuard::create_keep`], but forwards extra flags to
+    /// `sandbox create` (e.g. `--policy <file>`, `--name <n>`) before the
+    /// `-- <command>` separator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the process exits prematurely, the ready marker is
+    /// not seen within [`SANDBOX_READY_TIMEOUT`], or the sandbox name cannot
+    /// be parsed.
+    pub async fn create_keep_with_args(
+        create_args: &[&str],
+        command: &[&str],
+        ready_marker: &str,
+    ) -> Result<Self, String> {
+        let mut create_cmd = openshell_cmd();
+        create_cmd.arg("sandbox").arg("create").arg("--detach");
+        for arg in create_args {
+            create_cmd.arg(arg);
+        }
+        create_cmd.arg("--").args(command);
+        create_cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let create_output = timeout(SANDBOX_READY_TIMEOUT, create_cmd.output())
+            .await
+            .map_err(|_| format!("sandbox create timed out after {SANDBOX_READY_TIMEOUT:?}"))?
+            .map_err(|e| format!("failed to spawn openshell: {e}"))?;
+        let create_stdout = String::from_utf8_lossy(&create_output.stdout).to_string();
+        let create_stderr = String::from_utf8_lossy(&create_output.stderr).to_string();
+        let create_combined = format!("{create_stdout}{create_stderr}");
+
+        if !create_output.status.success() {
+            return Err(format!(
+                "sandbox create failed (exit {:?}):\n{create_combined}",
+                create_output.status.code()
+            ));
+        }
+
+        let sandbox_name = extract_sandbox_name(&create_combined).ok_or_else(|| {
+            format!("could not parse sandbox name from create output:\n{create_combined}")
+        })?;
+
+        let mut connect_cmd = openshell_cmd();
+        connect_cmd
+            .arg("sandbox")
+            .arg("connect")
+            .arg(&sandbox_name)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = connect_cmd
+            .spawn()
+            .map_err(|e| format!("failed to spawn openshell connect: {e}"))?;
 
         let stdout = child.stdout.take().expect("stdout must be piped");
         let mut reader = BufReader::new(stdout).lines();
 
-        let mut accumulated = String::new();
-        let mut name: Option<String> = None;
+        let stderr_handle = child.stderr.take().expect("stderr must be piped");
+        let stderr_buf = Arc::new(Mutex::new(String::new()));
+        let stderr_buf_clone = Arc::clone(&stderr_buf);
+        let stderr_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr_handle).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let clean = strip_ansi(&line);
+                let mut buf = stderr_buf_clone.lock().unwrap();
+                buf.push_str(&clean);
+                buf.push('\n');
+            }
+        });
+
+        let mut accumulated = create_combined;
         let mut ready = false;
 
         let poll_result = timeout(SANDBOX_READY_TIMEOUT, async {
@@ -151,13 +277,6 @@ impl SandboxGuard {
                 let clean = strip_ansi(&line);
                 accumulated.push_str(&clean);
                 accumulated.push('\n');
-
-                // Try to extract the sandbox name from the header.
-                if name.is_none()
-                    && let Some(n) = extract_sandbox_name(&accumulated)
-                {
-                    name = Some(n);
-                }
 
                 // Check for the ready marker.
                 if clean.contains(ready_marker) {
@@ -168,27 +287,31 @@ impl SandboxGuard {
         })
         .await;
 
+        let collect_stderr = || {
+            stderr_task.abort();
+            let buf = stderr_buf.lock().unwrap();
+            buf.clone()
+        };
+
         if poll_result.is_err() {
             // Timeout — kill the child and report.
             let _ = child.kill().await;
+            let stderr_output = collect_stderr();
             return Err(format!(
                 "sandbox did not become ready within {SANDBOX_READY_TIMEOUT:?}.\n\
-                 Output so far:\n{accumulated}"
+                 Stdout:\n{accumulated}\nStderr:\n{stderr_output}"
             ));
         }
 
         if !ready {
             // The line reader ended before seeing the marker (process exited).
             let _ = child.kill().await;
+            let stderr_output = collect_stderr();
             return Err(format!(
-                "sandbox create exited before ready marker '{ready_marker}' was seen.\n\
-                 Output:\n{accumulated}"
+                "sandbox connect exited before ready marker '{ready_marker}' was seen.\n\
+                 Stdout:\n{accumulated}\nStderr:\n{stderr_output}"
             ));
         }
-
-        let sandbox_name = name.ok_or_else(|| {
-            format!("could not parse sandbox name from create output:\n{accumulated}")
-        })?;
 
         Ok(Self {
             name: sandbox_name,
@@ -198,11 +321,13 @@ impl SandboxGuard {
         })
     }
 
-    /// Create a sandbox that runs a command, with `--upload` to pre-load files.
+    /// Create a detached scratch sandbox with pre-loaded files, then exec a
+    /// command in it.
     ///
     /// Equivalent to:
     /// ```text
-    /// openshell sandbox create --upload <local>:<dest> [extra_args...] -- <command>
+    /// openshell sandbox create --detach --upload <local>:<dest> [extra_args...]
+    /// openshell sandbox exec <name> -- <command>
     /// ```
     ///
     /// The `--no-git-ignore` flag is passed to avoid needing a git repository.
@@ -228,19 +353,17 @@ impl SandboxGuard {
         command: &[&str],
     ) -> Result<Self, String> {
         let mut cmd = openshell_cmd();
-        cmd.arg("sandbox").arg("create");
+        cmd.arg("sandbox").arg("create").arg("--detach");
         for (local, dest) in uploads {
             cmd.arg("--upload").arg(format!("{local}:{dest}"));
         }
-        cmd.arg("--no-git-ignore").arg("--").args(command);
+        cmd.arg("--no-git-ignore");
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let output = timeout(SANDBOX_READY_TIMEOUT, cmd.output())
             .await
             .map_err(|_| {
-                format!(
-                    "sandbox create --upload timed out after {SANDBOX_READY_TIMEOUT:?}"
-                )
+                format!("sandbox create --upload timed out after {SANDBOX_READY_TIMEOUT:?}")
             })?
             .map_err(|e| format!("failed to spawn openshell: {e}"))?;
 
@@ -259,12 +382,22 @@ impl SandboxGuard {
             format!("could not parse sandbox name from create output:\n{combined}")
         })?;
 
-        Ok(Self {
+        let mut guard = Self {
             name,
             create_output: combined,
             child: None,
             cleaned_up: false,
-        })
+        };
+
+        match guard.exec(command).await {
+            Ok(exec_output) => guard.create_output.push_str(&exec_output),
+            Err(err) => {
+                guard.cleanup().await;
+                return Err(err);
+            }
+        }
+
+        Ok(guard)
     }
 
     /// Upload local files to the sandbox via `openshell sandbox upload`.
@@ -284,6 +417,39 @@ impl SandboxGuard {
             .arg(&self.name)
             .arg(local_path)
             .arg(dest)
+            .arg("--no-git-ignore");
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| format!("failed to spawn openshell upload: {e}"))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let combined = format!("{stdout}{stderr}");
+
+        if !output.status.success() {
+            return Err(format!(
+                "sandbox upload failed (exit {:?}):\n{combined}",
+                output.status.code()
+            ));
+        }
+
+        Ok(combined)
+    }
+
+    /// Upload local files to the sandbox's discovered working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the upload command fails.
+    pub async fn upload_to_workdir(&self, local_path: &str) -> Result<String, String> {
+        let mut cmd = openshell_cmd();
+        cmd.arg("sandbox")
+            .arg("upload")
+            .arg(&self.name)
+            .arg(local_path)
             .arg("--no-git-ignore");
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -412,11 +578,7 @@ impl SandboxGuard {
     /// # Errors
     ///
     /// Returns an error if the download command fails.
-    pub async fn download(
-        &self,
-        sandbox_path: &str,
-        local_dest: &str,
-    ) -> Result<String, String> {
+    pub async fn download(&self, sandbox_path: &str, local_dest: &str) -> Result<String, String> {
         let mut cmd = openshell_cmd();
         cmd.arg("sandbox")
             .arg("download")

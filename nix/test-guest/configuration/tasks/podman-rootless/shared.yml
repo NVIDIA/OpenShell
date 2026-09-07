@@ -1,0 +1,56 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Verify test user subordinate ID mappings
+  ansible.builtin.command:
+    argv:
+      - awk
+      - "-F:"
+      - >-
+        $1 == "openshell" && $2 ~ /^[0-9]+$/ &&
+        $3 ~ /^[1-9][0-9]*$/ && $3 >= 65536 { found = 1 }
+        END { exit !found }
+      - "{{ item }}"
+  loop:
+    - /etc/subuid
+    - /etc/subgid
+  changed_when: false
+
+- name: Enable the rootless Podman API socket
+  ansible.builtin.systemd_service:
+    name: podman.socket
+    scope: user
+    enabled: true
+    state: started
+  become: false
+
+- name: Verify rootless Podman
+  ansible.builtin.command:
+    cmd: podman info
+  become: false
+  changed_when: false
+
+- name: Verify rootless Podman mode
+  ansible.builtin.command:
+    argv:
+      - podman
+      - info
+      - --format
+      - "{% raw %}{{.Host.Security.Rootless}}{% endraw %}"
+  become: false
+  changed_when: false
+  register: podman_rootless
+  failed_when: podman_rootless.stdout != "true"
+
+- name: Verify rootless Podman uses pasta
+  ansible.builtin.command:
+    argv:
+      - podman
+      - info
+      - --format
+      - "{% raw %}{{.Host.RootlessNetworkCmd}}{% endraw %}"
+  become: false
+  changed_when: false
+  register: podman_rootless_network
+  failed_when: podman_rootless_network.stdout != "pasta"

@@ -12,9 +12,6 @@ title: NVIDIA OpenShell
 
 global-theme: nvidia
 
-announcement:
-  message: "🔔 NVIDIA OpenShell is <strong>alpha software</strong>. APIs and behavior may change without notice. Do not use in production."
-
 footer: ./components/CustomFooter.tsx
 
 layout:
@@ -64,6 +61,8 @@ versions:
     slug: latest
 
 redirects:
+  - source: "/openshell/latest/sandboxes/providers-v2"
+    destination: "/openshell/latest/providers/profiles"
   # Paths are relative to the site root; subpath prefix matches instances + custom-domain.
   # Legacy HTML URLs used .../path/to/page/index.html; Fern canonical URLs omit index.html.
   # List explicit /index.html routes before :path*/index.html so empty path segments do not

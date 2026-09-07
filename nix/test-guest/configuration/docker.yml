@@ -1,0 +1,73 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# PROTOTYPE: Configure Docker in a disposable test guest.
+
+- name: Configure Docker
+  hosts: test_vm
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Validate Docker support
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution in ["Ubuntu", "Rocky"]
+        fail_msg: >-
+          Docker is supported on Ubuntu and Rocky in this prototype,
+          not {{ ansible_facts.distribution }}.
+
+    - name: Refresh Ubuntu package metadata
+      ansible.builtin.apt:
+        update_cache: true
+      when: ansible_facts.distribution == "Ubuntu"
+
+    - name: Install Docker on Ubuntu
+      ansible.builtin.apt:
+        name: docker.io
+        state: present
+        install_recommends: false
+      when: ansible_facts.distribution == "Ubuntu"
+
+    - name: Configure the Docker CE repository on Rocky
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/centos/docker-ce.repo
+        dest: /etc/yum.repos.d/docker-ce.repo
+        mode: "0644"
+      when: ansible_facts.distribution == "Rocky"
+
+    - name: Install Docker on Rocky
+      ansible.builtin.dnf:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+      when: ansible_facts.distribution == "Rocky"
+
+    - name: Enable Docker
+      ansible.builtin.service:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Add the test user to the Docker group
+      ansible.builtin.user:
+        name: openshell
+        groups:
+          - docker
+        append: true
+      register: docker_group_membership
+
+    - name: Refresh the test user's group membership
+      ansible.builtin.meta: reset_connection
+      when: docker_group_membership.changed
+
+    - name: Verify Docker
+      ansible.builtin.command:
+        cmd: docker info
+      become: false
+      changed_when: false

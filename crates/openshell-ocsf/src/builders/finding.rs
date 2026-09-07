@@ -25,6 +25,7 @@ pub struct DetectionFindingBuilder<'a> {
     risk_level: Option<RiskLevelId>,
     message: Option<String>,
     log_source: Option<String>,
+    unmapped: serde_json::Map<String, serde_json::Value>,
 }
 
 impl<'a> DetectionFindingBuilder<'a> {
@@ -45,6 +46,7 @@ impl<'a> DetectionFindingBuilder<'a> {
             risk_level: None,
             message: None,
             log_source: None,
+            unmapped: serde_json::Map::new(),
         }
     }
 
@@ -71,6 +73,13 @@ impl<'a> DetectionFindingBuilder<'a> {
     #[must_use]
     pub fn log_source(mut self, source: impl Into<String>) -> Self {
         self.log_source = Some(source.into());
+        self
+    }
+
+    /// Add a source-specific attribute that is not defined by the OCSF class.
+    #[must_use]
+    pub fn unmapped(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
+        self.unmapped.insert(key.to_string(), value.into());
         self
     }
 
@@ -122,6 +131,9 @@ impl<'a> DetectionFindingBuilder<'a> {
             self.severity,
             metadata,
         );
+        if !self.unmapped.is_empty() {
+            base.unmapped = Some(serde_json::Value::Object(self.unmapped));
+        }
         self.ctx.apply_common_fields(&mut base, None, self.message);
 
         OcsfEvent::DetectionFinding(DetectionFindingEvent {
@@ -169,6 +181,7 @@ mod tests {
             .is_alert(true)
             .confidence(ConfidenceId::High)
             .risk_level(RiskLevelId::High)
+            .unmapped("source_rule", "nonce_replay")
             .finding_info(
                 FindingInfo::new("nssh1-replay-abc", "NSSH1 Nonce Replay Attack")
                     .with_desc("A nonce was replayed."),
@@ -188,5 +201,6 @@ mod tests {
         assert_eq!(json["finding_info"]["title"], "NSSH1 Nonce Replay Attack");
         assert_eq!(json["is_alert"], true);
         assert_eq!(json["confidence"], "High");
+        assert_eq!(json["unmapped"]["source_rule"], "nonce_replay");
     }
 }

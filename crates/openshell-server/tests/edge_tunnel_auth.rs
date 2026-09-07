@@ -168,6 +168,9 @@ async fn mtls_valid_client_cert_accepted() {
         &temp.path().join("server-key.pem"),
         Some(temp.path().join("ca.pem").as_path()),
         false,
+        None,
+        None,
+        Vec::new(),
     )
     .unwrap();
 
@@ -209,6 +212,9 @@ async fn no_client_cert_accepted_with_ca_configured() {
         &temp.path().join("server-key.pem"),
         Some(temp.path().join("ca.pem").as_path()),
         false,
+        None,
+        None,
+        Vec::new(),
     )
     .unwrap();
 
@@ -252,6 +258,9 @@ async fn bearer_header_reaches_server_without_client_cert() {
         &temp.path().join("server-key.pem"),
         Some(temp.path().join("ca.pem").as_path()),
         false,
+        None,
+        None,
+        Vec::new(),
     )
     .unwrap();
 
@@ -283,6 +292,9 @@ async fn rogue_cert_rejected() {
         &temp.path().join("server-key.pem"),
         Some(temp.path().join("ca.pem").as_path()),
         false,
+        None,
+        None,
+        Vec::new(),
     )
     .unwrap();
 
@@ -329,6 +341,9 @@ async fn https_only_no_client_cert_required() {
         &temp.path().join("server-key.pem"),
         None,
         false,
+        None,
+        None,
+        Vec::new(),
     )
     .unwrap();
 

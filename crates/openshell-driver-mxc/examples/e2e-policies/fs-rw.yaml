@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# fs-rw.yaml — Filesystem read-write grant scenario.
+#
+# Grants read-write access to the DemoDir (substituted at runtime).
+# Used by the fs-rw-positive-negative scenario in run-mxc-e2e.ps1.
+version: 1
+
+filesystem_policy:
+  include_workdir: false
+  read_only: []
+  read_write:
+    - "C:/work/openshell-mxc-e2e"

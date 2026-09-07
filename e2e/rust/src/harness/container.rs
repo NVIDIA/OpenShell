@@ -182,6 +182,277 @@ impl ContainerHttpServer {
     }
 }
 
+/// A generic support container running on the shared e2e container network.
+///
+/// Unlike [`ContainerHttpServer`], this helper requires the network mode used
+/// by the Docker/Podman gateway lanes (`OPENSHELL_E2E_NETWORK_NAME`), probes
+/// readiness with a plain TCP connect instead of an HTTP GET (so it can host
+/// non-HTTP fixtures such as forward proxies and TLS servers), and exposes the
+/// container's logs and network IP for test assertions.
+pub struct SupportContainer {
+    /// Network alias other containers on the e2e network reach this one by.
+    pub alias: String,
+    container_id: String,
+    network: String,
+    engine: ContainerEngine,
+}
+
+/// A TCP fixture published on the test host for Kubernetes sandbox e2e tests.
+///
+/// Kubernetes sandboxes reach it through the chart-provided
+/// `host.openshell.internal` alias. Unlike [`SupportContainer`], this does not
+/// require the Docker e2e network used by local-container driver tests.
+pub struct HostSupportContainer {
+    pub port: u16,
+    container_id: String,
+    engine: ContainerEngine,
+}
+
+impl HostSupportContainer {
+    /// Start a Python fixture and publish `container_port` on a free host port.
+    pub async fn start_python(script: &str, container_port: u16) -> Result<Self, String> {
+        Self::start_python_on_host_port(script, container_port, find_free_port()).await
+    }
+
+    /// Start a Python fixture on a caller-selected host port.
+    ///
+    /// Use this when the fixture endpoint must be known before the Helm chart
+    /// starts the gateway, such as the configured corporate forward proxy.
+    pub async fn start_python_on_host_port(
+        script: &str,
+        container_port: u16,
+        port: u16,
+    ) -> Result<Self, String> {
+        let engine = ContainerEngine::from_env()?;
+        let output = engine
+            .command()
+            .args([
+                "run",
+                "--detach",
+                "--entrypoint",
+                "python3",
+                "-p",
+                &format!("{port}:{container_port}"),
+                DEFAULT_TEST_SERVER_IMAGE,
+                "-c",
+                script,
+            ])
+            .output()
+            .map_err(|err| format!("start {} host fixture: {err}", engine.name()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "{} run failed (exit {:?}):\n{}",
+                engine.name(),
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let fixture = Self {
+            port,
+            container_id: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            engine,
+        };
+        fixture.wait_until_listening(container_port).await?;
+        Ok(fixture)
+    }
+
+    async fn wait_until_listening(&self, container_port: u16) -> Result<(), String> {
+        let deadline = timeout(Duration::from_secs(60), async {
+            let mut tick = interval(Duration::from_millis(500));
+            loop {
+                tick.tick().await;
+                let output = self
+                    .engine
+                    .command()
+                    .args(["exec", &self.container_id, "python3", "-c", &format!("import socket; socket.create_connection(('127.0.0.1', {container_port}), timeout=1).close()")])
+                    .output()
+                    .ok();
+                if output.is_some_and(|output| output.status.success()) {
+                    return;
+                }
+            }
+        })
+        .await;
+        deadline.map_err(|_| {
+            format!(
+                "host fixture did not listen within 60s. Logs:\n{}",
+                self.logs().unwrap_or_else(|err| err)
+            )
+        })
+    }
+
+    pub fn logs(&self) -> Result<String, String> {
+        let output = self
+            .engine
+            .command()
+            .args(["logs", &self.container_id])
+            .output()
+            .map_err(|err| format!("read {} fixture logs: {err}", self.engine.name()))?;
+        Ok(format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+impl Drop for HostSupportContainer {
+    fn drop(&mut self) {
+        let _ = self
+            .engine
+            .command()
+            .args(["rm", "-f", &self.container_id])
+            .output();
+    }
+}
+
+impl SupportContainer {
+    /// Start a `python3 -c <script>` container with `alias` on the shared e2e
+    /// network and wait until `ready_port` accepts TCP connections inside the
+    /// container.
+    pub async fn start_python(alias: &str, script: &str, ready_port: u16) -> Result<Self, String> {
+        Self::start_python_with_capabilities(alias, script, ready_port, &[]).await
+    }
+
+    /// Start a Python support container with the requested Linux capabilities.
+    pub async fn start_python_with_capabilities(
+        alias: &str,
+        script: &str,
+        ready_port: u16,
+        capabilities: &[&str],
+    ) -> Result<Self, String> {
+        let engine = ContainerEngine::from_env()?;
+        let network = e2e_network_name().ok_or_else(|| {
+            "SupportContainer requires OPENSHELL_E2E_NETWORK_NAME (managed gateway network mode)"
+                .to_string()
+        })?;
+
+        let mut args = vec![
+            "run".to_string(),
+            "--detach".to_string(),
+            "--entrypoint".to_string(),
+            "python3".to_string(),
+            "--network".to_string(),
+            network.clone(),
+            "--network-alias".to_string(),
+            alias.to_string(),
+        ];
+        args.extend(
+            capabilities
+                .iter()
+                .map(|capability| format!("--cap-add={capability}")),
+        );
+        args.extend([
+            DEFAULT_TEST_SERVER_IMAGE.to_string(),
+            "-c".to_string(),
+            script.to_string(),
+        ]);
+
+        let output = engine
+            .command()
+            .args(&args)
+            .output()
+            .map_err(|e| format!("start {} support container: {e}", engine.name()))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if !output.status.success() {
+            return Err(format!(
+                "{} run failed (exit {:?}):\n{stderr}",
+                engine.name(),
+                output.status.code()
+            ));
+        }
+
+        let container = Self {
+            alias: alias.to_string(),
+            container_id: stdout,
+            network,
+            engine,
+        };
+        container.wait_until_listening(ready_port).await?;
+        Ok(container)
+    }
+
+    async fn wait_until_listening(&self, port: u16) -> Result<(), String> {
+        let probe = format!(
+            "import socket; socket.create_connection(('127.0.0.1', {port}), timeout=1).close()"
+        );
+        let deadline = timeout(Duration::from_secs(60), async {
+            let mut tick = interval(Duration::from_millis(500));
+            loop {
+                tick.tick().await;
+                let output = self
+                    .engine
+                    .command()
+                    .args(["exec", &self.container_id, "python3", "-c", &probe])
+                    .output()
+                    .ok();
+                if output.is_some_and(|o| o.status.success()) {
+                    return;
+                }
+            }
+        })
+        .await;
+        deadline.map_err(|_| {
+            format!(
+                "support container '{}' did not listen on port {port} within 60s.\nLogs:\n{}",
+                self.alias,
+                self.logs().unwrap_or_else(|err| err)
+            )
+        })
+    }
+
+    /// Combined stdout/stderr logs of the container.
+    pub fn logs(&self) -> Result<String, String> {
+        let output = self
+            .engine
+            .command()
+            .args(["logs", &self.container_id])
+            .output()
+            .map_err(|e| format!("read {} container logs: {e}", self.engine.name()))?;
+        Ok(format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+
+    /// The container's IP address on the shared e2e network.
+    pub fn ip(&self) -> Result<String, String> {
+        let format = format!(
+            "{{{{with index .NetworkSettings.Networks \"{}\"}}}}{{{{.IPAddress}}}}{{{{end}}}}",
+            self.network
+        );
+        let output = self
+            .engine
+            .command()
+            .args(["inspect", "--format", &format, &self.container_id])
+            .output()
+            .map_err(|e| format!("inspect {} container: {e}", self.engine.name()))?;
+        let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !output.status.success() || ip.is_empty() {
+            return Err(format!(
+                "could not resolve IP of support container '{}' on network '{}':\n{}",
+                self.alias,
+                self.network,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(ip)
+    }
+}
+
+impl Drop for SupportContainer {
+    fn drop(&mut self) {
+        let _ = self
+            .engine
+            .command()
+            .args(["rm", "-f", &self.container_id])
+            .output();
+    }
+}
+
 fn normalized_env(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)

@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# MXC gateway runtime configuration.
+#
+# Commands, working directories, and environment variables are sandbox-scoped.
+# Supply command and cwd through --driver-config-json when creating a sandbox,
+# and environment variables through the standard sandbox --env option.
+
+[openshell.drivers.mxc]
+# Path to wxc-exec.exe. Required for live runs. Leave the default for mock-mode
+# smoke tests (set OPENSHELL_MXC_MOCK_WXC=1 instead).
+wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
+
+# process_container is the default because AppContainer enforces default-deny
+# filesystem access. isolation_session is an explicit grant-only compatibility
+# mode and does not deny access to paths omitted from the sandbox policy.
+backend = "process_container"
+
+# process_container only: request a Less-Privileged AppContainer.
+# pc_least_privilege = false
+# process_container only: AppContainer capabilities to grant.
+# pc_capabilities = []
+
+# isolation_session only. Never use "small" (known OS bug).
+default_configuration_id = "composable"
+
+# Enable --debug on wxc-exec invocations.
+debug = false

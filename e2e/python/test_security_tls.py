@@ -234,11 +234,14 @@ class TestServerMtlsEnforcement:
             stub = openshell_pb2_grpc.OpenShellStub(channel)
             with pytest.raises(grpc.RpcError) as exc_info:
                 stub.Health(openshell_pb2.HealthRequest(), timeout=10)
-            # Plaintext to a TLS port will fail at the transport level.
+            # The loopback listener may intentionally accept plaintext service
+            # HTTP. A gRPC request is still rejected, either at the transport
+            # boundary or as an unimplemented HTTP route.
             assert exc_info.value.code() in (
                 grpc.StatusCode.UNAVAILABLE,
                 grpc.StatusCode.UNKNOWN,
                 grpc.StatusCode.INTERNAL,
-            ), f"expected transport failure, got {exc_info.value.code()}"
+                grpc.StatusCode.UNIMPLEMENTED,
+            ), f"expected plaintext gRPC rejection, got {exc_info.value.code()}"
         finally:
             channel.close()

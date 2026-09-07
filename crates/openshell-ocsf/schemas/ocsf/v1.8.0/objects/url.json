@@ -1,0 +1,370 @@
+{
+    "attributes": {
+        "port": {
+            "type": "port_t",
+            "description": "The URL port. For example: <code>80</code>.",
+            "requirement": "recommended",
+            "caption": "Port",
+            "type_name": "Port"
+        },
+        "scheme": {
+            "type": "string_t",
+            "description": "The scheme portion of the URL. For example: <code>http</code>, <code>https</code>, <code>ftp</code>, or <code>sftp</code>.",
+            "requirement": "recommended",
+            "caption": "Scheme",
+            "type_name": "String"
+        },
+        "path": {
+            "type": "string_t",
+            "description": "The URL path as extracted from the URL. For example: <code>/download/trouble</code> from <code>www.example.com/download/trouble</code>.",
+            "requirement": "recommended",
+            "caption": "Path",
+            "type_name": "String"
+        },
+        "domain": {
+            "type": "string_t",
+            "description": "The domain portion of the URL. For example: <code>example.com</code> in <code>https://sub.example.com</code>.",
+            "requirement": "optional",
+            "caption": "Domain",
+            "type_name": "String"
+        },
+        "hostname": {
+            "type": "hostname_t",
+            "description": "The URL host as extracted from the URL. For example: <code>www.example.com</code> from <code>www.example.com/download/trouble</code>.",
+            "requirement": "recommended",
+            "caption": "Hostname",
+            "type_name": "Hostname"
+        },
+        "query_string": {
+            "type": "string_t",
+            "description": "The query portion of the URL. For example: the query portion of the URL <code>http://www.example.com/search?q=bad&sort=date</code> is <code>q=bad&sort=date</code>.",
+            "requirement": "recommended",
+            "caption": "HTTP Query String",
+            "type_name": "String"
+        },
+        "categories": {
+            "type": "string_t",
+            "description": "The Website categorization names, as defined by <code>category_ids</code> enum values.",
+            "is_array": true,
+            "requirement": "optional",
+            "caption": "Website Categorization",
+            "type_name": "String"
+        },
+        "category_ids": {
+            "type": "integer_t",
+            "enum": {
+                "60": {
+                    "caption": "Real Estate"
+                },
+                "93": {
+                    "caption": "Sexual Expression"
+                },
+                "32": {
+                    "caption": "Brokerage/Trading"
+                },
+                "15": {
+                    "caption": "Weapons"
+                },
+                "37": {
+                    "caption": "Health"
+                },
+                "5": {
+                    "caption": "Intimate Apparel/Swimsuit"
+                },
+                "102": {
+                    "caption": "Potentially Unwanted Software"
+                },
+                "47": {
+                    "caption": "Personals/Dating"
+                },
+                "20": {
+                    "caption": "Entertainment"
+                },
+                "16": {
+                    "caption": "Abortion"
+                },
+                "101": {
+                    "caption": "Spam"
+                },
+                "109": {
+                    "caption": "Internet Connected Devices"
+                },
+                "85": {
+                    "caption": "Office/Business Applications"
+                },
+                "31": {
+                    "caption": "Financial Services"
+                },
+                "25": {
+                    "caption": "Controlled Substances"
+                },
+                "114": {
+                    "caption": "TV/Video Streams"
+                },
+                "36": {
+                    "caption": "Political/Social Advocacy"
+                },
+                "63": {
+                    "caption": "Personal Sites"
+                },
+                "22": {
+                    "caption": "Alternative Spirituality/Belief"
+                },
+                "59": {
+                    "caption": "Auctions"
+                },
+                "34": {
+                    "caption": "Government/Legal"
+                },
+                "27": {
+                    "caption": "Education"
+                },
+                "99": {
+                    "description": "The Domain/URL category is not mapped. See the <code>categories</code> attribute, which contains a data source specific value.",
+                    "caption": "Other"
+                },
+                "118": {
+                    "caption": "Piracy/Copyright Concerns"
+                },
+                "4": {
+                    "caption": "Sex Education"
+                },
+                "45": {
+                    "caption": "Job Search/Careers"
+                },
+                "90": {
+                    "caption": "Uncategorized"
+                },
+                "56": {
+                    "caption": "File Storage/Sharing"
+                },
+                "29": {
+                    "caption": "Charitable Organizations"
+                },
+                "67": {
+                    "caption": "Vehicles"
+                },
+                "65": {
+                    "caption": "Sports/Recreation"
+                },
+                "24": {
+                    "caption": "Tobacco"
+                },
+                "83": {
+                    "caption": "Peer-to-Peer (P2P)"
+                },
+                "1": {
+                    "caption": "Adult/Mature Content"
+                },
+                "66": {
+                    "caption": "Travel"
+                },
+                "57": {
+                    "caption": "Remote Access Tools"
+                },
+                "97": {
+                    "caption": "Content Servers"
+                },
+                "92": {
+                    "caption": "Suspicious"
+                },
+                "38": {
+                    "caption": "Technology/Internet"
+                },
+                "111": {
+                    "caption": "Online Meetings"
+                },
+                "51": {
+                    "caption": "Chat (IM)/SMS"
+                },
+                "52": {
+                    "caption": "Email"
+                },
+                "46": {
+                    "caption": "News/Media"
+                },
+                "23": {
+                    "caption": "Alcohol"
+                },
+                "14": {
+                    "caption": "Violence/Hate/Racism"
+                },
+                "87": {
+                    "caption": "For Kids"
+                },
+                "89": {
+                    "caption": "Web Hosting"
+                },
+                "88": {
+                    "caption": "Web Ads/Analytics"
+                },
+                "107": {
+                    "caption": "Informational"
+                },
+                "61": {
+                    "caption": "Society/Daily Living"
+                },
+                "113": {
+                    "caption": "Radio/Audio Streams"
+                },
+                "103": {
+                    "caption": "Dynamic DNS Host"
+                },
+                "121": {
+                    "caption": "Marijuana"
+                },
+                "86": {
+                    "caption": "Proxy Avoidance"
+                },
+                "55": {
+                    "caption": "Social Networking"
+                },
+                "49": {
+                    "caption": "Reference"
+                },
+                "106": {
+                    "caption": "E-Card/Invitations"
+                },
+                "7": {
+                    "caption": "Extreme"
+                },
+                "98": {
+                    "caption": "Placeholders"
+                },
+                "112": {
+                    "caption": "Media Sharing"
+                },
+                "40": {
+                    "caption": "Search Engines/Portals"
+                },
+                "58": {
+                    "caption": "Shopping"
+                },
+                "17": {
+                    "caption": "Hacking"
+                },
+                "6": {
+                    "caption": "Nudity"
+                },
+                "44": {
+                    "caption": "Malicious Outbound Data/Botnets"
+                },
+                "3": {
+                    "caption": "Pornography"
+                },
+                "110": {
+                    "caption": "Internet Telephony"
+                },
+                "26": {
+                    "caption": "Child Pornography"
+                },
+                "50": {
+                    "caption": "Mixed Content/Potentially Adult"
+                },
+                "30": {
+                    "caption": "Art/Culture"
+                },
+                "95": {
+                    "caption": "Translation"
+                },
+                "18": {
+                    "caption": "Phishing"
+                },
+                "0": {
+                    "description": "The Domain/URL category is unknown.",
+                    "caption": "Unknown"
+                },
+                "71": {
+                    "caption": "Software Downloads"
+                },
+                "53": {
+                    "caption": "Newsgroups/Forums"
+                },
+                "35": {
+                    "caption": "Military"
+                },
+                "54": {
+                    "caption": "Religion"
+                },
+                "43": {
+                    "caption": "Malicious Sources/Malnets"
+                },
+                "84": {
+                    "caption": "Audio/Video Clips"
+                },
+                "64": {
+                    "caption": "Restaurants/Dining/Food"
+                },
+                "21": {
+                    "caption": "Business/Economy"
+                },
+                "11": {
+                    "caption": "Gambling"
+                },
+                "68": {
+                    "caption": "Humor/Jokes"
+                },
+                "108": {
+                    "caption": "Computer/Information Security"
+                },
+                "9": {
+                    "caption": "Scam/Questionable/Illegal"
+                },
+                "96": {
+                    "caption": "Non-Viewable/Infrastructure"
+                },
+                "33": {
+                    "caption": "Games"
+                }
+            },
+            "description": "The Website categorization identifiers.",
+            "is_array": true,
+            "requirement": "recommended",
+            "caption": "Website Categorization IDs",
+            "sibling": "categories",
+            "type_name": "Integer"
+        },
+        "resource_type": {
+            "type": "string_t",
+            "description": "The context in which a resource was retrieved in a web request.",
+            "requirement": "optional",
+            "caption": "Resource Type",
+            "type_name": "String"
+        },
+        "subdomain": {
+            "type": "string_t",
+            "description": "The subdomain portion of the URL. For example: <code>sub</code> in <code>https://sub.example.com</code> or <code>sub2.sub1</code> in <code>https://sub2.sub1.example.com</code>.",
+            "requirement": "optional",
+            "caption": "Subdomain",
+            "type_name": "String"
+        },
+        "url_string": {
+            "type": "url_t",
+            "description": "The URL string. See RFC 1738. For example: <code>http://www.example.com/download/trouble.exe</code>. Note: The URL path should not populate the URL string.",
+            "requirement": "recommended",
+            "caption": "URL String",
+            "type_name": "URL String"
+        }
+    },
+    "name": "url",
+    "description": "The Uniform Resource Locator (URL) object describes the characteristics of a URL.",
+    "extends": "object",
+    "constraints": {
+        "at_least_one": [
+            "url_string",
+            "path"
+        ]
+    },
+    "references": [
+        {
+            "description": "Defined in RFC 1738",
+            "url": "https://datatracker.ietf.org/doc/html/rfc1738"
+        },
+        {
+            "description": "D3FEND\u2122 Ontology d3f:URL",
+            "url": "https://d3fend.mitre.org/dao/artifact/d3f:URL/"
+        }
+    ],
+    "caption": "Uniform Resource Locator",
+    "observable": 23
+}

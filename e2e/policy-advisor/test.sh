@@ -22,7 +22,7 @@ DEMO_BRANCH="${DEMO_BRANCH:-main}"
 DEMO_RUN_ID="${DEMO_RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 DEMO_FILE_DIR="${DEMO_FILE_DIR:-openshell-policy-advisor-validation}"
 DEMO_FILE_PATH="${DEMO_FILE_PATH:-${DEMO_FILE_DIR}/${DEMO_RUN_ID}.md}"
-DEMO_SANDBOX_NAME="${DEMO_SANDBOX_NAME:-policy-agent-validation-${DEMO_RUN_ID}}"
+DEMO_SANDBOX_NAME="${DEMO_SANDBOX_NAME:-pav-${DEMO_RUN_ID}}"
 DEMO_GITHUB_PROVIDER_NAME="${DEMO_GITHUB_PROVIDER_NAME:-github-policy-validation-${DEMO_RUN_ID}}"
 DEMO_KEEP_SANDBOX="${DEMO_KEEP_SANDBOX:-0}"
 DEMO_RETRY_ATTEMPTS="${DEMO_RETRY_ATTEMPTS:-30}"
@@ -230,10 +230,7 @@ create_sandbox() {
         --policy "$POLICY_FILE" \
         --upload "${RUNNER_SOURCE}:/sandbox/policy-validation-runner.sh" \
         --no-git-ignore \
-        --keep \
-        --no-auto-providers \
-        --no-tty \
-        -- bash -lc "chmod +x /sandbox/policy-validation-runner.sh && echo sandbox ready"
+        --no-auto-providers
 }
 
 connect_ssh() {
@@ -246,6 +243,8 @@ connect_ssh() {
     local i
     for i in $(seq 1 "$retries"); do
         if ssh -F "$SSH_CONFIG" "$SSH_HOST" true >/dev/null 2>&1; then
+            ssh -F "$SSH_CONFIG" "$SSH_HOST" chmod +x /sandbox/policy-validation-runner.sh \
+                || fail "could not make uploaded policy runner executable"
             return
         fi
         sleep 2

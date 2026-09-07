@@ -269,6 +269,24 @@
       }
     },
     {
+      "name": "workspace:read",
+      "description": "Read workspace resources",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true"
+      }
+    },
+    {
+      "name": "workspace:write",
+      "description": "Write workspace resources",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true"
+      }
+    },
+    {
       "name": "openshell:all",
       "description": "Full access to all OpenShell resources",
       "protocol": "openid-connect",
@@ -295,8 +313,22 @@
       },
       "protocol": "openid-connect",
       "fullScopeAllowed": true,
+      "protocolMappers": [
+        {
+          "name": "openshell-cli audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "openshell-cli",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ],
       "defaultClientScopes": ["openid", "profile", "email", "roles", "web-origins", "acr"],
-      "optionalClientScopes": ["sandbox:read", "sandbox:write", "provider:read", "provider:write", "config:read", "config:write", "inference:read", "inference:write", "openshell:all"]
+      "optionalClientScopes": ["sandbox:read", "sandbox:write", "provider:read", "provider:write", "config:read", "config:write", "inference:read", "inference:write", "workspace:read", "workspace:write", "openshell:all"]
     },
     {
       "clientId": "openshell-ci",
@@ -310,6 +342,20 @@
       "serviceAccountsEnabled": true,
       "protocol": "openid-connect",
       "fullScopeAllowed": true,
+      "protocolMappers": [
+        {
+          "name": "openshell-ci audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "openshell-cli",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ],
       "defaultClientScopes": ["openid", "profile", "email", "roles", "web-origins", "acr", "openshell:all"]
     }
   ],
@@ -341,6 +387,22 @@
         {
           "type": "password",
           "value": "user",
+          "temporary": false
+        }
+      ],
+      "realmRoles": ["openshell-user"]
+    },
+    {
+      "username": "user-b@test",
+      "email": "user-b@test",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Second",
+      "lastName": "User",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "user-b",
           "temporary": false
         }
       ],

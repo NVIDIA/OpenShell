@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import errno
+import ipaddress
 import json
+import math
 import os
 import pathlib
 import sys
@@ -13,14 +16,15 @@ import tempfile
 import threading
 import time
 from collections import namedtuple
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Never, SupportsIndex, cast
 from urllib.parse import urlparse
 
 import grpc
 import httpx
 
 from ._proto import (
+    datamodel_pb2,
     inference_pb2,
     inference_pb2_grpc,
     openshell_pb2,
@@ -31,6 +35,8 @@ _ClientCallDetailsBase = namedtuple(
     "_ClientCallDetailsBase",
     ("method", "timeout", "metadata", "credentials", "wait_for_ready", "compression"),
 )
+
+_OAUTH_MAX_RESPONSE_BYTES = 1 << 20
 
 
 class _ClientCallDetails(_ClientCallDetailsBase, grpc.ClientCallDetails):
@@ -124,17 +130,289 @@ def _normalize_bearer(
     return lambda: token
 
 
+def _is_loopback_host(hostname: str | None) -> bool:
+    if hostname is None:
+        return False
+    if hostname.lower() == "localhost":
+        return True
+    with contextlib.suppress(ValueError):
+        return ipaddress.ip_address(hostname).is_loopback
+    return False
+
+
+def _is_local_grpc_endpoint(endpoint: str) -> bool:
+    if endpoint.startswith("unix:"):
+        return True
+    return _is_loopback_host(urlparse(f"//{endpoint}").hostname)
+
+
+def _validate_oauth_url(name: str, raw: str) -> str:
+    """Validate an OAuth endpoint without reflecting attacker-controlled URLs."""
+    parsed = urlparse(raw)
+    if not parsed.scheme or not parsed.hostname or parsed.username or parsed.password:
+        raise SandboxError(f"invalid OAuth {name} URL")
+    if parsed.fragment:
+        raise SandboxError(f"OAuth {name} URL must not contain a fragment")
+    if parsed.scheme == "https":
+        return raw
+    if parsed.scheme == "http" and _is_loopback_host(parsed.hostname):
+        return raw
+    raise SandboxError(
+        f"OAuth {name} URL must use HTTPS (HTTP is allowed only for loopback hosts)"
+    )
+
+
+def _oauth_json_request(
+    client: httpx.Client,
+    method: str,
+    url: str,
+    *,
+    kind: str,
+    headers: Mapping[str, str],
+    data: Mapping[str, str] | None = None,
+) -> tuple[int, dict[str, object]]:
+    """Read a bounded JSON response without retaining arbitrary error bodies."""
+    with client.stream(method, url, headers=headers, data=data) as response:
+        if response.status_code != 200:
+            return response.status_code, {}
+        content = bytearray()
+        for chunk in response.iter_bytes():
+            content.extend(chunk)
+            if len(content) > _OAUTH_MAX_RESPONSE_BYTES:
+                raise SandboxError(f"OAuth {kind} response is too large")
+    try:
+        payload = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise SandboxError(f"OAuth {kind} returned invalid JSON") from None
+    if not isinstance(payload, dict):
+        raise SandboxError(f"OAuth {kind} returned invalid JSON")
+    return 200, payload
+
+
+class ClientCredentialsAuth:
+    """Renewable OAuth 2.0 client-credentials bearer provider.
+
+    Tokens and client secrets remain in memory. The first RPC lazily performs
+    discovery and an exchange; later RPCs share the cached token until it is
+    within 30 seconds of expiry. Concurrent callers share one exchange.
+    """
+
+    def __init__(
+        self,
+        *,
+        client_secret: str | Callable[[], str],
+        issuer: str | None = None,
+        client_id: str | None = None,
+        scopes: Sequence[str] | None = None,
+        audience: str | None = None,
+        insecure: bool = False,
+        timeout: float = 30.0,
+        _transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        if not isinstance(client_secret, str) and not callable(client_secret):
+            raise TypeError("client_secret must be a string or zero-argument callable")
+        if isinstance(client_secret, str) and not client_secret:
+            raise SandboxError("OAuth client secret must not be empty")
+        self._secret = client_secret
+        self._issuer = issuer
+        self._client_id = client_id
+        self._scopes = tuple(scopes) if scopes is not None else None
+        self._audience = audience
+        self._insecure = insecure
+        self._timeout = timeout
+        self._transport = _transport
+        self._lock = threading.Lock()
+        self._access_token: str | None = None
+        self._expires_at = 0.0
+        self._token_endpoint: str | None = None
+
+    def __repr__(self) -> str:
+        return (
+            "ClientCredentialsAuth(issuer="
+            f"{self._issuer!r}, client_id={self._client_id!r}, "
+            f"scopes={self._scopes!r}, audience={self._audience!r})"
+        )
+
+    def _apply_gateway_metadata(
+        self, metadata: Mapping[str, object], *, insecure: bool = False
+    ) -> None:
+        """Fill omitted fields and apply active-gateway transport settings."""
+        if self._issuer is None:
+            value = metadata.get("oidc_issuer")
+            self._issuer = value if isinstance(value, str) and value else None
+        if self._client_id is None:
+            value = metadata.get("oidc_client_id")
+            self._client_id = value if isinstance(value, str) and value else None
+        if self._audience is None:
+            value = metadata.get("oidc_audience")
+            self._audience = value if isinstance(value, str) and value else None
+        if self._scopes is None:
+            value = metadata.get("oidc_scopes")
+            if isinstance(value, str):
+                self._scopes = tuple(value.split())
+        # Preserve an explicit provider-level opt-in while also honoring the
+        # active-gateway construction flag used by the existing OIDC refresher.
+        self._insecure = self._insecure or insecure
+
+    def __call__(self) -> str:
+        if (
+            self._access_token is not None
+            and time.time() + _OIDC_TOKEN_EXPIRY_GRACE_SECONDS < self._expires_at
+        ):
+            return self._access_token
+        with self._lock:
+            if (
+                self._access_token is not None
+                and time.time() + _OIDC_TOKEN_EXPIRY_GRACE_SECONDS < self._expires_at
+            ):
+                return self._access_token
+            token, expires_at = self._exchange()
+            self._access_token = token
+            self._expires_at = expires_at
+            return token
+
+    def _exchange(self) -> tuple[str, float]:
+        if not self._issuer or not self._client_id:
+            raise SandboxError("OAuth client credentials require issuer and client_id")
+        issuer = _validate_oauth_url("issuer", self._issuer).rstrip("/")
+        headers = {"accept": "application/json"}
+        try:
+            with httpx.Client(
+                verify=not self._insecure,
+                follow_redirects=False,
+                timeout=self._timeout,
+                transport=self._transport,
+            ) as client:
+                if self._token_endpoint is None:
+                    status, discovery = _oauth_json_request(
+                        client,
+                        "GET",
+                        f"{issuer}/.well-known/openid-configuration",
+                        kind="discovery",
+                        headers=headers,
+                    )
+                    if status != 200:
+                        raise SandboxError(f"OAuth discovery failed with HTTP {status}")
+                    discovered = discovery.get("issuer")
+                    if (
+                        not isinstance(discovered, str)
+                        or discovered.rstrip("/") != issuer
+                    ):
+                        raise SandboxError("OAuth discovery issuer mismatch")
+                    endpoint = discovery.get("token_endpoint")
+                    if not isinstance(endpoint, str) or not endpoint:
+                        raise SandboxError(
+                            "OAuth discovery document is missing token_endpoint"
+                        )
+                    self._token_endpoint = _validate_oauth_url(
+                        "token endpoint", endpoint
+                    )
+                secret = self._resolve_secret()
+                data = {
+                    "grant_type": "client_credentials",
+                    "client_id": self._client_id,
+                    "client_secret": secret,
+                }
+                if self._scopes:
+                    data["scope"] = " ".join(self._scopes)
+                if self._audience:
+                    data["audience"] = self._audience
+                status, payload = _oauth_json_request(
+                    client,
+                    "POST",
+                    self._token_endpoint,
+                    kind="client credentials response",
+                    data=data,
+                    headers=headers,
+                )
+        except SandboxError:
+            raise
+        except httpx.HTTPError:
+            raise SandboxError("OAuth client credentials request failed") from None
+        if status != 200:
+            raise SandboxError(
+                f"OAuth client credentials exchange failed with HTTP {status}"
+            )
+        access_token = payload.get("access_token")
+        expires_in = payload.get("expires_in")
+        if not isinstance(access_token, str) or not access_token:
+            raise SandboxError(
+                "OAuth client credentials response is missing access_token"
+            )
+        if (
+            isinstance(expires_in, bool)
+            or not isinstance(expires_in, (int, float))
+            or not math.isfinite(expires_in)
+            or expires_in <= 0
+        ):
+            raise SandboxError(
+                "OAuth client credentials response requires a positive finite expires_in"
+            )
+        return access_token, time.time() + float(expires_in)
+
+    def _resolve_secret(self) -> str:
+        if isinstance(self._secret, str):
+            return self._secret
+        try:
+            value = self._secret()
+        except Exception:
+            raise SandboxError("OAuth client secret supplier failed") from None
+        if not isinstance(value, str) or not value:
+            raise SandboxError("OAuth client secret supplier returned an empty secret")
+        return value
+
+
 @dataclass(frozen=True)
 class SandboxStatusRef:
     phase: int
     current_policy_version: int
+    exit_code: int | None = None
+
+
+class _ImmutableLabels(dict[str, str]):
+    """A read-only, copy- and pickle-safe label mapping."""
+
+    def _deny_mutation(self, *args: object, **kwargs: object) -> Never:
+        del args, kwargs
+        raise TypeError("sandbox labels are immutable")
+
+    __setitem__ = _deny_mutation
+    __delitem__ = _deny_mutation
+    clear = _deny_mutation
+    pop = _deny_mutation
+    popitem = _deny_mutation
+    setdefault = _deny_mutation
+    update = _deny_mutation
+    __ior__ = _deny_mutation
+
+    def __deepcopy__(self, memo: dict[int, object]) -> _ImmutableLabels:
+        del memo
+        return type(self)(self)
+
+    def __reduce_ex__(self, protocol: SupportsIndex, /) -> str | tuple[Any, ...]:
+        del protocol
+        return type(self), (dict(self),)
+
+
+@dataclass(frozen=True)
+class SandboxWorkloadTemplateProvenanceRef:
+    name: str
+    resource_version: str
 
 
 @dataclass(frozen=True)
 class SandboxRef:
     id: str
     name: str
+    workspace: str
     status: SandboxStatusRef
+    # Excluded from equality/hash to preserve the original identity while the
+    # immutable mapping remains safe for deepcopy, pickle, and asdict.
+    labels: Mapping[str, str] = field(default_factory=_ImmutableLabels, compare=False)
+    created_from_workload_template: SandboxWorkloadTemplateProvenanceRef | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "labels", _ImmutableLabels(self.labels))
 
     @property
     def phase(self) -> int:
@@ -166,6 +444,7 @@ class SandboxSession:
     def __init__(self, client: SandboxClient, sandbox: SandboxRef) -> None:
         self._client = client
         self.sandbox = sandbox
+        self._workspace = sandbox.workspace
 
     @property
     def id(self) -> str:
@@ -180,6 +459,7 @@ class SandboxSession:
         env: Mapping[str, str] | None = None,
         stdin: bytes | None = None,
         timeout_seconds: int | None = None,
+        no_login_shell: bool = False,
     ) -> ExecResult:
         return self._client.exec(
             self.sandbox.id,
@@ -189,6 +469,7 @@ class SandboxSession:
             env=env,
             stdin=stdin,
             timeout_seconds=timeout_seconds,
+            no_login_shell=no_login_shell,
         )
 
     def exec_python(
@@ -214,7 +495,15 @@ class SandboxSession:
         )
 
     def delete(self) -> bool:
-        return self._client.delete(self.sandbox.name)
+        return self._client.delete(self.sandbox.name, workspace=self._workspace)
+
+    def stop(self) -> SandboxRef:
+        self.sandbox = self._client.stop(self.sandbox.name, workspace=self._workspace)
+        return self.sandbox
+
+    def start(self) -> SandboxRef:
+        self.sandbox = self._client.start(self.sandbox.name, workspace=self._workspace)
+        return self.sandbox
 
 
 class SandboxClient:
@@ -226,6 +515,7 @@ class SandboxClient:
         *,
         tls: TlsConfig | None = None,
         bearer_token: str | Callable[[], str] | None = None,
+        client_credentials: ClientCredentialsAuth | None = None,
         timeout: float = 30.0,
         cluster_name: str | None = None,
         _bearer_close: Callable[[], None] | None = None,
@@ -240,6 +530,9 @@ class SandboxClient:
                 runtime refresh). Combines with `tls` — pass both when
                 the gateway uses mTLS for transport identity and OIDC
                 for user identity.
+            client_credentials: renewable OAuth client-credentials provider.
+                Mutually exclusive with `bearer_token`. A non-loopback endpoint
+                requires `tls` so the acquired bearer is never sent in cleartext.
             timeout: default per-call timeout in seconds.
             cluster_name: optional friendly name for error messages.
             _bearer_close: internal — wired by `from_active_cluster`
@@ -249,6 +542,18 @@ class SandboxClient:
                 lifecycle of any callable they supplied as
                 `bearer_token`.
         """
+        if bearer_token is not None and client_credentials is not None:
+            raise SandboxError(
+                "bearer_token and client_credentials are mutually exclusive"
+            )
+        if (
+            client_credentials is not None
+            and tls is None
+            and not _is_local_grpc_endpoint(endpoint)
+        ):
+            raise SandboxError(
+                "OAuth client credentials require TLS for non-loopback gateway endpoints"
+            )
         self._endpoint = endpoint
         self._timeout = timeout
         self._cluster_name = cluster_name
@@ -268,7 +573,7 @@ class SandboxClient:
                 ),
             )
             self._channel = grpc.secure_channel(endpoint, credentials)
-        provider = _normalize_bearer(bearer_token)
+        provider = _normalize_bearer(client_credentials or bearer_token)
         if provider is not None:
             self._channel = grpc.intercept_channel(
                 self._channel,
@@ -285,6 +590,7 @@ class SandboxClient:
         auto_refresh: bool = True,
         write_back: bool = True,
         insecure: bool = False,
+        client_credentials: ClientCredentialsAuth | None = None,
     ) -> SandboxClient:
         """Construct a `SandboxClient` from the active gateway's on-disk state.
 
@@ -313,6 +619,10 @@ class SandboxClient:
                 for OIDC discovery and refresh calls. Mirrors the Rust
                 CLI's `--insecure` flag for issuers behind self-signed
                 certs. Off by default.
+            client_credentials: renewable OAuth client-credentials provider.
+                Omitted issuer, client ID, audience, and scopes are filled from
+                the registered gateway metadata. This provider does not read or
+                write `oidc_token.json`. Remote plaintext gateways are rejected.
         """
         cluster_name = cluster or _resolve_active_cluster()
         gateway_dir = _xdg_config_home() / "openshell" / "gateways" / cluster_name
@@ -352,7 +662,13 @@ class SandboxClient:
         # a non-OIDC gateway should NOT cause us to attach a bearer.
         bearer_token: Callable[[], str] | None = None
         bearer_close: Callable[[], None] | None = None
-        if metadata.get("auth_mode") == "oidc":
+        if client_credentials is not None:
+            if metadata.get("auth_mode") != "oidc":
+                raise SandboxError(
+                    f"gateway '{cluster_name}' is not configured for OIDC"
+                )
+            client_credentials._apply_gateway_metadata(metadata, insecure=insecure)
+        elif metadata.get("auth_mode") == "oidc":
             bearer_token, bearer_close = _make_cluster_bearer_provider(
                 gateway_dir,
                 cluster_name,
@@ -365,6 +681,7 @@ class SandboxClient:
             endpoint,
             tls=tls,
             bearer_token=bearer_token,
+            client_credentials=client_credentials,
             timeout=timeout,
             cluster_name=cluster_name,
             _bearer_close=bearer_close,
@@ -396,11 +713,46 @@ class SandboxClient:
     def create(
         self,
         *,
+        workspace: str,
         spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
     ) -> SandboxRef:
         request_spec = spec if spec is not None else _default_spec()
         response = self._stub.CreateSandbox(
-            openshell_pb2.CreateSandboxRequest(spec=request_spec),
+            openshell_pb2.CreateSandboxRequest(
+                spec=request_spec,
+                name=name or "",
+                labels=dict(labels) if labels else {},
+                workspace=workspace,
+            ),
+            timeout=self._timeout,
+        )
+        sandbox_ref = _sandbox_ref(response.sandbox)
+        if sandbox_ref.id == "":
+            raise SandboxError("CreateSandbox returned empty sandbox id")
+        return sandbox_ref
+
+    def create_from_template(
+        self,
+        *,
+        workspace: str,
+        template_name: str,
+        spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
+    ) -> SandboxRef:
+        if not template_name.strip():
+            raise SandboxError("template_name is required")
+        request_spec = spec if spec is not None else openshell_pb2.SandboxSpec()
+        response = self._stub.CreateSandbox(
+            openshell_pb2.CreateSandboxRequest(
+                spec=request_spec,
+                name=name or "",
+                labels=dict(labels) if labels else {},
+                workspace=workspace,
+                workload_template_name=template_name,
+            ),
             timeout=self._timeout,
         )
         sandbox_ref = _sandbox_ref(response.sandbox)
@@ -411,42 +763,143 @@ class SandboxClient:
     def create_session(
         self,
         *,
+        workspace: str,
         spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
     ) -> SandboxSession:
-        return SandboxSession(self, self.create(spec=spec))
+        return SandboxSession(
+            self, self.create(workspace=workspace, spec=spec, name=name, labels=labels)
+        )
 
-    def get(self, sandbox_name: str) -> SandboxRef:
+    def create_session_from_template(
+        self,
+        *,
+        workspace: str,
+        template_name: str,
+        spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
+    ) -> SandboxSession:
+        return SandboxSession(
+            self,
+            self.create_from_template(
+                workspace=workspace,
+                template_name=template_name,
+                spec=spec,
+                name=name,
+                labels=labels,
+            ),
+        )
+
+    def sandbox_templates(self) -> SandboxTemplateClient:
+        return SandboxTemplateClient(self._channel, timeout=self._timeout)
+
+    def get(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.GetSandbox(
-            openshell_pb2.GetSandboxRequest(name=sandbox_name),
+            openshell_pb2.GetSandboxRequest(name=sandbox_name, workspace=workspace),
             timeout=self._timeout,
         )
         return _sandbox_ref(response.sandbox)
 
-    def get_session(self, sandbox_name: str) -> SandboxSession:
-        return SandboxSession(self, self.get(sandbox_name))
+    def get_session(self, sandbox_name: str, *, workspace: str) -> SandboxSession:
+        return SandboxSession(self, self.get(sandbox_name, workspace=workspace))
 
-    def list(self, *, limit: int = 100, offset: int = 0) -> builtins.list[SandboxRef]:
-        response = self._stub.ListSandboxes(
-            openshell_pb2.ListSandboxesRequest(limit=limit, offset=offset),
-            timeout=self._timeout,
+    def list(
+        self,
+        *,
+        workspace: str,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str | None = None,
+    ) -> builtins.list[SandboxRef]:
+        request = openshell_pb2.ListSandboxesRequest(
+            workspace=workspace,
+            limit=limit,
+            offset=offset,
+            label_selector=label_selector or "",
         )
+        response = self._stub.ListSandboxes(request, timeout=self._timeout)
         return [_sandbox_ref(item) for item in response.sandboxes]
 
-    def list_ids(self, *, limit: int = 100, offset: int = 0) -> builtins.list[str]:
-        return [item.id for item in self.list(limit=limit, offset=offset)]
+    def list_for_all_workspaces(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str | None = None,
+    ) -> builtins.list[SandboxRef]:
+        request = openshell_pb2.ListSandboxesRequest(
+            all_workspaces=True,
+            limit=limit,
+            offset=offset,
+            label_selector=label_selector or "",
+        )
+        response = self._stub.ListSandboxes(request, timeout=self._timeout)
+        return [_sandbox_ref(item) for item in response.sandboxes]
 
-    def delete(self, sandbox_name: str) -> bool:
+    def list_ids(
+        self,
+        *,
+        workspace: str,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str | None = None,
+    ) -> builtins.list[str]:
+        return [
+            item.id
+            for item in self.list(
+                workspace=workspace,
+                limit=limit,
+                offset=offset,
+                label_selector=label_selector,
+            )
+        ]
+
+    def list_ids_for_all_workspaces(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str | None = None,
+    ) -> builtins.list[str]:
+        return [
+            item.id
+            for item in self.list_for_all_workspaces(
+                limit=limit,
+                offset=offset,
+                label_selector=label_selector,
+            )
+        ]
+
+    def delete(self, sandbox_name: str, *, workspace: str) -> bool:
         response = self._stub.DeleteSandbox(
-            openshell_pb2.DeleteSandboxRequest(name=sandbox_name),
+            openshell_pb2.DeleteSandboxRequest(name=sandbox_name, workspace=workspace),
             timeout=self._timeout,
         )
         return bool(response.deleted)
 
-    def wait_deleted(self, sandbox_name: str, *, timeout_seconds: float = 60.0) -> None:
+    def stop(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
+        response = self._stub.StopSandbox(
+            openshell_pb2.StopSandboxRequest(name=sandbox_name, workspace=workspace),
+            timeout=self._timeout,
+        )
+        return _sandbox_ref(response.sandbox)
+
+    def start(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
+        response = self._stub.StartSandbox(
+            openshell_pb2.StartSandboxRequest(name=sandbox_name, workspace=workspace),
+            timeout=self._timeout,
+        )
+        return _sandbox_ref(response.sandbox)
+
+    def wait_deleted(
+        self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 60.0
+    ) -> None:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             try:
-                self.get(sandbox_name)
+                self.get(sandbox_name, workspace=workspace)
             except grpc.RpcError as exc:
                 if (
                     isinstance(exc, grpc.Call)
@@ -458,17 +911,59 @@ class SandboxClient:
         raise SandboxError(f"sandbox {sandbox_name} was not deleted within timeout")
 
     def wait_ready(
-        self, sandbox_name: str, *, timeout_seconds: float = 300.0
+        self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 300.0
+    ) -> SandboxRef:
+        return self._wait_for_phase(
+            sandbox_name,
+            workspace=workspace,
+            target_phase=openshell_pb2.SANDBOX_PHASE_READY,
+            target_name="ready",
+            timeout_seconds=timeout_seconds,
+        )
+
+    def wait_stopped(
+        self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 300.0
+    ) -> SandboxRef:
+        return self._wait_for_phase(
+            sandbox_name,
+            workspace=workspace,
+            target_phase=openshell_pb2.SANDBOX_PHASE_STOPPED,
+            target_name="stopped",
+            timeout_seconds=timeout_seconds,
+        )
+
+    def _wait_for_phase(
+        self,
+        sandbox_name: str,
+        *,
+        workspace: str,
+        target_phase: int,
+        target_name: str,
+        timeout_seconds: float,
     ) -> SandboxRef:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
-            sandbox = self.get(sandbox_name)
-            if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_READY:
+            sandbox = self.get(sandbox_name, workspace=workspace)
+            if sandbox.status.phase == target_phase:
                 return sandbox
+            if (
+                target_phase == openshell_pb2.SANDBOX_PHASE_READY
+                and sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_COMPLETED
+            ):
+                return sandbox
+            if (
+                target_phase == openshell_pb2.SANDBOX_PHASE_READY
+                and sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_STOPPED
+            ):
+                raise SandboxError(
+                    f"sandbox {sandbox_name} stopped before becoming ready"
+                )
             if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_ERROR:
                 raise SandboxError(f"sandbox {sandbox_name} entered error phase")
             time.sleep(1)
-        raise SandboxError(f"sandbox {sandbox_name} was not ready within timeout")
+        raise SandboxError(
+            f"sandbox {sandbox_name} was not {target_name} within timeout"
+        )
 
     def exec_stream(
         self,
@@ -479,6 +974,7 @@ class SandboxClient:
         env: Mapping[str, str] | None = None,
         stdin: bytes | None = None,
         timeout_seconds: int | None = None,
+        no_login_shell: bool = False,
     ) -> Iterator[ExecChunk | ExecResult]:
         if not command:
             raise SandboxError("command must not be empty")
@@ -490,6 +986,7 @@ class SandboxClient:
             environment=dict(env or {}),
             timeout_seconds=timeout_seconds or 0,
             stdin=stdin or b"",
+            no_login_shell=no_login_shell,
         )
         # Use whichever is larger: the default client timeout or the command
         # timeout plus headroom for SSH setup / teardown overhead.
@@ -534,6 +1031,7 @@ class SandboxClient:
         env: Mapping[str, str] | None = None,
         stdin: bytes | None = None,
         timeout_seconds: int | None = None,
+        no_login_shell: bool = False,
     ) -> ExecResult:
         result: ExecResult | None = None
         for item in self.exec_stream(
@@ -543,6 +1041,7 @@ class SandboxClient:
             env=env,
             stdin=stdin,
             timeout_seconds=timeout_seconds,
+            no_login_shell=no_login_shell,
         ):
             if stream_output and isinstance(item, ExecChunk):
                 if item.stream == "stdout":
@@ -585,15 +1084,135 @@ class SandboxClient:
         )
 
 
+class SandboxTemplateClient:
+    """gRPC client for reusable sandbox template lifecycle operations."""
+
+    def __init__(self, channel: grpc.Channel, *, timeout: float = 30.0) -> None:
+        self._stub = openshell_pb2_grpc.OpenShellStub(channel)
+        self._timeout = timeout
+
+    @classmethod
+    def from_sandbox_client(cls, client: SandboxClient) -> SandboxTemplateClient:
+        return client.sandbox_templates()
+
+    def create(
+        self,
+        *,
+        workspace: str,
+        template: openshell_pb2.SandboxWorkloadTemplate | None = None,
+        name: str | None = None,
+        image: str | None = None,
+        labels: Mapping[str, str] | None = None,
+        annotations: Mapping[str, str] | None = None,
+        environment: Mapping[str, str] | None = None,
+        cpu: str | None = None,
+        memory: str | None = None,
+        gpu_count: int | None = None,
+        gpu: bool = False,
+        driver_config: Mapping[str, Any] | None = None,
+    ) -> openshell_pb2.SandboxWorkloadTemplate:
+        if template is None:
+            if name is None or not name.strip():
+                raise SandboxError("name is required when template is omitted")
+            template = _sandbox_workload_template(
+                name=name,
+                image=image,
+                labels=labels,
+                annotations=annotations,
+                environment=environment,
+                cpu=cpu,
+                memory=memory,
+                gpu_count=gpu_count,
+                gpu=gpu,
+                driver_config=driver_config,
+            )
+        elif (
+            any(value is not None for value in (name, image, cpu, memory, gpu_count))
+            or any(
+                bool(value)
+                for value in (labels, annotations, environment, driver_config)
+            )
+            or gpu
+        ):
+            raise SandboxError(
+                "template cannot be combined with template builder fields"
+            )
+
+        response = self._stub.CreateSandboxTemplate(
+            openshell_pb2.CreateSandboxTemplateRequest(
+                workspace=workspace,
+                template=template,
+            ),
+            timeout=self._timeout,
+        )
+        return response.template
+
+    def get(
+        self,
+        name: str,
+        *,
+        workspace: str,
+    ) -> openshell_pb2.SandboxWorkloadTemplate:
+        response = self._stub.GetSandboxTemplate(
+            openshell_pb2.GetSandboxTemplateRequest(name=name, workspace=workspace),
+            timeout=self._timeout,
+        )
+        return response.template
+
+    def list(
+        self,
+        *,
+        workspace: str,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str = "",
+    ) -> builtins.list[openshell_pb2.SandboxWorkloadTemplate]:
+        response = self._stub.ListSandboxTemplates(
+            openshell_pb2.ListSandboxTemplatesRequest(
+                workspace=workspace,
+                limit=limit,
+                offset=offset,
+                label_selector=label_selector,
+            ),
+            timeout=self._timeout,
+        )
+        return list(response.templates)
+
+    def list_for_all_workspaces(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str = "",
+    ) -> builtins.list[openshell_pb2.SandboxWorkloadTemplate]:
+        response = self._stub.ListSandboxTemplates(
+            openshell_pb2.ListSandboxTemplatesRequest(
+                all_workspaces=True,
+                limit=limit,
+                offset=offset,
+                label_selector=label_selector,
+            ),
+            timeout=self._timeout,
+        )
+        return list(response.templates)
+
+    def delete(self, name: str, *, workspace: str) -> bool:
+        response = self._stub.DeleteSandboxTemplate(
+            openshell_pb2.DeleteSandboxTemplateRequest(name=name, workspace=workspace),
+            timeout=self._timeout,
+        )
+        return bool(response.deleted)
+
+
 @dataclass(frozen=True)
-class ClusterInferenceConfig:
+class InferenceRouteConfig:
     provider_name: str
     model_id: str
     version: int
 
 
 class InferenceRouteClient:
-    """gRPC client for cluster-level inference configuration."""
+    """gRPC client for workspace-scoped inference route configuration."""
 
     def __init__(self, channel: grpc.Channel, *, timeout: float = 30.0) -> None:
         self._stub = inference_pb2_grpc.InferenceStub(channel)
@@ -603,37 +1222,128 @@ class InferenceRouteClient:
     def from_sandbox_client(cls, client: SandboxClient) -> InferenceRouteClient:
         return cls(client._channel, timeout=client._timeout)
 
-    def set_cluster(
+    def set_route(
         self,
         *,
+        workspace: str,
         provider_name: str,
         model_id: str,
         no_verify: bool = False,
-    ) -> ClusterInferenceConfig:
-        response = self._stub.SetClusterInference(
-            inference_pb2.SetClusterInferenceRequest(
+    ) -> InferenceRouteConfig:
+        response = self._stub.SetInferenceRoute(
+            inference_pb2.SetInferenceRouteRequest(
+                workspace=workspace,
                 provider_name=provider_name,
                 model_id=model_id,
                 no_verify=no_verify,
             ),
             timeout=self._timeout,
         )
-        return ClusterInferenceConfig(
+        return InferenceRouteConfig(
             provider_name=response.provider_name,
             model_id=response.model_id,
             version=response.version,
         )
 
-    def get_cluster(self) -> ClusterInferenceConfig:
-        response = self._stub.GetClusterInference(
-            inference_pb2.GetClusterInferenceRequest(),
+    def get_route(self, *, workspace: str) -> InferenceRouteConfig:
+        response = self._stub.GetInferenceRoute(
+            inference_pb2.GetInferenceRouteRequest(workspace=workspace),
             timeout=self._timeout,
         )
-        return ClusterInferenceConfig(
+        return InferenceRouteConfig(
             provider_name=response.provider_name,
             model_id=response.model_id,
             version=response.version,
         )
+
+    def delete_route(
+        self,
+        *,
+        workspace: str,
+        route_name: str = "",
+    ) -> bool:
+        response = self._stub.DeleteInferenceRoute(
+            inference_pb2.DeleteInferenceRouteRequest(
+                workspace=workspace,
+                route_name=route_name,
+            ),
+            timeout=self._timeout,
+        )
+        return response.deleted
+
+
+@dataclass(frozen=True)
+class WorkspaceRef:
+    name: str
+    phase: str
+    labels: dict[str, str]
+
+
+def _workspace_ref(ws: datamodel_pb2.Workspace) -> WorkspaceRef:
+    meta = ws.metadata
+    return WorkspaceRef(
+        name=meta.name,
+        phase=datamodel_pb2.WorkspacePhase.Name(ws.status.phase),
+        labels=dict(meta.labels),
+    )
+
+
+class WorkspaceClient:
+    """gRPC client for workspace lifecycle operations."""
+
+    def __init__(self, channel: grpc.Channel, *, timeout: float = 30.0) -> None:
+        self._stub = openshell_pb2_grpc.OpenShellStub(channel)
+        self._timeout = timeout
+
+    @classmethod
+    def from_sandbox_client(cls, client: SandboxClient) -> WorkspaceClient:
+        return cls(client._channel, timeout=client._timeout)
+
+    def create(
+        self,
+        name: str,
+        *,
+        labels: Mapping[str, str] | None = None,
+    ) -> WorkspaceRef:
+        response = self._stub.CreateWorkspace(
+            openshell_pb2.CreateWorkspaceRequest(
+                name=name,
+                labels=dict(labels) if labels else {},
+            ),
+            timeout=self._timeout,
+        )
+        return _workspace_ref(response.workspace)
+
+    def get(self, name: str) -> WorkspaceRef:
+        response = self._stub.GetWorkspace(
+            openshell_pb2.GetWorkspaceRequest(name=name),
+            timeout=self._timeout,
+        )
+        return _workspace_ref(response.workspace)
+
+    def list(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str | None = None,
+    ) -> builtins.list[WorkspaceRef]:
+        response = self._stub.ListWorkspaces(
+            openshell_pb2.ListWorkspacesRequest(
+                limit=limit,
+                offset=offset,
+                label_selector=label_selector or "",
+            ),
+            timeout=self._timeout,
+        )
+        return [_workspace_ref(ws) for ws in response.workspaces]
+
+    def delete(self, name: str) -> bool:
+        response = self._stub.DeleteWorkspace(
+            openshell_pb2.DeleteWorkspaceRequest(name=name),
+            timeout=self._timeout,
+        )
+        return response.deleted
 
 
 class Sandbox:
@@ -642,34 +1352,46 @@ class Sandbox:
     def __init__(
         self,
         *,
+        workspace: str,
         cluster: str | None = None,
         sandbox: str | SandboxRef | None = None,
         delete_on_exit: bool = True,
         spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
+        template_name: str | None = None,
         timeout: float = 30.0,
         ready_timeout_seconds: float = 120.0,
         auto_refresh: bool = True,
         write_back: bool = True,
         insecure: bool = False,
+        client_credentials: ClientCredentialsAuth | None = None,
     ) -> None:
         """Bind a Sandbox context to the active gateway.
 
-        OIDC kwargs (`auto_refresh`, `write_back`, `insecure`) forward
+        OIDC kwargs (`auto_refresh`, `write_back`, `insecure`, and
+        `client_credentials`) forward
         directly to `SandboxClient.from_active_cluster` and have the
         same semantics. They're surfaced on `Sandbox` so callers using
         the higher-level wrapper get parity with `SandboxClient` for
         OIDC-protected gateways (e.g. passing `insecure=True` for a
         self-signed dev IdP). Non-OIDC gateways ignore them.
         """
+        self._workspace = workspace
         self._cluster = cluster
         self._sandbox_input = sandbox
         self._delete_on_exit = delete_on_exit
         self._spec = spec
+        self._name = name
+        # Copy so later caller mutation cannot change what gets sent on enter.
+        self._labels = dict(labels) if labels is not None else None
+        self._template_name = template_name
         self._timeout = timeout
         self._ready_timeout_seconds = ready_timeout_seconds
         self._auto_refresh = auto_refresh
         self._write_back = write_back
         self._insecure = insecure
+        self._client_credentials = client_credentials
         self._client: SandboxClient | None = None
         self._session: SandboxSession | None = None
 
@@ -686,24 +1408,54 @@ class Sandbox:
         return self._session.sandbox
 
     def __enter__(self) -> Sandbox:
+        # Creation metadata cannot be applied when attaching to an existing
+        # sandbox; reject it before opening a connection.
+        if self._sandbox_input is not None and (
+            self._name is not None
+            or self._labels is not None
+            or self._template_name is not None
+        ):
+            raise SandboxError(
+                "name, labels, and template_name cannot be set when attaching to an existing sandbox"
+            )
+
         client = SandboxClient.from_active_cluster(
             cluster=self._cluster,
             timeout=self._timeout,
             auto_refresh=self._auto_refresh,
             write_back=self._write_back,
             insecure=self._insecure,
+            client_credentials=self._client_credentials,
         )
         self._client = client
 
-        if self._sandbox_input is None:
-            self._session = client.create_session(spec=self._spec)
+        if self._sandbox_input is None and self._template_name is not None:
+            self._session = client.create_session_from_template(
+                workspace=self._workspace,
+                template_name=self._template_name,
+                spec=self._spec,
+                name=self._name,
+                labels=self._labels,
+            )
+        elif self._sandbox_input is None:
+            self._session = client.create_session(
+                workspace=self._workspace,
+                spec=self._spec,
+                name=self._name,
+                labels=self._labels,
+            )
         elif isinstance(self._sandbox_input, SandboxRef):
             self._session = SandboxSession(client, self._sandbox_input)
         else:
-            self._session = client.get_session(self._sandbox_input)
+            self._session = client.get_session(
+                self._sandbox_input, workspace=self._workspace
+            )
+
+        self._workspace = getattr(self._session, "_workspace", self._workspace)
 
         ready = client.wait_ready(
             self._session.sandbox.name,
+            workspace=self._workspace,
             timeout_seconds=self._ready_timeout_seconds,
         )
         self._session = SandboxSession(client, ready)
@@ -720,7 +1472,10 @@ class Sandbox:
                 try:
                     deleted = self._session.delete()
                     if deleted:
-                        self._client.wait_deleted(self._session.sandbox.name)
+                        self._client.wait_deleted(
+                            self._session.sandbox.name,
+                            workspace=self._workspace,
+                        )
                 except grpc.RpcError as exc:
                     if (
                         not isinstance(exc, grpc.Call)
@@ -742,6 +1497,7 @@ class Sandbox:
         env: Mapping[str, str] | None = None,
         stdin: bytes | None = None,
         timeout_seconds: int | None = None,
+        no_login_shell: bool = False,
     ) -> ExecResult:
         if self._session is None:
             raise SandboxError("sandbox context has not been entered")
@@ -752,6 +1508,7 @@ class Sandbox:
             env=env,
             stdin=stdin,
             timeout_seconds=timeout_seconds,
+            no_login_shell=no_login_shell,
         )
 
     def exec_python(
@@ -806,13 +1563,27 @@ def _serialize_python_callable(
 
 def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
     status = sandbox.status if sandbox.HasField("status") else None
+    provenance = (
+        SandboxWorkloadTemplateProvenanceRef(
+            name=sandbox.created_from_workload_template.name,
+            resource_version=sandbox.created_from_workload_template.resource_version,
+        )
+        if sandbox.HasField("created_from_workload_template")
+        else None
+    )
     return SandboxRef(
         id=sandbox.metadata.id if sandbox.metadata else "",
         name=sandbox.metadata.name if sandbox.metadata else "",
+        workspace=sandbox.metadata.workspace if sandbox.metadata else "",
         status=SandboxStatusRef(
             phase=status.phase if status else 0,
             current_policy_version=status.current_policy_version if status else 0,
+            exit_code=status.exit_code
+            if status is not None and status.HasField("exit_code")
+            else None,
         ),
+        labels=sandbox.metadata.labels if sandbox.metadata else {},
+        created_from_workload_template=provenance,
     )
 
 
@@ -823,6 +1594,50 @@ def _default_spec() -> openshell_pb2.SandboxSpec:
     # container image and ensures sandboxes get the full dev-sandbox-policy
     # (including network_policies) out of the box.
     return openshell_pb2.SandboxSpec()
+
+
+def _sandbox_workload_template(
+    *,
+    name: str,
+    image: str | None = None,
+    labels: Mapping[str, str] | None = None,
+    annotations: Mapping[str, str] | None = None,
+    environment: Mapping[str, str] | None = None,
+    cpu: str | None = None,
+    memory: str | None = None,
+    gpu_count: int | None = None,
+    gpu: bool = False,
+    driver_config: Mapping[str, Any] | None = None,
+) -> openshell_pb2.SandboxWorkloadTemplate:
+    if gpu_count is not None and gpu_count <= 0:
+        raise SandboxError("gpu_count must be greater than zero")
+
+    template = openshell_pb2.SandboxWorkloadTemplate()
+    template.metadata.name = name
+    # The gateway permits an empty workload so it can apply the default image
+    # at sandbox create time, but the workload message itself is required.
+    template.spec.workload.SetInParent()
+    if labels:
+        template.metadata.labels.update(dict(labels))
+    if annotations:
+        template.metadata.annotations.update(dict(annotations))
+
+    if image is not None:
+        template.spec.workload.image = image
+    if environment:
+        template.spec.workload.environment.update(dict(environment))
+    if cpu is not None:
+        template.spec.workload.resources.cpu = cpu
+    if memory is not None:
+        template.spec.workload.resources.memory = memory
+    if gpu or gpu_count is not None:
+        template.spec.workload.resources.gpu.SetInParent()
+    if gpu_count is not None:
+        template.spec.workload.resources.gpu.count = gpu_count
+    if driver_config:
+        template.spec.driver_config.update(dict(driver_config))
+
+    return template
 
 
 def _xdg_config_home() -> pathlib.Path:
@@ -836,6 +1651,40 @@ def _xdg_config_home() -> pathlib.Path:
 # stated expiry, to leave room for in-flight RPCs and clock skew. This
 # matches `openshell-bootstrap::oidc_token::is_token_expired`.
 _OIDC_TOKEN_EXPIRY_GRACE_SECONDS = 30
+
+_IS_WINDOWS = os.name == "nt"
+_WINDOWS_REPLACE_RETRYABLE_ERRORS = frozenset({5, 32})
+_WINDOWS_REPLACE_TIMEOUT_SECONDS = 0.25
+_WINDOWS_REPLACE_INITIAL_DELAY_SECONDS = 0.005
+_WINDOWS_REPLACE_MAX_DELAY_SECONDS = 0.05
+_WINDOWS_REPLACE_LOCK = threading.Lock()
+
+
+def _atomic_replace(source: pathlib.Path, destination: pathlib.Path) -> None:
+    """Atomically replace a file, retrying transient Windows sharing errors."""
+    if not _IS_WINDOWS:
+        source.replace(destination)
+        return
+
+    # Serialize writers in this process. The retry still handles other
+    # processes (including the Rust CLI) and filesystem scanners that briefly
+    # open the destination without delete sharing.
+    with _WINDOWS_REPLACE_LOCK:
+        deadline = time.monotonic() + _WINDOWS_REPLACE_TIMEOUT_SECONDS
+        delay = _WINDOWS_REPLACE_INITIAL_DELAY_SECONDS
+        while True:
+            try:
+                source.replace(destination)
+                return
+            except PermissionError as error:
+                winerror = getattr(error, "winerror", None)
+                retryable = winerror in _WINDOWS_REPLACE_RETRYABLE_ERRORS or (
+                    winerror is None and error.errno == errno.EACCES
+                )
+                if not retryable or time.monotonic() >= deadline:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, _WINDOWS_REPLACE_MAX_DELAY_SECONDS)
 
 
 def _read_oidc_token_bundle(gateway_dir: pathlib.Path) -> dict | None:
@@ -1303,7 +2152,7 @@ class _OidcRefresher:
                 f.write(payload)
             with contextlib.suppress(OSError):
                 tmp_path.chmod(0o600)
-            tmp_path.replace(path)
+            _atomic_replace(tmp_path, path)
         except BaseException:
             # Clean up our tmp on failure so we don't leave orphaned
             # `.oidc_token.<rand>.tmp` files lying around. The replace

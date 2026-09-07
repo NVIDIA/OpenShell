@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+display_name: Slack
+description: Read-only Slack Web API access for governed sandbox agents
+category: messaging
+credentials:
+  - name: api_token
+    description: Slack bot or user token
+    env_vars: [SLACK_BOT_TOKEN, SLACK_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_token]
+endpoints:
+  - host: slack.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow:
+          method: GET
+          path: /api/team.info
+      - allow:
+          method: GET
+          path: /api/users.info
+      - allow:
+          method: GET
+          path: /api/conversations.info
+      - allow:
+          method: GET
+          path: /api/conversations.history
+binaries:
+  - /usr/bin/curl
+  - /usr/local/bin/curl

@@ -5,10 +5,7 @@
 
 ["markdown:deps"]
 description = "Install Node deps for markdown/mermaid linting from lockfile"
-run = """
-cd scripts/lint-mermaid
-npm ci --no-audit --no-fund --silent
-"""
+run = "npm --prefix scripts/lint-mermaid ci --no-audit --no-fund --silent"
 hide = true
 sources = ["scripts/lint-mermaid/package.json", "scripts/lint-mermaid/package-lock.json"]
 outputs = ["scripts/lint-mermaid/node_modules/.package-lock.json"]

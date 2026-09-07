@@ -28,7 +28,7 @@ if [[ -z "${OPENSHELL_BIN:-}" ]]; then
 fi
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
-SANDBOX="${SANDBOX:-mechanistic-smoke-${RUN_ID}}"
+SANDBOX="${SANDBOX:-ms-${RUN_ID}}"
 KEEP_SANDBOX="${KEEP_SANDBOX:-0}"
 # Allow override so CI can set a shorter interval via OPENSHELL_DENIAL_FLUSH_INTERVAL_SECS.
 FLUSH_WAIT="${FLUSH_WAIT:-15}"
@@ -76,10 +76,10 @@ create_sandbox() {
     "$OPENSHELL_BIN" sandbox delete "$SANDBOX" >/dev/null 2>&1 || true
     "$OPENSHELL_BIN" sandbox create \
         --name "$SANDBOX" \
+        --detach \
         --no-auto-providers \
         --no-tty \
-        --keep \
-        -- bash -lc "echo sandbox ready" \
+        -- sh -c "exec sleep infinity" \
         | sed 's/^/  /'
 
     "$OPENSHELL_BIN" sandbox ssh-config "$SANDBOX" > "$SSH_CONFIG"
@@ -102,14 +102,20 @@ trigger_l4_deny() {
 }
 
 assert_pending_chunk() {
-    step "Waiting ${FLUSH_WAIT}s then checking for pending chunk"
-    sleep "$FLUSH_WAIT"
-    local output
-    output="$("$OPENSHELL_BIN" rule get "$SANDBOX" --status pending 2>&1)"
+    step "Waiting up to ${FLUSH_WAIT}s for pending chunk"
+    local output=""
+    local _i
+    for _i in $(seq 1 "$FLUSH_WAIT"); do
+        output="$("$OPENSHELL_BIN" rule get "$SANDBOX" --status pending 2>&1)"
+        if printf '%s\n' "$output" | grep -qi "blocked.invalid"; then
+            printf '%s\n' "$output" | sed 's/^/  /'
+            ok "pending mechanistic chunk present for blocked.invalid"
+            return
+        fi
+        sleep 1
+    done
     printf '%s\n' "$output" | sed 's/^/  /'
-    printf '%s\n' "$output" | grep -qi "blocked.invalid" \
-        || fail "no pending chunk for blocked.invalid"
-    ok "pending mechanistic chunk present for blocked.invalid"
+    fail "no pending chunk for blocked.invalid after ${FLUSH_WAIT}s"
 }
 
 main() {

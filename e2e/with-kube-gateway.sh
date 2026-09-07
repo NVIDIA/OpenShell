@@ -39,6 +39,13 @@
 #   PostgreSQL Deployment and a matching Secret with a `uri` key before
 #   installing OpenShell. This is used by HA CI so the gateway can run multiple
 #   replicas without requiring the OpenShell chart to own a database.
+#
+# Credential-driver fixture:
+#   Set OPENSHELL_E2E_CREDENTIAL_DRIVERS=1 to enable one credential storage
+#   backend. Set OPENSHELL_E2E_CREDENTIAL_DRIVER to `kubernetes-secrets` or
+#   `vault`; the Rust `credential_drivers` e2e test validates the active
+#   backend. Vault mode installs a dev OpenBao fixture because it exposes the
+#   Vault-compatible API used by the driver.
 
 set -euo pipefail
 
@@ -80,6 +87,13 @@ EXTERNAL_PG_FIXTURE_SERVICE="openshell-e2e-postgres"
 EXTERNAL_PG_FIXTURE_USER="openshell"
 EXTERNAL_PG_FIXTURE_PASSWORD="openshell-e2e-postgres"
 EXTERNAL_PG_FIXTURE_DATABASE="openshell"
+VAULT_FIXTURE_DEPLOYED=0
+VAULT_NAMESPACE="${OPENSHELL_E2E_VAULT_NAMESPACE:-openbao}"
+VAULT_RELEASE_NAME="${OPENSHELL_E2E_VAULT_RELEASE_NAME:-openbao}"
+VAULT_CHART_VERSION="${OPENSHELL_E2E_OPENBAO_CHART_VERSION:-0.28.3}"
+VAULT_DEV_ROOT_TOKEN="${OPENSHELL_E2E_VAULT_DEV_ROOT_TOKEN:-root}"
+CORPORATE_PROXY_FIXTURE_DEPLOYED=0
+CORPORATE_PROXY_FIXTURE_SECRET="openshell-e2e-proxy-auth"
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -89,30 +103,26 @@ kctl() {
   kubectl --context "${KUBE_CONTEXT}" "$@"
 }
 
-wait_for_agent_sandbox_crd() {
-  local deadline
-  local established
-
-  deadline=$(( $(date +%s) + 120 ))
-  while [ "$(date +%s)" -lt "${deadline}" ]; do
-    if kctl get crd/sandboxes.agents.x-k8s.io >/dev/null 2>&1; then
-      established="$(kctl get crd/sandboxes.agents.x-k8s.io \
-        -o 'jsonpath={.status.conditions[?(@.type=="Established")].status}' \
-        2>/dev/null || true)"
-      if [ "${established}" = "True" ]; then
-        return 0
-      fi
-    fi
-    sleep 2
-  done
-
-  echo "Timed out waiting for agent-sandbox Sandbox CRD to become Established" >&2
-  kctl get crd/sandboxes.agents.x-k8s.io -o yaml >&2 || true
-  return 1
-}
-
 helmctl() {
   helm --kube-context "${KUBE_CONTEXT}" "$@"
+}
+
+# Return the resource reference for the gateway workload installed by the chart.
+# SQLite releases use a StatefulSet; external-database releases may use a Deployment.
+kube_workload_ref() {
+  local name="$1"
+  local namespace="${2:-${NAMESPACE}}"
+  local resource
+
+  for resource in "statefulset/${name}" "deployment/${name}"; do
+    if kctl -n "${namespace}" get "${resource}" >/dev/null 2>&1; then
+      printf '%s\n' "${resource}"
+      return 0
+    fi
+  done
+
+  echo "ERROR: gateway workload ${name} was not found in namespace ${namespace}" >&2
+  return 1
 }
 
 deploy_postgres_fixture() {
@@ -150,6 +160,47 @@ cleanup_postgres_fixture() {
 
   EXTERNAL_PG_FIXTURE_DEPLOYED=0
   EXTERNAL_PG_FIXTURE_SECRET=""
+}
+
+deploy_vault_fixture() {
+  echo "Deploying OpenBao fixture for Vault credential-driver validation..."
+
+  helmctl repo add openbao https://openbao.github.io/openbao-helm \
+    >/dev/null 2>&1 || true
+  helmctl repo update openbao >/dev/null
+  helmctl upgrade --install "${VAULT_RELEASE_NAME}" openbao/openbao \
+    --namespace "${VAULT_NAMESPACE}" --create-namespace \
+    --version "${VAULT_CHART_VERSION}" \
+    --set "server.dev.enabled=true" \
+    --set "server.dev.devRootToken=${VAULT_DEV_ROOT_TOKEN}" \
+    --set "injector.enabled=false" \
+    --wait --timeout 5m
+  VAULT_FIXTURE_DEPLOYED=1
+
+  kctl -n "${VAULT_NAMESPACE}" wait \
+    --for=condition=Ready pod \
+    -l "app.kubernetes.io/name=openbao,component=server" \
+    --timeout=300s
+
+  export OPENSHELL_E2E_VAULT_NAMESPACE="${VAULT_NAMESPACE}"
+  export OPENSHELL_E2E_VAULT_POD="${VAULT_RELEASE_NAME}-0"
+  export OPENSHELL_E2E_VAULT_TOKEN="${VAULT_DEV_ROOT_TOKEN}"
+}
+
+cleanup_vault_fixture() {
+  [ -n "${KUBE_CONTEXT}" ] || return 0
+  [ -n "${VAULT_NAMESPACE}" ] || return 0
+
+  if command -v helm >/dev/null 2>&1; then
+    helmctl uninstall "${VAULT_RELEASE_NAME}" \
+      --namespace "${VAULT_NAMESPACE}" --wait --timeout 60s \
+      >/dev/null 2>&1 || true
+  fi
+  if command -v kubectl >/dev/null 2>&1; then
+    kctl delete namespace "${VAULT_NAMESPACE}" --wait=true --timeout=60s \
+      --ignore-not-found >/dev/null 2>&1 || true
+  fi
+  VAULT_FIXTURE_DEPLOYED=0
 }
 
 cleanup() {
@@ -193,6 +244,31 @@ cleanup() {
 
   if [ "${EXTERNAL_PG_FIXTURE_DEPLOYED}" = "1" ]; then
     cleanup_postgres_fixture "${EXTERNAL_PG_FIXTURE_SECRET}"
+  fi
+
+  if [ "${VAULT_FIXTURE_DEPLOYED}" = "1" ]; then
+    cleanup_vault_fixture
+  fi
+
+  if [ "${CORPORATE_PROXY_FIXTURE_DEPLOYED}" = "1" ]; then
+    kctl -n "${NAMESPACE}" delete secret "${CORPORATE_PROXY_FIXTURE_SECRET}" \
+      --ignore-not-found >/dev/null 2>&1 || true
+  fi
+
+  # Sweep managed-mode and operator-mode workspace namespaces before
+  # uninstalling the Helm release (ClusterRole still needed for deletion).
+  if command -v kubectl >/dev/null 2>&1 && [ -n "${KUBE_CONTEXT}" ]; then
+    for label in "openshell.ai/managed-by=openshell" \
+                 "openshell.ai/e2e-operator-workspace=true"; do
+      ns_list="$(kctl get namespaces -l "${label}" -o name 2>/dev/null || true)"
+      if [ -n "${ns_list}" ]; then
+        echo "Cleaning up namespaces with label ${label}..."
+        echo "${ns_list}" | while read -r ns_ref; do
+          kctl delete "${ns_ref}" --wait=false --ignore-not-found \
+            2>/dev/null || true
+        done
+      fi
+    done
   fi
 
   if [ "${HELM_INSTALLED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ]; then
@@ -282,6 +358,7 @@ run_scenario() {
     --set "image.tag=${IMAGE_TAG_VALUE}" \
     --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
     --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
+    "${helm_post_renderer_args[@]}" \
     "$@" \
     --wait --timeout 5m
   HELM_INSTALLED=1
@@ -320,8 +397,10 @@ run_scenario() {
   fi
 
   HEALTH_LOCAL_PORT="$(e2e_pick_port)"
-  echo "Starting kubectl port-forward sts/${RELEASE_NAME} ${HEALTH_LOCAL_PORT}:health..."
-  kctl -n "${NAMESPACE}" port-forward "sts/${RELEASE_NAME}" \
+  local workload_ref
+  workload_ref="$(kube_workload_ref "${RELEASE_NAME}")"
+  echo "Starting kubectl port-forward ${workload_ref} ${HEALTH_LOCAL_PORT}:health..."
+  kctl -n "${NAMESPACE}" port-forward "${workload_ref}" \
     "${HEALTH_LOCAL_PORT}:health" >"${PORTFORWARD_HEALTH_LOG}" 2>&1 &
   PORTFORWARD_HEALTH_PID=$!
 
@@ -364,6 +443,12 @@ run_scenario() {
 
   export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
   export OPENSHELL_E2E_DRIVER="kubernetes"
+  # Kubernetes e2e runs against k3d/kind-style Docker-backed clusters. Host
+  # fixture containers must use the same Docker host so published ports and
+  # cluster host-gateway aliases line up even on machines where Podman is also
+  # installed.
+  export CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
+  export OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
 
@@ -391,6 +476,21 @@ require_cmd() {
     echo "ERROR: $1 is required to run Helm-backed e2e tests" >&2
     exit 2
   fi
+}
+
+configure_fixture_container_engine() {
+  [ -n "${CONTAINER_ENGINE:-}" ] || return 0
+  local selected_engine
+  selected_engine="$(printf '%s' "${CONTAINER_ENGINE}" | tr '[:upper:]' '[:lower:]')"
+  case "${selected_engine}" in
+    docker|podman)
+      ;;
+    *)
+      echo "ERROR: CONTAINER_ENGINE=${CONTAINER_ENGINE} is invalid; expected docker or podman" >&2
+      exit 2
+      ;;
+  esac
+  export CONTAINER_ENGINE="${selected_engine}"
 }
 
 require_cmd helm
@@ -423,6 +523,8 @@ else
   KUBE_CONTEXT="k3d-${CLUSTER_NAME}"
 fi
 
+configure_fixture_container_engine
+
 if [ -z "${OPENSHELL_E2E_KUBE_BUILD_IMAGES+x}" ]; then
   if [ "${CLUSTER_CREATED_BY_US}" = "1" ]; then
     OPENSHELL_E2E_KUBE_BUILD_IMAGES=1
@@ -431,6 +533,7 @@ if [ -z "${OPENSHELL_E2E_KUBE_BUILD_IMAGES+x}" ]; then
   fi
 fi
 
+reuse_supervisor_image=0
 if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
   REGISTRY_VALUE="${OPENSHELL_REGISTRY:-openshell}"
   IMAGE_TAG_VALUE="${IMAGE_TAG:-e2e-${CLUSTER_NAME:-local}}"
@@ -501,7 +604,7 @@ if [ -z "${HOST_GATEWAY_IP}" ] \
     # is unreachable for the typical test-host listener (0.0.0.0 bind).
     detected="$(docker network inspect "${net}" \
       -f '{{range .IPAM.Config}}{{.Gateway}}{{"\n"}}{{end}}' 2>/dev/null \
-      | awk '/^[0-9.]+$/ { print; exit }')"
+      | awk '/^[0-9.]+$/ { print; exit }' || true)"
     if [ -n "${detected}" ]; then
       HOST_GATEWAY_IP="${detected}"
       echo "Detected host gateway IP ${HOST_GATEWAY_IP} from docker network '${net}'."
@@ -532,10 +635,51 @@ fi
 if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
   require_cmd docker
   echo "Building local Kubernetes e2e images (${REGISTRY_VALUE}/{gateway,supervisor}:${IMAGE_TAG_VALUE})..."
-  CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
-    bash "${ROOT}/tasks/scripts/docker-build-image.sh" gateway
-  CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
-    bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor
+  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+    if [ "$(uname -s)" != "Linux" ]; then
+      echo "ERROR: external Kubernetes driver image composition currently requires a Linux build host." >&2
+      exit 2
+    fi
+    external_gateway="${OPENSHELL_GATEWAY_BIN:-${ROOT}/target/debug/openshell-gateway}"
+    external_driver="${OPENSHELL_EXTERNAL_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-kubernetes}"
+    # The test image uses a distroless runtime, so keep Z3 self-contained just
+    # like the production gateway image artifact. A host-linked debug binary
+    # would otherwise require libz3.so from the CI build machine at runtime.
+    if [ -z "${OPENSHELL_GATEWAY_BIN:-}" ]; then
+      cargo build -p openshell-gateway --bin openshell-gateway \
+        --no-default-features --features telemetry,bundled-z3
+    fi
+    if [ -z "${OPENSHELL_EXTERNAL_DRIVER_BIN:-}" ]; then
+      cargo build -p openshell-driver-kubernetes --bin openshell-driver-kubernetes
+    fi
+    case "$(uname -m)" in
+      x86_64) external_arch=amd64 ;;
+      aarch64|arm64) external_arch=arm64 ;;
+      *) echo "ERROR: unsupported external Kubernetes driver architecture: $(uname -m)" >&2; exit 2 ;;
+    esac
+    external_stage="${ROOT}/deploy/docker/.build/prebuilt-binaries/${external_arch}"
+    mkdir -p "${external_stage}"
+    cp "${external_gateway}" "${external_stage}/openshell-gateway"
+    cp "${external_driver}" "${external_stage}/openshell-driver-kubernetes"
+    docker build \
+      --build-arg "TARGETARCH=${external_arch}" \
+      --build-arg "SUPERVISOR_IMAGE=${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}" \
+      --tag "${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}" \
+      --file "${ROOT}/e2e/docker/Dockerfile.external-kubernetes-gateway" \
+      "${ROOT}"
+  else
+    CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
+      bash "${ROOT}/tasks/scripts/docker-build-image.sh" gateway
+  fi
+  supervisor_image="${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}"
+  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" != "1" ] \
+     || ! docker image inspect "${supervisor_image}" >/dev/null 2>&1; then
+    CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
+      bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor
+  else
+    reuse_supervisor_image=1
+    echo "Reusing existing supervisor image ${supervisor_image}"
+  fi
 fi
 
 if [ -n "${import_cluster_name}" ]; then
@@ -548,23 +692,111 @@ if [ -n "${import_cluster_name}" ]; then
         --mode direct >/dev/null
     fi
   done
+elif [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ] \
+   && [[ "${KUBE_CONTEXT}" == kind-* ]] \
+   && command -v kind >/dev/null 2>&1; then
+  kind_cluster_name="${KUBE_CONTEXT#kind-}"
+  kind_images=("${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}")
+  # The CI workflow loads its published supervisor archive before invoking this
+  # wrapper. Only load a supervisor image here when this script rebuilt it.
+  if [ "${reuse_supervisor_image}" != "1" ]; then
+    kind_images+=("${REGISTRY_VALUE}/supervisor:${IMAGE_TAG_VALUE}")
+  fi
+  for image in "${kind_images[@]}"; do
+    echo "Loading ${image} into kind cluster ${kind_cluster_name}..."
+    kind load docker-image "${image}" --name "${kind_cluster_name}"
+  done
 fi
 
 # The Kubernetes compute driver creates and watches Sandbox CRs reconciled
 # by the upstream agent-sandbox-controller. Without the CRD + controller,
 # every gateway K8s call 404s and CreateSandbox never produces a Pod.
-echo "Installing agent-sandbox CRDs and controller (${AGENT_SANDBOX_VERSION})..."
-_agent_sandbox_base="https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}"
-kctl apply -f "${_agent_sandbox_base}/manifest.yaml"
-wait_for_agent_sandbox_crd
-kctl -n agent-sandbox-system rollout status deployment/agent-sandbox-controller --timeout=300s
+AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION}" \
+  bash "${ROOT}/e2e/support/install-agent-sandbox.sh" --context "${KUBE_CONTEXT}"
+
+ACTIVE_CREDENTIAL_DRIVER="${OPENSHELL_E2E_CREDENTIAL_DRIVER:-kubernetes-secrets}"
+if [ "${OPENSHELL_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ] \
+   && [ "${ACTIVE_CREDENTIAL_DRIVER}" = "vault" ]; then
+  deploy_vault_fixture
+fi
 
 helm_extra_args=()
+helm_post_renderer_args=()
+helm_extra_args+=(--set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}")
+if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+  if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" != "1" ]; then
+    echo "ERROR: external Kubernetes driver e2e requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=1." >&2
+    exit 2
+  fi
+  export HELM_PLUGINS="${ROOT}/e2e/helm-plugins"
+  helm_post_renderer_args+=(
+    --post-renderer openshell-external-compute-driver
+  )
+fi
 if [ -n "${HOST_GATEWAY_IP}" ]; then
   helm_extra_args+=(--set "server.hostGatewayIP=${HOST_GATEWAY_IP}")
 fi
 
 helm_values_args=(--values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml")
+if [ "${OPENSHELL_E2E_KUBE_CORPORATE_PROXY:-0}" = "1" ]; then
+  if [ -z "${HOST_GATEWAY_IP}" ]; then
+    echo "ERROR: corporate proxy e2e requires a host gateway IP for host.openshell.internal" >&2
+    exit 2
+  fi
+  CORPORATE_PROXY_PORT="$(e2e_pick_port)"
+  CORPORATE_PROXY_MODE="${OPENSHELL_E2E_KUBE_CORPORATE_PROXY_MODE:-authenticated}"
+  CORPORATE_PROXY_UPSTREAM_PORT=""
+  if [ "${CORPORATE_PROXY_MODE}" = "missing-secret" ] || [ "${CORPORATE_PROXY_MODE}" = "malformed" ]; then
+    export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-45}"
+  fi
+  CORPORATE_PROXY_VALUES="${WORKDIR}/corporate-proxy-values.yaml"
+  cat >"${CORPORATE_PROXY_VALUES}" <<EOF
+upstreamProxy:
+  url: http://host.openshell.internal:${CORPORATE_PROXY_PORT}
+EOF
+  if [ "${CORPORATE_PROXY_MODE}" = "no-proxy" ]; then
+    CORPORATE_PROXY_UPSTREAM_PORT="$(e2e_pick_port)"
+    cat >>"${CORPORATE_PROXY_VALUES}" <<EOF
+  noProxy: host.openshell.internal
+EOF
+  fi
+  case "${CORPORATE_PROXY_MODE}" in
+    authenticated|no-proxy)
+      kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
+      kctl -n "${NAMESPACE}" create secret generic "${CORPORATE_PROXY_FIXTURE_SECRET}" \
+        --from-literal=proxy-auth=proxyuser:proxypass --dry-run=client -o yaml | kctl apply -f -
+      CORPORATE_PROXY_FIXTURE_DEPLOYED=1
+      ;;
+    malformed)
+      kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
+      kctl -n "${NAMESPACE}" create secret generic "${CORPORATE_PROXY_FIXTURE_SECRET}" \
+        --from-literal=proxy-auth=malformed --dry-run=client -o yaml | kctl apply -f -
+      CORPORATE_PROXY_FIXTURE_DEPLOYED=1
+      ;;
+    missing-secret) ;;
+    *) echo "ERROR: unknown corporate proxy e2e mode '${CORPORATE_PROXY_MODE}'" >&2; exit 2 ;;
+  esac
+  export OPENSHELL_E2E_CORPORATE_PROXY_PORT="${CORPORATE_PROXY_PORT}"
+  export OPENSHELL_E2E_CORPORATE_PROXY_UPSTREAM_PORT="${CORPORATE_PROXY_UPSTREAM_PORT}"
+  export OPENSHELL_E2E_CORPORATE_PROXY_MODE="${CORPORATE_PROXY_MODE}"
+  helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-corporate-proxy-e2e.yaml")
+  helm_values_args+=(--values "${CORPORATE_PROXY_VALUES}")
+fi
+if [ "${OPENSHELL_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ]; then
+  case "${ACTIVE_CREDENTIAL_DRIVER}" in
+    kubernetes-secrets)
+      helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-credential-driver-kubernetes-secrets.yaml")
+      ;;
+    vault)
+      helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-credential-driver-vault.yaml")
+      ;;
+    *)
+      echo "ERROR: OPENSHELL_E2E_CREDENTIAL_DRIVER must be kubernetes-secrets or vault, got '${ACTIVE_CREDENTIAL_DRIVER}'" >&2
+      exit 2
+      ;;
+  esac
+  export OPENSHELL_E2E_CREDENTIAL_DRIVER="${ACTIVE_CREDENTIAL_DRIVER}"
+fi
 if [ -n "${OPENSHELL_E2E_KUBE_EXTRA_VALUES:-}" ]; then
   IFS=':' read -r -a extra_values_files <<< "${OPENSHELL_E2E_KUBE_EXTRA_VALUES}"
   for values_file in "${extra_values_files[@]}"; do
@@ -622,8 +854,17 @@ else
     --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
     --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
     "${helm_extra_args[@]}" \
+    "${helm_post_renderer_args[@]}" \
     --wait --timeout 5m
   HELM_INSTALLED=1
+
+  if [ -n "${OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET:-}" ]; then
+    kctl -n "${NAMESPACE}" create secret docker-registry \
+      "${OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET}" \
+      --docker-server=registry.example.test \
+      --docker-username=e2e-user \
+      --docker-password=e2e-password
+  fi
 
   LOCAL_PORT="$(e2e_pick_port)"
   echo "Starting kubectl port-forward svc/openshell ${LOCAL_PORT}:8080..."
@@ -652,8 +893,9 @@ else
   fi
 
   HEALTH_LOCAL_PORT="$(e2e_pick_port)"
-  echo "Starting kubectl port-forward sts/${RELEASE_NAME} ${HEALTH_LOCAL_PORT}:health..."
-  kctl -n "${NAMESPACE}" port-forward "sts/${RELEASE_NAME}" \
+  WORKLOAD_REF="$(kube_workload_ref "${RELEASE_NAME}")"
+  echo "Starting kubectl port-forward ${WORKLOAD_REF} ${HEALTH_LOCAL_PORT}:health..."
+  kctl -n "${NAMESPACE}" port-forward "${WORKLOAD_REF}" \
     "${HEALTH_LOCAL_PORT}:health" >"${PORTFORWARD_HEALTH_LOG}" 2>&1 &
   PORTFORWARD_HEALTH_PID=$!
 
@@ -689,6 +931,12 @@ else
 
   export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
   export OPENSHELL_E2E_DRIVER="kubernetes"
+  # Kubernetes e2e runs against k3d/kind-style Docker-backed clusters. Host
+  # fixture containers must use the same Docker host so published ports and
+  # cluster host-gateway aliases line up even on machines where Podman is also
+  # installed.
+  export CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
+  export OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
 

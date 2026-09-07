@@ -24,7 +24,6 @@ request.
 - SPIRE enabled for provider token grants.
 - OpenShell configured with the Kubernetes ServiceAccount supervisor bootstrap
   path. Gateway end-user OIDC is not required for this demo.
-- `providers_v2_enabled=true` on the target gateway.
 
 For the Helm dev environment, deploy with the SPIRE releases and
 `ci/values-spire.yaml` enabled in `deploy/helm/openshell/skaffold.yaml`.
@@ -60,9 +59,6 @@ Then run:
 export XDG_CONFIG_HOME="$(mktemp -d)"
 export GATEWAY=http://127.0.0.1:8097
 
-openshell --gateway-endpoint "$GATEWAY" settings set \
-  --global --key providers_v2_enabled --value true --yes
-
 openshell --gateway-endpoint "$GATEWAY" provider profile import \
   -f examples/spiffe-token-grant-demo/provider-profile.yaml
 
@@ -74,7 +70,6 @@ openshell --gateway-endpoint "$GATEWAY" provider create \
 openshell --gateway-endpoint "$GATEWAY" sandbox create \
   --name spiffe-token-demo \
   --provider spiffe-token-demo \
-  --keep \
   --no-tty \
   -- echo "sandbox ready"
 

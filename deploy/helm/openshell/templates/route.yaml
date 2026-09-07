@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if .Values.openshiftRoute.enabled }}
+{{- if .Values.server.disableTls }}
+{{- fail "openshiftRoute.enabled=true requires TLS (server.disableTls must be false) \u2014 a passthrough Route forwards encrypted traffic by SNI, so the gateway must terminate its own TLS." }}
+{{- end }}
+{{- if and .Values.certManager.serverIssuerRef.name (not .Values.openshiftRoute.host) }}
+{{- fail "openshiftRoute.enabled=true with certManager.serverIssuerRef requires an explicit openshiftRoute.host \u2014 without one, OpenShift generates a hostname absent from certManager.serverDnsNames, causing the gateway to serve its internal certificate to external clients." }}
+{{- end }}
+{{- if and .Values.openshiftRoute.host .Values.certManager.serverIssuerRef.name .Values.certManager.serverDnsNames }}
+{{- $routeHost := .Values.openshiftRoute.host }}
+{{- $hostCovered := false }}
+{{- range .Values.certManager.serverDnsNames }}
+  {{- if eq . $routeHost }}
+    {{- $hostCovered = true }}
+  {{- else if hasPrefix "*." . }}
+    {{- $wildcardSuffix := trimPrefix "*" . }}
+    {{- $prefix := trimSuffix $wildcardSuffix $routeHost }}
+    {{- if and (ne $prefix $routeHost) (gt (len $prefix) 0) (not (contains "." $prefix)) }}
+      {{- $hostCovered = true }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+{{- if not $hostCovered }}
+{{- fail (printf "openshiftRoute.host %q is not covered by certManager.serverDnsNames %v \u2014 the Route will forward SNI for a hostname the external certificate does not cover, causing TLS verification failures for CLI clients. Exact names and single-level wildcards (e.g. *.example.com) are checked." $routeHost .Values.certManager.serverDnsNames) }}
+{{- end }}
+{{- end }}
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ include "openshell.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+  {{- with .Values.openshiftRoute.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.openshiftRoute.host }}
+  host: {{ .Values.openshiftRoute.host | quote }}
+  {{- end }}
+  to:
+    kind: Service
+    name: {{ include "openshell.fullname" . }}
+  port:
+    targetPort: grpc
+  tls:
+    termination: passthrough
+  wildcardPolicy: None
+{{- end }}

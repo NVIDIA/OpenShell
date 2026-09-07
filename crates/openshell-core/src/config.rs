@@ -4,15 +4,10 @@
 //! Configuration management for `OpenShell` components.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::fmt;
-#[cfg(unix)]
-use std::io::{Read, Write};
 use std::net::SocketAddr;
-#[cfg(unix)]
-use std::os::unix::fs::FileTypeExt;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -28,47 +23,94 @@ pub const DEFAULT_SSH_PORT: u16 = 2222;
 /// Default gateway server port.
 pub const DEFAULT_SERVER_PORT: u16 = 17670;
 
+/// Default operator-facing name for a gateway installation.
+pub const DEFAULT_GATEWAY_NAME: &str = "openshell";
+
 /// Default container stop timeout in seconds (SIGTERM → SIGKILL).
 pub const DEFAULT_STOP_TIMEOUT_SECS: u32 = 10;
-
-/// Default Docker bridge network name for local sandboxes.
-pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 
 /// Default domain used for browser-facing sandbox service URLs.
 pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
 
-/// Default OCI image for the openshell-sandbox supervisor binary.
-pub const DEFAULT_SUPERVISOR_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:latest";
+/// Gateway posture when a sandbox rejects a candidate policy generation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyValidationFailureMode {
+    /// Deactivate the previous policy and deny new egress until a valid
+    /// generation is loaded.
+    #[default]
+    FailClosed,
+    /// Keep the last valid generation active when a newer candidate fails
+    /// validation. Startup still fails closed when no valid generation exists.
+    RetainLastValid,
+}
+
+impl PolicyValidationFailureMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FailClosed => "fail_closed",
+            Self::RetainLastValid => "retain_last_valid",
+        }
+    }
+}
+
+impl FromStr for PolicyValidationFailureMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "fail_closed" => Ok(Self::FailClosed),
+            "retain_last_valid" => Ok(Self::RetainLastValid),
+            _ => Err(format!(
+                "invalid policy validation failure mode '{value}'; expected fail_closed or retain_last_valid"
+            )),
+        }
+    }
+}
+
+/// Default OCI repository for the supervisor image (no tag).
+pub const DEFAULT_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
+
+/// Return the default supervisor image reference with a version-pinned tag.
+#[must_use]
+pub fn default_supervisor_image() -> String {
+    format!(
+        "{DEFAULT_SUPERVISOR_IMAGE_REPO}:{}",
+        default_supervisor_image_tag()
+    )
+}
+
+fn default_supervisor_image_tag() -> String {
+    resolve_supervisor_image_tag(&[
+        option_env!("OPENSHELL_IMAGE_TAG").unwrap_or(""),
+        option_env!("IMAGE_TAG").unwrap_or(""),
+        env!("CARGO_PKG_VERSION"),
+    ])
+}
+
+/// Resolve the supervisor image tag from an ordered list of candidates.
+///
+/// Returns the first non-empty, non-`"0.0.0"` candidate, falling back to
+/// `"dev"` when none qualifies. Replaces `+` with `-` for OCI tag
+/// compatibility.
+#[must_use]
+pub fn resolve_supervisor_image_tag(candidates: &[&str]) -> String {
+    candidates
+        .iter()
+        .copied()
+        .find(|t| !t.is_empty() && *t != "0.0.0")
+        .unwrap_or("dev")
+        .replace('+', "-")
+}
 
 /// CDI device identifier for requesting all NVIDIA GPUs.
 pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
 
 /// Default maximum number of processes (PIDs) allowed inside a sandbox container.
 ///
-/// Shared by the Docker and Podman drivers; override via driver config.
+/// Compute drivers may override this through backend configuration.
 pub const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
-
-/// Compute backends the gateway can orchestrate sandboxes through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ComputeDriverKind {
-    Kubernetes,
-    Vm,
-    Docker,
-    Podman,
-}
-
-impl ComputeDriverKind {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Kubernetes => "kubernetes",
-            Self::Vm => "vm",
-            Self::Docker => "docker",
-            Self::Podman => "podman",
-        }
-    }
-}
 
 /// Normalize a configured compute driver name.
 ///
@@ -91,233 +133,6 @@ pub fn normalize_compute_driver_name(value: &str) -> Result<String, String> {
     Ok(value.to_ascii_lowercase())
 }
 
-impl fmt::Display for ComputeDriverKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for ComputeDriverKind {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "kubernetes" => Ok(Self::Kubernetes),
-            "vm" => Ok(Self::Vm),
-            "docker" => Ok(Self::Docker),
-            "podman" => Ok(Self::Podman),
-            other => Err(format!(
-                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman"
-            )),
-        }
-    }
-}
-
-/// Auto-detect the appropriate compute driver based on the runtime environment.
-///
-/// Priority order: Kubernetes → Podman → Docker.
-/// VM is never auto-detected (requires explicit `--drivers vm`).
-///
-/// Returns the first driver where the environment check passes.
-/// Returns `None` if no compatible driver is found.
-pub fn detect_driver() -> Option<ComputeDriverKind> {
-    // Kubernetes: check for KUBERNETES_SERVICE_HOST env var (set inside pods)
-    if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
-        return Some(ComputeDriverKind::Kubernetes);
-    }
-
-    // Podman: check for a reachable local API socket.
-    if is_podman_available() {
-        return Some(ComputeDriverKind::Podman);
-    }
-
-    // Docker: check if the CLI is available or a local Docker socket exists.
-    if is_docker_available() {
-        return Some(ComputeDriverKind::Docker);
-    }
-
-    None
-}
-
-/// Check if a binary is available on the system PATH.
-fn is_binary_available(name: &str) -> bool {
-    Command::new(name)
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
-}
-
-fn is_podman_available() -> bool {
-    podman_socket_candidates()
-        .iter()
-        .any(|path| podman_socket_responds(path))
-}
-
-fn podman_socket_candidates() -> Vec<PathBuf> {
-    let socket = std::env::var("OPENSHELL_PODMAN_SOCKET")
-        .ok()
-        .filter(|path| !path.trim().is_empty())
-        .map(PathBuf::from);
-    podman_socket_candidates_from_env(
-        socket,
-        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
-    )
-}
-
-fn podman_socket_candidates_from_env(
-    socket: Option<PathBuf>,
-    runtime_dir: Option<PathBuf>,
-    home: Option<PathBuf>,
-) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-
-    if let Some(path) = socket {
-        candidates.push(path);
-    }
-
-    if let Some(runtime_dir) = runtime_dir {
-        candidates.push(runtime_dir.join("podman/podman.sock"));
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        candidates.push(PathBuf::from(format!(
-            "/run/user/{}/podman/podman.sock",
-            current_uid()
-        )));
-    }
-
-    if let Some(home) = home {
-        candidates.push(home.join(".local/share/containers/podman/machine/podman.sock"));
-    }
-
-    candidates
-}
-
-fn is_docker_available() -> bool {
-    is_binary_available("docker") || docker_socket_available()
-}
-
-fn docker_socket_available() -> bool {
-    docker_socket_candidates()
-        .iter()
-        .any(|path| is_unix_socket(path))
-}
-
-fn docker_socket_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-
-    if let Ok(host) = std::env::var("DOCKER_HOST")
-        && let Some(path) = docker_host_unix_socket_path(&host)
-    {
-        candidates.push(path);
-    }
-
-    candidates.push(PathBuf::from("/var/run/docker.sock"));
-
-    if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(PathBuf::from(home).join(".docker/run/docker.sock"));
-    }
-
-    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        candidates.push(PathBuf::from(runtime_dir).join("docker.sock"));
-    }
-
-    candidates
-}
-
-fn docker_host_unix_socket_path(host: &str) -> Option<PathBuf> {
-    let path = host.trim().strip_prefix("unix://")?;
-    (!path.is_empty()).then(|| PathBuf::from(path))
-}
-
-#[cfg(unix)]
-fn is_unix_socket(path: &Path) -> bool {
-    path.metadata()
-        .is_ok_and(|metadata| metadata.file_type().is_socket())
-}
-
-#[cfg(unix)]
-fn podman_socket_responds(path: &Path) -> bool {
-    unix_socket_http_ping(path, |response| {
-        http_response_is_success(response) && contains_ascii(response, b"Libpod-Api-Version:")
-    })
-}
-
-#[cfg(unix)]
-fn unix_socket_http_ping(path: &Path, accepts_response: impl FnOnce(&[u8]) -> bool) -> bool {
-    const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
-    const PING_REQUEST: &[u8] =
-        b"GET /_ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-
-    if !is_unix_socket(path) {
-        return false;
-    }
-
-    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(path) else {
-        return false;
-    };
-    if stream.set_read_timeout(Some(PROBE_TIMEOUT)).is_err()
-        || stream.set_write_timeout(Some(PROBE_TIMEOUT)).is_err()
-        || stream.write_all(PING_REQUEST).is_err()
-    {
-        return false;
-    }
-
-    let mut response = [0_u8; 512];
-    let mut total = 0;
-    while total < response.len() {
-        let Ok(n) = stream.read(&mut response[total..]) else {
-            return false;
-        };
-        if n == 0 {
-            break;
-        }
-        total += n;
-        if contains_ascii(&response[..total], b"\r\n\r\n") {
-            break;
-        }
-    }
-    total > 0 && accepts_response(&response[..total])
-}
-
-#[cfg(unix)]
-fn http_response_is_success(response: &[u8]) -> bool {
-    response.starts_with(b"HTTP/1.1 200") || response.starts_with(b"HTTP/1.0 200")
-}
-
-#[cfg(unix)]
-fn contains_ascii(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle))
-}
-
-#[cfg(all(unix, test))]
-fn is_reachable_unix_socket(path: &Path) -> bool {
-    is_unix_socket(path) && std::os::unix::net::UnixStream::connect(path).is_ok()
-}
-
-#[cfg(all(unix, target_os = "linux"))]
-fn current_uid() -> u32 {
-    use std::os::unix::fs::MetadataExt;
-
-    std::fs::metadata("/proc/self").map_or(0, |metadata| metadata.uid())
-}
-
-#[cfg(not(unix))]
-fn is_unix_socket(path: &Path) -> bool {
-    let _ = path;
-    false
-}
-
-#[cfg(not(unix))]
-fn podman_socket_responds(path: &Path) -> bool {
-    let _ = path;
-    false
-}
-
 /// Server configuration.
 ///
 /// Built programmatically in [`crate::Config::new`] and the gateway CLI from
@@ -327,6 +142,9 @@ fn podman_socket_responds(path: &Path) -> bool {
 /// `Deserialize` impls for that purpose).
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Operator-assigned name for this gateway installation.
+    pub name: String,
+
     /// Address to bind the server to.
     pub bind_address: SocketAddr,
 
@@ -343,6 +161,9 @@ pub struct Config {
     /// Log level (trace, debug, info, warn, error).
     pub log_level: String,
 
+    /// Security posture for rejected sandbox policy generations.
+    pub policy_validation_failure_mode: PolicyValidationFailureMode,
+
     /// TLS configuration.  When `None`, the server listens on plaintext HTTP.
     pub tls: Option<TlsConfig>,
 
@@ -351,6 +172,12 @@ pub struct Config {
 
     /// Gateway user authentication behavior.
     pub auth: GatewayAuthConfig,
+
+    /// Disabled-by-default gateway interceptor service configs.
+    pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
+
+    /// Ordered provider-profile sources used to build the effective catalog.
+    pub provider_profile_sources: Vec<GatewayProviderProfileSourceConfig>,
 
     /// mTLS user authentication configuration. When enabled, a verified TLS
     /// client certificate can authenticate CLI/SDK callers as a
@@ -380,6 +207,13 @@ pub struct Config {
     /// TOML-authored endpoints live under `[openshell.drivers.<name>]` and are
     /// resolved by the gateway config loader.
     pub compute_driver_endpoints: BTreeMap<String, PathBuf>,
+
+    /// Credential drivers enabled for provider credential storage.
+    pub credential_drivers: Vec<String>,
+
+    /// Optional credential-driver default retained for compatibility. When
+    /// set, it must match the single enabled credential driver.
+    pub default_credential_driver: Option<String>,
 
     /// TTL for SSH session tokens, in seconds. 0 disables expiry.
     pub ssh_session_ttl_secs: u64,
@@ -447,6 +281,24 @@ pub struct TlsConfig {
     /// When `false`, client certificates are accepted but not required.
     #[serde(default)]
     pub require_client_auth: bool,
+
+    /// Path to an external TLS certificate file (e.g. ACME/publicly-trusted).
+    /// When set, the server uses SNI-based certificate selection: connections
+    /// whose SNI hostname matches `external_server_names` receive this cert,
+    /// all others receive the primary (internal) cert.
+    #[serde(default)]
+    pub external_cert_path: Option<PathBuf>,
+
+    /// Path to the private key for the external TLS certificate.
+    #[serde(default)]
+    pub external_key_path: Option<PathBuf>,
+
+    /// Hostnames that should be served with the external certificate.
+    /// Connections whose SNI matches one of these names receive the external
+    /// cert; all other connections (including those with no SNI) receive the
+    /// primary (internal) cert.
+    #[serde(default)]
+    pub external_server_names: Vec<String>,
 }
 
 /// OIDC (`OpenID` Connect) configuration for JWT-based authentication.
@@ -515,6 +367,138 @@ pub struct GatewayAuthConfig {
     pub allow_unauthenticated_users: bool,
 }
 
+/// One configured gateway interceptor service.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayInterceptorConfig {
+    /// Operator-assigned instance name used in logs and config overrides.
+    pub name: String,
+    /// Interceptor gRPC endpoint. Supports `http://`, `https://`, and
+    /// `unix://` endpoints.
+    pub grpc_endpoint: String,
+    /// Optional PEM trust-root bundle for an HTTPS endpoint. The gateway
+    /// loads this file during interceptor initialization.
+    #[serde(default)]
+    pub tls_ca_cert_path: Option<PathBuf>,
+    /// Exact JWT audience for this service. When omitted, a kind-scoped value
+    /// is derived from the configured registration name.
+    #[serde(default)]
+    pub audience: Option<String>,
+    /// Opt out of extension authentication for this interceptor, permitting a
+    /// plaintext `http://` endpoint with no bearer credential. Development and
+    /// trusted-network deployments only.
+    #[serde(default)]
+    pub allow_insecure_transport: bool,
+    /// Deterministic service ordering. Lower values run first.
+    #[serde(default)]
+    pub order: i32,
+    /// Default failure policy for this configured service.
+    #[serde(default)]
+    pub failure_policy: Option<GatewayInterceptorFailurePolicy>,
+    /// RFC-style timeout string such as `500ms` or `2s`.
+    #[serde(default)]
+    pub timeout: Option<String>,
+    /// Maximum accepted encoded `Evaluate` response size.
+    #[serde(default)]
+    pub max_response_bytes: Option<usize>,
+    /// Maximum JSON patches accepted from one evaluation result.
+    #[serde(default)]
+    pub max_patches: Option<usize>,
+    /// Controls whether manifest bindings are dynamic, allowlisted, or must
+    /// exactly match operator configuration.
+    #[serde(default)]
+    pub binding_policy: GatewayInterceptorBindingPolicy,
+    /// Binding configuration. Its validation and authorization semantics are
+    /// selected by `binding_policy`.
+    #[serde(default)]
+    pub bindings: Vec<GatewayInterceptorBindingOverride>,
+}
+
+impl GatewayInterceptorConfig {
+    /// Resolve the configured JWT audience to its deterministic default.
+    pub fn resolved_audience(&self) -> Cow<'_, str> {
+        self.audience
+            .as_deref()
+            .filter(|audience| !audience.is_empty())
+            .map_or_else(
+                || Cow::Owned(format!("urn:openshell:extension:interceptor:{}", self.name)),
+                Cow::Borrowed,
+            )
+    }
+}
+
+/// Operator policy for authorizing interceptor manifest bindings.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayInterceptorBindingPolicy {
+    /// Preserve manifest-controlled binding discovery. Configured bindings
+    /// may narrow or disable manifest declarations.
+    #[default]
+    Dynamic,
+    /// Enable only configured RPC selectors and phases. Extra manifest
+    /// declarations are ignored.
+    Allowlist,
+    /// Require configured and manifest RPC selectors and phases to match.
+    Exact,
+}
+
+/// One configured source in the gateway's effective provider-profile catalog.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GatewayProviderProfileSourceConfig {
+    /// Profiles bundled with the `OpenShell` build.
+    Builtin,
+    /// Profiles managed through the provider profile mutation APIs.
+    User,
+    /// Profiles vended by a configured gateway interceptor instance.
+    Interceptor { name: String },
+}
+
+/// Failure behavior when an interceptor evaluation cannot produce a valid
+/// result.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayInterceptorFailurePolicy {
+    FailClosed,
+    FailOpen,
+}
+
+/// Configured binding authorization or dynamic-manifest override.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayInterceptorBindingOverride {
+    /// Binding id from the interceptor manifest.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Full selector form: `openshell.v1.OpenShell/CreateSandbox`.
+    #[serde(default)]
+    pub rpc: Option<String>,
+    /// Structured selector service, e.g. `openshell.v1.OpenShell`.
+    #[serde(default)]
+    pub service: Option<String>,
+    /// Structured selector method, e.g. `CreateSandbox`.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// Narrowed phase set.
+    #[serde(default)]
+    pub phases: Option<Vec<GatewayInterceptorPhaseConfig>>,
+    /// Disable the selected binding.
+    #[serde(default)]
+    pub disabled: bool,
+    /// Binding-specific failure policy override.
+    #[serde(default)]
+    pub failure_policy: Option<GatewayInterceptorFailurePolicy>,
+}
+
+/// Config file phase names.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayInterceptorPhaseConfig {
+    ModifyOperation,
+    Validate,
+    PostCommit,
+}
+
 const fn default_jwks_ttl_secs() -> u64 {
     3600
 }
@@ -534,8 +518,8 @@ pub struct GatewayJwtConfig {
     pub public_key_path: PathBuf,
     /// Path to the `kid` value (plain text, one line).
     pub kid_path: PathBuf,
-    /// Stable gateway identity embedded in `iss`/`aud`. Defaults to the
-    /// hostname-or-`openshell` placeholder if unset.
+    /// Stable gateway identity embedded in `iss`/`aud`. Defaults to
+    /// `openshell`.
     #[serde(default = "default_gateway_id")]
     pub gateway_id: String,
     /// Token lifetime in seconds. A value of 0 disables expiration and is
@@ -568,23 +552,39 @@ impl Config {
     /// Create a new config with optional TLS.
     pub fn new(tls: Option<TlsConfig>) -> Self {
         Self {
+            name: DEFAULT_GATEWAY_NAME.to_string(),
             bind_address: default_bind_address(),
             health_bind_address: None,
             metrics_bind_address: None,
             log_level: default_log_level(),
+            policy_validation_failure_mode: PolicyValidationFailureMode::default(),
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),
+            gateway_interceptors: Vec::new(),
+            provider_profile_sources: vec![
+                GatewayProviderProfileSourceConfig::Builtin,
+                GatewayProviderProfileSourceConfig::User,
+            ],
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
             database_url: String::new(),
             compute_drivers: vec![],
             compute_driver_endpoints: BTreeMap::new(),
+            credential_drivers: Vec::new(),
+            default_credential_driver: None,
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),
         }
+    }
+
+    /// Create a new configuration with the gateway installation name.
+    #[must_use]
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
     }
 
     /// Create a new configuration with the given bind address.
@@ -646,6 +646,24 @@ impl Config {
         self
     }
 
+    /// Create a new configuration with the configured credential drivers.
+    #[must_use]
+    pub fn with_credential_drivers<I, S>(mut self, drivers: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.credential_drivers = drivers.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Create a new configuration with the default credential driver.
+    #[must_use]
+    pub fn with_default_credential_driver(mut self, driver: Option<impl Into<String>>) -> Self {
+        self.default_credential_driver = driver.map(Into::into);
+        self
+    }
+
     /// Create a new configuration with the SSH session TTL.
     #[must_use]
     pub const fn with_ssh_session_ttl_secs(mut self, secs: u64) -> Self {
@@ -662,6 +680,26 @@ impl Config {
     ) -> Self {
         self.grpc_rate_limit_requests = requests;
         self.grpc_rate_limit_window_secs = window_secs;
+        self
+    }
+
+    /// Set configured gateway interceptors.
+    #[must_use]
+    pub fn with_gateway_interceptors<I>(mut self, interceptors: I) -> Self
+    where
+        I: IntoIterator<Item = GatewayInterceptorConfig>,
+    {
+        self.gateway_interceptors = interceptors.into_iter().collect();
+        self
+    }
+
+    /// Set the ordered provider-profile sources used by the gateway.
+    #[must_use]
+    pub fn with_provider_profile_sources<I>(mut self, sources: I) -> Self
+    where
+        I: IntoIterator<Item = GatewayProviderProfileSourceConfig>,
+    {
+        self.provider_profile_sources = sources.into_iter().collect();
         self
     }
 
@@ -786,45 +824,28 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use super::is_reachable_unix_socket;
     use super::{
-        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayJwtConfig, detect_driver,
-        docker_host_unix_socket_path, is_unix_socket, normalize_compute_driver_name,
-        podman_socket_candidates_from_env, podman_socket_responds,
+        Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
+        GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
+        GatewayProviderProfileSourceConfig, PolicyValidationFailureMode,
+        normalize_compute_driver_name,
     };
-    #[cfg(unix)]
-    use std::io::{Read as _, Write as _};
     use std::net::SocketAddr;
-    #[cfg(unix)]
-    use std::os::unix::net::UnixListener;
-    use std::path::PathBuf;
     use std::time::Duration;
 
     #[test]
-    fn compute_driver_kind_parses_supported_values() {
+    fn policy_validation_failure_mode_is_secure_by_default() {
         assert_eq!(
-            "kubernetes".parse::<ComputeDriverKind>().unwrap(),
-            ComputeDriverKind::Kubernetes
+            Config::new(None).policy_validation_failure_mode,
+            PolicyValidationFailureMode::FailClosed
         );
         assert_eq!(
-            "vm".parse::<ComputeDriverKind>().unwrap(),
-            ComputeDriverKind::Vm
+            "retain_last_valid"
+                .parse::<PolicyValidationFailureMode>()
+                .unwrap(),
+            PolicyValidationFailureMode::RetainLastValid
         );
-        assert_eq!(
-            "podman".parse::<ComputeDriverKind>().unwrap(),
-            ComputeDriverKind::Podman
-        );
-        assert_eq!(
-            "docker".parse::<ComputeDriverKind>().unwrap(),
-            ComputeDriverKind::Docker
-        );
-    }
-
-    #[test]
-    fn compute_driver_kind_rejects_unknown_values() {
-        let err = "firecracker".parse::<ComputeDriverKind>().unwrap_err();
-        assert!(err.contains("unsupported compute driver 'firecracker'"));
+        assert!("keep_old".parse::<PolicyValidationFailureMode>().is_err());
     }
 
     #[test]
@@ -858,6 +879,41 @@ mod tests {
     }
 
     #[test]
+    fn config_defaults_to_builtin_and_user_provider_profile_sources() {
+        let cfg = Config::new(None);
+        assert_eq!(
+            cfg.provider_profile_sources,
+            vec![
+                GatewayProviderProfileSourceConfig::Builtin,
+                GatewayProviderProfileSourceConfig::User,
+            ]
+        );
+    }
+
+    #[test]
+    fn config_defaults_to_internal_credential_storage() {
+        let cfg = Config::new(None);
+        assert!(cfg.credential_drivers.is_empty());
+        assert!(cfg.default_credential_driver.is_none());
+    }
+
+    #[test]
+    fn config_accepts_credential_driver_settings() {
+        let cfg = Config::new(None)
+            .with_credential_drivers(["kubernetes-secrets", "vault"])
+            .with_default_credential_driver(Some("kubernetes-secrets"));
+
+        assert_eq!(
+            cfg.credential_drivers,
+            vec!["kubernetes-secrets".to_string(), "vault".to_string()]
+        );
+        assert_eq!(
+            cfg.default_credential_driver.as_deref(),
+            Some("kubernetes-secrets")
+        );
+    }
+
+    #[test]
     fn gateway_jwt_ttl_defaults_to_non_expiring() {
         let cfg: GatewayJwtConfig = serde_json::from_value(serde_json::json!({
             "signing_key_path": "/tmp/signing.pem",
@@ -867,6 +923,57 @@ mod tests {
         .expect("gateway JWT config should deserialize with default ttl");
 
         assert_eq!(cfg.ttl_secs, 0);
+    }
+
+    #[test]
+    fn name_defaults_and_can_be_overridden() {
+        assert_eq!(Config::new(None).name, "openshell");
+        assert_eq!(
+            Config::new(None).with_name("production-us-west").name,
+            "production-us-west"
+        );
+    }
+
+    #[test]
+    fn gateway_interceptor_failure_policy_rejects_ignore() {
+        let err =
+            serde_json::from_value::<GatewayInterceptorFailurePolicy>(serde_json::json!("ignore"))
+                .unwrap_err();
+
+        assert!(err.to_string().contains("unknown variant `ignore`"));
+    }
+
+    #[test]
+    fn gateway_interceptor_binding_policy_defaults_and_parses_strict_modes() {
+        let defaulted: GatewayInterceptorConfig = serde_json::from_value(serde_json::json!({
+            "name": "governance",
+            "grpc_endpoint": "unix:///tmp/governance.sock"
+        }))
+        .unwrap();
+        let allowlist: GatewayInterceptorBindingPolicy =
+            serde_json::from_value(serde_json::json!("allowlist")).unwrap();
+        let exact: GatewayInterceptorBindingPolicy =
+            serde_json::from_value(serde_json::json!("exact")).unwrap();
+
+        assert_eq!(
+            defaulted.binding_policy,
+            GatewayInterceptorBindingPolicy::Dynamic
+        );
+        assert_eq!(
+            defaulted.resolved_audience(),
+            "urn:openshell:extension:interceptor:governance"
+        );
+        let explicitly_empty = GatewayInterceptorConfig {
+            name: "governance".to_string(),
+            audience: Some(String::new()),
+            ..GatewayInterceptorConfig::default()
+        };
+        assert_eq!(
+            explicitly_empty.resolved_audience(),
+            "urn:openshell:extension:interceptor:governance"
+        );
+        assert_eq!(allowlist, GatewayInterceptorBindingPolicy::Allowlist);
+        assert_eq!(exact, GatewayInterceptorBindingPolicy::Exact);
     }
 
     #[test]
@@ -946,122 +1053,40 @@ mod tests {
     }
 
     #[test]
-    fn detect_driver_returns_none_without_k8s_env_or_local_runtime() {
-        // When KUBERNETES_SERVICE_HOST is not set, no Docker binary/socket is
-        // available, and no Podman API socket is available, detect_driver
-        // should return None.
-        // This test may pass or fail depending on the test environment,
-        // but it documents the expected behavior.
-        let _ = detect_driver(); // Returns Some or None based on environment
-    }
-
-    #[test]
-    fn docker_host_unix_socket_path_parses_unix_hosts() {
+    fn supervisor_image_tag_prefers_explicit_build_tags() {
+        use super::resolve_supervisor_image_tag;
         assert_eq!(
-            docker_host_unix_socket_path("unix:///var/run/docker.sock"),
-            Some(PathBuf::from("/var/run/docker.sock"))
+            resolve_supervisor_image_tag(&["1.2.3", "sha", "0.0.0"]),
+            "1.2.3"
         );
-        assert_eq!(docker_host_unix_socket_path("tcp://127.0.0.1:2375"), None);
-        assert_eq!(docker_host_unix_socket_path("unix://"), None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn is_unix_socket_detects_socket_files() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let socket_path = temp_dir.path().join("docker.sock");
-        let _listener = UnixListener::bind(&socket_path).expect("bind unix socket");
-
-        assert!(is_unix_socket(&socket_path));
-        assert!(is_reachable_unix_socket(&socket_path));
-
-        let regular_file = temp_dir.path().join("not-a-socket");
-        std::fs::write(&regular_file, b"not a socket").expect("write regular file");
-        assert!(!is_unix_socket(&regular_file));
-        assert!(!is_reachable_unix_socket(&regular_file));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn podman_socket_probe_accepts_successful_ping_response() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let socket_path = temp_dir.path().join("podman.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind podman socket");
-
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept podman probe");
-            let mut request = [0_u8; 128];
-            let n = stream.read(&mut request).expect("read podman probe");
-            assert!(request[..n].starts_with(b"GET /_ping HTTP/1.1\r\n"));
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nLibpod-Api-Version: 5.8.2\r\nContent-Length: 2\r\n\r\nOK",
-                )
-                .expect("write podman ping response");
-        });
-
-        assert!(podman_socket_responds(&socket_path));
-        handle.join().expect("probe server exits");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn podman_socket_probe_rejects_docker_ping_response() {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let socket_path = temp_dir.path().join("podman.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind podman socket");
-
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept podman probe");
-            let mut request = [0_u8; 128];
-            let n = stream.read(&mut request).expect("read podman probe");
-            assert!(request[..n].starts_with(b"GET /_ping HTTP/1.1\r\n"));
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nServer: Docker/29.2.1\r\nContent-Length: 2\r\n\r\nOK",
-                )
-                .expect("write docker ping response");
-        });
-
-        assert!(!podman_socket_responds(&socket_path));
-        handle.join().expect("probe server exits");
-    }
-
-    #[test]
-    fn podman_socket_candidates_include_env_runtime_and_home_paths() {
-        let candidates = podman_socket_candidates_from_env(
-            Some(PathBuf::from("/tmp/custom-podman.sock")),
-            Some(PathBuf::from("/tmp/runtime")),
-            Some(PathBuf::from("/tmp/home")),
+        assert_eq!(resolve_supervisor_image_tag(&["", "sha", "0.0.0"]), "sha");
+        assert_eq!(resolve_supervisor_image_tag(&["", "", "1.2.3"]), "1.2.3");
+        assert_eq!(resolve_supervisor_image_tag(&["", "", "0.0.0"]), "dev");
+        assert_eq!(
+            resolve_supervisor_image_tag(&["latest", "", "1.2.3"]),
+            "latest"
         );
-
-        assert!(candidates.contains(&PathBuf::from("/tmp/custom-podman.sock")));
-        assert!(candidates.contains(&PathBuf::from("/tmp/runtime/podman/podman.sock")));
-        assert!(candidates.contains(&PathBuf::from(
-            "/tmp/home/.local/share/containers/podman/machine/podman.sock"
-        )));
     }
 
     #[test]
-    #[allow(unsafe_code)] // std::env::set_var/remove_var require unsafe in Rust 2024
-    fn detect_driver_prefers_kubernetes_when_k8s_env_is_set() {
-        // Save the original env var
-        let original = std::env::var("KUBERNETES_SERVICE_HOST").ok();
+    fn supervisor_image_tag_sanitizes_build_metadata_for_oci() {
+        use super::resolve_supervisor_image_tag;
+        assert_eq!(
+            resolve_supervisor_image_tag(&["", "", "0.0.37-dev.156+g1d3b741ee"]),
+            "0.0.37-dev.156-g1d3b741ee",
+        );
+        assert_eq!(
+            resolve_supervisor_image_tag(&["0.0.37-dev.156+g1d3b741ee", "", "0.0.0"]),
+            "0.0.37-dev.156-g1d3b741ee",
+        );
+    }
 
-        // Set the env var
-        unsafe {
-            std::env::set_var("KUBERNETES_SERVICE_HOST", "127.0.0.1");
-        }
-
-        let result = detect_driver();
-        assert_eq!(result, Some(ComputeDriverKind::Kubernetes));
-
-        // Restore the original env var
-        unsafe {
-            match original {
-                Some(val) => std::env::set_var("KUBERNETES_SERVICE_HOST", val),
-                None => std::env::remove_var("KUBERNETES_SERVICE_HOST"),
-            }
-        }
+    #[test]
+    fn default_supervisor_image_is_version_pinned() {
+        use super::default_supervisor_image;
+        let image = default_supervisor_image();
+        assert!(image.starts_with("ghcr.io/nvidia/openshell/supervisor:"));
+        let tag = image.rsplit_once(':').unwrap().1;
+        assert!(!tag.is_empty());
     }
 }

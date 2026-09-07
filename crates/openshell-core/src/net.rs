@@ -1,16 +1,23 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Network IP classification utilities shared across `OpenShell` crates.
+//! Shared networking utilities for `OpenShell` crates.
 //!
-//! These helpers enforce the always-blocked IP invariant (loopback, link-local,
-//! unspecified) and the broader internal-IP classification (adds RFC 1918 and
-//! ULA).  They are used by:
+//! The IP-classification helpers enforce the always-blocked IP invariant
+//! (loopback, link-local, unspecified) and the broader internal-IP
+//! classification (adds RFC 1918 and ULA).  They are used by:
 //! - The sandbox proxy for runtime SSRF enforcement
 //! - The mechanistic mapper for proposal filtering
 //! - The gateway server for defense-in-depth validation on approval
+//!
+//! The socket tuning helpers ([`set_tcp_nodelay_best_effort`],
+//! [`connect_tcp_nodelay_best_effort`]) help avoid the known latency
+//! imposed by conflict between Nagle's algorithm and delayed ACK behaviors.
+//!
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use tokio::net::TcpStream;
 
 /// Check if a hostname is a known cloud metadata hostname that resolves to an
 /// always-blocked metadata service.
@@ -80,9 +87,9 @@ pub fn is_always_blocked_ip(ip: IpAddr) -> bool {
 ///
 /// Used at policy load time and server-side approval to reject entries that
 /// would be silently blocked at runtime by [`is_always_blocked_ip`].
-pub fn is_always_blocked_net(net: ipnet::IpNet) -> bool {
+pub fn is_always_blocked_net(net: IpNet) -> bool {
     match net {
-        ipnet::IpNet::V4(v4net) => {
+        IpNet::V4(v4net) => {
             let network = v4net.network();
             let broadcast = v4net.broadcast();
 
@@ -107,7 +114,7 @@ pub fn is_always_blocked_net(net: ipnet::IpNet) -> bool {
 
             false
         }
-        ipnet::IpNet::V6(v6net) => {
+        IpNet::V6(v6net) => {
             // For IPv6, check the network address itself and representative
             // addresses within the range.
             let network = v6net.network();
@@ -155,6 +162,43 @@ pub fn is_always_blocked_net(net: ipnet::IpNet) -> bool {
     }
 }
 
+const RFC1918_10_NET: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(10, 0, 0, 0), 8);
+const RFC1918_172_NET: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(172, 16, 0, 0), 12);
+const RFC1918_192_NET: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(192, 168, 0, 0), 16);
+const CGNAT_NET: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(100, 64, 0, 0), 10);
+const IETF_PROTOCOL_ASSIGNMENTS_NET: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(192, 0, 0, 0), 24);
+const TEST_NET_1: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(192, 0, 2, 0), 24);
+const BENCHMARKING_NET: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(198, 18, 0, 0), 15);
+const TEST_NET_2: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(198, 51, 100, 0), 24);
+const TEST_NET_3: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(203, 0, 113, 0), 24);
+const LIMITED_BROADCAST_NET: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::BROADCAST, 32);
+const IPV6_ULA_NET: Ipv6Net = Ipv6Net::new_assert(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7);
+
+const NON_HARD_INTERNAL_V4_NETS: [Ipv4Net; 10] = [
+    RFC1918_10_NET,
+    RFC1918_172_NET,
+    RFC1918_192_NET,
+    CGNAT_NET,
+    IETF_PROTOCOL_ASSIGNMENTS_NET,
+    TEST_NET_1,
+    BENCHMARKING_NET,
+    TEST_NET_2,
+    TEST_NET_3,
+    LIMITED_BROADCAST_NET,
+];
+
+fn ipv4_nets_intersect(left: Ipv4Net, right: Ipv4Net) -> bool {
+    left.network() <= right.broadcast() && right.network() <= left.broadcast()
+}
+
+fn ipv6_nets_intersect(left: Ipv6Net, right: Ipv6Net) -> bool {
+    left.network() <= right.broadcast() && right.network() <= left.broadcast()
+}
+
+fn ipv4_net_to_mapped_ipv6(net: Ipv4Net) -> Ipv6Net {
+    Ipv6Net::new_assert(net.network().to_ipv6_mapped(), 96_u8 + net.prefix_len())
+}
+
 /// Check if an IP address is internal (loopback, private RFC 1918, link-local,
 /// or unspecified).
 ///
@@ -184,6 +228,26 @@ pub fn is_internal_ip(ip: IpAddr) -> bool {
                 return is_internal_v4(v4);
             }
             false
+        }
+    }
+}
+
+/// Check if a CIDR network intersects any address range classified by
+/// [`is_internal_ip`].
+pub fn is_internal_net(net: IpNet) -> bool {
+    if is_always_blocked_net(net) {
+        return true;
+    }
+
+    match net {
+        IpNet::V4(net) => NON_HARD_INTERNAL_V4_NETS
+            .iter()
+            .any(|internal| ipv4_nets_intersect(net, *internal)),
+        IpNet::V6(net) => {
+            ipv6_nets_intersect(net, IPV6_ULA_NET)
+                || NON_HARD_INTERNAL_V4_NETS
+                    .iter()
+                    .any(|internal| ipv6_nets_intersect(net, ipv4_net_to_mapped_ipv6(*internal)))
         }
     }
 }
@@ -219,6 +283,27 @@ fn is_internal_v4(v4: Ipv4Addr) -> bool {
         return true;
     }
     false
+}
+
+/// Enable `TCP_NODELAY` on a stream, logging (not returning) any failure.
+///
+/// Disabling Nagle's algorithm keeps small writes from waiting on delayed ACKs.
+/// It's a latency optimization: if it fails the connection still works, just a
+/// bit slower, so there is nothing for the caller to act on — we log and move on.
+pub fn set_tcp_nodelay_best_effort(stream: &TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!(error = %e, "failed to set TCP_NODELAY");
+    }
+}
+
+/// Connect to `addrs`, then enable `TCP_NODELAY` on a best-effort basis, propagating
+/// any errors from `TcpStream::connect`.
+///
+/// The returned stream is not *guaranteed* to have `TCP_NODELAY` set.
+pub async fn connect_tcp_nodelay_best_effort(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
+    let stream = TcpStream::connect(addrs).await?;
+    set_tcp_nodelay_best_effort(&stream);
+    Ok(stream)
 }
 
 #[cfg(test)]
@@ -382,45 +467,45 @@ mod tests {
 
     #[test]
     fn test_always_blocked_net_loopback_v4() {
-        let net: ipnet::IpNet = "127.0.0.0/8".parse().unwrap();
+        let net: IpNet = "127.0.0.0/8".parse().unwrap();
         assert!(is_always_blocked_net(net));
     }
 
     #[test]
     fn test_always_blocked_net_link_local_v4() {
-        let net: ipnet::IpNet = "169.254.0.0/16".parse().unwrap();
+        let net: IpNet = "169.254.0.0/16".parse().unwrap();
         assert!(is_always_blocked_net(net));
     }
 
     #[test]
     fn test_always_blocked_net_unspecified_v4() {
-        let net: ipnet::IpNet = "0.0.0.0/32".parse().unwrap();
+        let net: IpNet = "0.0.0.0/32".parse().unwrap();
         assert!(is_always_blocked_net(net));
     }
 
     #[test]
     fn test_always_blocked_net_loopback_v6() {
-        let net: ipnet::IpNet = "::1/128".parse().unwrap();
+        let net: IpNet = "::1/128".parse().unwrap();
         assert!(is_always_blocked_net(net));
     }
 
     #[test]
     fn test_always_blocked_net_link_local_v6() {
-        let net: ipnet::IpNet = "fe80::/10".parse().unwrap();
+        let net: IpNet = "fe80::/10".parse().unwrap();
         assert!(is_always_blocked_net(net));
     }
 
     #[test]
     fn test_always_blocked_net_ipv4_mapped_v6_loopback() {
-        let net: ipnet::IpNet = "::ffff:127.0.0.1/128".parse().unwrap();
+        let net: IpNet = "::ffff:127.0.0.1/128".parse().unwrap();
         assert!(is_always_blocked_net(net));
     }
 
     #[test]
     fn test_always_blocked_net_allows_rfc1918() {
-        let net10: ipnet::IpNet = "10.0.0.0/8".parse().unwrap();
-        let net172: ipnet::IpNet = "172.16.0.0/12".parse().unwrap();
-        let net192: ipnet::IpNet = "192.168.0.0/16".parse().unwrap();
+        let net10: IpNet = "10.0.0.0/8".parse().unwrap();
+        let net172: IpNet = "172.16.0.0/12".parse().unwrap();
+        let net192: IpNet = "192.168.0.0/16".parse().unwrap();
         assert!(!is_always_blocked_net(net10));
         assert!(!is_always_blocked_net(net172));
         assert!(!is_always_blocked_net(net192));
@@ -428,44 +513,44 @@ mod tests {
 
     #[test]
     fn test_always_blocked_net_allows_public() {
-        let net: ipnet::IpNet = "8.8.8.0/24".parse().unwrap();
+        let net: IpNet = "8.8.8.0/24".parse().unwrap();
         assert!(!is_always_blocked_net(net));
     }
 
     #[test]
     fn test_always_blocked_net_single_ip_loopback() {
-        let net: ipnet::IpNet = "127.0.0.1/32".parse().unwrap();
+        let net: IpNet = "127.0.0.1/32".parse().unwrap();
         assert!(is_always_blocked_net(net));
     }
 
     #[test]
     fn test_always_blocked_net_single_ip_metadata() {
-        let net: ipnet::IpNet = "169.254.169.254/32".parse().unwrap();
+        let net: IpNet = "169.254.169.254/32".parse().unwrap();
         assert!(is_always_blocked_net(net));
     }
 
     #[test]
     fn test_always_blocked_net_broad_cidr_containing_blocked() {
         // 0.0.0.0/0 contains everything including unspecified, loopback, link-local
-        let net: ipnet::IpNet = "0.0.0.0/0".parse().unwrap();
+        let net: IpNet = "0.0.0.0/0".parse().unwrap();
         assert!(is_always_blocked_net(net));
     }
 
     #[test]
     fn test_always_blocked_net_v6_broad_containing_loopback() {
-        let net: ipnet::IpNet = "::/0".parse().unwrap();
+        let net: IpNet = "::/0".parse().unwrap();
         assert!(is_always_blocked_net(net));
     }
 
     #[test]
     fn test_always_blocked_net_v6_ipv4_mapped_loopback_single() {
-        let net: ipnet::IpNet = "::ffff:127.0.0.1/128".parse().unwrap();
+        let net: IpNet = "::ffff:127.0.0.1/128".parse().unwrap();
         assert!(is_always_blocked_net(net));
     }
 
     #[test]
     fn test_always_blocked_net_v6_ipv4_mapped_link_local_single() {
-        let net: ipnet::IpNet = "::ffff:169.254.0.1/128".parse().unwrap();
+        let net: IpNet = "::ffff:169.254.0.1/128".parse().unwrap();
         assert!(is_always_blocked_net(net));
     }
 
@@ -474,7 +559,7 @@ mod tests {
         // ::ffff:168.0.0.0/103 has a public network address (168.0.0.0) but
         // the range covers 168.0.0.0–169.255.255.255, which includes the
         // link-local block 169.254.0.0/16.
-        let net: ipnet::IpNet = "::ffff:168.0.0.0/103".parse().unwrap();
+        let net: IpNet = "::ffff:168.0.0.0/103".parse().unwrap();
         assert!(is_always_blocked_net(net));
     }
 
@@ -482,15 +567,72 @@ mod tests {
     fn test_always_blocked_net_v6_ipv4_mapped_broad_spans_loopback() {
         // ::ffff:64.0.0.0/98 has a public network address (64.0.0.0) but the
         // range covers 64.0.0.0–127.255.255.255, which includes loopback.
-        let net: ipnet::IpNet = "::ffff:64.0.0.0/98".parse().unwrap();
+        let net: IpNet = "::ffff:64.0.0.0/98".parse().unwrap();
         assert!(is_always_blocked_net(net));
     }
 
     #[test]
     fn test_always_blocked_net_v6_ipv4_mapped_allows_public() {
         // ::ffff:8.8.8.8/128 is a public address — should not be blocked.
-        let net: ipnet::IpNet = "::ffff:8.8.8.8/128".parse().unwrap();
+        let net: IpNet = "::ffff:8.8.8.8/128".parse().unwrap();
         assert!(!is_always_blocked_net(net));
+    }
+
+    // -- is_internal_net --
+
+    #[test]
+    fn test_internal_net_rfc1918_contained_and_supernet() {
+        for cidr in ["10.1.0.0/16", "8.0.0.0/5"] {
+            assert!(is_internal_net(cidr.parse().unwrap()), "{cidr}");
+        }
+    }
+
+    #[test]
+    fn test_internal_net_cgnat_contained_and_supernet() {
+        for cidr in ["100.64.0.0/10", "100.0.0.0/9"] {
+            assert!(is_internal_net(cidr.parse().unwrap()), "{cidr}");
+        }
+    }
+
+    #[test]
+    fn test_internal_net_ipv4_special_use_ranges() {
+        for cidr in [
+            "192.0.0.0/24",
+            "192.0.2.0/24",
+            "198.18.0.0/15",
+            "198.51.100.0/24",
+            "203.0.113.0/24",
+            "255.255.255.255/32",
+        ] {
+            assert!(is_internal_net(cidr.parse().unwrap()), "{cidr}");
+        }
+    }
+
+    #[test]
+    fn test_internal_net_ipv6_ula() {
+        for cidr in ["fc00::/7", "fd00::/8"] {
+            assert!(is_internal_net(cidr.parse().unwrap()), "{cidr}");
+        }
+    }
+
+    #[test]
+    fn test_internal_net_ipv4_mapped_cgnat_supernet() {
+        let net: IpNet = "::ffff:100.0.0.0/105".parse().unwrap();
+        assert!(is_internal_net(net));
+    }
+
+    #[test]
+    fn test_internal_net_always_blocked() {
+        for cidr in ["127.0.0.0/8", "fe80::/10"] {
+            assert!(is_internal_net(cidr.parse().unwrap()), "{cidr}");
+        }
+    }
+
+    #[test]
+    fn test_internal_net_allows_large_public_ranges() {
+        for cidr in ["8.0.0.0/8", "::ffff:8.0.0.0/104"] {
+            assert!(!is_internal_net(cidr.parse().unwrap()), "{cidr}");
+        }
     }
 
     // -- is_internal_ip --
@@ -583,5 +725,32 @@ mod tests {
     fn test_internal_ip_ipv6_mapped_cgnat() {
         let v6 = Ipv4Addr::new(100, 64, 0, 1).to_ipv6_mapped();
         assert!(is_internal_ip(IpAddr::V6(v6)));
+    }
+
+    // -- tcp_nodelay helpers --
+
+    #[tokio::test]
+    async fn set_tcp_nodelay_best_effort_enables_nodelay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let stream = TcpStream::connect(addr).await.expect("connect");
+
+        set_tcp_nodelay_best_effort(&stream);
+        assert!(stream.nodelay().expect("query TCP_NODELAY"));
+    }
+
+    #[tokio::test]
+    async fn connect_tcp_nodelay_best_effort_sets_nodelay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+
+        let stream = connect_tcp_nodelay_best_effort(&[addr])
+            .await
+            .expect("connect");
+        assert!(stream.nodelay().expect("query TCP_NODELAY"));
     }
 }

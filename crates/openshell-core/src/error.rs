@@ -106,13 +106,16 @@ impl Error {
 
 /// Error type shared by all compute driver implementations.
 ///
-/// Both the Podman and Kubernetes drivers map their backend-specific
-/// errors into these variants before crossing crate boundaries.
+/// Drivers map backend-specific errors into these variants before crossing
+/// crate boundaries.
 #[derive(Debug, Error)]
 pub enum ComputeDriverError {
     /// The requested sandbox already exists.
     #[error("sandbox already exists")]
     AlreadyExists,
+    /// The requested sandbox does not exist.
+    #[error("sandbox not found")]
+    NotFound,
     /// The request contains an invalid argument.
     #[error("{0}")]
     InvalidArgument(String),
@@ -128,6 +131,7 @@ impl From<ComputeDriverError> for tonic::Status {
     fn from(err: ComputeDriverError) -> Self {
         match err {
             ComputeDriverError::AlreadyExists => Self::already_exists("sandbox already exists"),
+            ComputeDriverError::NotFound => Self::not_found("sandbox not found"),
             ComputeDriverError::InvalidArgument(m) => Self::invalid_argument(m),
             ComputeDriverError::Precondition(m) => Self::failed_precondition(m),
             ComputeDriverError::Message(m) => Self::internal(m),

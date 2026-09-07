@@ -19,9 +19,9 @@
 #        ANTHROPIC_API_KEY=sk-ant-... \
 #          openshell provider create --type anthropic --from-existing
 #
-#   4. Create a sandboxed agent — Claude Code or OpenClaw:
+#   4. Create a sandboxed agent — Claude Code:
 #        openshell sandbox create -- claude
-#        openshell sandbox create --from openclaw
+#      For OpenClaw, use NemoClaw: https://github.com/NVIDIA/NemoClaw
 #
 # Sandbox containers are managed by the gateway, not by this Compose file.
 # Each `openshell sandbox create` call launches a fresh container; the gateway

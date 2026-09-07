@@ -624,9 +624,11 @@ fn read_pem(path: &Path) -> Result<String> {
 }
 
 fn write_local_bundle(dir: &Path, bundle: &PkiBundle, paths: &LocalPaths) -> Result<()> {
-    // Stage to a sibling tmp dir so individual renames into the final layout
-    // are atomic on the same filesystem.
-    let temp = sibling_temp_dir(dir);
+    // Ensure output dir exists before staging inside it.
+    create_dir_restricted(dir)?;
+
+    // Stage inside the output dir so individual renames are atomic on the same filesystem.
+    let temp = staging_temp_dir(dir);
     if temp.exists() {
         std::fs::remove_dir_all(&temp)
             .into_diagnostic()
@@ -659,8 +661,7 @@ fn write_local_bundle(dir: &Path, bundle: &PkiBundle, paths: &LocalPaths) -> Res
     )?;
     write_pem(&temp_jwt.join("kid"), &bundle.jwt_key_id, false)?;
 
-    // Final destination (might not exist yet on first run).
-    create_dir_restricted(dir)?;
+    // Final destination subdirs (might not exist yet on first run).
     create_dir_restricted(&paths.server_dir)?;
     create_dir_restricted(&paths.client_dir)?;
     create_dir_restricted(&paths.jwt_dir)?;
@@ -687,7 +688,10 @@ fn write_local_bundle(dir: &Path, bundle: &PkiBundle, paths: &LocalPaths) -> Res
 }
 
 fn write_local_tls_bundle(bundle: &PkiBundle, paths: &LocalPaths) -> Result<()> {
-    let temp = sibling_temp_dir(&paths.server_dir);
+    create_dir_restricted(&paths.server_dir)?;
+    create_dir_restricted(&paths.client_dir)?;
+
+    let temp = staging_temp_dir(&paths.server_dir);
     if temp.exists() {
         std::fs::remove_dir_all(&temp)
             .into_diagnostic()
@@ -707,8 +711,6 @@ fn write_local_tls_bundle(bundle: &PkiBundle, paths: &LocalPaths) -> Result<()> 
     write_pem(&temp_client.join("tls.crt"), &bundle.client_cert_pem, false)?;
     write_pem(&temp_client.join("tls.key"), &bundle.client_key_pem, true)?;
 
-    create_dir_restricted(&paths.server_dir)?;
-    create_dir_restricted(&paths.client_dir)?;
     let renames: [(PathBuf, &Path); 6] = [
         (temp.join("ca.crt"), paths.ca_crt.as_path()),
         (temp.join("ca.key"), paths.ca_key.as_path()),
@@ -728,7 +730,9 @@ fn write_local_tls_bundle(bundle: &PkiBundle, paths: &LocalPaths) -> Result<()> 
 }
 
 fn write_local_jwt_bundle(bundle: &PkiBundle, paths: &LocalPaths) -> Result<()> {
-    let temp = sibling_temp_dir(&paths.jwt_dir);
+    create_dir_restricted(&paths.jwt_dir)?;
+
+    let temp = staging_temp_dir(&paths.jwt_dir);
     if temp.exists() {
         std::fs::remove_dir_all(&temp)
             .into_diagnostic()
@@ -740,7 +744,6 @@ fn write_local_jwt_bundle(bundle: &PkiBundle, paths: &LocalPaths) -> Result<()> 
     write_pem(&temp.join("public.pem"), &bundle.jwt_public_key_pem, false)?;
     write_pem(&temp.join("kid"), &bundle.jwt_key_id, false)?;
 
-    create_dir_restricted(&paths.jwt_dir)?;
     let renames: [(PathBuf, &Path); 3] = [
         (temp.join("signing.pem"), paths.jwt_signing.as_path()),
         (temp.join("public.pem"), paths.jwt_public.as_path()),
@@ -766,14 +769,9 @@ fn write_pem(path: &Path, contents: &str, owner_only: bool) -> Result<()> {
     Ok(())
 }
 
-fn sibling_temp_dir(dir: &Path) -> PathBuf {
-    // Use a sibling so std::fs::rename succeeds (same filesystem).
-    let mut name = dir
-        .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_default();
-    name.push(".certgen.tmp");
-    dir.with_file_name(name)
+fn staging_temp_dir(dir: &Path) -> PathBuf {
+    // Place temp inside dir so rename stays on the same filesystem as the destination.
+    dir.join(".certgen.tmp")
 }
 
 // ────────────────────────────── Shared utility ─────────────────────────────
@@ -790,7 +788,7 @@ fn print_bundle(bundle: &PkiBundle) {
 mod tests {
     use super::{
         CertSan, K8sAction, LocalAction, LocalPaths, decide_k8s, decide_local, jwt_signing_secret,
-        missing_required_server_sans, read_local_bundle, sibling_temp_dir, tls_secret,
+        missing_required_server_sans, read_local_bundle, staging_temp_dir, tls_secret,
         write_local_bundle, write_local_jwt_bundle, write_local_tls_bundle,
     };
     use openshell_bootstrap::pki::generate_pki;
@@ -902,10 +900,10 @@ mod tests {
     }
 
     #[test]
-    fn sibling_temp_dir_is_adjacent_to_target() {
+    fn staging_temp_dir_is_inside_target() {
         assert_eq!(
-            sibling_temp_dir(Path::new("/var/lib/openshell/tls")),
-            Path::new("/var/lib/openshell/tls.certgen.tmp")
+            staging_temp_dir(Path::new("/var/lib/openshell/tls")),
+            Path::new("/var/lib/openshell/tls/.certgen.tmp")
         );
     }
 
@@ -922,7 +920,7 @@ mod tests {
             assert!(f.is_file(), "missing {}", f.display());
         }
         assert!(
-            !sibling_temp_dir(&dir).exists(),
+            !staging_temp_dir(&dir).exists(),
             "temp dir should be cleaned up"
         );
 
@@ -1032,7 +1030,7 @@ mod tests {
     fn write_local_bundle_recovers_from_stale_temp_dir() {
         let parent = tempfile::tempdir().expect("tempdir");
         let dir = parent.path().join("tls");
-        let stale = sibling_temp_dir(&dir);
+        let stale = staging_temp_dir(&dir);
         std::fs::create_dir_all(&stale).unwrap();
         std::fs::write(stale.join("garbage"), "stale").unwrap();
 

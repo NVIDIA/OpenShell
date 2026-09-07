@@ -7,6 +7,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 OUTPUT_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-compressed}"
 
+# shellcheck source=tasks/scripts/build-env.sh
+source "${ROOT}/tasks/scripts/build-env.sh"
+
 GUEST_ARCH=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -57,64 +60,6 @@ esac
 
 SUPERVISOR_BIN="${ROOT}/target/${RUST_TARGET}/release/openshell-sandbox"
 SUPERVISOR_OUTPUT="${OUTPUT_DIR}/openshell-sandbox.zst"
-
-ensure_build_nofile_limit() {
-    local desired="${OPENSHELL_VM_BUILD_NOFILE_LIMIT:-8192}"
-    local minimum=1024
-    local current=""
-    local hard=""
-    local target=""
-
-    [ "$(uname -s)" = "Darwin" ] || return 0
-    command -v cargo-zigbuild >/dev/null 2>&1 || return 0
-
-    current="$(ulimit -n 2>/dev/null || echo "")"
-    case "${current}" in
-        ''|*[!0-9]*)
-            return 0
-            ;;
-    esac
-
-    if [ "${current}" -ge "${desired}" ]; then
-        return 0
-    fi
-
-    hard="$(ulimit -Hn 2>/dev/null || echo "")"
-    target="${desired}"
-    case "${hard}" in
-        ''|unlimited|infinity)
-            ;;
-        *[!0-9]*)
-            ;;
-        *)
-            if [ "${hard}" -lt "${target}" ]; then
-                target="${hard}"
-            fi
-            ;;
-    esac
-
-    if [ "${target}" -gt "${current}" ] && ulimit -n "${target}" 2>/dev/null; then
-        echo "==> Raised open file limit for cargo-zigbuild: ${current} -> $(ulimit -n)"
-    fi
-
-    current="$(ulimit -n 2>/dev/null || echo "${current}")"
-    case "${current}" in
-        ''|*[!0-9]*)
-            return 0
-            ;;
-    esac
-
-    if [ "${current}" -lt "${desired}" ]; then
-        echo "WARNING: Open file limit is ${current}; cargo-zigbuild is more reliable at ${desired}+ on macOS."
-    fi
-
-    if [ "${current}" -lt "${minimum}" ]; then
-        echo "ERROR: Open file limit (${current}) is too low for cargo-zigbuild on macOS." >&2
-        echo "       Run: ulimit -n ${desired}" >&2
-        echo "       Then re-run this script." >&2
-        exit 1
-    fi
-}
 
 echo "==> Building openshell-sandbox supervisor bundle"
 echo "    Guest arch: ${GUEST_ARCH}"

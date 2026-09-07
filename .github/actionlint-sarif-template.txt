@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "Actionlint",
+          "version": {{ getVersion | json }},
+          "informationUri": "https://github.com/rhysd/actionlint",
+          "rules": [
+            {{$first := true}}
+            {{range $ := allKinds}}
+            {{if $first}}{{$first = false}}{{else}},{{end}}
+            {
+              "id": {{json $.Name}},
+              "name": {{$.Name | toPascalCase | json}},
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": {{json $.Description}}
+              },
+              "helpUri": "https://github.com/rhysd/actionlint/blob/v1.7.12/docs/checks.md"
+            }
+            {{end}}
+          ]
+        }
+      },
+      "results": [
+        {{$first := true}}
+        {{range $ := .}}
+        {{if $first}}{{$first = false}}{{else}},{{end}}
+        {
+          "ruleId": {{json $.Kind}},
+          "level": "warning",
+          "message": {
+            "text": {{json $.Message}}
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": {{json $.Filepath}},
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": {{$.Line}},
+                  "startColumn": {{$.Column}},
+                  "endColumn": {{$.EndColumn}},
+                  "snippet": {
+                    "text": {{json $.Snippet}}
+                  }
+                }
+              }
+            }
+          ]
+        }
+        {{end}}
+      ]
+    }
+  ]
+}

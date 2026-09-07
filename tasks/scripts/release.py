@@ -12,14 +12,17 @@ import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-SEMVER_TAG_GLOB = "v[0-9]*.[0-9]*.[0-9]*"
 SEMVER_TAG_RE = re.compile(r"^v?(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)$")
+PRERELEASE_TAG_RE = re.compile(
+    r"^v?(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)-pre\.(?P<sequence>[1-9]\d*)$"
+)
 
 
 @dataclass(frozen=True)
 class Versions:
     python: str
     cargo: str
+    npm: str
     docker: str
     deb: str
     snap: str
@@ -65,6 +68,18 @@ def _parse_semver_tag(tag: str) -> tuple[int, int, int] | None:
     )
 
 
+def _parse_prerelease_tag(tag: str) -> tuple[int, int, int, int] | None:
+    match = PRERELEASE_TAG_RE.match(tag)
+    if match is None:
+        return None
+    return (
+        int(match.group("major")),
+        int(match.group("minor")),
+        int(match.group("patch")),
+        int(match.group("sequence")),
+    )
+
+
 def _format_semver(version: tuple[int, int, int]) -> str:
     return f"{version[0]}.{version[1]}.{version[2]}"
 
@@ -73,17 +88,22 @@ def _next_patch(version: tuple[int, int, int]) -> tuple[int, int, int]:
     return version[0], version[1], version[2] + 1
 
 
-def _latest_semver_tag() -> str | None:
-    try:
-        tag = _git(
-            ["describe", "--tags", "--match", SEMVER_TAG_GLOB, "--abbrev=0", "HEAD"]
-        )
-    except subprocess.CalledProcessError:
-        return None
+def _exact_release_tag() -> str | None:
+    tags = _git(["tag", "--points-at", "HEAD"]).splitlines()
+    stable = [(version, tag) for tag in tags if (version := _parse_semver_tag(tag))]
+    if stable:
+        return max(stable)[1]
 
-    if _parse_semver_tag(tag) is None:
-        raise RuntimeError(f"git describe returned non-semver release tag: {tag}")
-    return tag
+    prereleases = [
+        (version, tag) for tag in tags if (version := _parse_prerelease_tag(tag))
+    ]
+    return max(prereleases)[1] if prereleases else None
+
+
+def _latest_stable_tag() -> str | None:
+    tags = _git(["tag", "--merged", "HEAD", "--list", "v*.*.*"]).splitlines()
+    stable = [(version, tag) for tag in tags if (version := _parse_semver_tag(tag))]
+    return max(stable)[1] if stable else None
 
 
 def _versions_from_parts(
@@ -106,6 +126,12 @@ def _versions_from_parts(
     # 0.1.0.dev3+gabcdef -> 0.1.0-dev.3+gabcdef
     cargo_version = re.sub(r"\.dev(\d+)", r"-dev.\1", python_version)
 
+    # npm follows SemVer 2.0 like Cargo, but fold the '+g<sha>' build metadata
+    # into the prerelease (npm/registries treat build metadata as insignificant
+    # for version identity, so each dev build must differ in the prerelease).
+    # 0.1.0-dev.3+gabcdef -> 0.1.0-dev.3.gabcdef ; a tagged release stays 0.1.0.
+    npm_version = cargo_version.replace("+", ".")
+
     # Docker tags can't contain '+'.
     docker_version = cargo_version.replace("+", "-")
 
@@ -123,6 +149,7 @@ def _versions_from_parts(
     return Versions(
         python=python_version,
         cargo=cargo_version,
+        npm=npm_version,
         docker=docker_version,
         deb=deb_version,
         snap=snap_version,
@@ -134,10 +161,45 @@ def _versions_from_parts(
     )
 
 
-def _compute_versions() -> Versions:
-    git_tag = _latest_semver_tag()
-    git_sha = _git(["rev-parse", "--short=9", "HEAD"])
+def _versions_from_prerelease(
+    base_version: tuple[int, int, int],
+    sequence: int,
+    git_sha: str,
+    git_tag: str,
+) -> Versions:
+    version = f"{_format_semver(base_version)}-pre.{sequence}"
+    return Versions(
+        python=f"{_format_semver(base_version)}rc{sequence}",
+        cargo=version,
+        npm=version,
+        docker=version,
+        deb=f"{_format_semver(base_version)}~pre.{sequence}-1",
+        snap=version,
+        rpm_version=_format_semver(base_version),
+        rpm_release=f"0.pre.{sequence}",
+        git_tag=git_tag,
+        git_sha=git_sha,
+        git_distance=0,
+    )
 
+
+def _compute_versions() -> Versions:
+    git_sha = _git(["rev-parse", "--short=9", "HEAD"])
+    exact_tag = _exact_release_tag()
+
+    if exact_tag is not None:
+        stable = _parse_semver_tag(exact_tag)
+        if stable is not None:
+            return _versions_from_parts(stable, 0, git_sha, exact_tag)
+
+        prerelease = _parse_prerelease_tag(exact_tag)
+        if prerelease is None:
+            raise RuntimeError(f"invalid semantic release tag: {exact_tag}")
+        return _versions_from_prerelease(
+            prerelease[:3], prerelease[3], git_sha, exact_tag
+        )
+
+    git_tag = _latest_stable_tag()
     if git_tag is None:
         base_version = (0, 0, 0)
         git_distance = int(_git(["rev-list", "--count", "HEAD"]))
@@ -151,9 +213,25 @@ def _compute_versions() -> Versions:
     return _versions_from_parts(parsed_tag, git_distance, git_sha, git_tag)
 
 
+def _compute_dev_versions() -> Versions:
+    git_sha = _git(["rev-parse", "--short=9", "HEAD"])
+    git_tag = _latest_stable_tag()
+    if git_tag is None:
+        git_distance = int(_git(["rev-list", "--count", "HEAD"]))
+        return _versions_from_parts((0, 0, 0), git_distance, git_sha, "")
+
+    parsed_tag = _parse_semver_tag(git_tag)
+    if parsed_tag is None:
+        raise RuntimeError(f"invalid semantic release tag: {git_tag}")
+
+    git_distance = int(_git(["rev-list", f"{git_tag}..HEAD", "--count"]))
+    return _versions_from_parts(parsed_tag, git_distance, git_sha, git_tag)
+
+
 def _print_env(versions: Versions) -> None:
     print(f"VERSION_PY={versions.python}")
     print(f"VERSION_CARGO={versions.cargo}")
+    print(f"VERSION_NPM={versions.npm}")
     print(f"VERSION_DOCKER={versions.docker}")
     print(f"VERSION_DEB={versions.deb}")
     print(f"VERSION_SNAP={versions.snap}")
@@ -164,12 +242,14 @@ def _print_env(versions: Versions) -> None:
     print(f"GIT_DISTANCE={versions.git_distance}")
 
 
-def get_version(format: str) -> None:
-    versions = _compute_versions()
+def get_version(format: str, *, dev: bool = False) -> None:
+    versions = _compute_dev_versions() if dev else _compute_versions()
     if format == "python":
         print(versions.python)
     elif format == "cargo":
         print(versions.cargo)
+    elif format == "npm":
+        print(versions.npm)
     elif format == "docker":
         print(versions.docker)
     elif format == "deb":
@@ -329,6 +409,30 @@ class Openshell < Formula
     (var/"log/openshell").mkpath
     system bin/"openshell-gateway", "generate-certs", "--output-dir", var/"openshell/tls", "--server-san", "host.openshell.internal"
 
+    gateway_config = var/"openshell/gateway.toml"
+    gateway_config_contents = <<~TOML
+      [openshell]
+      version = 1
+
+      [openshell.gateway]
+    TOML
+    legacy_ipv6_gateway_config_contents = <<~TOML
+      [openshell]
+      version = 1
+
+      [openshell.gateway]
+      bind_address = "[::1]:{LOCAL_GATEWAY_PORT}"
+    TOML
+    unless gateway_config.exist?
+      gateway_config.write gateway_config_contents
+    else
+      # Migrate only the exact config generated by the affected formula. Keep
+      # any user-edited config untouched.
+      if gateway_config.read == legacy_ipv6_gateway_config_contents
+        gateway_config.write gateway_config_contents
+      end
+    end
+
     entitlements = var/"openshell/openshell-driver-vm.entitlements.plist"
     entitlements.atomic_write <<~XML
       <?xml version="1.0" encoding="UTF-8"?>
@@ -357,7 +461,7 @@ class Openshell < Formula
         brew services restart openshell
 
       Register it with the OpenShell CLI:
-        openshell gateway add https://127.0.0.1:{LOCAL_GATEWAY_PORT} --local --name openshell
+        openshell gateway add https://localhost:{LOCAL_GATEWAY_PORT} --local --name openshell
     EOS
   end
 
@@ -403,10 +507,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     get_version_parser = sub.add_parser("get-version", help="Print computed version.")
     get_version_parser.add_argument(
+        "--dev", action="store_true", help="Ignore exact tags and print a dev version."
+    )
+    get_version_parser.add_argument(
         "--python", action="store_true", help="Print Python version only."
     )
     get_version_parser.add_argument(
         "--cargo", action="store_true", help="Print Cargo version only."
+    )
+    get_version_parser.add_argument(
+        "--npm", action="store_true", help="Print npm version only."
     )
     get_version_parser.add_argument(
         "--docker", action="store_true", help="Print Docker version only."
@@ -458,23 +568,25 @@ def main() -> None:
 
     if args.command == "get-version":
         if args.python:
-            get_version("python")
+            get_version("python", dev=args.dev)
         elif args.cargo:
-            get_version("cargo")
+            get_version("cargo", dev=args.dev)
+        elif args.npm:
+            get_version("npm", dev=args.dev)
         elif args.docker:
-            get_version("docker")
+            get_version("docker", dev=args.dev)
         elif args.deb:
-            get_version("deb")
+            get_version("deb", dev=args.dev)
         elif args.snap:
-            get_version("snap")
+            get_version("snap", dev=args.dev)
         elif args.rpm_version:
-            get_version("rpm-version")
+            get_version("rpm-version", dev=args.dev)
         elif args.rpm_release:
-            get_version("rpm-release")
+            get_version("rpm-release", dev=args.dev)
         elif args.json:
-            get_version("json")
+            get_version("json", dev=args.dev)
         else:
-            get_version("all")
+            get_version("all", dev=args.dev)
     elif args.command == "generate-homebrew-formula":
         generate_homebrew_formula(
             release_tag=args.release_tag,

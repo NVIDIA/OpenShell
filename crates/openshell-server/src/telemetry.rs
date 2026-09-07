@@ -9,19 +9,38 @@ use openshell_core::telemetry::DenyGroup;
 use std::collections::HashMap;
 
 #[derive(Debug, Default)]
-pub struct TelemetryState;
+pub struct TelemetryState {
+    #[cfg(test)]
+    ended_sandbox_sessions: std::sync::Mutex<Vec<String>>,
+}
 
 #[allow(clippy::unused_self)]
 impl TelemetryState {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 
     pub fn sandbox_session_connected(&self, _sandbox_id: &str) {}
 
     pub fn sandbox_session_disconnected(&self, _sandbox_id: &str) {}
 
-    pub fn end_sandbox_session(&self, _sandbox_id: &str) {}
+    pub fn end_sandbox_session(&self, sandbox_id: &str) {
+        #[cfg(test)]
+        self.ended_sandbox_sessions
+            .lock()
+            .expect("telemetry session lock poisoned")
+            .push(sandbox_id.to_string());
+        #[cfg(not(test))]
+        let _ = sandbox_id;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ended_sandbox_sessions(&self) -> Vec<String> {
+        self.ended_sandbox_sessions
+            .lock()
+            .expect("telemetry session lock poisoned")
+            .clone()
+    }
 
     pub fn record_network_activity(&self, sandbox_id: &str, summary: &NetworkActivitySummary) {
         if sandbox_id.is_empty() || !openshell_core::telemetry::enabled() {

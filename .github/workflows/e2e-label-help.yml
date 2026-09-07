@@ -51,7 +51,7 @@ jobs:
               status_summary="The matching required CI gate status on this PR will flip green automatically once the run finishes."
               ;;
             test:e2e-kubernetes)
-              suite_summary="Kubernetes HA E2E"
+              suite_summary="Kubernetes HA and credential-driver E2E"
               build_summary="gateway and supervisor images"
               status_summary="This is an optional proof-of-life suite; failures are visible in the workflow run but do not publish a required CI gate status."
               ;;
@@ -59,7 +59,8 @@ jobs:
           esac
 
           mirror_ref="pull-request/$PR_NUMBER"
-          mirror_sha=$(gh api "repos/$GH_REPO/branches/$mirror_ref" --jq '.commit.sha' 2>/dev/null || echo "")
+          mirror_sha=$(gh api "repos/$GH_REPO/git/ref/heads/$mirror_ref" --jq '.object.sha' 2>/dev/null || true)
+          if [[ ! "$mirror_sha" =~ ^[0-9a-f]{40}$ ]]; then mirror_sha=""; fi
           short_pr=${PR_HEAD_SHA:0:7}
 
           if [ -z "$mirror_sha" ]; then

@@ -45,6 +45,8 @@ pub fn mock_response(route: &ResolvedRoute, source_protocol: &str) -> ProxyRespo
             ("x-openshell-mock".to_string(), "true".to_string()),
         ],
         body: body_bytes,
+        route_model: Some(route.model.clone()),
+        route_endpoint: Some(route.endpoint.clone()),
     }
 }
 

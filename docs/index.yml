@@ -19,6 +19,8 @@ navigation:
   title: "Manage OpenShell"
 - folder: providers
   title: "Providers"
+- folder: extensibility
+  title: "Extensibility"
 - folder: observability
   title: "Observability"
 - folder: kubernetes

@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+rules:
+  dangerous-triggers:
+    ignore:
+      # These base-branch workflows never check out or execute pull request
+      # head code. Keep each suppression scoped to its reviewed trigger block.
+      - dco.yml:3
+      - e2e-label-help.yml:13
+      - release-canary.yml:3
+      - required-ci-gates.yml:3
+      - vouch-check.yml:3

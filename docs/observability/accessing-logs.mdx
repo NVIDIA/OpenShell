@@ -41,18 +41,21 @@ For durable log storage, use the log files inside the sandbox or enable [OCSF JS
 
 ## Direct Filesystem Access
 
-Use `openshell sandbox connect` to open a shell inside the sandbox and read the log files directly:
+Start an independent shell with `sandbox exec` to read log files directly:
 
 ```text
-openshell sandbox connect my-sandbox
+openshell sandbox exec --name my-sandbox --tty -- /bin/bash -l
 sandbox@my-sandbox:~$ cat /var/log/openshell.2026-04-01.log
 ```
 
-You can also run a one-off command without an interactive shell:
+Or run a one-off command without an interactive shell:
 
 ```shell
-openshell sandbox connect my-sandbox -- cat /var/log/openshell.2026-04-01.log
+openshell sandbox exec --name my-sandbox -- cat /var/log/openshell.2026-04-01.log
 ```
+
+`sandbox connect` attaches to the sandbox's existing canonical main process; it
+does not start a new shell.
 
 The log files inside the sandbox contain the complete record, including events that the gRPC push channel can drop under load. The push channel is bounded and drops events rather than blocking.
 

@@ -7,14 +7,18 @@ use crate::client::{
     ContainerInspect, ContainerListEntry, ContainerState, HealthState, PodmanApiError,
     PodmanClient, PodmanEvent,
 };
-use crate::container::{LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, short_id};
+use crate::container::{
+    LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_WORKSPACE, short_id,
+};
 use futures::Stream;
 use openshell_core::ComputeDriverError;
 use openshell_core::proto::compute::v1::{
     DriverCondition, DriverSandbox, DriverSandboxStatus, WatchSandboxesDeletedEvent,
     WatchSandboxesEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
+use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
@@ -22,11 +26,69 @@ use tracing::{debug, info, warn};
 // Condition reason constants shared across event-building paths.
 const CONDITION_RUNNING: &str = "ContainerRunning";
 const CONDITION_STARTING: &str = "ContainerStarting";
-const CONDITION_EXITED: &str = "ContainerExited";
-const CONDITION_STOPPED: &str = "ContainerStopped";
+use openshell_core::driver_utils::{
+    CONDITION_EXITED, CONDITION_RUNTIME_RESTART, CONDITION_STOPPED,
+};
 
 pub type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, ComputeDriverError>> + Send>>;
+
+/// Per-sandbox container exit timestamps that fence state changes from an earlier run.
+///
+/// Podman can deliver a container's `die` or `stop` event after the stop API
+/// has returned. If a restart is already in progress, inspecting the container
+/// for that delayed event can report the previous exit and incorrectly regress
+/// the sandbox from `Starting` to `Error`.
+#[derive(Clone, Debug, Default)]
+pub struct LifecycleEventFences {
+    previous_finished_at: Arc<Mutex<HashMap<String, String>>>,
+}
+
+impl LifecycleEventFences {
+    pub fn record_previous_exit(&self, sandbox_id: &str, finished_at: Option<&str>) {
+        let mut fences = self
+            .previous_finished_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match finished_at.filter(|finished_at| !finished_at.is_empty()) {
+            Some(finished_at) => {
+                fences.insert(sandbox_id.to_string(), finished_at.to_string());
+            }
+            None => {
+                fences.remove(sandbox_id);
+            }
+        }
+    }
+
+    pub fn remove(&self, sandbox_id: &str) {
+        self.previous_finished_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(sandbox_id);
+    }
+
+    fn matches_previous_exit(
+        &self,
+        event: &PodmanEvent,
+        sandbox_id: &str,
+        state: &ContainerState,
+    ) -> bool {
+        if !matches!(event.action.as_str(), "die" | "stop")
+            || !matches!(state.status.as_str(), "exited" | "stopped")
+        {
+            return false;
+        }
+
+        let Some(finished_at) = state.finished_at.as_deref() else {
+            return false;
+        };
+        self.previous_finished_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(sandbox_id)
+            .is_some_and(|previous| previous == finished_at)
+    }
+}
 
 /// Build a `WatchSandboxesEvent` carrying a sandbox snapshot.
 fn sandbox_event(sandbox: DriverSandbox) -> WatchSandboxesEvent {
@@ -60,23 +122,23 @@ fn deleted_event(sandbox_id: String) -> WatchSandboxesEvent {
 /// drops (daemon restart, socket error, or clean shutdown), the stream
 /// terminates with a final error item and stops producing events.
 ///
-/// Callers are responsible for reconnecting by calling [`start_watch`] again.
-/// The server's `ComputeRuntime::watch_loop` in `openshell-server` provides
-/// this behaviour with a 2-second backoff: when the stream terminates with an
-/// error, `watch_loop` sleeps and then calls `watch_sandboxes()` again, which
-/// ultimately calls `start_watch()` again and re-syncs state.
+/// Callers are responsible for reconnecting by calling [`start_watch`] again
+/// and re-synchronizing state.
 ///
 /// **Do not add reconnection logic inside this function.**  A local reconnect
-/// would race with `watch_loop`'s retry and produce duplicate initial-sync
-/// events that corrupt the server's sandbox index.
-pub async fn start_watch(client: PodmanClient) -> Result<WatchStream, PodmanApiError> {
+/// would race with the consumer's retry and produce duplicate initial-sync
+/// events.
+pub async fn start_watch(
+    client: PodmanClient,
+    lifecycle_event_fences: LifecycleEventFences,
+) -> Result<WatchStream, PodmanApiError> {
     let (tx, rx) = mpsc::channel::<Result<WatchSandboxesEvent, ComputeDriverError>>(256);
 
     // 1. Subscribe to events first so we don't miss any during the list.
     let mut event_rx = client.events_stream(LABEL_MANAGED_FILTER).await?;
 
     // 2. List existing containers for initial state sync.
-    let existing = client.list_containers(LABEL_MANAGED_FILTER).await?;
+    let existing = client.list_containers(&[LABEL_MANAGED_FILTER]).await?;
 
     for entry in &existing {
         // For running containers, use inspect to get full state including
@@ -118,7 +180,8 @@ pub async fn start_watch(client: PodmanClient) -> Result<WatchStream, PodmanApiE
         while let Some(result) = event_rx.recv().await {
             match result {
                 Ok(event) => {
-                    if let Some(we) = map_podman_event(&event, &client).await
+                    if let Some(we) =
+                        map_podman_event(&event, &client, &lifecycle_event_fences).await
                         && tx.send(Ok(we)).await.is_err()
                     {
                         return;
@@ -163,6 +226,7 @@ pub async fn start_watch(client: PodmanClient) -> Result<WatchStream, PodmanApiE
 async fn map_podman_event(
     event: &PodmanEvent,
     client: &PodmanClient,
+    lifecycle_event_fences: &LifecycleEventFences,
 ) -> Option<WatchSandboxesEvent> {
     let container_id = &event.actor.id;
     let sandbox_id = event
@@ -186,7 +250,24 @@ async fn map_podman_event(
         "create" | "start" | "stop" | "die" | "health_status" => {
             // Inspect the container to get current state.
             match client.inspect_container(container_id).await {
-                Ok(inspect) => driver_sandbox_from_inspect(&inspect).map(sandbox_event),
+                Ok(inspect) => {
+                    if lifecycle_event_fences.matches_previous_exit(
+                        event,
+                        &sandbox_id,
+                        &inspect.state,
+                    ) {
+                        debug!(
+                            sandbox_id,
+                            container_id = %container_id,
+                            action = %event.action,
+                            finished_at = inspect.state.finished_at.as_deref().unwrap_or_default(),
+                            "Ignoring container stop event from before the latest sandbox start"
+                        );
+                        None
+                    } else {
+                        driver_sandbox_from_inspect(&inspect).map(sandbox_event)
+                    }
+                }
                 Err(PodmanApiError::NotFound(_)) => {
                     // The container is already gone by the time we inspected
                     // it. This is a normal race between the `die`/`stop` event
@@ -215,9 +296,15 @@ async fn map_podman_event(
                         .get(LABEL_SANDBOX_NAME)
                         .cloned()
                         .unwrap_or_default();
+                    let workspace = event
+                        .actor
+                        .attributes
+                        .get(LABEL_SANDBOX_WORKSPACE)
+                        .cloned()?;
                     Some(sandbox_event(build_driver_sandbox(
                         sandbox_id.clone(),
                         sandbox_name,
+                        workspace,
                         String::new(),
                         short_id(container_id),
                         DriverCondition {
@@ -247,6 +334,7 @@ async fn map_podman_event(
 fn build_driver_sandbox(
     sandbox_id: String,
     sandbox_name: String,
+    workspace: String,
     instance_name: String,
     instance_id: String,
     condition: DriverCondition,
@@ -265,6 +353,7 @@ fn build_driver_sandbox(
             conditions: vec![condition],
             deleting,
         }),
+        workspace,
     }
 }
 
@@ -277,6 +366,11 @@ pub fn driver_sandbox_from_inspect(inspect: &ContainerInspect) -> Option<DriverS
         .get(LABEL_SANDBOX_NAME)
         .cloned()
         .unwrap_or_default();
+    let workspace = inspect
+        .config
+        .labels
+        .get(LABEL_SANDBOX_WORKSPACE)
+        .cloned()?;
 
     let condition = condition_from_state(&inspect.state);
     let deleting = inspect.state.status == "removing";
@@ -284,6 +378,7 @@ pub fn driver_sandbox_from_inspect(inspect: &ContainerInspect) -> Option<DriverS
     Some(build_driver_sandbox(
         sandbox_id,
         sandbox_name,
+        workspace,
         inspect.name.trim_start_matches('/').to_string(),
         short_id(&inspect.id),
         condition,
@@ -299,6 +394,7 @@ pub fn driver_sandbox_from_list_entry(entry: &ContainerListEntry) -> Option<Driv
         .get(LABEL_SANDBOX_NAME)
         .cloned()
         .unwrap_or_default();
+    let workspace = entry.labels.get(LABEL_SANDBOX_WORKSPACE).cloned()?;
 
     let (reason, status_str, message) = match entry.state.as_str() {
         "running" => (
@@ -316,6 +412,7 @@ pub fn driver_sandbox_from_list_entry(entry: &ContainerListEntry) -> Option<Driv
     Some(build_driver_sandbox(
         sandbox_id,
         sandbox_name,
+        workspace,
         entry.names.first().cloned().unwrap_or_default(),
         short_id(&entry.id),
         DriverCondition {
@@ -346,15 +443,29 @@ fn condition_from_state(state: &ContainerState) -> DriverCondition {
         },
         "created" => ("False", "ContainerCreated", String::new()),
         "exited" | "stopped" => {
-            let msg = if state.oom_killed {
-                "Container was killed by the OOM killer".to_string()
+            // Exit codes 137 (128+SIGKILL) and 143 (128+SIGTERM) mean the
+            // container was terminated by an external signal rather than
+            // exiting on its own — the signature of a machine/daemon restart
+            // killing running containers. Those are recoverable at gateway
+            // startup; ordinary application exits (0, non-zero, faults) are not.
+            let (reason, msg) = if state.oom_killed {
+                (
+                    "OOMKilled",
+                    "Container was killed by the OOM killer".to_string(),
+                )
+            } else if matches!(state.exit_code, 137 | 143) {
+                (
+                    CONDITION_RUNTIME_RESTART,
+                    format!(
+                        "Container terminated by signal (exit code {})",
+                        state.exit_code
+                    ),
+                )
             } else {
-                format!("Container exited with code {}", state.exit_code)
-            };
-            let reason = if state.oom_killed {
-                "OOMKilled"
-            } else {
-                CONDITION_EXITED
+                (
+                    CONDITION_EXITED,
+                    format!("Container exited with code {}", state.exit_code),
+                )
             };
             ("False", reason, msg)
         }
@@ -386,6 +497,66 @@ fn condition_from_state(state: &ContainerState) -> DriverCondition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn podman_event(action: &str, sandbox_id: &str, time_nano: i64) -> PodmanEvent {
+        PodmanEvent {
+            event_type: "container".to_string(),
+            action: action.to_string(),
+            actor: crate::client::EventActor {
+                id: "container-1".to_string(),
+                attributes: HashMap::from([(LABEL_SANDBOX_ID.to_string(), sandbox_id.to_string())]),
+            },
+            time_nano,
+        }
+    }
+
+    #[test]
+    fn lifecycle_fence_rejects_delayed_stop_events_from_before_restart() {
+        let fences = LifecycleEventFences::default();
+        fences.record_previous_exit("sandbox-1", Some("2026-08-12T16:39:13Z"));
+        let previous_exit = ContainerState {
+            status: "exited".to_string(),
+            running: false,
+            exit_code: 137,
+            oom_killed: false,
+            health: None,
+            started_at: Some("2026-08-12T16:38:58Z".to_string()),
+            finished_at: Some("2026-08-12T16:39:13Z".to_string()),
+        };
+
+        assert!(fences.matches_previous_exit(
+            &podman_event("die", "sandbox-1", 199),
+            "sandbox-1",
+            &previous_exit,
+        ));
+        assert!(fences.matches_previous_exit(
+            &podman_event("stop", "sandbox-1", 200),
+            "sandbox-1",
+            &previous_exit,
+        ));
+
+        let mut new_exit = previous_exit.clone();
+        new_exit.finished_at = Some("2026-08-12T16:40:00Z".to_string());
+        assert!(!fences.matches_previous_exit(
+            &podman_event("die", "sandbox-1", 201),
+            "sandbox-1",
+            &new_exit,
+        ));
+
+        let mut running = previous_exit.clone();
+        running.status = "running".to_string();
+        running.finished_at = None;
+        assert!(!fences.matches_previous_exit(
+            &podman_event("die", "sandbox-1", 201),
+            "sandbox-1",
+            &running,
+        ));
+        assert!(!fences.matches_previous_exit(
+            &podman_event("start", "sandbox-1", 199),
+            "sandbox-1",
+            &previous_exit,
+        ));
+    }
 
     #[test]
     fn condition_healthy_container() {
@@ -442,6 +613,32 @@ mod tests {
     }
 
     #[test]
+    fn condition_signal_kill_is_runtime_restart() {
+        // 137 (128+SIGKILL) and 143 (128+SIGTERM) are external terminations —
+        // the signature of a machine/daemon restart. They classify as
+        // recoverable `ContainerRuntimeRestart`, distinct from an ordinary
+        // application exit.
+        for exit_code in [137, 143] {
+            let state = ContainerState {
+                status: "exited".to_string(),
+                running: false,
+                exit_code,
+                oom_killed: false,
+                health: None,
+                started_at: None,
+                finished_at: Some("2026-04-14T12:30:00Z".to_string()),
+            };
+            let cond = condition_from_state(&state);
+            assert_eq!(cond.status, "False");
+            assert_eq!(
+                cond.reason, "ContainerRuntimeRestart",
+                "exit code {exit_code} should classify as runtime restart"
+            );
+            assert!(cond.message.contains(&format!("code {exit_code}")));
+        }
+    }
+
+    #[test]
     fn short_id_truncates() {
         assert_eq!(short_id("abc123def456789"), "abc123def456");
         assert_eq!(short_id("short"), "short");
@@ -449,9 +646,10 @@ mod tests {
 
     #[test]
     fn sandbox_event_from_list_entry_running() {
-        let mut labels = std::collections::HashMap::new();
+        let mut labels = HashMap::new();
         labels.insert(LABEL_SANDBOX_ID.to_string(), "test-id".to_string());
         labels.insert(LABEL_SANDBOX_NAME.to_string(), "test-name".to_string());
+        labels.insert(LABEL_SANDBOX_WORKSPACE.to_string(), "default".to_string());
 
         let entry = ContainerListEntry {
             id: "abc123def456789".to_string(),
@@ -497,6 +695,7 @@ mod tests {
                 conditions: vec![condition],
                 deleting: false,
             }),
+            workspace: String::new(),
         };
 
         let event = WatchSandboxesEvent {

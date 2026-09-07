@@ -66,6 +66,16 @@ pub fn discover_from_profile(
         }
     }
 
+    if profile.id == "google-vertex-ai" {
+        for key in openshell_core::inference::VERTEX_AI_CONFIG_KEY_NAMES {
+            if let Some(value) = context.env_var(key)
+                && !value.trim().is_empty()
+            {
+                discovered.config.entry((*key).to_string()).or_insert(value);
+            }
+        }
+    }
+
     if discovered.is_empty() {
         Ok(None)
     } else {
@@ -84,6 +94,7 @@ mod tests {
         ProviderTypeProfile {
             id: "custom".to_string(),
             resource_version: 0,
+            annotations: std::collections::HashMap::new(),
             display_name: "Custom".to_string(),
             description: String::new(),
             category: openshell_core::proto::ProviderProfileCategory::Other,
@@ -119,6 +130,8 @@ mod tests {
             discovery: DiscoveryProfile {
                 credentials: vec!["api_key".to_string(), "secondary".to_string()],
             },
+            source: String::new(),
+            scope: String::new(),
         }
     }
 
@@ -161,5 +174,28 @@ mod tests {
                 credential_name
             } if profile_id == "custom" && credential_name == "missing"
         ));
+    }
+
+    #[test]
+    fn vertex_profile_discovery_includes_supported_configuration() {
+        let mut profile = profile();
+        profile.id = "google-vertex-ai".to_string();
+        let ctx = MockDiscoveryContext::new()
+            .with_env("CUSTOM_API_KEY", "vertex-token")
+            .with_env("VERTEX_AI_PROJECT_ID", "project-a")
+            .with_env("VERTEX_AI_REGION", "us-central1");
+
+        let discovered = discover_from_profile(&profile, &ctx)
+            .expect("discovery should succeed")
+            .expect("provider should be discovered");
+
+        assert_eq!(
+            discovered.config.get("VERTEX_AI_PROJECT_ID"),
+            Some(&"project-a".to_string())
+        );
+        assert_eq!(
+            discovered.config.get("VERTEX_AI_REGION"),
+            Some(&"us-central1".to_string())
+        );
     }
 }

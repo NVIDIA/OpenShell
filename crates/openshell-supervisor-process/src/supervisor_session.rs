@@ -13,13 +13,15 @@
 use std::net::IpAddr;
 #[cfg(target_os = "linux")]
 use std::os::fd::RawFd;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
-    GatewayMessage, RelayFrame, RelayInit, RelayOpen, RelayOpenResult, SupervisorHeartbeat,
-    SupervisorHello, SupervisorMessage, TcpRelayTarget, gateway_message, relay_open,
-    supervisor_message,
+    FinalizeMainProcessExitRequest, GatewayMessage, RelayFrame, RelayInit, RelayOpen,
+    RelayOpenResult, ReportMainProcessExitRequest, SupervisorHeartbeat, SupervisorHello,
+    SupervisorMessage, TcpRelayTarget, gateway_message, relay_open, supervisor_message,
 };
 use openshell_ocsf::{
     ActivityId, ConnectionInfo, Endpoint, NetworkActivityBuilder, OcsfEvent, SandboxContext,
@@ -31,6 +33,8 @@ use tokio_stream::StreamExt;
 use tracing::{debug, warn};
 
 use openshell_core::grpc_client;
+use openshell_core::net::set_tcp_nodelay_best_effort;
+use openshell_core::transport_errors::is_expected_transport_close_status;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -226,6 +230,46 @@ fn map_stream_message<T>(
     }
 }
 
+#[derive(Debug)]
+enum SessionStreamMessage<T> {
+    Message(T),
+    ExpectedShutdownClose,
+}
+
+fn supervisor_is_terminating(terminating: &AtomicBool) -> bool {
+    terminating.load(Ordering::Acquire)
+}
+
+fn expected_transport_close_during_shutdown(
+    status: &tonic::Status,
+    terminating: &AtomicBool,
+) -> bool {
+    supervisor_is_terminating(terminating) && is_expected_transport_close_status(status)
+}
+
+fn map_session_stream_message<T>(
+    message: Result<Option<T>, tonic::Status>,
+    eof_error: &'static str,
+    terminating: &AtomicBool,
+) -> Result<SessionStreamMessage<T>, Box<dyn std::error::Error + Send + Sync>> {
+    match message {
+        Ok(Some(msg)) => Ok(SessionStreamMessage::Message(msg)),
+        Ok(None) if supervisor_is_terminating(terminating) => {
+            debug!("supervisor session: stream closed during local shutdown");
+            Ok(SessionStreamMessage::ExpectedShutdownClose)
+        }
+        Ok(None) => Err(eof_error.into()),
+        Err(e) if expected_transport_close_during_shutdown(&e, terminating) => {
+            debug!(
+                error = %e,
+                "supervisor session: expected transport close during local shutdown"
+            );
+            Ok(SessionStreamMessage::ExpectedShutdownClose)
+        }
+        Err(e) => Err(format!("stream error: {e}").into()),
+    }
+}
+
 /// Spawn the supervisor session task.
 ///
 /// The task runs for the lifetime of the sandbox process, reconnecting with
@@ -235,38 +279,53 @@ pub fn spawn(
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
     netns_fd: Option<i32>,
+    expected_ssh_peer_pid: Option<u32>,
+    terminating: Arc<AtomicBool>,
+    instance_id: String,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_session_loop(
+    let config = SessionConfig {
         endpoint,
         sandbox_id,
         ssh_socket_path,
         netns_fd,
-    ))
+        expected_ssh_peer_pid,
+        terminating,
+        instance_id,
+    };
+    tokio::spawn(run_session_loop(config))
 }
 
-async fn run_session_loop(
+struct SessionConfig {
     endpoint: String,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
     netns_fd: Option<i32>,
-) {
+    expected_ssh_peer_pid: Option<u32>,
+    terminating: Arc<AtomicBool>,
+    instance_id: String,
+}
+
+async fn run_session_loop(config: SessionConfig) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
 
     loop {
         attempt += 1;
 
-        match run_single_session(&endpoint, &sandbox_id, &ssh_socket_path, netns_fd).await {
+        match run_single_session(&config).await {
             Ok(()) => {
-                let event =
-                    session_closed_event(openshell_ocsf::ctx::ctx(), &endpoint, &sandbox_id);
+                let event = session_closed_event(
+                    openshell_ocsf::ctx::ctx(),
+                    &config.endpoint,
+                    &config.sandbox_id,
+                );
                 ocsf_emit!(event);
                 break;
             }
             Err(e) => {
                 let event = session_failed_event(
                     openshell_ocsf::ctx::ctx(),
-                    &endpoint,
+                    &config.endpoint,
                     attempt,
                     &e.to_string(),
                 );
@@ -279,16 +338,13 @@ async fn run_session_loop(
 }
 
 async fn run_single_session(
-    endpoint: &str,
-    sandbox_id: &str,
-    ssh_socket_path: &std::path::Path,
-    netns_fd: Option<i32>,
+    config: &SessionConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
     // every relay rides the same TCP+TLS+HTTP/2 connection — no new TLS
     // handshake per relay.
-    let channel = grpc_client::connect_channel_pub(endpoint)
+    let channel = grpc_client::connect_channel_pub(&config.endpoint)
         .await
         .map_err(|e| format!("connect failed: {e}"))?;
     let mut client = OpenShellClient::new(channel.clone());
@@ -298,11 +354,10 @@ async fn run_single_session(
     let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
 
     // Send hello as the first message.
-    let instance_id = uuid::Uuid::new_v4().to_string();
     tx.send(SupervisorMessage {
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
-            sandbox_id: sandbox_id.to_string(),
-            instance_id: instance_id.clone(),
+            sandbox_id: config.sandbox_id.clone(),
+            instance_id: config.instance_id.clone(),
         })),
     })
     .await
@@ -332,12 +387,11 @@ async fn run_single_session(
     let heartbeat_secs = accepted.heartbeat_interval_secs.max(5);
     let event = session_established_event(
         openshell_ocsf::ctx::ctx(),
-        endpoint,
+        &config.endpoint,
         &accepted.session_id,
         heartbeat_secs,
     );
     ocsf_emit!(event);
-
     // Main loop: receive gateway messages + send heartbeats.
     let mut heartbeat_interval =
         tokio::time::interval(Duration::from_secs(u64::from(heartbeat_secs)));
@@ -346,14 +400,26 @@ async fn run_single_session(
     loop {
         tokio::select! {
             msg = inbound.message() => {
-                let msg = map_stream_message(msg, "gateway closed stream")?;
+                let msg = match map_session_stream_message(
+                    msg,
+                    "gateway closed stream",
+                    &config.terminating,
+                )? {
+                    SessionStreamMessage::Message(msg) => msg,
+                    SessionStreamMessage::ExpectedShutdownClose => return Ok(()),
+                };
+                let context = GatewayMessageContext {
+                    sandbox_id: &config.sandbox_id,
+                    ssh_socket_path: &config.ssh_socket_path,
+                    netns_fd: config.netns_fd,
+                    expected_ssh_peer_pid: config.expected_ssh_peer_pid,
+                    channel: &channel,
+                    tx: &tx,
+                    terminating: &config.terminating,
+                };
                 handle_gateway_message(
                     &msg,
-                    sandbox_id,
-                    ssh_socket_path,
-                    netns_fd,
-                    &channel,
-                    &tx,
+                    &context,
                 );
             }
             _ = heartbeat_interval.tick() => {
@@ -370,14 +436,57 @@ async fn run_single_session(
     }
 }
 
-fn handle_gateway_message(
-    msg: &GatewayMessage,
+/// Report the canonical process result and wait for durable handling.
+pub async fn report_main_process_exit(
+    endpoint: &str,
     sandbox_id: &str,
-    ssh_socket_path: &std::path::Path,
+    instance_id: &str,
+    exit_code: i32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let channel = grpc_client::connect_channel_pub(endpoint)
+        .await
+        .map_err(|error| format!("connect failed: {error}"))?;
+    let mut client = OpenShellClient::new(channel);
+    client
+        .report_main_process_exit(ReportMainProcessExitRequest {
+            sandbox_id: sandbox_id.to_string(),
+            instance_id: instance_id.to_string(),
+            exit_code,
+        })
+        .await?;
+    Ok(())
+}
+
+/// Confirm terminal delivery and permit ephemeral cleanup.
+pub async fn finalize_main_process_exit(
+    endpoint: &str,
+    sandbox_id: &str,
+    instance_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let channel = grpc_client::connect_channel_pub(endpoint)
+        .await
+        .map_err(|error| format!("connect failed: {error}"))?;
+    let mut client = OpenShellClient::new(channel);
+    client
+        .finalize_main_process_exit(FinalizeMainProcessExitRequest {
+            sandbox_id: sandbox_id.to_string(),
+            instance_id: instance_id.to_string(),
+        })
+        .await?;
+    Ok(())
+}
+
+struct GatewayMessageContext<'a> {
+    sandbox_id: &'a str,
+    ssh_socket_path: &'a std::path::Path,
     netns_fd: Option<i32>,
-    channel: &grpc_client::AuthedChannel,
-    tx: &mpsc::Sender<SupervisorMessage>,
-) {
+    expected_ssh_peer_pid: Option<u32>,
+    channel: &'a grpc_client::AuthedChannel,
+    tx: &'a mpsc::Sender<SupervisorMessage>,
+    terminating: &'a Arc<AtomicBool>,
+}
+
+fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<'_>) {
     match &msg.payload {
         Some(gateway_message::Payload::Heartbeat(_)) => {
             // Gateway heartbeat — nothing to do.
@@ -385,17 +494,30 @@ fn handle_gateway_message(
         Some(gateway_message::Payload::RelayOpen(open)) => {
             let channel_id = open.channel_id.clone();
             let relay_open = open.clone();
-            let sandbox_id = sandbox_id.to_string();
-            let channel = channel.clone();
-            let ssh_socket_path = ssh_socket_path.to_path_buf();
-            let tx = tx.clone();
+            let sandbox_id = context.sandbox_id.to_string();
+            let channel = context.channel.clone();
+            let ssh_socket_path = context.ssh_socket_path.to_path_buf();
+            let tx = context.tx.clone();
+            let netns_fd = context.netns_fd;
+            let expected_ssh_peer_pid = context.expected_ssh_peer_pid;
+            let terminating = Arc::clone(context.terminating);
 
             let event = relay_open_event(openshell_ocsf::ctx::ctx(), &relay_open, &ssh_socket_path);
             ocsf_emit!(event);
 
             tokio::spawn(async move {
                 let event_open = relay_open.clone();
-                match handle_relay_open(relay_open, &ssh_socket_path, netns_fd, channel, tx).await {
+                match handle_relay_open(
+                    relay_open,
+                    &ssh_socket_path,
+                    netns_fd,
+                    expected_ssh_peer_pid,
+                    channel,
+                    tx,
+                    terminating,
+                )
+                .await
+                {
                     Ok(()) => {
                         let event = relay_closed_event(
                             openshell_ocsf::ctx::ctx(),
@@ -431,7 +553,7 @@ fn handle_gateway_message(
             ocsf_emit!(event);
         }
         _ => {
-            warn!(sandbox_id = %sandbox_id, "supervisor session: unexpected gateway message");
+            warn!(sandbox_id = %context.sandbox_id, "supervisor session: unexpected gateway message");
         }
     }
 }
@@ -446,11 +568,20 @@ async fn handle_relay_open(
     relay_open: RelayOpen,
     ssh_socket_path: &std::path::Path,
     netns_fd: Option<i32>,
+    expected_ssh_peer_pid: Option<u32>,
     channel: grpc_client::AuthedChannel,
     tx: mpsc::Sender<SupervisorMessage>,
+    terminating: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let channel_id = relay_open.channel_id.clone();
-    let target = match open_target(&relay_open, ssh_socket_path, netns_fd).await {
+    let target = match open_target(
+        &relay_open,
+        ssh_socket_path,
+        netns_fd,
+        expected_ssh_peer_pid,
+    )
+    .await
+    {
         Ok(target) => target,
         Err(err) => {
             send_relay_open_result(&tx, &channel_id, false, err.to_string()).await;
@@ -479,10 +610,18 @@ async fn handle_relay_open(
         .map_err(|_| "outbound channel closed before init")?;
 
     // Initiate the RPC. This rides the existing HTTP/2 connection.
-    let response = client
-        .relay_stream(outbound)
-        .await
-        .map_err(|e| format!("relay_stream RPC failed: {e}"))?;
+    let response = match client.relay_stream(outbound).await {
+        Ok(response) => response,
+        Err(e) if expected_transport_close_during_shutdown(&e, &terminating) => {
+            debug!(
+                channel_id = %channel_id,
+                error = %e,
+                "relay bridge: relay_stream RPC closed during local shutdown"
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(format!("relay_stream RPC failed: {e}").into()),
+    };
     let mut inbound = response.into_inner();
 
     // Connect to the local SSH daemon on its Unix socket.
@@ -533,7 +672,15 @@ async fn handle_relay_open(
                 }
             }
             Err(e) => {
-                inbound_err = Some(format!("relay inbound errored: {e}"));
+                if expected_transport_close_during_shutdown(&e, &terminating) {
+                    debug!(
+                        channel_id = %channel_id,
+                        error = %e,
+                        "relay bridge: inbound closed during local shutdown"
+                    );
+                } else {
+                    inbound_err = Some(format!("relay inbound errored: {e}"));
+                }
                 break;
             }
         }
@@ -576,11 +723,23 @@ async fn open_target(
     relay_open: &RelayOpen,
     ssh_socket_path: &std::path::Path,
     netns_fd: Option<i32>,
+    expected_ssh_peer_pid: Option<u32>,
 ) -> Result<Box<dyn TargetStream>, Box<dyn std::error::Error + Send + Sync>> {
     match relay_open.target.as_ref() {
         Some(relay_open::Target::Tcp(target)) => open_tcp_target(target, netns_fd).await,
         Some(relay_open::Target::Ssh(_)) | None => {
-            let stream = tokio::net::UnixStream::connect(ssh_socket_path).await?;
+            let runtime_path = crate::unix_socket::runtime_path(ssh_socket_path);
+            let stream = tokio::net::UnixStream::connect(runtime_path.as_ref()).await?;
+            if let Some(expected_pid) = expected_ssh_peer_pid {
+                let credentials = stream.peer_cred()?;
+                let actual_pid = credentials.pid().and_then(|pid| u32::try_from(pid).ok());
+                if actual_pid != Some(expected_pid) {
+                    return Err(format!(
+                        "SSH relay peer PID mismatch: expected {expected_pid}, got {actual_pid:?}"
+                    )
+                    .into());
+                }
+            }
             Ok(Box::new(stream))
         }
     }
@@ -620,10 +779,14 @@ async fn connect_tcp_target(
             .await
             .map_err(|_| "netns tcp connect thread panicked")??;
         stream.set_nonblocking(true)?;
-        return Ok(tokio::net::TcpStream::from_std(stream)?);
+        let stream = tokio::net::TcpStream::from_std(stream)?;
+        set_tcp_nodelay_best_effort(&stream);
+        return Ok(stream);
     }
 
-    Ok(tokio::net::TcpStream::connect((host.as_str(), port)).await?)
+    let stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+    set_tcp_nodelay_best_effort(&stream);
+    Ok(stream)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -632,7 +795,9 @@ async fn connect_tcp_target(
     port: u16,
     _netns_fd: Option<i32>,
 ) -> Result<tokio::net::TcpStream, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(tokio::net::TcpStream::connect((host.as_str(), port)).await?)
+    let stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+    set_tcp_nodelay_best_effort(&stream);
+    Ok(stream)
 }
 
 #[cfg(test)]
@@ -672,6 +837,20 @@ mod target_tests {
             host: host.to_string(),
             port,
         }
+    }
+
+    /// Regression test: the TCP relay connect path sets `TCP_NODELAY`.
+    #[tokio::test]
+    async fn connect_tcp_target_sets_tcp_nodelay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let stream = connect_tcp_target(addr.ip().to_string(), addr.port(), None)
+            .await
+            .expect("connect");
+        assert!(stream.nodelay().expect("query TCP_NODELAY"));
     }
 
     #[test]
@@ -894,5 +1073,84 @@ mod ocsf_event_tests {
         let err = map_stream_message::<SupervisorMessage>(Ok(None), "gateway closed stream")
             .expect_err("eof should force reconnect");
         assert_eq!(err.to_string(), "gateway closed stream");
+    }
+
+    #[test]
+    fn map_session_stream_message_allows_expected_close_during_shutdown() {
+        let terminating = AtomicBool::new(true);
+        let message = map_session_stream_message::<GatewayMessage>(
+            Err(tonic::Status::unknown(
+                "h2 protocol error: error reading a body from connection",
+            )),
+            "gateway closed stream",
+            &terminating,
+        )
+        .expect("expected transport close should be non-fatal during shutdown");
+
+        assert!(matches!(
+            message,
+            SessionStreamMessage::ExpectedShutdownClose
+        ));
+    }
+
+    #[test]
+    fn map_session_stream_message_keeps_transport_close_fatal_when_not_shutting_down() {
+        let terminating = AtomicBool::new(false);
+        let err = map_session_stream_message::<GatewayMessage>(
+            Err(tonic::Status::unknown(
+                "h2 protocol error: error reading a body from connection",
+            )),
+            "gateway closed stream",
+            &terminating,
+        )
+        .expect_err("same transport close should fail before shutdown starts");
+
+        assert!(err.to_string().contains("h2 protocol error"));
+    }
+
+    #[test]
+    fn map_session_stream_message_keeps_unexpected_error_fatal_during_shutdown() {
+        let terminating = AtomicBool::new(true);
+        let err = map_session_stream_message::<GatewayMessage>(
+            Err(tonic::Status::internal("policy evaluation failed")),
+            "gateway closed stream",
+            &terminating,
+        )
+        .expect_err("non-transport errors must stay fatal");
+
+        assert!(err.to_string().contains("policy evaluation failed"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ssh_target_requires_authenticated_supervisor_peer_pid() {
+        let socket =
+            std::path::PathBuf::from(format!("@openshell-relay-test-{}", uuid::Uuid::new_v4()));
+        let runtime_path = crate::unix_socket::runtime_path(&socket);
+        let listener = tokio::net::UnixListener::bind(runtime_path.as_ref()).unwrap();
+        let accept_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (_stream, _) = listener.accept().await.unwrap();
+            }
+        });
+        let relay = ssh_relay_open("peer-check");
+
+        let trusted = open_target(&relay, &socket, None, Some(std::process::id()))
+            .await
+            .expect("matching peer PID should be accepted");
+        drop(trusted);
+
+        let Err(err) = open_target(
+            &relay,
+            &socket,
+            None,
+            Some(std::process::id().saturating_add(1)),
+        )
+        .await
+        else {
+            panic!("mismatched peer PID must be rejected");
+        };
+        assert!(err.to_string().contains("peer PID mismatch"));
+        accept_task.await.unwrap();
     }
 }

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -54,8 +56,24 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
     assert "OPENSHELL_DRIVERS: " not in formula
     assert 'OPENSHELL_GATEWAY_CONFIG: "#{var}/openshell/gateway.toml"' not in formula
     assert "init-gateway-config.sh" not in formula
-    assert 'bind_address = "127.0.0.1:17670"' not in formula
+    assert 'gateway_config = var/"openshell/gateway.toml"' in formula
+    assert "unless gateway_config.exist?" in formula
+    generated_config = re.search(
+        r"gateway_config_contents = <<~TOML\n(?P<contents>.*?)\n    TOML",
+        formula,
+        flags=re.DOTALL,
+    )
+    assert generated_config is not None
+    assert "[openshell.gateway]" in generated_config.group("contents")
+    assert "bind_address =" not in generated_config.group("contents")
+    assert 'bind_address = "[::1]:17670"' in formula
+    assert "gateway_config.read == legacy_ipv6_gateway_config_contents" in formula
+    assert "gateway_config.write gateway_config_contents" in formula
     assert '# compute_drivers = ["vm"]' not in formula
+    assert (
+        "openshell gateway add https://localhost:17670 --local --name openshell"
+        in formula
+    )
     assert 'run opt_libexec/"openshell-gateway-homebrew-service"' in formula
     assert 'xdg_config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"' in formula
     assert 'xdg_gateway_config="${xdg_config_home}/openshell/gateway.toml"' in formula
@@ -111,6 +129,17 @@ def test_snap_wrapper_uses_optional_gateway_config_without_generating_toml() -> 
         in wrapper
     )
     assert 'exec "${SNAP}/bin/openshell-gateway" "$@"' in wrapper
+
+
+def test_snap_docker_connect_hook_restarts_gateway() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    hook = repo_root / "snap/hooks/connect-plug-docker"
+
+    assert hook.is_file()
+    assert hook.stat().st_mode & stat.S_IXUSR
+    assert 'snapctl restart "${SNAP_INSTANCE_NAME}.gateway"' in hook.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_rpm_spec_uses_gateway_defaults_without_config_helper() -> None:

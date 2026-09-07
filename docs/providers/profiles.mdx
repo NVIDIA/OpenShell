@@ -1,0 +1,993 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Profiles"
+sidebar-title: "Profiles"
+description: "Use provider profiles to attach credentials, network policy, and refresh metadata to OpenShell sandboxes."
+keywords: "Generative AI, Cybersecurity, Providers, Provider Profiles, Credentials, Policy, Sandbox"
+position: 1
+---
+
+Provider profiles turn providers from credential records into profile-backed access bundles. A provider profile describes the credentials, endpoints, binaries, policy rules, and refresh behavior for a provider type. A provider instance stores the concrete credential and config values for one gateway.
+
+Use provider profiles when you want provider-owned policy rules to travel with provider credentials. For example, a GitHub provider can describe both `GITHUB_TOKEN` and the GitHub API endpoints that a sandbox needs, so users do not have to copy the same network policy into every sandbox.
+
+## Why Provider Profiles Exist
+
+Provider credentials and network policy were previously configured through separate workflows. A user could create a GitHub provider that stored `GITHUB_TOKEN`, but the sandbox still needed a separate policy that allowed `api.github.com`, selected the right binaries, and configured REST enforcement.
+
+Provider profiles keep those pieces together:
+
+| Need | Profile-backed behavior |
+|---|---|
+| Repeatable provider setup | Built-in and custom provider profiles define reusable provider types. |
+| Provider-aware policy | Attached providers contribute `_provider_*` network policy entries to the effective sandbox policy. |
+| Custom provider definitions | You can export, edit, lint, import, list, and delete custom profiles. |
+| Runtime provider lifecycle | You can list, attach, and detach providers on existing sandboxes. |
+| Credential rotation | Provider refresh metadata lets the gateway refresh short-lived access tokens and update provider records. |
+| Credential transport | Credential delivery uses environment placeholders and proxy rewrite. Static placeholders resolve only at profile endpoints or explicitly bound sandbox policy endpoints for endpointless profiles. |
+
+## Available Features
+
+Provider profiles include these user-facing features:
+
+- Built-in provider profiles loaded by the gateway by default.
+- Gateway configuration can compose built-in, user-managed, and interceptor-vended profile sources. Selecting only an interceptor makes its catalog authoritative by omission.
+- A user-managed profile shadows a built-in profile with the same ID in its applicable workspace or platform scope. The built-in remains the fallback outside that scope. Source-managed interceptor collisions still fail closed.
+- `openshell provider list-profiles` with table, YAML, and JSON output.
+- `openshell provider profile export`, `import`, `update`, `lint`, and `delete` for custom profiles.
+- Provider instances created from built-in or imported profile IDs with `openshell provider create --type <id>`.
+- Provider instances whose submitted credentials can be stored by a configured gateway credential driver.
+- Profile-backed credential discovery for explicit `openshell provider create --from-existing` and `openshell provider update --from-existing` flows. The built-in `google-vertex-ai` profile also supplements discovery with Vertex config env vars such as `VERTEX_AI_PROJECT_ID` and `VERTEX_AI_REGION`.
+- Just-in-time effective policy composition from sandbox policy plus attached provider profiles.
+- Runtime sandbox provider lifecycle commands under `openshell sandbox provider list|attach|detach`.
+- Credential refresh configuration with `openshell provider refresh status|configure|rotate|delete`.
+- Credential expiry metadata with `openshell provider update --credential-expires-at`; values accept Unix epoch milliseconds or ISO/RFC3339 timestamps.
+- Dynamic token grants that use the sandbox's SPIFFE JWT-SVID as an OAuth2 client assertion and inject short-lived tokens into supported headers for matching profile endpoints.
+- Endpoint-bound static credential placeholders. The sandbox proxy resolves a static credential only for request hosts, ports, and paths declared by its provider profile or explicitly bound in sandbox policy for an endpointless profile.
+
+## Understand Static Credential Endpoint Binding
+
+Static credential endpoint binding prevents a placeholder for one service from
+resolving on a different policy-allowed service. OpenShell associates every
+static credential environment key with an endpoint boundary. Profile endpoints
+supply that boundary by default. For an endpointless profile, a sandbox policy
+endpoint can name the attached provider instance explicitly. The proxy checks
+the resulting association before it substitutes the real value.
+
+The built-in `openai` and `anthropic` profiles use their public vendor
+endpoints. Configuring an alternate base URL makes those providers route-only:
+OpenShell withholds their static credentials and fixed-vendor policy from
+direct sandbox traffic while gateway inference routing continues to use the
+configured upstream.
+
+A request can use a static credential only when all of these checks pass:
+
+| Check | Configuration source |
+|---|---|
+| The placeholder belongs to the current attached provider state. | Sandbox provider attachment and current provider record. |
+| The calling binary and destination are allowed. | Effective sandbox network policy. |
+| The host, port, and canonical request path match the credential binding. | Provider profile endpoints, or an explicit sandbox policy binding for an endpointless profile. |
+| The HTTP method, path, or protocol operation is allowed when L7 inspection is configured. | Effective sandbox network policy. |
+| The credential has not expired. | Provider credential expiry metadata. |
+
+Network policy and credential binding serve different purposes. Network policy
+authorizes traffic. A credential binding authorizes use of one provider
+instance's credentials at an admitted endpoint. A credential binding cannot
+widen sandbox network policy.
+
+For example, this profile endpoint binds all static credential environment keys
+from the profile to `api.example.com:443` under `/v1`:
+
+```yaml showLineNumbers={false}
+endpoints:
+  - host: api.example.com
+    port: 443
+    path: /v1/**
+```
+
+The path `/v1/**` matches `/v1` and its descendants. An empty path, `**`, or
+`/**` matches every path on the selected host and port. Other path values use
+glob matching. OpenShell removes the query string and uses a canonical,
+secret-redacted path for this check, so a credential embedded in a request path
+does not need to be revealed before authorization.
+
+Use an explicit sandbox policy binding when the profile intentionally defines
+credentials without defining service endpoints. The policy names the concrete
+provider instance, not the profile type:
+
+```yaml showLineNumbers={false}
+network_policies:
+  gcp_storage:
+    endpoints:
+      - host: storage.googleapis.com
+        port: 443
+        protocol: rest
+        access: full
+        credential_binding:
+          provider: work-gcp
+```
+
+The provider must be attached to the sandbox and must select an endpointless
+profile. OpenShell rejects the complete policy update if the provider is
+unattached, has no profile, or selects a profile that already defines endpoints.
+This keeps one source of credential-binding authority for each provider.
+`credential_binding` is sandbox-scoped and is not accepted in a gateway-global
+policy.
+
+For AWS endpoints, the binding and signing fields have separate jobs.
+`credential_binding.provider` selects the provider instance that supplies
+credentials. `credential_signing`, `signing_service`, and `signing_region`
+control how the proxy applies those credentials:
+
+```yaml showLineNumbers={false}
+network_policies:
+  aws_s3:
+    endpoints:
+      - host: s3.us-west-2.amazonaws.com
+        port: 443
+        protocol: rest
+        access: full
+        credential_binding:
+          provider: work-aws
+        credential_signing: sigv4
+        signing_service: s3
+        signing_region: us-west-2
+```
+
+The binding applies to CONNECT and forward-proxy HTTP requests, including
+headers, Basic and Bearer authorization, URL paths, query parameters, opted-in
+request bodies, AWS SigV4 signing, and opted-in WebSocket text messages. Raw
+`tls: skip` and non-HTTP tunnels do not perform static credential substitution.
+
+Before it activates a sandbox policy, OpenShell verifies that every endpoint
+with `credential_signing` has an attached profile that declares
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. An endpoint-bearing profile must
+cover the signed host, port, and path. An endpointless profile must be selected
+by `credential_binding.provider` on that endpoint. A missing or mismatched
+source rejects the whole policy update with `FAILED_PRECONDITION`.
+
+If an HTTP request contains a known placeholder at a destination outside its
+binding, OpenShell returns HTTP 403 with this response:
+
+```json
+{"error":"credential_endpoint_mismatch","message":"Credential is not authorized for this request endpoint"}
+```
+
+The sandbox logs include the destination and
+`credential_endpoint_mismatch`. OCSF output includes both the denied activity
+and a detection finding. These events omit credential values, placeholders,
+environment keys, and query strings.
+
+For opted-in WebSocket text-message rewriting, the mismatch can occur after the
+HTTP 101 upgrade has completed. OpenShell closes that WebSocket with policy
+violation code 1008 instead of returning an HTTP response.
+
+Binding updates apply to both current and retained placeholder generations.
+For gateway-managed refresh credentials, automatic and manual token rotation
+keep one opaque workload placeholder and replace only its current resolver
+value. This lets a long-running process use each newly minted access token
+without restarting. OpenShell does not retain older values behind this stable
+placeholder.
+
+Explicitly configuring refresh again starts a new authorization epoch, even
+when the provider and credential key are unchanged. Reconfiguration, provider
+replacement or detachment, refresh deletion, and endpoint-boundary changes
+revoke the old placeholder. Updating a provider profile changes the binding on
+the next sandbox provider-environment sync.
+
+<Warning>
+Static credentials require at least one usable binding. OpenShell withholds only
+the static credential keys and associated expiry and binding metadata from an
+endpointless selected profile when no sandbox policy endpoint explicitly binds
+that provider. It retains that provider's generated non-secret configuration
+and valid endpoint-bound static credentials from other attached providers.
+</Warning>
+
+After upgrading a gateway and supervisor to a release with endpoint binding,
+restart or recreate older running sandboxes. A new gateway withholds static
+credential material from supervisors that do not advertise binding support.
+Rotate attached static credentials after upgrading when an older sandbox may
+have received their real values.
+
+When upgrading from revision-scoped refresh placeholders to stable refresh
+handles, restart each existing workload once so it receives the new placeholder.
+Later access-token rotations do not require workload restarts.
+
+## Roadmap
+
+The following provider profile design items are not part of the current behavior:
+
+| Roadmap item | Current behavior |
+|---|---|
+| General profile-driven credential placement | Static `auth_style`, `header_name`, `query_param`, and `path_template` placement metadata is stored and validated, but static credential injection still depends on environment placeholders generated from provider credentials. Dynamic `token_grant` credentials support `bearer` and `header` placement for matching HTTP endpoints. |
+| Binary-scoped credential injection | Provider profile binaries affect policy composition but do not yet restrict placeholder resolution by calling binary. Static and dynamic credentials are endpoint-scoped. |
+| Credential verification on create | `openshell provider create` does not yet probe provider verification endpoints or expose `--no-verify`. |
+| Automatic credential scope extraction | OpenShell does not yet inspect upstream provider responses to discover credential scopes. |
+| Inference mounting from attached providers | `inference_capable` is profile metadata. Attaching an inference-capable provider does not yet create `inference.local` routes. |
+| Multi-provider inference routing | Path-based routing such as `inference.local/openai/...` and `inference.local/anthropic/...` is not yet wired to provider profiles. |
+| Policy prover integration | OpenShell does not yet run the policy prover automatically on sandbox startup or block startup based on prover findings. |
+| Refresh telemetry as OCSF events | Credential refresh logs are secret-safe gateway logs. OCSF refresh events and metrics are future work. |
+
+Use [Inference Routing](/sandboxes/inference-routing) for the current `inference.local` model.
+
+## Provider Profiles
+
+A provider profile defines a provider type. It contains metadata, credential declarations, endpoint policy, binary policy, inference metadata, and optional credential refresh metadata.
+
+List available profiles:
+
+```shell
+openshell provider list-profiles
+```
+
+By default the gateway lists built-in profiles plus custom profiles imported
+through the profile APIs. When a configured gateway interceptor vends an
+authoritative provider profile catalog, that catalog becomes the visible source
+of truth: list, export, provider creation, policy composition, and sandbox
+provider environment resolution use the interceptor-vended profiles instead of
+built-in or user-imported profiles.
+
+Built-in provider profiles currently include:
+
+| Profile ID | Category | Credential environment variables |
+|---|---|---|
+| `anthropic` | `inference` | `ANTHROPIC_API_KEY` |
+| `claude-code` | `agent` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` |
+| `codex` | `agent` | `CODEX_AUTH_ACCESS_TOKEN`, `CODEX_AUTH_REFRESH_TOKEN`, `CODEX_AUTH_ACCOUNT_ID`, `CODEX_AUTH_ID_TOKEN` |
+| `copilot` | `agent` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` |
+| `cursor` | `agent` | None |
+| `deepinfra` | `inference` | `DEEPINFRA_API_KEY` |
+| `github` | `source_control` | `GITHUB_TOKEN`, `GH_TOKEN` |
+| `google-vertex-ai` | `inference` | `GOOGLE_SERVICE_ACCOUNT_KEY`, `GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN`, `VERTEX_AI_SERVICE_ACCOUNT_TOKEN`, `GOOGLE_VERTEX_AI_TOKEN`, `VERTEX_AI_TOKEN` |
+| `nvidia` | `inference` | `NVIDIA_API_KEY` |
+| `openai` | `inference` | `OPENAI_API_KEY` |
+| `pypi` | `data` | None |
+
+Export a built-in profile as YAML:
+
+```shell
+openshell provider profile export github -o yaml > github-profile.yaml
+```
+
+Lint a profile before importing it:
+
+```shell
+openshell provider profile lint -f github-profile.yaml
+```
+
+Import one profile file:
+
+```shell
+openshell provider profile import -f github-profile.yaml
+```
+
+Import all non-recursive `*.yaml`, `*.yml`, and `*.json` files from a directory:
+
+```shell
+openshell provider profile import --from ./provider-profiles
+```
+
+Import is create-only. It fails if a custom profile with the same ID already exists.
+
+Update an existing custom profile by exporting the current custom profile, editing the file, and submitting the edited file back:
+
+```shell
+openshell provider profile export github-profile -o yaml > github-profile.yaml
+openshell provider profile update github-profile -f github-profile.yaml
+```
+
+Exported custom profiles include `resource_version`. OpenShell requires that version during update so stale files cannot silently overwrite newer profile definitions. The target ID in the command must match the profile ID in the file. Update accepts one file at a time. If an update would make dynamic token grants ambiguous for an attached sandbox, OpenShell rejects it before changing the profile.
+
+Custom profile IDs must use lowercase kebab-case with `a-z`, `0-9`, and `-`. Built-in profile IDs and legacy provider aliases are reserved. Built-in and interceptor-managed profiles are read-only through the profile APIs. OpenShell also rejects deleting a custom profile while a sandbox-attached provider uses it.
+
+### Category Enum
+
+The `category` field controls how `openshell provider list-profiles` groups profiles. Use one of these canonical YAML values:
+
+| Value | Use for |
+|---|---|
+| `other` | Profiles that do not fit a more specific category. This is the default when omitted. |
+| `inference` | Model and inference API providers. |
+| `agent` | Agent CLIs and coding tools. |
+| `source_control` | Git hosting, repository, and source control providers. |
+| `messaging` | Chat, email, notification, and messaging APIs. |
+| `data` | Data storage, file, database, and document APIs. |
+| `knowledge` | Search, retrieval, and knowledge-base providers. |
+
+### Profile Schema
+
+Provider profile YAML and JSON use this shape. Treat this as a field map, not a profile to import verbatim. The endpoint and rule fields mirror the network policy schema used under `network_policies`. Refer to [Policy Schema Reference](/reference/policy-schema) for field semantics.
+Use `annotations` only for non-secret metadata such as source, signature, or governance markers. OpenShell preserves annotations through profile import, export, and interceptor-managed profile snapshots.
+
+```yaml wordWrap showLineNumbers={false}
+id: custom-api
+# Present on exported custom profiles; preserve it when updating.
+resource_version: 1
+annotations:
+  example.com/source: platform
+display_name: Custom API
+description: Custom API access for sandbox agents
+category: data
+inference_capable: false
+
+credentials:
+  - name: user_oidc_token
+    description: User OIDC token stored for gateway-side token exchange only
+    required: true
+
+  - name: api_token
+    description: API access token
+    env_vars: [CUSTOM_API_TOKEN]
+    required: true
+
+    # Accepted values: basic, bearer, header, query, path.
+    # These fields describe static credential placement.
+    # Static runtime injection still uses env placeholder resolution.
+    auth_style: bearer
+    header_name: authorization
+    query_param: api_key
+    path_template: /v1/{credential}/resources
+
+    refresh:
+      # Accepted values:
+      # static, external, oauth2_refresh_token,
+      # oauth2_client_credentials, google_service_account_jwt.
+      strategy: oauth2_client_credentials
+      token_url: https://login.example.com/oauth2/token
+      scopes: [api.read, api.write]
+      refresh_before_seconds: 300
+      max_lifetime_seconds: 3600
+      material:
+        - name: client_id
+          description: OAuth client ID
+          required: true
+          secret: false
+        - name: client_secret
+          description: OAuth client secret
+          required: true
+          secret: true
+
+    # Optional dynamic credential. The sandbox supervisor resolves this on
+    # demand for matching endpoint traffic, caches the returned access token,
+    # and injects it according to auth_style/header_name.
+    token_grant:
+      # Accepted values: client_credentials, token_exchange.
+      grant_type: token_exchange
+      token_endpoint: https://login.example.com/realms/custom/protocol/openid-connect/token
+      audience: api://custom-api
+      jwt_svid_audience: https://login.example.com/realms/custom
+      client_assertion_type: urn:ietf:params:oauth:client-assertion-type:jwt-spiffe
+      scopes: [api.read, api.write]
+      cache_ttl_seconds: 300
+      requested_token_type: urn:ietf:params:oauth:token-type:access_token
+      subject_token:
+        source: provider_credential
+        credential: user_oidc_token
+        subject_token_type: urn:ietf:params:oauth:token-type:access_token
+      audience_overrides:
+        - host: api.example.com
+          port: 443
+          path: /v1/projects/**
+          audience: api://custom-projects
+          scopes: [projects.read]
+
+discovery:
+  credentials: [api_token]
+
+endpoints:
+  - host: api.example.com
+    port: 443
+    path: /v1/**
+    protocol: rest
+    tls: ""
+    enforcement: enforce
+    allowed_ips: []
+    ports: []
+    allow_encoded_slash: false
+    websocket_credential_rewrite: false
+    request_body_credential_rewrite: false
+    allow_uninspected_credentials: false
+    persisted_queries: deny
+    graphql_max_body_bytes: 65536
+    rules:
+      - allow:
+          method: GET
+          path: /v1/projects/**
+          command: ""
+          query:
+            tag:
+              any: ["prod-*", "staging-*"]
+          operation_type: ""
+          operation_name: ""
+          fields: []
+    deny_rules:
+      - method: DELETE
+        path: /v1/projects/**
+        command: ""
+        query: {}
+        operation_type: ""
+        operation_name: ""
+        fields: []
+    graphql_persisted_queries:
+      # Key must match the request's persisted query hash or saved-query ID.
+      9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08:
+        operation_type: query
+        operation_name: GetProject
+        fields: [project]
+
+binaries:
+  - /usr/bin/curl
+  - /usr/local/bin/custom-cli
+```
+
+### Profile Sections
+
+`id`, `display_name`, and `description` identify the profile. `id` is the value passed to `openshell provider create --type`.
+
+`category` groups profiles in `openshell provider list-profiles`. Use one of the values in the category enum.
+
+`credentials` declares the credential names, environment variables, auth metadata, optional refresh metadata, and optional dynamic token grant metadata for the provider type. The `auth_style` field accepts `basic`, `bearer`, `header`, `query`, or `path`. When `auth_style` is `path`, set `path_template` to a URL path containing the `{credential}` placeholder exactly once (for example, `/v1/{credential}/resources`). Static credentials are exposed as placeholder environment variables and resolved in outbound HTTP requests only at their binding endpoints. Every static credential environment key receives the full profile endpoint set when the profile defines endpoints. An endpointless profile requires explicit sandbox policy bindings for each attached provider instance. Dynamic token grants are resolved by the sandbox proxy on demand for matching profile endpoints and support `bearer` or `header` placement. Credential environment variable names must not use the reserved `v<digits>_` prefix, such as `v10_GITHUB_TOKEN`, because OpenShell uses that namespace for revision-scoped placeholders.
+
+`discovery` controls what `--from-existing` scans. Each entry in
+`discovery.credentials` must name a
+credential declared under `credentials`. OpenShell scans the referenced
+credential's `env_vars` in order and stores the first non-empty local
+environment value under the actual environment variable key.
+
+`endpoints` contains the same endpoint object shape as sandbox network policy. A profile can use access presets, protocol-specific allow rules, deny rules, WebSocket credential rewriting, request body credential rewriting, GraphQL fields, and SSRF IP allowlists. Because profile credentials are not mapped to individual endpoints, OpenShell conservatively treats every endpoint in a profile that declares credentials as credentialed. Such endpoints require L7 inspection and cannot use `tls: skip` unless the profile explicitly sets `allow_uninspected_credentials: true`.
+
+`binaries` contains the executable paths allowed to reach the profile endpoints when the profile contributes policy to a sandbox.
+
+`inference_capable` marks profiles that are intended to participate in inference workflows. It does not currently mount or configure `inference.local`.
+
+### Refresh Metadata
+
+Credential refresh metadata belongs to one credential declaration. The profile defines allowed defaults, such as token URL, scopes, refresh lead time, maximum lifetime, and required material keys. The provider instance stores the actual refresh material.
+
+Profile YAML can declare these refresh strategies:
+
+| Strategy | Behavior |
+|---|---|
+| `static` | Current credentials are updated through `openshell provider update`. The gateway does not mint a token. |
+| `external` | An external process updates current credentials through `openshell provider update`. The gateway does not mint a token. |
+| `oauth2_refresh_token` | The gateway exchanges a refresh token for a short-lived access token. |
+| `oauth2_client_credentials` | The gateway mints a short-lived access token with OAuth2 client credentials. |
+| `google_service_account_jwt` | The gateway signs a Google service account JWT and exchanges it for an access token. |
+| `aws_sts_assume_role` | The gateway calls `sts:AssumeRole` and mints `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` in one operation. |
+
+`openshell provider refresh configure` accepts only gateway-mintable strategies: `oauth2-refresh-token`, `oauth2-client-credentials`, `google-service-account-jwt`, and `aws-sts-assume-role`. Use `openshell provider update` for `static` and `external` refresh patterns.
+
+Gateway-managed refresh strategies use these material keys:
+
+| Strategy | Material keys |
+|---|---|
+| `oauth2_refresh_token` | `client_id`, `refresh_token`, optional `client_secret`. |
+| `oauth2_client_credentials` | `client_id`, `client_secret`, optional `tenant_id` for Microsoft Entra token URLs. |
+| `google_service_account_jwt` | `client_email`, `private_key`, optional `subject` or `sub`. |
+| `aws_sts_assume_role` | `role_arn`, optional `session_name`, `external_id`, `aws_region`, and optional long-lived `aws_access_key_id` / `aws_secret_access_key` for gateways without ambient AWS credentials. |
+
+OpenShell keeps token endpoints profile-owned. Refresh material cannot override `token_url` or `token_uri` during refresh configuration.
+
+### Additional Outputs
+
+Most refresh strategies mint a single credential. `aws_sts_assume_role` mints three. A refresh declares the extra credentials it co-mints with `additional_outputs`, mapping each strategy-defined output id to a sibling credential whose `env_vars` receive the value:
+
+```yaml
+credentials:
+  - name: access_key_id
+    env_vars: [AWS_ACCESS_KEY_ID]
+    required: true
+    refresh:
+      strategy: aws_sts_assume_role
+      additional_outputs:
+        - output: secret_access_key
+          credential: secret_access_key
+        - output: session_token
+          credential: session_token
+  - name: secret_access_key
+    env_vars: [AWS_SECRET_ACCESS_KEY]
+    required: true
+  - name: session_token
+    env_vars: [AWS_SESSION_TOKEN]
+    required: true
+```
+
+The refresh attaches to the primary credential (`access_key_id`). Each referenced sibling must exist, declare exactly one env var, and not carry its own refresh. Because a refresh's outputs are runtime-resolvable, a profile whose only credentials are STS-minted can be created with `--runtime-credentials`. The resolved output-to-env-key mapping is pinned when refresh is configured, so later profile edits do not silently redirect where minted values are written.
+
+### Dynamic Token Grants
+
+`token_grant` belongs to one credential declaration. When a sandbox with the provider attached sends HTTP traffic to a matching profile endpoint, the supervisor resolves the dynamic credential, caches the returned access token, and injects it before forwarding the request upstream. Use `auth_style: bearer` to inject `Authorization: Bearer <token>`, or `auth_style: header` with `header_name` to inject the raw access token into a custom header. Token grants do not support `query` or `path` placement.
+
+OpenShell supports two dynamic grant types:
+
+| Grant type | Behavior |
+|---|---|
+| `client_credentials` | The supervisor requests a SPIFFE JWT-SVID from the local Workload API and sends it directly to `token_endpoint` as the OAuth2 client assertion. This is the default when `grant_type` is omitted. |
+| `token_exchange` | The supervisor first asks the gateway for an intermediate token. The request includes the supervisor JWT-SVID; the gateway verifies it, uses the SVID subject as the intermediate token audience, and exchanges the stored subject credential at the same `token_endpoint` using the gateway's own JWT-SVID as the client assertion. The supervisor then exchanges that intermediate token for the final upstream token using its own JWT-SVID as the client assertion. |
+
+Create provider instances for token-grant-only profiles with `--runtime-credentials`. This records an empty provider instance and makes the runtime-resolved credential source explicit:
+
+```shell
+openshell provider create \
+  --name spiffe-token-demo \
+  --type spiffe-token-demo \
+  --runtime-credentials
+```
+
+For `token_exchange` profiles, the provider also stores the user subject token referenced by `token_grant.subject_token.credential`. That credential is gateway-only: the sandbox does not receive it as environment material, static credential binding metadata, or workload placeholder ownership. Create or update that provider credential from the current gateway OIDC login with `--from-oidc-token`. This requires an active named gateway that was registered for OIDC. The CLI copies the current OIDC access token and its expiry into the provider. If the stored gateway access token is expired and a refresh token is available, the CLI refreshes it first. OpenShell does not store the OIDC refresh token in the provider. When the stored subject-token credential expires, the gateway rejects intermediate token exchange until the provider is updated with a fresh token.
+
+```shell
+openshell provider create \
+  --name custom-api \
+  --type custom-api \
+  --from-oidc-token
+
+openshell provider update custom-api \
+  --from-oidc-token
+```
+
+OpenShell infers the destination credential when the provider profile has exactly one `token_grant.subject_token.credential`. If a profile declares more than one token-exchange subject credential, pass `--credential <key>` to choose one.
+
+Token grant fields:
+
+| Field | Required | Behavior |
+|---|---|---|
+| `grant_type` | No | `client_credentials` or `token_exchange`. Defaults to `client_credentials` for backward compatibility. |
+| `token_endpoint` | Yes | OAuth2 token endpoint that accepts a SPIFFE JWT-SVID client assertion. Use `https://` unless the endpoint is loopback or a Kubernetes service DNS name such as `token-issuer.default.svc.cluster.local`. |
+| `audience` | No | Resource audience requested from the token service. For `token_exchange`, this is the final exchange audience; the gateway intermediate exchange always uses the verified supervisor SVID subject as its audience. |
+| `jwt_svid_audience` | No | Audience used when requesting the JWT-SVID. When omitted, OpenShell derives an issuer-style audience from Keycloak token endpoint paths or falls back to the full token endpoint URL. |
+| `client_assertion_type` | No | OAuth2 `client_assertion_type` form value. Defaults to RFC 7523 `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`. Set `urn:ietf:params:oauth:client-assertion-type:jwt-spiffe` when the token issuer expects the SPIFFE assertion type. |
+| `scopes` | No | OAuth2 scopes sent as a space-separated `scope` parameter. |
+| `cache_ttl_seconds` | No | Token cache TTL override. When omitted or `0`, OpenShell uses the token response `expires_in` with a 30-second safety margin and one-hour cap, or five minutes minus the margin if the response does not include an expiry. |
+| `requested_token_type` | No | RFC 8693 `requested_token_type` sent during token exchange. Defaults to `urn:ietf:params:oauth:token-type:access_token`. |
+| `subject_token` | Required for `token_exchange` | Subject-token source used for the gateway-brokered intermediate exchange. Phase one supports `source: provider_credential`, where `credential` names another credential declared in the same profile. That referenced credential is broker-only and cannot declare workload injection metadata such as env vars, static placement, refresh, or token grant metadata. |
+| `subject_token.subject_token_type` | No | RFC 8693 `subject_token_type` for the stored subject token. Defaults to `urn:ietf:params:oauth:token-type:access_token`. |
+| `audience_overrides` | No | Endpoint-specific final-exchange `audience` and `scopes` overrides selected by host, port, and path. These overrides do not affect the gateway intermediate exchange. |
+
+Token grants require the sandbox supervisor to have access to a SPIFFE Workload API socket. `token_exchange` also requires the gateway to have its own Workload API socket so it can present a gateway JWT-SVID during the intermediate exchange. They apply to HTTP traffic that the proxy can inspect. Endpoints with `tls: skip` bypass TLS termination and cannot receive dynamic token grant injection for HTTPS traffic. The token service must return a token value that is safe for HTTP header placement; malformed values are rejected before caching or header injection.
+
+The gateway only brokers an intermediate token for a sandbox principal, and only when the requested provider is attached to that sandbox. It verifies the supervisor JWT-SVID issuer, audience, signature, and SPIFFE trust domain against the gateway's own JWT-SVID, then uses the verified supervisor SVID subject as the intermediate-token audience.
+
+## Provider Instances
+
+A provider instance stores concrete credentials and config for a profile type. Built-in profile IDs and imported custom profile IDs are accepted by `--type`.
+
+Create a GitHub provider from the built-in `github` profile:
+
+```shell
+openshell provider create \
+  --name work-github \
+  --type github \
+  --credential GITHUB_TOKEN
+```
+
+Create a provider from local credentials discovered through the provider profile:
+
+```shell
+openshell provider create \
+  --name work-claude \
+  --type claude-code \
+  --from-existing
+```
+
+`--from-existing` uses the provider profile's `discovery` section. If no
+profile exists for the requested type, the command fails instead of falling
+back to the retired provider registry. The built-in `openai` profile discovers
+`OPENAI_API_KEY`; the built-in `anthropic` profile discovers
+`ANTHROPIC_API_KEY`.
+
+Create a provider from an imported custom profile:
+
+```shell
+openshell provider create \
+  --name custom-api \
+  --type custom-api \
+  --credential CUSTOM_API_TOKEN
+```
+
+Create a provider whose credential is stored by a configured gateway credential
+driver:
+
+```shell
+openshell provider create \
+  --name openai-stored \
+  --type openai \
+  --credential OPENAI_API_KEY
+```
+
+The create/update API stores submitted provider credentials and secret refresh
+material through the gateway's active credential storage path and persists only
+internal credential handles. Secret refresh material includes OAuth refresh
+tokens, client secrets, service-account private keys, and temporary AWS source
+secrets. By default, the gateway stores AES-256-GCM encrypted credential
+envelopes in the gateway database outside provider and refresh-state records. The Helm chart
+creates a retained Kubernetes Secret for the default storage key-encryption key
+and injects it into every gateway pod when no external credential driver is enabled.
+`credential_drivers = []` is invalid. Multi-replica Kubernetes gateways can use
+a shared database with the default encrypted store, or choose a shared backend
+such as `kubernetes-secrets` or `vault`.
+
+Every `secret_material_keys` entry must name a key supplied in `material` in the
+same configure request. Clients submit secret values, not internal credential
+handles.
+
+Provider records that already contain inline database credentials remain
+readable for upgrade compatibility. New provider create/update requests store
+credential values through the active credential driver and persist only handles.
+
+Provider profiles whose required credentials are fully runtime-resolvable through `token_grant` or gateway-managed refresh can be created without `--credential`.
+
+Inspect the provider:
+
+```shell
+openshell provider get custom-api
+```
+
+Update provider credentials:
+
+```shell
+openshell provider update custom-api --credential CUSTOM_API_TOKEN
+```
+
+Set or clear credential expiry metadata:
+
+```shell
+openshell provider update custom-api \
+  --credential CUSTOM_API_TOKEN="$CUSTOM_API_TOKEN" \
+  --credential-expires-at CUSTOM_API_TOKEN=2026-01-01T00:00:00Z
+```
+
+Use an ISO/RFC3339 timestamp or Unix epoch milliseconds. Use `0` as the timestamp to clear expiry for a credential key.
+
+OpenShell skips expired provider credentials when it builds a sandbox provider environment. Running sandboxes also reject expired retained credential generations during placeholder resolution, so stale placeholders fail closed instead of forwarding unresolved or expired credential material.
+
+The gateway sends a complete host, port, and path binding for every emitted static credential key. It derives bindings from profile endpoints or explicit sandbox policy endpoints for endpointless profiles. It withholds static credential keys from endpointless selected profiles that have no explicit policy binding. Supervisors reject other incomplete binding metadata and clear previously active provider material when a refresh fails validation. Refer to [Static Credential Endpoint Binding](#understand-static-credential-endpoint-binding) for matching, denial, lifecycle, and migration behavior.
+
+## Configure Credential Refresh
+
+Refresh configuration is stored separately from the current injectable credential value. Non-secret refresh configuration remains in the refresh-state record. Secret material is resolved from the active credential driver only while the gateway mints a new short-lived token. The gateway writes the token back through credential storage and updates credential expiry metadata. If an OAuth issuer rotates its refresh token, the gateway stages the replacement through credential storage before committing the refresh generation and removes the previous handle afterward.
+
+For OAuth token endpoint failures, the gateway parses the bounded standard OAuth
+error response and reports a structured recovery action through `provider
+refresh status`. It does not retain provider error descriptions or raw response
+bodies. The recovery actions are:
+
+- `retry`: a network, rate-limit, or temporary issuer failure; the worker retries automatically.
+- `reauthorize`: a user refresh grant is no longer usable, such as `invalid_grant`; obtain a new grant and run `provider refresh configure`.
+- `fix_configuration`: the OAuth client, scopes, grant type, or administrator policy must be corrected.
+- `investigate`: the issuer returned an unrecognized response; the worker retries, but the operator should investigate persistent failures.
+
+The gateway parks `reauthorize` and `fix_configuration` failures instead of
+retrying them every worker tick. A manual `provider refresh rotate` still
+attempts the exchange. The current access token remains available only until
+its recorded expiry, after which credential resolution fails closed.
+
+Before OpenShell 0.1.0, refresh-state and credential-driver migrations are not
+supported. Upgrading from a build that stored refresh material inline requires
+reconfiguring the refresh grant. To change credential drivers, delete or
+reconfigure affected providers while the original driver is still available,
+then select the new driver and create the credentials again. Do not run mixed
+gateway versions against the same refresh records.
+
+Each explicit `refresh configure` call also starts a new gateway-owned
+authorization epoch. Automatic refresh and `refresh rotate` preserve that epoch,
+so running workloads keep the same opaque credential handle while the short-lived
+token changes. Configuring refresh again is a revocation boundary and causes
+running workloads that still hold the previous handle to fail closed.
+
+While gateway-managed refresh is configured, `provider update --credential`
+cannot replace or delete its primary credential or any co-minted output. Use
+`provider refresh rotate` to mint a new short-lived value. Re-run
+`provider refresh configure` to start a new authorization, or use
+`provider refresh delete` before returning those credential keys to manual
+management. You can still update unrelated credentials, configuration, and
+credential expiry metadata.
+
+For a complete Microsoft Graph OAuth2 refresh-token walkthrough, see [Refresh Microsoft Graph Credentials with a Provider Profile](/get-started/tutorials/microsoft-graph-provider-refresh).
+
+The profile YAML strategy values use underscores, while the CLI `--strategy` values use kebab-case:
+
+| Profile YAML | CLI |
+|---|---|
+| `oauth2_refresh_token` | `oauth2-refresh-token` |
+| `oauth2_client_credentials` | `oauth2-client-credentials` |
+| `google_service_account_jwt` | `google-service-account-jwt` |
+
+Create the provider instance first:
+
+```shell
+openshell provider create \
+  --name my-graph \
+  --type microsoft-graph-mail \
+  --credential MS_GRAPH_ACCESS_TOKEN
+```
+
+This example assumes you imported a custom profile with
+`id: microsoft-graph-mail`. Provider refresh can be configured only for provider
+types whose profile declares compatible credential refresh metadata.
+
+Configure OAuth2 client credentials refresh:
+
+```shell
+openshell provider refresh configure my-graph \
+  --credential-key MS_GRAPH_ACCESS_TOKEN \
+  --strategy oauth2-client-credentials \
+  --material tenant_id="$MS_TENANT_ID" \
+  --material client_id="$MS_CLIENT_ID" \
+  --material client_secret="$MS_CLIENT_SECRET" \
+  --secret-material-key client_secret \
+  --credential-expires-at 2026-01-01T00:00:00Z
+```
+
+Configure OAuth2 refresh-token refresh:
+
+```shell
+openshell provider refresh configure my-graph \
+  --credential-key MS_GRAPH_ACCESS_TOKEN \
+  --strategy oauth2-refresh-token \
+  --material client_id="$MS_CLIENT_ID" \
+  --material refresh_token="$MS_REFRESH_TOKEN" \
+  --material client_secret="$MS_CLIENT_SECRET" \
+  --secret-material-key refresh_token \
+  --secret-material-key client_secret
+```
+
+Configure Google service account JWT refresh:
+
+```shell
+openshell provider create \
+  --name drive-work \
+  --type google-drive \
+  --credential GOOGLE_DRIVE_ACCESS_TOKEN
+
+openshell provider refresh configure drive-work \
+  --credential-key GOOGLE_DRIVE_ACCESS_TOKEN \
+  --strategy google-service-account-jwt \
+  --material client_email="$GOOGLE_CLIENT_EMAIL" \
+  --material private_key="$GOOGLE_PRIVATE_KEY" \
+  --secret-material-key private_key
+```
+
+This example assumes you imported a custom profile with `id: google-drive`.
+
+<Note>
+`--secret-material-key` takes the name of a `--material` key, not the secret value. For example, use `--material client_secret="$MS_CLIENT_SECRET"` with `--secret-material-key client_secret`. Prefer `--secret-material-env` so the value does not appear in shell history. The gateway combines caller markings with authoritative profile metadata and strategy-defined secret fields, then stores those values through the active credential driver. Only the `--credential-key` value, such as `MS_GRAPH_ACCESS_TOKEN`, becomes injectable. If an OAuth response rotates a refresh token, OpenShell stores the replacement through the credential driver automatically.
+</Note>
+
+Use `--credential-expires-at` when the current provider credential already has a known expiry timestamp. For refresh-managed keys, the value can be Unix epoch milliseconds or an ISO/RFC3339 timestamp such as `2026-01-01T00:00:00Z` or `2026-01-01T01:00:00+01:00`. OpenShell stores that value as epoch milliseconds in both refresh state and provider credential metadata. Later gateway-managed refreshes replace it with the minted token expiry.
+
+Force a refresh immediately:
+
+```shell
+openshell provider refresh rotate my-graph \
+  --credential-key MS_GRAPH_ACCESS_TOKEN
+```
+
+Check refresh status:
+
+```shell
+openshell provider refresh status my-graph
+```
+
+The status table includes `RECOVERY` and `FAILURE_CODE`. Clients should use the
+structured recovery action rather than parsing `LAST_ERROR`. For example,
+`oauth_invalid_grant` with recovery action `reauthorize` means the user must
+complete OAuth authorization again; `oauth_invalid_client` with
+`fix_configuration` means changing the user login alone will not repair the
+grant. OpenShell parks `reauthorize` failures until an explicit rotation or
+reconfiguration. It retries `fix_configuration` failures hourly so externally
+repaired clocks, policies, or credential-store values can recover without
+creating rapid token-endpoint traffic. Transient and unrecognized failures use
+the existing bounded 60-second retry interval.
+
+The status table reports operational state without printing token values or refresh material:
+
+```text
+PROVIDER                  CREDENTIAL_KEY                STRATEGY                      STATUS                    RECOVERY            EXPIRES_AT            NEXT_REFRESH          LAST_REFRESH          FAILURE_CODE                                  LAST_ERROR
+my-graph                  MS_GRAPH_ACCESS_TOKEN         oauth2_refresh_token          reauthorization_required  reauthorize         2026-06-01 00:00:00   -                     2026-05-31 23:00:00   oauth_invalid_grant                           OAuth refresh grant is no longer usable
+```
+
+When no refresh configuration exists, the CLI distinguishes whole-provider checks from credential-specific checks:
+
+```text
+No refresh configurations found for provider 'my-graph'.
+No refresh configuration found for provider 'my-graph' credential 'MS_GRAPH_ACCESS_TOKEN'.
+```
+
+Delete refresh state for one credential:
+
+```shell
+openshell provider refresh delete my-graph \
+  --credential-key MS_GRAPH_ACCESS_TOKEN
+```
+
+Deleting refresh state clears the provider credential expiry only when that expiry came from the deleted refresh state. If you later set a different expiry manually with `openshell provider update --credential-expires-at`, OpenShell preserves the manual value.
+
+### Refresh Logs
+
+The gateway emits secret-safe refresh logs during each worker sweep. Use these logs to check which credentials the gateway is watching, when the next refresh is due, and whether a credential is already refreshed.
+
+```text
+2026-05-16T19:42:34.705768Z  INFO openshell_server::provider_refresh: provider credential refresh worker sweep watched_count=1 due_count=0 rotation_requested_count=0
+2026-05-16T19:42:34.705905Z  INFO openshell_server::provider_refresh: provider credential refresh watch provider=outlook-email credential_key=MS_GRAPH_ACCESS_TOKEN strategy=oauth2_refresh_token status=refreshed expires_at_ms=1778961995456 seconds_until_expiry=1440 next_refresh_at_ms=1778961395456 last_refresh_at_ms=1778958395456 seconds_until_refresh=840 due=false rotation_requested=false
+```
+
+The sweep line summarizes how many credential refresh records the worker inspected. The watch line shows the provider, credential key, strategy, refresh status, expiry time, next refresh time, and whether refresh is due or manually requested. It does not include access-token values or refresh material.
+
+<Note>
+Refresh updates the provider record. Sandboxes receive the updated credential through the same placeholder environment and proxy rewrite path as other provider credentials.
+</Note>
+
+## Launch Sandboxes with Providers
+
+Attach providers when creating a sandbox with repeated `--provider` flags:
+
+```shell
+openshell sandbox create \
+  --name provider-demo \
+  --provider work-claude \
+  --provider work-github \
+  -- claude
+```
+
+Each attached provider with a matching profile contributes a provider policy layer to the sandbox effective policy. The base policy is the user-authored sandbox policy that you can edit and apply. The effective policy is the composed policy that the sandbox enforces: base policy plus provider policy layers. A gateway-global policy suppresses provider-derived policy layers.
+
+Updating a custom provider profile affects every provider instance whose `type` matches that profile ID. Provider instances are not rewritten, and sandbox-authored policies are not modified. Running sandboxes observe the updated provider-derived policy on their next config sync. If a gateway-global policy is active, provider-derived policy layers remain suppressed.
+
+The CLI can infer a provider profile from a recognized sandbox command and
+auto-create the provider from profile discovery. Attach a different existing
+provider explicitly with `--provider`, or use `openshell sandbox provider
+attach` after creation.
+
+List providers attached to a sandbox:
+
+```shell
+openshell sandbox provider list provider-demo
+```
+
+The list output includes provider name, provider type, credential key count, and config key count.
+Add `--output json` or `--output yaml` to return the provider name and type plus
+sorted `credential_keys` and `config_keys` arrays. Structured output never
+includes credential values, opaque credential handles, or config values.
+
+## Policy Composition
+
+OpenShell stores the base policy and provider attachments separately. When a sandbox asks for its effective policy, the gateway composes the current base policy with provider policy layers just in time.
+
+For example, the built-in GitHub profile contains these endpoints and binaries:
+
+```yaml wordWrap showLineNumbers={false}
+id: github
+display_name: GitHub
+category: source_control
+credentials:
+  - name: api_token
+    env_vars: [GITHUB_TOKEN, GH_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+endpoints:
+  - host: api.github.com
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+  - host: api.github.com
+    port: 443
+    path: /graphql
+    protocol: graphql
+    access: read-only
+    enforcement: enforce
+  - host: github.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: { method: GET, path: "**" }
+      - allow: { method: HEAD, path: "**" }
+      - allow: { method: OPTIONS, path: "**" }
+      - allow: { method: POST, path: "/**/git-upload-pack" }
+binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]
+```
+
+The `github.com` git-transport endpoint uses explicit rules instead of the `read-only` preset so HTTPS clone and fetch work out of the box. Git smart HTTP performs a `GET` on `*/info/refs` followed by a `POST` to `*/git-upload-pack`; the read-only preset (`GET`/`HEAD`/`OPTIONS`) blocks that `POST`. The rules permit the read-only methods plus `POST */git-upload-pack` only, so clone and fetch succeed while push (`git-receive-pack`) and other API mutations stay denied. Enabling push requires an explicit policy proposal.
+
+If a sandbox attaches a provider named `work-github`, the effective policy includes a generated provider rule:
+
+```yaml wordWrap showLineNumbers={false}
+network_policies:
+  custom_pypi:
+    name: custom_pypi
+    endpoints:
+      - host: pypi.org
+        port: 443
+        protocol: rest
+        access: read-only
+        enforcement: enforce
+    binaries:
+      - path: /usr/bin/python
+
+  _provider_work_github:
+    name: _provider_work_github
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        access: read-only
+        enforcement: enforce
+      - host: api.github.com
+        port: 443
+        path: /graphql
+        protocol: graphql
+        access: read-only
+        enforcement: enforce
+      - host: github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "**" }
+          - allow: { method: HEAD, path: "**" }
+          - allow: { method: OPTIONS, path: "**" }
+          - allow: { method: POST, path: "/**/git-upload-pack" }
+    binaries:
+      - path: /usr/bin/gh
+      - path: /usr/local/bin/gh
+      - path: /usr/bin/git
+      - path: /usr/local/bin/git
+```
+
+Inspect the effective policy:
+
+```shell
+openshell policy get provider-demo --full
+```
+
+Pull the round-trippable base policy without provider entries:
+
+```shell
+openshell policy get provider-demo --base
+```
+
+Composition follows these rules:
+
+- Provider policy entries use reserved `_provider_*` keys derived from provider instance names.
+- Provider policy entries are derived data. OpenShell does not persist them back into the base policy.
+- User-authored policies cannot define `_provider_*` network policy keys. The gateway rejects those keys on sandbox create and full policy replacement, and sandbox-originated policy sync strips them before persistence.
+- Provider and user rules are concatenated. Overlapping endpoints remain separate rules.
+- A gateway global policy override suppresses provider-derived policy layers.
+
+## Attach and Detach Providers
+
+Attach an existing provider to a running sandbox:
+
+```shell
+openshell sandbox provider attach provider-demo work-github
+```
+
+Detach a provider:
+
+```shell
+openshell sandbox provider detach provider-demo work-github
+```
+
+Attach and detach are idempotent. Attach validates that the provider exists before mutating the sandbox, and provider deletion fails while the provider is attached to any sandbox.
+
+### Runtime Limitations
+
+Provider attach and detach update the persisted sandbox provider list. Running sandboxes poll for provider environment revisions and effective policy changes.
+
+The policy effect applies to future effective policy reads after the sandbox observes the update. The credential environment effect applies only to new process launches after the update is observed, such as later SSH, exec, or SFTP sessions.
+
+Already-running processes keep the placeholder environment they started with. OpenShell does not mutate a live process environment after provider attach, detach, or credential update. The proxy resolves existing placeholders against current credentials and bindings, so rotation, expiry, endpoint changes, and detach take effect without restarting the process. If a long-running process needs a newly attached provider credential placeholder, restart that process or launch a new process after the sandbox has observed the provider update.
+
+Detaching a provider removes its provider policy layer from future effective policy reads, revokes resolution for its existing placeholders, and removes its credential placeholders from future process environments. It does not remove the placeholder strings from already-running process environments.
+
+OpenShell rejects provider updates and refresh configuration when they would make two providers attached to the same sandbox expose the same active credential environment key. It also rejects attached provider sets with ambiguous dynamic token grants at equal host/path specificity. Use provider-specific credential names and make one dynamic grant selector more specific when one sandbox needs multiple providers with overlapping upstream concepts.
+
+## Next Steps
+
+- Use [Providers](/sandboxes/manage-providers) for the current provider command reference.
+- Use [Customize Sandbox Policies](/sandboxes/policies) to apply user-authored policy rules.
+- Use [Policy Schema Reference](/reference/policy-schema) for endpoint and L7 rule field details.

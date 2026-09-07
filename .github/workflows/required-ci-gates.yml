@@ -1,6 +1,8 @@
 name: Required CI Gates
 
 on:
+  merge_group:
+    types: [checks_requested]
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
   workflow_run:
@@ -17,7 +19,7 @@ permissions:
   statuses: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.workflow_run.head_sha || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.workflow_run.head_sha || github.sha || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -33,9 +35,13 @@ jobs:
           PR_NUMBER_FROM_EVENT: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA_FROM_EVENT: ${{ github.event.pull_request.head.sha }}
           PR_LABELS_FROM_EVENT: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          GITHUB_SHA_FROM_CONTEXT: ${{ github.sha }}
+          GITHUB_REF_NAME_FROM_CONTEXT: ${{ github.ref_name }}
+          GITHUB_RUN_ID_FROM_CONTEXT: ${{ github.run_id }}
           WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           WORKFLOW_RUN_EVENT: ${{ github.event.workflow_run.event }}
+          WORKFLOW_RUN_HTML_URL: ${{ github.event.workflow_run.html_url }}
         shell: bash
         run: |
           set -euo pipefail
@@ -67,12 +73,19 @@ jobs:
           }
 
           resolve_pull_request_event() {
+            CONTEXT_KIND="pull_request"
+            WORKFLOW_EVENT="push"
             PR_NUMBER="$PR_NUMBER_FROM_EVENT"
             HEAD_SHA="$PR_HEAD_SHA_FROM_EVENT"
             LABELS_JSON=$(jq -c . <<< "$PR_LABELS_FROM_EVENT")
+            MIRROR_REF="pull-request/$PR_NUMBER"
+            EXPECTED_HEAD_BRANCH="$MIRROR_REF"
+            STATUS_TARGET_URL="https://github.com/$GH_REPO/pull/$PR_NUMBER"
           }
 
           load_pr_context() {
+            CONTEXT_KIND="pull_request"
+            WORKFLOW_EVENT="push"
             PR_NUMBER="$1"
 
             local pr state
@@ -85,9 +98,35 @@ jobs:
 
             HEAD_SHA=$(jq -r '.head.sha' <<< "$pr")
             LABELS_JSON=$(gh api "repos/$GH_REPO/issues/$PR_NUMBER" --jq '[.labels[].name]')
+            MIRROR_REF="pull-request/$PR_NUMBER"
+            EXPECTED_HEAD_BRANCH="$MIRROR_REF"
+            STATUS_TARGET_URL="https://github.com/$GH_REPO/pull/$PR_NUMBER"
+          }
+
+          resolve_merge_group_event() {
+            CONTEXT_KIND="merge_group"
+            WORKFLOW_EVENT="merge_group"
+            HEAD_SHA="$GITHUB_SHA_FROM_CONTEXT"
+            LABELS_JSON="[]"
+            EXPECTED_HEAD_BRANCH="$GITHUB_REF_NAME_FROM_CONTEXT"
+            STATUS_TARGET_URL="https://github.com/$GH_REPO/actions/runs/$GITHUB_RUN_ID_FROM_CONTEXT"
+          }
+
+          resolve_merge_group_workflow_run_event() {
+            CONTEXT_KIND="merge_group"
+            WORKFLOW_EVENT="merge_group"
+            HEAD_SHA="$WORKFLOW_RUN_HEAD_SHA"
+            LABELS_JSON="[]"
+            EXPECTED_HEAD_BRANCH="$WORKFLOW_RUN_HEAD_BRANCH"
+            STATUS_TARGET_URL="${WORKFLOW_RUN_HTML_URL:-https://github.com/$GH_REPO/actions}"
           }
 
           resolve_workflow_run_event() {
+            if [ "$WORKFLOW_RUN_EVENT" = "merge_group" ]; then
+              resolve_merge_group_workflow_run_event
+              return
+            fi
+
             if [ "$WORKFLOW_RUN_EVENT" != "push" ]; then
               echo "Ignoring workflow_run from event '$WORKFLOW_RUN_EVENT'."
               exit 0
@@ -112,6 +151,8 @@ jobs:
           resolve_context() {
             if [ "$EVENT_NAME" = "pull_request_target" ]; then
               resolve_pull_request_event
+            elif [ "$EVENT_NAME" = "merge_group" ]; then
+              resolve_merge_group_event
             elif [ "$EVENT_NAME" = "workflow_run" ]; then
               resolve_workflow_run_event
             else
@@ -119,22 +160,25 @@ jobs:
               exit 1
             fi
 
-            PR_URL="https://github.com/$GH_REPO/pull/$PR_NUMBER"
-            MIRROR_REF="pull-request/$PR_NUMBER"
+            STATUS_TARGET_URL="${STATUS_TARGET_URL:-https://github.com/$GH_REPO/actions}"
           }
 
           verify_mirror() {
             local context="$1"
             local mirror_sha
 
+            if [ "$CONTEXT_KIND" = "merge_group" ]; then
+              return 0
+            fi
+
             mirror_sha=$(gh api "repos/$GH_REPO/branches/$MIRROR_REF" --jq '.commit.sha' 2>/dev/null || true)
             if [ -z "$mirror_sha" ]; then
-              post_status "$context" pending "Waiting for /ok to test mirror" "$PR_URL"
+              post_status "$context" pending "Waiting for /ok to test mirror" "$STATUS_TARGET_URL"
               return 1
             fi
 
             if [ "$mirror_sha" != "$HEAD_SHA" ]; then
-              post_status "$context" pending "Waiting for /ok to test mirror" "$PR_URL"
+              post_status "$context" pending "Waiting for /ok to test mirror" "$STATUS_TARGET_URL"
               return 1
             fi
 
@@ -149,8 +193,8 @@ jobs:
             local required_job_name="${5:-}"
             local workflow_url="https://github.com/$GH_REPO/actions/workflows/$workflow_file"
 
-            if [ -n "$required_label" ] && ! has_label "$required_label"; then
-              post_status "$context" success "$required_label not applied" "$PR_URL"
+            if [ "$CONTEXT_KIND" = "pull_request" ] && [ -n "$required_label" ] && ! has_label "$required_label"; then
+              post_status "$context" success "$required_label not applied" "$STATUS_TARGET_URL"
               return 0
             fi
 
@@ -159,8 +203,12 @@ jobs:
             fi
 
             local runs latest run_id status conclusion run_url real_success
-            runs=$(gh api "repos/$GH_REPO/actions/workflows/$workflow_file/runs?head_sha=$HEAD_SHA&event=push" --jq '.workflow_runs')
-            latest=$(jq -c --arg branch "$MIRROR_REF" '[.[] | select(.head_branch == $branch)] | sort_by(.created_at) | reverse | .[0] // empty' <<< "$runs")
+            runs=$(gh api "repos/$GH_REPO/actions/workflows/$workflow_file/runs?head_sha=$HEAD_SHA&event=$WORKFLOW_EVENT" --jq '.workflow_runs')
+            if [ -n "${EXPECTED_HEAD_BRANCH:-}" ]; then
+              latest=$(jq -c --arg branch "$EXPECTED_HEAD_BRANCH" '[.[] | select(.head_branch == $branch)] | sort_by(.created_at) | reverse | .[0] // empty' <<< "$runs")
+            else
+              latest=$(jq -c 'sort_by(.created_at) | reverse | .[0] // empty' <<< "$runs")
+            fi
 
             if [ -z "$latest" ]; then
               post_status "$context" pending "Waiting for $workflow_name" "$workflow_url"

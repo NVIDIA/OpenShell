@@ -5,8 +5,18 @@
 # Shared helpers for local gateway-backed e2e wrappers. Driver-specific setup,
 # cleanup, and runtime behavior stay in the Docker/Podman wrapper scripts.
 
+# E2E traffic is synthetic and must not contribute to product usage metrics.
+# Keep an explicit override so telemetry-specific tests can opt back in.
+export OPENSHELL_TELEMETRY_ENABLED="${OPENSHELL_TELEMETRY_ENABLED:-false}"
+
 e2e_cargo_target_dir() {
   local root=$1
+  shift
+  local cargo_command=(cargo)
+
+  if [ "$#" -gt 0 ]; then
+    cargo_command=("$@")
+  fi
 
   if [ -n "${CARGO_TARGET_DIR:-}" ]; then
     case "${CARGO_TARGET_DIR}" in
@@ -16,7 +26,7 @@ e2e_cargo_target_dir() {
     return 0
   fi
 
-  cargo metadata --format-version=1 --no-deps \
+  "${cargo_command[@]}" metadata --format-version=1 --no-deps \
     | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
 }
 
@@ -112,18 +122,25 @@ e2e_register_mtls_gateway() {
   local endpoint=$3
   local port=$4
   local pki_dir=$5
+  local oidc_issuer="${6:-}"
   local gateway_config_dir="${config_home}/openshell/gateways/${name}"
 
   mkdir -p "${gateway_config_dir}/mtls"
   cp "${pki_dir}/ca.crt"         "${gateway_config_dir}/mtls/ca.crt"
   cp "${pki_dir}/client/tls.crt" "${gateway_config_dir}/mtls/tls.crt"
   cp "${pki_dir}/client/tls.key" "${gateway_config_dir}/mtls/tls.key"
+
+  local oidc_line=""
+  if [ -n "${oidc_issuer}" ]; then
+    oidc_line="$(printf ',\n  "oidc_issuer": "%s"' "${oidc_issuer}")"
+  fi
+
   cat >"${gateway_config_dir}/metadata.json" <<EOF
 {
   "name": "${name}",
   "gateway_endpoint": "${endpoint}",
   "is_remote": false,
-  "gateway_port": ${port}
+  "gateway_port": ${port}${oidc_line}
 }
 EOF
   printf '%s' "${name}" >"${config_home}/openshell/active_gateway"
@@ -167,6 +184,20 @@ e2e_write_gateway_mtls_auth_config() {
   printf 'enabled = true\n\n'
 }
 
+e2e_write_gateway_oidc_config() {
+  local issuer=$1
+  local scopes_claim="${2:-scope}"
+
+  printf '[openshell.gateway.oidc]\n'
+  printf 'issuer = %s\n'         "$(e2e_toml_string "${issuer}")"
+  printf 'audience = "openshell-cli"\n'
+  printf 'jwks_ttl_secs = 60\n'
+  printf 'roles_claim = "realm_access.roles"\n'
+  printf 'admin_role = "openshell-admin"\n'
+  printf 'user_role = "openshell-user"\n'
+  printf 'scopes_claim = %s\n\n' "$(e2e_toml_string "${scopes_claim}")"
+}
+
 e2e_build_gateway_binaries() {
   local root=$1
   local target_var=$2
@@ -181,24 +212,96 @@ e2e_build_gateway_binaries() {
 
   target_dir="$(e2e_cargo_target_dir "${root}")"
   printf -v "${target_var}" '%s' "${target_dir}"
-  printf -v "${gateway_var}" '%s' "${target_dir}/debug/openshell-gateway"
-  printf -v "${cli_var}" '%s' "${target_dir}/debug/openshell"
+  printf -v "${gateway_var}" '%s' "${OPENSHELL_GATEWAY_BIN:-${target_dir}/debug/openshell-gateway}"
+  printf -v "${cli_var}" '%s' "${OPENSHELL_BIN:-${target_dir}/debug/openshell}"
 
-  echo "Building openshell-gateway..."
-  cargo build "${jobs[@]}" \
-    -p openshell-server --bin openshell-gateway
+  if [ -z "${OPENSHELL_GATEWAY_BIN:-}" ]; then
+    echo "Building openshell-gateway..."
+    if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+      cargo build "${jobs[@]}" \
+        -p openshell-gateway --bin openshell-gateway \
+        --no-default-features --features telemetry
+    else
+      cargo build "${jobs[@]}" \
+        -p openshell-gateway --bin openshell-gateway
+    fi
+  else
+    echo "Using prebuilt openshell gateway at ${OPENSHELL_GATEWAY_BIN}"
+  fi
 
-  echo "Building openshell-cli..."
-  cargo build "${jobs[@]}" \
-    -p openshell-cli
+  if [ -z "${OPENSHELL_BIN:-}" ]; then
+    echo "Building openshell-cli..."
+    cargo build "${jobs[@]}" \
+      -p openshell-cli
+  else
+    echo "Using prebuilt openshell CLI at ${OPENSHELL_BIN}"
+  fi
 
-  if [ ! -x "${target_dir}/debug/openshell-gateway" ]; then
-    echo "ERROR: expected openshell-gateway binary at ${target_dir}/debug/openshell-gateway" >&2
+  if [ ! -x "${!gateway_var}" ]; then
+    echo "ERROR: expected openshell-gateway binary at ${!gateway_var}" >&2
     exit 1
   fi
-  if [ ! -x "${target_dir}/debug/openshell" ]; then
-    echo "ERROR: expected openshell CLI binary at ${target_dir}/debug/openshell" >&2
+  if [ ! -x "${!cli_var}" ]; then
+    echo "ERROR: expected openshell CLI binary at ${!cli_var}" >&2
     exit 1
+  fi
+}
+
+e2e_build_external_driver() {
+  local root=$1
+  local package=$2
+  local binary=$3
+  local output_var=$4
+  local target_dir
+  local jobs=()
+
+  if [ -n "${CARGO_BUILD_JOBS:-}" ]; then
+    jobs=(-j "${CARGO_BUILD_JOBS}")
+  fi
+  target_dir="$(e2e_cargo_target_dir "${root}")"
+  if [ -n "${OPENSHELL_EXTERNAL_DRIVER_BIN:-}" ]; then
+    printf -v "${output_var}" '%s' "${OPENSHELL_EXTERNAL_DRIVER_BIN}"
+    echo "Using prebuilt external driver at ${OPENSHELL_EXTERNAL_DRIVER_BIN}"
+  else
+    printf -v "${output_var}" '%s' "${target_dir}/debug/${binary}"
+    echo "Building external ${binary}..."
+    cargo build "${jobs[@]}" -p "${package}" --bin "${binary}"
+  fi
+  if [ ! -x "${!output_var}" ]; then
+    echo "ERROR: expected external driver binary at ${!output_var}" >&2
+    exit 1
+  fi
+}
+
+e2e_wait_for_socket() {
+  local socket_path=$1
+  local process_pid=$2
+  local process_label=$3
+  local timeout="${4:-30}"
+  local elapsed=0
+
+  while [ "${elapsed}" -lt "${timeout}" ]; do
+    if [ -S "${socket_path}" ]; then
+      return 0
+    fi
+    if ! kill -0 "${process_pid}" 2>/dev/null; then
+      echo "ERROR: ${process_label} exited before creating ${socket_path}" >&2
+      return 1
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  echo "ERROR: ${process_label} did not create ${socket_path} within ${timeout}s" >&2
+  return 1
+}
+
+e2e_stop_process() {
+  local process_pid=$1
+  local process_label=$2
+  if [ -n "${process_pid}" ] && kill -0 "${process_pid}" 2>/dev/null; then
+    echo "Stopping ${process_label} (pid ${process_pid})..."
+    kill "${process_pid}" 2>/dev/null || true
+    wait "${process_pid}" 2>/dev/null || true
   fi
 }
 
@@ -234,6 +337,29 @@ e2e_stop_gateway() {
   if [ -n "${gateway_pid}" ] && kill -0 "${gateway_pid}" 2>/dev/null; then
     echo "Stopping openshell-gateway (pid ${gateway_pid})..."
     kill "${gateway_pid}" 2>/dev/null || true
+
+    # A Rust E2E test may have restarted the gateway and updated the PID file.
+    # That replacement process is not a child of this shell, so `wait` returns
+    # immediately even though gateway shutdown (including its sandbox stop
+    # sweep) is still in progress. Poll until either the process exits or a
+    # child process becomes a zombie that the final `wait` can reap.
+    local attempts=0
+    local process_state=""
+    while kill -0 "${gateway_pid}" 2>/dev/null && [ "${attempts}" -lt 120 ]; do
+      process_state="$(ps -p "${gateway_pid}" -o stat= 2>/dev/null || true)"
+      case "${process_state}" in
+        *Z*) break ;;
+      esac
+      sleep 0.5
+      attempts=$((attempts + 1))
+    done
+    if kill -0 "${gateway_pid}" 2>/dev/null; then
+      process_state="$(ps -p "${gateway_pid}" -o stat= 2>/dev/null || true)"
+      case "${process_state}" in
+        *Z*) ;;
+        *) kill -KILL "${gateway_pid}" 2>/dev/null || true ;;
+      esac
+    fi
     wait "${gateway_pid}" 2>/dev/null || true
   fi
 }

@@ -1,6 +1,6 @@
 # Syncing Files To and From a Sandbox
 
-Move code, data, and artifacts between your local machine and a OpenShell
+Move code, data, and artifacts between your local machine and an OpenShell
 sandbox using `openshell sandbox upload` and `openshell sandbox download`.
 
 ## Push local files into a sandbox

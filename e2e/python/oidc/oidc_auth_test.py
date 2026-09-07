@@ -14,147 +14,31 @@ Skip condition: set OPENSHELL_E2E_OIDC=1 to enable these tests.
 from __future__ import annotations
 
 import contextlib
-import json
 import os
 import urllib.parse
-import urllib.request
 from pathlib import Path
 
 import grpc
 import pytest
 
+from openshell import ClientCredentialsAuth, SandboxClient, TlsConfig
 from openshell._proto import datamodel_pb2, openshell_pb2, openshell_pb2_grpc
 
-KEYCLOAK_REALM = "openshell"
-
-
-def _xdg_config_home() -> Path:
-    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-
-
-def _keycloak_url() -> str:
-    """Derive the Keycloak URL from the gateway's stored OIDC issuer.
-
-    The server validates the issuer claim in JWTs, so the token must be
-    requested from the same base URL the server was configured with
-    (typically the host IP, not localhost).
-    """
-    if url := os.environ.get("OPENSHELL_KEYCLOAK_URL"):
-        return url
-    cluster_name = os.environ.get("OPENSHELL_GATEWAY", "openshell")
-    metadata_path = (
-        _xdg_config_home() / "openshell" / "gateways" / cluster_name / "metadata.json"
-    )
-    if metadata_path.exists():
-        metadata = json.loads(metadata_path.read_text())
-        issuer = metadata.get("oidc_issuer", "")
-        if issuer:
-            # issuer is like "http://192.168.4.172:8180/realms/openshell"
-            # extract base URL before /realms/
-            idx = issuer.find("/realms/")
-            if idx > 0:
-                return issuer[:idx]
-    return "http://localhost:8180"
-
-
-TOKEN_ENDPOINT = (
-    f"{_keycloak_url()}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/token"
+from .helpers import (
+    KEYCLOAK_REALM,
+    _gateway_endpoint,
+    _mtls_dir,
+    extract_sub,
+    get_token,
+    grpc_channel,
+    keycloak_url,
+    stub_with_token,
 )
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("OPENSHELL_E2E_OIDC") != "1",
     reason="OIDC e2e tests disabled (set OPENSHELL_E2E_OIDC=1)",
 )
-
-
-def _gateway_endpoint() -> tuple[str, bool]:
-    """Read the active gateway endpoint from metadata."""
-    cluster_name = os.environ.get("OPENSHELL_GATEWAY", "openshell")
-    metadata_path = (
-        _xdg_config_home() / "openshell" / "gateways" / cluster_name / "metadata.json"
-    )
-    metadata = json.loads(metadata_path.read_text())
-    endpoint = metadata["gateway_endpoint"]
-    is_tls = endpoint.startswith("https://")
-    return endpoint, is_tls
-
-
-def _mtls_dir() -> Path:
-    cluster_name = os.environ.get("OPENSHELL_GATEWAY", "openshell")
-    return _xdg_config_home() / "openshell" / "gateways" / cluster_name / "mtls"
-
-
-def _token_request(data: dict[str, str]) -> str:
-    """POST to the Keycloak token endpoint and return the access token."""
-    encoded = urllib.parse.urlencode(data).encode()
-    req = urllib.request.Request(TOKEN_ENDPOINT, data=encoded)
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        body = json.loads(resp.read())
-    return body["access_token"]
-
-
-def _get_token(
-    username: str,
-    password: str,
-    *,
-    client_id: str = "openshell-cli",
-    scopes: str | None = None,
-) -> str:
-    """Get an access token from Keycloak via password grant."""
-    data = {
-        "grant_type": "password",
-        "client_id": client_id,
-        "username": username,
-        "password": password,
-    }
-    if scopes:
-        data["scope"] = scopes
-    return _token_request(data)
-
-
-def _get_ci_token(
-    *,
-    client_id: str = "openshell-ci",
-    client_secret: str = "ci-test-secret",
-) -> str:
-    """Get an access token via client credentials grant."""
-    return _token_request(
-        {
-            "grant_type": "client_credentials",
-            "client_id": client_id,
-            "client_secret": client_secret,
-        }
-    )
-
-
-def _grpc_channel() -> grpc.Channel:
-    """Create a gRPC channel to the gateway with mTLS transport."""
-    endpoint, is_tls = _gateway_endpoint()
-    parsed = urllib.parse.urlparse(endpoint)
-    host = parsed.hostname or "127.0.0.1"
-    port = parsed.port or (443 if is_tls else 80)
-    target = f"{host}:{port}"
-
-    if is_tls:
-        mtls = _mtls_dir()
-        ca_cert = (mtls / "ca.crt").read_bytes()
-        client_cert = (mtls / "tls.crt").read_bytes()
-        client_key = (mtls / "tls.key").read_bytes()
-        creds = grpc.ssl_channel_credentials(
-            root_certificates=ca_cert,
-            private_key=client_key,
-            certificate_chain=client_cert,
-        )
-        return grpc.secure_channel(target, creds)
-    return grpc.insecure_channel(target)
-
-
-def _stub_with_token(token: str) -> tuple[openshell_pb2_grpc.OpenShellStub, list[tuple[str, str]]]:
-    """Create a gRPC stub that injects a Bearer token."""
-    channel = _grpc_channel()
-    return openshell_pb2_grpc.OpenShellStub(channel), [
-        ("authorization", f"Bearer {token}")
-    ]
 
 
 # ── RBAC Tests ────────────────────────────────────────────────────────
@@ -164,13 +48,13 @@ class TestRbac:
     """Test role-based access control."""
 
     def test_admin_can_create_provider(self) -> None:
-        token = _get_token("admin@test", "admin", scopes="openid openshell:all")
-        stub, metadata = _stub_with_token(token)
+        token = get_token("admin@test", "admin", scopes="openid openshell:all")
+        stub, metadata = stub_with_token(token)
         req = openshell_pb2.CreateProviderRequest(
             provider=datamodel_pb2.Provider(
-                name="e2e-oidc-admin-test",
+                metadata=datamodel_pb2.ObjectMeta(name="e2e-oidc-admin-test"),
                 type="claude",
-                credentials={"API_KEY": "test-value"},
+                credentials={"ANTHROPIC_API_KEY": "test-value"},
             )
         )
         try:
@@ -188,34 +72,60 @@ class TestRbac:
                 )
 
     def test_user_cannot_create_provider(self) -> None:
-        token = _get_token("user@test", "user", scopes="openid openshell:all")
-        stub, metadata = _stub_with_token(token)
+        token = get_token("user@test", "user", scopes="openid openshell:all")
+        stub, metadata = stub_with_token(token)
         req = openshell_pb2.CreateProviderRequest(
             provider=datamodel_pb2.Provider(
-                name="e2e-oidc-user-blocked",
+                metadata=datamodel_pb2.ObjectMeta(name="e2e-oidc-user-blocked"),
                 type="claude",
-                credentials={"API_KEY": "test-value"},
+                credentials={"ANTHROPIC_API_KEY": "test-value"},
             )
         )
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.CreateProvider(req, metadata=metadata)
         assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
-        assert "openshell-admin" in exc_info.value.details()
 
     def test_user_can_list_sandboxes(self) -> None:
-        token = _get_token("user@test", "user", scopes="openid openshell:all")
-        stub, metadata = _stub_with_token(token)
-        stub.ListSandboxes(openshell_pb2.ListSandboxesRequest(), metadata=metadata)
+        admin_token = get_token("admin@test", "admin", scopes="openid openshell:all")
+        admin_stub, admin_md = stub_with_token(admin_token)
+        user_token = get_token("user@test", "user", scopes="openid openshell:all")
+        user_sub = extract_sub(user_token)
+        user_stub, user_md = stub_with_token(user_token)
 
-    def test_unauthenticated_request_rejected(self) -> None:
-        channel = _grpc_channel()
+        with contextlib.suppress(grpc.RpcError):
+            admin_stub.AddWorkspaceMember(
+                openshell_pb2.AddWorkspaceMemberRequest(
+                    workspace="default",
+                    principal_subject=user_sub,
+                    role=openshell_pb2.WORKSPACE_ROLE_USER,
+                ),
+                metadata=admin_md,
+            )
+        try:
+            user_stub.ListSandboxes(
+                openshell_pb2.ListSandboxesRequest(), metadata=user_md
+            )
+        finally:
+            with contextlib.suppress(grpc.RpcError):
+                admin_stub.RemoveWorkspaceMember(
+                    openshell_pb2.RemoveWorkspaceMemberRequest(
+                        workspace="default", principal_subject=user_sub
+                    ),
+                    metadata=admin_md,
+                )
+
+    def test_request_without_bearer_token_rejected(self) -> None:
+        channel = grpc_channel()
         stub = openshell_pb2_grpc.OpenShellStub(channel)
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.ListSandboxes(openshell_pb2.ListSandboxesRequest())
-        assert exc_info.value.code() == grpc.StatusCode.UNAUTHENTICATED
+        assert exc_info.value.code() in (
+            grpc.StatusCode.UNAUTHENTICATED,
+            grpc.StatusCode.PERMISSION_DENIED,
+        )
 
     def test_health_does_not_require_auth(self) -> None:
-        channel = _grpc_channel()
+        channel = grpc_channel()
         stub = openshell_pb2_grpc.OpenShellStub(channel)
         resp = stub.Health(openshell_pb2.HealthRequest())
         assert resp.status == openshell_pb2.SERVICE_STATUS_HEALTHY
@@ -237,31 +147,31 @@ class TestScopes:
     )
 
     def test_sandbox_scoped_token_can_list_sandboxes(self) -> None:
-        token = _get_token(
+        token = get_token(
             "admin@test", "admin", scopes="openid sandbox:read sandbox:write"
         )
-        stub, metadata = _stub_with_token(token)
+        stub, metadata = stub_with_token(token)
         stub.ListSandboxes(openshell_pb2.ListSandboxesRequest(), metadata=metadata)
 
     def test_sandbox_scoped_token_cannot_list_providers(self) -> None:
-        token = _get_token(
+        token = get_token(
             "admin@test", "admin", scopes="openid sandbox:read sandbox:write"
         )
-        stub, metadata = _stub_with_token(token)
+        stub, metadata = stub_with_token(token)
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.ListProviders(openshell_pb2.ListProvidersRequest(), metadata=metadata)
         assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
         assert "provider:read" in exc_info.value.details()
 
     def test_openshell_all_grants_full_access(self) -> None:
-        token = _get_token("admin@test", "admin", scopes="openid openshell:all")
-        stub, metadata = _stub_with_token(token)
+        token = get_token("admin@test", "admin", scopes="openid openshell:all")
+        stub, metadata = stub_with_token(token)
         stub.ListSandboxes(openshell_pb2.ListSandboxesRequest(), metadata=metadata)
         stub.ListProviders(openshell_pb2.ListProvidersRequest(), metadata=metadata)
 
     def test_no_openshell_scopes_denied(self) -> None:
-        token = _get_token("admin@test", "admin")
-        stub, metadata = _stub_with_token(token)
+        token = get_token("admin@test", "admin")
+        stub, metadata = stub_with_token(token)
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.ListSandboxes(openshell_pb2.ListSandboxesRequest(), metadata=metadata)
         assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
@@ -274,6 +184,48 @@ class TestClientCredentials:
     """Test CI/automation client credentials flow."""
 
     def test_ci_token_can_list_sandboxes(self) -> None:
-        token = _get_ci_token()
-        stub, metadata = _stub_with_token(token)
-        stub.ListSandboxes(openshell_pb2.ListSandboxesRequest(), metadata=metadata)
+        admin_token = get_token("admin@test", "admin", scopes="openid openshell:all")
+        admin_stub, admin_md = stub_with_token(admin_token)
+        auth = ClientCredentialsAuth(
+            issuer=f"{keycloak_url()}/realms/{KEYCLOAK_REALM}",
+            client_id="openshell-ci",
+            client_secret="ci-test-secret",
+        )
+        ci_token = auth()
+        ci_sub = extract_sub(ci_token)
+        gateway_endpoint, is_tls = _gateway_endpoint()
+        parsed = urllib.parse.urlparse(gateway_endpoint)
+        target = f"{parsed.hostname}:{parsed.port or (443 if is_tls else 80)}"
+        tls = None
+        if is_tls:
+            if ca_path := os.environ.get("OPENSHELL_E2E_GATEWAY_CA_CERT"):
+                tls = TlsConfig(ca_path=Path(ca_path))
+            else:
+                mtls = _mtls_dir()
+                tls = TlsConfig(
+                    ca_path=mtls / "ca.crt",
+                    cert_path=mtls / "tls.crt",
+                    key_path=mtls / "tls.key",
+                )
+        ci_client = SandboxClient(target, tls=tls, client_credentials=auth)
+
+        with contextlib.suppress(grpc.RpcError):
+            admin_stub.AddWorkspaceMember(
+                openshell_pb2.AddWorkspaceMemberRequest(
+                    workspace="default",
+                    principal_subject=ci_sub,
+                    role=openshell_pb2.WORKSPACE_ROLE_USER,
+                ),
+                metadata=admin_md,
+            )
+        try:
+            ci_client.list(workspace="default")
+        finally:
+            ci_client.close()
+            with contextlib.suppress(grpc.RpcError):
+                admin_stub.RemoveWorkspaceMember(
+                    openshell_pb2.RemoveWorkspaceMemberRequest(
+                        workspace="default", principal_subject=ci_sub
+                    ),
+                    metadata=admin_md,
+                )

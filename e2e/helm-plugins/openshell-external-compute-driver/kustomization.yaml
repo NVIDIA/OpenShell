@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - rendered.yaml
+patches:
+  - path: workload-patch.yaml
+    target:
+      group: apps
+      version: v1
+      kind: StatefulSet
+      name: openshell
+replacements:
+  - source:
+      group: apps
+      version: v1
+      kind: StatefulSet
+      name: openshell
+      fieldPath: spec.template.spec.containers.[name=openshell-gateway].image
+    targets:
+      - select:
+          group: apps
+          version: v1
+          kind: StatefulSet
+          name: openshell
+        fieldPaths:
+          - spec.template.spec.containers.[name=kubernetes-compute-driver].image

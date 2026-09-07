@@ -32,18 +32,40 @@ const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 /// run `openshell-sandbox debug-rpc get-sandbox-config --sandbox-id <other>`
 /// to confirm the cross-sandbox IDOR guard fires.
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
+const VALIDATE_WORKSPACE_SUBCOMMAND: &str = "validate-workspace";
 
 /// Default `--mode` value: run both supervisor leaves in a single binary.
 const DEFAULT_MODE: &str = "network,process";
+const SIDECAR_STATE_DIR: &str = openshell_core::container_paths::SIDECAR_RUN_ROOT;
+const SIDECAR_TLS_DIR: &str = openshell_core::container_paths::SIDECAR_TLS_DIR;
+#[cfg(target_os = "linux")]
+const CLIENT_TLS_DIR: &str = openshell_core::container_paths::CLIENT_TLS_DIR;
+#[cfg(target_os = "linux")]
+const SIDECAR_CLIENT_TLS_SUBDIR: &str = "client";
+#[cfg(target_os = "linux")]
+const CLIENT_TLS_FILES: [&str; 3] = ["ca.crt", "tls.crt", "tls.key"];
+#[cfg(target_os = "linux")]
+const SIDECAR_STATE_DIR_MODE: u32 = 0o2775;
+#[cfg(target_os = "linux")]
+const SIDECAR_TLS_DIR_MODE: u32 = 0o755;
+#[cfg(target_os = "linux")]
+const SIDECAR_TLS_STAGING_DIR_MODE: u32 = 0o700;
+#[cfg(target_os = "linux")]
+const SIDECAR_CLIENT_TLS_DIR_MODE: u32 = 0o750;
+#[cfg(target_os = "linux")]
+const SIDECAR_CLIENT_TLS_FILE_MODE: u32 = 0o400;
 
 /// Which supervisor leaves are enabled in this process.
 ///
 /// Parsed from a comma-separated `--mode` value, e.g. `network`,
-/// `process`, or `network,process`. At least one must be set.
+/// `process`, or `network,process`. `network-init` is a one-shot setup mode
+/// used by the Kubernetes sidecar topology and cannot be combined with other
+/// mode components. At least one must be set.
 #[derive(Clone, Copy, Debug)]
 struct Mode {
     network: bool,
     process: bool,
+    network_init: bool,
 }
 
 impl std::str::FromStr for Mode {
@@ -53,34 +75,45 @@ impl std::str::FromStr for Mode {
         let mut mode = Self {
             network: false,
             process: false,
+            network_init: false,
         };
         for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             match part {
                 "network" => mode.network = true,
                 "process" => mode.process = true,
+                "network-init" => mode.network_init = true,
                 other => {
                     return Err(format!(
-                        "unknown mode component '{other}' (expected 'network' and/or 'process')"
+                        "unknown mode component '{other}' (expected 'network', 'process', or 'network-init')"
                     ));
                 }
             }
         }
-        if !mode.network && !mode.process {
-            return Err("--mode must enable at least one of: network, process".into());
+        if mode.network_init && (mode.network || mode.process) {
+            return Err("--mode=network-init cannot be combined with other components".into());
+        }
+        if !mode.network && !mode.process && !mode.network_init {
+            return Err(
+                "--mode must enable at least one of: network, process, network-init".into(),
+            );
         }
         Ok(mode)
     }
 }
 
 /// `OpenShell` Sandbox - process isolation and monitoring.
+// CLI flags are naturally boolean switches; grouping them into structs would
+// only obscure the clap definition.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Parser, Debug)]
 #[command(name = "openshell-sandbox")]
 #[command(version = openshell_core::VERSION)]
 #[command(about = "Process sandbox and monitor", long_about = None)]
 struct Args {
     /// Command to execute in the sandbox.
-    /// Can also be provided via `OPENSHELL_SANDBOX_COMMAND` environment variable.
-    /// Defaults to `/bin/bash` if neither is provided.
+    /// Defaults to a login shell if neither this nor the driver specification is
+    /// provided: `/bin/bash -l` when available, otherwise a shell detected in the
+    /// sandbox image (e.g. `/bin/sh` on Alpine).
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
 
@@ -125,7 +158,8 @@ struct Args {
     #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
     log_level: String,
 
-    /// Filesystem path to the Unix socket the embedded SSH daemon binds.
+    /// Unix socket the embedded SSH daemon binds. On Linux, a value beginning
+    /// with `@` selects an abstract socket in the network namespace.
     /// The supervisor bridges `RelayStream` traffic from the gateway onto
     /// this socket; nothing else should connect to it.
     #[arg(long, env = openshell_core::sandbox_env::SSH_SOCKET_PATH)]
@@ -149,9 +183,104 @@ struct Args {
     /// "network" and/or "process". Defaults to both (single-binary
     /// topology). Use --mode=network for a network-only sidecar, or
     /// --mode=process for a process-only supervisor when network
-    /// enforcement runs in another pod.
+    /// enforcement runs in another pod. Use --mode=network-init only in
+    /// the Kubernetes init container that prepares sidecar nftables.
     #[arg(long, default_value = DEFAULT_MODE)]
     mode: Mode,
+
+    /// UID that the long-running Kubernetes network sidecar will run as.
+    /// `--mode=network-init` installs nftables rules that exempt this UID.
+    #[arg(long, env = "OPENSHELL_PROXY_UID", default_value_t = 1337)]
+    proxy_uid: u32,
+
+    /// GID assigned to shared sidecar state directories. Defaults to
+    /// `--proxy-uid` when omitted.
+    #[arg(long, env = "OPENSHELL_PROXY_GID")]
+    proxy_gid: Option<u32>,
+
+    /// Shared state directory between the network init container and sidecar.
+    #[arg(long, env = "OPENSHELL_SIDECAR_STATE_DIR", default_value = SIDECAR_STATE_DIR)]
+    sidecar_state_dir: String,
+
+    /// Shared TLS work directory between the network init container and sidecar.
+    #[arg(long, env = "OPENSHELL_PROXY_TLS_DIR", default_value = SIDECAR_TLS_DIR)]
+    sidecar_tls_dir: String,
+
+    // Corporate upstream proxy. Operator-owned egress boundary: accepted
+    // only as command-line arguments (no `env =`), because the driver
+    // controls the supervisor's argv while a sandbox image could bake
+    // matching `ENV` values.
+    /// Corporate forward proxy URL (`http://host:port`) for upstream TLS egress.
+    #[arg(long)]
+    upstream_proxy: Option<String>,
+
+    /// Comma-separated `NO_PROXY` list for the corporate proxy.
+    #[arg(long)]
+    upstream_no_proxy: Option<String>,
+
+    /// Path to the root-only file holding corporate proxy credentials (`user:pass`).
+    #[arg(long)]
+    upstream_proxy_auth_file: Option<String>,
+
+    /// Acknowledge that proxy credentials travel as cleartext Basic auth over
+    /// the plain-TCP connection to the `http://` proxy.
+    #[arg(long)]
+    upstream_proxy_auth_allow_insecure: bool,
+
+    /// Send the destination hostname in CONNECT instead of a validated IP
+    /// (for proxies whose ACLs filter on hostnames).
+    #[arg(long)]
+    upstream_proxy_connect_by_hostname: bool,
+
+    /// Path to a PEM CA bundle trusted for the corporate proxy: the TLS
+    /// handshake with an `https://` proxy and, for TLS-intercepting proxies,
+    /// re-signed upstream certificates and the sandbox trust bundle.
+    #[arg(long)]
+    upstream_proxy_ca_bundle: Option<String>,
+}
+
+/// Internal one-shot command used by the privileged supervisor to validate an
+/// image-provided workdir as the final sandbox identity.
+#[derive(Parser, Debug)]
+#[command(name = "validate-workspace", hide = true)]
+struct ValidateWorkspaceArgs {
+    #[arg(long)]
+    workdir: String,
+    #[arg(long)]
+    expected_uid: u32,
+    #[arg(long)]
+    expected_gid: u32,
+}
+
+#[cfg(target_os = "linux")]
+fn validate_workspace(args: &[String]) -> Result<()> {
+    let args = ValidateWorkspaceArgs::try_parse_from(
+        std::iter::once(VALIDATE_WORKSPACE_SUBCOMMAND.to_string()).chain(args.iter().cloned()),
+    )
+    .into_diagnostic()?;
+    let actual = (
+        nix::unistd::geteuid().as_raw(),
+        nix::unistd::getegid().as_raw(),
+    );
+    if actual != (args.expected_uid, args.expected_gid) {
+        return Err(miette::miette!(
+            "workspace validator privilege drop failed: expected {}:{}, got {}:{}",
+            args.expected_uid,
+            args.expected_gid,
+            actual.0,
+            actual.1
+        ));
+    }
+    openshell_supervisor_process::process::validate_oci_workspace_as_effective_identity(Path::new(
+        &args.workdir,
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_workspace(_args: &[String]) -> Result<()> {
+    Err(miette::miette!(
+        "workspace validation is only supported on Unix"
+    ))
 }
 
 /// Copy the running executable to `dest`, creating parent directories as
@@ -194,6 +323,196 @@ fn copy_self(dest: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn prepare_sidecar_directory(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<()> {
+    use miette::Context as _;
+    use nix::unistd::{Gid, Uid, chown};
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create sidecar directory {}", path.display()))?;
+    let mut perms = std::fs::metadata(path).into_diagnostic()?.permissions();
+    perms.set_mode(mode);
+    std::fs::set_permissions(path, perms)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to chmod sidecar directory {}", path.display()))?;
+    chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to chown sidecar directory {} to {uid}:{gid}",
+                path.display()
+            )
+        })?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_sidecar_directory_for_current_user(path: &Path, mode: u32) -> Result<()> {
+    use miette::Context as _;
+    use nix::unistd::{Gid, Uid, chown};
+    use std::os::unix::fs::PermissionsExt;
+
+    let uid = Uid::current();
+    let gid = Gid::current();
+    std::fs::create_dir_all(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create sidecar directory {}", path.display()))?;
+    chown(path, Some(uid), Some(gid))
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to chown sidecar directory {} to {}:{}",
+                path.display(),
+                uid.as_raw(),
+                gid.as_raw()
+            )
+        })?;
+    let mut perms = std::fs::metadata(path).into_diagnostic()?.permissions();
+    perms.set_mode(mode);
+    std::fs::set_permissions(path, perms)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to chmod sidecar directory {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn copy_sidecar_client_tls_if_present(
+    source_dir: &Path,
+    sidecar_tls_dir: &Path,
+    uid: u32,
+    gid: u32,
+) -> Result<()> {
+    use miette::Context as _;
+    use nix::unistd::{Gid, Uid, chown};
+    use std::os::unix::fs::PermissionsExt;
+
+    if !source_dir.exists() {
+        return Ok(());
+    }
+
+    let dest_dir = sidecar_tls_dir.join(SIDECAR_CLIENT_TLS_SUBDIR);
+    prepare_sidecar_directory_for_current_user(&dest_dir, SIDECAR_TLS_STAGING_DIR_MODE)?;
+    for file_name in CLIENT_TLS_FILES {
+        let source = source_dir.join(file_name);
+        if !source.exists() {
+            return Err(miette::miette!(
+                "client TLS source file is missing: {}",
+                source.display()
+            ));
+        }
+        let dest = dest_dir.join(file_name);
+        if dest.exists() {
+            std::fs::remove_file(&dest)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!("failed to remove stale client TLS file {}", dest.display())
+                })?;
+        }
+        std::fs::copy(&source, &dest)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to copy client TLS file {} to {}",
+                    source.display(),
+                    dest.display()
+                )
+            })?;
+        let mut perms = std::fs::metadata(&dest).into_diagnostic()?.permissions();
+        perms.set_mode(SIDECAR_CLIENT_TLS_FILE_MODE);
+        std::fs::set_permissions(&dest, perms)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!("failed to chmod copied client TLS file {}", dest.display())
+            })?;
+        chown(&dest, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to chown copied client TLS file {} to {uid}:{gid}",
+                    dest.display()
+                )
+            })?;
+    }
+
+    prepare_sidecar_directory(&dest_dir, uid, gid, SIDECAR_CLIENT_TLS_DIR_MODE)?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_network_init(
+    proxy_user_id: u32,
+    proxy_primary_group_id: u32,
+    sidecar_state_dir: &str,
+    sidecar_tls_dir: &str,
+) -> Result<()> {
+    validate_network_init_ids(proxy_user_id, proxy_primary_group_id)?;
+
+    let sidecar_state_dir = Path::new(sidecar_state_dir);
+    let sidecar_tls_dir = Path::new(sidecar_tls_dir);
+    prepare_sidecar_directory(
+        sidecar_state_dir,
+        proxy_user_id,
+        proxy_primary_group_id,
+        SIDECAR_STATE_DIR_MODE,
+    )?;
+    // The init container runs as uid 0 with CAP_DAC_OVERRIDE dropped. Keep the
+    // TLS work directory owned by the init user until the client cert copy is
+    // complete, then hand it to the long-running proxy UID.
+    prepare_sidecar_directory_for_current_user(sidecar_tls_dir, SIDECAR_TLS_DIR_MODE)?;
+    copy_sidecar_client_tls_if_present(
+        Path::new(CLIENT_TLS_DIR),
+        sidecar_tls_dir,
+        proxy_user_id,
+        proxy_primary_group_id,
+    )?;
+    prepare_sidecar_directory(
+        sidecar_tls_dir,
+        proxy_user_id,
+        proxy_primary_group_id,
+        SIDECAR_TLS_DIR_MODE,
+    )?;
+    openshell_supervisor_process::netns::install_sidecar_bypass_rules(proxy_user_id)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_network_init_ids(proxy_user_id: u32, proxy_primary_group_id: u32) -> Result<()> {
+    if proxy_user_id != 0
+        && !(openshell_policy::MIN_SANDBOX_PROXY_UID..=openshell_policy::MAX_SANDBOX_UID)
+            .contains(&proxy_user_id)
+    {
+        return Err(miette::miette!(
+            "--proxy-uid must be 0 or in range [{}, {}]",
+            openshell_policy::MIN_SANDBOX_PROXY_UID,
+            openshell_policy::MAX_SANDBOX_UID,
+        ));
+    }
+    if !(openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID)
+        .contains(&proxy_primary_group_id)
+    {
+        return Err(miette::miette!(
+            "--proxy-gid must be in range [{}, {}]",
+            openshell_policy::MIN_SANDBOX_UID,
+            openshell_policy::MAX_SANDBOX_UID,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_network_init(
+    _proxy_uid: u32,
+    _proxy_gid: u32,
+    _sidecar_state_dir: &str,
+    _sidecar_tls_dir: &str,
+) -> Result<()> {
+    Err(miette::miette!(
+        "--mode=network-init is only supported on Linux"
+    ))
+}
+
 fn main() -> Result<()> {
     // Handle `copy-self <DEST>` before clap so it works without any of the
     // sandbox flags. Kubernetes init containers invoke this path to seed an
@@ -219,8 +538,21 @@ fn main() -> Result<()> {
             std::process::exit(exit);
         });
     }
+    if raw_args.get(1).map(String::as_str) == Some(VALIDATE_WORKSPACE_SUBCOMMAND) {
+        return validate_workspace(&raw_args[2..]);
+    }
 
     let args = Args::parse();
+
+    if args.mode.network_init {
+        let proxy_gid = args.proxy_gid.unwrap_or(args.proxy_uid);
+        return run_network_init(
+            args.proxy_uid,
+            proxy_gid,
+            &args.sidecar_state_dir,
+            &args.sidecar_tls_dir,
+        );
+    }
 
     // Try to open a rolling log file; fall back to stderr-only logging if it fails
     // (e.g., /var/log is not writable in custom workload images).
@@ -270,6 +602,7 @@ fn main() -> Result<()> {
         // `ocsf_json_enabled` setting changes. The JSONL layer checks it
         // on each event and short-circuits when false.
         let ocsf_enabled = Arc::new(AtomicBool::new(false));
+        let ocsf_schema_version = Arc::new(std::sync::Mutex::new(String::new()));
 
         // Keep guards alive for the entire process. When a guard is dropped the
         // non-blocking writer flushes remaining logs.
@@ -288,7 +621,9 @@ fn main() -> Result<()> {
                 .ok()
                 .map(|roller| {
                     let (writer, guard) = tracing_appender::non_blocking(roller);
-                    let layer = OcsfJsonlLayer::new(writer).with_enabled_flag(ocsf_enabled.clone());
+                    let layer = OcsfJsonlLayer::new(writer)
+                        .with_enabled_flag(ocsf_enabled.clone())
+                        .with_target_version(ocsf_schema_version.clone());
                     (layer, guard)
                 });
             let (jsonl_layer, jsonl_guard) = match jsonl_logging {
@@ -325,26 +660,55 @@ fn main() -> Result<()> {
             (None, None)
         };
 
-        // Get command - either from CLI args, environment variable, or default to /bin/bash
-        let command = if !args.command.is_empty() {
-            args.command
-        } else if let Ok(c) = std::env::var(openshell_core::sandbox_env::SANDBOX_COMMAND) {
-            // Simple shell-like splitting on whitespace
-            c.split_whitespace().map(String::from).collect()
+        // Resolve an exact canonical process. Explicit offline/test argv wins;
+        // drivers otherwise provide a versioned JSON transport so argument
+        // boundaries are never reconstructed with shell parsing.
+        let workdir = args.workdir.clone();
+        let (command, interactive, await_main_process_attachment) = if !args.command.is_empty() {
+            (args.command, args.interactive, false)
+        } else if let Ok(json) = std::env::var(openshell_core::sandbox_env::MAIN_PROCESS_SPEC) {
+            let config = openshell_core::sandbox_env::MainProcessConfig::decode(&json)
+                .map_err(|error| miette::miette!("{error}"))?;
+            (
+                config.command,
+                config.tty,
+                config.await_main_process_attachment,
+            )
         } else {
-            vec!["/bin/bash".to_string()]
+            let config = openshell_core::sandbox_env::MainProcessConfig::scratch();
+            (
+                config.command,
+                config.tty,
+                config.await_main_process_attachment,
+            )
         };
+
+        // An omitted command (the gateway leaves the default empty rather than
+        // baking a shell it cannot verify) is resolved to a login shell here, in
+        // the supervisor, so it matches the sandbox image: bash when present,
+        // otherwise /bin/sh (e.g. Alpine). An explicit command is used verbatim.
+        let command = resolve_default_command(command);
 
         info!(command = ?command, "Starting sandbox");
         // Note: "Starting sandbox" stays as plain info!() since the OCSF context
         // is not yet initialized at this point (run_sandbox hasn't been called).
         // The shorthand layer will render it in fallback format.
 
+        let upstream_proxy_args = openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs {
+            https_proxy: args.upstream_proxy,
+            no_proxy: args.upstream_no_proxy,
+            proxy_auth_file: args.upstream_proxy_auth_file,
+            proxy_auth_allow_insecure: args.upstream_proxy_auth_allow_insecure,
+            proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname,
+            proxy_ca_bundle: args.upstream_proxy_ca_bundle,
+        };
+
         run_sandbox(
             command,
-            args.workdir,
+            workdir,
             args.timeout,
-            args.interactive,
+            interactive,
+            await_main_process_attachment,
             args.sandbox_id,
             args.sandbox,
             args.openshell_endpoint,
@@ -355,8 +719,10 @@ fn main() -> Result<()> {
             args.health_port,
             args.inference_routes,
             ocsf_enabled,
+            ocsf_schema_version,
             args.mode.network,
             args.mode.process,
+            upstream_proxy_args,
         )
         .await
     })?;
@@ -364,10 +730,49 @@ fn main() -> Result<()> {
     std::process::exit(exit_code);
 }
 
+/// Resolve an omitted canonical command to a login shell that exists in this
+/// sandbox image. Empty means "use the default": the gateway leaves an omitted
+/// command empty rather than persisting a shell it cannot verify, so the
+/// supervisor picks one here against the real sandbox filesystem (bash when
+/// present, otherwise `/bin/sh`). An explicit command is returned unchanged.
+fn resolve_default_command(command: Vec<String>) -> Vec<String> {
+    if !command.is_empty() {
+        return command;
+    }
+    let shell = openshell_core::shell::detect_login_shell();
+    info!(shell = %shell, "no command specified; resolved default login shell");
+    vec![shell, "-l".to_string()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_validation_subcommand_uses_final_policy_identity() {
+        let uid = nix::unistd::geteuid().as_raw();
+        let gid = nix::unistd::getegid().as_raw();
+        if uid < 1000 || gid < 1000 {
+            return;
+        }
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+        let root = dir.path().canonicalize().unwrap().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let args = vec![
+            "--workdir".to_string(),
+            root.display().to_string(),
+            "--expected-uid".to_string(),
+            uid.to_string(),
+            "--expected-gid".to_string(),
+            gid.to_string(),
+        ];
+
+        validate_workspace(&args).expect("current identity should retain workspace authority");
+    }
 
     /// Drives `copy_self`'s file-copy logic against an arbitrary source path
     /// so tests don't depend on `current_exe()`.
@@ -420,5 +825,57 @@ mod tests {
 
         let final_path = dest_dir.join("openshell-sandbox");
         assert!(final_path.exists(), "binary should land inside dest dir");
+    }
+
+    #[test]
+    fn mode_parses_network_init_standalone() {
+        let mode = "network-init".parse::<Mode>().unwrap();
+        assert!(mode.network_init);
+        assert!(!mode.network);
+        assert!(!mode.process);
+    }
+
+    #[test]
+    fn mode_rejects_combined_network_init() {
+        let err = "network-init,network".parse::<Mode>().unwrap_err();
+        assert!(err.contains("cannot be combined"));
+    }
+
+    #[test]
+    fn mode_rejects_empty_value() {
+        let err = "".parse::<Mode>().unwrap_err();
+        assert!(err.contains("at least one"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sidecar_tls_modes_preserve_proxy_owned_parent_and_private_client_dir() {
+        assert_eq!(SIDECAR_TLS_DIR_MODE, 0o755);
+        assert_eq!(SIDECAR_TLS_STAGING_DIR_MODE, 0o700);
+        assert_eq!(SIDECAR_CLIENT_TLS_DIR_MODE, 0o750);
+        assert_eq!(SIDECAR_CLIENT_TLS_FILE_MODE, 0o400);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_init_accepts_root_proxy_uid_for_binary_aware_sidecar() {
+        validate_network_init_ids(0, 30).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_init_still_rejects_low_non_root_proxy_uid_and_root_gid() {
+        let uid_err =
+            validate_network_init_ids(999, openshell_policy::MIN_SANDBOX_UID).unwrap_err();
+        assert!(uid_err.to_string().contains("--proxy-uid"));
+
+        let gid_err = validate_network_init_ids(0, 0).unwrap_err();
+        assert!(gid_err.to_string().contains("--proxy-gid"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_init_accepts_non_root_system_proxy_group() {
+        validate_network_init_ids(openshell_policy::MIN_SANDBOX_PROXY_UID, 30).unwrap();
     }
 }

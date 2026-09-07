@@ -9,6 +9,10 @@
 
 set -euo pipefail
 
+# libkrun consumes this driver-owned switch before exec'ing this script as
+# PID 1. Do not leak the runtime control into the supervisor or workloads.
+unset KRUN_INIT_PID1
+
 BOOT_START=$(date +%s%3N 2>/dev/null || date +%s)
 # gvisor-tap-vsock subnet layout:
 #   192.168.127.1   — gateway: gvproxy's DNS / DHCP / HTTP API. Does NOT
@@ -188,6 +192,67 @@ prepare_guest_image_rootfs() {
     rm -rf "$payload_dir"
 }
 
+# Driver-owned arguments appended to the supervisor's command line.
+#
+# The VM driver cannot build the supervisor's argv the way the container
+# drivers do, so it writes the arguments it chose into the overlay upperdir
+# and this script appends them verbatim. Populated by
+# read_supervisor_extra_args; empty until then.
+SUPERVISOR_EXTRA_ARGS=()
+
+# Upper bound on driver-supplied supervisor arguments.
+#
+# The corporate proxy settings are the only producer today and top out at ten
+# entries. The cap exists so a corrupt or oversized file cannot expand into an
+# unbounded command line.
+SUPERVISOR_EXTRA_ARGS_MAX=32
+
+read_supervisor_extra_args() {
+    # Read the driver-authored supervisor argument list, one argument per
+    # line, verbatim -- no word splitting, globbing, or expansion, so values
+    # containing spaces (e.g. a NO_PROXY list) survive intact.
+    #
+    # Security: this is the operator-owned egress boundary. The driver writes
+    # this file into the overlay upperdir on every launch, including an empty
+    # file when it has no arguments to pass, so the upperdir copy always
+    # shadows the read-only image layer. A sandbox image can therefore neither
+    # supply its own supervisor arguments by baking a file at this path nor
+    # disable the operator's by omitting one. A missing file means the driver
+    # passed nothing; a file it cannot read means the overlay is broken, and
+    # we fail closed rather than start a supervisor with a silently truncated
+    # egress configuration.
+    local args_file
+    args_file="$(root_path /opt/openshell/supervisor-args)"
+
+    SUPERVISOR_EXTRA_ARGS=()
+    if [ ! -f "$args_file" ]; then
+        return 0
+    fi
+    if [ ! -r "$args_file" ]; then
+        ts "FATAL: supervisor argument list ${args_file} is not readable"
+        exit 1
+    fi
+
+    local arg
+    while IFS= read -r arg; do
+        # render_guest_supervisor_args never emits a blank line, so one means
+        # the file was truncated or tampered with after the driver wrote it.
+        if [ -z "$arg" ]; then
+            ts "FATAL: empty entry in supervisor argument list"
+            exit 1
+        fi
+        if [ "${#SUPERVISOR_EXTRA_ARGS[@]}" -ge "$SUPERVISOR_EXTRA_ARGS_MAX" ]; then
+            ts "FATAL: supervisor argument list exceeds ${SUPERVISOR_EXTRA_ARGS_MAX} entries"
+            exit 1
+        fi
+        SUPERVISOR_EXTRA_ARGS+=("$arg")
+    done < "$args_file"
+
+    if [ "${#SUPERVISOR_EXTRA_ARGS[@]}" -gt 0 ]; then
+        ts "supervisor arguments from driver: ${#SUPERVISOR_EXTRA_ARGS[@]} entries"
+    fi
+}
+
 exec_supervisor_in_newroot() {
     local chroot_bin
     local bootstrap="/.openshell-bootstrap"
@@ -210,14 +275,16 @@ exec_supervisor_in_newroot() {
                 "${bootstrap}/lib64/ld-linux-aarch64.so.1"; do
                 if [ -x "/newroot${loader}" ]; then
                     lib_path="${bootstrap}/lib:${bootstrap}/lib64:${bootstrap}/usr/lib:${bootstrap}/usr/lib64:${bootstrap}/lib/aarch64-linux-gnu:${bootstrap}/lib/x86_64-linux-gnu:${bootstrap}/usr/lib/aarch64-linux-gnu:${bootstrap}/usr/lib/x86_64-linux-gnu"
-                    exec "$chroot_bin" /newroot "$loader" --library-path "$lib_path" "$supervisor" --workdir /sandbox
+                    exec "$chroot_bin" /newroot "$loader" --library-path "$lib_path" \
+                        "$supervisor" --workdir /sandbox "${SUPERVISOR_EXTRA_ARGS[@]+"${SUPERVISOR_EXTRA_ARGS[@]}"}"
                 fi
             done
-            exec "$chroot_bin" /newroot "$supervisor" --workdir /sandbox
+            exec "$chroot_bin" /newroot "$supervisor" --workdir /sandbox "${SUPERVISOR_EXTRA_ARGS[@]+"${SUPERVISOR_EXTRA_ARGS[@]}"}"
         fi
 
         if [ -x /newroot/opt/openshell/bin/openshell-sandbox ]; then
-            exec "$chroot_bin" /newroot /opt/openshell/bin/openshell-sandbox --workdir /sandbox
+            exec "$chroot_bin" /newroot /opt/openshell/bin/openshell-sandbox \
+                --workdir /sandbox "${SUPERVISOR_EXTRA_ARGS[@]+"${SUPERVISOR_EXTRA_ARGS[@]}"}"
         fi
     done
 
@@ -243,6 +310,10 @@ setup_overlay_root() {
     if [ "${OPENSHELL_VM_INIT_MODE:-sandbox}" = "image-prep" ]; then
         prepare_guest_image_rootfs
         sync
+        if ! umount /overlay; then
+            ts "FATAL: failed to unmount /overlay cleanly after image-prep; refusing to produce a dirty image-cache disk"
+            exit 1
+        fi
         ts "image-prep complete"
         exit 0
     fi
@@ -252,7 +323,7 @@ setup_overlay_root() {
 
     local lower_root="/lower"
     if [ -b /dev/vdc ]; then
-        mount -t ext4 -o ro /dev/vdc /image-cache
+        mount -t ext4 -o ro,noload /dev/vdc /image-cache
         if [ -d /image-cache/image-rootfs ]; then
             lower_root="/image-cache/image-rootfs"
             ts "using prepared image rootfs lowerdir"
@@ -825,11 +896,13 @@ if [ -n "${OPENSHELL_SANDBOX_ID:-}" ]; then
     ts "OPENSHELL_SANDBOX_ID=${OPENSHELL_SANDBOX_ID}"
 fi
 
+read_supervisor_extra_args
+
 ts "starting openshell-sandbox supervisor"
 if [ "${ROOT_PREFIX:-}" = "/newroot" ]; then
     exec_supervisor_in_newroot
 fi
-exec /opt/openshell/bin/openshell-sandbox --workdir /sandbox
+exec /opt/openshell/bin/openshell-sandbox --workdir /sandbox "${SUPERVISOR_EXTRA_ARGS[@]+"${SUPERVISOR_EXTRA_ARGS[@]}"}"
 }
 
 if [ "${1:-}" != "--post-overlay" ]; then

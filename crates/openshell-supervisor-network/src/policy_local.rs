@@ -4,6 +4,7 @@
 //! Sandbox-local policy advisor HTTP API.
 
 use miette::{IntoDiagnostic, Result};
+use openshell_core::proposals::AgentProposals;
 use openshell_core::proto::{
     L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
     SandboxPolicy as ProtoSandboxPolicy,
@@ -23,7 +24,7 @@ pub const POLICY_LOCAL_HOST: &str = "policy.local";
 /// Single source of truth: the skill installer writes here, the L7 deny body
 /// references this path in `next_steps`, and the skill's own documentation
 /// renders the same path. Changing the location is a one-line update here.
-pub const SKILL_PATH: &str = "/etc/openshell/skills/policy_advisor.md";
+pub use openshell_core::container_paths::POLICY_ADVISOR_SKILL_PATH as SKILL_PATH;
 
 /// Human-readable guidance for agents that are more likely to follow plain
 /// instructions than structured next-step JSON alone.
@@ -84,10 +85,12 @@ const MAX_DENIAL_LINE_BYTES: usize = 4096;
 
 #[derive(Debug)]
 pub struct PolicyLocalContext {
-    current_policy: Arc<RwLock<Option<ProtoSandboxPolicy>>>,
+    current_policy: Arc<RwLock<Option<Arc<ProtoSandboxPolicy>>>>,
+    agent_proposals: AgentProposals,
     gateway_endpoint: Option<String>,
     sandbox_name: Option<String>,
     shorthand_log_dir: PathBuf,
+    workspace_rx: tokio::sync::watch::Receiver<String>,
 }
 
 impl PolicyLocalContext {
@@ -95,12 +98,16 @@ impl PolicyLocalContext {
         current_policy: Option<ProtoSandboxPolicy>,
         gateway_endpoint: Option<String>,
         sandbox_name: Option<String>,
+        agent_proposals: AgentProposals,
+        workspace_rx: tokio::sync::watch::Receiver<String>,
     ) -> Self {
         Self::with_log_dir(
             current_policy,
             gateway_endpoint,
             sandbox_name,
+            agent_proposals,
             PathBuf::from(LOG_DIR),
+            workspace_rx,
         )
     }
 
@@ -108,18 +115,39 @@ impl PolicyLocalContext {
         current_policy: Option<ProtoSandboxPolicy>,
         gateway_endpoint: Option<String>,
         sandbox_name: Option<String>,
+        agent_proposals: AgentProposals,
         shorthand_log_dir: PathBuf,
+        workspace_rx: tokio::sync::watch::Receiver<String>,
     ) -> Self {
         Self {
-            current_policy: Arc::new(RwLock::new(current_policy)),
+            current_policy: Arc::new(RwLock::new(current_policy.map(Arc::new))),
+            agent_proposals,
             gateway_endpoint,
             sandbox_name,
             shorthand_log_dir,
+            workspace_rx,
         }
     }
 
     pub async fn set_current_policy(&self, policy: ProtoSandboxPolicy) {
-        *self.current_policy.write().await = Some(policy);
+        // Every successful reload receives a distinct Arc, including an
+        // identical policy installed again. Waiters use pointer identity to
+        // decide whether the installed snapshot needs another coverage scan.
+        *self.current_policy.write().await = Some(Arc::new(policy));
+    }
+
+    pub fn workspace(&self) -> String {
+        self.workspace_rx.borrow().clone()
+    }
+
+    #[must_use]
+    pub fn agent_proposals(&self) -> AgentProposals {
+        self.agent_proposals.clone()
+    }
+
+    #[must_use]
+    pub fn agent_proposals_enabled(&self) -> bool {
+        self.agent_proposals.enabled()
     }
 }
 
@@ -149,7 +177,7 @@ async fn route_request(
     // when the flag is off — including the diagnostic `current_policy` and
     // `denials` routes. The skill is also not installed in that mode, so a
     // disabled sandbox has no entry point into this API at all.
-    if !openshell_core::proposals::agent_proposals_enabled() {
+    if !ctx.agent_proposals_enabled() {
         return (
             404,
             serde_json::json!({
@@ -218,12 +246,12 @@ fn not_found_payload(path: &str) -> (u16, serde_json::Value) {
 /// the deny body and the actual route table from drifting — adding or
 /// renaming a route only requires touching the route constants above.
 ///
-/// Returns an empty array when `agent_proposals_enabled()` is false so a
+/// Returns an empty array when agent policy proposals are disabled so a
 /// disabled sandbox doesn't advertise a surface that 404s. The deny body
 /// caller still emits the field (with `[]`) so the wire shape is stable.
 #[must_use]
-pub fn agent_next_steps() -> serde_json::Value {
-    if !openshell_core::proposals::agent_proposals_enabled() {
+pub fn agent_next_steps(agent_proposals_enabled: bool) -> serde_json::Value {
+    if !agent_proposals_enabled {
         return serde_json::json!([]);
     }
     let host = POLICY_LOCAL_HOST;
@@ -253,8 +281,8 @@ pub fn agent_next_steps() -> serde_json::Value {
 
 /// Build the optional natural-language guidance embedded in L7 deny bodies.
 #[must_use]
-pub fn agent_guidance() -> Option<&'static str> {
-    openshell_core::proposals::agent_proposals_enabled().then_some(AGENT_GUIDANCE)
+pub fn agent_guidance_for(agent_proposals_enabled: bool) -> Option<&'static str> {
+    agent_proposals_enabled.then_some(AGENT_GUIDANCE)
 }
 
 async fn current_policy_response(ctx: &PolicyLocalContext) -> (u16, serde_json::Value) {
@@ -484,13 +512,27 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
         );
     };
 
+    let workspace = ctx.workspace_rx.borrow().clone();
+    if workspace.is_empty() {
+        return (
+            503,
+            serde_json::json!({
+                "error": "workspace_unavailable",
+                "detail": "sandbox workspace has not been discovered yet; retry shortly"
+            }),
+        );
+    }
+
     let chunks = match proposal_chunks_from_body(body) {
         Ok(chunks) => chunks,
         Err(error) => return (400, error_payload("invalid_proposal", error)),
     };
 
     let client = match openshell_core::grpc_client::CachedOpenShellClient::connect(endpoint).await {
-        Ok(client) => client,
+        Ok(client) => {
+            client.set_workspace(workspace);
+            client
+        }
         Err(error) => {
             return (
                 502,
@@ -782,7 +824,8 @@ async fn fetch_chunk_or_404(
 /// next on the redraft loop — identity (`chunk_id`, `status`), the proposal
 /// it submitted (`rule_name`, `binary`), the two feedback signals
 /// (`rejection_reason` from the reviewer, `validation_result` from the
-/// gateway prover), and (on /wait) `policy_reloaded` so the agent can tell
+/// gateway prover, and `application_error` from complete candidate preflight),
+/// plus the review token/candidate hashes and (on /wait) `policy_reloaded` so the agent can tell
 /// "approved AND the new rule is loaded — safe to retry" from "approved
 /// but the supervisor hasn't reloaded yet — re-issue /wait or surface to
 /// user". Display-only proto fields (`hit_count`, `confidence`, `stage`,
@@ -799,6 +842,10 @@ fn chunk_state_payload(
         "binary": chunk.binary,
         "rejection_reason": chunk.rejection_reason,
         "validation_result": chunk.validation_result,
+        "application_error": chunk.application_error,
+        "review_token": chunk.review_token,
+        "current_effective_policy_hash": chunk.current_effective_policy_hash,
+        "candidate_effective_policy_hash": chunk.candidate_effective_policy_hash,
     });
     if timed_out {
         payload["timed_out"] = serde_json::json!(true);
@@ -843,18 +890,41 @@ async fn wait_for_local_policy_to_cover(
     proposed_rule: &NetworkPolicyRule,
     deadline: tokio::time::Instant,
 ) -> bool {
+    wait_for_local_policy_to_cover_with(
+        ctx,
+        proposed_rule,
+        deadline,
+        openshell_policy::policy_covers_rule,
+    )
+    .await
+}
+
+async fn wait_for_local_policy_to_cover_with<F>(
+    ctx: &PolicyLocalContext,
+    proposed_rule: &NetworkPolicyRule,
+    deadline: tokio::time::Instant,
+    covers_rule: F,
+) -> bool
+where
+    F: Fn(&ProtoSandboxPolicy, &NetworkPolicyRule) -> bool,
+{
     const TICK: std::time::Duration = std::time::Duration::from_millis(200);
+    let mut checked_snapshot: Option<Arc<ProtoSandboxPolicy>> = None;
     loop {
-        // Clone the snapshot out of the RwLock before running coverage —
-        // otherwise the read guard is held across `policy_covers_rule`'s
-        // iteration of `network_policies`, serializing a writer (supervisor
-        // reload) on the very thing we're waiting for. Clone-per-tick on
-        // a few-KB struct is cheap for the bounded wait window here.
+        // Clone only the Arc while holding the lock. Coverage runs once for
+        // each installed snapshot and never holds the read guard, so reloads
+        // cannot block behind a full network-policy scan.
         let snapshot = ctx.current_policy.read().await.clone();
         if let Some(policy) = snapshot.as_ref()
-            && openshell_policy::policy_covers_rule(policy, proposed_rule)
+            && checked_snapshot
+                .as_ref()
+                .is_none_or(|checked| !Arc::ptr_eq(checked, policy))
         {
-            return true;
+            let covered = covers_rule(policy, proposed_rule);
+            checked_snapshot = Some(Arc::clone(policy));
+            if covered {
+                return true;
+            }
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -914,9 +984,20 @@ async fn open_lookup_session(
                 ),
             )
         })?;
+    let workspace = ctx.workspace_rx.borrow().clone();
+    if workspace.is_empty() {
+        return Err((
+            503,
+            error_payload(
+                "workspace_unavailable",
+                "sandbox workspace has not been discovered yet; retry shortly".to_string(),
+            ),
+        ));
+    }
     let client = openshell_core::grpc_client::CachedOpenShellClient::connect(endpoint)
         .await
         .map_err(|e| (502, error_payload("gateway_connect_failed", e.to_string())))?;
+    client.set_workspace(workspace);
     Ok(LookupSession {
         client,
         sandbox_name,
@@ -1006,6 +1087,7 @@ fn policy_chunk_from_add_rule(
         binary,
         validation_result: String::new(),
         rejection_reason: String::new(),
+        ..Default::default()
     })
 }
 
@@ -1055,6 +1137,11 @@ fn network_endpoint_from_json(
 ) -> std::result::Result<NetworkEndpoint, String> {
     if endpoint.host.trim().is_empty() {
         return Err("endpoint.host is required".to_string());
+    }
+    if let Some(reason) =
+        openshell_policy::agent_authored_transport_rejection(&endpoint.protocol, &endpoint.tls)
+    {
+        return Err(reason.to_string());
     }
 
     let mut ports = endpoint.ports;
@@ -1121,6 +1208,8 @@ fn network_endpoint_from_json(
         allow_encoded_slash: endpoint.allow_encoded_slash,
         websocket_credential_rewrite: false,
         request_body_credential_rewrite: false,
+        allow_uninspected_credentials: false,
+        provider_credentialed: false,
         advisor_proposed: false,
         // GraphQL persisted-query knobs and path scoping default empty —
         // agent proposals don't author them today.
@@ -1133,6 +1222,8 @@ fn network_endpoint_from_json(
         credential_signing: String::new(),
         signing_service: String::new(),
         signing_region: String::new(),
+        // policy.local proposals cannot reference a concrete sandbox provider.
+        credential_binding: None,
     })
 }
 
@@ -1325,6 +1416,11 @@ struct L7DenyRuleJson {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_core::proposals::AgentProposals;
+
+    fn test_workspace_rx() -> tokio::sync::watch::Receiver<String> {
+        tokio::sync::watch::channel(String::new()).1
+    }
 
     #[test]
     fn proposal_chunks_from_body_accepts_add_rule_operation() {
@@ -1375,6 +1471,7 @@ mod tests {
         assert_eq!(rule.endpoints[0].port, 443);
         assert_eq!(rule.endpoints[0].ports, vec![443]);
         assert_eq!(rule.endpoints[0].protocol, "rest");
+        assert!(rule.endpoints[0].advisor_proposed);
         #[allow(deprecated)]
         {
             assert!(rule.binaries[0].harness);
@@ -1416,6 +1513,47 @@ mod tests {
         let error = proposal_chunks_from_body(body).unwrap_err();
         assert!(error.contains("query strings"));
         assert!(!error.contains("secret"));
+    }
+
+    #[test]
+    fn proposal_chunks_from_body_rejects_native_tcp_and_tls_skip() {
+        for endpoint in [
+            r#"{"host":"db.example.com","port":5432,"protocol":"tcp"}"#,
+            r#"{"host":"api.example.com","port":443,"tls":"skip"}"#,
+        ] {
+            let body = format!(
+                r#"{{
+                    "operations": [{{
+                        "addRule": {{
+                            "ruleName": "raw_transport",
+                            "rule": {{"endpoints": [{endpoint}]}}
+                        }}
+                    }}]
+                }}"#
+            );
+
+            let error = proposal_chunks_from_body(body.as_bytes()).unwrap_err();
+            assert!(error.contains("administrator"), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn proposal_chunks_from_body_accepts_omitted_protocol_with_default_tls() {
+        let body = br#"{
+            "operations": [{
+                "addRule": {
+                    "ruleName": "explicit_proxy",
+                    "rule": {
+                        "endpoints": [{"host":"api.example.com","port":443}]
+                    }
+                }
+            }]
+        }"#;
+
+        let chunks = proposal_chunks_from_body(body).unwrap();
+        let endpoint = &chunks[0].proposed_rule.as_ref().unwrap().endpoints[0];
+        assert!(endpoint.protocol.is_empty());
+        assert!(endpoint.tls.is_empty());
     }
 
     #[test]
@@ -1467,7 +1605,14 @@ mod tests {
 ";
         std::fs::write(&log_path, body).unwrap();
 
-        let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf());
+        let ctx = PolicyLocalContext::with_log_dir(
+            None,
+            None,
+            None,
+            AgentProposals::new(true),
+            dir.path().to_path_buf(),
+            test_workspace_rx(),
+        );
         let (status, payload) = recent_denials_response(&ctx, "last=10").await;
         assert_eq!(status, 200);
         assert_eq!(payload["log_available"], true);
@@ -1498,7 +1643,14 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf());
+        let ctx = PolicyLocalContext::with_log_dir(
+            None,
+            None,
+            None,
+            AgentProposals::new(true),
+            dir.path().to_path_buf(),
+            test_workspace_rx(),
+        );
         let (status, payload) = recent_denials_response(&ctx, "").await;
         assert_eq!(status, 200);
         assert_eq!(payload["log_available"], false);
@@ -1508,7 +1660,14 @@ mod tests {
     #[tokio::test]
     async fn recent_denials_signals_when_log_is_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf());
+        let ctx = PolicyLocalContext::with_log_dir(
+            None,
+            None,
+            None,
+            AgentProposals::new(true),
+            dir.path().to_path_buf(),
+            test_workspace_rx(),
+        );
         let (status, payload) = recent_denials_response(&ctx, "").await;
         assert_eq!(status, 200);
         assert_eq!(payload["log_available"], false);
@@ -1571,7 +1730,14 @@ mod tests {
         );
         std::fs::write(&log_path, line).unwrap();
 
-        let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf());
+        let ctx = PolicyLocalContext::with_log_dir(
+            None,
+            None,
+            None,
+            AgentProposals::new(true),
+            dir.path().to_path_buf(),
+            test_workspace_rx(),
+        );
         let (_, payload) = recent_denials_response(&ctx, "last=1").await;
         let denials = payload["denials"].as_array().unwrap();
         assert_eq!(denials.len(), 1);
@@ -1580,12 +1746,9 @@ mod tests {
         assert!(surfaced.ends_with("...[truncated]"));
     }
 
-    use openshell_core::proposals::test_helpers::ProposalsFlagGuard;
-
     #[test]
     fn agent_next_steps_returns_empty_when_flag_off() {
-        let _guard = ProposalsFlagGuard::set_blocking(false);
-        let steps = agent_next_steps();
+        let steps = agent_next_steps(false);
         let arr = steps.as_array().expect("agent_next_steps is an array");
         assert!(
             arr.is_empty(),
@@ -1595,8 +1758,7 @@ mod tests {
 
     #[test]
     fn agent_next_steps_returns_full_array_when_flag_on() {
-        let _guard = ProposalsFlagGuard::set_blocking(true);
-        let steps = agent_next_steps();
+        let steps = agent_next_steps(true);
         let arr = steps.as_array().expect("agent_next_steps is an array");
         assert_eq!(arr.len(), 4, "expected 4 next_steps when feature is on");
         let actions: Vec<&str> = arr
@@ -1609,14 +1771,12 @@ mod tests {
 
     #[test]
     fn agent_guidance_is_absent_when_flag_off() {
-        let _guard = ProposalsFlagGuard::set_blocking(false);
-        assert!(agent_guidance().is_none());
+        assert!(agent_guidance_for(false).is_none());
     }
 
     #[test]
     fn agent_guidance_points_to_policy_advisor_when_flag_on() {
-        let _guard = ProposalsFlagGuard::set_blocking(true);
-        let guidance = agent_guidance().expect("guidance when proposals are enabled");
+        let guidance = agent_guidance_for(true).expect("guidance when proposals are enabled");
         assert!(guidance.contains("do not stop"));
         assert!(guidance.contains("/etc/openshell/skills/policy_advisor.md"));
         assert!(guidance.contains("http://policy.local/v1/proposals"));
@@ -1625,7 +1785,6 @@ mod tests {
 
     #[tokio::test]
     async fn route_request_returns_feature_disabled_when_flag_off() {
-        let _guard = ProposalsFlagGuard::set(false).await;
         let ctx = PolicyLocalContext::new(
             Some(ProtoSandboxPolicy {
                 version: 1,
@@ -1633,6 +1792,8 @@ mod tests {
             }),
             None,
             None,
+            AgentProposals::new(false),
+            test_workspace_rx(),
         );
 
         // Even the otherwise-public `current_policy` route returns 404 with
@@ -1652,7 +1813,6 @@ mod tests {
 
     #[tokio::test]
     async fn current_policy_route_returns_yaml_envelope() {
-        let _guard = ProposalsFlagGuard::set(true).await;
         let ctx = PolicyLocalContext::new(
             Some(ProtoSandboxPolicy {
                 version: 1,
@@ -1660,6 +1820,8 @@ mod tests {
             }),
             None,
             None,
+            AgentProposals::new(true),
+            test_workspace_rx(),
         );
 
         let (mut client, mut server) = tokio::io::duplex(4096);
@@ -1715,6 +1877,10 @@ mod tests {
             binary: "/usr/bin/curl".to_string(),
             rejection_reason: "scope too broad".to_string(),
             validation_result: "no exfil paths".to_string(),
+            application_error: "candidate invalid: malformed GraphQL operation".to_string(),
+            review_token: "review-v1".to_string(),
+            current_effective_policy_hash: "current-hash".to_string(),
+            candidate_effective_policy_hash: "candidate-hash".to_string(),
             ..Default::default()
         };
         let pending = chunk_state_payload(&chunk, false, false);
@@ -1722,6 +1888,13 @@ mod tests {
         assert_eq!(pending["status"], "rejected");
         assert_eq!(pending["rejection_reason"], "scope too broad");
         assert_eq!(pending["validation_result"], "no exfil paths");
+        assert_eq!(
+            pending["application_error"],
+            "candidate invalid: malformed GraphQL operation"
+        );
+        assert_eq!(pending["review_token"], "review-v1");
+        assert_eq!(pending["current_effective_policy_hash"], "current-hash");
+        assert_eq!(pending["candidate_effective_policy_hash"], "candidate-hash");
         // timed_out and policy_reloaded only appear when relevant.
         assert!(pending.get("timed_out").is_none());
         assert!(
@@ -1752,8 +1925,13 @@ mod tests {
 
     #[tokio::test]
     async fn proposal_routes_reject_malformed_paths() {
-        let _guard = ProposalsFlagGuard::set(true).await;
-        let ctx = PolicyLocalContext::new(None, None, None);
+        let ctx = PolicyLocalContext::new(
+            None,
+            None,
+            None,
+            AgentProposals::new(true),
+            test_workspace_rx(),
+        );
 
         // Empty chunk_id after the prefix is 404, not a wildcard list.
         let (status, _) = route_request(&ctx, "GET", "/v1/proposals/", &[]).await;
@@ -1773,8 +1951,13 @@ mod tests {
 
     #[tokio::test]
     async fn proposal_status_route_returns_503_when_no_gateway() {
-        let _guard = ProposalsFlagGuard::set(true).await;
-        let ctx = PolicyLocalContext::new(None, None, Some("test-sandbox".to_string()));
+        let ctx = PolicyLocalContext::new(
+            None,
+            None,
+            Some("test-sandbox".to_string()),
+            AgentProposals::new(true),
+            test_workspace_rx(),
+        );
 
         let (status, body) = route_request(&ctx, "GET", "/v1/proposals/chunk-id", &[]).await;
         assert_eq!(status, 503);
@@ -1783,8 +1966,13 @@ mod tests {
 
     #[tokio::test]
     async fn proposal_wait_route_returns_503_when_no_gateway() {
-        let _guard = ProposalsFlagGuard::set(true).await;
-        let ctx = PolicyLocalContext::new(None, None, Some("test-sandbox".to_string()));
+        let ctx = PolicyLocalContext::new(
+            None,
+            None,
+            Some("test-sandbox".to_string()),
+            AgentProposals::new(true),
+            test_workspace_rx(),
+        );
 
         let (status, body) =
             route_request(&ctx, "GET", "/v1/proposals/chunk-id/wait?timeout=1", &[]).await;
@@ -1794,8 +1982,13 @@ mod tests {
 
     #[tokio::test]
     async fn proposal_routes_return_feature_disabled_when_flag_off() {
-        let _guard = ProposalsFlagGuard::set(false).await;
-        let ctx = PolicyLocalContext::new(None, None, Some("test-sandbox".to_string()));
+        let ctx = PolicyLocalContext::new(
+            None,
+            None,
+            Some("test-sandbox".to_string()),
+            AgentProposals::new(false),
+            test_workspace_rx(),
+        );
 
         let (status, body) = route_request(&ctx, "GET", "/v1/proposals/abc", &[]).await;
         assert_eq!(status, 404);
@@ -1871,7 +2064,13 @@ mod tests {
         // whole-policy diff would never see another change and burn the
         // full timeout. Rule-coverage must return immediately.
         let proposed = proposed_curl_rule_for_github();
-        let ctx = PolicyLocalContext::new(Some(policy_with_rule(proposed.clone())), None, None);
+        let ctx = PolicyLocalContext::new(
+            Some(policy_with_rule(proposed.clone())),
+            None,
+            None,
+            AgentProposals::new(false),
+            test_workspace_rx(),
+        );
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
 
         let start = tokio::time::Instant::now();
@@ -1897,14 +2096,20 @@ mod tests {
             version: 1,
             ..Default::default()
         };
-        let ctx = PolicyLocalContext::new(Some(initial), None, None);
+        let ctx = PolicyLocalContext::new(
+            Some(initial),
+            None,
+            None,
+            AgentProposals::new(false),
+            test_workspace_rx(),
+        );
 
         // Concurrently, an unrelated rule lands. We must not return.
         let unrelated_load = {
             let policy = ctx.current_policy.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                *policy.write().await = Some(policy_with_rule(NetworkPolicyRule {
+                *policy.write().await = Some(Arc::new(policy_with_rule(NetworkPolicyRule {
                     name: "unrelated".to_string(),
                     endpoints: vec![NetworkEndpoint {
                         host: "api.example.com".to_string(),
@@ -1916,7 +2121,7 @@ mod tests {
                         path: "/usr/bin/curl".to_string(),
                         ..Default::default()
                     }],
-                }));
+                })));
             })
         };
 
@@ -1948,6 +2153,8 @@ mod tests {
             }),
             None,
             None,
+            AgentProposals::new(false),
+            test_workspace_rx(),
         );
 
         let matching_load = {
@@ -1955,7 +2162,7 @@ mod tests {
             let target = proposed.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                *policy.write().await = Some(policy_with_rule(target));
+                *policy.write().await = Some(Arc::new(policy_with_rule(target)));
             })
         };
 
@@ -1985,6 +2192,8 @@ mod tests {
             }),
             None,
             None,
+            AgentProposals::new(false),
+            test_workspace_rx(),
         );
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
         let start = tokio::time::Instant::now();
@@ -1999,6 +2208,81 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_millis(800),
             "should not extend past deadline by much; took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_checks_unchanged_policy_snapshot_once() {
+        let proposed = proposed_curl_rule_for_github();
+        let ctx = PolicyLocalContext::new(
+            Some(ProtoSandboxPolicy {
+                version: 1,
+                ..Default::default()
+            }),
+            None,
+            None,
+            AgentProposals::new(false),
+            test_workspace_rx(),
+        );
+        let checks = std::cell::Cell::new(0_u32);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(650);
+
+        let reloaded = wait_for_local_policy_to_cover_with(&ctx, &proposed, deadline, |_, _| {
+            checks.set(checks.get() + 1);
+            false
+        })
+        .await;
+
+        assert!(!reloaded);
+        assert_eq!(
+            checks.get(),
+            1,
+            "an unchanged snapshot must be checked once"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_checks_each_installed_snapshot_once() {
+        let proposed = proposed_curl_rule_for_github();
+        let empty_policy = ProtoSandboxPolicy {
+            version: 1,
+            ..Default::default()
+        };
+        let ctx = Arc::new(PolicyLocalContext::new(
+            Some(empty_policy.clone()),
+            None,
+            None,
+            AgentProposals::new(false),
+            test_workspace_rx(),
+        ));
+        let reloads = Arc::clone(&ctx);
+        let covering_rule = proposed.clone();
+        let installations = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            reloads.set_current_policy(empty_policy).await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            reloads
+                .set_current_policy(policy_with_rule(covering_rule))
+                .await;
+        });
+        let checks = std::cell::Cell::new(0_u32);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+
+        let reloaded =
+            wait_for_local_policy_to_cover_with(&ctx, &proposed, deadline, |policy, rule| {
+                checks.set(checks.get() + 1);
+                openshell_policy::policy_covers_rule(policy, rule)
+            })
+            .await;
+        installations
+            .await
+            .expect("policy installation task must complete");
+
+        assert!(reloaded, "the covering snapshot must complete the wait");
+        assert_eq!(
+            checks.get(),
+            3,
+            "initial, identical replacement, and covering snapshots need one check each"
         );
     }
 
