@@ -2250,6 +2250,7 @@ async fn refresh_global_settings(app: &mut App) {
         offset: 0,
         global: true,
         workspace: String::new(),
+        page_token: String::new(),
     };
     match tokio::time::timeout(
         Duration::from_secs(5),

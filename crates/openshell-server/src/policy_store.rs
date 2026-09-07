@@ -134,6 +134,13 @@ pub trait PolicyStoreExt {
         offset: u32,
     ) -> PersistenceResult<Vec<PolicyRecord>>;
 
+    async fn list_policies_after(
+        &self,
+        sandbox_id: &str,
+        limit: u32,
+        after_version: Option<i64>,
+    ) -> PersistenceResult<Vec<PolicyRecord>>;
+
     async fn update_policy_status(
         &self,
         sandbox_id: &str,
@@ -281,6 +288,26 @@ impl PolicyStoreExt for Store {
         match self {
             Self::Postgres(store) => store.list_policies(sandbox_id, limit, offset).await,
             Self::Sqlite(store) => store.list_policies(sandbox_id, limit, offset).await,
+        }
+    }
+
+    async fn list_policies_after(
+        &self,
+        sandbox_id: &str,
+        limit: u32,
+        after_version: Option<i64>,
+    ) -> PersistenceResult<Vec<PolicyRecord>> {
+        match self {
+            Self::Postgres(store) => {
+                store
+                    .list_policies_after(sandbox_id, limit, after_version)
+                    .await
+            }
+            Self::Sqlite(store) => {
+                store
+                    .list_policies_after(sandbox_id, limit, after_version)
+                    .await
+            }
         }
     }
 

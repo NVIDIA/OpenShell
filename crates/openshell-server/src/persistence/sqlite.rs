@@ -1167,6 +1167,37 @@ LIMIT ?3 OFFSET ?4
         rows.into_iter().map(row_to_policy_record).collect()
     }
 
+    pub async fn list_policies_after(
+        &self,
+        sandbox_id: &str,
+        limit: u32,
+        after_version: Option<i64>,
+    ) -> PersistenceResult<Vec<PolicyRecord>> {
+        match after_version {
+            Some(after_version) => {
+                let rows = sqlx::query(
+                    r#"
+SELECT "id", "scope", "version", "status", "payload", "created_at_ms"
+FROM "objects"
+WHERE "object_type" = ?1 AND "scope" = ?2 AND "version" < ?3
+ORDER BY "version" DESC, "created_at_ms" DESC
+LIMIT ?4
+"#,
+                )
+                .bind(POLICY_OBJECT_TYPE)
+                .bind(sandbox_id)
+                .bind(after_version)
+                .bind(i64::from(limit))
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+
+                rows.into_iter().map(row_to_policy_record).collect()
+            }
+            None => self.list_policies(sandbox_id, limit, 0).await,
+        }
+    }
+
     pub async fn update_policy_status(
         &self,
         sandbox_id: &str,

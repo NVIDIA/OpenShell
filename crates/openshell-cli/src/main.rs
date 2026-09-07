@@ -2045,6 +2045,10 @@ enum PolicyCommands {
         #[arg(long)]
         global: bool,
 
+        /// Opaque continuation token returned by the previous policy page.
+        #[arg(long)]
+        page_token: Option<String>,
+
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
         output: OutputFormat,
@@ -2940,12 +2944,14 @@ async fn run_async() -> Result<()> {
                     name,
                     limit,
                     global,
+                    page_token,
                     output,
                 } => {
                     if global {
                         run::sandbox_policy_list_global(
                             &ctx.endpoint,
                             limit,
+                            page_token.as_deref().unwrap_or(""),
                             output.as_str(),
                             &cli.workspace,
                             &tls,
@@ -2957,6 +2963,7 @@ async fn run_async() -> Result<()> {
                             &ctx.endpoint,
                             &name,
                             limit,
+                            page_token.as_deref().unwrap_or(""),
                             output.as_str(),
                             &cli.workspace,
                             &tls,

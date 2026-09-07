@@ -2290,6 +2290,8 @@ message ListSandboxPoliciesRequest {
   bool global = 4;
   // Workspace scope. Empty defaults to "default". Ignored when global is true.
   string workspace = 5;
+  // Opaque continuation token returned by the previous policy page.
+  string page_token = 6;
 }
 
 // List sandbox policies response.
@@ -2297,6 +2299,8 @@ message ListSandboxPoliciesResponse {
   // Invalid historical payloads remain visible as failed projections so one
   // legacy row cannot hide the rest of the policy history.
   repeated SandboxPolicyRevision revisions = 1;
+  // Opaque continuation token for the next page, if any.
+  string next_page_token = 2;
 }
 
 // Report policy load status (called by sandbox runtime after reload attempt).

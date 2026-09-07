@@ -3996,6 +3996,12 @@ pub(super) async fn handle_list_sandbox_policies(
             .await?
             .name
     };
+    let page_token = req.page_token.trim();
+    if !page_token.is_empty() && req.offset > 0 {
+        return Err(Status::invalid_argument(
+            "page_token cannot be combined with an explicit offset",
+        ));
+    }
 
     let policy_id = if req.global {
         GLOBAL_POLICY_SANDBOX_ID.to_string()
@@ -4013,18 +4019,55 @@ pub(super) async fn handle_list_sandbox_policies(
     };
 
     let limit = clamp_limit(req.limit, 50, MAX_PAGE_SIZE);
-    let records = state
-        .store
-        .list_policies(&policy_id, limit, req.offset)
-        .await
-        .map_err(|e| Status::internal(format!("list policies failed: {e}")))?;
+    let use_cursor_pagination = req.offset == 0 || !page_token.is_empty();
+    let query = if req.global {
+        "global".to_string()
+    } else {
+        format!("sandbox:{policy_id}")
+    };
+    let records = if use_cursor_pagination {
+        let after_version = if !page_token.is_empty() {
+            Some(super::decode_policy_list_page_token(
+                "sandbox.policy.list",
+                &query,
+                page_token,
+            )?)
+        } else {
+            None
+        };
+        state
+            .store
+            .list_policies_after(&policy_id, limit, after_version)
+            .await
+            .map_err(|e| Status::internal(format!("list policies failed: {e}")))?
+    } else {
+        state
+            .store
+            .list_policies(&policy_id, limit, req.offset)
+            .await
+            .map_err(|e| Status::internal(format!("list policies failed: {e}")))?
+    };
 
     let revisions = records
         .iter()
         .map(|r| policy_record_to_revision(r, false))
         .collect::<Result<Vec<_>, Status>>()?;
 
-    Ok(Response::new(ListSandboxPoliciesResponse { revisions }))
+    let next_page_token = if use_cursor_pagination {
+        match records.last() {
+            Some(record) => {
+                super::encode_policy_list_page_token("sandbox.policy.list", &query, record.version)?
+            }
+            None => String::new(),
+        }
+    } else {
+        String::new()
+    };
+
+    Ok(Response::new(ListSandboxPoliciesResponse {
+        revisions,
+        next_page_token,
+    }))
 }
 
 pub(super) async fn handle_report_policy_status(
@@ -7092,6 +7135,23 @@ mod tests {
         request
     }
 
+    /// Wrap a request with a user `Principal` that satisfies the configured
+    /// platform admin role used in the test state.
+    fn with_platform_admin<T>(mut request: Request<T>) -> Request<T> {
+        request
+            .extensions_mut()
+            .insert(Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: "test-admin".to_string(),
+                    display_name: None,
+                    roles: vec!["openshell-admin".to_string()],
+                    scopes: vec![],
+                    provider: IdentityProvider::Oidc,
+                },
+            }));
+        request
+    }
+
     /// Wrap a request with a sandbox `Principal` bound to `sandbox_id`.
     /// Use for tests that exercise sandbox-caller code paths.
     #[allow(dead_code)]
@@ -7546,6 +7606,7 @@ mod tests {
             with_user(Request::new(ListSandboxPoliciesRequest {
                 name: "stored-invalid-history".to_string(),
                 limit: 10,
+                page_token: String::new(),
                 ..Default::default()
             })),
         )
@@ -8575,6 +8636,7 @@ mod tests {
             &state,
             with_user(Request::new(ListSandboxPoliciesRequest {
                 global: true,
+                page_token: String::new(),
                 ..ListSandboxPoliciesRequest::default()
             })),
         )
@@ -8586,6 +8648,190 @@ mod tests {
                 .message()
                 .contains("platform admin role required")
         );
+    }
+
+    #[tokio::test]
+    async fn list_sandbox_policies_uses_stable_page_tokens_for_sandbox_scope() {
+        let state = test_server_state().await;
+        let sandbox_id = "sandbox-page-token";
+        let sandbox_name = "sandbox-page-token";
+        let policy = validate_and_canonicalize_policy(mcp_policy_with_versions(&["2025-11-25"]))
+            .expect("test policy must canonicalize");
+        let payload = policy.encode_to_vec();
+
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                policy.clone(),
+                Vec::new(),
+            ))
+            .await
+            .expect("store sandbox");
+
+        for (version, id) in [
+            (1, "sandbox-page-token-revision-1"),
+            (2, "sandbox-page-token-revision-2"),
+            (3, "sandbox-page-token-revision-3"),
+        ] {
+            state
+                .store
+                .put_policy_revision(id, sandbox_id, "default", version, &payload, id)
+                .await
+                .expect("store sandbox policy revision");
+        }
+
+        let first_page = handle_list_sandbox_policies(
+            &state,
+            with_user(Request::new(ListSandboxPoliciesRequest {
+                name: sandbox_name.to_string(),
+                limit: 1,
+                offset: 0,
+                global: false,
+                workspace: "default".to_string(),
+                page_token: String::new(),
+            })),
+        )
+        .await
+        .expect("first sandbox policy page")
+        .into_inner();
+        assert_eq!(first_page.revisions.len(), 1);
+        assert_eq!(first_page.revisions[0].version, 3);
+        assert!(!first_page.next_page_token.is_empty());
+
+        state
+            .store
+            .put_policy_revision(
+                "sandbox-page-token-revision-4",
+                sandbox_id,
+                "default",
+                4,
+                &payload,
+                "sandbox-page-token-revision-4",
+            )
+            .await
+            .expect("insert newer sandbox policy revision");
+
+        let offset_page = handle_list_sandbox_policies(
+            &state,
+            with_user(Request::new(ListSandboxPoliciesRequest {
+                name: sandbox_name.to_string(),
+                limit: 1,
+                offset: 1,
+                global: false,
+                workspace: "default".to_string(),
+                page_token: String::new(),
+            })),
+        )
+        .await
+        .expect("offset sandbox policy page")
+        .into_inner();
+        assert_eq!(offset_page.revisions.len(), 1);
+        assert_eq!(offset_page.revisions[0].version, 3);
+
+        let token_page = handle_list_sandbox_policies(
+            &state,
+            with_user(Request::new(ListSandboxPoliciesRequest {
+                name: sandbox_name.to_string(),
+                limit: 1,
+                offset: 0,
+                global: false,
+                workspace: "default".to_string(),
+                page_token: first_page.next_page_token,
+            })),
+        )
+        .await
+        .expect("token sandbox policy page")
+        .into_inner();
+        assert_eq!(token_page.revisions.len(), 1);
+        assert_eq!(token_page.revisions[0].version, 2);
+    }
+
+    #[tokio::test]
+    async fn list_sandbox_policies_uses_stable_page_tokens_for_global_scope() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        let policy = validate_and_canonicalize_policy(mcp_policy_with_versions(&["2025-11-25"]))
+            .expect("test policy must canonicalize");
+        let payload = policy.encode_to_vec();
+
+        for (version, id) in [
+            (1, "global-page-token-revision-1"),
+            (2, "global-page-token-revision-2"),
+            (3, "global-page-token-revision-3"),
+        ] {
+            state
+                .store
+                .put_policy_revision(id, GLOBAL_POLICY_SANDBOX_ID, "", version, &payload, id)
+                .await
+                .expect("store global policy revision");
+        }
+
+        let first_page = handle_list_sandbox_policies(
+            &state,
+            with_platform_admin(Request::new(ListSandboxPoliciesRequest {
+                name: String::new(),
+                limit: 1,
+                offset: 0,
+                global: true,
+                workspace: String::new(),
+                page_token: String::new(),
+            })),
+        )
+        .await
+        .expect("first global policy page")
+        .into_inner();
+        assert_eq!(first_page.revisions.len(), 1);
+        assert_eq!(first_page.revisions[0].version, 3);
+        assert!(!first_page.next_page_token.is_empty());
+
+        state
+            .store
+            .put_policy_revision(
+                "global-page-token-revision-4",
+                GLOBAL_POLICY_SANDBOX_ID,
+                "",
+                4,
+                &payload,
+                "global-page-token-revision-4",
+            )
+            .await
+            .expect("insert newer global policy revision");
+
+        let offset_page = handle_list_sandbox_policies(
+            &state,
+            with_platform_admin(Request::new(ListSandboxPoliciesRequest {
+                name: String::new(),
+                limit: 1,
+                offset: 1,
+                global: true,
+                workspace: String::new(),
+                page_token: String::new(),
+            })),
+        )
+        .await
+        .expect("offset global policy page")
+        .into_inner();
+        assert_eq!(offset_page.revisions.len(), 1);
+        assert_eq!(offset_page.revisions[0].version, 3);
+
+        let token_page = handle_list_sandbox_policies(
+            &state,
+            with_platform_admin(Request::new(ListSandboxPoliciesRequest {
+                name: String::new(),
+                limit: 1,
+                offset: 0,
+                global: true,
+                workspace: String::new(),
+                page_token: first_page.next_page_token,
+            })),
+        )
+        .await
+        .expect("token global policy page")
+        .into_inner();
+        assert_eq!(token_page.revisions.len(), 1);
+        assert_eq!(token_page.revisions[0].version, 2);
     }
 
     #[tokio::test]
@@ -13422,6 +13668,7 @@ mod tests {
                 offset: 0,
                 global: false,
                 workspace: "default".to_string(),
+                page_token: String::new(),
             }),
         )
         .await
@@ -13479,6 +13726,7 @@ mod tests {
                 offset: 0,
                 global: false,
                 workspace: "default".to_string(),
+                page_token: String::new(),
             }),
         )
         .await

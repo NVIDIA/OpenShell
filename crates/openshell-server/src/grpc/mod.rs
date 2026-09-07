@@ -196,6 +196,13 @@ struct ListPageToken {
     cursor: ObjectCursor,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PolicyListPageToken {
+    kind: String,
+    query: String,
+    version: i64,
+}
+
 pub(crate) fn encode_list_page_token(
     kind: &str,
     query: &str,
@@ -231,6 +238,43 @@ pub(crate) fn decode_list_page_token(
         ));
     }
     Ok(decoded.cursor)
+}
+
+pub(crate) fn encode_policy_list_page_token(
+    kind: &str,
+    query: &str,
+    version: i64,
+) -> Result<String, Status> {
+    let token = PolicyListPageToken {
+        kind: kind.to_string(),
+        query: query.to_string(),
+        version,
+    };
+    let json = serde_json::to_vec(&token)
+        .map_err(|err| Status::internal(format!("failed to encode page token: {err}")))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json))
+}
+
+pub(crate) fn decode_policy_list_page_token(
+    expected_kind: &str,
+    expected_query: &str,
+    token: &str,
+) -> Result<i64, Status> {
+    if token.trim().is_empty() {
+        return Err(Status::invalid_argument("page_token is required"));
+    }
+
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| Status::invalid_argument("page_token is invalid"))?;
+    let decoded: PolicyListPageToken = serde_json::from_slice(&bytes)
+        .map_err(|_| Status::invalid_argument("page_token is invalid"))?;
+    if decoded.kind != expected_kind || decoded.query != expected_query {
+        return Err(Status::invalid_argument(
+            "page_token does not match the current query",
+        ));
+    }
+    Ok(decoded.version)
 }
 
 // ---------------------------------------------------------------------------

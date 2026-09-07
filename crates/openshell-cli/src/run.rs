@@ -5367,6 +5367,7 @@ pub async fn sandbox_policy_list(
     server: &str,
     name: &str,
     limit: u32,
+    page_token: &str,
     output: &str,
     workspace: &str,
     tls: &TlsOptions,
@@ -5380,11 +5381,13 @@ pub async fn sandbox_policy_list(
             offset: 0,
             global: false,
             workspace: workspace.to_string(),
+            page_token: page_token.to_string(),
         })
         .await
         .into_diagnostic()?;
 
-    let revisions = resp.into_inner().revisions;
+    let response = resp.into_inner();
+    let revisions = response.revisions;
     let structured = policy_revision_list_json("sandbox", Some(name), &revisions)?;
     if crate::output::print_output_collection(output, &structured, Clone::clone)? {
         return Ok(());
@@ -5396,12 +5399,17 @@ pub async fn sandbox_policy_list(
     }
 
     print_policy_revision_table(&revisions);
+    if !response.next_page_token.is_empty() {
+        println!();
+        println!("Next page token: {}", response.next_page_token);
+    }
     Ok(())
 }
 
 pub async fn sandbox_policy_list_global(
     server: &str,
     limit: u32,
+    page_token: &str,
     output: &str,
     workspace: &str,
     tls: &TlsOptions,
@@ -5415,11 +5423,13 @@ pub async fn sandbox_policy_list_global(
             offset: 0,
             global: true,
             workspace: workspace.to_string(),
+            page_token: page_token.to_string(),
         })
         .await
         .into_diagnostic()?;
 
-    let revisions = resp.into_inner().revisions;
+    let response = resp.into_inner();
+    let revisions = response.revisions;
     let structured = policy_revision_list_json("global", None, &revisions)?;
     if crate::output::print_output_collection(output, &structured, Clone::clone)? {
         return Ok(());
@@ -5431,6 +5441,10 @@ pub async fn sandbox_policy_list_global(
     }
 
     print_policy_revision_table(&revisions);
+    if !response.next_page_token.is_empty() {
+        println!();
+        println!("Next page token: {}", response.next_page_token);
+    }
     Ok(())
 }
 
