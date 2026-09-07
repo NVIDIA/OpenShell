@@ -4157,8 +4157,9 @@ endpoints:
         assert!(parse_profile_yaml(yaml).is_err());
         assert!(parse_profile_catalog_yamls(&[yaml]).is_err());
 
-        let value = serde_yml::from_str(yaml).expect("generic YAML value must parse");
-        assert!(serde_yml::from_value::<ProviderTypeProfile>(value).is_err());
+        let value =
+            serde_yml::from_str::<serde_yml::Value>(yaml).expect("generic YAML value must parse");
+        assert!(serde_yml::from_value::<ProviderTypeProfile>(&value).is_err());
 
         for json in [
             r#"{"id":"mcp-example","display_name":"MCP Example","endpoints":[{"host":"mcp.example.com","port":443,"protocol":"mcp","mcp":null}]}"#,
@@ -4220,8 +4221,9 @@ mcp:
             endpoint_yaml.trim_start().replace('\n', "\n    ")
         );
         assert!(parse_profile_yaml(&profile_yaml).is_err());
-        let value = serde_yml::from_str(&profile_yaml).expect("generic YAML value must parse");
-        assert!(serde_yml::from_value::<ProviderTypeProfile>(value).is_err());
+        let value = serde_yml::from_str::<serde_yml::Value>(&profile_yaml)
+            .expect("generic YAML value must parse");
+        assert!(serde_yml::from_value::<ProviderTypeProfile>(&value).is_err());
 
         let profile_json = format!(
             r#"{{"id":"mcp-example","display_name":"MCP Example","endpoints":[{endpoint_json}]}}"#
