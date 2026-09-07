@@ -7,7 +7,7 @@ set -euo pipefail
 
 # Scan release artifacts with Trivy.
 #
-#   trivy-scan.sh config [--chart-ref <oci-ref>]
+#   trivy-scan.sh config [--chart-ref <oci-ref>]...
 #   trivy-scan.sh images <image-ref> [<image-ref>...]
 #   trivy-scan.sh gate
 #   trivy-scan.sh gate-config-diff <baseline-reports> <candidate-reports>
@@ -293,10 +293,15 @@ case "${1:-}" in
     shift
     mkdir -p "${REPORT_DIR}"
     scan_config
-    if [ "${1:-}" = "--chart-ref" ]; then
+    # A release publishes every chart under deploy/helm, so `--chart-ref`
+    # repeats. Unparsed arguments are rejected rather than ignored: a misspelled
+    # flag would otherwise leave the packaged charts unscanned and still exit 0.
+    while [ "${1:-}" = "--chart-ref" ]; do
       [ -n "${2:-}" ] || { echo "Error: --chart-ref needs a value" >&2; exit 2; }
       scan_packaged_chart "$2"
-    fi
+      shift 2
+    done
+    [ $# -eq 0 ] || { echo "Error: unexpected argument '$1' after config" >&2; exit 2; }
     ;;
   images)
     shift
@@ -318,7 +323,7 @@ case "${1:-}" in
   *)
     cat >&2 <<'USAGE'
 Usage:
-  trivy-scan.sh config [--chart-ref <oci-ref>]
+  trivy-scan.sh config [--chart-ref <oci-ref>]...
   trivy-scan.sh images <image-ref> [<image-ref>...]
   trivy-scan.sh gate
   trivy-scan.sh gate-config-diff <baseline-reports> <candidate-reports>

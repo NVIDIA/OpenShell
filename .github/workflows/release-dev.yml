@@ -628,6 +628,26 @@ jobs:
           release-kind: dev
           pin-sha: ${{ github.sha }}
 
+  # Scans what this run published, so it can only follow publication and cannot
+  # gate it. Findings stay informational; a scanner that cannot run still fails.
+  # The SHA-pinned chart is used over the floating 0.0.0-dev tag so the scan is
+  # tied to the images above rather than to whatever dev points at.
+  scan-released-artifacts:
+    needs: release-helm
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    uses: ./.github/workflows/trivy-scan.yml
+    with:
+      images: |
+        ghcr.io/nvidia/openshell/gateway:${{ github.sha }}
+        ghcr.io/nvidia/openshell/supervisor:${{ github.sha }}
+      charts: |
+        oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev.${{ github.sha }}
+        oci://ghcr.io/nvidia/openshell/openshell-workspace:0.0.0-dev.${{ github.sha }}
+    secrets: inherit
+
   trigger-wheel-publish:
     name: Trigger Wheel Publish
     needs: [compute-versions, release-dev]

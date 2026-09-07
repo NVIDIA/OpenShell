@@ -101,9 +101,14 @@ additionally ignores vulnerabilities with no upstream fix, because a base-image
 CVE without a patch would otherwise be permanent noise. That option does not
 apply to misconfigurations.
 
-It is not listed in any release workflow's `needs:`, so no publication depends
-on it. Wiring it into `release-dev.yml` and `release-tag.yml` is a separate
-change, and one that only makes sense once findings fail.
+`release-dev.yml` and `release-tag.yml` both call it once publication has
+finished, passing the images and the two charts that run published. Because it
+scans published artifacts, it can only follow publication and never gates it —
+no release waits on the result. Release Dev uploads SARIF against `main`; the
+tag release keeps reports as artifacts only, since Code Scanning keys alerts by
+ref and a tag ref would duplicate what `main` already shows. Findings remain
+informational there too: with four checks reporting today, `fail-on-findings`
+would break every release, so flipping it stays a separate change.
 
 The configuration scan targets `deploy/` in one pass, which covers both charts,
 the published Dockerfiles and the raw manifests. The macOS Dockerfiles export a

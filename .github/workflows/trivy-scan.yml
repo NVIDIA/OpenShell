@@ -19,9 +19,9 @@ on:
         required: false
         type: string
         default: ""
-      chart-ref:
+      charts:
         description: |
-          Packaged Helm chart to scan, for example
+          Newline-separated packaged Helm charts to scan, for example
           oci://ghcr.io/nvidia/openshell/helm-chart:0.0.116
         required: false
         type: string
@@ -58,8 +58,8 @@ on:
         required: false
         type: string
         default: ""
-      chart-ref:
-        description: Packaged Helm chart OCI reference to scan
+      charts:
+        description: Newline-separated packaged Helm chart OCI references to scan
         required: false
         type: string
         default: ""
@@ -202,12 +202,13 @@ jobs:
       - name: Scan configuration
         id: scan
         env:
-          CHART_REF: ${{ inputs.chart-ref }}
+          CHARTS: ${{ inputs.charts }}
         run: |
           args=()
-          if [ -n "$CHART_REF" ]; then
-            args+=(--chart-ref "$CHART_REF")
-          fi
+          while IFS= read -r ref; do
+            [ -n "$ref" ] || continue
+            args+=(--chart-ref "$ref")
+          done <<<"$CHARTS"
           tasks/scripts/trivy-scan.sh config "${args[@]}"
 
       - name: Upload SARIF to Code Scanning

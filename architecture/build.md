@@ -447,9 +447,15 @@ pull-request change gate.
 ### Release Artifacts
 
 `.github/workflows/trivy-scan.yml` is reusable and takes OCI references as
-input, so it has no knowledge of how a release is assembled and no dependency on
-release job ordering. Nix supplies both Trivy and Helm, and the jobs stay on
-GitHub-hosted runners like the other scanners.
+input, so it has no knowledge of how a release is assembled. Nix supplies both
+Trivy and Helm, and the jobs stay on GitHub-hosted runners like the other
+scanners.
+
+Both release workflows call it after their Helm publication step, passing the
+images and every chart that run published. Scanning published artifacts means it
+can only follow publication, so it reports on a release rather than gating one:
+no publication job depends on the result. Findings stay informational while four
+checks report, because `fail-on-findings` would otherwise break every release.
 
 Findings are informational during the observation phase: they warn and the run
 stays green, while a scanner that cannot run still fails. The `fail-on-findings`
@@ -470,8 +476,8 @@ Two scopes, with deliberately different reporting semantics:
   combinations: the chart defaults render 10 of the chart's 19 templates, so
   CI value fixtures exercise conditional resources such as the high-availability
   Deployment, Gateway API objects, OpenShift Route, and broader workspace-mode
-  ClusterRole. Each fixture is scanned on its own, and the packaged chart is
-  scanned from its published OCI reference to cover the artifact consumers
+  ClusterRole. Each fixture is scanned on its own, and each packaged chart is
+  scanned from its published OCI reference to cover the artifacts consumers
   actually install.
 
 Trivy has no OCI artifact target, and `trivy image` rejects the Helm config media
