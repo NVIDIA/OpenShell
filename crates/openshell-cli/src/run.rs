@@ -3548,6 +3548,7 @@ pub async fn workspace_list(
     limit: u32,
     offset: u32,
     label_selector: &str,
+    page_token: &str,
     output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -3559,10 +3560,12 @@ pub async fn workspace_list(
             limit,
             offset,
             label_selector: label_selector.to_string(),
+            page_token: page_token.to_string(),
         })
         .await
         .into_diagnostic()?;
-    let workspaces = response.into_inner().workspaces;
+    let response = response.into_inner();
+    let workspaces = response.workspaces;
 
     if crate::output::print_output_collection(output, &workspaces, workspace_to_json)? {
         return Ok(());
@@ -3608,6 +3611,11 @@ pub async fn workspace_list(
             created,
             labels,
         );
+    }
+
+    if !response.next_page_token.is_empty() {
+        println!();
+        println!("Next page token: {}", response.next_page_token);
     }
 
     Ok(())

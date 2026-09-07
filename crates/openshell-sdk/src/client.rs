@@ -449,6 +449,7 @@ impl OpenShellClient {
                     limit: opts.limit,
                     offset: opts.offset,
                     label_selector: opts.label_selector.clone().unwrap_or_default(),
+                    page_token: String::new(),
                 };
                 async move { grpc.list_workspaces(request).await }
             })

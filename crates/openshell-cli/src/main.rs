@@ -2284,6 +2284,10 @@ enum WorkspaceCommands {
         #[arg(long)]
         label_selector: Option<String>,
 
+        /// Opaque continuation token returned by the previous workspace page.
+        #[arg(long)]
+        page_token: Option<String>,
+
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
         output: OutputFormat,
@@ -3628,6 +3632,7 @@ async fn run_async() -> Result<()> {
                     limit,
                     offset,
                     label_selector,
+                    page_token,
                     output,
                 } => {
                     run::workspace_list(
@@ -3635,6 +3640,7 @@ async fn run_async() -> Result<()> {
                         limit,
                         offset,
                         label_selector.as_deref().unwrap_or(""),
+                        page_token.as_deref().unwrap_or(""),
                         output.as_str(),
                         &tls,
                     )

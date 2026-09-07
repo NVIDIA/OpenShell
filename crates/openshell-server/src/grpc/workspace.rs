@@ -25,12 +25,12 @@ use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{AuthGrant, MinWorkspaceRole, authorize_workspace};
 use crate::persistence::{
-    DRAFT_CHUNK_OBJECT_TYPE, ObjectLabels, ObjectType, POLICY_OBJECT_TYPE, WriteCondition,
-    current_time_ms,
+    DRAFT_CHUNK_OBJECT_TYPE, ObjectCursor, ObjectLabels, ObjectType, POLICY_OBJECT_TYPE,
+    WriteCondition, current_time_ms,
 };
 use std::collections::HashMap;
 
-use super::{MAX_PAGE_SIZE, clamp_limit};
+use super::{MAX_PAGE_SIZE, clamp_limit, decode_list_page_token, encode_list_page_token};
 
 pub const WORKSPACE_OBJECT_TYPE: &str = "workspace";
 pub const DEFAULT_WORKSPACE_NAME: &str = "default";
@@ -82,6 +82,19 @@ fn validate_workspace_name(name: &str) -> Result<(), Status> {
         )));
     }
     super::validation::validate_dns1123_label(name, "workspace name")
+}
+
+fn workspace_page_cursor(workspace: &Workspace) -> Result<ObjectCursor, Status> {
+    let metadata = workspace
+        .metadata
+        .as_ref()
+        .ok_or_else(|| Status::internal("workspace metadata missing"))?;
+    Ok(ObjectCursor {
+        created_at_ms: metadata.created_at_ms,
+        name: metadata.name.clone(),
+        workspace: metadata.workspace.clone(),
+        id: metadata.id.clone(),
+    })
 }
 
 /// A resolved workspace name with its current lifecycle state.
@@ -250,38 +263,75 @@ pub(super) async fn handle_list_workspaces(
     super::validation::validate_label_selector(&req.label_selector)?;
     let limit = clamp_limit(req.limit, 100, MAX_PAGE_SIZE);
     let subject = membership_filter_subject(state, &principal)?;
+    let page_token = req.page_token.trim();
+    if !page_token.is_empty() && (subject.is_some() || !req.label_selector.is_empty()) {
+        return Err(Status::invalid_argument(
+            "page_token is currently supported only for unfiltered global workspace listings",
+        ));
+    }
 
-    let member_type = WorkspaceMember::object_type();
-    let workspaces = match subject {
-        Some(subject) if req.label_selector.is_empty() => state
+    let use_cursor_pagination = subject.is_none()
+        && req.label_selector.is_empty()
+        && (req.offset == 0 || !page_token.is_empty());
+    let workspaces = if use_cursor_pagination {
+        let after = if !page_token.is_empty() {
+            Some(decode_list_page_token(
+                "workspace.list",
+                "global",
+                page_token,
+            )?)
+        } else {
+            None
+        };
+        state
             .store
-            .list_messages_with_membership::<Workspace>(member_type, subject, limit, req.offset)
+            .list_all_messages_after::<Workspace>(after.as_ref(), limit)
             .await
-            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?,
-        Some(subject) => state
-            .store
-            .list_messages_with_membership_and_selector::<Workspace>(
-                member_type,
-                subject,
-                &req.label_selector,
-                limit,
-                req.offset,
-            )
-            .await
-            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?,
-        None if req.label_selector.is_empty() => state
-            .store
-            .list_messages("", limit, req.offset)
-            .await
-            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?,
-        None => state
-            .store
-            .list_messages_with_selector("", &req.label_selector, limit, req.offset)
-            .await
-            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?,
+            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?
+    } else {
+        let member_type = WorkspaceMember::object_type();
+        match subject {
+            Some(subject) if req.label_selector.is_empty() => state
+                .store
+                .list_messages_with_membership::<Workspace>(member_type, subject, limit, req.offset)
+                .await
+                .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?,
+            Some(subject) => state
+                .store
+                .list_messages_with_membership_and_selector::<Workspace>(
+                    member_type,
+                    subject,
+                    &req.label_selector,
+                    limit,
+                    req.offset,
+                )
+                .await
+                .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?,
+            None => state
+                .store
+                .list_messages_with_selector("", &req.label_selector, limit, req.offset)
+                .await
+                .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?,
+        }
     };
 
-    Ok(Response::new(ListWorkspacesResponse { workspaces }))
+    let next_page_token = if use_cursor_pagination {
+        match workspaces.last() {
+            Some(workspace) => encode_list_page_token(
+                "workspace.list",
+                "global",
+                &workspace_page_cursor(workspace)?,
+            )?,
+            None => String::new(),
+        }
+    } else {
+        String::new()
+    };
+
+    Ok(Response::new(ListWorkspacesResponse {
+        workspaces,
+        next_page_token,
+    }))
 }
 
 pub(super) async fn handle_delete_workspace(
@@ -1697,5 +1747,94 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn list_workspaces_returns_stable_page_tokens_for_global_list() {
+        let state = test_server_state().await;
+
+        for name in ["page-a", "page-b", "page-c"] {
+            handle_create_workspace(
+                &state,
+                Request::new(CreateWorkspaceRequest {
+                    name: name.to_string(),
+                    labels: HashMap::new(),
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let first_page = handle_list_workspaces(
+            &state,
+            authed_request(ListWorkspacesRequest {
+                limit: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(
+            first_page
+                .workspaces
+                .iter()
+                .filter_map(|workspace| workspace.metadata.as_ref().map(|m| m.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec!["default", "page-a"]
+        );
+        assert!(
+            !first_page.next_page_token.is_empty(),
+            "first page should return a continuation token"
+        );
+
+        state
+            .store
+            .delete_by_name(Workspace::object_type(), "", "default")
+            .await
+            .unwrap();
+
+        let token_page = handle_list_workspaces(
+            &state,
+            authed_request(ListWorkspacesRequest {
+                limit: 2,
+                page_token: first_page.next_page_token.clone(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(
+            token_page
+                .workspaces
+                .iter()
+                .filter_map(|workspace| workspace.metadata.as_ref().map(|m| m.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec!["page-b", "page-c"]
+        );
+
+        let offset_page = handle_list_workspaces(
+            &state,
+            authed_request(ListWorkspacesRequest {
+                limit: 2,
+                offset: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(
+            offset_page
+                .workspaces
+                .iter()
+                .filter_map(|workspace| workspace.metadata.as_ref().map(|m| m.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec!["page-c"]
+        );
     }
 }

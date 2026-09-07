@@ -2993,11 +2993,15 @@ message ListWorkspacesRequest {
   uint32 offset = 2;
   // Optional label selector for filtering (format: "key1=value1,key2=value2").
   string label_selector = 3;
+  // Opaque continuation token returned by the previous page.
+  string page_token = 4;
 }
 
 // List workspaces response.
 message ListWorkspacesResponse {
   repeated openshell.datamodel.v1.Workspace workspaces = 1;
+  // Opaque continuation token for the next page, if more results exist.
+  string next_page_token = 2;
 }
 
 // Delete workspace request.

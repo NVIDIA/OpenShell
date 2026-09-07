@@ -11,6 +11,7 @@ mod service;
 mod validation;
 pub mod workspace;
 
+use base64::Engine as _;
 use openshell_core::proto::{
     AddWorkspaceMemberRequest, AddWorkspaceMemberResponse, ApproveAllDraftChunksRequest,
     ApproveAllDraftChunksResponse, ApproveDraftChunkRequest, ApproveDraftChunkResponse,
@@ -67,6 +68,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use crate::ServerState;
+use crate::persistence::ObjectCursor;
 
 // ---------------------------------------------------------------------------
 // Public re-exports
@@ -185,6 +187,50 @@ enum StoredSettingValue {
     Int(i64),
     /// Hex-encoded binary payload.
     Bytes(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ListPageToken {
+    kind: String,
+    query: String,
+    cursor: ObjectCursor,
+}
+
+pub(crate) fn encode_list_page_token(
+    kind: &str,
+    query: &str,
+    cursor: &ObjectCursor,
+) -> Result<String, Status> {
+    let token = ListPageToken {
+        kind: kind.to_string(),
+        query: query.to_string(),
+        cursor: cursor.clone(),
+    };
+    let json = serde_json::to_vec(&token)
+        .map_err(|err| Status::internal(format!("failed to encode page token: {err}")))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json))
+}
+
+pub(crate) fn decode_list_page_token(
+    expected_kind: &str,
+    expected_query: &str,
+    token: &str,
+) -> Result<ObjectCursor, Status> {
+    if token.trim().is_empty() {
+        return Err(Status::invalid_argument("page_token is required"));
+    }
+
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| Status::invalid_argument("page_token is invalid"))?;
+    let decoded: ListPageToken = serde_json::from_slice(&bytes)
+        .map_err(|_| Status::invalid_argument("page_token is invalid"))?;
+    if decoded.kind != expected_kind || decoded.query != expected_query {
+        return Err(Status::invalid_argument(
+            "page_token does not match the current query",
+        ));
+    }
+    Ok(decoded.cursor)
 }
 
 // ---------------------------------------------------------------------------

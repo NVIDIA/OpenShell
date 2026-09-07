@@ -13,6 +13,7 @@ pub use openshell_core::proto::{
 use openshell_core::{Error as CoreError, Result as CoreResult};
 use prost::Message;
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -112,7 +113,7 @@ pub struct ObjectRecord {
 /// Keyset consumers must use the matching store method for the order encoded
 /// here: workspace-scoped lists use `created_at_ms`, `name`, and `id`; global
 /// lists additionally include `workspace`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectCursor {
     pub created_at_ms: i64,
     pub name: String,
@@ -130,7 +131,6 @@ impl From<&ObjectRecord> for ObjectCursor {
         }
     }
 }
-
 /// Write condition for compare-and-swap operations.
 #[derive(Debug, Clone, Copy)]
 pub enum WriteCondition {
@@ -874,6 +874,19 @@ impl Store {
         offset: u32,
     ) -> PersistenceResult<Vec<T>> {
         self.list_all_with_selector(T::object_type(), label_selector, limit, offset)
+            .await?
+            .into_iter()
+            .map(decode_record)
+            .collect()
+    }
+
+    /// List and decode protobuf messages across all workspaces after a stable cursor.
+    pub async fn list_all_messages_after<T: Message + Default + ObjectType + SetResourceVersion>(
+        &self,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<T>> {
+        self.list_by_type_after(T::object_type(), after, limit)
             .await?
             .into_iter()
             .map(decode_record)

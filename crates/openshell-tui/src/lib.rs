@@ -2029,6 +2029,7 @@ async fn refresh_workspaces(app: &mut App) {
         limit: 100,
         offset: 0,
         label_selector: String::new(),
+        page_token: String::new(),
     };
     match tokio::time::timeout(Duration::from_secs(5), app.client.list_workspaces(req)).await {
         Ok(Ok(resp)) => {

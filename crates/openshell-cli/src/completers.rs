@@ -90,6 +90,7 @@ pub fn complete_workspace_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
                 limit: 200,
                 offset: 0,
                 label_selector: String::new(),
+                page_token: String::new(),
             })
             .await
             .ok()?;
