@@ -839,11 +839,21 @@ async fn serve_gateway_listener(
                 continue;
             }
         };
-        let listener_scope = match stream.local_addr() {
-            Ok(local_addr) => spec.scope_for_local_addr(local_addr),
+        let connection = match stream.local_addr() {
+            Ok(local_addr) => GatewayConnectionContext {
+                listen_addr: local_addr,
+                listener_scope: spec.scope_for_local_addr(local_addr),
+                listener_allows_plaintext_service_http: spec
+                    .allows_plaintext_service_http_for_local_addr(local_addr),
+            },
             Err(e) => {
                 debug!(error = %e, client = %addr, listen = %listen_addr, "Failed to inspect accepted local address");
-                spec.scope
+                GatewayConnectionContext {
+                    listen_addr,
+                    listener_scope: spec.scope,
+                    listener_allows_plaintext_service_http: spec
+                        .allows_plaintext_service_http_for_local_addr(listen_addr),
+                }
             }
         };
 
@@ -852,8 +862,7 @@ async fn serve_gateway_listener(
         spawn_gateway_connection(
             stream,
             addr,
-            listen_addr,
-            listener_scope,
+            connection,
             service.clone(),
             tls_acceptor.clone(),
             enable_loopback_service_http,
@@ -912,34 +921,40 @@ fn looks_like_http(prefix: &[u8]) -> bool {
 
 fn allow_plaintext_service_http(
     enabled: bool,
-    listen_addr: SocketAddr,
     peer_addr: SocketAddr,
-    listener_scope: GatewayListenerScope,
+    listener_allows_plaintext_service_http: bool,
 ) -> bool {
-    enabled
-        && matches!(listener_scope, GatewayListenerScope::Primary)
-        && listen_addr.ip().is_loopback()
-        && peer_addr.ip().is_loopback()
+    enabled && listener_allows_plaintext_service_http && peer_addr.ip().is_loopback()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GatewayConnectionContext {
+    listen_addr: SocketAddr,
+    listener_scope: GatewayListenerScope,
+    listener_allows_plaintext_service_http: bool,
 }
 
 fn spawn_gateway_connection(
     stream: TcpStream,
     addr: SocketAddr,
-    listen_addr: SocketAddr,
-    listener_scope: GatewayListenerScope,
+    connection: GatewayConnectionContext,
     service: MultiplexService,
     tls_acceptor: Option<TlsAcceptor>,
     enable_loopback_service_http: bool,
 ) {
+    let GatewayConnectionContext {
+        listen_addr,
+        listener_scope,
+        listener_allows_plaintext_service_http,
+    } = connection;
     if let Some(acceptor) = tls_acceptor {
         tokio::spawn(async move {
             match classify_connection_protocol(&stream).await {
                 Ok(ConnectionProtocol::PlainHttp)
                     if allow_plaintext_service_http(
                         enable_loopback_service_http,
-                        listen_addr,
                         addr,
-                        listener_scope,
+                        listener_allows_plaintext_service_http,
                     ) =>
                 {
                     if let Err(e) = service
@@ -1401,20 +1416,28 @@ async fn build_compute_runtime(
             };
             let instance = registration.factory.build(build_context).await?;
             match instance {
-                ComputeDriverInstance::InProcess(driver) => ComputeRuntime::from_driver(
-                    registration.name,
-                    driver,
-                    None,
-                    store,
-                    sandbox_index,
-                    sandbox_watch_bus,
-                    tracing_log_bus,
-                    supervisor_sessions,
-                )
-                .await
-                .map_err(|error| {
-                    Error::execution(format!("failed to create compute runtime: {error}"))
-                })?,
+                ComputeDriverInstance::InProcess(driver) => {
+                    let listener_bind_policy = if registration.name == "podman" {
+                        compute::GatewayListenerBindPolicy::TrustedBuiltinPodman
+                    } else {
+                        compute::GatewayListenerBindPolicy::Deny
+                    };
+                    ComputeRuntime::from_driver(
+                        registration.name,
+                        driver,
+                        None,
+                        listener_bind_policy,
+                        store,
+                        sandbox_index,
+                        sandbox_watch_bus,
+                        tracing_log_bus,
+                        supervisor_sessions,
+                    )
+                    .await
+                    .map_err(|error| {
+                        Error::execution(format!("failed to create compute runtime: {error}"))
+                    })?
+                }
                 ComputeDriverInstance::ManagedRemote(mut endpoint) => {
                     endpoint.name = registration.name;
                     ComputeRuntime::new_remote_driver(
@@ -1932,28 +1955,14 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_service_http_requires_loopback_listener_and_peer() {
-        let loopback: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    fn plaintext_service_http_requires_enabled_listener_and_loopback_peer() {
         let peer: SocketAddr = "127.0.0.1:54000".parse().unwrap();
-        let wildcard: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         let remote_peer: SocketAddr = "192.0.2.10:54000".parse().unwrap();
-        let primary = GatewayListenerScope::Primary;
-        let callback = GatewayListenerScope::ComputeDriverCallback;
 
-        assert!(allow_plaintext_service_http(true, loopback, peer, primary));
-        assert!(!allow_plaintext_service_http(
-            false, loopback, peer, primary
-        ));
-        assert!(!allow_plaintext_service_http(true, wildcard, peer, primary));
-        assert!(!allow_plaintext_service_http(
-            true,
-            loopback,
-            remote_peer,
-            primary
-        ));
-        assert!(!allow_plaintext_service_http(
-            true, loopback, peer, callback
-        ));
+        assert!(allow_plaintext_service_http(true, peer, true));
+        assert!(!allow_plaintext_service_http(false, peer, true));
+        assert!(!allow_plaintext_service_http(true, remote_peer, true));
+        assert!(!allow_plaintext_service_http(true, peer, false));
     }
 
     #[tokio::test]
@@ -2296,6 +2305,7 @@ mod tests {
             address,
             driver_name: "docker".to_string(),
             reason: "managed bridge".to_string(),
+            allow_delayed_bind: false,
         }
     }
 }

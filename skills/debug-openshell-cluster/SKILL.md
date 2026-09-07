@@ -235,6 +235,20 @@ Common findings:
 - Current gateways reuse the primary listener when it covers Podman's callback
   address. If the primary does not cover that address, inspect the gateway
   startup logs for the additional callback-only listener and its provenance.
+- For rootful Podman, a missing managed bridge address can trigger
+  `listener_purpose="compute-driver-callback-delayed-bind"`. Confirm the exact
+  private address belongs to the built-in driver's discovered managed bridge,
+  the initial bind error is `EADDRNOTAVAIL`, and the log reports
+  `bind_strategy="linux-ip-freebind"`. The listener is callback-only and
+  becomes reachable when the first sandbox materializes the bridge.
+- In a nested Linux container with rootful Podman, a missing bridge address can
+  trigger `listener_purpose="nested-podman-callback-fallback"` only when the
+  delayed exact bind also fails. Confirm the failed exact address is the
+  built-in driver's discovered managed bridge (not rootless Podman, an explicit
+  `host_gateway_ip`, or an external driver), and the wildcard socket is
+  callback-only off loopback. The callback RPC surface is reachable on every
+  IPv4 interface in the outer container namespace for that gateway process, so
+  also inspect the surrounding container-network boundary.
 - Rootless slirp4netns, another named helper, or missing helper metadata
   requires an explicitly remote `grpc_endpoint`. An explicit `host_gateway_ip`
   cannot bypass slirp4netns host-loopback isolation. Do not work around
@@ -680,6 +694,8 @@ configuration — check that the gateway spawned the driver binary you expect
 | `BatchSpanProcessor.ExportError` repeatedly reports connection refused on `127.0.0.1:4317` | The local gateway started with OTLP configured but the collector forwarding task later stopped, or the config was created manually | Restart `gateway:docker`, `gateway:podman`, or `gateway:vm` so it re-detects the listener; inspect the generated `gateway.toml` for `[openshell.gateway.otlp]` |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
 | Gateway exits while resolving compute-driver listener requirements | Callback alias topology is unsupported, the Podman network cannot be inspected, or the selected address is not private/authorized | Gateway startup error, `podman info --debug`, Podman network inspection, host IPv4 default route |
+| Rootful Podman gateway logs `compute-driver-callback-delayed-bind` | Podman reported a private bridge gateway before netavark assigned it | Confirm the listener uses `linux-ip-freebind`; create a sandbox and verify the managed bridge acquires the logged address |
+| Nested rootful Podman gateway logs `nested-podman-callback-fallback` | Both the ordinary and delayed exact binds failed before netavark assigned the bridge | Verify non-loopback destinations receive callback-only scope and restrict the outer container network |
 | Admin, health, reflection, or HTTP request is denied on an additional Docker/Podman callback-only listener | Additional callback listeners intentionally expose only sandbox-callable gRPC methods | Retry through the gateway's primary endpoint; inspect the listener-purpose startup log if the address was unexpected |
 | Docker or Podman sandbox never registers | Wrong callback endpoint or supervisor startup failure | Gateway logs and sandbox container logs |
 | Docker GPU sandbox fails before startup | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |

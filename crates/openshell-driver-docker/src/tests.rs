@@ -14,8 +14,8 @@ use openshell_core::progress::{
 };
 use openshell_core::proto::compute::v1::{
     DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
-    GetGatewayListenerRequirementsRequest, GpuResourceRequirements, ResourceRequirements,
-    gateway_listener_requirement::Selector,
+    GatewayExactBindAddressRequirement, GetGatewayListenerRequirementsRequest,
+    GpuResourceRequirements, ResourceRequirements, gateway_listener_requirement::Selector,
 };
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -777,7 +777,12 @@ async fn gateway_listener_requirements_report_managed_bridge_address() {
     assert_eq!(response.requirements.len(), 1);
     assert_eq!(
         response.requirements[0].selector,
-        Some(Selector::ExactBindAddress(expected_address.to_string()))
+        Some(Selector::ExactBindAddress(
+            GatewayExactBindAddressRequirement {
+                address: expected_address.to_string(),
+                allow_delayed_bind: false,
+            }
+        ))
     );
 }
 
@@ -813,7 +818,12 @@ async fn host_gateway_route_reports_ipv4_loopback_callback_listener() {
     assert_eq!(response.requirements.len(), 1);
     assert_eq!(
         response.requirements[0].selector,
-        Some(Selector::ExactBindAddress("127.0.0.1:17670".to_string()))
+        Some(Selector::ExactBindAddress(
+            GatewayExactBindAddressRequirement {
+                address: "127.0.0.1:17670".to_string(),
+                allow_delayed_bind: false,
+            }
+        ))
     );
 }
 

@@ -41,8 +41,8 @@ use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition, DriverPlatformEvent,
     DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate, EnsureWorkspaceRequest,
-    EnsureWorkspaceResponse, GatewayListenerRequirement, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    EnsureWorkspaceResponse, GatewayExactBindAddressRequirement, GatewayListenerRequirement,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
     GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest,
     StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
@@ -1876,7 +1876,12 @@ impl ComputeDriver for DockerComputeDriver {
                             DockerGatewayRoute::HostGateway => "docker host-gateway IPv4 loopback",
                         }
                         .to_string(),
-                        selector: Some(Selector::ExactBindAddress(bind_address.to_string())),
+                        selector: Some(Selector::ExactBindAddress(
+                            GatewayExactBindAddressRequirement {
+                                address: bind_address.to_string(),
+                                allow_delayed_bind: false,
+                            },
+                        )),
                     }]
                 });
         Ok(Response::new(GetGatewayListenerRequirementsResponse {
