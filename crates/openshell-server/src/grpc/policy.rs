@@ -333,14 +333,24 @@ fn summarize_endpoint(endpoint: &NetworkEndpoint) -> String {
     if !endpoint.protocol.is_empty() {
         parts.push(format!("protocol={}", endpoint.protocol));
     }
-    if !endpoint.access.is_empty() {
-        parts.push(format!("access={}", endpoint.access));
+    if endpoint.access != 0 {
+        parts.push(format!(
+            "access={}",
+            openshell_policy::network_access_preset_to_str(endpoint.access).unwrap_or("unknown")
+        ));
     }
-    if !endpoint.enforcement.is_empty() {
-        parts.push(format!("enforcement={}", endpoint.enforcement));
+    if endpoint.enforcement != 0 {
+        parts.push(format!(
+            "enforcement={}",
+            openshell_policy::network_enforcement_mode_to_str(endpoint.enforcement)
+                .unwrap_or("unknown")
+        ));
     }
-    if !endpoint.tls.is_empty() {
-        parts.push(format!("tls={}", endpoint.tls));
+    if endpoint.tls != 0 {
+        parts.push(format!(
+            "tls={}",
+            openshell_policy::network_tls_mode_to_str(endpoint.tls).unwrap_or("unknown")
+        ));
     }
     if endpoint.websocket_credential_rewrite {
         parts.push("websocket_credential_rewrite=true".to_string());
@@ -3004,7 +3014,7 @@ fn find_uninspected_credentialed_endpoint(
 
             let mode = if endpoint.protocol.trim().is_empty() {
                 "L4-only"
-            } else if endpoint.tls.trim().eq_ignore_ascii_case("skip") {
+            } else if openshell_policy::network_tls_mode_to_str(endpoint.tls) == Some("skip") {
                 "tls: skip"
             } else {
                 continue;
@@ -4384,7 +4394,7 @@ pub(super) async fn handle_submit_policy_analysis(
             && let Some(reason) = rule_ref.endpoints.iter().find_map(|endpoint| {
                 openshell_policy::agent_authored_transport_rejection(
                     &endpoint.protocol,
-                    &endpoint.tls,
+                    openshell_policy::network_tls_mode_to_str(endpoint.tls).unwrap_or(""),
                 )
             })
         {
@@ -8205,7 +8215,8 @@ mod tests {
             host: "api.vendor.example".to_string(),
             port: 443,
             protocol: protocol.to_string(),
-            tls: tls.to_string(),
+            tls: openshell_policy::network_tls_mode_from_str(tls).expect("valid test TLS mode")
+                as i32,
             provider_credentialed: true,
             allow_uninspected_credentials: allow,
             ..Default::default()
@@ -9134,8 +9145,8 @@ mod tests {
         let mut policy = test_policy_with_rule("aws", host);
         let endpoint = &mut policy.network_policies.get_mut("aws").unwrap().endpoints[0];
         endpoint.protocol = "rest".to_string();
-        endpoint.tls = "terminate".to_string();
-        endpoint.access = "full".to_string();
+        endpoint.tls = 2;
+        endpoint.access = openshell_core::proto::NetworkAccessPreset::Full as i32;
         endpoint.credential_signing = "sigv4".to_string();
         endpoint.signing_service = "s3".to_string();
         endpoint.credential_binding =
@@ -9147,7 +9158,8 @@ mod tests {
 
     fn test_ambiguous_policy() -> ProtoSandboxPolicy {
         let mut left = test_policy_with_rule("left", "api.example.com");
-        left.network_policies.get_mut("left").unwrap().endpoints[0].tls = "skip".to_string();
+        left.network_policies.get_mut("left").unwrap().endpoints[0].tls =
+            openshell_core::proto::NetworkTlsMode::Skip as i32;
         let right = test_policy_with_rule("right", "api.example.com");
         left.network_policies.extend(right.network_policies);
         left
@@ -9230,7 +9242,7 @@ mod tests {
                     host: host.to_string(),
                     port: 443,
                     protocol: "rest".to_string(),
-                    access: "full".to_string(),
+                    access: openshell_core::proto::NetworkAccessPreset::Full as i32,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -9663,7 +9675,8 @@ mod tests {
                 endpoint.host == "api.github.com"
                     && endpoint.protocol == "graphql"
                     && endpoint.path == "/graphql"
-                    && endpoint.access == "read-only"
+                    && endpoint.access
+                        == openshell_core::proto::NetworkAccessPreset::ReadOnly as i32
             }),
             "github provider policy should include read-only GraphQL endpoint"
         );
@@ -9672,9 +9685,9 @@ mod tests {
                 // API endpoints stay read-only; the github.com git transport
                 // carries explicit rules so clone/fetch works (see #1769).
                 if endpoint.host == "github.com" {
-                    endpoint.access.is_empty()
+                    endpoint.access == 0
                 } else {
-                    endpoint.access == "read-only"
+                    endpoint.access == openshell_core::proto::NetworkAccessPreset::ReadOnly as i32
                 }
             }),
             "github API endpoints should be read-only; git transport uses explicit rules"
@@ -9961,7 +9974,7 @@ mod tests {
             .network_policies
             .remove("provider")
             .unwrap();
-        provider_rule.endpoints[0].tls = "skip".to_string();
+        provider_rule.endpoints[0].tls = openshell_core::proto::NetworkTlsMode::Skip as i32;
         let layers = [ProviderPolicyLayer {
             rule_name: "_provider_test".to_string(),
             rule: provider_rule,
@@ -10159,8 +10172,8 @@ mod tests {
             .unwrap()
             .endpoints[0];
         tls_endpoint.protocol = "rest".to_string();
-        tls_endpoint.access = "full".to_string();
-        tls_endpoint.tls = "skip".to_string();
+        tls_endpoint.access = openshell_core::proto::NetworkAccessPreset::Full as i32;
+        tls_endpoint.tls = openshell_core::proto::NetworkTlsMode::Skip as i32;
         let tls_error = handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
@@ -10377,8 +10390,8 @@ mod tests {
 
         let mut policy = test_sigv4_policy("bucket.s3.amazonaws.com", None);
         let endpoint = &mut policy.network_policies.get_mut("aws").unwrap().endpoints[0];
-        endpoint.access = "read-write".to_string();
-        endpoint.enforcement = "enforce".to_string();
+        endpoint.access = openshell_core::proto::NetworkAccessPreset::ReadWrite as i32;
+        endpoint.enforcement = openshell_core::proto::NetworkEnforcementMode::Enforce as i32;
 
         handle_update_config(
             &state,
@@ -10497,7 +10510,7 @@ mod tests {
                     endpoints: vec![NetworkEndpoint {
                         host: "api.example.com".to_string(),
                         port: 443,
-                        tls: "skip".to_string(),
+                        tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -10568,7 +10581,7 @@ mod tests {
                 endpoints: vec![NetworkEndpoint {
                     host: "api.example.com".to_string(),
                     port: 443,
-                    tls: "skip".to_string(),
+                    tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -10858,7 +10871,7 @@ mod tests {
             .expect("custom rule")
             .endpoints[0];
         endpoint.protocol = "rest".to_string();
-        endpoint.access = "read-only".to_string();
+        endpoint.access = openshell_core::proto::NetworkAccessPreset::ReadOnly as i32;
         state
             .store
             .put_message(&test_sandbox(
@@ -11085,8 +11098,8 @@ mod tests {
             .unwrap()
             .endpoints[0];
         bound_endpoint.protocol = "rest".to_string();
-        bound_endpoint.access = "full".to_string();
-        bound_endpoint.tls = "terminate".to_string();
+        bound_endpoint.access = openshell_core::proto::NetworkAccessPreset::Full as i32;
+        bound_endpoint.tls = 2;
         openshell_policy::ensure_sandbox_process_identity(&mut policy);
         state
             .store
@@ -11298,7 +11311,7 @@ mod tests {
                     port: 443,
                     path: "/**".to_string(),
                     protocol: "rest".to_string(),
-                    access: "full".to_string(),
+                    access: openshell_core::proto::NetworkAccessPreset::Full as i32,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -11399,7 +11412,7 @@ mod tests {
                     host: "api.exchange.example.test".to_string(),
                     port: 443,
                     protocol: "rest".to_string(),
-                    access: "full".to_string(),
+                    access: openshell_core::proto::NetworkAccessPreset::Full as i32,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -11597,7 +11610,7 @@ mod tests {
                         port: 443,
                         path: "/**".to_string(),
                         protocol: "rest".to_string(),
-                        access: "full".to_string(),
+                        access: openshell_core::proto::NetworkAccessPreset::Full as i32,
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -11784,7 +11797,7 @@ mod tests {
                         host: "api.custom.example".to_string(),
                         port: 443,
                         protocol: "rest".to_string(),
-                        access: "full".to_string(),
+                        access: openshell_core::proto::NetworkAccessPreset::Full as i32,
                         ..Default::default()
                     }],
                     binaries: Vec::new(),
@@ -12587,8 +12600,9 @@ mod tests {
                                 host: "shared.example.com".to_string(),
                                 port: 443,
                                 protocol: "rest".to_string(),
-                                enforcement: "enforce".to_string(),
-                                access: "read-only".to_string(),
+                                enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce
+                                    as i32,
+                                access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
                                 ..Default::default()
                             }],
                             binaries: vec![NetworkBinary {
@@ -12606,8 +12620,9 @@ mod tests {
                                 host: "shared.example.com".to_string(),
                                 port: 443,
                                 protocol: "graphql".to_string(),
-                                enforcement: "enforce".to_string(),
-                                access: "read-only".to_string(),
+                                enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce
+                                    as i32,
+                                access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
                                 advisor_proposed: true,
                                 ..Default::default()
                             }],
@@ -13674,7 +13689,7 @@ mod tests {
                 host: "api.github.com".to_string(),
                 port: 443,
                 protocol: "rest".to_string(),
-                enforcement: "enforce".to_string(),
+                enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                 rules: vec![L7Rule {
                     allow: Some(L7Allow {
                         method: "PUT".to_string(),
@@ -13862,7 +13877,7 @@ mod tests {
                 host: "api.github.com".to_string(),
                 port: 443,
                 protocol: "rest".to_string(),
-                enforcement: "enforce".to_string(),
+                enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                 rules: vec![L7Rule {
                     allow: Some(L7Allow {
                         method: "PUT".to_string(),
@@ -14066,8 +14081,8 @@ mod tests {
                     port: 80,
                     ports: vec![80, 443],
                     protocol: "rest".to_string(),
-                    enforcement: "enforce".to_string(),
-                    access: "read-only".to_string(),
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+                    access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
                     ..Default::default()
                 }],
                 binaries: vec![NetworkBinary {
@@ -14154,7 +14169,10 @@ mod tests {
         assert!(!chunk.review_token.is_empty());
         let canonical = chunk.proposed_rule.as_ref().unwrap();
         assert_eq!(canonical.endpoints[0].protocol, "rest");
-        assert_eq!(canonical.endpoints[0].access, "read-only");
+        assert_eq!(
+            canonical.endpoints[0].access,
+            openshell_core::proto::NetworkAccessPreset::ReadOnly as i32
+        );
         assert!(
             canonical.endpoints[0].advisor_proposed,
             "a new advisor overlay must retain proposal provenance"
@@ -14171,14 +14189,20 @@ mod tests {
         assert_eq!(cargo_rule.endpoints.len(), 1);
         assert_eq!(cargo_rule.endpoints[0].ports, vec![80, 443]);
         assert_eq!(cargo_rule.endpoints[0].protocol, "rest");
-        assert_eq!(cargo_rule.endpoints[0].access, "read-only");
+        assert_eq!(
+            cargo_rule.endpoints[0].access,
+            openshell_core::proto::NetworkAccessPreset::ReadOnly as i32
+        );
         assert_eq!(cargo_rule.binaries.len(), 1);
         assert_eq!(cargo_rule.binaries[0].path, "/usr/bin/cargo");
         let curl_rule = &applied.network_policies["allow_index_crates_io_443"];
         assert_eq!(curl_rule.endpoints.len(), 1);
         assert_eq!(curl_rule.endpoints[0].ports, vec![443]);
         assert_eq!(curl_rule.endpoints[0].protocol, "rest");
-        assert_eq!(curl_rule.endpoints[0].access, "read-only");
+        assert_eq!(
+            curl_rule.endpoints[0].access,
+            openshell_core::proto::NetworkAccessPreset::ReadOnly as i32
+        );
         assert!(
             curl_rule.endpoints[0].advisor_proposed,
             "the persisted advisor overlay must retain proposal provenance"
@@ -14226,7 +14250,8 @@ mod tests {
                             host: "api.example.com".to_string(),
                             port: 443,
                             protocol: "graphql".to_string(),
-                            enforcement: "enforce".to_string(),
+                            enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce
+                                as i32,
                             rules: vec![L7Rule {
                                 allow: Some(L7Allow {
                                     // Runtime requires an operation type for
@@ -14541,8 +14566,8 @@ mod tests {
                 host: "api.github.com".to_string(),
                 port: 443,
                 protocol: "rest".to_string(),
-                enforcement: "enforce".to_string(),
-                access: "full".to_string(),
+                enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+                access: openshell_core::proto::NetworkAccessPreset::Full as i32,
                 ..Default::default()
             }],
             binaries: vec![NetworkBinary {
@@ -15169,7 +15194,8 @@ mod tests {
             host: "api.example.com".to_string(),
             port: 443,
             protocol: protocol.to_string(),
-            tls: tls.to_string(),
+            tls: openshell_policy::network_tls_mode_from_str(tls)
+                .expect("test TLS mode must be valid") as i32,
             ..Default::default()
         };
         let chunk = |name: &str, endpoint: NetworkEndpoint| PolicyChunk {
@@ -15653,7 +15679,7 @@ mod tests {
                         host: "api.github.com".to_string(),
                         port: 443,
                         protocol: "rest".to_string(),
-                        access: "full".to_string(),
+                        access: openshell_core::proto::NetworkAccessPreset::Full as i32,
                         deny_rules: vec![L7DenyRule {
                             method: "DELETE".to_string(),
                             path: "/repos/*".to_string(),
@@ -15714,7 +15740,7 @@ mod tests {
                 // Match the provider-owned endpoint contract so this test
                 // exercises prover composition rather than a deterministic
                 // application failure.
-                enforcement: "audit".to_string(),
+                enforcement: openshell_core::proto::NetworkEnforcementMode::Audit as i32,
                 rules: vec![L7Rule {
                     allow: Some(L7Allow {
                         method: "PUT".to_string(),
@@ -15815,7 +15841,10 @@ mod tests {
 
         let effective_policy = get_sandbox_policy(&state, sandbox_id).await;
         let provider_rule = &effective_policy.network_policies["_provider_work_custom"];
-        assert_eq!(provider_rule.endpoints[0].access, "full");
+        assert_eq!(
+            provider_rule.endpoints[0].access,
+            openshell_core::proto::NetworkAccessPreset::Full as i32
+        );
         assert_eq!(provider_rule.endpoints[0].deny_rules.len(), 1);
         assert!(!provider_rule.endpoints[0].advisor_proposed);
         assert!(
@@ -15894,7 +15923,7 @@ mod tests {
                 host: "raw.githubusercontent.com".to_string(),
                 port: 443,
                 protocol: "rest".to_string(),
-                enforcement: "enforce".to_string(),
+                enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                 rules: vec![L7Rule {
                     allow: Some(L7Allow {
                         method: "GET".to_string(),
@@ -15936,7 +15965,7 @@ mod tests {
                 host: "api.github.com".to_string(),
                 port: 443,
                 protocol: "rest".to_string(),
-                enforcement: "enforce".to_string(),
+                enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                 rules: vec![L7Rule {
                     allow: Some(L7Allow {
                         method: "PUT".to_string(),
@@ -16929,8 +16958,8 @@ mod tests {
                     host: "api.github.com".to_string(),
                     port: 443,
                     protocol: "rest".to_string(),
-                    access: "read-only".to_string(),
-                    enforcement: "enforce".to_string(),
+                    access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                     ..Default::default()
                 }],
                 binaries: vec![NetworkBinary {
@@ -16956,8 +16985,8 @@ mod tests {
                     host: "realtime.example.com".to_string(),
                     port: 443,
                     protocol: "websocket".to_string(),
-                    access: "read-write".to_string(),
-                    enforcement: "enforce".to_string(),
+                    access: openshell_core::proto::NetworkAccessPreset::ReadWrite as i32,
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                     websocket_credential_rewrite: true,
                     ..Default::default()
                 }],
@@ -16984,8 +17013,8 @@ mod tests {
                     host: "slack.com".to_string(),
                     port: 443,
                     protocol: "rest".to_string(),
-                    access: "read-write".to_string(),
-                    enforcement: "enforce".to_string(),
+                    access: openshell_core::proto::NetworkAccessPreset::ReadWrite as i32,
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                     request_body_credential_rewrite: true,
                     ..Default::default()
                 }],
@@ -17278,7 +17307,7 @@ mod tests {
                         port: 443,
                         ports: vec![443],
                         protocol: "rest".to_string(),
-                        access: "read-only".to_string(),
+                        access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -17364,7 +17393,7 @@ mod tests {
 
         let policy = SandboxPolicy::decode(latest.policy_payload.as_slice()).unwrap();
         let endpoint = &policy.network_policies["github"].endpoints[0];
-        assert!(endpoint.access.is_empty());
+        assert!(endpoint.access == 0);
         assert_eq!(endpoint.rules.len(), 4);
         assert_eq!(endpoint.deny_rules.len(), 1);
         assert_eq!(endpoint.deny_rules[0].path, "/admin");
@@ -17832,7 +17861,7 @@ mod tests {
                     endpoints: vec![NetworkEndpoint {
                         host: "api.example.com".to_string(),
                         port: 443,
-                        tls: "skip".to_string(),
+                        tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
                         ..Default::default()
                     }],
                     ..Default::default()

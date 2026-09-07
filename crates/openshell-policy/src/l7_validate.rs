@@ -9,6 +9,79 @@
 //! L7 endpoint field combinations, preventing drift between lint-time
 //! and runtime checks.
 
+use openshell_core::proto::{NetworkAccessPreset, NetworkEnforcementMode, NetworkTlsMode};
+
+#[allow(deprecated)]
+pub fn network_tls_mode_from_str(value: &str) -> Option<NetworkTlsMode> {
+    match value {
+        "" => Some(NetworkTlsMode::Unspecified),
+        "skip" => Some(NetworkTlsMode::Skip),
+        "terminate" => Some(NetworkTlsMode::Terminate),
+        "passthrough" => Some(NetworkTlsMode::Passthrough),
+        _ => None,
+    }
+}
+
+#[allow(deprecated)]
+pub fn network_tls_mode_to_str(value: i32) -> Option<&'static str> {
+    match NetworkTlsMode::try_from(value).ok()? {
+        NetworkTlsMode::Unspecified => Some(""),
+        NetworkTlsMode::Skip => Some("skip"),
+        NetworkTlsMode::Terminate => Some("terminate"),
+        NetworkTlsMode::Passthrough => Some("passthrough"),
+    }
+}
+
+pub fn network_enforcement_mode_from_str(value: &str) -> Option<NetworkEnforcementMode> {
+    match value {
+        "" => Some(NetworkEnforcementMode::Unspecified),
+        "enforce" => Some(NetworkEnforcementMode::Enforce),
+        "audit" => Some(NetworkEnforcementMode::Audit),
+        _ => None,
+    }
+}
+
+pub fn network_enforcement_mode_to_str(value: i32) -> Option<&'static str> {
+    match NetworkEnforcementMode::try_from(value).ok()? {
+        NetworkEnforcementMode::Unspecified => Some(""),
+        NetworkEnforcementMode::Enforce => Some("enforce"),
+        NetworkEnforcementMode::Audit => Some("audit"),
+    }
+}
+
+pub fn network_access_preset_from_str(value: &str) -> Option<NetworkAccessPreset> {
+    match value {
+        "" => Some(NetworkAccessPreset::Unspecified),
+        "read-only" => Some(NetworkAccessPreset::ReadOnly),
+        "read-write" => Some(NetworkAccessPreset::ReadWrite),
+        "full" => Some(NetworkAccessPreset::Full),
+        _ => None,
+    }
+}
+
+pub fn network_access_preset_to_str(value: i32) -> Option<&'static str> {
+    match NetworkAccessPreset::try_from(value).ok()? {
+        NetworkAccessPreset::Unspecified => Some(""),
+        NetworkAccessPreset::ReadOnly => Some("read-only"),
+        NetworkAccessPreset::ReadWrite => Some("read-write"),
+        NetworkAccessPreset::Full => Some("full"),
+    }
+}
+
+pub fn validate_endpoint_mode_values(tls: i32, enforcement: i32, access: i32) -> Vec<String> {
+    let mut errors = Vec::new();
+    if network_tls_mode_to_str(tls).is_none() {
+        errors.push(format!("unknown tls enum value {tls}"));
+    }
+    if network_enforcement_mode_to_str(enforcement).is_none() {
+        errors.push(format!("unknown enforcement enum value {enforcement}"));
+    }
+    if network_access_preset_to_str(access).is_none() {
+        errors.push(format!("unknown access enum value {access}"));
+    }
+    errors
+}
+
 /// Known L7 inspection protocols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum L7Protocol {

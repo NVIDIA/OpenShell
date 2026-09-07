@@ -187,9 +187,11 @@ connection metadata agrees. When request paths overlap, a path endpoint with a
 higher specificity rank deterministically overrides broader request-processing
 metadata. Equally specific overlapping endpoints must agree.
 
-Endpoint `tls`, `enforcement`, `access`, and `protocol` strings are validated
-before persistence or activation. The supervisor also refuses unknown endpoint
-modes defensively; an unrecognized enforcement value never falls back to audit.
+Endpoint `tls`, `enforcement`, and `access` use protobuf enums and retain their
+named YAML spellings. `protocol` remains a string so the supported protocol set
+can evolve, but every ingress validates it before persistence or activation.
+The supervisor also refuses unknown enum numbers and protocol values
+defensively; an unrecognized enforcement value never falls back to audit.
 
 Gateway mutation paths validate the complete effective candidate before
 persistence when the affected sandbox scope is known. Direct replacements,

@@ -506,27 +506,25 @@ fn report_endpoint_l7_losses(endpoint: &NetworkEndpoint, path: &str, items: &mut
         );
     }
 
-    if !endpoint.tls.is_empty() {
-        let severity = if endpoint.tls == "skip" {
-            "warning"
-        } else {
-            "error"
-        };
+    if endpoint.tls != 0 {
+        let tls = openshell_policy::network_tls_mode_to_str(endpoint.tls).unwrap_or("unknown");
+        let severity = if tls == "skip" { "warning" } else { "error" };
         add_loss(
             items,
             &format!("{path}.tls"),
             severity,
             &format!(
                 "MXC has no OpenShell TLS inspection mode equivalent for '{}'.",
-                endpoint.tls
+                tls
             ),
             "TLS inspection mode",
             "MXC network policy is host-level only.",
         );
     }
 
-    if !endpoint.enforcement.is_empty() {
-        if endpoint.enforcement == "audit" {
+    if endpoint.enforcement != 0 {
+        if openshell_policy::network_enforcement_mode_to_str(endpoint.enforcement) == Some("audit")
+        {
             add_loss(
                 items,
                 &format!("{path}.enforcement"),
@@ -547,15 +545,14 @@ fn report_endpoint_l7_losses(endpoint: &NetworkEndpoint, path: &str, items: &mut
         }
     }
 
-    if !endpoint.access.is_empty() {
+    if endpoint.access != 0 {
+        let access =
+            openshell_policy::network_access_preset_to_str(endpoint.access).unwrap_or("unknown");
         add_loss(
             items,
             &format!("{path}.access"),
             "error",
-            &format!(
-                "MXC has no access preset equivalent for '{}'.",
-                endpoint.access
-            ),
+            &format!("MXC has no access preset equivalent for '{}'.", access),
             "REST/WebSocket/GraphQL access preset",
             "MXC cannot enforce method or operation-level access.",
         );

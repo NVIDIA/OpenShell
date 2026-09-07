@@ -5125,7 +5125,7 @@ mod tests {
             port,
             path: path.to_string(),
             protocol: "rest".to_string(),
-            access: "full".to_string(),
+            access: openshell_core::proto::NetworkAccessPreset::Full as i32,
             ..Default::default()
         }];
         handle_import_provider_profiles(
@@ -5265,7 +5265,7 @@ mod tests {
             port: 443,
             path: "/v1/**".to_string(),
             protocol: "rest".to_string(),
-            access: "full".to_string(),
+            access: openshell_core::proto::NetworkAccessPreset::Full as i32,
             ..Default::default()
         }];
         let response = handle_import_provider_profiles(
@@ -5601,7 +5601,7 @@ mod tests {
             port: 443,
             path: "/v1/**".to_string(),
             protocol: "rest".to_string(),
-            access: "full".to_string(),
+            access: openshell_core::proto::NetworkAccessPreset::Full as i32,
             ..Default::default()
         }];
         let response = handle_update_provider_profiles(
@@ -6057,7 +6057,7 @@ mod tests {
         conflicting_profile.endpoints.push(NetworkEndpoint {
             host: "api.example.com".to_string(),
             port: 443,
-            tls: "skip".to_string(),
+            tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
             ..Default::default()
         });
         let response = handle_update_provider_profiles(
@@ -9664,7 +9664,7 @@ mod tests {
             port: 443,
             path: "/v1/**".to_string(),
             protocol: "rest".to_string(),
-            access: "full".to_string(),
+            access: openshell_core::proto::NetworkAccessPreset::Full as i32,
             ..Default::default()
         }];
         handle_import_provider_profiles(

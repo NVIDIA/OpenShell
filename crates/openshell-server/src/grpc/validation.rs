@@ -2019,8 +2019,8 @@ mod tests {
                     host: "api.github.com".into(),
                     port: 443,
                     protocol: "rest".into(),
-                    enforcement: "enforc".into(),
-                    access: "read-only".into(),
+                    enforcement: 99,
+                    access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -2031,8 +2031,7 @@ mod tests {
 
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("endpoint 0"));
-        assert!(err.message().contains("unknown enforcement value 'enforc'"));
-        assert!(err.message().contains("expected enforce or audit"));
+        assert!(err.message().contains("unknown enforcement enum value 99"));
     }
 
     #[test]
