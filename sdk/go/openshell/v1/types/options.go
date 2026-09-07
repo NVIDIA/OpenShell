@@ -28,10 +28,15 @@ func WithAnnotations(annotations map[string]string) CreateOption {
 	}
 }
 
-// ApplyCreateOptions applies options and returns the config.
+// ApplyCreateOptions applies options and returns the config. Nil options are
+// ignored so that callers migrating from the positional labels parameter, which
+// they passed as nil for an unlabeled sandbox, do not panic.
 func ApplyCreateOptions(opts []CreateOption) createConfig { //nolint:revive // unexported return is intentional; consumed only by v1 package
 	var cfg createConfig
 	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
 		opt(&cfg)
 	}
 	return cfg

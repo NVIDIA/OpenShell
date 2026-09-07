@@ -267,6 +267,26 @@ func TestSandboxCreate(t *testing.T) {
 	assert.Equal(t, SandboxProvisioning, result.Status.Phase)
 }
 
+// Callers that passed nil for the old positional labels parameter still compile
+// against the variadic signature, so the nil option must be ignored rather than
+// invoked.
+func TestSandboxCreate_LegacyTrailingNil(t *testing.T) {
+	mock := newMockSandboxServer()
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	result, err := client.Create(context.Background(), "default", "legacy-sandbox", &SandboxSpec{}, nil)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	require.NotNil(t, mock.createRequest)
+	assert.Empty(t, mock.createRequest.Labels)
+	assert.Empty(t, mock.createRequest.Annotations)
+}
+
 func TestSandboxCreate_WithAnnotations(t *testing.T) {
 	mock := newMockSandboxServer()
 	client, cleanup := setupSandboxTest(t, mock)

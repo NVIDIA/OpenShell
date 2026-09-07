@@ -53,6 +53,40 @@ func TestSandbox_Create_AlreadyExists(t *testing.T) {
 	assert.True(t, types.IsAlreadyExists(err))
 }
 
+// Before functional options, an unlabeled sandbox was created by passing nil
+// for the positional labels parameter. Such calls still compile against the new
+// variadic signature, so they must keep working instead of panicking.
+func TestSandbox_Create_LegacyTrailingNil(t *testing.T) {
+	sc := newTestSandboxClient()
+	ctx := context.Background()
+
+	sb, err := sc.Create(ctx, "default", "legacy-sb", &types.SandboxSpec{LogLevel: "debug"}, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "legacy-sb", sb.Name)
+	assert.Empty(t, sb.Labels)
+	assert.Empty(t, sb.Annotations)
+}
+
+func TestSandbox_CreateFromTemplate_LegacyTrailingNil(t *testing.T) {
+	sc := newTestSandboxClient()
+	ctx := context.Background()
+
+	sc.templateStore.Insert("default", &types.SandboxWorkloadTemplate{
+		Name:            "gpu-kata",
+		ResourceVersion: 1,
+		Spec: types.SandboxWorkloadTemplateSpec{
+			Workload: &types.SandboxWorkloadConfig{
+				Image: "registry.example.com/agent:latest",
+			},
+		},
+	})
+
+	sb, err := sc.CreateFromTemplate(ctx, "default", "legacy-tpl", "gpu-kata", &types.SandboxSpec{}, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "legacy-tpl", sb.Name)
+	assert.Empty(t, sb.Labels)
+}
+
 func TestSandbox_Create_WithAnnotations(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
