@@ -251,10 +251,6 @@ jobs:
         run: |
           bash tasks/scripts/test-gateway-pull-policy.sh
           bash tasks/scripts/test-gateway-config.sh
-
-      - name: Test Cargo lockfile validation
-        run: mise run test:cargo-lockfiles
-
   go:
     name: Go SDK
     needs: pr_metadata

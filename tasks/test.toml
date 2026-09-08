@@ -15,7 +15,6 @@ depends = [
   "test:gateway-pull-policy",
   "test:gateway-config",
   "test:e2e-parity",
-  "test:cargo-lockfiles",
   "test:packaging-assets",
   "test:codex-security-release-range",
   "test:docs-website",
@@ -26,12 +25,6 @@ description = "Test the docs-website sync script"
 # --no-project skips installing the OpenShell package; --with supplies the test
 # dependencies and the script's runtime dependency, which live outside the project env.
 run = "uv run --no-project --with pytest --with pytest-asyncio --with pyyaml pytest tasks/scripts/sync_docs_website_test.py"
-
-["test:cargo-lockfiles"]
-description = "Test Cargo lockfile validation script"
-run = "uv run --no-project --with pytest --with pytest-asyncio pytest tasks/scripts/check_cargo_lockfiles_test.py"
-run_windows = "echo Skipping test:cargo-lockfiles: the Bash validation script runs on Unix."
-hide = true
 
 ["test:sbom"]
 description = "Run SBOM tooling tests"

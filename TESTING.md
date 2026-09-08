@@ -46,7 +46,7 @@ Run Rust tests only:
 mise run test:rust     # cargo test --workspace
 ```
 
-Run `mise run rust:lockfiles:check` to validate every tracked Cargo lockfile against its adjacent manifest. Cargo diagnostics explain whether a failure requires refreshing a lockfile or resolving another problem, such as registry access. Run `mise run test:cargo-lockfiles` for the validator's regression tests, which use temporary Git repositories and a stub Cargo command. These tests also run in `mise run test` and the Python branch CI jobs.
+Run `mise run rust:lockfiles:check` to validate every tracked Cargo lockfile against its adjacent manifest. Cargo diagnostics explain whether a failure requires refreshing a lockfile or resolving another problem, such as registry access. To refresh a stale lockfile, run `cargo metadata --format-version 1 --manifest-path path/to/Cargo.toml > /dev/null` with the adjacent manifest, review and commit the lockfile changes, then rerun `mise run pre-commit`.
 
 ## Python Unit Tests
 
