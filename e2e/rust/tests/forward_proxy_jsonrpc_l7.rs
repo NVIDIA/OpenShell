@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! E2E tests for JSON-RPC L7 inspection across both proxy entry points.
+//! E2E tests for JSON-RPC L7 inspection through transparent interception.
 //!
 //! The upstream server deliberately does not implement JSON-RPC. `OpenShell`
 //! parses and enforces JSON-RPC before forwarding, so any HTTP server that
@@ -187,7 +187,7 @@ network_policies:
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn jsonrpc_l7_enforces_method_rules_on_forward_and_connect_paths() {
+async fn jsonrpc_l7_enforces_high_level_and_raw_transparent_paths() {
     let server = start_test_server(RULES_TEST_SERVER_ALIAS)
         .await
         .expect("start test server");
@@ -201,25 +201,15 @@ async fn jsonrpc_l7_enforces_method_rules_on_forward_and_connect_paths() {
     let script = format!(
         r#"
 import json
-import os
 import socket
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 
 HOST = {host:?}
 PORT = {port}
 DETAILS = {{
     "debug_target": {{"host": HOST, "port": PORT}},
-    "debug_proxy_env": {{
-        "http_proxy": os.environ.get("http_proxy"),
-        "https_proxy": os.environ.get("https_proxy"),
-        "HTTP_PROXY": os.environ.get("HTTP_PROXY"),
-        "HTTPS_PROXY": os.environ.get("HTTPS_PROXY"),
-        "NO_PROXY": os.environ.get("NO_PROXY"),
-        "no_proxy": os.environ.get("no_proxy"),
-    }},
 }}
 
 def text(data):
@@ -291,11 +281,6 @@ def post_invalid_json(label):
     except urllib.error.HTTPError as error:
         return record_http_error(label, error, text(encoded))
 
-def proxy_parts(*names):
-    proxy_url = next((os.environ.get(name) for name in names if os.environ.get(name)), None)
-    parsed = urllib.parse.urlparse(proxy_url)
-    return parsed.hostname, parsed.port or 80
-
 def read_until(sock, marker):
     data = b""
     while marker not in data:
@@ -339,21 +324,11 @@ def record_raw_response(label, response, body=b""):
             DETAILS[f"{{label}}_body"] = text(body)
     return code
 
-def connect_http_status(label, request):
-    proxy_host, proxy_port = proxy_parts("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")
-    target = f"{{HOST}}:{{PORT}}"
-
+def raw_http_status(label, request):
     last_error = None
     for attempt in range(5):
         try:
-            with socket.create_connection((proxy_host, proxy_port), timeout=15) as sock:
-                sock.sendall(
-                    f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode()
-                )
-                connect_response = read_until(sock, b"\r\n\r\n")
-                connect_code = record_raw_response(f"{{label}}_connect", connect_response)
-                if connect_code != 200:
-                    return connect_code
+            with socket.create_connection((HOST, PORT), timeout=15) as sock:
                 sock.sendall(request)
                 sock.shutdown(socket.SHUT_WR)
                 response, body = read_response(sock)
@@ -365,7 +340,7 @@ def connect_http_status(label, request):
 
     raise RuntimeError(f"{{label}}: failed after 5 attempts: {{last_error}}")
 
-def connect_jsonrpc_status(method, params, label):
+def raw_jsonrpc_status(method, params, label):
     target = f"{{HOST}}:{{PORT}}"
     body = {{"jsonrpc": "2.0", "id": 1, "method": method}}
     if params is not None:
@@ -379,7 +354,7 @@ def connect_jsonrpc_status(method, params, label):
         f"Connection: close\r\n"
         f"\r\n"
     ).encode() + encoded
-    return connect_http_status(label, request)
+    return raw_http_status(label, request)
 
 results = {{
     # forward proxy — method-only allow rules
@@ -406,12 +381,12 @@ results = {{
     # forward proxy — invalid JSON body fails closed before generic rules apply
     "forward_invalid_json_denied": post_invalid_json("forward_invalid_json_denied"),
 
-    # CONNECT path — representative allowed and denied cases
-    "connect_method_initialize_allowed": connect_jsonrpc_status("initialize", {{"protocolVersion": "2025-11-25", "capabilities": {{}}}}, "connect_method_initialize_allowed"),
-    "connect_method_tools_list_allowed": connect_jsonrpc_status("tools/list", None, "connect_method_tools_list_allowed"),
-    "connect_method_tools_call_allowed": connect_jsonrpc_status("tools/call", {{"name": "read_status"}}, "connect_method_tools_call_allowed"),
-    "connect_method_tools_call_with_unmatched_params_allowed": connect_jsonrpc_status("tools/call", {{"name": "blocked_action", "arguments": {{"scope": "ignored"}}}}, "connect_method_tools_call_with_unmatched_params_allowed"),
-    "connect_method_tools_delete_denied": connect_jsonrpc_status("tools/delete", {{"name": "purge_cache"}}, "connect_method_tools_delete_denied"),
+    # raw socket path — representative allowed and denied cases
+    "raw_method_initialize_allowed": raw_jsonrpc_status("initialize", {{"protocolVersion": "2025-11-25", "capabilities": {{}}}}, "raw_method_initialize_allowed"),
+    "raw_method_tools_list_allowed": raw_jsonrpc_status("tools/list", None, "raw_method_tools_list_allowed"),
+    "raw_method_tools_call_allowed": raw_jsonrpc_status("tools/call", {{"name": "read_status"}}, "raw_method_tools_call_allowed"),
+    "raw_method_tools_call_with_unmatched_params_allowed": raw_jsonrpc_status("tools/call", {{"name": "blocked_action", "arguments": {{"scope": "ignored"}}}}, "raw_method_tools_call_with_unmatched_params_allowed"),
+    "raw_method_tools_delete_denied": raw_jsonrpc_status("tools/delete", {{"name": "purge_cache"}}, "raw_method_tools_delete_denied"),
 }}
 results.update(DETAILS)
 print(json.dumps(results, sort_keys=True))
@@ -440,16 +415,13 @@ print(json.dumps(results, sort_keys=True))
         ("forward_batch_one_denied", 403),
         // forward proxy — parse error
         ("forward_invalid_json_denied", 403),
-        // CONNECT path — allowed
-        ("connect_method_initialize_allowed", 200),
-        ("connect_method_tools_list_allowed", 200),
-        ("connect_method_tools_call_allowed", 200),
-        (
-            "connect_method_tools_call_with_unmatched_params_allowed",
-            200,
-        ),
-        // CONNECT path — method denied
-        ("connect_method_tools_delete_denied", 403),
+        // raw socket path — allowed
+        ("raw_method_initialize_allowed", 200),
+        ("raw_method_tools_list_allowed", 200),
+        ("raw_method_tools_call_allowed", 200),
+        ("raw_method_tools_call_with_unmatched_params_allowed", 200),
+        // raw socket path — method denied
+        ("raw_method_tools_delete_denied", 403),
     ] {
         let expected_fragment = format!(r#""{key}": {expected}"#);
         assert!(
