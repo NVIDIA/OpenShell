@@ -8,6 +8,9 @@ command = "/home/openshell/.local/bin/openshell-test-guest-diagnostics"
 timeout_secs = 60
 
 [[runs]]
+scenario = "sandbox-lifecycle"
+
+[[runs]]
 scenario = "sandbox-continuity"
 workload_expectation = "reconciled"
 

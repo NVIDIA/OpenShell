@@ -125,13 +125,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_a_smoke_and_continuity_plan() {
+    fn parses_a_smoke_lifecycle_and_continuity_plan() {
         let plan = ConformancePlan::parse(
             r#"
                 version = 1
 
                 [[runs]]
                 scenario = "smoke"
+
+                [[runs]]
+                scenario = "sandbox-lifecycle"
 
                 [[runs]]
                 scenario = "sandbox-continuity"
@@ -145,8 +148,8 @@ mod tests {
         )
         .expect("valid plan");
 
-        assert_eq!(plan.runs.len(), 2);
-        assert_eq!(plan.runs[1].actions[0].name, "gateway-upgrade");
+        assert_eq!(plan.runs.len(), 3);
+        assert_eq!(plan.runs[2].actions[0].name, "gateway-upgrade");
     }
 
     #[test]

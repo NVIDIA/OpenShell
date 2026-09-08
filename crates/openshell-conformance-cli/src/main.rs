@@ -103,15 +103,15 @@ fn list(output: OutputFormat) -> Result<(), String> {
     match output {
         OutputFormat::Text => {
             for candidate in scenarios() {
-                println!("{:<16} {}", candidate.name, candidate.description);
+                println!("{:<16} {}", candidate.name(), candidate.description());
             }
         }
         OutputFormat::Json => {
             let result = scenarios()
                 .iter()
                 .map(|candidate| ScenarioDescription {
-                    name: candidate.name,
-                    description: candidate.description,
+                    name: candidate.name(),
+                    description: candidate.description(),
                 })
                 .collect::<Vec<_>>();
             println!(
@@ -137,7 +137,7 @@ async fn run(
     let selected = select_scenarios(requested)?;
     let mut results = Vec::with_capacity(selected.len());
     for candidate in selected {
-        let plan_run = default_plan_run(candidate.name);
+        let plan_run = default_plan_run(candidate.name());
         results.push(run_scenario(candidate, &plan_run, binary.as_ref(), None).await);
     }
 
@@ -179,20 +179,20 @@ fn default_plan_run(scenario: &str) -> PlanRun {
 }
 
 async fn run_scenario(
-    candidate: &'static Scenario,
+    candidate: &'static dyn Scenario,
     plan_run: &PlanRun,
     binary: Option<&PathBuf>,
     host_action_executor: Option<Arc<dyn HostActionExecutor>>,
 ) -> ScenarioResult<'static> {
     let runner = binary.map_or_else(
-        || OpenShellRunner::new(candidate.name),
-        |path| OpenShellRunner::with_binary(path.clone(), candidate.name),
+        || OpenShellRunner::new(candidate.name()),
+        |path| OpenShellRunner::with_binary(path.clone(), candidate.name()),
     );
     let mut runner = match runner {
         Ok(runner) => runner,
         Err(error) => {
             return ScenarioResult {
-                name: candidate.name,
+                name: candidate.name(),
                 passed: false,
                 diagnostic: Some(error.to_string()),
             };
@@ -208,7 +208,7 @@ async fn run_scenario(
     };
     let outcome = runner.finish(scenario_result).await;
     ScenarioResult {
-        name: candidate.name,
+        name: candidate.name(),
         passed: outcome.is_ok(),
         diagnostic: outcome.err(),
     }
@@ -276,7 +276,7 @@ fn read_plan(path: &PathBuf) -> Result<ConformancePlan, String> {
     ConformancePlan::parse(&contents).map_err(|error| format!("invalid conformance plan: {error}"))
 }
 
-fn select_scenarios(requested: &[String]) -> Result<Vec<&'static Scenario>, String> {
+fn select_scenarios(requested: &[String]) -> Result<Vec<&'static dyn Scenario>, String> {
     if requested.is_empty() {
         return Ok(default_scenarios().collect());
     }
@@ -359,19 +359,22 @@ mod tests {
     #[test]
     fn selects_named_scenario() {
         let selected = select_scenarios(&["smoke".to_string()]).expect("select smoke");
-        assert_eq!(selected[0].name, "smoke");
+        assert_eq!(selected[0].name(), "smoke");
     }
 
     #[test]
     fn unknown_scenario_has_actionable_diagnostic() {
-        let error = select_scenarios(&["missing".to_string()]).expect_err("unknown scenario");
+        let error = select_scenarios(&["missing".to_string()])
+            .err()
+            .expect("unknown scenario");
         assert!(error.contains("openshell-conformance list"));
     }
 
     #[test]
     fn action_scenario_requires_an_explicit_plan() {
         let error = select_scenarios(&["sandbox-continuity".to_string()])
-            .expect_err("action scenario requires a plan");
+            .err()
+            .expect("action scenario requires a plan");
 
         assert!(error.contains("requires an explicit --plan"));
     }
