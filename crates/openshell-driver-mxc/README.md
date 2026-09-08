@@ -42,6 +42,7 @@ default_configuration_id = "composable"
 pc_least_privilege = false
 pc_capabilities = []
 debug = false
+etw_audit = false
 ```
 
 Supply workload settings for each sandbox. The public config is keyed by driver name; the gateway forwards only the inner `mxc` object to the driver:
@@ -57,6 +58,13 @@ The `command` array is required and preserves Windows argument boundaries. `cwd`
 Network policy support depends on the selected containment path. Policy
 replacement and merge updates use the gateway's standard sandbox configuration
 revision contract.
+
+When `etw_audit` is enabled, each gateway process owns a distinct real-time ETW
+session named from the stable `OpenShell-MXC-ETW` prefix, its process ID, and a
+per-start discriminator. Starting another gateway never stops an existing
+gateway's capture. Graceful shutdown stops the session by its owned handle. A
+force-killed gateway can leave a stale session; the audit example removes only
+matching sessions whose encoded owner process is no longer running.
 
 ## Prerequisites (live runs)
 

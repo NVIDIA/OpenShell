@@ -43,7 +43,7 @@ param(
   # Gateway bind port (matches the gateway default) + CLI registration name.
   [int]    $Port         = 17670,
   [string] $GatewayName  = "openshell-mxc-ocsf",
-  # Internal driver ETW session name (used to clean up a leaked session).
+  # Internal driver ETW session prefix (used to find owned or proven-stale sessions).
   [string] $SessionName  = "OpenShell-MXC-ETW",
   # Optional: copy the results bundle to this path (e.g. a shared drive) for
   # pickup. Empty by default (no copy); pass -ShareOut '\\server\share' to enable.
@@ -71,6 +71,19 @@ function Info([string]$m) { Write-Host "    $m" }
 function Ok([string]$m)   { Write-Host "[OK]   $m" -ForegroundColor Green }
 function Bad([string]$m)  { Write-Host "[FAIL] $m" -ForegroundColor Red }
 
+function Get-MxcEtwSessions {
+  $pattern = [regex]::Escape($SessionName) + '-(?<pid>[0-9]+)-[0-9a-fA-F]{32}-[0-9a-fA-F]{8}'
+  foreach ($line in @(logman query -ets 2>$null)) {
+    $match = [regex]::Match([string]$line, $pattern)
+    if ($match.Success) {
+      [pscustomobject]@{
+        Name = $match.Value
+        Pid  = [int]$match.Groups['pid'].Value
+      }
+    }
+  }
+}
+
 $gateway = Join-Path $here "openshell-gateway.exe"
 $cli     = Join-Path $here "openshell.exe"
 $policySrc = Join-Path $here "ocsf-audit.yaml"
@@ -80,6 +93,7 @@ $toml    = Join-Path $resultDir "mxc-ocsf-audit.used.toml"   # disposable patche
 $helloPath = Join-Path $ShareDir "hello.txt"
 
 $gw       = $null
+$gatewayEtwSessions = @()
 $passed   = $true
 $proxyOn  = -not $NoProxy
 
@@ -173,12 +187,19 @@ try {
   Ok "port $Port free"
 
   # 4. ETW session pre-flight. A force-killed gateway never runs Drop, so its
-  #    real-time ETW session LEAKS and can starve the next run's capture. Stop
-  #    any leftover before we start.
+  #    real-time ETW session can leak. Session names include their owning PID;
+  #    stop only sessions whose process is proven gone and leave live gateways
+  #    untouched.
   Step "ETW session pre-flight"
-  $leaked = @(logman query -ets 2>$null | Select-String -SimpleMatch $SessionName)
-  Info "leaked '$SessionName' sessions before run: $($leaked.Count)"
-  if ($leaked.Count -gt 0) { logman stop $SessionName -ets 2>&1 | Out-Null; Info "stopped leaked session(s)" }
+  $discoveredSessions = @(Get-MxcEtwSessions)
+  $staleSessions = @($discoveredSessions | Where-Object {
+    -not (Get-Process -Id $_.Pid -ErrorAction SilentlyContinue)
+  })
+  Info "'$SessionName' sessions before run: $($discoveredSessions.Count) total, $($staleSessions.Count) proven stale"
+  foreach ($session in $staleSessions) {
+    logman stop $session.Name -ets 2>&1 | Out-Null
+    Info "stopped stale session '$($session.Name)'"
+  }
 
   # 5. Prepare share folder.
   New-Item -ItemType Directory -Force $ShareDir | Out-Null
@@ -214,6 +235,12 @@ try {
   }
   if (-not $ready) { throw "gateway did not start listening on $Port within 30s." }
   Ok "gateway listening on 127.0.0.1:$Port"
+  $gatewayEtwSessions = @(Get-MxcEtwSessions | Where-Object { $_.Pid -eq $gw.Id })
+  if ($gatewayEtwSessions.Count -eq 1) {
+    Info "gateway ETW session: $($gatewayEtwSessions[0].Name)"
+  } else {
+    Info "gateway ETW session lookup returned $($gatewayEtwSessions.Count) matches for pid $($gw.Id)"
+  }
 
   # 9. Register CLI -> gateway.
   Step "Register CLI -> gateway"
@@ -242,6 +269,9 @@ catch {
   $passed = $false
 }
 finally {
+  if (-not $KeepRunning -and $gw -and $gatewayEtwSessions.Count -eq 0) {
+    $gatewayEtwSessions = @(Get-MxcEtwSessions | Where-Object { $_.Pid -eq $gw.Id })
+  }
   # Stop the gateway FIRST so it releases its log + JSONL file handles.
   if ($KeepRunning -and $gw -and -not $gw.HasExited) {
     Info "leaving gateway pid $($gw.Id) running (-KeepRunning); stop it with: Stop-Process -Id $($gw.Id) -Force"
@@ -251,8 +281,13 @@ finally {
     try { $gw.WaitForExit(5000) | Out-Null } catch {}
     Info "stopped gateway pid $($gw.Id)"
   }
-  # Belt-and-suspenders: force-kill skips Drop, so stop the leaked session here.
-  if (-not $KeepRunning) { logman stop $SessionName -ets 2>&1 | Out-Null }
+  # Belt-and-suspenders: force-kill skips Drop, so stop only the exact session(s)
+  # observed for the gateway process started by this run.
+  if (-not $KeepRunning) {
+    foreach ($session in $gatewayEtwSessions) {
+      logman stop $session.Name -ets 2>&1 | Out-Null
+    }
+  }
 
   # ---- summarise the OCSF audit trail --------------------------------------
   $logText = @()

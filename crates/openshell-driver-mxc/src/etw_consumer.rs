@@ -56,7 +56,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Foundation::WIN32_ERROR;
 use windows::Win32::System::Diagnostics::Etw::{
@@ -84,8 +84,15 @@ use openshell_ocsf::{
 pub(crate) const SANDBOXING_PROVIDER_GUID: GUID =
     GUID::from_u128(0xf6ec123e_314e_400b_9e0a_151365e23083);
 
-/// Our real-time session name (distinct from MXC's diagnostic console session).
-const SESSION_NAME: &str = "OpenShell-MXC-ETW";
+/// Stable gateway-owned prefix for real-time ETW sessions (distinct from MXC's
+/// diagnostic console session). The complete name also carries the gateway PID
+/// and a per-start discriminator so concurrent gateways and stale sessions never
+/// share an ETW controller name.
+const SESSION_NAME_PREFIX: &str = "OpenShell-MXC-ETW";
+
+/// Separates multiple backend constructions in one process even if their clocks
+/// resolve to the same instant.
+static SESSION_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
 /// `EVENT_CONTROL_CODE_ENABLE_PROVIDER`.
 const EVENT_CONTROL_CODE_ENABLE_PROVIDER: u32 = 1;
@@ -238,6 +245,7 @@ struct CaptureHealth {
 /// [`EtwSession::stop`]) stops the session and joins the threads.
 pub(crate) struct EtwSession {
     handle: u64,
+    session_name: String,
     pump_thread: Option<JoinHandle<()>>,
     consumer_thread: Option<JoinHandle<()>>,
     health: Arc<CaptureHealth>,
@@ -250,7 +258,7 @@ impl EtwSession {
         // `ProcessTrace` return isn't logged as an unexpected capture death.
         self.health.stopping.store(true, Ordering::SeqCst);
         if self.handle != 0 {
-            stop_session(self.handle);
+            stop_session(self.handle, &self.session_name);
             self.handle = 0;
         }
         // ControlTraceW(STOP) makes ProcessTrace return → the pump thread ends and
@@ -306,10 +314,10 @@ unsafe impl Send for OpenedTrace {}
 ///
 /// Returns an [`EtwSession`] that must be kept alive; dropping it stops capture.
 pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSession, String> {
-    cleanup_stale_session();
+    let session_name = new_session_name();
 
-    let handle = start_trace_session()?;
-    enable_provider(handle)?;
+    let handle = start_trace_session(&session_name)?;
+    enable_provider(handle, &session_name)?;
 
     let (tx, rx) = mpsc::channel::<RawEtwEvent>();
 
@@ -346,7 +354,7 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
             drain_and_emit(&index);
         })
         .map_err(|e| {
-            stop_session(handle);
+            stop_session(handle, &session_name);
             format!("failed to spawn ETW consumer thread: {e}")
         })?;
 
@@ -357,11 +365,11 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
     // reclaim the boxed Sender (which disconnects the consumer's channel so it
     // exits), stop the session, and join the consumer before returning `Err`.
     let tx_ptr = Box::into_raw(Box::new(tx));
-    let opened = match open_trace(tx_ptr) {
+    let opened = match open_trace(&session_name, tx_ptr) {
         Ok(o) => o,
         Err(e) => {
             unsafe { drop(Box::from_raw(tx_ptr)) };
-            stop_session(handle);
+            stop_session(handle, &session_name);
             let _ = consumer_thread.join();
             return Err(e);
         }
@@ -378,19 +386,20 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
             // The trace is open but we couldn't spawn the pump. Stop the session,
             // reclaim the boxed Sender so the consumer disconnects, and join it.
             unsafe { drop(Box::from_raw(tx_ptr)) };
-            stop_session(handle);
+            stop_session(handle, &session_name);
             let _ = consumer_thread.join();
             return Err(format!("failed to spawn ETW pump thread: {e}"));
         }
     };
 
     tracing::info!(
-        session = SESSION_NAME,
+        session = %session_name,
         "MXC ETW→OCSF consumer started (Sandboxing provider)"
     );
 
     Ok(EtwSession {
         handle,
+        session_name,
         pump_thread: Some(pump_thread),
         consumer_thread: Some(consumer_thread),
         health,
@@ -401,16 +410,29 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
 // Session management
 // ---------------------------------------------------------------------------
 
-fn session_name_wide() -> Vec<u16> {
-    SESSION_NAME
+fn format_session_name(process_id: u32, started_at_nanos: u128, sequence: u32) -> String {
+    format!("{SESSION_NAME_PREFIX}-{process_id}-{started_at_nanos:032x}-{sequence:08x}")
+}
+
+fn new_session_name() -> String {
+    let started_at_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format_session_name(std::process::id(), started_at_nanos, sequence)
+}
+
+fn session_name_wide(session_name: &str) -> Vec<u16> {
+    session_name
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect()
 }
 
-fn alloc_properties_buf() -> Vec<u8> {
+fn alloc_properties_buf(session_name: &str) -> Vec<u8> {
     let props_size = size_of::<EVENT_TRACE_PROPERTIES>();
-    let name_wide_len = SESSION_NAME.encode_utf16().count() + 1;
+    let name_wide_len = session_name.encode_utf16().count() + 1;
     let name_bytes = name_wide_len * 2;
     let total = props_size + name_bytes + 2;
 
@@ -424,9 +446,9 @@ fn alloc_properties_buf() -> Vec<u8> {
     buf
 }
 
-fn start_trace_session() -> Result<u64, String> {
-    let name = session_name_wide();
-    let mut buf = alloc_properties_buf();
+fn start_trace_session(session_name: &str) -> Result<u64, String> {
+    let name = session_name_wide(session_name);
+    let mut buf = alloc_properties_buf(session_name);
     let props = buf.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
 
     unsafe {
@@ -457,7 +479,7 @@ fn start_trace_session() -> Result<u64, String> {
     Ok(handle.Value)
 }
 
-fn enable_provider(session_handle: u64) -> Result<(), String> {
+fn enable_provider(session_handle: u64, session_name: &str) -> Result<(), String> {
     let h = CONTROLTRACE_HANDLE {
         Value: session_handle,
     };
@@ -476,7 +498,7 @@ fn enable_provider(session_handle: u64) -> Result<(), String> {
     };
 
     if status != WIN32_ERROR(0) {
-        stop_session(session_handle);
+        stop_session(session_handle, session_name);
         return Err(format!(
             "EnableTraceEx2 (Sandboxing provider) failed: error {}",
             status.0
@@ -486,9 +508,9 @@ fn enable_provider(session_handle: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn stop_session(handle: u64) {
-    let name = session_name_wide();
-    let mut buf = alloc_properties_buf();
+fn stop_session(handle: u64, session_name: &str) {
+    let name = session_name_wide(session_name);
+    let mut buf = alloc_properties_buf(session_name);
     let props = buf.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
     let h = CONTROLTRACE_HANDLE { Value: handle };
 
@@ -511,30 +533,13 @@ fn stop_session(handle: u64) {
                     events_lost,
                     realtime_buffers_lost = rt_lost,
                     log_buffers_lost = log_lost,
-                    session = SESSION_NAME,
+                    session = session_name,
                     "ETW session lost events (increase buffers / speed up consumer)"
                 );
             } else {
-                tracing::debug!(session = SESSION_NAME, "ETW session stopped; 0 events lost");
+                tracing::debug!(session = session_name, "ETW session stopped; 0 events lost");
             }
         }
-    }
-}
-
-/// Best-effort stop of a same-named session left behind by a crashed run, so
-/// `StartTraceW` doesn't fail with `ERROR_ALREADY_EXISTS`.
-fn cleanup_stale_session() {
-    let name = session_name_wide();
-    let mut buf = alloc_properties_buf();
-    let props = buf.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
-
-    unsafe {
-        let _ = ControlTraceW(
-            CONTROLTRACE_HANDLE::default(),
-            PCWSTR(name.as_ptr()),
-            props,
-            EVENT_TRACE_CONTROL_STOP,
-        );
     }
 }
 
@@ -548,8 +553,11 @@ fn cleanup_stale_session() {
 /// `Sender` and the `LoggerName` buffer are handed to the returned [`OpenedTrace`]
 /// so they outlive the subsequent blocking `ProcessTrace`.
 #[allow(clippy::field_reassign_with_default)]
-fn open_trace(tx_ptr: *mut mpsc::Sender<RawEtwEvent>) -> Result<OpenedTrace, String> {
-    let mut name = session_name_wide();
+fn open_trace(
+    session_name: &str,
+    tx_ptr: *mut mpsc::Sender<RawEtwEvent>,
+) -> Result<OpenedTrace, String> {
+    let mut name = session_name_wide(session_name);
 
     let mut logfile = EVENT_TRACE_LOGFILEW::default();
     logfile.LoggerName = PWSTR(name.as_mut_ptr());
@@ -1667,6 +1675,22 @@ fn wide_str_at(buf: &[u8], offset: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_processes_and_restarts_use_distinct_session_names() {
+        let first_gateway = format_session_name(1001, 0x1111, 0);
+        let second_gateway = format_session_name(1002, 0x1111, 0);
+        let restarted_gateway = format_session_name(1001, 0x2222, 0);
+
+        assert!(first_gateway.starts_with("OpenShell-MXC-ETW-1001-"));
+        assert_ne!(first_gateway, second_gateway);
+        assert_ne!(first_gateway, restarted_gateway);
+        assert_eq!(
+            first_gateway,
+            format_session_name(1001, 0x1111, 0),
+            "the controller and consumer must derive the same session name"
+        );
+    }
 
     fn mk_event(pid: u32, name: &str) -> DecodedEtwEvent {
         DecodedEtwEvent {
