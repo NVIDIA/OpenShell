@@ -11,6 +11,10 @@ inputs:
   binary:
     description: Binary staged in the Docker build context
     required: true
+  additional-binary:
+    description: Optional second binary staged in the Docker build context
+    required: false
+    default: ""
   triple:
     description: Binary artifact target triple
     required: true
@@ -51,6 +55,21 @@ runs:
       run: install -Dm0755 artifact/${INPUTS_BINARY} deploy/docker/.build/prebuilt-binaries/${INPUTS_ARCH}/${INPUTS_BINARY}
       env:
         INPUTS_BINARY: ${{ inputs.binary }}
+        INPUTS_ARCH: ${{ inputs.arch }}
+
+    - name: Download ${{ inputs.additional-binary }}
+      if: inputs.additional-binary != ''
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: ${{ inputs.additional-binary }}-${{ inputs.triple }}
+        path: additional-artifact
+
+    - name: Stage ${{ inputs.additional-binary }}
+      if: inputs.additional-binary != ''
+      shell: bash
+      run: install -Dm0755 additional-artifact/${INPUTS_ADDITIONAL_BINARY} deploy/docker/.build/prebuilt-binaries/${INPUTS_ARCH}/${INPUTS_ADDITIONAL_BINARY}
+      env:
+        INPUTS_ADDITIONAL_BINARY: ${{ inputs.additional-binary }}
         INPUTS_ARCH: ${{ inputs.arch }}
 
     - name: Build ${{ inputs.component }} image

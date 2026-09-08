@@ -1,0 +1,57 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Platform sandboxing implementation.
+
+use miette::Result;
+use openshell_core::policy::SandboxPolicy;
+
+#[cfg(target_os = "linux")]
+pub mod linux;
+
+/// Apply sandboxing rules for the current platform.
+///
+/// # Errors
+///
+/// Returns an error if the sandbox cannot be applied.
+// On Linux the spawn path uses `prepare`+`enforce` directly; this single-phase
+// apply is only invoked from the non-Linux spawn_impl.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
+pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::apply(policy, workdir)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (policy, workdir);
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(openshell_ocsf::ActivityId::Open)
+                .severity(openshell_ocsf::SeverityId::Medium)
+                .finding_info(openshell_ocsf::FindingInfo::new(
+                    "platform-sandbox-unavailable",
+                    "Platform Sandboxing Not Implemented",
+                ).with_desc("Sandbox policy provided but platform sandboxing is not yet implemented on this OS"))
+                .message("Platform sandboxing not yet implemented")
+                .build()
+        );
+        Ok(())
+    }
+}
+
+/// Apply seccomp hardening for the long-lived supervisor process itself.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
+pub fn apply_supervisor_startup_hardening() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::apply_supervisor_prelude()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(())
+    }
+}

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! E2E tests for GraphQL L7 inspection across both proxy entry points.
+//! E2E tests for GraphQL L7 inspection through transparent interception.
 //!
 //! The upstream server deliberately does not implement GraphQL. `OpenShell`
 //! parses and enforces GraphQL before forwarding, so any HTTP server that
@@ -130,7 +130,7 @@ network_policies:
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn graphql_l7_enforces_allow_and_deny_rules_on_forward_and_connect_paths() {
+async fn graphql_l7_enforces_high_level_and_raw_transparent_paths() {
     let server = start_test_server().await.expect("start test server");
     let policy = write_graphql_policy(&server.host, server.port).expect("write custom policy");
     let policy_path = policy
@@ -142,7 +142,6 @@ async fn graphql_l7_enforces_allow_and_deny_rules_on_forward_and_connect_paths()
     let script = format!(
         r#"
 import json
-import os
 import socket
 import time
 import urllib.error
@@ -231,26 +230,14 @@ def retry_forward_allowed(label, request_fn):
         time.sleep(0.3)
     return last_status
 
-def proxy_parts(*names):
-    proxy_url = next((os.environ.get(name) for name in names if os.environ.get(name)), None)
-    parsed = urllib.parse.urlparse(proxy_url)
-    return parsed.hostname, parsed.port or 80
-
-def forward_proxy_parts():
-    return proxy_parts("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")
-
-def connect_proxy_parts():
-    return proxy_parts("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")
-
 def forward_chunked_status(query):
-    proxy_host, proxy_port = forward_proxy_parts()
     target = f"{{HOST}}:{{PORT}}"
     body = json.dumps({{"query": query}}).encode()
     chunk = f"{{len(body):x}}\r\n".encode() + body + b"\r\n0\r\n\r\n"
 
-    with socket.create_connection((proxy_host, proxy_port), timeout=15) as sock:
+    with socket.create_connection((HOST, PORT), timeout=15) as sock:
         request = (
-            f"POST http://{{target}}/graphql HTTP/1.1\r\n"
+            f"POST /graphql HTTP/1.1\r\n"
             f"Host: {{target}}\r\n"
             f"Content-Type: application/json\r\n"
             f"Transfer-Encoding: chunked\r\n"
@@ -297,22 +284,11 @@ def status_code(response, label):
         DETAILS[f"{{label}}_raw"] = response.decode(errors="replace")
         raise RuntimeError(f"{{label}}: non-numeric HTTP status: {{response!r}}") from error
 
-def connect_http_status(label, request):
-    proxy_host, proxy_port = connect_proxy_parts()
-    target = f"{{HOST}}:{{PORT}}"
-
+def raw_http_status(label, request):
     last_error = None
     for attempt in range(5):
         try:
-            with socket.create_connection((proxy_host, proxy_port), timeout=15) as sock:
-                sock.sendall(
-                    f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode()
-                )
-                connect_response = read_until(sock, b"\r\n\r\n")
-                connect_code = status_code(connect_response, f"{{label}}_connect")
-                if connect_code != 200:
-                    return connect_code
-
+            with socket.create_connection((HOST, PORT), timeout=15) as sock:
                 sock.sendall(request)
                 sock.shutdown(socket.SHUT_WR)
                 response = read_until(sock, b"\r\n\r\n")
@@ -324,7 +300,7 @@ def connect_http_status(label, request):
 
     raise RuntimeError(f"{{label}}: failed after 5 attempts: {{last_error}}")
 
-def connect_status(query, label):
+def raw_status(query, label):
     target = f"{{HOST}}:{{PORT}}"
     body = json.dumps({{"query": query}}).encode()
 
@@ -336,9 +312,9 @@ def connect_status(query, label):
         f"Connection: close\r\n"
         f"\r\n"
     ).encode() + body
-    return connect_http_status(label, request)
+    return raw_http_status(label, request)
 
-def connect_get_status(query, label):
+def raw_get_status(query, label):
     target = f"{{HOST}}:{{PORT}}"
     encoded = urllib.parse.urlencode({{"query": query}})
 
@@ -348,9 +324,9 @@ def connect_get_status(query, label):
         f"Connection: close\r\n"
         f"\r\n"
     ).encode()
-    return connect_http_status(label, request)
+    return raw_http_status(label, request)
 
-def connect_duplicate_get_status():
+def raw_duplicate_get_status():
     target = f"{{HOST}}:{{PORT}}"
     safe = urllib.parse.quote_plus(QUERY_VIEWER)
     unsafe = urllib.parse.quote_plus(MUTATION_DELETE)
@@ -361,9 +337,9 @@ def connect_duplicate_get_status():
         f"Connection: close\r\n"
         f"\r\n"
     ).encode()
-    return connect_http_status("connect_duplicate_get_denied", request)
+    return raw_http_status("raw_duplicate_get_denied", request)
 
-def connect_persisted_get_status(hash_value, label):
+def raw_persisted_get_status(hash_value, label):
     target = f"{{HOST}}:{{PORT}}"
     extensions = json.dumps({{"persistedQuery": {{"version": 1, "sha256Hash": hash_value}}}})
     encoded = urllib.parse.urlencode({{"operationName": "Viewer", "extensions": extensions}})
@@ -374,9 +350,9 @@ def connect_persisted_get_status(hash_value, label):
         f"Connection: close\r\n"
         f"\r\n"
     ).encode()
-    return connect_http_status(label, request)
+    return raw_http_status(label, request)
 
-def connect_chunked_status(query):
+def raw_chunked_status(query):
     target = f"{{HOST}}:{{PORT}}"
     body = json.dumps({{"query": query}}).encode()
     chunk = f"{{len(body):x}}\r\n".encode() + body + b"\r\n0\r\n\r\n"
@@ -389,7 +365,7 @@ def connect_chunked_status(query):
         f"Connection: close\r\n"
         f"\r\n"
     ).encode() + chunk
-    return connect_http_status("connect_chunked_query_allowed", request)
+    return raw_http_status("raw_chunked_query_allowed", request)
 
 results = {{
     "forward_query_allowed": retry_forward_allowed("forward_query_allowed", lambda: forward_status(QUERY_VIEWER)),
@@ -401,15 +377,15 @@ results = {{
     "forward_unlisted_field_denied": forward_status(QUERY_REPOSITORY),
     "forward_mutation_allowed": retry_forward_allowed("forward_mutation_allowed", lambda: forward_status(MUTATION_CREATE)),
     "forward_deny_rule_denied": forward_status(MUTATION_DELETE),
-    "connect_query_allowed": connect_status(QUERY_VIEWER, "connect_query_allowed"),
-    "connect_get_query_allowed": connect_get_status(QUERY_VIEWER, "connect_get_query_allowed"),
-    "connect_duplicate_get_denied": connect_duplicate_get_status(),
-    "connect_persisted_get_allowed": connect_persisted_get_status("abc123", "connect_persisted_get_allowed"),
-    "connect_unregistered_persisted_get_denied": connect_persisted_get_status("missing", "connect_unregistered_persisted_get_denied"),
-    "connect_chunked_query_allowed": connect_chunked_status(QUERY_VIEWER),
-    "connect_unlisted_field_denied": connect_status(QUERY_REPOSITORY, "connect_unlisted_field_denied"),
-    "connect_mutation_allowed": connect_status(MUTATION_CREATE, "connect_mutation_allowed"),
-    "connect_deny_rule_denied": connect_status(MUTATION_DELETE, "connect_deny_rule_denied"),
+    "raw_query_allowed": raw_status(QUERY_VIEWER, "raw_query_allowed"),
+    "raw_get_query_allowed": raw_get_status(QUERY_VIEWER, "raw_get_query_allowed"),
+    "raw_duplicate_get_denied": raw_duplicate_get_status(),
+    "raw_persisted_get_allowed": raw_persisted_get_status("abc123", "raw_persisted_get_allowed"),
+    "raw_unregistered_persisted_get_denied": raw_persisted_get_status("missing", "raw_unregistered_persisted_get_denied"),
+    "raw_chunked_query_allowed": raw_chunked_status(QUERY_VIEWER),
+    "raw_unlisted_field_denied": raw_status(QUERY_REPOSITORY, "raw_unlisted_field_denied"),
+    "raw_mutation_allowed": raw_status(MUTATION_CREATE, "raw_mutation_allowed"),
+    "raw_deny_rule_denied": raw_status(MUTATION_DELETE, "raw_deny_rule_denied"),
 }}
 results.update(DETAILS)
 print(json.dumps(results, sort_keys=True))
@@ -432,15 +408,15 @@ print(json.dumps(results, sort_keys=True))
         ("forward_unlisted_field_denied", 403),
         ("forward_mutation_allowed", 200),
         ("forward_deny_rule_denied", 403),
-        ("connect_query_allowed", 200),
-        ("connect_get_query_allowed", 200),
-        ("connect_duplicate_get_denied", 403),
-        ("connect_persisted_get_allowed", 200),
-        ("connect_unregistered_persisted_get_denied", 403),
-        ("connect_chunked_query_allowed", 200),
-        ("connect_unlisted_field_denied", 403),
-        ("connect_mutation_allowed", 200),
-        ("connect_deny_rule_denied", 403),
+        ("raw_query_allowed", 200),
+        ("raw_get_query_allowed", 200),
+        ("raw_duplicate_get_denied", 403),
+        ("raw_persisted_get_allowed", 200),
+        ("raw_unregistered_persisted_get_denied", 403),
+        ("raw_chunked_query_allowed", 200),
+        ("raw_unlisted_field_denied", 403),
+        ("raw_mutation_allowed", 200),
+        ("raw_deny_rule_denied", 403),
     ] {
         let expected_fragment = format!(r#""{key}": {expected}"#);
         assert!(
