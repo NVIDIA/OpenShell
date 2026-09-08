@@ -37,7 +37,8 @@
       rust-overlay,
       ...
     }:
-    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ] (
+    let
+      perSystem = flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ] (
       system:
       let
         pkgs = import nixpkgs {
@@ -100,6 +101,11 @@
                 ++ commonDevShellPackages;
               };
         }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+          cross-aarch64-linux-musl = import ./nix/devShells/cross-aarch64-linux-musl.nix {
+            inherit pkgs rust-overlay commonDevShellPackages;
+          };
+        }
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           glibc-2-28 = import ./nix/devShells/glibc-2-28.nix {
             inherit pkgs rust-overlay commonDevShellPackages;
@@ -111,5 +117,12 @@
 
         formatter = treefmtEval.config.build.wrapper;
       }
-    );
+      );
+    in
+    perSystem
+    // {
+      # Cross-shell names describe the Linux target, rather than the Darwin
+      # execution platform that runs their toolchains.
+      crossShells.aarch64-darwin.aarch64-linux.musl = perSystem.devShells.aarch64-darwin.cross-aarch64-linux-musl;
+    };
 }

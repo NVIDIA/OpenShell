@@ -77,6 +77,17 @@ continue to opt in with `bundled-z3`.
 
 ## Linux Runtime Environments
 
+### macOS-hosted ARM64 musl CLI builds
+
+On Apple Silicon macOS, `nix develop .#crossShells.aarch64-darwin.aarch64-linux.musl` provides a
+Darwin-hosted toolchain for building Linux ARM64 musl binaries. Its `cargo`
+shim dispatches `cargo build` through `cargo-zigbuild` with the
+`aarch64-unknown-linux-musl` target, so a plain CLI build produces
+`target/aarch64-unknown-linux-musl/<profile>/openshell`. The resulting static
+ELF binary is intended for a Linux guest VM; this shell is not a Linux runtime
+environment and does not replace `devShells.aarch64-linux.musl`, which remains
+the native Linux shell used in ARM64 Linux CI.
+
 OpenShell uses different Linux libc environments for different host artifacts.
 The standalone `openshell` CLI is built as a static musl binary so it can run on
 a wide range of Linux distributions without depending on the host's glibc. Host
