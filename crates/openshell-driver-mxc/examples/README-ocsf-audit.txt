@@ -17,7 +17,7 @@ WHAT THIS PROVES / PRODUCES
   OCSF classes you will see:
     [6002] Application Lifecycle        - sandbox created
     [5019] Device Config State Change   - OS policy / hardening / proxy / console
-    [1007] Process Activity             - in-sandbox process launch (+ cmd line)
+    [1007] Process Activity             - in-sandbox process launch (+ executable identity)
     [2004] Detection Finding            - MXC setup activity errors (informational)
 
 PREREQUISITES (on this test box)
@@ -75,5 +75,6 @@ NOTES
   - The Sandboxing provider reports the sandbox entry-point process, not the full
     in-sandbox process tree. Deep process-tree auditing would need a second ETW
     source (Microsoft-Windows-Kernel-Process) and is out of scope for this trail.
-  - cmd_line is captured verbatim into OCSF process.cmd_line with no redaction on
-    this path; treat the audit log as sensitive at rest and in transit.
+  - MXC process audit events record the executable basename only. Command-line
+    arguments are omitted from OCSF JSON and shorthand because they can contain
+    credentials, signed URLs, or PII.

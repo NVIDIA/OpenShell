@@ -300,7 +300,7 @@ finally {
     "win32k lockdown applied"       = Seen "(?i)ocsf:.*win32k lockdown"
     "UI restrictions applied"       = Seen "(?i)ocsf:.*UI restrictions"
     "console reference plumbed"     = Seen "(?i)ocsf:.*console reference plumbed"
-    "process launch (command line)" = Seen "(?i)ocsf:.*PROC:LAUNCH"
+    "process launch (executable identity)" = Seen "(?i)ocsf:.*PROC:LAUNCH"
   }
   if ($proxyOn) { $coreEvents["egress proxy configured"] = Seen "(?i)ocsf:.*proxy configured" }
 

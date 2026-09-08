@@ -377,3 +377,5 @@ record for the same request.
 
 Never log secrets, credentials, bearer tokens, or query parameters in OCSF
 messages. OCSF JSONL output may be shipped to external systems.
+MXC ETW process events record executable identity but omit command-line
+arguments from both structured fields and messages.

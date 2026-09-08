@@ -1325,7 +1325,8 @@ fn emit_resolved(
         }
         // Process [1007]: `CreateProcessInSandbox` carries the real agent command
         // line + working directory. The activity fires once empty (probe) and
-        // once with the command — only emit for the populated one.
+        // once with the command. Emit only the populated event, and map the
+        // command to a safe executable identity rather than durable arguments.
         "CreateProcessInSandbox" if ev.opcode == OPCODE_START => {
             if let Some(cmd) = ev.get_unquoted("commandLine") {
                 let ctx = etw_ctx(sandbox_id, sandbox_name);
@@ -1338,7 +1339,7 @@ fn emit_resolved(
         // `CreateProcessInSandbox` — it carries the *actual* `processId`/`threadId`
         // of the started in-sandbox process (the create event only has the request +
         // command line). We emit it as a distinct PROC row so the trail records both
-        // the launch request (with cmd line) and the confirmed start (with real pid).
+        // the launch request (with executable identity) and confirmed start (with pid).
         "ProcessLaunched" => {
             let ctx = etw_ctx(sandbox_id, sandbox_name);
             emit_ocsf(sandbox_id, map_process_started(&ctx, ev));
@@ -1468,23 +1469,15 @@ fn map_config_state(ctx: &SandboxContext, ev: &DecodedEtwEvent) -> OcsfEvent {
 
 /// `CreateProcessInSandbox` (populated) → Process Activity [1007] "Launch".
 ///
-/// PRIVACY NOTE (review item #3): `cmd_line` is copied **verbatim** from MXC's
-/// ETW event into the OCSF `process.cmd_line` field. This consumer performs **no
-/// privacy/secret filtering** — if a caller passes credentials, tokens, or PII on
-/// the command line, they will appear **unredacted** in the durable audit trail.
-/// This is deliberate (audit fidelity), so the OCSF log must be treated as
-/// sensitive at rest and in transit.
-///
-/// Redaction is intentionally **not** done here and is owned by an upstream
-/// privacy layer, not the ETW→OCSF path. Note that no general PII/secret scrubber
-/// covers this field today: the only redaction that exists
-/// (`openshell_core::secrets`, `${…}` → `[CREDENTIAL]`) is scoped to the network
-/// proxy's HTTP-target logging, a separate egress path. If/when a general
-/// audit-output PII filter lands, this field is where it must apply.
+/// Command arguments are intentionally omitted from both `process.cmd_line` and
+/// the message because legitimate arguments may contain credentials, signed URLs,
+/// or PII. The executable basename provides a useful, bounded audit identity
+/// without copying the raw ETW command line into durable or streamed logs.
 fn map_process_launch(ctx: &SandboxContext, ev: &DecodedEtwEvent, cmd_line: &str) -> OcsfEvent {
     // The created process's own pid isn't in this event (it appears later in
     // `ProcessLaunched`); the emitting pid is the sandbox host (wxc-exec).
-    let proc = Process::new(&exe_name(cmd_line), 0).with_cmd_line(cmd_line);
+    let executable = exe_name(cmd_line);
+    let proc = Process::new(&executable, 0);
     let cwd = ev.get_unquoted("currentDirectory").unwrap_or_default();
     let cwd_suffix = if cwd.is_empty() {
         String::new()
@@ -1501,8 +1494,7 @@ fn map_process_launch(ctx: &SandboxContext, ev: &DecodedEtwEvent, cmd_line: &str
         .process(proc)
         .actor_process(Process::new("wxc-exec", i64::from(ev.process_id)))
         .message(format!(
-            "MXC sandbox launched process: {}{cwd_suffix}",
-            truncate(cmd_line, 160)
+            "MXC sandbox launched process: {executable}{cwd_suffix}"
         ))
         .build()
 }
@@ -1575,18 +1567,6 @@ fn exe_name(cmd_line: &str) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or("process")
         .to_string()
-}
-
-/// Truncate at a char boundary with an ellipsis (keeps shorthand tidy).
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
 }
 
 // ---------------------------------------------------------------------------
@@ -1699,6 +1679,34 @@ mod tests {
             event_name: Some(name.to_string()),
             props: Vec::new(),
         }
+    }
+
+    #[test]
+    fn process_launch_omits_command_arguments_from_audit_output() {
+        const SECRET: &str = "secret-value";
+        let ctx = etw_ctx("sbx-secret-test", "secret-test");
+        let mut ev = mk_event(4242, "CreateProcessInSandbox");
+        ev.props
+            .push(("currentDirectory".into(), r#""C:\work\openshell""#.into()));
+
+        let event = map_process_launch(&ctx, &ev, &format!("tool --token {SECRET}"));
+        let json = serde_json::to_string(&event).expect("process event should serialize");
+        let shorthand = event.format_shorthand();
+
+        assert!(!json.contains(SECRET), "serialized OCSF leaked an argument");
+        assert!(
+            !shorthand.contains(SECRET),
+            "OCSF shorthand leaked an argument"
+        );
+        let OcsfEvent::ProcessActivity(process_event) = event else {
+            panic!("expected Process Activity event");
+        };
+        assert_eq!(process_event.process.name, "tool");
+        assert!(process_event.process.cmd_line.is_none());
+        assert_eq!(
+            process_event.base.message.as_deref(),
+            Some("MXC sandbox launched process: tool (cwd: C:\\work\\openshell)")
+        );
     }
 
     // Shailendra #2: the create/config burst can reach the consumer before the
