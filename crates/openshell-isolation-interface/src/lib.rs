@@ -21,9 +21,9 @@
 //! The lifecycle states run in order: attach -> Bound -> confirm -> Ready ->
 //! `start_agent` -> Running. Nothing untrusted runs inside the boundary until it
 //! is confirmed ready. This is enforced *by construction*: each transition
-//! consumes the prior state by value, and no state type has a public
-//! constructor, so the supervisor cannot skip a stage or run a workload before
-//! [`contract::ReadyBoundary`] exists.
+//! consumes the prior state by value. Trusted backends construct confirmation
+//! through [`contract::ConfirmedBoundary::try_new`], which checks common evidence
+//! before the supervisor can obtain a [`contract::ReadyBoundary`].
 //!
 //! [`AgentSpec`] is shared between the workload definition the supervisor
 //! submits and the [`contract::SandboxContext`] that `attach` binds to a

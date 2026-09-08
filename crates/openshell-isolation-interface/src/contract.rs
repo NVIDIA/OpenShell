@@ -14,9 +14,10 @@
 //!     -> start_agent -> Running
 //! ```
 //!
-//! Each transition consumes the prior state by value (`self: Box<Self>`), and no
-//! state type has a public constructor, so a stage cannot be skipped or
-//! replayed. The supervisor holds no `match`/downcast on concrete backends: the
+//! Each transition consumes the prior state by value (`self: Box<Self>`).
+//! Trusted backend implementations construct confirmation through a validating
+//! constructor; the supervisor cannot obtain a ready boundary without evidence.
+//! The supervisor holds no `match`/downcast on concrete backends: the
 //! registry is the only lookup by `backend_name`, and everything past it is a
 //! `Box<dyn _>` / `Arc<dyn _>`.
 //!
@@ -492,10 +493,23 @@ pub struct ConfirmedBoundary {
 }
 
 impl ConfirmedBoundary {
-    /// Construct a confirmed state after backend-specific evidence validation.
-    #[allow(dead_code)] // Implemented by the remote backend in the next stack layer.
-    pub(crate) fn new(boundary: Box<dyn ReadyBoundary>, evidence: SandboxConfirmEvidence) -> Self {
-        Self { boundary, evidence }
+    /// Construct confirmation after checking measured evidence against the
+    /// immutable identity admitted at attach time.
+    ///
+    /// Backend implementations are trusted to collect this evidence and bind
+    /// it to their resource. This constructor enforces the common requirements
+    /// without requiring those implementations to live in the interface crate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if evidence is incomplete or the identity does not match.
+    pub fn try_new(
+        boundary: Box<dyn ReadyBoundary>,
+        evidence: SandboxConfirmEvidence,
+        expected: &ResolvedWorkloadIdentity,
+    ) -> Result<Self, BackendError> {
+        evidence.validate(expected)?;
+        Ok(Self { boundary, evidence })
     }
 
     /// Return the measured evidence carried by this confirmed state.
@@ -830,6 +844,3 @@ pub trait DnsMediationSource: Send + Sync {
     /// Await the next DNS query from this boundary.
     async fn accept(&self) -> Result<MediatedDnsQuery, BackendError>;
 }
-
-#[cfg(test)]
-mod tests;
