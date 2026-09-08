@@ -4,10 +4,9 @@
 //! Cross-platform "die when my parent dies" primitive.
 //!
 //! The VM driver spawns a chain of subprocesses (compute driver → `--internal-run-vm`
-//! launcher → gvproxy + libkrun fork). If any link in that chain is killed
+//! launcher → libkrun fork). If any link in that chain is killed
 //! with SIGKILL — or simply crashes — the children are reparented to init
-//! and survive indefinitely, leaking libkrun workers and gvproxy
-//! instances.
+//! and survive indefinitely, leaking libkrun workers.
 //!
 //! This module exposes two functions:
 //! * [`die_with_parent`] — configure the kernel (Linux) or a helper
@@ -17,7 +16,7 @@
 //!   the runtime.rs comment at the single call site).
 //! * [`die_with_parent_cleanup`] — same as above, but on the BSD path a
 //!   best-effort cleanup callback runs *before* this process exits.
-//!   This matters when we own a non-Rust child (e.g. gvproxy) that
+//!   This matters when we own a non-Rust child that
 //!   cannot arm its own procguard; the callback lets us SIGTERM it
 //!   first.
 //!

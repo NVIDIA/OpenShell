@@ -11,24 +11,36 @@ compile_error!(
      build a telemetry-free VM driver with `--no-default-features --features defaults-without-telemetry`"
 );
 
+#[cfg(feature = "compute-driver")]
 pub mod driver;
+#[cfg(feature = "compute-driver")]
 mod embedded_runtime;
+#[cfg(feature = "compute-driver")]
 mod ffi;
+#[cfg(feature = "compute-driver")]
 pub mod gpu;
+#[cfg(feature = "compute-driver")]
+mod isolation;
+#[cfg(feature = "compute-driver")]
 pub mod lifecycle;
-mod nft_ruleset;
+#[cfg(feature = "compute-driver")]
 pub mod otel_tracing;
+#[cfg(feature = "compute-driver")]
 pub mod procguard;
+#[cfg(feature = "compute-driver")]
 mod rootfs;
+#[cfg(feature = "compute-driver")]
 mod runtime;
 
+#[cfg(feature = "compute-driver")]
 pub use driver::{VmDriver, VmDriverConfig};
+#[cfg(feature = "compute-driver")]
 pub use lifecycle::{
     BackendFeature, ExtensionCapabilities, ExtensionDescriptor, GuestInitDropin, LaunchAbortReason,
     LaunchPlan, LifecycleError, LifecycleExtension, LifecycleExtensionRegistry, LifecycleResult,
     RestoreContext,
 };
+#[cfg(feature = "compute-driver")]
 pub use runtime::{
-    VM_RUNTIME_DIR_ENV, VmBackend, VmLaunchConfig, cleanup_stale_tap_interfaces,
-    configured_runtime_dir, run_vm,
+    VM_RUNTIME_DIR_ENV, VmBackend, VmLaunchConfig, VsockPortMap, configured_runtime_dir, run_vm,
 };
