@@ -1936,26 +1936,6 @@ mod tests {
             "first page should return a continuation token"
         );
 
-        state
-            .store
-            .put_message(&Workspace {
-                metadata: Some(ObjectMeta {
-                    id: "ws-page-aa".to_string(),
-                    name: "page-aa".to_string(),
-                    created_at_ms: 999_999,
-                    labels: HashMap::new(),
-                    resource_version: 0,
-                    annotations: HashMap::new(),
-                    workspace: String::new(),
-                    deletion_timestamp_ms: 0,
-                }),
-                status: Some(WorkspaceStatus {
-                    phase: WorkspacePhase::Active.into(),
-                }),
-            })
-            .await
-            .unwrap();
-
         let token_page = handle_list_workspaces(
             &state,
             authed_request(ListWorkspacesRequest {
@@ -1977,6 +1957,12 @@ mod tests {
             vec!["page-b", "page-c"]
         );
 
+        state
+            .store
+            .delete_by_name(Workspace::object_type(), "", "page-a")
+            .await
+            .unwrap();
+
         let offset_page = handle_list_workspaces(
             &state,
             authed_request(ListWorkspacesRequest {
@@ -1995,7 +1981,7 @@ mod tests {
                 .iter()
                 .filter_map(|workspace| workspace.metadata.as_ref().map(|m| m.name.as_str()))
                 .collect::<Vec<_>>(),
-            vec!["page-b", "page-c"]
+            vec!["page-c"]
         );
     }
 
