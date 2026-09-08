@@ -1,18 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::gpu::{
-    GpuInventory, SubnetAllocator, allocate_vsock_cid, mac_from_sandbox_id, tap_device_name,
-};
+#![allow(unsafe_code)]
+
+use crate::gpu::{GpuInventory, allocate_vsock_cid};
+
+use crate::isolation::VmBoundarySpec;
 use crate::lifecycle::{
     BackendFeature, GuestInitDropin, LaunchAbortReason, LaunchPlan, LifecycleExtensionRegistry,
     RestoreContext, extension_state_dir,
 };
 use crate::rootfs::{
     clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
-    extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path,
-    sandbox_guest_user_ids_from_image, sandbox_guest_user_ids_from_overlay_image,
-    set_rootfs_image_file_mode, write_rootfs_image_file,
+    extract_host_supervisor, extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root,
+    recover_rootfs_image, sandbox_guest_init_path, sandbox_guest_runtime_identity,
+    set_rootfs_image_file_mode, validate_host_supervisor, write_rootfs_image_file,
 };
 use crate::runtime::VmBackend;
 use bollard::Docker;
@@ -57,15 +59,20 @@ use openshell_core::proto::compute::v1::{
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
+use openshell_isolation_interface::boundary_protocol::{
+    BoundaryConfig, BoundaryListener, BoundaryTopology, GatewayVerificationKey,
+    SandboxTlsClientConfig, SandboxTlsMaterial, SandboxTlsServerConfig, SandboxTransport,
+    generate_sandbox_tls_material,
+};
 use openshell_vfio::SysfsRoot;
 use opentelemetry::trace::TraceContextExt as _;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::future::Future;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-use std::net::{IpAddr, Ipv4Addr};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -97,6 +104,7 @@ const REGISTRY_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 /// 10 GiB — configurable via `rootfs_tar_max_bytes`.
 const DEFAULT_ROOTFS_TAR_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const ROOTFS_TAR_STAGING_DIR: &str = "rootfs-tar-staging";
+const VM_CONSOLE_DIAGNOSTIC_BYTES: u64 = 8 * 1024;
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -132,39 +140,34 @@ impl VmSandboxDriverConfig {
     }
 }
 
-/// gvproxy host-loopback IP — gvproxy's TCP/UDP/ICMP forwarder NAT-rewrites
-/// this destination to the host's `127.0.0.1` and dials out from the host
-/// process. This is the only address that transparently reaches host-bound
-/// services without explicit `expose` rules.
-///
-/// See gvisor-tap-vsock `cmd/gvproxy/config.go` (default NAT entry
-/// `HostIP -> 127.0.0.1`) and `pkg/services/forwarder/tcp.go` (NAT lookup
-/// before `net.Dial`).
-///
-/// Code paths route via `GVPROXY_HOST_LOOPBACK_ALIAS` (DNS / /etc/hosts)
-/// instead so logs stay readable; this constant is kept for documentation
-/// and parity with the guest init script.
-#[allow(dead_code)] // Documentation/parity anchor; all routing goes via the alias.
-const GVPROXY_HOST_LOOPBACK_IP: &str = "192.168.127.254";
 const OPENSHELL_HOST_GATEWAY_ALIAS: &str = "host.openshell.internal";
-/// Hostname gvproxy resolves (via its embedded DNS) to the host-loopback IP.
-///
-/// We rewrite loopback URLs to this hostname rather than the bare IP because:
-///   * the guest init script seeds /etc/hosts with the same mapping, so it
-///     resolves even when gvproxy's DNS is not in resolv.conf;
-///   * keeping a recognisable hostname makes log messages clearer than a bare
-///     192.168.127.254 reference;
-///   * package-managed gateway certificates include this SAN for guest mTLS.
-///
-/// Both names ultimately route through the gvproxy NAT path on
-/// `GVPROXY_HOST_LOOPBACK_IP` — they do **not** go through the gateway IP.
-const GVPROXY_HOST_LOOPBACK_ALIAS: &str = OPENSHELL_HOST_GATEWAY_ALIAS;
+const HOST_LOOPBACK_ALIASES: &[&str] = &[
+    OPENSHELL_HOST_GATEWAY_ALIAS,
+    "host.containers.internal",
+    "host.docker.internal",
+];
+#[allow(dead_code)]
 const GUEST_SSH_SOCKET_PATH: &str = openshell_core::container_paths::SSH_SOCKET_PATH;
+#[allow(dead_code)]
 const GUEST_TLS_CA_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CA_PATH;
+#[allow(dead_code)]
 const GUEST_TLS_CERT_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CERT_PATH;
+#[allow(dead_code)]
 const GUEST_TLS_KEY_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_KEY_PATH;
+#[allow(dead_code)]
 const GUEST_SANDBOX_TOKEN_PATH: &str = openshell_core::container_paths::VM_GUEST_SANDBOX_TOKEN_PATH;
 const GUEST_INIT_DROPIN_DIR: &str = openshell_core::container_paths::VM_GUEST_INIT_DROPIN_DIR;
+const GUEST_BOUNDARY_CONFIG_DIR: &str = "/.openshell/state";
+const GUEST_BOUNDARY_CONFIG_ENV: &str = "OPENSHELL_VM_SANDBOX_BOOTSTRAP";
+const HOST_AUTH_BUNDLE_FILE: &str = "supervisor-auth.json";
+const HOST_TOPOLOGY_PAYLOAD_FILE: &str = "topology.payload";
+/// The backend this driver's deployment admits, delivered to the supervisor on
+/// a channel separate from the topology descriptor so descriptor verification
+/// is not self-referential.
+const DRIVER_ADMITTED_BACKEND: &str = "vm";
+const HOST_SUPERVISOR_BINARY: &str = "host-runtime/openshell-supervisor";
+const VM_CONTROL_SOCKET: &str = "control.sock";
+const VM_CONTROL_PORT: u32 = 5500;
 /// Guest path of the driver-authored manifest enumerating which
 /// `init.d` drop-ins the guest init script is allowed to execute.
 ///
@@ -174,19 +177,6 @@ const GUEST_INIT_DROPIN_DIR: &str = openshell_core::container_paths::VM_GUEST_IN
 /// upperdir on every launch, so the image cannot forge or shadow it.
 const GUEST_INIT_DROPIN_MANIFEST: &str =
     openshell_core::container_paths::VM_GUEST_INIT_DROPIN_MANIFEST;
-/// Guest path of the root-only corporate proxy credential staged by the driver.
-const GUEST_UPSTREAM_PROXY_AUTH_PATH: &str =
-    openshell_core::container_paths::VM_GUEST_UPSTREAM_PROXY_AUTH_PATH;
-/// Guest path of the corporate proxy CA bundle staged by the driver.
-const GUEST_PROXY_CA_PATH: &str = openshell_core::container_paths::VM_GUEST_PROXY_CA_PATH;
-/// Guest path of the driver-authored supervisor argument list.
-///
-/// The counterpart of [`GUEST_INIT_DROPIN_MANIFEST`] for the supervisor's own
-/// command line: written into the overlay upperdir on every launch (empty
-/// when there is nothing to pass) so the guest appends exactly the arguments
-/// the driver chose and a sandbox image cannot forge or shadow them.
-const GUEST_SUPERVISOR_ARGS_PATH: &str =
-    openshell_core::container_paths::VM_GUEST_SUPERVISOR_ARGS_PATH;
 const IMAGE_CACHE_ROOT_DIR: &str = "images";
 const IMAGE_CACHE_ROOTFS_IMAGE: &str = "rootfs.ext4";
 const OVERLAY_TEMPLATE_CACHE_DIR: &str = "overlay-templates";
@@ -204,7 +194,7 @@ const GUEST_IMAGE_CONFIG_DIR: &str = "openshell-image";
 const GUEST_IMAGE_OCI_LAYOUT_DIR: &str = "oci";
 const GUEST_IMAGE_OCI_REF: &str = "openshell";
 const IMAGE_EXPORT_ROOTFS_ARCHIVE: &str = "source-rootfs.tar";
-const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v3";
+const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v4";
 const PREPARED_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-prepared-rootfs-ext4-umoci-v3";
 const IMAGE_IDENTITY_FILE: &str = "image-identity";
 const IMAGE_REFERENCE_FILE: &str = "image-reference";
@@ -286,6 +276,67 @@ pub struct VmDriverConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_gid: Option<u32>,
 
+    /// Corporate forward proxy URL (`http://host:port` or `https://host:port`)
+    /// passed to the host supervisor.
+    ///
+    /// The supervisor chains policy-approved TLS tunnels through this proxy
+    /// with HTTP CONNECT instead of dialing destinations directly. This is an
+    /// operator-owned egress boundary: it travels on the supervisor's argv,
+    /// which sandbox spec/template environment and image `ENV` cannot
+    /// influence. `host.openshell.internal` resolves to host loopback for the
+    /// host supervisor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https_proxy: Option<String>,
+
+    /// Comma-separated `NO_PROXY` list passed alongside the proxy URL.
+    ///
+    /// Matching destinations are dialed directly instead of through the
+    /// corporate proxy. This bypasses only the corporate proxy, never
+    /// `OpenShell` policy evaluation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_proxy: Option<String>,
+
+    /// Path (on the gateway host) to a file containing the corporate proxy
+    /// credential in `user:pass` form.
+    ///
+    /// The driver validates it at sandbox-create time and stages it into the
+    /// per-sandbox overlay at [`GUEST_UPSTREAM_PROXY_AUTH_PATH`], root-only.
+    /// Credentials are never embedded in the proxy URL and never reach the
+    /// guest environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_auth_file: Option<String>,
+
+    /// Explicit acknowledgement that proxy credentials are sent in cleartext.
+    ///
+    /// `Proxy-Authorization: Basic` over the plain-TCP connection to an
+    /// `http://` proxy is recoverable by anyone on the network path, so
+    /// [`Self::proxy_auth_file`] requires this acknowledgement. An `https://`
+    /// proxy carries the credential inside the verified TLS session and does
+    /// not need it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_auth_allow_insecure: Option<bool>,
+
+    /// Send the destination hostname in CONNECT requests instead of a
+    /// validated IP.
+    ///
+    /// The default binds the tunnel to an address that passed the sandbox's
+    /// SSRF and `allowed_ips` validation. Set this only when the proxy's ACLs
+    /// filter on hostnames and reject IP CONNECT targets: the proxy then
+    /// resolves the name itself and its own ACLs become the effective egress
+    /// control for proxied TLS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_connect_by_hostname: Option<bool>,
+
+    /// Path (on the gateway host) to a PEM CA bundle trusted for the
+    /// corporate proxy.
+    ///
+    /// The driver stages it into the per-sandbox overlay at
+    /// [`GUEST_PROXY_CA_PATH`] and passes that path via
+    /// `--upstream-proxy-ca-bundle`. It is trusted both for the handshake
+    /// with an `https://` proxy and for server certificates re-signed by a
+    /// TLS-intercepting proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_ca_bundle: Option<String>,
     /// Directory where rootfs tar files must be staged before they can be
     /// referenced in a `CreateSandbox` request. Defaults to `<state_dir>/rootfs-tar-staging`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -462,6 +513,29 @@ impl VmDriverConfig {
         Ok(())
     }
 
+    /// Validate the operator's corporate upstream-proxy settings, fail-closed.
+    ///
+    /// Delegates to the validator shared with the Podman and Kubernetes
+    /// drivers and with the host supervisor, so a value accepted here is
+    /// never rejected by the host supervisor — and no misconfiguration can silently
+    /// degrade to a direct dial.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the offending key.
+    pub fn validate_proxy_config(&self) -> Result<(), String> {
+        openshell_core::driver_utils::validate_upstream_proxy_settings(
+            &openshell_core::driver_utils::UpstreamProxySettings {
+                url: self.https_proxy.as_deref(),
+                no_proxy: self.no_proxy.as_deref(),
+                auth_file: self.proxy_auth_file.as_deref(),
+                auth_allow_insecure: self.proxy_auth_allow_insecure,
+                connect_by_hostname: self.proxy_connect_by_hostname,
+                ca_bundle: self.proxy_ca_bundle.as_deref(),
+            },
+        )
+    }
+
     fn rootfs_tar_staging_dir(&self) -> PathBuf {
         self.rootfs_tar_staging_dir
             .clone()
@@ -486,7 +560,7 @@ impl VmDriverConfig {
         if provided.iter().all(Option::is_none) {
             return if self.requires_tls_materials() {
                 Err(
-                    "https:// openshell endpoint requires OPENSHELL_VM_TLS_CA, OPENSHELL_VM_TLS_CERT, and OPENSHELL_VM_TLS_KEY so sandbox VMs can authenticate to the gateway"
+                    "https:// openshell endpoint requires OPENSHELL_VM_TLS_CA, OPENSHELL_VM_TLS_CERT, and OPENSHELL_VM_TLS_KEY so the host supervisor can authenticate to the gateway"
                         .to_string(),
                 )
             } else {
@@ -545,9 +619,27 @@ fn validate_openshell_endpoint(endpoint: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn host_control_openshell_endpoint(endpoint: &str) -> Result<(String, Option<String>), String> {
+    let mut url = Url::parse(endpoint)
+        .map_err(|err| format!("invalid openshell endpoint '{endpoint}': {err}"))?;
+    let Some(host) = url.host_str().map(str::to_string) else {
+        return Ok((endpoint.to_string(), None));
+    };
+    if !HOST_LOOPBACK_ALIASES.contains(&host.as_str()) {
+        return Ok((endpoint.to_string(), None));
+    }
+
+    // The supervisor runs on the host, so guest aliases dial loopback while
+    // retaining the configured hostname for TLS certificate verification.
+    url.set_host(Some("127.0.0.1"))
+        .map_err(|error| format!("failed to rewrite host endpoint '{endpoint}': {error}"))?;
+    Ok((url.into(), Some(host)))
+}
+
 #[derive(Debug)]
 struct VmProcess {
     child: Child,
+    supervisor: Child,
     deleting: bool,
 }
 
@@ -557,7 +649,6 @@ struct SandboxRecord {
     process: Option<Arc<Mutex<VmProcess>>>,
     provisioning_task: Option<JoinHandle<()>>,
     gpu_bdf: Option<String>,
-    qemu_network_allocated: bool,
     deleting: bool,
 }
 
@@ -615,7 +706,6 @@ pub struct VmDriver {
     image_cache_lock: Arc<Mutex<()>>,
     events: broadcast::Sender<WatchSandboxesEvent>,
     gpu_inventory: Option<Arc<std::sync::Mutex<GpuInventory>>>,
-    subnet_allocator: Arc<std::sync::Mutex<SubnetAllocator>>,
     lifecycle_extensions: Arc<LifecycleExtensionRegistry>,
 }
 
@@ -625,7 +715,7 @@ impl VmDriver {
     }
 
     pub async fn new_with_extensions(
-        config: VmDriverConfig,
+        mut config: VmDriverConfig,
         lifecycle_extensions: LifecycleExtensionRegistry,
     ) -> Result<Self, String> {
         lifecycle_extensions
@@ -639,13 +729,11 @@ impl VmDriver {
         }
         validate_openshell_endpoint(&config.grpc_endpoint)?;
         let _ = config.tls_paths()?;
+        config.state_dir = absolute_state_dir(&config.state_dir)?;
 
         #[cfg(target_os = "linux")]
         if config.gpu_enabled {
             check_gpu_privileges()?;
-            tokio::task::spawn_blocking(crate::cleanup_stale_tap_interfaces)
-                .await
-                .map_err(|e| format!("cleanup stale TAP interfaces panicked: {e}"))?;
         }
 
         let state_root = sandboxes_root_dir(&config.state_dir);
@@ -691,11 +779,6 @@ impl VmDriver {
             None
         };
 
-        let subnet_allocator = Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
-            Ipv4Addr::new(10, 0, 128, 0),
-            17,
-        )));
-
         let (events, _) = broadcast::channel(WATCH_BUFFER);
         let driver = Self {
             config,
@@ -704,7 +787,6 @@ impl VmDriver {
             image_cache_lock: Arc::new(Mutex::new(())),
             events,
             gpu_inventory,
-            subnet_allocator,
             lifecycle_extensions: Arc::new(lifecycle_extensions),
         };
         driver.restore_persisted_sandboxes().await;
@@ -771,6 +853,175 @@ impl VmDriver {
         }
 
         Ok(canonical)
+    }
+
+    async fn host_supervisor_binary(&self) -> Result<PathBuf, Status> {
+        if let Some(configured) = std::env::var_os("OPENSHELL_VM_SUPERVISOR_BIN") {
+            let configured = PathBuf::from(configured);
+            if configured.is_file() {
+                return Ok(configured);
+            }
+            return Err(Status::failed_precondition(format!(
+                "configured host supervisor does not exist: {}",
+                configured.display()
+            )));
+        }
+
+        let destination = self.config.state_dir.join(HOST_SUPERVISOR_BINARY);
+        if validate_host_supervisor(&destination).is_ok() {
+            return Ok(destination);
+        }
+        let _cache_guard = self.image_cache_lock.lock().await;
+        if validate_host_supervisor(&destination).is_ok() {
+            return Ok(destination);
+        }
+        let destination_for_extract = destination.clone();
+        tokio::task::spawn_blocking(move || extract_host_supervisor(&destination_for_extract))
+            .await
+            .map_err(|error| {
+                Status::internal(format!("host supervisor extraction panicked: {error}"))
+            })?
+            .map_err(Status::failed_precondition)?;
+        validate_host_supervisor(&destination).map_err(Status::failed_precondition)?;
+        Ok(destination)
+    }
+
+    async fn spawn_host_supervisor(
+        &self,
+        sandbox: &Sandbox,
+        state_dir: &Path,
+        tls_paths: Option<&VmDriverTlsPaths>,
+        topology: &BoundaryTopology,
+        auth_bundle: &openshell_core::jwt::SupervisorAuthBundle,
+    ) -> Result<Child, Status> {
+        let supervisor_binary = self.host_supervisor_binary().await?;
+        let (openshell_endpoint, gateway_tls_server_name) =
+            host_control_openshell_endpoint(&self.config.openshell_endpoint)
+                .map_err(Status::failed_precondition)?;
+        let auth_bundle_path = state_dir.join(HOST_AUTH_BUNDLE_FILE);
+        let encoded_auth_bundle = serde_json::to_vec(auth_bundle)
+            .map_err(|error| Status::internal(format!("encode supervisor auth bundle: {error}")))?;
+        tokio::fs::write(&auth_bundle_path, encoded_auth_bundle)
+            .await
+            .map_err(|error| Status::internal(format!("write supervisor auth bundle: {error}")))?;
+        #[cfg(unix)]
+        tokio::fs::set_permissions(&auth_bundle_path, fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(|error| {
+                Status::internal(format!("restrict supervisor auth bundle: {error}"))
+            })?;
+
+        let descriptor = topology
+            .descriptor(DRIVER_ADMITTED_BACKEND)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        // The payload carries the boundary bootstrap token, so it must not
+        // appear in the world-readable process cmdline; deliver it through a
+        // driver-owned 0600 file like the gateway token.
+        let payload_path = state_dir.join(HOST_TOPOLOGY_PAYLOAD_FILE);
+        tokio::fs::write(&payload_path, &descriptor.payload)
+            .await
+            .map_err(|error| Status::internal(format!("write host topology payload: {error}")))?;
+        #[cfg(unix)]
+        tokio::fs::set_permissions(&payload_path, fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(|error| {
+                Status::internal(format!("restrict host topology payload: {error}"))
+            })?;
+        let main_process_spec = openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(
+            sandbox.spec.as_ref(),
+        )
+        .map_err(|error| Status::internal(format!("encode main process spec: {error}")))?;
+        let sandbox_user_id = self.config.resolve_sandbox_uid();
+        let primary_group_id = self.config.resolve_sandbox_gid(sandbox_user_id);
+        let upstream_proxy_args = upstream_proxy_cli_args(&self.config)
+            .map_err(|error| Status::invalid_argument(format!("render upstream proxy: {error}")))?;
+        let mut command = Command::new(&supervisor_binary);
+        isolate_host_control_environment(&mut command);
+        command
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(
+                fs::File::create(state_dir.join("supervisor.log"))
+                    .map_err(|error| Status::internal(format!("create supervisor log: {error}")))?,
+            ))
+            .stderr(Stdio::from(
+                fs::File::create(state_dir.join("supervisor.err.log")).map_err(|error| {
+                    Status::internal(format!("create supervisor error log: {error}"))
+                })?,
+            ))
+            .arg(format!(
+                "--topology-backend-name={}",
+                descriptor.backend_name
+            ))
+            .arg("--topology-payload-file")
+            .arg(&payload_path)
+            .arg("--auth-bundle-file")
+            .arg(&auth_bundle_path)
+            .arg("--workdir")
+            .arg("/sandbox")
+            .args(upstream_proxy_args)
+            .env(
+                openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND,
+                DRIVER_ADMITTED_BACKEND,
+            )
+            .env(
+                openshell_core::sandbox_env::MAIN_PROCESS_SPEC,
+                main_process_spec,
+            )
+            .env(openshell_core::sandbox_env::ENDPOINT, openshell_endpoint)
+            .env(openshell_core::sandbox_env::SANDBOX_ID, &sandbox.id)
+            .env(openshell_core::sandbox_env::SANDBOX, &sandbox.name)
+            .env(
+                openshell_core::sandbox_env::SSH_SOCKET_PATH,
+                state_dir.join("ssh.sock"),
+            )
+            .env(
+                openshell_core::sandbox_env::PROXY_TLS_DIR,
+                state_dir.join("proxy-tls"),
+            )
+            .env(
+                openshell_core::sandbox_env::SANDBOX_UID,
+                sandbox_user_id.to_string(),
+            )
+            .env(
+                openshell_core::sandbox_env::SANDBOX_GID,
+                primary_group_id.to_string(),
+            )
+            .env(openshell_core::sandbox_env::OCI_IMAGE_USER, "")
+            .env(
+                openshell_core::sandbox_env::LOG_LEVEL,
+                openshell_core::driver_utils::sandbox_log_level(sandbox, &self.config.log_level),
+            )
+            .env(
+                openshell_core::sandbox_env::TELEMETRY_ENABLED,
+                openshell_core::telemetry::enabled_env_value(),
+            );
+        if let Some(server_name) = gateway_tls_server_name {
+            command.env(
+                openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
+                server_name,
+            );
+        }
+        configure_main_exit_marker(&mut command, state_dir);
+        if let Some(tls) = tls_paths {
+            command
+                .env(openshell_core::sandbox_env::TLS_CA, &tls.ca)
+                .env(openshell_core::sandbox_env::TLS_CERT, &tls.cert)
+                .env(openshell_core::sandbox_env::TLS_KEY, &tls.key);
+        }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            command.pre_exec(|| {
+                nix::sys::prctl::set_pdeathsig(Signal::SIGKILL)
+                    .map_err(|error| std::io::Error::other(error.to_string()))
+            });
+        }
+        command.spawn().map_err(|error| {
+            Status::internal(format!(
+                "start host supervisor '{}': {error}",
+                supervisor_binary.display()
+            ))
+        })
     }
 
     #[must_use]
@@ -865,7 +1116,6 @@ impl VmDriver {
                     process: None,
                     provisioning_task: None,
                     gpu_bdf: None,
-                    qemu_network_allocated: false,
                     deleting: false,
                 },
             );
@@ -922,15 +1172,14 @@ impl VmDriver {
         let provisioning_span = provisioning_span(&parent, &sandbox_id, &image_ref);
         let task = tokio::spawn(
             async move {
-                driver
-                    .provision_sandbox(
-                        sandbox_for_task,
-                        image_ref_for_task,
-                        state_dir_for_task,
-                        tls_paths,
-                        OverlayPreparation::Fresh,
-                    )
-                    .await;
+                Box::pin(driver.provision_sandbox(
+                    sandbox_for_task,
+                    image_ref_for_task,
+                    state_dir_for_task,
+                    tls_paths,
+                    OverlayPreparation::Fresh,
+                ))
+                .await;
             }
             .instrument(provisioning_span),
         );
@@ -1068,6 +1317,29 @@ impl VmDriver {
         let image_disk = image_plan.image_disk;
         let owner_source_disk = image_disk.as_ref().unwrap_or(&root_disk).clone();
         let overlay_disk = disk_paths.overlay_disk;
+        let boundary_generation = random_boundary_token();
+        let launch_authentication = sandbox
+            .spec
+            .as_ref()
+            .filter(|spec| !spec.launch_authentication.is_empty())
+            .ok_or_else(|| {
+                Status::failed_precondition("VM sandbox launch authentication is required")
+            })
+            .and_then(|spec| {
+                serde_json::from_slice::<openshell_core::jwt::SandboxLaunchAuthentication>(
+                    &spec.launch_authentication,
+                )
+                .map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "decode VM sandbox launch authentication: {error}"
+                    ))
+                })
+            })?;
+        launch_authentication.validate().map_err(|error| {
+            Status::failed_precondition(format!(
+                "validate VM sandbox launch authentication: {error}"
+            ))
+        })?;
 
         self.publish_platform_event(
             sandbox.id.clone(),
@@ -1078,19 +1350,8 @@ impl VmDriver {
                 "Preparing writable VM overlay disk".to_string(),
             ),
         );
-        let sandbox_owner_state = self
-            .prepare_runtime_overlay(
-                &state_dir,
-                &overlay_disk,
-                &owner_source_disk,
-                tls_paths.as_ref(),
-                sandbox
-                    .spec
-                    .as_ref()
-                    .map(|spec| spec.sandbox_token.as_str())
-                    .filter(|token| !token.is_empty()),
-                overlay_preparation,
-            )
+        if let Err(err) = self
+            .prepare_runtime_overlay(&overlay_disk, overlay_preparation)
             .await
             .map_err(|err| Status::internal(format!("prepare guest overlay disk failed: {err}")))?;
         self.ensure_provisioning_active(&sandbox.id).await?;
@@ -1119,23 +1380,10 @@ impl VmDriver {
             match self.build_vm_launch_plan(&sandbox.id, needs_qemu, is_gpu, gpu_bdf.clone()) {
                 Ok(plan) => plan,
                 Err(err) => {
-                    self.release_gpu_and_subnet(&sandbox.id);
+                    self.release_gpu(&sandbox.id);
                     return Err(err);
                 }
             };
-
-        // `build_vm_launch_plan` already allocated the QEMU subnet, so record
-        // it as allocated now — before the cancellable `configure_launch` /
-        // `before_launch` hooks run. If a delete aborts provisioning while
-        // one of those hooks is awaiting, the aborted future never runs its
-        // own release path, and the delete cleanup is gated on this flag; if
-        // the flag were still unset the subnet would leak.
-        if plan.backend == VmBackend::Qemu
-            && let Err(err) = self.mark_qemu_network_allocated(&sandbox.id).await
-        {
-            self.release_gpu_and_subnet(&sandbox.id);
-            return Err(err);
-        }
 
         if let Err(err) = self
             .lifecycle_extensions
@@ -1149,7 +1397,7 @@ impl VmDriver {
                     LaunchAbortReason::BeforeLaunchHookFailed,
                 )
                 .await;
-            self.release_gpu_and_subnet(&sandbox.id);
+            self.release_gpu(&sandbox.id);
             let message = format!(
                 "vm lifecycle extension rejected sandbox launch plan: {}",
                 err.message()
@@ -1163,8 +1411,8 @@ impl VmDriver {
 
         // Resolve and validate the backend from the requirements that
         // `configure_launch` extensions contributed. After this point the
-        // plan's backend, sizing, and host allocations (subnet, tap, vsock)
-        // are final; the `before_launch` hook below may still mutate
+        // plan's backend, sizing, and host allocations are final; the
+        // `before_launch` hook below may still mutate
         // `plan.env` and `plan.guest_init_dropins` and may abort the launch,
         // but it MUST NOT change `plan.backend`, `plan.required_backends`,
         // or `plan.required_backend_features` -- those are enforced as a
@@ -1179,7 +1427,7 @@ impl VmDriver {
                     LaunchAbortReason::BeforeLaunchHookFailed,
                 )
                 .await;
-            self.release_gpu_and_subnet(&sandbox.id);
+            self.release_gpu(&sandbox.id);
             return Err(err);
         }
 
@@ -1191,7 +1439,7 @@ impl VmDriver {
                     LaunchAbortReason::BeforeLaunchHookFailed,
                 )
                 .await;
-            self.release_gpu_and_subnet(&sandbox.id);
+            self.release_gpu(&sandbox.id);
             return Err(err);
         }
 
@@ -1207,7 +1455,7 @@ impl VmDriver {
                     LaunchAbortReason::BeforeLaunchHookFailed,
                 )
                 .await;
-            self.release_gpu_and_subnet(&sandbox.id);
+            self.release_gpu(&sandbox.id);
             let message = format!(
                 "vm lifecycle extension rejected sandbox launch: {}",
                 err.message()
@@ -1223,29 +1471,75 @@ impl VmDriver {
             self.lifecycle_extensions
                 .after_launch_failed(&sandbox, &state_dir, LaunchAbortReason::GuestPrepareFailed)
                 .await;
-            self.release_gpu_and_subnet(&sandbox.id);
+            self.release_gpu(&sandbox.id);
             return Err(err);
         }
-
-        // Staged on every launch, including a restart onto a preserved
-        // overlay, so the driver's copy always shadows the image layer.
-        if let Err(err) = inject_guest_upstream_proxy(&overlay_disk, &self.config).await {
-            self.lifecycle_extensions
-                .after_launch_failed(&sandbox, &state_dir, LaunchAbortReason::GuestPrepareFailed)
-                .await;
-            self.release_gpu_and_subnet(&sandbox.id);
-            return Err(err);
-        }
-
-        let endpoint_override = if plan.backend == VmBackend::Qemu {
-            plan.host_ip.as_deref().map(|host_ip| {
-                guest_visible_openshell_endpoint_for_tap(&self.config.grpc_endpoint, host_ip)
-            })
-        } else {
-            None
-        };
 
         let console_output = state_dir.join("rootfs-console.log");
+        let control_socket = state_dir.join(VM_CONTROL_SOCKET);
+        let session_id = launch_authentication.supervisor.session_id;
+        let channel_tls = generate_sandbox_tls_material(session_id)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let supervisor_tls = SandboxTlsClientConfig {
+            server_name: channel_tls.server_name.clone(),
+            trust_anchor_pem: channel_tls.trust_anchor_pem.clone(),
+        };
+        let transport = if plan.backend == VmBackend::Qemu {
+            SandboxTransport::Vsock {
+                guest_cid: plan.vsock_cid.ok_or_else(|| {
+                    Status::internal("QEMU launch plan is missing a guest vsock CID")
+                })?,
+                port: VM_CONTROL_PORT,
+            }
+        } else {
+            SandboxTransport::Unix {
+                socket_path: control_socket.clone(),
+            }
+        };
+        let verification_keys = launch_authentication
+            .verification_keys
+            .iter()
+            .map(|key| {
+                String::from_utf8(key.public_key_pem.clone())
+                    .map(|public_key_pem| GatewayVerificationKey {
+                        key_id: key.key_id.clone(),
+                        public_key_pem,
+                    })
+                    .map_err(|error| {
+                        Status::failed_precondition(format!(
+                            "VM sandbox verification key is not UTF-8 PEM: {error}"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let sandbox_user_id = self.config.resolve_sandbox_uid();
+        let provisioning = VmBoundarySpec {
+            boundary_id: sandbox.id.clone(),
+            generation: boundary_generation.clone(),
+            session_id,
+            gateway_id: launch_authentication.gateway_id.clone(),
+            verification_keys,
+            image_identity,
+            transport,
+            supervisor_tls,
+            sandbox_tls: guest_boundary_tls_paths(&boundary_generation),
+            control_port: VM_CONTROL_PORT,
+            agent_uid: sandbox_user_id,
+            agent_gid: self.config.resolve_sandbox_gid(sandbox_user_id),
+            child_env: merged_environment(&sandbox),
+        }
+        .provision()
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let guest_boundary_config_path =
+            guest_boundary_config_path(&provisioning.boundary_config.generation);
+        inject_guest_boundary_bundle(
+            &overlay_disk,
+            &guest_boundary_config_path,
+            &provisioning.boundary_config,
+            &channel_tls,
+        )
+        .map_err(|error| Status::internal(format!("inject VM boundary configuration: {error}")))?;
+        let topology = provisioning.topology;
         let mut command = Command::new(&self.launcher_bin);
         command.kill_on_drop(true);
         command.stdin(Stdio::null());
@@ -1271,24 +1565,16 @@ impl VmDriver {
             if let Some(bdf) = plan.gpu_bdf.as_deref() {
                 command.arg("--vm-gpu-bdf").arg(bdf);
             }
-            if let Some(tap) = plan.tap_device.as_deref() {
-                command.arg("--vm-tap-device").arg(tap);
-            }
-            if let Some(guest_ip) = plan.guest_ip.as_deref() {
-                command.arg("--vm-guest-ip").arg(guest_ip);
-            }
-            if let Some(host_ip) = plan.host_ip.as_deref() {
-                command.arg("--vm-host-ip").arg(host_ip);
-            }
             if let Some(vsock_cid) = plan.vsock_cid {
                 command.arg("--vm-vsock-cid").arg(vsock_cid.to_string());
             }
-            if let Some(guest_mac) = plan.guest_mac.as_deref() {
-                command.arg("--vm-guest-mac").arg(guest_mac);
-            }
-            if let Some(port) = plan.gateway_port {
-                command.arg("--vm-gateway-port").arg(port.to_string());
-            }
+        } else {
+            let _ = tokio::fs::remove_file(&control_socket).await;
+            command
+                .arg("--vm-vsock-control-port")
+                .arg(VM_CONTROL_PORT.to_string())
+                .arg("--vm-vsock-control-socket")
+                .arg(&control_socket);
         }
 
         self.ensure_provisioning_active(&sandbox.id).await?;
@@ -1297,9 +1583,12 @@ impl VmDriver {
             .arg("--vm-krun-log-level")
             .arg(self.config.krun_log_level.to_string());
 
-        for env in build_guest_environment(&sandbox, &self.config, endpoint_override.as_deref()) {
+        for env in build_guest_environment(&sandbox, &self.config) {
             command.arg("--vm-env").arg(env);
         }
+        command.arg("--vm-env").arg(format!(
+            "{GUEST_BOUNDARY_CONFIG_ENV}={guest_boundary_config_path}"
+        ));
         for env in &plan.env {
             command.arg("--vm-env").arg(env);
         }
@@ -1313,7 +1602,7 @@ impl VmDriver {
             console_output = %console_output.display(),
             "vm driver: spawning VM launcher"
         );
-        let child = match spawn_vm_launcher(&mut command, &sandbox.id, &plan.backend) {
+        let mut child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
                 warn!(
@@ -1328,7 +1617,7 @@ impl VmDriver {
                         LaunchAbortReason::LauncherSpawnFailed,
                     )
                     .await;
-                self.release_gpu_and_subnet(&sandbox.id);
+                self.release_gpu(&sandbox.id);
                 return Err(Status::internal(format!(
                     "failed to launch vm helper '{}': {err}",
                     self.launcher_bin.display()
@@ -1340,8 +1629,33 @@ impl VmDriver {
             launcher_pid = child.id().unwrap_or(0),
                 "vm driver: launcher spawned"
         );
+        let supervisor = match self
+            .spawn_host_supervisor(
+                &sandbox,
+                &state_dir,
+                tls_paths.as_ref(),
+                &topology,
+                &launch_authentication.supervisor,
+            )
+            .await
+        {
+            Ok(supervisor) => supervisor,
+            Err(error) => {
+                let _ = terminate_vm_process(&mut child).await;
+                self.lifecycle_extensions
+                    .after_launch_failed(
+                        &sandbox,
+                        &state_dir,
+                        LaunchAbortReason::LauncherSpawnFailed,
+                    )
+                    .await;
+                self.release_gpu(&sandbox.id);
+                return Err(error);
+            }
+        };
         let process = Arc::new(Mutex::new(VmProcess {
             child,
+            supervisor,
             deleting: false,
         }));
 
@@ -1353,7 +1667,6 @@ impl VmDriver {
                 Some(record) if !record.deleting => {
                     record.process = Some(process.clone());
                     record.gpu_bdf.clone_from(&gpu_bdf);
-                    record.qemu_network_allocated = plan.backend == VmBackend::Qemu;
                     snapshot_to_publish = Some(record.snapshot.clone());
                 }
                 _ => {
@@ -1366,11 +1679,11 @@ impl VmDriver {
             {
                 let mut process = process.lock().await;
                 process.deleting = true;
-                terminate_vm_process(&mut process.child)
+                terminate_sandbox_processes(&mut process)
                     .await
-                    .map_err(|err| Status::internal(format!("failed to stop vm: {err}")))?;
+                    .map_err(|err| Status::internal(format!("failed to stop sandbox: {err}")))?;
             }
-            self.release_gpu_and_subnet(&sandbox.id);
+            self.release_gpu(&sandbox.id);
             return Err(Status::cancelled("sandbox provisioning cancelled"));
         }
 
@@ -1431,7 +1744,7 @@ impl VmDriver {
             .await
             .map_err(|err| Status::internal(format!("persist stop marker failed: {err}")))?;
 
-        let (process, provisioning_task, has_gpu, has_qemu_network, snapshot) = {
+        let (process, provisioning_task, has_gpu, snapshot) = {
             let mut registry = self.registry.lock().await;
             let record = registry
                 .get_mut(&record_id)
@@ -1440,7 +1753,6 @@ impl VmDriver {
                 record.process.take(),
                 record.provisioning_task.take(),
                 record.gpu_bdf.take().is_some(),
-                std::mem::take(&mut record.qemu_network_allocated),
                 record.snapshot.clone(),
             )
         };
@@ -1451,14 +1763,16 @@ impl VmDriver {
         if let Some(process) = process {
             let mut process = process.lock().await;
             process.deleting = true;
-            terminate_vm_process(&mut process.child)
+            terminate_sandbox_processes(&mut process)
                 .await
-                .map_err(|err| Status::internal(format!("failed to stop vm: {err}")))?;
+                .map_err(|err| Status::internal(format!("failed to stop sandbox: {err}")))?;
         }
         self.lifecycle_extensions
             .after_launch_failed(&snapshot, &state_dir, LaunchAbortReason::Stopped)
             .await;
-        self.release_allocations(&record_id, has_gpu, has_qemu_network);
+        if has_gpu {
+            self.release_gpu(&record_id);
+        }
 
         if let Some(snapshot) = self
             .set_snapshot_condition(&record_id, stopped_condition(), false)
@@ -1558,14 +1872,7 @@ impl VmDriver {
             return span_status.finish(Ok(DeleteSandboxResponse { deleted: false }));
         };
 
-        let (
-            state_dir,
-            process,
-            gpu_bdf,
-            qemu_network_allocated,
-            provisioning_task,
-            sandbox_snapshot,
-        ) = {
+        let (state_dir, process, gpu_bdf, provisioning_task, sandbox_snapshot) = {
             let mut registry = self.registry.lock().await;
             let Some(record) = registry.get_mut(&record_id) else {
                 return span_status.finish(Ok(DeleteSandboxResponse { deleted: false }));
@@ -1575,7 +1882,6 @@ impl VmDriver {
                 record.state_dir.clone(),
                 record.process.clone(),
                 record.gpu_bdf.clone(),
-                record.qemu_network_allocated,
                 record.provisioning_task.take(),
                 record.snapshot.clone(),
             )
@@ -1595,16 +1901,18 @@ impl VmDriver {
         if let Some(process) = process {
             let mut process = process.lock().await;
             process.deleting = true;
-            terminate_vm_process(&mut process.child)
+            terminate_sandbox_processes(&mut process)
                 .await
-                .map_err(|err| Status::internal(format!("failed to stop vm: {err}")))?;
+                .map_err(|err| Status::internal(format!("failed to stop sandbox: {err}")))?;
         }
 
         self.lifecycle_extensions
             .after_delete(&sandbox_snapshot, &state_dir)
             .await;
 
-        self.release_allocations(&record_id, gpu_bdf.is_some(), qemu_network_allocated);
+        if gpu_bdf.is_some() {
+            self.release_gpu(&record_id);
+        }
 
         remove_sandbox_state_dir(&self.config.state_dir, &state_dir).await?;
 
@@ -1740,7 +2048,6 @@ impl VmDriver {
                     process: None,
                     provisioning_task: None,
                     gpu_bdf: None,
-                    qemu_network_allocated: false,
                     deleting: false,
                 });
                 drop(registry);
@@ -1768,7 +2075,6 @@ impl VmDriver {
                     process: None,
                     provisioning_task: None,
                     gpu_bdf: None,
-                    qemu_network_allocated: false,
                     deleting: false,
                 });
                 drop(registry);
@@ -1864,7 +2170,6 @@ impl VmDriver {
                     process: None,
                     provisioning_task: None,
                     gpu_bdf: None,
-                    qemu_network_allocated: false,
                     deleting: false,
                 },
             );
@@ -1912,15 +2217,14 @@ impl VmDriver {
             provisioning_span(&restoration_span.context(), &sandbox_id, &image_ref);
         let task = tokio::spawn(
             async move {
-                driver
-                    .provision_sandbox(
-                        sandbox,
-                        image_ref,
-                        state_dir,
-                        tls_paths,
-                        OverlayPreparation::PreserveExisting,
-                    )
-                    .await;
+                Box::pin(driver.provision_sandbox(
+                    sandbox,
+                    image_ref,
+                    state_dir,
+                    tls_paths,
+                    OverlayPreparation::PreserveExisting,
+                ))
+                .await;
                 drop(reconciliation_span);
             }
             .instrument(provisioning_span)
@@ -1946,26 +2250,6 @@ impl VmDriver {
         {
             inv.release(sandbox_id);
         }
-    }
-
-    fn release_subnet(&self, sandbox_id: &str) {
-        if let Ok(mut alloc) = self.subnet_allocator.lock() {
-            alloc.release(sandbox_id);
-        }
-    }
-
-    fn release_allocations(&self, sandbox_id: &str, has_gpu: bool, has_qemu_network: bool) {
-        if has_gpu {
-            self.release_gpu(sandbox_id);
-        }
-        if has_qemu_network {
-            self.release_subnet(sandbox_id);
-        }
-    }
-
-    fn release_gpu_and_subnet(&self, sandbox_id: &str) {
-        self.release_gpu(sandbox_id);
-        self.release_subnet(sandbox_id);
     }
 
     async fn ensure_extension_state_dirs(&self, state_dir: &Path) -> Result<(), Status> {
@@ -2017,10 +2301,12 @@ impl VmDriver {
         Ok(())
     }
 
-    #[allow(clippy::result_large_err)]
+    // Keep the fallible shape used by launch-plan resolution: driver-local
+    // backends may add allocation failures here without changing callers.
+    #[allow(clippy::result_large_err, clippy::unnecessary_wraps)]
     fn configure_qemu_launch_plan(
         &self,
-        sandbox_id: &str,
+        _sandbox_id: &str,
         is_gpu: bool,
         gpu_bdf: Option<String>,
         plan: &mut LaunchPlan,
@@ -2033,44 +2319,10 @@ impl VmDriver {
         if plan.gpu_bdf.is_none() {
             plan.gpu_bdf = gpu_bdf;
         }
-        if !has_complete_qemu_network(plan) {
-            let subnet = self
-                .subnet_allocator
-                .lock()
-                .map_err(|e| Status::internal(format!("subnet allocator lock poisoned: {e}")))?
-                .allocate(sandbox_id)
-                .map_err(Status::failed_precondition)?;
-            let mac = mac_from_sandbox_id(sandbox_id);
-            plan.tap_device = Some(tap_device_name(sandbox_id));
-            plan.guest_ip = Some(subnet.guest_ip.to_string());
-            plan.host_ip = Some(subnet.host_ip.to_string());
-            plan.vsock_cid = Some(allocate_vsock_cid());
-            plan.guest_mac = Some(format!(
-                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-            ));
-            plan.gateway_port = gateway_port_from_endpoint(&self.config.grpc_endpoint);
+        if plan.vsock_cid.is_some() {
+            return Ok(());
         }
-
-        // The corporate-proxy host-loopback recipe is a libkrun/gvproxy
-        // property and has no QEMU/TAP equivalent (see
-        // `proxy_url_targets_gateway_host`). Run it here, after the subnet
-        // allocation above has settled `plan.host_ip`, because the address to
-        // compare against is this sandbox's own TAP host address. Fail the
-        // create with the reason rather than boot a sandbox whose
-        // policy-approved CONNECTs all time out against an unreachable proxy.
-        if let Some(url) = self.config.upstream_proxy.https_proxy.as_deref()
-            && proxy_url_targets_gateway_host(url, plan.host_ip.as_deref())
-        {
-            let tap_host = plan.host_ip.as_deref().unwrap_or("the TAP host address");
-            return Err(Status::failed_precondition(format!(
-                "https_proxy '{url}' addresses the gateway host, which a QEMU/TAP sandbox \
-                 (GPU sandboxes) cannot reach: host.openshell.internal resolves to this \
-                 sandbox's TAP host address {tap_host} and the driver's nftables rules allow \
-                 only the gateway port from the guest. Configure a proxy address routable \
-                 from the guest's masqueraded egress, or run this sandbox without a GPU"
-            )));
-        }
+        plan.vsock_cid = Some(allocate_vsock_cid());
         Ok(())
     }
 
@@ -2149,21 +2401,12 @@ impl VmDriver {
         Ok(())
     }
 
-    async fn mark_qemu_network_allocated(&self, sandbox_id: &str) -> Result<(), Status> {
-        let mut registry = self.registry.lock().await;
-        match registry.get_mut(sandbox_id) {
-            Some(record) if !record.deleting => {
-                record.qemu_network_allocated = true;
-                Ok(())
-            }
-            _ => Err(Status::cancelled("sandbox provisioning cancelled")),
-        }
-    }
-
-    #[allow(clippy::result_large_err)]
+    // Keep the fallible shape used by provisioning and lifecycle tests even
+    // though NIC/subnet allocation no longer introduces a failure today.
+    #[allow(clippy::result_large_err, clippy::unnecessary_wraps)]
     fn build_vm_launch_plan(
         &self,
-        sandbox_id: &str,
+        _sandbox_id: &str,
         needs_qemu: bool,
         is_gpu: bool,
         gpu_bdf: Option<String>,
@@ -2178,32 +2421,13 @@ impl VmDriver {
                 kernel_profile: None,
                 kernel_image: None,
                 gpu_bdf: None,
-                tap_device: None,
-                guest_ip: None,
-                host_ip: None,
                 vsock_cid: None,
-                guest_mac: None,
-                gateway_port: None,
                 guest_init_dropins: Vec::new(),
                 env: Vec::new(),
             });
         }
 
-        let subnet = self
-            .subnet_allocator
-            .lock()
-            .map_err(|e| Status::internal(format!("subnet allocator lock poisoned: {e}")))?
-            .allocate(sandbox_id)
-            .map_err(Status::failed_precondition)?;
         let vsock_cid = allocate_vsock_cid();
-        let mac = mac_from_sandbox_id(sandbox_id);
-        let mac_str = format!(
-            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-        );
-        let tap = tap_device_name(sandbox_id);
-        let gateway_port = gateway_port_from_endpoint(&self.config.grpc_endpoint);
-
         let (vcpus, mem_mib) = if is_gpu {
             (self.config.gpu_vcpus, self.config.gpu_mem_mib)
         } else {
@@ -2219,12 +2443,7 @@ impl VmDriver {
             kernel_profile: None,
             kernel_image: None,
             gpu_bdf,
-            tap_device: Some(tap),
-            guest_ip: Some(subnet.guest_ip.to_string()),
-            host_ip: Some(subnet.host_ip.to_string()),
             vsock_cid: Some(vsock_cid),
-            guest_mac: Some(mac_str),
-            gateway_port,
             guest_init_dropins: Vec::new(),
             env: Vec::new(),
         })
@@ -2296,7 +2515,7 @@ impl VmDriver {
         message: &str,
         remove_state: bool,
     ) {
-        self.release_gpu_and_subnet(sandbox_id);
+        self.release_gpu(sandbox_id);
         let snapshot = {
             let mut registry = self.registry.lock().await;
             let Some(record) = registry.get_mut(sandbox_id) else {
@@ -2307,7 +2526,6 @@ impl VmDriver {
             }
             record.process = None;
             record.gpu_bdf = None;
-            record.qemu_network_allocated = false;
             record.snapshot.status = Some(status_with_condition(
                 &record.snapshot,
                 error_condition(reason, message),
@@ -2419,17 +2637,9 @@ impl VmDriver {
         &self,
         state_dir: &Path,
         overlay_disk: &Path,
-        owner_source_disk: &Path,
-        tls_paths: Option<&VmDriverTlsPaths>,
-        sandbox_token: Option<&str>,
         preparation: OverlayPreparation,
     ) -> Result<SandboxOwnerIdentity, String> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        let tls_materials = match tls_paths {
-            Some(paths) => Some(read_guest_tls_materials(paths).await?),
-            None => None,
-        };
-        let sandbox_token = sandbox_token.map(str::to_string);
         let overlay_disk = overlay_disk.to_path_buf();
         let overlay_size_bytes = self
             .config
@@ -2459,6 +2669,10 @@ impl VmDriver {
         }
 
         let template_path = overlay_template_image(&self.config.state_dir, overlay_size_bytes);
+        let recover_preserved_overlay = preparation == OverlayPreparation::PreserveExisting
+            && tokio::fs::metadata(&overlay_disk)
+                .await
+                .is_ok_and(|metadata| metadata.is_file());
         if !overlay_template_image_ready(&template_path, overlay_size_bytes).await? {
             let _cache_guard = self.image_cache_lock.lock().await;
             let template_path = template_path.clone();
@@ -2469,12 +2683,11 @@ impl VmDriver {
             .map_err(|err| format!("overlay template preparation panicked: {err}"))??;
         }
 
+        let overlay_to_recover = overlay_disk.clone();
         let result = tokio::task::spawn_blocking(move || {
             prepare_sandbox_overlay_image(
                 &template_path,
                 &overlay_disk,
-                tls_materials.as_ref(),
-                sandbox_token.as_deref(),
                 preparation,
                 overlay_size_bytes,
             )
@@ -2482,10 +2695,12 @@ impl VmDriver {
         .await
         .map_err(|err| format!("overlay image preparation panicked: {err}"))?;
         result?;
-        if write_owner_state && !owner_state_written_before_prepare {
-            write_sandbox_owner_state(state_dir, owner_state).await?;
+        if recover_preserved_overlay {
+            tokio::task::spawn_blocking(move || recover_rootfs_image(&overlay_to_recover))
+                .await
+                .map_err(|error| format!("overlay recovery panicked: {error}"))??;
         }
-        span_status.finish(Ok(owner_state))
+        span_status.finish(Ok(()))
     }
 
     fn resolved_sandbox_image(&self, sandbox: &Sandbox) -> Option<String> {
@@ -3726,62 +3941,89 @@ impl VmDriver {
                 process.clone()
             };
 
-            let exit_status = {
+            let poll_result = {
                 let mut process = process.lock().await;
                 if process.deleting {
                     return;
                 }
                 match process.child.try_wait() {
-                    Ok(status) => status,
-                    Err(err) => {
-                        if let Some(snapshot) = self
-                            .set_snapshot_condition(
-                                &sandbox_id,
-                                error_condition("ProcessPollFailed", &err.to_string()),
-                                false,
-                            )
-                            .await
-                        {
-                            self.publish_snapshot(snapshot);
-                        }
-                        self.publish_platform_event(
-                            sandbox_id.clone(),
-                            platform_event(
-                                "vm",
-                                "Warning",
-                                "ProcessPollFailed",
-                                format!("Failed to poll VM helper process: {err}"),
-                            ),
-                        );
-                        return;
-                    }
+                    Ok(Some(status)) => Ok(Some(("VM", status))),
+                    Ok(None) => process
+                        .supervisor
+                        .try_wait()
+                        .map(|status| status.map(|status| ("host supervisor", status))),
+                    Err(error) => Err(error),
                 }
             };
 
-            if let Some(status) = exit_status {
+            let exit_status = match poll_result {
+                Ok(status) => status,
+                Err(err) => {
+                    if let Some(snapshot) = self
+                        .set_snapshot_condition(
+                            &sandbox_id,
+                            error_condition("ProcessPollFailed", &err.to_string()),
+                            false,
+                        )
+                        .await
+                    {
+                        self.publish_snapshot(snapshot);
+                    }
+                    self.publish_platform_event(
+                        sandbox_id.clone(),
+                        platform_event(
+                            "vm",
+                            "Warning",
+                            "ProcessPollFailed",
+                            format!("Failed to poll VM sandbox process: {err}"),
+                        ),
+                    );
+                    return;
+                }
+            };
+
+            if let Some((component, status)) = exit_status {
                 let state_dir = {
                     let registry = self.registry.lock().await;
                     registry
                         .get(&sandbox_id)
                         .map(|record| record.state_dir.clone())
                 };
-                if let Some(state_dir) = state_dir
-                    && let Err(error) = write_private_file(
-                        &state_dir.join(MAIN_PROCESS_EXITED_FILE),
-                        b"terminal\n".to_vec(),
-                    )
-                    .await
-                {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        %error,
-                        "vm driver: failed to persist canonical-process exit tombstone"
-                    );
+                if let Some(ref state_dir) = state_dir {
+                    let marker = state_dir.join(MAIN_PROCESS_EXITED_FILE);
+                    if !tokio::fs::try_exists(&marker).await.unwrap_or(false)
+                        && let Err(error) =
+                            write_private_file(&marker, b"terminal\n".to_vec()).await
+                    {
+                        warn!(
+                            sandbox_id = %sandbox_id,
+                            %error,
+                            "vm driver: failed to persist canonical-process exit tombstone"
+                        );
+                    }
                 }
-                let message = status.code().map_or_else(
-                    || "VM process exited".to_string(),
-                    |code| format!("VM process exited with status {code}"),
+                {
+                    let mut process = process.lock().await;
+                    if component == "VM" {
+                        let _ = terminate_vm_process(&mut process.supervisor).await;
+                    } else {
+                        let _ = terminate_vm_process(&mut process.child).await;
+                    }
+                }
+                let mut message = status.code().map_or_else(
+                    || format!("{component} process exited"),
+                    |code| format!("{component} process exited with status {code}"),
                 );
+                if component == "VM"
+                    && let Some(state_dir) = state_dir.as_deref()
+                    && let Some(console) = read_vm_console_tail(
+                        &state_dir.join("rootfs-console.log"),
+                        VM_CONSOLE_DIAGNOSTIC_BYTES,
+                    )
+                {
+                    write!(message, "; guest console tail:\n{console}")
+                        .expect("writing to String cannot fail");
+                }
                 if let Some(snapshot) = self
                     .set_snapshot_condition(
                         &sandbox_id,
@@ -3796,17 +4038,14 @@ impl VmDriver {
                     sandbox_id.clone(),
                     platform_event("vm", "Warning", "ProcessExited", message),
                 );
-                let (has_gpu, has_qemu_network, cleanup_ctx) = {
+                let (has_gpu, cleanup_ctx) = {
                     let registry = self.registry.lock().await;
-                    registry
-                        .get(&sandbox_id)
-                        .map_or((false, false, None), |record| {
-                            (
-                                record.gpu_bdf.is_some(),
-                                record.qemu_network_allocated,
-                                Some((record.snapshot.clone(), record.state_dir.clone())),
-                            )
-                        })
+                    registry.get(&sandbox_id).map_or((false, None), |record| {
+                        (
+                            record.gpu_bdf.is_some(),
+                            Some((record.snapshot.clone(), record.state_dir.clone())),
+                        )
+                    })
                 };
                 // Give lifecycle extensions a chance to release host
                 // resources they allocated in `before_launch` (e.g. device
@@ -3820,7 +4059,9 @@ impl VmDriver {
                         .after_launch_failed(&sandbox, &state_dir, LaunchAbortReason::ProcessExited)
                         .await;
                 }
-                self.release_allocations(&sandbox_id, has_gpu, has_qemu_network);
+                if has_gpu {
+                    self.release_gpu(&sandbox_id);
+                }
                 return;
             }
 
@@ -3881,6 +4122,27 @@ impl VmDriver {
         attach_vm_progress_metadata(&mut event);
         self.publish_platform_event(sandbox_id.to_string(), event);
     }
+}
+
+fn read_vm_console_tail(path: &Path, limit: u64) -> Option<String> {
+    if limit == 0 {
+        return None;
+    }
+    let mut file = fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(length.saturating_sub(limit)))
+        .ok()?;
+    let mut bytes = Vec::with_capacity(usize::try_from(length.min(limit)).ok()?);
+    file.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.trim_matches(['\0', '\n', '\r']);
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+fn configure_main_exit_marker(command: &mut Command, state_dir: &Path) {
+    command
+        .arg("--main-exit-marker")
+        .arg(state_dir.join(MAIN_PROCESS_EXITED_FILE));
 }
 
 #[tonic::async_trait]
@@ -4078,8 +4340,8 @@ impl ComputeDriver for VmDriver {
 fn check_gpu_privileges() -> Result<(), String> {
     if !rustix::process::geteuid().is_root() {
         return Err(
-            "GPU support requires root privileges for VFIO bind/unbind and TAP networking. \
-             Run with sudo or ensure CAP_SYS_ADMIN + CAP_NET_ADMIN capabilities are set."
+            "GPU support requires root privileges for VFIO bind/unbind. \
+             Run with sudo or grant the host device-management capabilities required by VFIO."
                 .to_string(),
         );
     }
@@ -5204,147 +5466,25 @@ fn merged_environment(sandbox: &Sandbox) -> HashMap<String, String> {
     environment
 }
 
-/// Rewrites loopback host references in a gateway URL to a hostname the guest
-/// can reach via gvproxy.
-///
-/// The driver receives the gateway endpoint from `--grpc-endpoint`, which
-/// in local/dev/e2e setups is typically `http://127.0.0.1:<port>`. That URL is
-/// useless inside the guest because the guest's loopback interface is its own,
-/// not the host's. Inside the guest we need a name that gvproxy will translate
-/// into the host's loopback address.
-///
-/// We rewrite to `host.openshell.internal`, which gvproxy's embedded DNS resolves
-/// to the host-loopback IP `192.168.127.254`. gvproxy installs a default NAT entry
-/// rewriting that destination to the host's `127.0.0.1` and dialing out from the
-/// host process, so any port the host is listening on becomes reachable. The
-/// gateway IP `192.168.127.1` does **not** do this — it only listens on gvproxy's
-/// own service ports (DNS, DHCP, HTTP API). The guest init script also seeds the
-/// hostname in `/etc/hosts` so resolution works even if gvproxy's DNS isn't in
-/// resolv.conf (e.g. when DHCP fails).
-///
-/// Non-loopback URLs are returned unchanged.
-fn guest_visible_openshell_endpoint(endpoint: &str) -> String {
-    let Ok(mut url) = Url::parse(endpoint) else {
-        return endpoint.to_string();
-    };
-
-    let should_rewrite = match url.host() {
-        Some(Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(Host::Ipv6(ip)) => ip.is_loopback(),
-        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-        None => false,
-    };
-
-    if should_rewrite && url.set_host(Some(GVPROXY_HOST_LOOPBACK_ALIAS)).is_ok() {
-        return url.to_string();
+fn random_boundary_token() -> String {
+    let mut token = String::with_capacity(64);
+    for byte in rand::random::<[u8; 32]>() {
+        write!(&mut token, "{byte:02x}").expect("writing to String cannot fail");
     }
-
-    endpoint.to_string()
+    token
 }
 
-/// Whether a corporate proxy URL points at the gateway host itself, as seen
-/// from a QEMU/TAP guest whose TAP host address is `tap_host_ip`.
-///
-/// On the libkrun backend gvproxy NATs the host-loopback alias
-/// `host.openshell.internal` (and any loopback URL, which the driver rewrites
-/// to that alias) to the gateway host's `127.0.0.1`, so a proxy bound to host
-/// loopback is reachable from the guest. The QEMU/TAP backend used for GPU
-/// sandboxes has no equivalent: `host.openshell.internal` resolves to the TAP
-/// host address, and the driver's own nftables `input` chain accepts only the
-/// gateway port from the guest and drops the rest, so no proxy on the gateway
-/// host is reachable regardless of the address it binds.
-///
-/// The gateway host is therefore reached from a QEMU guest under exactly three
-/// spellings: the guest's own loopback (never the host's, but a configuration
-/// that plainly means the host), the documented host aliases that
-/// `write_host_gateway_aliases` seeds to the TAP host address, and that TAP
-/// host address written literally. `tap_host_ip` is this sandbox's allocated
-/// address, so the comparison must be made after the launch plan's subnet
-/// allocation; `None` means the plan carries no TAP host and only the
-/// address-independent spellings are classified.
-///
-/// gvproxy's `GVPROXY_HOST_LOOPBACK_IP` is deliberately **not** matched here.
-/// It is special only to libkrun; on QEMU/TAP it is an ordinary address that
-/// may well be routable through the guest's masqueraded egress, and rejecting
-/// it would refuse a working configuration.
-///
-/// Used to reject an unreachable configuration up front on the QEMU path
-/// instead of letting every policy-approved CONNECT time out.
-fn proxy_url_targets_gateway_host(url: &str, tap_host_ip: Option<&str>) -> bool {
-    let Ok(parsed) = Url::parse(url) else {
-        // Unparseable URLs are rejected by shared validation before launch.
-        return false;
-    };
-    let tap_host = tap_host_ip.and_then(|ip| ip.parse::<IpAddr>().ok());
-    match parsed.host() {
-        Some(Host::Ipv4(ip)) => ip.is_loopback() || tap_host == Some(IpAddr::V4(ip)),
-        Some(Host::Ipv6(ip)) => ip.is_loopback() || tap_host == Some(IpAddr::V6(ip)),
-        Some(Host::Domain(host)) => {
-            host.eq_ignore_ascii_case("localhost")
-                || host.eq_ignore_ascii_case(OPENSHELL_HOST_GATEWAY_ALIAS)
-                || host.eq_ignore_ascii_case("host.containers.internal")
-                || host.eq_ignore_ascii_case("host.docker.internal")
-        }
-        None => false,
-    }
-}
-
-fn gateway_port_from_endpoint(endpoint: &str) -> Option<u16> {
-    Url::parse(endpoint).ok().and_then(|url| url.port())
-}
-
-fn has_complete_qemu_network(plan: &LaunchPlan) -> bool {
-    plan.tap_device.is_some()
-        && plan.guest_ip.is_some()
-        && plan.host_ip.is_some()
-        && plan.vsock_cid.is_some()
-        && plan.guest_mac.is_some()
-}
-
-fn guest_visible_openshell_endpoint_for_tap(endpoint: &str, host_ip: &str) -> String {
-    let Ok(mut url) = Url::parse(endpoint) else {
-        return endpoint.to_string();
-    };
-    if url.set_host(Some(host_ip)).is_ok() {
-        url.to_string()
-    } else {
-        endpoint.to_string()
-    }
-}
-
-fn build_guest_environment(
-    sandbox: &Sandbox,
-    config: &VmDriverConfig,
-    endpoint_override: Option<&str>,
-) -> Vec<String> {
-    let openshell_endpoint = endpoint_override.map_or_else(
-        || guest_visible_openshell_endpoint(&config.grpc_endpoint),
-        String::from,
-    );
-    // 1. User-supplied environment (lowest priority).
-    let user_env = merged_environment(sandbox);
+fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<String> {
+    // The guest receives only driver-owned boot metadata. Gateway credentials,
+    // TLS material, and logical-supervisor configuration remain on the host;
+    // workload environment is carried in the authenticated BoundaryConfig.
     let mut environment: HashMap<String, String> = HashMap::new();
-    environment.extend(user_env.clone());
-    if !user_env.is_empty()
-        && let Ok(json) = serde_json::to_string(&user_env)
-    {
-        environment.insert(
-            openshell_core::sandbox_env::USER_ENVIRONMENT.to_string(),
-            json,
-        );
-    }
-
-    // 2. Required driver vars (highest priority -- always overwrite).
     environment.insert("HOME".to_string(), "/root".to_string());
     environment.insert(
         "PATH".to_string(),
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
     );
     environment.insert("TERM".to_string(), "xterm".to_string());
-    environment.insert(
-        openshell_core::sandbox_env::ENDPOINT.to_string(),
-        openshell_endpoint,
-    );
     environment.insert(
         openshell_core::sandbox_env::SANDBOX_ID.to_string(),
         sandbox.id.clone(),
@@ -5354,73 +5494,13 @@ fn build_guest_environment(
         sandbox.name.clone(),
     );
     environment.insert(
-        openshell_core::sandbox_env::SSH_SOCKET_PATH.to_string(),
-        GUEST_SSH_SOCKET_PATH.to_string(),
-    );
-    // The libkrun guest environment path does not preserve spaces in values
-    // before guest startup. Use a whitespace-free base64url envelope so
-    // command arguments remain lossless.
-    let main_process =
-        openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec_base64url(
-            sandbox.spec.as_ref(),
-        )
-        .expect("main process config serialization cannot fail");
-    environment.insert(
-        openshell_core::sandbox_env::MAIN_PROCESS_SPEC.to_string(),
-        main_process,
-    );
-    environment.insert(
         openshell_core::sandbox_env::LOG_LEVEL.to_string(),
         openshell_core::driver_utils::sandbox_log_level(sandbox, &config.log_level),
     );
-    if config.requires_tls_materials() {
-        environment.insert(
-            openshell_core::sandbox_env::TLS_CA.to_string(),
-            GUEST_TLS_CA_PATH.to_string(),
-        );
-        environment.insert(
-            openshell_core::sandbox_env::TLS_CERT.to_string(),
-            GUEST_TLS_CERT_PATH.to_string(),
-        );
-        environment.insert(
-            openshell_core::sandbox_env::TLS_KEY.to_string(),
-            GUEST_TLS_KEY_PATH.to_string(),
-        );
-    }
-    if let Some(endpoint) = config.provider_spiffe_workload_api_tcp_endpoint.as_ref() {
-        environment.insert(
-            openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET.to_string(),
-            endpoint.clone(),
-        );
-    }
     environment.insert(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),
     );
-    // Runtime capabilities are driver-owned. The VM driver does not yet
-    // provide policy DNS and transparent TCP interception.
-    environment.insert(
-        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
-        String::new(),
-    );
-    environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
-    environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
-    // Prevent user-supplied environment from overriding the TLS server name
-    // the supervisor verifies — a sandbox user who can redirect the gateway
-    // hostname could otherwise present a certificate for a name they control
-    // and intercept the sandbox JWT.
-    environment.remove(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME);
-    if sandbox
-        .spec
-        .as_ref()
-        .is_some_and(|spec| !spec.sandbox_token.is_empty())
-    {
-        environment.insert(
-            openshell_core::sandbox_env::SANDBOX_TOKEN_FILE.to_string(),
-            GUEST_SANDBOX_TOKEN_PATH.to_string(),
-        );
-    }
-
     let mut pairs = environment.into_iter().collect::<Vec<_>>();
     pairs.sort_by(|left, right| left.0.cmp(&right.0));
     pairs
@@ -5826,8 +5906,9 @@ fn write_oci_layout_for_manifest(
 
 fn bootstrap_image_cache_identity(image_identity: &str) -> String {
     format!(
-        "{BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION}:openshell-{}:{image_identity}",
-        openshell_core::VERSION
+        "{BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION}:openshell-{}:guest-{}:{image_identity}",
+        openshell_core::VERSION,
+        sandbox_guest_runtime_identity()
     )
 }
 
@@ -5962,26 +6043,6 @@ fn validate_restored_sandbox_state(
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct GuestTlsMaterials {
-    ca: Vec<u8>,
-    cert: Vec<u8>,
-    key: Vec<u8>,
-}
-
-async fn read_guest_tls_materials(paths: &VmDriverTlsPaths) -> Result<GuestTlsMaterials, String> {
-    let ca = tokio::fs::read(&paths.ca)
-        .await
-        .map_err(|err| format!("read {}: {err}", paths.ca.display()))?;
-    let cert = tokio::fs::read(&paths.cert)
-        .await
-        .map_err(|err| format!("read {}: {err}", paths.cert.display()))?;
-    let key = tokio::fs::read(&paths.key)
-        .await
-        .map_err(|err| format!("read {}: {err}", paths.key.display()))?;
-    Ok(GuestTlsMaterials { ca, cert, key })
-}
-
 async fn overlay_template_image_ready(path: &Path, size_bytes: u64) -> Result<bool, String> {
     match tokio::fs::metadata(path).await {
         Ok(metadata) => Ok(metadata.is_file() && metadata.len() == size_bytes),
@@ -6066,36 +6127,19 @@ fn create_empty_sandbox_overlay_image(overlay_disk: &Path, size_bytes: u64) -> R
 fn create_sandbox_overlay_image_from_template(
     template_path: &Path,
     overlay_disk: &Path,
-    tls_materials: Option<&GuestTlsMaterials>,
-    sandbox_token: Option<&str>,
 ) -> Result<(), String> {
-    clone_or_copy_sparse_file(template_path, overlay_disk)?;
-    if let Some(tls) = tls_materials {
-        inject_guest_tls_materials(overlay_disk, tls)?;
-    }
-    if let Some(token) = sandbox_token {
-        inject_guest_sandbox_token(overlay_disk, token)?;
-    }
-    Ok(())
+    clone_or_copy_sparse_file(template_path, overlay_disk)
 }
 
 fn prepare_sandbox_overlay_image(
     template_path: &Path,
     overlay_disk: &Path,
-    tls_materials: Option<&GuestTlsMaterials>,
-    sandbox_token: Option<&str>,
     preparation: OverlayPreparation,
     expected_size_bytes: u64,
 ) -> Result<(), String> {
     if preparation == OverlayPreparation::PreserveExisting {
         match fs::metadata(overlay_disk) {
             Ok(metadata) if metadata.is_file() && metadata.len() == expected_size_bytes => {
-                if let Some(tls) = tls_materials {
-                    inject_guest_tls_materials(overlay_disk, tls)?;
-                }
-                if let Some(token) = sandbox_token {
-                    inject_guest_sandbox_token(overlay_disk, token)?;
-                }
                 return Ok(());
             }
             Ok(metadata) if metadata.is_file() => {
@@ -6122,37 +6166,53 @@ fn prepare_sandbox_overlay_image(
         }
     }
 
-    create_sandbox_overlay_image_from_template(
-        template_path,
-        overlay_disk,
-        tls_materials,
-        sandbox_token,
-    )
+    create_sandbox_overlay_image_from_template(template_path, overlay_disk)
 }
 
-fn inject_guest_tls_materials(
+fn inject_guest_boundary_bundle(
     overlay_disk: &Path,
-    materials: &GuestTlsMaterials,
+    guest_path: &str,
+    config: &BoundaryConfig,
+    material: &SandboxTlsMaterial,
 ) -> Result<(), String> {
-    write_rootfs_image_file(
-        overlay_disk,
-        &overlay_upper_path(GUEST_TLS_CA_PATH),
-        &materials.ca,
-    )?;
-    write_rootfs_image_file(
-        overlay_disk,
-        &overlay_upper_path(GUEST_TLS_CERT_PATH),
-        &materials.cert,
-    )?;
-    let key_path = overlay_upper_path(GUEST_TLS_KEY_PATH);
-    write_rootfs_image_file(overlay_disk, &key_path, &materials.key)?;
-    set_rootfs_image_file_mode(overlay_disk, &key_path, 0o600)
+    let tls = match &config.listener {
+        BoundaryListener::Unix { tls, .. }
+        | BoundaryListener::TlsTcp { tls, .. }
+        | BoundaryListener::Vsock { tls, .. } => tls.clone(),
+    };
+    let encoded_config = config
+        .encode()
+        .map_err(|error| format!("encode VM boundary configuration: {error}"))?;
+    let config_path = overlay_upper_path(guest_path);
+    write_rootfs_image_file(overlay_disk, &config_path, &encoded_config)?;
+    set_rootfs_image_file_mode(overlay_disk, &config_path, 0o600)?;
+    for (guest_path, contents) in [
+        (
+            tls.certificate_chain_path,
+            material.certificate_chain_pem.as_bytes(),
+        ),
+        (tls.private_key_path, material.private_key_pem.as_bytes()),
+    ] {
+        let path = overlay_upper_path(guest_path.to_string_lossy().as_ref());
+        write_rootfs_image_file(overlay_disk, &path, contents)?;
+        set_rootfs_image_file_mode(overlay_disk, &path, 0o600)?;
+    }
+    Ok(())
 }
 
-fn inject_guest_sandbox_token(overlay_disk: &Path, token: &str) -> Result<(), String> {
-    let token_path = overlay_upper_path(GUEST_SANDBOX_TOKEN_PATH);
-    write_rootfs_image_file(overlay_disk, &token_path, format!("{token}\n").as_bytes())?;
-    set_rootfs_image_file_mode(overlay_disk, &token_path, 0o600)
+fn guest_boundary_config_path(generation: &str) -> String {
+    format!("{GUEST_BOUNDARY_CONFIG_DIR}/bootstrap-{generation}.json")
+}
+
+fn guest_boundary_tls_paths(generation: &str) -> SandboxTlsServerConfig {
+    SandboxTlsServerConfig {
+        certificate_chain_path: PathBuf::from(format!(
+            "{GUEST_BOUNDARY_CONFIG_DIR}/sandbox-{generation}.crt"
+        )),
+        private_key_path: PathBuf::from(format!(
+            "{GUEST_BOUNDARY_CONFIG_DIR}/sandbox-{generation}.key"
+        )),
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -6202,26 +6262,34 @@ fn inject_guest_init_dropins(
     span_status.finish(Ok(()))
 }
 
-/// Build the corporate upstream-proxy arguments passed to the guest supervisor.
+/// Build the corporate upstream-proxy arguments passed to host control.
 ///
 /// This operator-owned egress boundary travels on the supervisor's argv,
 /// which sandbox spec/template environment and image `ENV` cannot influence.
-/// Credentials are never on argv — only the root-only guest path is passed;
-/// the supervisor reads the credential from that file.
-fn upstream_proxy_cli_args(config: &VmDriverConfig) -> Vec<String> {
+/// Credentials are never on argv; the supervisor reads them from the
+/// operator-owned host file.
+fn upstream_proxy_cli_args(config: &VmDriverConfig) -> Result<Vec<String>, String> {
     let mut args = Vec::new();
     if let Some(url) = &config.upstream_proxy.https_proxy {
         args.push("--upstream-proxy".to_string());
         args.push(url.clone());
+        let proxy_url = Url::parse(url)
+            .map_err(|error| format!("invalid upstream proxy endpoint '{url}': {error}"))?;
+        if proxy_url
+            .host_str()
+            .is_some_and(|host| HOST_LOOPBACK_ALIASES.contains(&host))
+        {
+            args.push("--upstream-proxy-dial-ip".to_string());
+            args.push("127.0.0.1".to_string());
+        }
     }
     if let Some(list) = &config.upstream_proxy.no_proxy {
         args.push("--upstream-no-proxy".to_string());
         args.push(list.clone());
     }
-    if config.upstream_proxy.proxy_auth_file.is_some() {
+    if let Some(path) = &config.proxy_auth_file {
         args.push("--upstream-proxy-auth-file".to_string());
-        // The guest path, never the gateway-host path the operator configured.
-        args.push(GUEST_UPSTREAM_PROXY_AUTH_PATH.to_string());
+        args.push(path.clone());
     }
     // Config validation guarantees the acknowledgement is `true` whenever an
     // auth file is configured against an http:// proxy; the supervisor
@@ -6234,156 +6302,11 @@ fn upstream_proxy_cli_args(config: &VmDriverConfig) -> Vec<String> {
     if config.upstream_proxy.proxy_connect_by_hostname == Some(true) {
         args.push("--upstream-proxy-connect-by-hostname".to_string());
     }
-    if config.proxy_ca_bundle.is_some() {
+    if let Some(path) = &config.proxy_ca_bundle {
         args.push("--upstream-proxy-ca-bundle".to_string());
-        // The guest path, never the gateway-host path the operator configured.
-        args.push(GUEST_PROXY_CA_PATH.to_string());
+        args.push(path.clone());
     }
-    args
-}
-
-/// Render the supervisor argument list as newline-separated arguments.
-///
-/// One argument per line, verbatim: the guest reads the lines into an array
-/// without word splitting or globbing, so values containing spaces survive
-/// intact. An empty list renders an empty file, which the guest reads as "no
-/// extra arguments".
-fn render_guest_supervisor_args(args: &[String]) -> Vec<u8> {
-    let mut body = args.join("\n");
-    if !body.is_empty() {
-        body.push('\n');
-    }
-    body.into_bytes()
-}
-
-/// Reject argument values the newline-delimited guest file cannot represent.
-///
-/// Every value here is operator-supplied config, so this is a guard against
-/// misconfiguration rather than an attack: a stray newline would otherwise
-/// split one value into two arguments in the guest.
-fn validate_guest_supervisor_args(args: &[String]) -> Result<(), String> {
-    for arg in args {
-        if arg.contains('\n') || arg.contains('\r') || arg.contains('\0') {
-            return Err(
-                "corporate proxy settings must not contain newline or NUL characters".to_string(),
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Read and validate the corporate proxy credential from the gateway host.
-///
-/// Uses the validators shared with the supervisor, so a credential accepted
-/// here is never rejected inside the guest. The error never carries the file
-/// contents.
-async fn read_sandbox_proxy_credential(path: &Path) -> Result<String, Status> {
-    let path_owned = path.to_path_buf();
-    let display_path = path.display().to_string();
-    let raw = tokio::task::spawn_blocking(move || {
-        let path = path_owned
-            .to_str()
-            .ok_or_else(|| "proxy_auth_file path is not valid UTF-8".to_string())?;
-        openshell_core::driver_utils::read_upstream_proxy_credential_file(path)
-    })
-    .await
-    .map_err(|err| Status::internal(format!("proxy_auth_file read task failed: {err}")))?
-    .map_err(Status::invalid_argument)?;
-    let credential =
-        openshell_core::driver_utils::parse_upstream_proxy_credential(&raw).map_err(|err| {
-            Status::invalid_argument(format!("proxy_auth_file '{display_path}': {err}"))
-        })?;
-    Ok(credential.to_string())
-}
-
-/// Read and validate the corporate proxy CA bundle from the gateway host.
-///
-/// The validation rejects symlinks and non-regular files, bounds the read,
-/// requires PEM certificate markers, and never includes file contents in an
-/// error.
-async fn read_sandbox_proxy_ca_bundle(path: &Path) -> Result<Vec<u8>, Status> {
-    let path_owned = path.to_path_buf();
-    let display_path = path.display().to_string();
-    tokio::task::spawn_blocking(move || {
-        let path = path_owned
-            .to_str()
-            .ok_or_else(|| "proxy_ca_bundle path is not valid UTF-8".to_string())?;
-        openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(path, "proxy_ca_bundle")
-            .map(String::into_bytes)
-    })
-    .await
-    .map_err(|err| Status::internal(format!("proxy_ca_bundle read task failed: {err}")))?
-    .map_err(|err| {
-        Status::invalid_argument(format!(
-            "proxy_ca_bundle '{display_path}' could not be read: {err}"
-        ))
-    })
-}
-
-/// Stage the corporate upstream-proxy configuration into the guest overlay.
-///
-/// Writes three files into the overlay upperdir the driver owns:
-///
-/// * the credential at [`GUEST_UPSTREAM_PROXY_AUTH_PATH`], mode `0600`;
-/// * the CA bundle at [`GUEST_PROXY_CA_PATH`], mode `0644` (a CA certificate
-///   is not secret);
-/// * the supervisor argument list at [`GUEST_SUPERVISOR_ARGS_PATH`], mode
-///   `0644`.
-///
-/// Both are written on every launch, empty when the corresponding
-/// setting is absent. Writing rather than skipping is what makes the channel
-/// unforgeable: the upperdir copy always shadows the read-only image layer, so
-/// a sandbox image cannot supply its own arguments or credential by baking a
-/// file at these paths, and cannot disable the operator's by omitting one. It
-/// also clears material a previous launch staged into a preserved overlay
-/// after the operator removed the setting.
-///
-/// A microVM has no bind mounts or container secrets, so the credential lives
-/// at rest inside the per-sandbox overlay disk on the host — the same
-/// delivery the per-sandbox gateway JWT already uses. It is removed with the
-/// sandbox when the state directory is deleted.
-#[allow(clippy::result_large_err)]
-async fn inject_guest_upstream_proxy(
-    overlay_disk: &Path,
-    config: &VmDriverConfig,
-) -> Result<(), Status> {
-    // Written whether or not they are configured. Writing empty files when
-    // the operator removed a setting clears material a previous launch staged
-    // into a preserved overlay, and shadows anything an image baked at these
-    // paths, so a staged file is only ever the one this launch produced.
-    let credential = match config.upstream_proxy.proxy_auth_file.as_deref() {
-        Some(path) => format!("{}\n", read_sandbox_proxy_credential(path).await?).into_bytes(),
-        None => Vec::new(),
-    };
-    let credential_path = overlay_upper_path(GUEST_UPSTREAM_PROXY_AUTH_PATH);
-    write_rootfs_image_file(overlay_disk, &credential_path, &credential)
-        .map_err(|err| Status::internal(format!("write VM guest proxy credential: {err}")))?;
-    set_rootfs_image_file_mode(overlay_disk, &credential_path, 0o600)
-        .map_err(|err| Status::internal(format!("set VM guest proxy credential mode: {err}")))?;
-
-    let ca_bundle = match config.proxy_ca_bundle.as_deref() {
-        Some(path) => read_sandbox_proxy_ca_bundle(path).await?,
-        None => Vec::new(),
-    };
-    let ca_path = overlay_upper_path(GUEST_PROXY_CA_PATH);
-    write_rootfs_image_file(overlay_disk, &ca_path, &ca_bundle)
-        .map_err(|err| Status::internal(format!("write VM guest proxy CA bundle: {err}")))?;
-    set_rootfs_image_file_mode(overlay_disk, &ca_path, 0o644)
-        .map_err(|err| Status::internal(format!("set VM guest proxy CA bundle mode: {err}")))?;
-
-    let args = upstream_proxy_cli_args(config);
-    validate_guest_supervisor_args(&args).map_err(Status::failed_precondition)?;
-    let guest_path = overlay_upper_path(GUEST_SUPERVISOR_ARGS_PATH);
-    write_rootfs_image_file(
-        overlay_disk,
-        &guest_path,
-        &render_guest_supervisor_args(&args),
-    )
-    .map_err(|err| Status::internal(format!("write VM guest supervisor arguments: {err}")))?;
-    set_rootfs_image_file_mode(overlay_disk, &guest_path, 0o644).map_err(|err| {
-        Status::internal(format!("set VM guest supervisor arguments mode: {err}"))
-    })?;
-    Ok(())
+    Ok(args)
 }
 
 /// Render the drop-in allow-list as newline-separated, ASCII-sorted,
@@ -6583,47 +6506,6 @@ fn dir_size_bytes(path: &Path) -> Result<u64, String> {
     Ok(total)
 }
 
-#[cfg(test)]
-fn stage_guest_tls_materials(
-    staging_dir: &Path,
-    materials: &GuestTlsMaterials,
-) -> Result<(), String> {
-    let tls_dir = staging_dir
-        .join("upper")
-        .join(GUEST_TLS_CA_PATH.trim_start_matches('/'))
-        .parent()
-        .ok_or_else(|| "guest TLS CA path has no parent".to_string())?
-        .to_path_buf();
-    fs::create_dir_all(&tls_dir)
-        .map_err(|err| format!("create guest TLS dir {}: {err}", tls_dir.display()))?;
-
-    let ca_path = staging_dir
-        .join("upper")
-        .join(GUEST_TLS_CA_PATH.trim_start_matches('/'));
-    let cert_path = staging_dir
-        .join("upper")
-        .join(GUEST_TLS_CERT_PATH.trim_start_matches('/'));
-    let key_path = staging_dir
-        .join("upper")
-        .join(GUEST_TLS_KEY_PATH.trim_start_matches('/'));
-    fs::write(&ca_path, &materials.ca)
-        .map_err(|err| format!("write guest TLS CA {}: {err}", ca_path.display()))?;
-    fs::write(&cert_path, &materials.cert)
-        .map_err(|err| format!("write guest TLS cert {}: {err}", cert_path.display()))?;
-    fs::write(&key_path, &materials.key)
-        .map_err(|err| format!("write guest TLS key {}: {err}", key_path.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
-            .map_err(|err| format!("chmod guest TLS key {}: {err}", key_path.display()))?;
-    }
-
-    Ok(())
-}
-
 fn overlay_staging_dir(overlay_disk: &Path) -> PathBuf {
     let parent = overlay_disk.parent().unwrap_or_else(|| Path::new("."));
     parent.join(format!(
@@ -6653,6 +6535,33 @@ async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
     }
 }
 
+async fn terminate_sandbox_processes(process: &mut VmProcess) -> Result<(), std::io::Error> {
+    let supervisor_error = terminate_vm_process(&mut process.supervisor).await.err();
+    let vm_error = terminate_vm_process(&mut process.child).await.err();
+
+    match (supervisor_error, vm_error) {
+        (None, None) => Ok(()),
+        (Some(error), None) => Err(std::io::Error::other(format!("stop supervisor: {error}"))),
+        (None, Some(error)) => Err(std::io::Error::other(format!("stop vm: {error}"))),
+        (Some(supervisor), Some(vm)) => Err(std::io::Error::other(format!(
+            "stop supervisor: {supervisor}; stop vm: {vm}"
+        ))),
+    }
+}
+
+fn absolute_state_dir(state_dir: &Path) -> Result<PathBuf, String> {
+    if state_dir.is_absolute() {
+        return Ok(state_dir.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|working_dir| working_dir.join(state_dir))
+        .map_err(|err| format!("failed to resolve VM driver state directory: {err}"))
+}
+
+fn isolate_host_control_environment(command: &mut Command) {
+    command.env_clear();
+}
+
 #[tracing::instrument(
     name = "vm.launch",
     skip(command),
@@ -6663,6 +6572,7 @@ async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
         vm.backend = ?backend,
     )
 )]
+#[allow(dead_code)]
 fn spawn_vm_launcher(
     command: &mut Command,
     sandbox_id: &str,
@@ -6847,7 +6757,7 @@ fn pulling_layer_detail(metadata: &HashMap<String, String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gpu::{SubnetAllocator, allocate_vsock_cid, mac_from_sandbox_id, tap_device_name};
+    use crate::gpu::allocate_vsock_cid;
     use openshell_core::progress::{
         PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
         PROGRESS_COMPLETE_STEP_KEY,
@@ -6865,6 +6775,23 @@ mod tests {
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    #[test]
+    fn vm_console_diagnostic_is_bounded_to_the_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let console = directory.path().join("rootfs-console.log");
+        fs::write(&console, b"discard-this\nFATAL: sandbox startup failed\n").unwrap();
+
+        assert_eq!(
+            read_vm_console_tail(&console, 30).as_deref(),
+            Some("FATAL: sandbox startup failed")
+        );
+        assert_eq!(read_vm_console_tail(&console, 0), None);
+        assert_eq!(
+            read_vm_console_tail(&directory.path().join("missing"), 30),
+            None
+        );
+    }
 
     #[test]
     fn registry_throttling_errors_are_retryable() {
@@ -7400,14 +7327,7 @@ mod tests {
         let parent = tracing::info_span!("vm.provision");
 
         let result = driver
-            .prepare_runtime_overlay(
-                Path::new("/unused"),
-                Path::new("/unused"),
-                Path::new("/unused"),
-                None,
-                None,
-                OverlayPreparation::Fresh,
-            )
+            .prepare_runtime_overlay(Path::new("/unused"), OverlayPreparation::Fresh)
             .instrument(parent)
             .await;
         assert!(result.is_err(), "overflow should stop before disk I/O");
@@ -8481,7 +8401,6 @@ mod tests {
                 process: None,
                 provisioning_task: None,
                 gpu_bdf: None,
-                qemu_network_allocated: false,
                 deleting: false,
             },
         );
@@ -8524,8 +8443,6 @@ mod tests {
         prepare_sandbox_overlay_image(
             &template,
             &overlay,
-            None,
-            None,
             OverlayPreparation::PreserveExisting,
             "saved-overlay".len() as u64,
         )
@@ -8547,8 +8464,6 @@ mod tests {
         prepare_sandbox_overlay_image(
             &template,
             &overlay,
-            None,
-            None,
             OverlayPreparation::PreserveExisting,
             "fresh-overlay".len() as u64,
         )
@@ -8562,8 +8477,8 @@ mod tests {
     #[test]
     fn overlay_upper_path_targets_overlay_upperdir() {
         assert_eq!(
-            overlay_upper_path(GUEST_TLS_KEY_PATH),
-            "/upper/opt/openshell/tls/tls.key"
+            overlay_upper_path(&guest_boundary_config_path("generation-123")),
+            "/upper/.openshell/state/bootstrap-generation-123.json"
         );
     }
 
@@ -8579,14 +8494,28 @@ mod tests {
             image_cache_lock: Arc::new(Mutex::new(())),
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
-            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
-                Ipv4Addr::new(10, 0, 128, 0),
-                17,
-            ))),
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
 
         assert_eq!(driver.capabilities().default_image, "openshell/sandbox:dev");
+    }
+
+    #[test]
+    fn host_control_receives_driver_owned_completion_marker() {
+        let mut command = Command::new("openshell-sandbox");
+        configure_main_exit_marker(&mut command, Path::new("/private/sandboxes/sb-1"));
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--main-exit-marker".to_string(),
+                "/private/sandboxes/sb-1/main-process-exited".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -8601,10 +8530,6 @@ mod tests {
             image_cache_lock: Arc::new(Mutex::new(())),
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
-            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
-                Ipv4Addr::new(10, 0, 128, 0),
-                17,
-            ))),
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
         let sandbox = Sandbox {
@@ -8636,10 +8561,6 @@ mod tests {
             image_cache_lock: Arc::new(Mutex::new(())),
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
-            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
-                Ipv4Addr::new(10, 0, 128, 0),
-                17,
-            ))),
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
         let sandbox = Sandbox {
@@ -8665,10 +8586,6 @@ mod tests {
             image_cache_lock: Arc::new(Mutex::new(())),
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
-            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
-                Ipv4Addr::new(10, 0, 128, 0),
-                17,
-            ))),
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
         let sandbox = Sandbox {
@@ -8695,10 +8612,6 @@ mod tests {
             image_cache_lock: Arc::new(Mutex::new(())),
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
-            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
-                Ipv4Addr::new(10, 0, 128, 0),
-                17,
-            ))),
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
 
@@ -8720,10 +8633,6 @@ mod tests {
             image_cache_lock: Arc::new(Mutex::new(())),
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
-            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
-                Ipv4Addr::new(10, 0, 128, 0),
-                17,
-            ))),
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
 
@@ -8742,10 +8651,6 @@ mod tests {
             image_cache_lock: Arc::new(Mutex::new(())),
             events: broadcast::channel(WATCH_BUFFER).0,
             gpu_inventory: None,
-            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
-                Ipv4Addr::new(10, 0, 128, 0),
-                17,
-            ))),
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
 
@@ -8777,7 +8682,7 @@ mod tests {
     }
 
     #[test]
-    fn build_guest_environment_sets_supervisor_defaults() {
+    fn build_guest_environment_sets_sandbox_boot_metadata() {
         let config = VmDriverConfig {
             grpc_endpoint: "http://127.0.0.1:8080".to_string(),
             ..Default::default()
@@ -8789,16 +8694,18 @@ mod tests {
             ..Default::default()
         };
 
-        let env = build_guest_environment(&sandbox, &config, None);
+        let env = build_guest_environment(&sandbox, &config);
         assert!(env.contains(&"HOME=/root".to_string()));
-        assert!(env.contains(&format!(
-            "OPENSHELL_ENDPOINT=http://{GVPROXY_HOST_LOOPBACK_ALIAS}:8080/"
-        )));
         assert!(env.contains(&"OPENSHELL_SANDBOX_ID=sandbox-123".to_string()));
         assert!(env.contains(&"OPENSHELL_SANDBOX=breezy-rhinoceros".to_string()));
-        assert!(env.contains(&format!(
-            "OPENSHELL_SSH_SOCKET_PATH={GUEST_SSH_SOCKET_PATH}"
-        )));
+        assert!(
+            !env.iter()
+                .any(|entry| entry.starts_with("OPENSHELL_ENDPOINT="))
+        );
+        assert!(
+            !env.iter()
+                .any(|entry| entry.starts_with("OPENSHELL_SSH_SOCKET_PATH="))
+        );
     }
 
     #[test]
@@ -8822,78 +8729,45 @@ mod tests {
     }
 
     #[test]
-    fn persisted_legacy_sandbox_without_command_uses_scratch_main() {
+    fn build_guest_environment_keeps_user_values_in_child_channel() {
         let config = VmDriverConfig {
             grpc_endpoint: "http://127.0.0.1:8080".to_string(),
             ..Default::default()
         };
-        // Requests persisted before the canonical-main contract have a
-        // present DriverSandboxSpec but no command or tty fields.
         let sandbox = Sandbox {
-            id: "legacy-sandbox".to_string(),
-            name: "legacy-sandbox".to_string(),
-            spec: Some(SandboxSpec::default()),
-            ..Default::default()
-        };
-
-        let env = build_guest_environment(&sandbox, &config, None);
-        let encoded = env
-            .iter()
-            .find_map(|entry| {
-                entry.strip_prefix(&format!(
-                    "{}=",
-                    openshell_core::sandbox_env::MAIN_PROCESS_SPEC
-                ))
-            })
-            .expect("main process environment");
-        let main = openshell_core::sandbox_env::MainProcessConfig::decode(encoded)
-            .expect("legacy persisted request should produce a valid main config");
-
-        assert_eq!(
-            main,
-            openshell_core::sandbox_env::MainProcessConfig::scratch()
-        );
-    }
-
-    #[test]
-    fn build_guest_environment_preserves_main_command_spaces() {
-        let config = VmDriverConfig {
-            grpc_endpoint: "https://127.0.0.1:8080".to_string(),
-            ..Default::default()
-        };
-        let command = vec![
-            "sh".to_string(),
-            "-lc".to_string(),
-            "echo ready; while true; do sleep 1; done".to_string(),
-        ];
-        let sandbox = Sandbox {
-            id: "space-command".to_string(),
-            name: "space-command".to_string(),
+            id: "sandbox-123".to_string(),
+            name: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
-                command: command.clone(),
+                environment: HashMap::from([
+                    ("LD_PRELOAD".to_string(), "/workload/evil.so".to_string()),
+                    ("BAD;touch /root/pwned".to_string(), "value".to_string()),
+                ]),
                 ..Default::default()
             }),
             ..Default::default()
         };
 
-        let env = build_guest_environment(&sandbox, &config, None);
-        let encoded = env
-            .iter()
-            .find_map(|entry| {
-                entry.strip_prefix(&format!(
-                    "{}=",
-                    openshell_core::sandbox_env::MAIN_PROCESS_SPEC
-                ))
-            })
-            .expect("main process environment");
+        let env = build_guest_environment(&sandbox, &config);
 
-        assert!(!encoded.contains(char::is_whitespace));
-        let main = openshell_core::sandbox_env::MainProcessConfig::decode(encoded).unwrap();
-        assert_eq!(main.command, command);
+        assert!(!env.iter().any(|entry| entry.starts_with("LD_PRELOAD=")));
+        assert!(!env.iter().any(|entry| entry.starts_with("BAD;")));
+        assert!(
+            !env.iter()
+                .any(|entry| { entry.starts_with(openshell_core::sandbox_env::USER_ENVIRONMENT) })
+        );
+        let child_env = merged_environment(&sandbox);
+        assert_eq!(
+            child_env.get("LD_PRELOAD"),
+            Some(&"/workload/evil.so".to_string())
+        );
+        assert_eq!(
+            child_env.get("BAD;touch /root/pwned"),
+            Some(&"value".to_string())
+        );
     }
 
     #[test]
-    fn build_guest_environment_uses_token_file_without_raw_token_env() {
+    fn build_guest_environment_excludes_all_gateway_credentials() {
         let config = VmDriverConfig {
             grpc_endpoint: "http://127.0.0.1:8080".to_string(),
             ..Default::default()
@@ -8912,16 +8786,16 @@ mod tests {
             ..Default::default()
         };
 
-        let env = build_guest_environment(&sandbox, &config, None);
+        let env = build_guest_environment(&sandbox, &config);
 
         assert!(!env.iter().any(|v| v.starts_with(&format!(
             "{}=",
             openshell_core::sandbox_env::SANDBOX_TOKEN
         ))));
-        assert!(env.contains(&format!(
-            "{}={GUEST_SANDBOX_TOKEN_PATH}",
+        assert!(!env.iter().any(|v| v.starts_with(&format!(
+            "{}=",
             openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
-        )));
+        ))));
     }
 
     #[test]
@@ -8943,7 +8817,7 @@ mod tests {
             ..Default::default()
         };
 
-        let env = build_guest_environment(&sandbox, &config, None);
+        let env = build_guest_environment(&sandbox, &config);
 
         assert!(
             !env.iter().any(|v| v.starts_with(&format!(
@@ -8980,7 +8854,7 @@ mod tests {
                     ..Default::default()
                 };
 
-                let env = build_guest_environment(&sandbox, &config, None);
+                let env = build_guest_environment(&sandbox, &config);
                 let telemetry_entries = env
                     .iter()
                     .filter(|entry| {
@@ -8997,102 +8871,6 @@ mod tests {
                     &format!("{}=false", openshell_core::sandbox_env::TELEMETRY_ENABLED)
                 );
             },
-        );
-    }
-
-    #[test]
-    fn build_guest_environment_clears_unsupported_network_capabilities() {
-        let config = VmDriverConfig {
-            grpc_endpoint: "http://127.0.0.1:8080".to_string(),
-            ..Default::default()
-        };
-        let sandbox = Sandbox {
-            id: "sandbox-123".to_string(),
-            name: "sandbox-123".to_string(),
-            spec: Some(SandboxSpec {
-                environment: HashMap::from([(
-                    openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
-                    openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.to_string(),
-                )]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let env = build_guest_environment(&sandbox, &config, None);
-        assert!(env.contains(&format!(
-            "{}=",
-            openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES
-        )));
-        assert!(!env.contains(&format!(
-            "{}={}",
-            openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
-            openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY
-        )));
-    }
-
-    #[test]
-    fn build_guest_environment_uses_endpoint_override_for_tap() {
-        let config = VmDriverConfig {
-            grpc_endpoint: "http://127.0.0.1:8080".to_string(),
-            ..Default::default()
-        };
-        let sandbox = Sandbox {
-            id: "sandbox-123".to_string(),
-            name: "sandbox-123".to_string(),
-            spec: Some(SandboxSpec::default()),
-            ..Default::default()
-        };
-
-        let env = build_guest_environment(&sandbox, &config, Some("http://10.0.128.1:8080"));
-        assert!(
-            env.contains(&"OPENSHELL_ENDPOINT=http://10.0.128.1:8080".to_string()),
-            "TAP endpoint override must replace the default"
-        );
-        let endpoint_count = env
-            .iter()
-            .filter(|e| e.starts_with("OPENSHELL_ENDPOINT="))
-            .count();
-        assert_eq!(
-            endpoint_count, 1,
-            "must have exactly one OPENSHELL_ENDPOINT"
-        );
-    }
-
-    #[test]
-    fn guest_visible_openshell_endpoint_rewrites_loopback_hosts_to_gvproxy_host_alias() {
-        assert_eq!(
-            guest_visible_openshell_endpoint("http://127.0.0.1:8080"),
-            format!("http://{GVPROXY_HOST_LOOPBACK_ALIAS}:8080/")
-        );
-        assert_eq!(
-            guest_visible_openshell_endpoint("http://localhost:8080"),
-            format!("http://{GVPROXY_HOST_LOOPBACK_ALIAS}:8080/")
-        );
-        assert_eq!(
-            guest_visible_openshell_endpoint("https://[::1]:8443"),
-            format!("https://{GVPROXY_HOST_LOOPBACK_ALIAS}:8443/")
-        );
-    }
-
-    #[test]
-    fn guest_visible_openshell_endpoint_preserves_non_loopback_hosts() {
-        assert_eq!(
-            guest_visible_openshell_endpoint(&format!(
-                "http://{OPENSHELL_HOST_GATEWAY_ALIAS}:8080"
-            )),
-            format!("http://{OPENSHELL_HOST_GATEWAY_ALIAS}:8080")
-        );
-        assert_eq!(
-            guest_visible_openshell_endpoint(&format!("http://{GVPROXY_HOST_LOOPBACK_ALIAS}:8080")),
-            format!("http://{GVPROXY_HOST_LOOPBACK_ALIAS}:8080")
-        );
-        assert_eq!(
-            guest_visible_openshell_endpoint("http://192.168.127.1:8080"),
-            "http://192.168.127.1:8080"
-        );
-        assert_eq!(
-            guest_visible_openshell_endpoint("https://gateway.internal:8443"),
-            "https://gateway.internal:8443"
         );
     }
 
@@ -9233,78 +9011,7 @@ mod tests {
     }
 
     #[test]
-    fn vm_driver_rejects_invalid_rootfs_tar_limits_before_startup() {
-        let config = VmDriverConfig {
-            rootfs_tar_max_bytes: Some(0),
-            ..Default::default()
-        };
-        let error = config.validate_rootfs_tar_config().unwrap_err();
-        assert!(error.contains("rootfs_tar_max_bytes"));
-
-        let config = VmDriverConfig {
-            rootfs_tar_staging_dir: Some(PathBuf::new()),
-            ..Default::default()
-        };
-        let error = config.validate_rootfs_tar_config().unwrap_err();
-        assert!(error.contains("rootfs_tar_staging_dir"));
-    }
-
-    #[test]
-    fn vm_proxy_and_spiffe_config_require_explicit_safe_acknowledgements() {
-        let config = VmDriverConfig {
-            upstream_proxy: UpstreamProxyConfig {
-                https_proxy: Some("http://proxy.example:8080".to_string()),
-                no_proxy: Some(".svc".to_string()),
-                proxy_auth_file: Some(PathBuf::from("/run/secrets/proxy-auth")),
-                proxy_auth_allow_insecure: Some(true),
-                proxy_connect_by_hostname: None,
-            },
-            provider_spiffe_workload_api_tcp_endpoint: Some("tcp:192.0.2.10:8081".to_string()),
-            provider_spiffe_allow_guest_tcp: false,
-            ..Default::default()
-        };
-        let error = config.validate_runtime_security_config().unwrap_err();
-        assert!(error.contains("provider_spiffe_allow_guest_tcp"));
-
-        let config = VmDriverConfig {
-            provider_spiffe_workload_api_tcp_endpoint: Some("tcp:192.0.2.10:8081".to_string()),
-            provider_spiffe_allow_guest_tcp: true,
-            ..Default::default()
-        };
-        assert!(config.validate_runtime_security_config().is_ok());
-    }
-
-    #[test]
-    fn build_guest_environment_projects_spiffe_endpoint_without_operator_proxy() {
-        let config = VmDriverConfig {
-            upstream_proxy: UpstreamProxyConfig {
-                https_proxy: Some("https://proxy.example:8443".to_string()),
-                no_proxy: Some(".svc".to_string()),
-                proxy_auth_file: Some(PathBuf::from("/run/secrets/proxy-auth")),
-                proxy_auth_allow_insecure: None,
-                proxy_connect_by_hostname: Some(true),
-            },
-            provider_spiffe_workload_api_tcp_endpoint: Some("tcp:192.0.2.10:8081".to_string()),
-            provider_spiffe_allow_guest_tcp: true,
-            ..Default::default()
-        };
-        let sandbox = Sandbox {
-            id: "vm-spiffe".to_string(),
-            name: "vm-spiffe".to_string(),
-            ..Default::default()
-        };
-        let env = build_guest_environment(&sandbox, &config, None);
-        assert!(env.contains(
-            &"OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET=tcp:192.0.2.10:8081".to_string()
-        ));
-        assert!(
-            !env.iter().any(|value| value.contains("UPSTREAM_PROXY")),
-            "operator proxy settings must use protected guest argument staging: {env:?}"
-        );
-    }
-
-    #[test]
-    fn build_guest_environment_includes_tls_paths_for_https_endpoint() {
+    fn build_guest_environment_keeps_tls_paths_host_side() {
         let config = VmDriverConfig {
             grpc_endpoint: "https://127.0.0.1:8443".to_string(),
             guest_tls_ca: Some(PathBuf::from("/host/ca.crt")),
@@ -9319,10 +9026,8 @@ mod tests {
             ..Default::default()
         };
 
-        let env = build_guest_environment(&sandbox, &config, None);
-        assert!(env.contains(&format!("OPENSHELL_TLS_CA={GUEST_TLS_CA_PATH}")));
-        assert!(env.contains(&format!("OPENSHELL_TLS_CERT={GUEST_TLS_CERT_PATH}")));
-        assert!(env.contains(&format!("OPENSHELL_TLS_KEY={GUEST_TLS_KEY_PATH}")));
+        let env = build_guest_environment(&sandbox, &config);
+        assert!(!env.iter().any(|entry| entry.starts_with("OPENSHELL_TLS_")));
     }
 
     #[test]
@@ -9352,10 +9057,6 @@ mod tests {
             image_cache_lock: Arc::new(Mutex::new(())),
             events,
             gpu_inventory: None,
-            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
-                Ipv4Addr::new(10, 0, 128, 0),
-                17,
-            ))),
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
 
@@ -9387,6 +9088,7 @@ mod tests {
             record.state_dir = retry_state_dir;
             record.process = Some(Arc::new(Mutex::new(VmProcess {
                 child: spawn_exited_child(),
+                supervisor: spawn_exited_child(),
                 deleting: false,
             })));
         }
@@ -9416,10 +9118,6 @@ mod tests {
             image_cache_lock: Arc::new(Mutex::new(())),
             events,
             gpu_inventory: None,
-            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
-                Ipv4Addr::new(10, 0, 128, 0),
-                17,
-            ))),
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
 
@@ -9439,7 +9137,6 @@ mod tests {
                     process: None,
                     provisioning_task: None,
                     gpu_bdf: None,
-                    qemu_network_allocated: false,
                     deleting: false,
                 },
             );
@@ -9472,10 +9169,6 @@ mod tests {
             image_cache_lock: Arc::new(Mutex::new(())),
             events,
             gpu_inventory: None,
-            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
-                Ipv4Addr::new(10, 0, 128, 0),
-                17,
-            ))),
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
 
@@ -9496,7 +9189,6 @@ mod tests {
                     process: None,
                     provisioning_task: None,
                     gpu_bdf: None,
-                    qemu_network_allocated: false,
                     deleting: false,
                 },
             );
@@ -9583,9 +9275,62 @@ mod tests {
     }
 
     #[test]
-    fn prepared_image_cache_identity_includes_layout_version_and_owner_contract() {
-        let image = "sha256:local-image";
-        let image_account = prepared_image_cache_identity(image, &VmDriverConfig::default());
+    fn host_control_endpoint_rewrites_guest_host_aliases() {
+        for host in HOST_LOOPBACK_ALIASES {
+            assert_eq!(
+                host_control_openshell_endpoint(&format!("https://{host}:8443/control"))
+                    .expect("guest alias should be rewritten"),
+                (
+                    "https://127.0.0.1:8443/control".to_string(),
+                    Some((*host).to_string()),
+                ),
+                "host alias {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_control_endpoint_preserves_remote_gateway() {
+        assert_eq!(
+            host_control_openshell_endpoint("https://gateway.internal:8443")
+                .expect("remote gateway should be preserved"),
+            ("https://gateway.internal:8443".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn relative_state_dir_is_resolved_from_the_working_directory() {
+        let working_dir = std::env::current_dir().expect("working directory");
+        assert_eq!(
+            absolute_state_dir(Path::new("target/driver-state")).expect("resolve state dir"),
+            working_dir.join("target/driver-state")
+        );
+
+        let absolute = working_dir.join("existing-absolute-state");
+        assert_eq!(
+            absolute_state_dir(&absolute).expect("preserve absolute state dir"),
+            absolute
+        );
+    }
+
+    #[test]
+    fn host_control_environment_contains_only_explicit_values() {
+        let mut command = Command::new("openshell-sandbox");
+        command.env("UNTRUSTED_PARENT_VALUE", "must-not-leak");
+        isolate_host_control_environment(&mut command);
+        command.env("DRIVER_OWNED_VALUE", "kept");
+
+        let environment = command.as_std().get_envs().collect::<Vec<_>>();
+        assert_eq!(environment.len(), 1);
+        assert_eq!(environment[0].0, "DRIVER_OWNED_VALUE");
+        assert_eq!(
+            environment[0].1.and_then(std::ffi::OsStr::to_str),
+            Some("kept")
+        );
+    }
+
+    #[test]
+    fn prepared_image_cache_identity_includes_rootfs_layout_and_openshell_version() {
         assert_eq!(
             image_account,
             format!(
@@ -9628,14 +9373,14 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_image_cache_identity_includes_rootfs_layout_and_openshell_version() {
-        assert_eq!(
-            bootstrap_image_cache_identity("sha256:bootstrap-image"),
-            format!(
-                "sandbox-bootstrap-rootfs-ext4-v3:openshell-{}:sha256:bootstrap-image",
-                openshell_core::VERSION
-            )
-        );
+    fn bootstrap_image_cache_identity_includes_rootfs_layout_version_and_guest_runtime() {
+        let identity = bootstrap_image_cache_identity("sha256:bootstrap-image");
+        assert!(identity.starts_with(&format!(
+            "sandbox-bootstrap-rootfs-ext4-v4:openshell-{}:guest-",
+            openshell_core::VERSION
+        )));
+        assert!(identity.ends_with(":sha256:bootstrap-image"));
+        assert!(identity.contains(&sandbox_guest_runtime_identity()));
     }
 
     #[test]
@@ -9738,96 +9483,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn read_guest_tls_materials_reports_missing_input() {
-        let base = unique_temp_dir();
-        let source_dir = base.join("missing-source");
-
-        let err = read_guest_tls_materials(&VmDriverTlsPaths {
-            ca: source_dir.join("ca.crt"),
-            cert: source_dir.join("tls.crt"),
-            key: source_dir.join("tls.key"),
-        })
-        .await
-        .expect_err("missing TLS materials should fail before image injection");
-
-        assert!(err.contains("ca.crt"));
-
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stage_guest_tls_materials_places_files_in_overlay_upper_with_private_key_mode() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let base = unique_temp_dir();
-        let materials = GuestTlsMaterials {
-            ca: b"ca".to_vec(),
-            cert: b"cert".to_vec(),
-            key: b"key".to_vec(),
-        };
-
-        stage_guest_tls_materials(&base, &materials).expect("stage TLS materials");
-
-        assert_eq!(
-            fs::read(
-                base.join("upper")
-                    .join(GUEST_TLS_CA_PATH.trim_start_matches('/'))
-            )
-            .unwrap(),
-            b"ca"
-        );
-        assert_eq!(
-            fs::read(
-                base.join("upper")
-                    .join(GUEST_TLS_CERT_PATH.trim_start_matches('/'))
-            )
-            .unwrap(),
-            b"cert"
-        );
-        let key_path = base
-            .join("upper")
-            .join(GUEST_TLS_KEY_PATH.trim_start_matches('/'));
-        assert_eq!(fs::read(&key_path).unwrap(), b"key");
-        assert_eq!(
-            fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn subnet_allocator_assigns_and_releases() {
-        let mut alloc = SubnetAllocator::new(Ipv4Addr::new(10, 0, 128, 0), 17);
-        let s1 = alloc.allocate("sandbox-1").unwrap();
-        assert_eq!(s1.host_ip, Ipv4Addr::new(10, 0, 128, 1));
-        assert_eq!(s1.guest_ip, Ipv4Addr::new(10, 0, 128, 2));
-        assert_eq!(s1.prefix_len, 30);
-
-        let s2 = alloc.allocate("sandbox-2").unwrap();
-        assert_ne!(s1.host_ip, s2.host_ip);
-
-        alloc.release("sandbox-1");
-        let s3 = alloc.allocate("sandbox-3").unwrap();
-        assert!(s3.host_ip != s2.host_ip);
-    }
-
-    #[test]
-    fn tap_device_name_fits_ifnamsiz() {
-        let name = tap_device_name("sandbox-abc-def-ghi");
-        assert!(name.len() <= 15);
-        assert!(name.starts_with("vmtap-"));
-    }
-
-    #[test]
-    fn mac_address_is_locally_administered() {
-        let mac = mac_from_sandbox_id("test-sandbox");
-        assert_eq!(mac[0] & 0x02, 0x02);
-        assert_eq!(mac[0] & 0x01, 0x00);
-    }
-
     #[test]
     fn vsock_cid_monotonically_increases() {
         let cid1 = allocate_vsock_cid();
@@ -9872,6 +9527,7 @@ mod tests {
         };
         let process = Arc::new(Mutex::new(VmProcess {
             child,
+            supervisor: spawn_exited_child(),
             deleting: false,
         }));
 
@@ -9884,7 +9540,6 @@ mod tests {
                 process: Some(process),
                 provisioning_task: None,
                 gpu_bdf: None,
-                qemu_network_allocated: false,
                 deleting: false,
             },
         );
@@ -9910,10 +9565,6 @@ mod tests {
             image_cache_lock: Arc::new(Mutex::new(())),
             events,
             gpu_inventory: None,
-            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
-                Ipv4Addr::new(10, 0, 128, 0),
-                17,
-            ))),
             lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         }
     }
@@ -10238,10 +9889,6 @@ mod tests {
             image_cache_lock: Arc::new(Mutex::new(())),
             events,
             gpu_inventory: None,
-            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
-                Ipv4Addr::new(10, 0, 128, 0),
-                17,
-            ))),
             lifecycle_extensions: Arc::new(extensions),
         }
     }
@@ -10320,11 +9967,7 @@ mod tests {
         assert_eq!(plan.backend, VmBackend::Libkrun);
         assert_eq!(plan.vcpus, 2);
         assert_eq!(plan.mem_mib, 2048);
-        assert!(plan.tap_device.is_none());
-        assert!(plan.guest_ip.is_none());
-        assert!(plan.host_ip.is_none());
         assert!(plan.vsock_cid.is_none());
-        assert!(plan.guest_mac.is_none());
         assert!(plan.gpu_bdf.is_none());
         assert!(plan.env.is_empty());
     }
@@ -10347,11 +9990,7 @@ mod tests {
         assert_eq!(plan.vcpus, 8);
         assert_eq!(plan.mem_mib, 16384);
         assert_eq!(plan.gpu_bdf.as_deref(), Some("0000:01:00.0"));
-        assert!(plan.tap_device.is_some());
-        assert!(plan.guest_ip.is_some());
-        assert!(plan.host_ip.is_some());
         assert!(plan.vsock_cid.is_some());
-        assert!(plan.guest_mac.is_some());
     }
 
     #[test]
@@ -10365,12 +10004,7 @@ mod tests {
             kernel_profile: None,
             kernel_image: Some(PathBuf::from("/tmp/openshell-test-kernel")),
             gpu_bdf: None,
-            tap_device: None,
-            guest_ip: None,
-            host_ip: None,
             vsock_cid: None,
-            guest_mac: None,
-            gateway_port: None,
             guest_init_dropins: Vec::new(),
             env: Vec::new(),
         };
@@ -10403,13 +10037,7 @@ mod tests {
             .expect("backend feature should resolve");
 
         assert_eq!(plan.backend, VmBackend::Qemu);
-        assert!(plan.tap_device.is_some());
-        assert!(plan.guest_ip.is_some());
-        assert!(plan.host_ip.is_some());
         assert!(plan.vsock_cid.is_some());
-        assert!(plan.guest_mac.is_some());
-
-        driver.release_subnet("sandbox-vfio");
     }
 
     #[test]
@@ -10425,11 +10053,7 @@ mod tests {
             .expect("backend requirement should resolve");
 
         assert_eq!(plan.backend, VmBackend::Qemu);
-        assert!(plan.tap_device.is_some());
-        assert!(plan.guest_ip.is_some());
-        assert!(plan.host_ip.is_some());
-
-        driver.release_subnet("sandbox-qemu");
+        assert!(plan.vsock_cid.is_some());
     }
 
     #[test]
@@ -10445,7 +10069,6 @@ mod tests {
             .expect("guest init feature should resolve");
 
         assert_eq!(plan.backend, VmBackend::Libkrun);
-        assert!(plan.tap_device.is_none());
     }
 
     #[test]
@@ -10508,12 +10131,7 @@ mod tests {
             kernel_profile: None,
             kernel_image: None,
             gpu_bdf: None,
-            tap_device: None,
-            guest_ip: None,
-            host_ip: None,
             vsock_cid: None,
-            guest_mac: None,
-            gateway_port: None,
             guest_init_dropins: Vec::new(),
             env: Vec::new(),
         };
@@ -10532,12 +10150,7 @@ mod tests {
             kernel_profile: None,
             kernel_image: None,
             gpu_bdf: None,
-            tap_device: Some("vmtap-x".to_string()),
-            guest_ip: Some("10.0.0.2".to_string()),
-            host_ip: Some("10.0.0.1".to_string()),
             vsock_cid: Some(7),
-            guest_mac: Some("02:00:00:00:00:01".to_string()),
-            gateway_port: Some(8080),
             guest_init_dropins: Vec::new(),
             env: Vec::new(),
         };
@@ -10565,12 +10178,7 @@ mod tests {
             kernel_profile: None,
             kernel_image: None,
             gpu_bdf: None,
-            tap_device: Some("vmtap-x".to_string()),
-            guest_ip: Some("10.0.0.2".to_string()),
-            host_ip: Some("10.0.0.1".to_string()),
             vsock_cid: Some(7),
-            guest_mac: Some("02:00:00:00:00:01".to_string()),
-            gateway_port: Some(8080),
             guest_init_dropins: Vec::new(),
             env: Vec::new(),
         };
@@ -10623,71 +10231,41 @@ mod tests {
     }
 
     #[test]
-    fn proxy_material_is_staged_inside_the_per_sandbox_overlay() {
-        // Everything the driver stages lands in the overlay upperdir, which
-        // lives in the sandbox's own state directory. That is what makes the
-        // credential removable with the sandbox (remove_sandbox_state_dir
-        // deletes the whole directory) and unforgeable by the guest image
-        // (the upperdir shadows the read-only image layer).
-        for guest_path in [
-            GUEST_UPSTREAM_PROXY_AUTH_PATH,
-            GUEST_PROXY_CA_PATH,
-            GUEST_SUPERVISOR_ARGS_PATH,
-        ] {
-            assert!(
-                guest_path.starts_with("/opt/openshell/"),
-                "{guest_path} must be under the reserved guest control root"
-            );
-            assert_eq!(
-                overlay_upper_path(guest_path),
-                format!("/upper{guest_path}"),
-                "{guest_path} must be staged into the overlay upperdir"
-            );
-        }
-    }
-
-    #[test]
     fn upstream_proxy_args_are_empty_without_a_configured_proxy() {
-        assert!(upstream_proxy_cli_args(&VmDriverConfig::default()).is_empty());
-        // The file is still written, empty, so the guest cannot fall back to
-        // an image-baked argument list.
-        assert!(render_guest_supervisor_args(&[]).is_empty());
+        assert!(
+            upstream_proxy_cli_args(&VmDriverConfig::default())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
-    fn upstream_proxy_args_pass_guest_paths_not_host_paths() {
-        let mut config = proxy_config(
+    fn upstream_proxy_args_pass_host_paths_to_host_control() {
+        let config = proxy_config(
             Some("http://proxy.corp.test:3128"),
             Some("/etc/openshell/secrets/proxy-auth"),
         );
-        config.proxy_ca_bundle = Some(PathBuf::from("/etc/openshell/tls/corp-ca.pem"));
-        let args = upstream_proxy_cli_args(&config);
+        let args = upstream_proxy_cli_args(&config).unwrap();
 
-        // The credential and CA live at fixed guest paths; the gateway-host
-        // paths the operator configured must never reach the guest argv.
+        // Control runs on the gateway host and receives the operator-owned
+        // paths directly; neither path is copied into the guest.
         let auth = args
             .iter()
             .position(|arg| arg == "--upstream-proxy-auth-file")
             .map(|i| args[i + 1].as_str());
-        assert_eq!(auth, Some(GUEST_UPSTREAM_PROXY_AUTH_PATH));
+        assert_eq!(auth, Some("/etc/openshell/secrets/proxy-auth"));
         let ca = args
             .iter()
             .position(|arg| arg == "--upstream-proxy-ca-bundle")
             .map(|i| args[i + 1].as_str());
-        assert_eq!(ca, Some(GUEST_PROXY_CA_PATH));
-        assert!(
-            !args
-                .iter()
-                .any(|arg| arg.contains("/etc/openshell/secrets") || arg.contains("corp-ca.pem")),
-            "host paths leaked into the guest argv: {args:?}"
-        );
+        assert_eq!(ca, Some("/etc/openshell/tls/corp-ca.pem"));
     }
 
     #[test]
     fn upstream_proxy_args_pass_only_explicit_opt_ins() {
-        let mut config = proxy_config(Some("https://proxy.corp.test:3130"), None);
-        config.upstream_proxy.no_proxy = Some("10.0.0.0/8,.svc.cluster.local".to_string());
-        let args = upstream_proxy_cli_args(&config);
+        let mut config = proxy_config(Some("https://proxy.corp.test:3130"), None, None);
+        config.no_proxy = Some("10.0.0.0/8,.svc.cluster.local".to_string());
+        let args = upstream_proxy_cli_args(&config).unwrap();
         assert_eq!(
             args,
             vec![
@@ -10703,44 +10281,35 @@ mod tests {
         config.upstream_proxy.proxy_connect_by_hostname = Some(false);
         assert!(
             !upstream_proxy_cli_args(&config)
+                .unwrap()
                 .iter()
                 .any(|arg| arg == "--upstream-proxy-connect-by-hostname")
         );
         config.upstream_proxy.proxy_connect_by_hostname = Some(true);
         assert!(
             upstream_proxy_cli_args(&config)
+                .unwrap()
                 .iter()
                 .any(|arg| arg == "--upstream-proxy-connect-by-hostname")
         );
     }
 
     #[test]
-    fn guest_supervisor_args_render_one_argument_per_line() {
-        let args = vec![
-            "--upstream-proxy".to_string(),
-            "http://proxy.corp.test:3128".to_string(),
-            "--upstream-no-proxy".to_string(),
-            "a.example, b.example".to_string(),
-        ];
-        // A value containing a space stays one line, so the guest reads it
-        // back as a single argument rather than word-splitting it.
-        assert_eq!(
-            String::from_utf8(render_guest_supervisor_args(&args)).unwrap(),
-            "--upstream-proxy\nhttp://proxy.corp.test:3128\n--upstream-no-proxy\na.example, b.example\n"
-        );
-    }
-
-    #[test]
-    fn guest_supervisor_args_reject_line_breaking_values() {
-        // A newline would split one operator value into two guest arguments.
-        for bad in ["a\nb", "a\rb", "a\0b"] {
-            assert!(
-                validate_guest_supervisor_args(&[bad.to_string()]).is_err(),
-                "{bad:?} must be rejected"
+    fn upstream_proxy_args_route_vm_host_aliases_to_host_loopback() {
+        for alias in HOST_LOOPBACK_ALIASES {
+            let config = proxy_config(Some(&format!("http://{alias}:3128")), None, None);
+            let args = upstream_proxy_cli_args(&config).unwrap();
+            assert_eq!(
+                args,
+                vec![
+                    "--upstream-proxy".to_string(),
+                    format!("http://{alias}:3128"),
+                    "--upstream-proxy-dial-ip".to_string(),
+                    "127.0.0.1".to_string(),
+                ],
+                "host alias {alias} must dial host loopback without changing its TLS identity"
             );
         }
-        validate_guest_supervisor_args(&["--upstream-proxy".to_string()])
-            .expect("ordinary arguments are accepted");
     }
 
     #[test]
@@ -10786,128 +10355,15 @@ mod tests {
     }
 
     #[test]
-    fn qemu_backend_rejects_a_gateway_host_proxy() {
-        // gvproxy's host-loopback NAT has no QEMU/TAP equivalent, so a proxy
-        // on the gateway host is unreachable from a GPU sandbox and must be
-        // rejected rather than time out on every CONNECT. The address that
-        // reaches the gateway host from a QEMU guest is this sandbox's own
-        // TAP host address, so the classifier is parameterized by it.
-        let tap_host = Some("10.0.128.1");
-        for url in [
-            "http://host.openshell.internal:8080",
-            "http://host.containers.internal:8080",
-            "http://host.docker.internal:8080",
-            "http://127.0.0.1:8080",
-            "http://localhost:8080",
-            "https://[::1]:8080",
-            // The address the aliases above resolve to inside the guest.
-            "http://10.0.128.1:8080",
-        ] {
-            assert!(proxy_url_targets_gateway_host(url, tap_host), "{url}");
-        }
-        for url in [
-            "http://proxy.corp.example:8080",
-            "https://10.1.2.3:3128",
-            // Special only to libkrun/gvproxy. On QEMU/TAP it is an ordinary
-            // address that may be routable through the guest's masqueraded
-            // egress, so rejecting it would refuse a working configuration.
-            "http://192.168.127.254:8080",
-            // Another sandbox's TAP host, not this one's.
-            "http://10.0.128.5:8080",
-            "not a url",
-        ] {
-            assert!(!proxy_url_targets_gateway_host(url, tap_host), "{url}");
-        }
-
-        // Without an allocated TAP host only the address-independent
-        // spellings classify; the loopback and alias guards still hold.
-        assert!(proxy_url_targets_gateway_host(
-            "http://127.0.0.1:8080",
-            None
-        ));
-        assert!(proxy_url_targets_gateway_host(
-            "http://host.openshell.internal:8080",
-            None
-        ));
-        assert!(!proxy_url_targets_gateway_host(
-            "http://10.0.128.1:8080",
-            None
-        ));
-    }
-
-    #[test]
-    fn qemu_launch_plan_rejects_a_proxy_at_the_allocated_tap_host() {
-        // The preflight has to run against the address this sandbox actually
-        // got, which only exists once the launch plan's subnet is allocated.
-        // A proxy there is what `host.openshell.internal` resolves to in the
-        // guest, and the driver's own nftables input chain drops the port.
-        let probe = test_driver_with_extensions(LifecycleExtensionRegistry::new());
-        let tap_host = probe
-            .build_vm_launch_plan("sandbox-proxy-tap", true, true, None)
-            .expect("gpu plan should build")
-            .host_ip
-            .expect("a QEMU plan carries a TAP host address");
-        probe.release_subnet("sandbox-proxy-tap");
-
-        let driver = test_driver_with_proxy(&format!("http://{tap_host}:8080"));
+    fn qemu_launch_plan_uses_vsock_only_with_host_proxy() {
+        let driver = test_driver_with_proxy("http://127.0.0.1:8080");
         let mut plan = driver
-            .build_vm_launch_plan("sandbox-proxy-tap", true, true, None)
+            .build_vm_launch_plan("sandbox-proxy-vsock", true, true, None)
             .expect("gpu plan should build");
-        assert_eq!(plan.host_ip.as_deref(), Some(tap_host.as_str()));
-
-        let err = driver
-            .resolve_launch_plan_backend("sandbox-proxy-tap", true, None, &mut plan)
-            .expect_err("a proxy at the TAP host address is unreachable from the guest");
-        assert_eq!(err.code(), Code::FailedPrecondition);
-        assert!(err.message().contains(&tap_host), "{err}");
-
-        driver.release_subnet("sandbox-proxy-tap");
-    }
-
-    #[test]
-    fn qemu_launch_plan_allows_a_proxy_at_the_gvproxy_host_loopback_address() {
-        // 192.168.127.254 carries no meaning on QEMU/TAP, so a launch must
-        // proceed rather than be refused for a libkrun-only reason.
-        let driver = test_driver_with_proxy(&format!("http://{GVPROXY_HOST_LOOPBACK_IP}:8080"));
-        let mut plan = driver
-            .build_vm_launch_plan("sandbox-proxy-gvproxy", true, true, None)
-            .expect("gpu plan should build");
-        assert_ne!(plan.host_ip.as_deref(), Some(GVPROXY_HOST_LOOPBACK_IP));
-
         driver
-            .resolve_launch_plan_backend("sandbox-proxy-gvproxy", true, None, &mut plan)
-            .expect("a routable proxy address must not block a GPU launch");
-        assert_eq!(plan.backend, VmBackend::Qemu);
-
-        driver.release_subnet("sandbox-proxy-gvproxy");
-    }
-
-    #[tokio::test]
-    async fn proxy_credential_is_validated_against_the_supervisor_rules() {
-        let dir = std::env::temp_dir().join(format!("openshell-vm-cred-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("proxy-auth");
-
-        std::fs::write(&path, "proxyuser:proxypass\n").unwrap();
-        assert_eq!(
-            read_sandbox_proxy_credential(&path)
-                .await
-                .expect("a well-formed credential is accepted"),
-            "proxyuser:proxypass"
-        );
-
-        // Rejected here rather than inside every sandbox's supervisor.
-        std::fs::write(&path, "no-separator\n").unwrap();
-        let err = read_sandbox_proxy_credential(&path)
-            .await
-            .expect_err("a malformed credential must fail closed");
-        assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(
-            !err.message().contains("no-separator"),
-            "the error must not echo credential file contents: {err}"
-        );
-
-        std::fs::remove_dir_all(&dir).unwrap();
+            .resolve_launch_plan_backend("sandbox-proxy-vsock", true, None, &mut plan)
+            .expect("host control can reach a host-loopback proxy");
+        assert!(plan.vsock_cid.is_some());
     }
 
     #[test]
@@ -10937,7 +10393,7 @@ mod tests {
             ..Default::default()
         };
 
-        let env = build_guest_environment(&sandbox, &config, None);
+        let env = build_guest_environment(&sandbox, &config);
         assert!(
             !env.iter().any(|entry| entry.starts_with("--upstream")),
             "driver environment must never carry supervisor arguments: {env:?}"
