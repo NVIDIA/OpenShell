@@ -9,6 +9,9 @@ cd "$(git rev-parse --show-toplevel)"
 found=0
 status=0
 
+# Policy: every tracked Cargo.lock represents an intentionally reproducible
+# Cargo workspace and must resolve against its adjacent Cargo.toml. Manifests
+# that intentionally do not own a lockfile are outside this check.
 while IFS= read -r -d '' lockfile; do
   found=1
   manifest="${lockfile%Cargo.lock}Cargo.toml"
