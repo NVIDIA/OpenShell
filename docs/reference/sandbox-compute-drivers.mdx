@@ -40,40 +40,13 @@ an exited canonical process remains a terminal sandbox result. Exit code zero
 produces `Completed`; a nonzero or signal-normalized exit produces `Error`
 with the exact exit code. Driver and supervisor failures remain `Error`.
 
-## Build with Selected Compute Drivers
-
-Source builds of `openshell-gateway` can include any subset of the Docker,
-Podman, Kubernetes, VM, and MXC drivers. Enable the corresponding
-`compute-driver-docker`, `compute-driver-podman`, `compute-driver-kubernetes`,
-`compute-driver-vm`, or `compute-driver-mxc` Cargo features. For example, build
-a Docker-only gateway with telemetry support:
-
-```shell
-cargo build --release -p openshell-gateway --no-default-features --features telemetry,compute-driver-docker
-```
-
-On Windows, select only MXC with:
-
-```shell
-cargo build --release -p openshell-gateway --no-default-features --features telemetry,compute-driver-mxc,bundled-z3
-```
-
-The default `in-tree-compute-drivers` feature retains the full platform driver
-set, including MXC on Windows. MXC links only on Windows. The other four
-features link drivers on non-Windows platforms; on Windows they install
-registrations that report the driver as unsupported. A build with no default
-features and no driver features connects to external drivers only.
-Auto-detection probes only compiled registrations.
-To select a driver omitted from a custom build, configure its external
-`socket_path` as described below.
-
 ## Configure a Compute Driver
 
-Configure the compute driver on the gateway. Current releases accept one driver per gateway. Set the singular `compute_driver` key in the gateway TOML file:
+Configure the compute driver on the gateway. Current releases accept one driver per gateway. Set `compute_drivers` in the gateway TOML file:
 
 ```toml
 [openshell.gateway]
-compute_driver = "docker"
+compute_drivers = ["docker"]
 ```
 
 Reserved built-in values are `docker`, `podman`, `kubernetes`, `vm`, and `mxc`.
@@ -81,17 +54,15 @@ The `mxc` driver is available only in native Windows gateway builds.
 Non-reserved names select an extension driver and require a
 `socket_path` in `[openshell.drivers.<name>]`.
 
-When `compute_driver` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. Docker must respond on a known API socket. Podman first probes known API sockets and then asks the `podman` CLI for the active native or machine-backed socket. The VM driver is never auto-detected; configure it explicitly with `compute_driver = "vm"` or set `OPENSHELL_COMPUTE_DRIVER=vm` in the launch environment.
-
-`compute_driver` accepts exactly one scalar driver name. The legacy `compute_drivers` list is rejected by schema version 2.
+When `compute_drivers` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. Docker must respond on a known API socket. Podman first probes known API sockets and then asks the `podman` CLI for the active native or machine-backed socket. The VM driver is never auto-detected; configure it explicitly with `compute_drivers = ["vm"]` or set `OPENSHELL_DRIVERS=vm` in the launch environment.
 
 Common gateway options:
 
 | Gateway TOML option | Description |
 |---|---|
-| `compute_driver = "<driver>"` | Select the compute driver. Built-in values are `docker`, `podman`, `kubernetes`, and `vm`; custom names require `[openshell.drivers.<name>].socket_path`. |
+| `compute_drivers = ["<driver>"]` | Select the compute driver. Built-in values are `docker`, `podman`, `kubernetes`, and `vm`; custom names require `[openshell.drivers.<name>].socket_path`. |
 
-Set driver-specific values such as sandbox images, callback endpoints, network names, and VM sizing in the gateway TOML file. A TLS-enabled gateway-managed Docker, Podman, or VM driver requires a complete `guest_tls_ca`, `guest_tls_cert`, and `guest_tls_key` bundle in `[openshell.gateway]`; package-managed local TLS supplies it automatically. Driver tables reject those gateway-owned fields. Kubernetes projects guest TLS through a Secret instead. See the [Gateway Configuration File](./gateway-config) reference for the full schema and migration steps.
+Set driver-specific values such as sandbox images, callback endpoints, network names, TLS material, and VM sizing in the gateway TOML file. See the [Gateway Configuration File](./gateway-config) reference for the full `[openshell.drivers.<name>]` schema.
 
 Extension drivers use the same `compute_driver.proto` gRPC surface as the
 managed VM driver. For an out-of-tree driver, choose a driver name and point
@@ -99,7 +70,7 @@ the gateway at the Unix socket the operator has already provisioned:
 
 ```toml
 [openshell.gateway]
-compute_driver = "kyma"
+compute_drivers = ["kyma"]
 
 [openshell.drivers.kyma]
 socket_path = "/run/openshell/kyma.sock"
@@ -110,8 +81,8 @@ socket path. The endpoint replaces normal driver construction for that name,
 including canonical built-in names:
 
 ```shell
-openshell-gateway --compute-driver kyma --compute-driver-socket /run/openshell/kyma.sock
-openshell-gateway --compute-driver docker --compute-driver-socket /run/openshell/docker.sock
+openshell-gateway --drivers kyma --compute-driver-socket /run/openshell/kyma.sock
+openshell-gateway --drivers docker --compute-driver-socket /run/openshell/docker.sock
 ```
 
 The gateway connects to the operator-provided endpoint; it does not provision
@@ -186,7 +157,7 @@ the gateway. If the primary listener covers that address, the gateway reuses
 it and sandbox JWT authentication restricts the supervisor to its callback RPC
 allowlist. If the primary listener is not reachable through that address, the
 gateway creates an additional callback-only listener. Use the primary endpoint
-for CLI, administrator, health, reflection, provider management, and
+for CLI, administrator, health, reflection, inference-route management, and
 HTTP requests. A `PermissionDenied` response from an additional callback-only
 listener is expected for those requests. Do not broaden the primary listener
 to `0.0.0.0` solely to make sandbox callbacks reachable.
@@ -195,7 +166,7 @@ to `0.0.0.0` solely to make sandbox callbacks reachable.
 
 [Docker](https://www.docker.com/get-started/)-backed sandboxes run as containers on the gateway host. Use Docker for local development, single-machine gateways, and hosts that already use Docker Desktop or Docker Engine.
 
-The gateway talks to the Docker daemon to create sandbox containers.
+The gateway talks to the Docker daemon to create sandbox containers. Docker is also required for local image builds from directories or Dockerfiles.
 
 Docker Desktop and compatible macOS runtimes route `host.openshell.internal`
 through an IPv4 host-gateway alias. The gateway reuses an IPv4 primary listener
@@ -204,7 +175,7 @@ that already covers loopback. Otherwise, the Docker driver requests a separate
 
 For maintainer-level implementation details, refer to the [Docker driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-docker/README.md).
 
-Select Docker with `compute_driver = "docker"` in `[openshell.gateway]`. Configure Docker driver values such as `socket_path`, `grpc_endpoint`, `network_name`, `sandbox_label`, `supervisor_bin`, `supervisor_image`, `image_pull_policy`, `ssh_socket_path`, and `sandbox_pids_limit` in `[openshell.drivers.docker]`. When `socket_path` is unset, the driver uses the same responsive local socket selected by auto-detection. An explicitly selected Docker driver falls back to `/var/run/docker.sock` when no candidate responds.
+Select Docker with `compute_drivers = ["docker"]` in `[openshell.gateway]`. Configure Docker driver values such as `socket_path`, `grpc_endpoint`, `network_name`, `supervisor_image`, `image_pull_policy`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.docker]`. The supervisor image must contain both `/openshell-sandbox` and `/openshell-supervisor`. When `socket_path` is unset, the driver uses the same responsive local socket selected by auto-detection. An explicitly selected Docker driver falls back to `/var/run/docker.sock` when no candidate responds.
 
 When operating `openshell-driver-docker` as an external driver, set
 `OPENSHELL_OTLP_ENDPOINT` to export its spans. The driver continues W3C trace
@@ -282,27 +253,7 @@ The gateway talks to the Podman API socket. The Podman driver requires Podman 5.
 
 For maintainer-level implementation details, refer to the [Podman driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/README.md) and [Podman networking notes](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/NETWORKING.md).
 
-Select Podman with `compute_driver = "podman"` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, `host_gateway_ip`, `ssh_socket_path`, and `sandbox_pids_limit` in `[openshell.drivers.podman]`.
-
-### macOS Podman Socket Path
-
-On macOS, Homebrew-installed Podman does not create the default socket path
-that the driver probes (`~/.local/share/containers/podman/machine/podman.sock`).
-The actual API socket lives under `/var/folders/` in a path that macOS can
-rotate after a reboot.
-
-If the gateway fails with `Podman socket not found; is podman machine running?`
-while `podman machine list` shows a running machine, set the
-`OPENSHELL_PODMAN_SOCKET` environment variable to the dynamic socket path:
-
-```shell
-export OPENSHELL_PODMAN_SOCKET="$(podman machine inspect --format '{{.ConnectionInfo.PodmanSocket.Path}}')"
-```
-
-Add this to your shell profile or gateway launch environment so it resolves
-correctly after each reboot. Alternatively, set `socket_path` in
-`[openshell.drivers.podman]` to the current path, but note that the path may
-change when macOS rotates `/var/folders/`.
+Select Podman with `compute_drivers = ["podman"]` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, `host_gateway_ip`, `sandbox_ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.podman]`.
 
 Podman sandboxes default to a 45-second graceful stop window before Podman escalates from `SIGTERM` to `SIGKILL`. Set `stop_timeout_secs` in gateway config, or `OPENSHELL_STOP_TIMEOUT` for the standalone driver, when a local runtime needs a different teardown window.
 
@@ -315,12 +266,6 @@ retained intent with an idempotent start request while leaving explicitly
 stopped sandboxes alone.
 
 For proxy-required networks, the Podman driver also accepts the corporate egress proxy keys `https_proxy`, `no_proxy`, `proxy_auth_file`, `proxy_auth_allow_insecure`, and `proxy_connect_by_hostname`. The supervisor chains policy-approved TLS tunnels through the proxy with HTTP CONNECT instead of dialing destinations directly. See the [Gateway Configuration File](./gateway-config) reference for the full contract, including the cleartext-credential acknowledgement and the validated-IP CONNECT behavior.
-
-Podman preserves its runtime-selected AppArmor profile when
-`app_armor_profile` is omitted. Set `Unconfined` explicitly only when the
-supervisor's mount setup requires it. Explicit `RuntimeDefault` and
-`Localhost/<profile>` selections fail startup when Podman reports that AppArmor
-is unavailable.
 
 On macOS with `podman machine`, the driver uses gvproxy's host-loopback IP, `192.168.127.254`, for sandbox host aliases by default. Set `host_gateway_ip` only when your Podman machine uses a non-standard host-loopback address. On Linux, an empty `host_gateway_ip` keeps Podman's `host-gateway` resolver behavior. Direct local callbacks from rootless Podman require Podman to report the pasta network helper. Slirp4netns, other helpers, and Podman versions that do not report their helper require an explicitly remote `grpc_endpoint`; otherwise the gateway fails startup rather than leaving sandbox callbacks unreachable. Rootful Podman continues to use the configured network's bridge gateway address.
 
@@ -402,24 +347,18 @@ For maintainer-level implementation details, refer to the [VM driver README](htt
 
 The VM driver is opt-in. Release packages can install `openshell-driver-vm`, but the gateway does not select it unless you configure the driver explicitly.
 
-Enable VM by setting `compute_driver = "vm"` in the gateway TOML file:
+Enable VM by setting `compute_drivers = ["vm"]` in the gateway TOML file:
 
 ```toml
 [openshell.gateway]
-compute_driver = "vm"
+compute_drivers = ["vm"]
 ```
 
-For a launch-time override, set `OPENSHELL_COMPUTE_DRIVER=vm` in the gateway environment and restart the service.
+For a launch-time override, set `OPENSHELL_DRIVERS=vm` in the gateway environment and restart the service.
 
-Configure VM driver values such as `grpc_endpoint`, `driver_dir`, `state_dir`, `default_image`, `bootstrap_image`, `vcpus`, `mem_mib`, `overlay_disk_mib`, and `krun_log_level` in `[openshell.drivers.vm]`. The VM `state_dir` stores overlay disks, console logs, runtime state, image-rootfs cache, and the private `run/compute-driver.sock` socket. The VM socket path is managed by the gateway and is not configurable through remote endpoint settings.
+Configure VM driver values such as `grpc_endpoint`, `driver_dir`, `state_dir`, `default_image`, `bootstrap_image`, `vcpus`, `mem_mib`, `overlay_disk_mib`, `krun_log_level`, and `guest_tls_*` in `[openshell.drivers.vm]`. The VM `state_dir` stores overlay disks, console logs, runtime state, image-rootfs cache, and the private `run/compute-driver.sock` socket. The VM socket path is managed by the gateway and is not configurable through remote endpoint settings.
 
 The gateway starts `openshell-driver-vm` over a private Unix socket and passes its process ID so the driver can reject unexpected local clients. The driver's standalone TCP listener is disabled unless `--allow-unauthenticated-tcp` is set for local development.
-
-Scripts that invoke the experimental standalone driver directly must use
-`--grpc-endpoint` and the `--upstream-proxy*` option family. Schema v2 removes
-the previous `--openshell-endpoint`, `--https-proxy`, `--no-proxy`, and
-`--proxy-*` spellings; gateway-managed deployments do not use those options
-directly.
 
 ### Local image resolution
 
@@ -467,24 +406,23 @@ owner references or use the sandbox ServiceAccount. The operator namespace
 allowlist is a trust grant, not a tenant isolation mechanism.
 </Warning>
 
-Helm deployments set Kubernetes driver values through the chart. Canonical TOML places `namespace`, `service_account_name`, and `enable_user_namespaces` in `[openshell.drivers.kubernetes]`; schema version 2 rejects their historical `[openshell.gateway]` locations.
+Helm deployments set Kubernetes driver values through the chart.
 
 For maintainer-level implementation details, refer to the [Kubernetes driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-kubernetes/README.md).
 
 | Gateway configuration | Helm value | Description |
 |---|---|---|
-| `compute_driver = "kubernetes"` | Not applicable | Select the Kubernetes compute driver. |
+| `compute_drivers = ["kubernetes"]` | Not applicable | Select the Kubernetes compute driver. |
 | `[openshell.drivers.kubernetes].namespace` | `server.sandboxNamespace` | Set the namespace for sandbox resources. The Helm chart defaults to the release namespace when left empty. |
-| `[openshell.drivers.kubernetes].service_account_name` | `sandboxServiceAccount.name` | Set the Kubernetes service account assigned to sandbox pods and accepted by the Kubernetes driver's TokenReview bootstrap path. The Helm chart creates a dedicated sandbox service account by default. |
-| `[openshell.drivers.kubernetes].enable_user_namespaces` | `server.enableUserNamespaces` | Enable Kubernetes user namespaces for sandbox pods. |
+| `service_account_name` | `sandboxServiceAccount.name` | Set the Kubernetes service account assigned to sandbox pods and accepted by the Kubernetes driver's TokenReview bootstrap path. The Helm chart creates a dedicated sandbox service account by default. |
 | `default_image` | `server.sandboxImage` | Set the default sandbox image. |
-| `image_pull_policy` | `server.sandboxImagePullPolicy` | Set the canonical sandbox pull policy: `always`, `if_not_present`, or `never`. `newer` is Podman-only. |
+| `image_pull_policy` | `server.sandboxImagePullPolicy` | Set the Kubernetes image pull policy for sandbox pods. |
 | `image_pull_secrets` | `server.sandboxImagePullSecrets` | Attach Kubernetes image-pull Secrets to sandbox pods. Managed mode copies these explicitly named Secrets from the configured source namespace into each workspace namespace. In shared and operator modes, the Secrets must already exist in the sandbox namespace. |
 | `[managed_ssh_ingress]` | `networkPolicy.enabled` | In managed mode, create an SSH ingress policy in every workspace namespace. Helm configures the gateway namespace and pod selector automatically. Operator mode leaves namespace policy management to the platform operator. |
-| `grpc_endpoint` | `server.grpcEndpoint` | Set the gateway callback endpoint reachable from sandbox pods. Raw TOML and the standalone Kubernetes driver require an explicit endpoint because the sandbox namespace does not identify the gateway Service. Helm derives it from the release's gateway Service when the value is empty. |
+| `grpc_endpoint` | `server.grpcEndpoint` | Set the gateway callback endpoint reachable from sandbox pods. |
 | `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Mount sandbox client TLS materials from a Kubernetes secret. |
 | `supervisor_image` | `supervisor.image.repository` / `supervisor.image.tag` | Override the supervisor image that provides the `openshell-sandbox` binary. The default repository with an empty tag uses the version-pinned image built into the gateway. Changing the repository uses the effective gateway image tag, while setting a tag pins that version explicitly. |
-| `supervisor_image_pull_policy` | `supervisor.image.pullPolicy` | Set the canonical supervisor pull policy: `always`, `if_not_present`, or `never`. `newer` is Podman-only. |
+| `supervisor_image_pull_policy` | `supervisor.image.pullPolicy` | Set the Kubernetes image pull policy for the supervisor image. |
 | `supervisor_sideload_method` | `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect from cluster version. Set to `image-volume` to mount the supervisor OCI image directly as a volume (requires Kubernetes 1.33+ with the ImageVolume feature gate; GA in 1.36), or `init-container` to copy it through an init container on older clusters. |
 | `topology` | `supervisor.topology` | Set `combined` for the default single supervisor path, or `sidecar` to move pod-level network enforcement and the gateway session into a dedicated sidecar. |
 | `https_proxy` | `upstreamProxy.url` | Set the operator-owned `http://host:port` corporate forward proxy used for policy-approved TLS CONNECT egress. |
@@ -675,7 +613,7 @@ The resolved UID/GID appear in:
 
 ### VM Driver
 
-The VM driver preserves an image-provided `sandbox` account when `sandbox_uid` and `sandbox_gid` are omitted. Images without that account use UID/GID `1000`. Explicit values in `[openshell.drivers.vm]` override the image account. Persisted overlays retain the UID/GID recorded when they were created. An unmarked overlay recovers identity from concrete overlay or prepared-image state, an explicit override, or the current image; the driver never assigns legacy `10001:10001` without persisted evidence.
+The VM driver injects the sandbox UID into the rootfs guest's `/etc/passwd`, `/etc/group`, and `/etc/gshadow` during rootfs preparation. Default UID is `10001`; configure `sandbox_uid` in `[openshell.drivers.vm]` to use a different value.
 
 ### Custom Images
 
