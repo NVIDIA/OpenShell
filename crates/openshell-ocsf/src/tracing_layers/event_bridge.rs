@@ -48,7 +48,9 @@ pub fn emit_ocsf_event(event: OcsfEvent) {
 
 /// Store an `OcsfEvent` in the thread-local bridge so OCSF layers
 /// (`OcsfJsonlLayer` / `OcsfShorthandLayer`) can `clone_current_event()` it
-/// during tracing dispatch. Pair with [`clear_current_event`] after the emit.
+/// during tracing dispatch.
+///
+/// Pair with [`clear_current_event`] after the emit.
 ///
 /// Exposed so callers that need to attach extra tracing fields to the *same*
 /// event (e.g. the gateway's per-sandbox `sandbox_id` routing field — see
@@ -67,7 +69,9 @@ pub fn clear_current_event() {
     });
 }
 
-/// Emit an `OcsfEvent` that is BOTH picked up by the structured OCSF layers
+/// Emit an `OcsfEvent` through the structured and routed output paths.
+///
+/// The event is picked up by the structured OCSF layers
 /// (via the thread-local bridge → `OcsfJsonlLayer` writes full JSON) AND
 /// routed by the gateway's `TracingLogBus` (via the `sandbox_id` + `message`
 /// tracing fields → per-sandbox stream / stdout shorthand).

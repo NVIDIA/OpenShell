@@ -79,16 +79,17 @@ pub fn install(
         }))
         .init();
 
-    match jsonl_dir {
-        Some(dir) => tracing::info!(
+    if let Some(dir) = jsonl_dir {
+        tracing::info!(
             target: "openshell_server",
             ocsf_jsonl_dir = %dir.display(),
             "OCSF JSONL audit log enabled (openshell-ocsf.<date>.log, daily rotation, keep 3)"
-        ),
-        None => tracing::debug!(
+        );
+    } else {
+        tracing::debug!(
             target: "openshell_server",
             "OCSF JSONL audit log disabled"
-        ),
+        );
     }
 
     (
@@ -114,14 +115,12 @@ fn build_ocsf_jsonl_layer() -> (
     Option<OcsfJsonlLayer<tracing_appender::rolling::RollingFileAppender>>,
     Option<std::path::PathBuf>,
 ) {
-    let disabled = std::env::var("OPENSHELL_OCSF_JSON")
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "off" | "no"
-            )
-        })
-        .unwrap_or(false);
+    let disabled = std::env::var("OPENSHELL_OCSF_JSON").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    });
     if disabled {
         return (None, None);
     }
