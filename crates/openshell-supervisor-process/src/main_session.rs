@@ -17,9 +17,21 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio::sync::watch;
 
-use crate::process::ProcessIo;
+use openshell_isolation_interface::contract::{
+    BoundaryProcess, BoundarySignal, BoundaryTerminal, ProcessAttachment,
+};
 
 const OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// Canonical-process I/O retained by the supervisor session multiplexer.
+pub enum ProcessIo {
+    Pty(std::fs::File),
+    Pipes {
+        stdin: tokio::process::ChildStdin,
+        stdout: tokio::process::ChildStdout,
+        stderr: tokio::process::ChildStderr,
+    },
+}
 
 #[derive(Clone, Debug)]
 pub enum MainOutput {
@@ -186,6 +198,8 @@ pub struct MainSession {
     input_owner: Mutex<Option<u64>>,
     next_owner: AtomicU64,
     pty_master: Option<Arc<std::fs::File>>,
+    boundary_process: Option<Arc<dyn BoundaryProcess>>,
+    boundary_terminal: Option<Arc<dyn BoundaryTerminal>>,
     readers_remaining: AtomicUsize,
     readers_done: Notify,
     finished: std::sync::atomic::AtomicBool,
@@ -194,6 +208,7 @@ pub struct MainSession {
 }
 
 impl MainSession {
+    const REMOTE_OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     #[cfg(test)]
     pub fn inert() -> Arc<Self> {
         let (input, _input_rx) = tokio::sync::mpsc::channel(64);
@@ -205,6 +220,8 @@ impl MainSession {
             input_owner: Mutex::new(None),
             next_owner: AtomicU64::new(1),
             pty_master: None,
+            boundary_process: None,
+            boundary_terminal: None,
             readers_remaining: AtomicUsize::new(0),
             readers_done: Notify::new(),
             finished: std::sync::atomic::AtomicBool::new(false),
@@ -256,6 +273,8 @@ impl MainSession {
             input_owner: Mutex::new(None),
             next_owner: AtomicU64::new(1),
             pty_master,
+            boundary_process: None,
+            boundary_terminal: None,
             readers_remaining: AtomicUsize::new(if terminal { 1 } else { 2 }),
             readers_done: Notify::new(),
             finished: std::sync::atomic::AtomicBool::new(false),
@@ -267,6 +286,81 @@ impl MainSession {
             terminal_attachments_done: Notify::new(),
         });
         Self::start_io(&session, io, input_rx);
+        session
+    }
+
+    /// Build the control-side multiplexer around a boundary-owned admitted
+    /// process. Process lifecycle and PTY operations remain delegated to the
+    /// boundary process handle.
+    #[must_use]
+    pub fn from_boundary(
+        attachment: ProcessAttachment,
+        process: Arc<dyn BoundaryProcess>,
+    ) -> Arc<Self> {
+        let ProcessAttachment {
+            stdin,
+            stdout,
+            stderr,
+            terminal,
+        } = attachment;
+        let terminal_mode = terminal.is_some();
+        let (input, mut input_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let session = Arc::new(Self {
+            pid: 0,
+            terminal: terminal_mode,
+            input,
+            output: OutputLog::new(),
+            input_owner: Mutex::new(None),
+            next_owner: AtomicU64::new(1),
+            pty_master: None,
+            boundary_process: Some(process),
+            boundary_terminal: terminal,
+            readers_remaining: AtomicUsize::new(if terminal_mode { 1 } else { 2 }),
+            readers_done: Notify::new(),
+            finished: std::sync::atomic::AtomicBool::new(false),
+            terminal_attachments: Mutex::new(TerminalAttachmentState {
+                active: 0,
+                process_finished: false,
+                expectation: AttachmentExpectation::None,
+            }),
+            terminal_attachments_done: Notify::new(),
+        });
+        let stdout_session = Arc::clone(&session);
+        tokio::spawn(async move {
+            let mut stdout = stdout;
+            let mut buffer = [0u8; 4096];
+            loop {
+                match stdout.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => stdout_session
+                        .publish(MainOutput::Stdout(Bytes::copy_from_slice(&buffer[..read]))),
+                }
+            }
+            stdout_session.reader_finished();
+        });
+        if let Some(mut stderr) = stderr {
+            let stderr_session = Arc::clone(&session);
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 4096];
+                loop {
+                    match stderr.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => stderr_session
+                            .publish(MainOutput::Stderr(Bytes::copy_from_slice(&buffer[..read]))),
+                    }
+                }
+                stderr_session.reader_finished();
+            });
+        }
+        tokio::spawn(async move {
+            let mut stdin = stdin;
+            while let Some(data) = input_rx.recv().await {
+                if stdin.write_all(&data).await.is_err() {
+                    break;
+                }
+                let _ = stdin.flush().await;
+            }
+        });
         session
     }
 
@@ -380,10 +474,39 @@ impl MainSession {
     ///
     /// Returns whether terminal delivery must complete before shutdown.
     pub async fn finish(&self, exit_code: i32, attachment_expected: bool) -> bool {
+        self.wait_for_output_readers().await;
+        self.complete_finish(exit_code, attachment_expected)
+    }
+
+    /// Finish a remotely owned process without allowing descendants that keep
+    /// inherited output descriptors open to block terminal publication forever.
+    pub async fn finish_remote(&self, exit_code: i32, attachment_expected: bool) -> bool {
+        self.finish_remote_with_timeout(
+            exit_code,
+            attachment_expected,
+            Self::REMOTE_OUTPUT_DRAIN_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn finish_remote_with_timeout(
+        &self,
+        exit_code: i32,
+        attachment_expected: bool,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let _ = tokio::time::timeout(timeout, self.wait_for_output_readers()).await;
+        self.complete_finish(exit_code, attachment_expected)
+    }
+
+    async fn wait_for_output_readers(&self) {
         let notified = self.readers_done.notified();
         if self.readers_remaining.load(Ordering::Acquire) != 0 {
             notified.await;
         }
+    }
+
+    fn complete_finish(&self, exit_code: i32, attachment_expected: bool) -> bool {
         let delivery_pending = {
             let mut state = self
                 .terminal_attachments
@@ -408,6 +531,23 @@ impl MainSession {
 
     pub fn subscribe(&self) -> MainOutputCursor {
         self.output.subscribe()
+    }
+
+    /// Return the bounded output sequence range currently retained for a
+    /// replacement supervisor. A nonzero first sequence is an explicit
+    /// truncation watermark rather than silent data loss.
+    #[must_use]
+    pub fn output_window(&self) -> (u64, u64, bool) {
+        let state = self
+            .output
+            .state
+            .lock()
+            .expect("main output log lock poisoned");
+        let first_sequence = state
+            .events
+            .front()
+            .map_or(state.next_sequence, |event| event.sequence);
+        (first_sequence, state.next_sequence, first_sequence != 0)
     }
 
     /// Wait until the gateway durably acknowledges the main-process result.
@@ -499,7 +639,16 @@ impl MainSession {
         }
     }
 
-    pub fn resize(&self, columns: u32, rows: u32, pixel_width: u32, pixel_height: u32) {
+    pub async fn resize(&self, columns: u32, rows: u32, pixel_width: u32, pixel_height: u32) {
+        if let Some(terminal) = self.boundary_terminal.as_ref() {
+            let _ = terminal
+                .resize(
+                    u16::try_from(columns.max(1)).unwrap_or(u16::MAX),
+                    u16::try_from(rows.max(1)).unwrap_or(u16::MAX),
+                )
+                .await;
+            return;
+        }
         let Some(master) = self.pty_master.as_ref() else {
             return;
         };
@@ -515,9 +664,23 @@ impl MainSession {
         }
     }
 
-    pub fn signal_group(&self, signal: nix::sys::signal::Signal) -> Result<(), nix::errno::Errno> {
+    pub async fn signal_group(&self, signal: nix::sys::signal::Signal) -> Result<(), String> {
+        if let Some(process) = self.boundary_process.as_ref() {
+            let signal = match signal {
+                nix::sys::signal::Signal::SIGHUP => BoundarySignal::Hup,
+                nix::sys::signal::Signal::SIGINT => BoundarySignal::Int,
+                nix::sys::signal::Signal::SIGKILL => BoundarySignal::Kill,
+                nix::sys::signal::Signal::SIGTERM => BoundarySignal::Term,
+                other => return Err(format!("boundary signal {other:?} is unsupported")),
+            };
+            return process
+                .signal(signal)
+                .await
+                .map_err(|error| error.to_string());
+        }
         let pid = i32::try_from(self.pid).unwrap_or(i32::MAX);
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(-pid), signal)
+            .map_err(|error| error.to_string())
     }
 
     #[must_use]
@@ -544,6 +707,83 @@ fn set_nonblocking(file: &std::fs::File) -> Result<(), nix::errno::Errno> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_isolation_interface::contract::{
+        BackendError, BoundaryExitStatus, BoundaryInput, BoundaryOutput,
+    };
+
+    struct TestBoundaryProcess {
+        signals: Mutex<Vec<BoundarySignal>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BoundaryProcess for TestBoundaryProcess {
+        async fn wait(&self) -> Result<BoundaryExitStatus, BackendError> {
+            Ok(BoundaryExitStatus::Exited(0))
+        }
+
+        async fn signal(&self, signal: BoundarySignal) -> Result<(), BackendError> {
+            self.signals.lock().unwrap().push(signal);
+            Ok(())
+        }
+
+        async fn terminate(&self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    struct TestBoundaryTerminal {
+        size: Mutex<Option<(u16, u16)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BoundaryTerminal for TestBoundaryTerminal {
+        async fn resize(&self, cols: u16, rows: u16) -> Result<(), BackendError> {
+            *self.size.lock().unwrap() = Some((cols, rows));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn boundary_attachment_drives_main_io_signal_and_terminal() {
+        let (stdin, mut stdin_peer) = tokio::io::duplex(1024);
+        let (stdout, mut stdout_peer) = tokio::io::duplex(1024);
+        let process = Arc::new(TestBoundaryProcess {
+            signals: Mutex::new(Vec::new()),
+        });
+        let terminal = Arc::new(TestBoundaryTerminal {
+            size: Mutex::new(None),
+        });
+        let stdin: BoundaryInput = Box::new(stdin);
+        let stdout: BoundaryOutput = Box::new(stdout);
+        let attachment = ProcessAttachment {
+            stdin,
+            stdout,
+            stderr: None,
+            terminal: Some(terminal.clone()),
+        };
+        let session = MainSession::from_boundary(attachment, process.clone());
+        let mut output = session.subscribe();
+
+        stdout_peer.write_all(b"ready\n").await.unwrap();
+        assert!(matches!(
+            output.recv().await.unwrap(),
+            MainOutput::Stdout(data) if data == b"ready\n"[..]
+        ));
+
+        let (_owner, input) = session.acquire_input().unwrap();
+        input.send(b"hello\n".to_vec()).await.unwrap();
+        let mut received = [0_u8; 6];
+        stdin_peer.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"hello\n");
+
+        session.resize(120, 40, 0, 0).await;
+        assert_eq!(*terminal.size.lock().unwrap(), Some((120, 40)));
+        session
+            .signal_group(nix::sys::signal::Signal::SIGINT)
+            .await
+            .unwrap();
+        assert_eq!(*process.signals.lock().unwrap(), vec![BoundarySignal::Int]);
+    }
 
     #[test]
     fn input_lease_has_one_owner_and_can_be_reacquired() {
@@ -630,6 +870,27 @@ mod tests {
         )
         .await
         .expect("closing the attachment should wake the waiter");
+    }
+
+    #[tokio::test]
+    async fn remote_finish_bounds_output_drain_before_publishing_exit() {
+        let mut session = MainSession::inert();
+        Arc::get_mut(&mut session)
+            .expect("sole test session reference")
+            .readers_remaining = AtomicUsize::new(1);
+        let mut output = session.subscribe();
+
+        session
+            .finish_remote_with_timeout(19, false, std::time::Duration::from_millis(10))
+            .await;
+
+        assert!(matches!(
+            output
+                .recv()
+                .await
+                .expect("terminal status after bounded drain"),
+            MainOutput::Exit(19)
+        ));
     }
 
     #[tokio::test]

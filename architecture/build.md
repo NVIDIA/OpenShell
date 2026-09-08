@@ -47,8 +47,7 @@ Cargo cannot subtract a single default feature, so each of the three binary
 crates also defines a `defaults-without-telemetry` alias listing every default
 except `telemetry`. Telemetry-free builds use
 `--no-default-features --features defaults-without-telemetry` and stay correct
-as the default set grows, instead of dropping unrelated defaults the way a bare
-`--no-default-features` does on `openshell-sandbox`. The alias is a keep-list,
+as the default set grows. The alias is a keep-list,
 not a switch: enabling it on top of the defaults would otherwise yield a
 telemetry-on binary that reads as telemetry-free, so each crate root carries a
 `compile_error!` for the `telemetry` + `defaults-without-telemetry` combination.
@@ -63,7 +62,7 @@ roots through `webpki-roots` plus locally-installed CAs from the system bundle.
 Building without `bundled-ca-roots` switches to the platform trust store via
 `rustls-native-certs` and excludes bundled Mozilla root crates such as
 `webpki-roots` and `webpki-root-certs` from the dependency graph. The
-`system-ca-roots` feature alias on `openshell-sandbox` includes all other
+`system-ca-roots` feature alias on `openshell-supervisor` includes all other
 defaults (currently `telemetry`) except `bundled-ca-roots`, so Linux
 distribution builds (e.g. RPM) can use
 `--no-default-features --features system-ca-roots` without manually re-adding
@@ -196,13 +195,12 @@ Runtime layout:
   cache action runs. An explicitly configured VM runtime bundle is required to
   contain every non-empty embedding input; the driver build fails before
   packaging when an input is absent or empty.
-- **Supervisor**: Alpine base with `nftables`, static binary at
-  `/openshell-sandbox` (musl by default; see `SUPERVISOR_LIBC` above). Static
-  linkage keeps the binary usable when the image is mounted/extracted into
-  sandbox environments (Docker extraction, Podman image volumes, Kubernetes
-  init-container copy-self), whose libc and glibc version are not known at build
-  time, while `nftables` supports Kubernetes supervisor sidecar egress
-  enforcement. The VM driver bundles its own supervisor build
+- **Sandbox and supervisor**: Alpine base with separate static
+  `/openshell-sandbox` and `/openshell-supervisor` binaries (musl by default;
+  see `SUPERVISOR_LIBC` above). Static linkage keeps the sandbox executable
+  usable when a driver stages it into an arbitrary workload image. The image
+  entrypoint is the external supervisor; drivers copy only the sandbox binary
+  into the workload trust domain. The VM driver bundles both builds
   (`tasks/scripts/vm/build-supervisor-bundle.sh`) and does not read
   `SUPERVISOR_LIBC`.
 

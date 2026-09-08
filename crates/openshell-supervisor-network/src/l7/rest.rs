@@ -3301,16 +3301,30 @@ fn parse_status_code(headers: &str) -> Option<u16> {
     code_str.parse().ok()
 }
 
-/// Check if the response headers contain `Connection: close`.
+/// Check whether the response is delimited by closing the connection.
+///
+/// HTTP/1.0 closes by default unless the server explicitly negotiates
+/// keep-alive. HTTP/1.1 keeps connections alive by default unless the server
+/// sends `Connection: close`.
 fn parse_connection_close(headers: &str) -> bool {
+    let http_1_0 = headers
+        .lines()
+        .next()
+        .is_some_and(|line| line.starts_with("HTTP/1.0 "));
     for line in headers.lines().skip(1) {
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("connection:") {
             let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
-            return val.contains("close");
+            return if http_1_0 {
+                !val.split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("keep-alive"))
+            } else {
+                val.split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("close"))
+            };
         }
     }
-    false
+    http_1_0
 }
 
 fn response_is_event_stream(headers: &str) -> bool {
@@ -5477,6 +5491,10 @@ mod tests {
         assert!(!parse_connection_close(
             "HTTP/1.1 200 OK\r\nHost: x\r\n\r\n"
         ));
+        assert!(parse_connection_close("HTTP/1.0 200 OK\r\nHost: x\r\n\r\n"));
+        assert!(!parse_connection_close(
+            "HTTP/1.0 200 OK\r\nConnection: keep-alive\r\n\r\n"
+        ));
     }
 
     #[test]
@@ -5546,6 +5564,41 @@ mod tests {
         assert!(
             received_str.contains("hello world"),
             "body should be forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_response_http_1_0_defaults_to_connection_close() {
+        let response = b"HTTP/1.0 200 OK\r\nServer: test\r\n\r\nhello world";
+        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+
+        tokio::spawn(async move {
+            upstream_write.write_all(response).await.unwrap();
+            upstream_write.shutdown().await.unwrap();
+        });
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            relay_response(
+                "POST",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
+        )
+        .await
+        .expect("HTTP/1.0 close-delimited response should not deadlock")
+        .expect("HTTP/1.0 response should relay");
+        assert!(matches!(outcome, RelayOutcome::Consumed));
+
+        client_write.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        client_read.read_to_end(&mut received).await.unwrap();
+        assert!(
+            received
+                .windows(b"hello world".len())
+                .any(|value| value == b"hello world")
         );
     }
 

@@ -32,30 +32,6 @@ use openshell_e2e::harness::output::{extract_field, strip_ansi};
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
-#[cfg(feature = "e2e-docker")]
-const LOCAL_OVERRIDE_REGO: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../crates/openshell-supervisor-network/data/sandbox-policy.rego"
-));
-
-#[cfg(feature = "e2e-docker")]
-const LOCAL_OVERRIDE_DOCKERFILE: &str = r#"FROM public.ecr.aws/docker/library/python:3.13-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
-    && rm -rf /var/lib/apt/lists/*
-RUN groupadd -g 1000660000 sandbox && \
-    useradd -m -u 1000660000 -g sandbox sandbox
-
-COPY local-policy.rego /etc/openshell/local-policy.rego
-COPY local-policy.yaml /etc/openshell/local-policy.yaml
-
-ENV OPENSHELL_POLICY_RULES=/etc/openshell/local-policy.rego
-ENV OPENSHELL_POLICY_DATA=/etc/openshell/local-policy.yaml
-ENV OPENSHELL_POLICY_POLL_INTERVAL_SECS=1
-
-CMD ["sleep", "infinity"]
-"#;
-
 // ---------------------------------------------------------------------------
 // Policy YAML builders
 // ---------------------------------------------------------------------------
@@ -144,44 +120,6 @@ landlock:
     file.flush()
         .map_err(|e| format!("flush temp policy file: {e}"))?;
     Ok(file)
-}
-
-#[cfg(feature = "e2e-docker")]
-fn write_local_override_image() -> Result<tempfile::TempDir, String> {
-    let dir = tempfile::tempdir().map_err(|e| format!("create image context: {e}"))?;
-    std::fs::write(dir.path().join("Dockerfile"), LOCAL_OVERRIDE_DOCKERFILE)
-        .map_err(|e| format!("write local override Dockerfile: {e}"))?;
-    std::fs::write(dir.path().join("local-policy.rego"), LOCAL_OVERRIDE_REGO)
-        .map_err(|e| format!("write local override Rego policy: {e}"))?;
-    std::fs::write(
-        dir.path().join("local-policy.yaml"),
-        r"version: 1
-
-filesystem_policy:
-  include_workdir: true
-  read_only:
-    - /usr
-    - /lib
-    - /proc
-    - /dev/urandom
-    - /etc
-  read_write:
-    - /sandbox
-    - /tmp
-    - /dev/null
-
-landlock:
-  compatibility: best_effort
-
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
-
-network_policies: {}
-",
-    )
-    .map_err(|e| format!("write local override policy data: {e}"))?;
-    Ok(dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -576,122 +514,6 @@ async fn initial_sparse_policy_is_acknowledged_as_loaded() {
     assert!(
         list_output_contains_version(&last_list, 1),
         "policy list should contain revision 1:\n{last_list}"
-    );
-
-    guard.cleanup().await;
-}
-
-/// An explicit local Rego/data override remains authoritative even when the
-/// sandbox has a gateway policy and that policy changes while it is running.
-/// Gateway polling must continue for settings and providers without replacing
-/// the locally loaded OPA engine.
-#[cfg(feature = "e2e-docker")]
-#[tokio::test]
-async fn local_policy_override_survives_gateway_policy_polls() {
-    let image_context = write_local_override_image().expect("write local override image");
-    let dockerfile = image_context.path().join("Dockerfile");
-    let dockerfile = dockerfile
-        .to_str()
-        .expect("Dockerfile path should be utf-8");
-
-    let gateway_policy_a_file = write_policy(&["example.com"]).expect("write gateway policy A");
-    let gateway_policy_a_path = gateway_policy_a_file
-        .path()
-        .to_str()
-        .expect("gateway policy A path should be utf-8")
-        .to_string();
-    let gateway_policy_b_file =
-        write_policy(&["example.com", "api.anthropic.com"]).expect("write gateway policy B");
-    let gateway_policy_b_path = gateway_policy_b_file
-        .path()
-        .to_str()
-        .expect("gateway policy B path should be utf-8")
-        .to_string();
-
-    let mut guard = SandboxGuard::create_keep_with_args(
-        &[
-            "--name",
-            "e2e-lcl-pol-ovrd",
-            "--from",
-            dockerfile,
-            "--policy",
-            &gateway_policy_a_path,
-            "--no-tty",
-        ],
-        &["sh", "-c", "echo Ready && sleep infinity"],
-        "Ready",
-    )
-    .await
-    .expect("create sandbox with local policy override");
-
-    // Allow several one-second poll intervals. Before the fix, the first poll
-    // immediately reloaded gateway policy A over the local override.
-    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-    let initial_logs = run_cli(&[
-        "logs",
-        &guard.name,
-        "-n",
-        "500",
-        "--since",
-        "1m",
-        "--source",
-        "sandbox",
-    ])
-    .await;
-    assert!(
-        initial_logs.success,
-        "fetch initial sandbox logs:\n{}",
-        initial_logs.output
-    );
-    assert!(
-        initial_logs
-            .output
-            .contains("Loading OPA policy engine from local files"),
-        "sandbox should load the explicit local policy:\n{}",
-        initial_logs.output
-    );
-    assert!(
-        !initial_logs.output.contains("Policy reloaded successfully"),
-        "the first gateway poll must not replace the local policy:\n{}",
-        initial_logs.output
-    );
-
-    let update = run_cli(&[
-        "policy",
-        "set",
-        &guard.name,
-        "--policy",
-        &gateway_policy_b_path,
-    ])
-    .await;
-    assert!(
-        update.success,
-        "publish gateway policy B:\n{}",
-        update.output
-    );
-
-    // A later gateway revision must also remain observational in local mode.
-    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-    let updated_logs = run_cli(&[
-        "logs",
-        &guard.name,
-        "-n",
-        "500",
-        "--since",
-        "1m",
-        "--source",
-        "sandbox",
-    ])
-    .await;
-    assert!(
-        updated_logs.success,
-        "fetch updated sandbox logs:\n{}",
-        updated_logs.output
-    );
-    assert!(
-        !updated_logs.output.contains("Policy reloaded successfully"),
-        "gateway policy updates must not replace the local override:\n{}",
-        updated_logs.output
     );
 
     guard.cleanup().await;

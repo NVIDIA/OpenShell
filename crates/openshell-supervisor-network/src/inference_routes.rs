@@ -107,6 +107,22 @@ pub async fn build_inference_context(
     openshell_endpoint: Option<&str>,
     inference_routes: Option<&str>,
 ) -> Result<Option<Arc<crate::proxy::InferenceContext>>> {
+    build_inference_context_with_host_gateway(
+        sandbox_id,
+        openshell_endpoint,
+        inference_routes,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::similar_names)]
+pub async fn build_inference_context_with_host_gateway(
+    sandbox_id: Option<&str>,
+    openshell_endpoint: Option<&str>,
+    inference_routes: Option<&str>,
+    host_gateway_ip: Option<std::net::IpAddr>,
+) -> Result<Option<Arc<crate::proxy::InferenceContext>>> {
     use openshell_router::Router;
     use openshell_router::config::RouterConfig;
 
@@ -250,13 +266,18 @@ pub async fn build_inference_context(
     // Partition routes by name into user-facing and system caches.
     let (user_routes, system_routes) = partition_routes(routes);
 
-    let router =
-        Router::new().map_err(|e| miette::miette!("failed to initialize inference router: {e}"))?;
+    let inference_router = Router::with_dns_overrides(host_gateway_ip.into_iter().flat_map(|ip| {
+        crate::proxy::HOST_GATEWAY_ALIASES
+            .iter()
+            .copied()
+            .map(move |host| (host, ip))
+    }))
+    .map_err(|e| miette::miette!("failed to initialize inference router: {e}"))?;
     let patterns = crate::l7::inference::default_patterns();
 
     let ctx = Arc::new(crate::proxy::InferenceContext::new(
         patterns,
-        router,
+        inference_router,
         user_routes,
         system_routes,
     ));

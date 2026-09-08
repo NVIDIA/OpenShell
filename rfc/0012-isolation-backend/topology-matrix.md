@@ -6,18 +6,29 @@ kernel; it does not select a deployment or establish conformance.
 
 ## Representative placements
 
-| Pattern | Logical supervisor and network-mediation placement | Backend placement | Workload-kernel relationship | Topology status |
+| Pattern | Control and network-mediation placement | Boundary-mode placement | Workload-kernel relationship | Topology status |
 |---|---|---|---|---|
-| **Co-located/in-pod** | With the workload | In the supervisor process | Trusted components share the workload's host, guest, or application kernel, depending on the runtime | Placement implemented (original topology) |
-| **Same-pod composite** | Spans the workload-local supervisor process and, when used, a network-mediation sidecar | In the workload-local supervisor process | Components share the workload's kernel | Placement implemented (#2076) |
-| **Delegated backend components** | With the workload and any delegated mediation component | A node or remote helper establishes some controls behind a workload-local backend | Depends on which trusted components remain with the workload | Placement proposed (#2606) |
-| **Driver-hosted/shared service** | With the compute driver or another trusted service; no in-sandbox supervisor process is required | May be co-located with the logical supervisor; one host may operate many isolated boundaries | Depends on the workload runtime | Placement proposed |
+| **Co-located/in-pod** | With the workload; the legacy in-process backend may omit boundary mode | Same process when used | Trusted components share the workload's host kernel | Placement implemented (original topology) |
+| **Kubernetes proxy pod** | Trusted control pod | Boundary-mode workload entrypoint owning the workload PID and network namespaces | Shared cluster-node kernel; pod security boundaries separate control from workload | Implemented in #3144; requires a conforming NetworkPolicy CNI and trusted namespace |
+| **Docker** | Gateway host | Trusted container entrypoint sharing the workload container's PID and network namespaces | Shared host kernel | Implemented in #2965 |
+| **MicroVM** | Gateway host | Guest PID 1 | Boundary mode shares the guest kernel; control is kernel-separated | Implemented in #2945 |
+
+The Kubernetes proxy-pod topology uses the same boundary protocol as Docker and
+VM, with per-boundary TLS because the connection traverses the pod network.
+Kubernetes-specific code provisions the workload fence, pair labels, boundary
+Service, control Deployment, immutable bootstrap Secret, and stable
+namespace/Sandbox/Deployment/NetworkPolicy claims. The workload pod has no
+direct egress; attributed proxy streams cross the TLS channel and hostname
+resolution occurs on the control side. Admission requires an explicitly acknowledged conforming CNI and a
+namespace in which untrusted principals cannot create pods, mutate pair labels,
+or read bootstrap Secrets. Pod readiness or the existence of a `NetworkPolicy`
+object alone does not prove enforcement.
 
 ## Durable rules
 
 - Every active boundary has one verified descriptor, one trusted
-  `SandboxContext`, and at most one logical supervisor, which may span multiple
-  coupled processes.
+  `SandboxContext`, one control role, and at most one boundary role. Those
+  processes form one logical supervisor.
 - Physical processes and listeners may be shared, but lifecycle state, policy,
   binary identity, enforcement, and cleanup remain isolated per boundary.
 - Moving a privileged component does not itself provide kernel separation.

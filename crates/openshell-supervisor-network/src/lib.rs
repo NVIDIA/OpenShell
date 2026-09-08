@@ -9,6 +9,7 @@
 //! aggregate them.
 
 pub mod identity;
+pub mod identity_source;
 pub mod inference_routes;
 pub mod l7;
 pub mod opa;
@@ -18,6 +19,7 @@ pub mod procfs;
 pub mod proxy;
 pub mod run;
 pub mod sigv4;
+mod spiffe_endpoint;
 mod token_grant;
 pub mod upstream_proxy;
 

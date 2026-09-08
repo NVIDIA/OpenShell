@@ -557,27 +557,13 @@ fn body_client_script(port: u16) -> String {
         r#"
 import os
 import socket
-import urllib.parse
 
 host = {TEST_HOST:?}
 port = {port}
 token = os.environ[{TOKEN_ENV:?}]
-proxy_url = next(os.environ[name] for name in
-                 ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
-                 if os.environ.get(name))
-proxy = urllib.parse.urlparse(proxy_url)
 
-with socket.create_connection((proxy.hostname, proxy.port or 80), timeout=10) as sock:
+with socket.create_connection((host, port), timeout=10) as sock:
     target = f"{{host}}:{{port}}"
-    sock.sendall(f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode("ascii"))
-    response = b""
-    while b"\r\n\r\n" not in response:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        response += chunk
-    if not response.startswith(b"HTTP/1.1 200"):
-        raise RuntimeError("CONNECT failed")
     body = ("prefix-" + token + "-suffix").encode("utf-8")
     request = (
         f"POST /token HTTP/1.1\r\nHost: {{target}}\r\n"
@@ -606,14 +592,9 @@ import base64
 import os
 import socket
 import struct
-import urllib.parse
 
 host = {TEST_HOST:?}
 port = {port}
-proxy_url = next(os.environ[name] for name in
-                 ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
-                 if os.environ.get(name))
-proxy = urllib.parse.urlparse(proxy_url)
 
 def recv_until(sock, marker):
     data = b""
@@ -633,11 +614,8 @@ def recv_exact(sock, size):
         data += chunk
     return data
 
-with socket.create_connection((proxy.hostname, proxy.port or 80), timeout=10) as sock:
+with socket.create_connection((host, port), timeout=10) as sock:
     target = f"{{host}}:{{port}}"
-    sock.sendall(f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode("ascii"))
-    if not recv_until(sock, b"\r\n\r\n").startswith(b"HTTP/1.1 200"):
-        raise RuntimeError("CONNECT failed")
     key = base64.b64encode(os.urandom(16)).decode("ascii")
     request = (
         f"GET /ws HTTP/1.1\r\nHost: {{target}}\r\n"

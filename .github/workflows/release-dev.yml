@@ -145,6 +145,7 @@ jobs:
     with:
       component: supervisor
       binary: openshell-sandbox
+      additional-binary: openshell-supervisor
       target-suffix: unknown-linux-musl
     secrets: inherit
 

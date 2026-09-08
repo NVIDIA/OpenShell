@@ -3,7 +3,7 @@
 
 //! Login-shell resolution for sandbox images.
 //!
-//! The default sandbox command and the interactive SSH session need a shell,
+//! The default sandbox command and interactive SSH sessions need a shell,
 //! but not every base image ships the same one. Debian-based images provide
 //! `bash`; minimal images such as Alpine only provide `/bin/sh` (`BusyBox`
 //! `ash`). Hard-coding `/bin/bash` makes sandbox startup fail on those images
@@ -51,8 +51,9 @@ pub fn is_executable(path: &str) -> bool {
 /// Resolve a login shell that exists in the current root filesystem.
 ///
 /// Tries [`SHELL_CANDIDATES`] in order and falls back to [`POSIX_SH`]. Because
-/// this inspects the filesystem, call it from the supervisor (inside the
-/// sandbox), never on the gateway.
+/// this inspects the filesystem, call it from the sandbox boundary or another
+/// process inside the workload filesystem, never from the external supervisor
+/// or gateway.
 ///
 /// `$SHELL` is intentionally not consulted: it is image/user-controlled, the
 /// result is later invoked with `-lc`, and an executable that is not a
