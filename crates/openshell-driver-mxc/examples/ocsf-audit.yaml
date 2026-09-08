@@ -3,9 +3,9 @@
 
 # ocsf-audit.yaml — sandbox policy for the MXC ETW -> OCSF audit-trail example.
 #
-# Minimal filesystem policy granting the shared host folder read-write; everything
-# else is default-deny. The granted path MUST match `share_dir` /
-# OPENSHELL_MXC_SHARE_DIR in mxc-ocsf-audit.toml.
+# Minimal filesystem policy granting the workload folder read-write; everything
+# else is default-deny. run-ocsf-audit.ps1 copies this policy into the result
+# bundle and replaces the default grant with -ShareDir for that run.
 #
 # No network_policies block is needed here: the per-sandbox egress proxy is driven
 # by `egress_proxy = true` in mxc-ocsf-audit.toml (that is what makes MXC emit the

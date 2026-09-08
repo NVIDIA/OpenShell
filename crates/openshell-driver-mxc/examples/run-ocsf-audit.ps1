@@ -34,7 +34,7 @@
 param(
   # Real wxc-exec on the test box.
   [string] $WxcExecPath  = "C:\mxc-kit\bin\wxc-exec.exe",
-  # Host folder mapped read-write into the sandbox (must match ocsf-audit.yaml).
+  # Host folder granted read-write in the disposable sandbox policy.
   [string] $ShareDir     = "C:\work\openshell-mxc-demo",
   # How many sandboxes to create (each drives a full event burst).
   [int]    $SandboxCount = 2,
@@ -73,9 +73,11 @@ function Bad([string]$m)  { Write-Host "[FAIL] $m" -ForegroundColor Red }
 
 $gateway = Join-Path $here "openshell-gateway.exe"
 $cli     = Join-Path $here "openshell.exe"
-$policy  = Join-Path $here "ocsf-audit.yaml"
+$policySrc = Join-Path $here "ocsf-audit.yaml"
+$policy    = Join-Path $resultDir "ocsf-audit.used.yaml"   # disposable policy matching -ShareDir
 $tomlSrc = Join-Path $here "mxc-ocsf-audit.toml"
 $toml    = Join-Path $resultDir "mxc-ocsf-audit.used.toml"   # disposable patched copy (bundled)
+$helloPath = Join-Path $ShareDir "hello.txt"
 
 $gw       = $null
 $passed   = $true
@@ -84,7 +86,7 @@ $proxyOn  = -not $NoProxy
 try {
   # 1. Validate artifacts + privilege.
   Step "Validate package artifacts"
-  foreach ($f in @($gateway, $cli, $policy, $tomlSrc)) {
+  foreach ($f in @($gateway, $cli, $policySrc, $tomlSrc)) {
     if (-not (Test-Path $f)) { throw "missing artifact: $f (run this script from inside the package folder)" }
     Info "found $(Split-Path $f -Leaf)"
   }
@@ -105,8 +107,9 @@ try {
   }
   Info "wxc-exec: $WxcExecPath"
 
-  # 2. Patch the disposable TOML copy: wxc path + backend + etw_audit + egress.
-  Step "Patch gateway config (disposable copy)"
+  # 2. Patch the disposable gateway config and derive a sandbox policy whose
+  #    filesystem grant matches -ShareDir.
+  Step "Prepare gateway config and sandbox policy (disposable copies)"
   $tomlText = Get-Content $tomlSrc -Raw
   $escaped  = $WxcExecPath.Replace('\', '\\')
   $tomlText = [regex]::Replace($tomlText, '(?m)^\s*#?\s*wxc_exec_path\s*=.*$', "wxc_exec_path = `"$escaped`"")
@@ -123,8 +126,36 @@ try {
     $tomlText = [regex]::Replace($tomlText, '(?m)^\[openshell\.drivers\.mxc\]\s*$', "[openshell.drivers.mxc]`r`negress_proxy = $proxyVal")
   }
   Set-Content $toml -Value $tomlText -Encoding UTF8
-  Copy-Item $policy (Join-Path $resultDir "ocsf-audit.used.yaml") -Force
+
+  $shareDirPolicy = $ShareDir.Replace('\', '/')
+  $shareDirJson = ConvertTo-Json $shareDirPolicy -Compress
+  $policyText = Get-Content $policySrc -Raw
+  $defaultGrant = '    - "C:/work/openshell-mxc-demo"'
+  if (-not $policyText.Contains($defaultGrant)) {
+    throw "policy template does not contain the expected default ShareDir grant"
+  }
+  $policyText = $policyText.Replace($defaultGrant, "    - $shareDirJson")
+  Set-Content $policy -Value $policyText -Encoding UTF8
+
+  $cmdExe = Join-Path $env:SystemRoot "System32\cmd.exe"
+  if (-not (Test-Path $cmdExe -PathType Leaf)) { throw "cmd.exe not found at '$cmdExe'" }
+  $helloPathCommand = $helloPath.Replace('\', '/')
+  $driverConfig = @{
+    mxc = @{
+      command = @($cmdExe, "/c", "echo hello from openshell ocsf audit 1>`"$helloPathCommand`"")
+      cwd = $shareDirPolicy
+    }
+  } | ConvertTo-Json -Compress -Depth 4
+  # Windows PowerShell 5.1 strips embedded quotes when constructing a native
+  # command line. Escape them so openshell.exe receives valid JSON.
+  $driverConfigArg = if ($PSVersionTable.PSVersion.Major -lt 7) {
+    $driverConfig.Replace('"', '\"')
+  } else {
+    $driverConfig
+  }
+
   Info "backend=process_container  etw_audit=true  egress_proxy=$proxyVal"
+  Info "workload cwd=$shareDirPolicy  policy grant=$shareDirPolicy"
 
   # 3. Port must be free. Auto-clear a stale OUR-gateway; refuse anything else.
   Step "Check gateway port $Port is free"
@@ -151,12 +182,11 @@ try {
 
   # 5. Prepare share folder.
   New-Item -ItemType Directory -Force $ShareDir | Out-Null
-  Remove-Item (Join-Path $ShareDir "hello.txt") -Force -ErrorAction SilentlyContinue
+  Remove-Item $helloPath -Force -ErrorAction SilentlyContinue
 
   # 6. Gateway environment. Enable the durable OCSF JSONL audit sink and point it
   #    at THIS run's dir so the log lands directly in the bundle.
   $env:OPENSHELL_DRIVERS       = "mxc"
-  $env:OPENSHELL_MXC_SHARE_DIR = $ShareDir
   $env:OPENSHELL_WXC_EXEC_PATH = $WxcExecPath
   $env:OPENSHELL_OCSF_JSON     = "1"
   $env:OPENSHELL_OCSF_LOG_DIR  = $resultDir
@@ -201,7 +231,7 @@ try {
   for ($i = 1; $i -le $SandboxCount; $i++) {
     $name = "ocsf$i"
     Info "-- creating $name --"
-    try { & $cli sandbox create --name $name --policy $policy --no-tty -- exit 2>&1 | ForEach-Object { Info $_ } }
+    try { & $cli sandbox create --name $name --policy $policy --driver-config-json $driverConfigArg --no-tty 2>&1 | ForEach-Object { Info $_ } }
     catch { Info "sandbox create attach: $($_.Exception.Message) (expected on MXC - agent ran in-driver; continuing)" }
     Start-Sleep -Seconds 3
     try { & $cli sandbox delete $name 2>&1 | Out-Null } catch {}
@@ -285,7 +315,8 @@ finally {
   $coreObserved     = @($coreEvents.Values   | Where-Object { $_ }).Count
   $findingsObserved = @($findingEvents.Values | Where-Object { $_ }).Count
   $classesSeen      = @($classCounts.Keys | Where-Object { $classCounts[$_] -gt 0 }).Count
-  if ($passed) { $passed = $consumerStarted -and ($jsonlCount -gt 0) -and ($jsonlBad -eq 0) -and ($coreObserved -eq $coreExpected) }
+  $workloadCompleted = Test-Path $helloPath -PathType Leaf
+  if ($passed) { $passed = $consumerStarted -and $workloadCompleted -and ($jsonlCount -gt 0) -and ($jsonlBad -eq 0) -and ($coreObserved -eq $coreExpected) }
 
   $verdict      = if ($passed) { "PASS" } else { "FAIL" }
   $classLines   = foreach ($uid in @(6002, 5019, 1007, 2004)) { "  [{0}] {1,-28} : {2}" -f $uid, $classNames[$uid], $classCounts[$uid] }
@@ -302,6 +333,7 @@ user             : $env:USERNAME   (admin=$admin  perfLogUsers=$plu)
 verdict          : $verdict
 event coverage   : $coreObserved of $coreExpected expected event types fired   (+ $findingsObserved anomaly finding(s))
 proxy            : $(if ($proxyOn) { 'on (full event set)' } else { 'off (-NoProxy; omits egress proxy event)' })
+workload output  : $(if ($workloadCompleted) { $helloPath } else { '(missing)' })
 wxc_exec         : $WxcExecPath
 backend          : process_container
 gateway_port     : $Port

@@ -9,9 +9,9 @@
 # Detection Finding [2004] — written to a durable JSONL log, just like the Linux
 # OCSF pipeline.
 #
-# run-ocsf-audit.ps1 patches wxc_exec_path, backend, etw_audit, the egress-proxy
-# switch and agent_command into a disposable copy of this file, so the values
-# here are sane defaults; edit them if you run the gateway directly.
+# run-ocsf-audit.ps1 patches wxc_exec_path, backend, etw_audit and the
+# egress-proxy switch into a disposable copy of this file. Workload command and
+# cwd are sandbox-scoped and passed separately through --driver-config-json.
 
 [openshell.drivers.mxc]
 # Path to wxc-exec.exe on the box (patched by the run script; default is the
@@ -23,20 +23,6 @@ wxc_exec_path = "C:\\mxc-kit\\bin\\wxc-exec.exe"
 backend = "process_container"
 
 default_configuration_id = "composable"
-
-# Host folder mapped read-write into the sandbox.
-share_dir = "C:/work/openshell-mxc-demo"
-agent_cwd = "C:/work/openshell-mxc-demo"
-
-# A simple in-policy write — enough to make wxc-exec provision an AppContainer and
-# drive the Sandboxing provider. Absolute cmd.exe path is REQUIRED when the egress
-# proxy is on (the host proxy hashes agent_command[0] as its static identity
-# binary, so it must be an absolute, existing exe).
-agent_command = [
-  "C:\\Windows\\System32\\cmd.exe",
-  "/c",
-  "echo hello from openshell ocsf audit 1>C:\\work\\openshell-mxc-demo\\hello.txt",
-]
 
 debug = false
 

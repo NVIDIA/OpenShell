@@ -57,6 +57,8 @@ USEFUL OPTIONS
   -NoProxy            Skip the per-sandbox egress proxy. This omits ONLY the
                       SandboxProxyConfigured config event; everything else is
                       still produced. (Default is proxy ON for the full set.)
+  -ShareDir <path>    Host folder granted read-write to the workload. The script
+                      derives a disposable policy and per-sandbox config for it.
   -WxcExecPath <path> Path to wxc-exec.exe on this box.
   -ShareOut <path>    Copy the results bundle to a shared location
                       (e.g. \\server\share). Off by default (results stay local).
