@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 mod resources {
     pub const LIBKRUN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libkrun.dylib.zst"));
     pub const LIBKRUNFW: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libkrunfw.5.dylib.zst"));
-    pub const GVPROXY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gvproxy.zst"));
     pub const LIBKRUN_NAME: &str = "libkrun.dylib";
     pub const LIBKRUNFW_NAME: &str = "libkrunfw.5.dylib";
 }
@@ -19,7 +18,6 @@ mod resources {
 mod resources {
     pub const LIBKRUN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libkrun.so.zst"));
     pub const LIBKRUNFW: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libkrunfw.so.5.zst"));
-    pub const GVPROXY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gvproxy.zst"));
     pub const LIBKRUN_NAME: &str = "libkrun.so";
     pub const LIBKRUNFW_NAME: &str = "libkrunfw.so.5";
 }
@@ -28,7 +26,6 @@ mod resources {
 mod resources {
     pub const LIBKRUN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libkrun.so.zst"));
     pub const LIBKRUNFW: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libkrunfw.so.5.zst"));
-    pub const GVPROXY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gvproxy.zst"));
     pub const LIBKRUN_NAME: &str = "libkrun.so";
     pub const LIBKRUNFW_NAME: &str = "libkrunfw.so.5";
 }
@@ -41,7 +38,6 @@ mod resources {
 mod resources {
     pub const LIBKRUN: &[u8] = &[];
     pub const LIBKRUNFW: &[u8] = &[];
-    pub const GVPROXY: &[u8] = &[];
     pub const LIBKRUN_NAME: &str = "libkrun";
     pub const LIBKRUNFW_NAME: &str = "libkrunfw";
 }
@@ -82,7 +78,6 @@ pub fn ensure_runtime_extracted() -> Result<PathBuf, String> {
         resources::LIBKRUNFW,
         &cache_dir.join(resources::LIBKRUNFW_NAME),
     )?;
-    extract_resource(resources::GVPROXY, &cache_dir.join("gvproxy"))?;
 
     #[cfg(target_os = "macos")]
     {
@@ -96,22 +91,13 @@ pub fn ensure_runtime_extracted() -> Result<PathBuf, String> {
     fs::write(&version_marker, cache_key)
         .map_err(|e| format!("write runtime marker {}: {e}", version_marker.display()))?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(cache_dir.join("gvproxy"), fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("chmod gvproxy: {e}"))?;
-    }
-
     Ok(cache_dir)
 }
 
 pub fn validate_runtime_dir(dir: &Path) -> Result<(), String> {
     let libkrun = dir.join(resources::LIBKRUN_NAME);
     let libkrunfw = dir.join(resources::LIBKRUNFW_NAME);
-    let gvproxy = dir.join("gvproxy");
-
-    for path in [&libkrun, &libkrunfw, &gvproxy] {
+    for path in [&libkrun, &libkrunfw] {
         if !path.is_file() {
             return Err(format!("missing runtime file: {}", path.display()));
         }
@@ -128,7 +114,6 @@ fn runtime_cache_key() -> String {
     let mut fp: u64 = 0;
     for (index, chunk) in [resources::LIBKRUN, resources::LIBKRUNFW]
         .into_iter()
-        .chain(std::iter::once(resources::GVPROXY))
         .enumerate()
     {
         let sample = &chunk[..chunk.len().min(64)];
