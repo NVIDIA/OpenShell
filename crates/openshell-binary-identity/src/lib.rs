@@ -15,22 +15,20 @@ use openshell_isolation_interface::contract::{BinaryIdentity, ResolveError};
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "linux")]
 const EXECUTABLE_DIGEST_CACHE_CAPACITY: usize = 1_024;
-
-#[cfg(target_os = "linux")]
-static EXECUTABLE_DIGEST_CACHE: OnceLock<Mutex<HashMap<ExecutableCacheKey, Sha256Digest>>> =
-    OnceLock::new();
 
 /// Resolves executable identity from a Linux procfs process identifier.
 ///
 /// The configured scope bounds ancestry and cmdline collection to the observed
 /// PID namespace or a known workload process tree.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ProcfsIdentityResolver {
     ancestry_scope: AncestryScope,
+    #[cfg(target_os = "linux")]
+    cache: Arc<Mutex<HashMap<ExecutableCacheKey, Sha256Digest>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -49,29 +47,33 @@ impl ProcfsIdentityResolver {
     /// Build a resolver that discovers a nested PID namespace's init process
     /// and never reports host-runtime ancestors outside that namespace.
     #[must_use]
-    pub const fn for_pid_namespace() -> Self {
+    pub fn for_pid_namespace() -> Self {
         Self {
             ancestry_scope: AncestryScope::PidNamespace,
+            #[cfg(target_os = "linux")]
+            cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Build a resolver bounded by the workload's trusted process-tree root.
     #[must_use]
-    pub const fn for_process_tree(ancestor_root: u32) -> Self {
+    pub fn for_process_tree(ancestor_root: u32) -> Self {
         Self {
             ancestry_scope: AncestryScope::ProcessTree(ancestor_root),
+            #[cfg(target_os = "linux")]
+            cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Resolve the identity for an authoritative process ID.
-    pub fn resolve(self, pid: u32) -> Result<BinaryIdentity, ResolveError> {
+    pub fn resolve(&self, pid: u32) -> Result<BinaryIdentity, ResolveError> {
         #[cfg(target_os = "linux")]
         {
             let ancestor_root = match self.ancestry_scope {
                 AncestryScope::PidNamespace => nested_pid_namespace_init(pid),
                 AncestryScope::ProcessTree(root) => Some(root),
             };
-            resolve_linux_process(pid, ancestor_root)
+            resolve_linux_process(pid, ancestor_root, &self.cache)
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -94,11 +96,12 @@ impl ProcfsIdentityResolver {
 fn resolve_linux_process(
     pid: u32,
     ancestor_root: Option<u32>,
+    cache: &Mutex<HashMap<ExecutableCacheKey, Sha256Digest>>,
 ) -> Result<BinaryIdentity, ResolveError> {
     let (snapshot, mut executable) = open_process_snapshot(pid)?;
     let binary_path = snapshot.binary_path.clone();
     let executable_key = snapshot.executable_cache_key();
-    let cached_digest = cached_executable_digest(executable_key);
+    let cached_digest = cached_executable_digest(cache, executable_key);
     let binary_digest = cached_digest.map_or_else(|| hash_executable(pid, &mut executable), Ok)?;
     let ancestor_processes = collect_ancestor_processes(&snapshot, ancestor_root);
     let ancestors = ancestor_processes
@@ -128,7 +131,7 @@ fn resolve_linux_process(
         validate_process_snapshot(ancestor.pid, ancestor)?;
     }
     if cached_digest.is_none() {
-        cache_executable_digest(executable_key, binary_digest);
+        cache_executable_digest(cache, executable_key, binary_digest);
     }
 
     Ok(BinaryIdentity {
@@ -184,13 +187,11 @@ impl ProcessSnapshot {
 }
 
 #[cfg(target_os = "linux")]
-fn executable_digest_cache() -> &'static Mutex<HashMap<ExecutableCacheKey, Sha256Digest>> {
-    EXECUTABLE_DIGEST_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-#[cfg(target_os = "linux")]
-fn cached_executable_digest(key: ExecutableCacheKey) -> Option<Sha256Digest> {
-    executable_digest_cache()
+fn cached_executable_digest(
+    cache: &Mutex<HashMap<ExecutableCacheKey, Sha256Digest>>,
+    key: ExecutableCacheKey,
+) -> Option<Sha256Digest> {
+    cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&key)
@@ -198,8 +199,12 @@ fn cached_executable_digest(key: ExecutableCacheKey) -> Option<Sha256Digest> {
 }
 
 #[cfg(target_os = "linux")]
-fn cache_executable_digest(key: ExecutableCacheKey, digest: Sha256Digest) {
-    let mut cache = executable_digest_cache()
+fn cache_executable_digest(
+    cache: &Mutex<HashMap<ExecutableCacheKey, Sha256Digest>>,
+    key: ExecutableCacheKey,
+    digest: Sha256Digest,
+) {
+    let mut cache = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if cache.len() >= EXECUTABLE_DIGEST_CACHE_CAPACITY {
@@ -434,6 +439,19 @@ fn cmdline_absolute_paths(cmdline: &[u8]) -> Vec<std::path::PathBuf> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolver_cache_is_owned_and_only_explicit_clones_share_it() {
+        let first = ProcfsIdentityResolver::for_pid_namespace();
+        let shared = first.clone();
+        let separate = ProcfsIdentityResolver::for_pid_namespace();
+        assert!(Arc::ptr_eq(&first.cache, &shared.cache));
+        assert!(!Arc::ptr_eq(&first.cache, &separate.cache));
+        first.resolve(std::process::id()).unwrap();
+        assert!(!shared.cache.lock().unwrap().is_empty());
+        assert!(separate.cache.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn resolves_current_process_from_live_executable() {

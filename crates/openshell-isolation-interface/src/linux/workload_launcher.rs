@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use super::seccomp_notify::{NotificationListener, install_workload_listener};
+use crate::linux::seccomp_notify::{NotificationListener, install_workload_listener};
 
 type LaunchJob = Box<dyn FnOnce() + Send + 'static>;
 

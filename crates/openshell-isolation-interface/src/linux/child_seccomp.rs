@@ -92,9 +92,10 @@ impl ChildHardeningProgram {
 ///
 /// `sandbox_tgid` is the sandbox PID as visible from its workload namespace.
 /// The filter blocks all direct thread-targeting through `tkill`, and blocks
-/// process-directed operations that name the trusted sandbox leader. Worker
-/// threads share that TGID and are therefore covered by `tgkill` and the
-/// process-level APIs.
+/// process-directed operations that name the trusted sandbox leader. The
+/// ordinary workload listener must additionally mediate `kill` and
+/// `rt_sigqueueinfo`: Linux accepts nonleader TIDs for those operations, so a
+/// static TGID comparison alone cannot protect future sandbox worker threads.
 pub fn prepare(sandbox_tgid: u32) -> io::Result<ChildHardeningProgram> {
     if sandbox_tgid == 0 {
         return Err(io::Error::new(

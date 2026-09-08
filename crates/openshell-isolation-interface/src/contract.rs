@@ -439,6 +439,11 @@ pub enum DriverFenceEvidence {
         network_mode: String,
         unexpected_networks: Vec<String>,
     },
+    Podman {
+        container_id: String,
+        network_mode: String,
+        unexpected_networks: Vec<String>,
+    },
     Kubernetes {
         network_policy_uid: String,
         network_policy_resource_version: String,
@@ -457,6 +462,7 @@ impl DriverFenceEvidence {
     pub const fn backend_name(&self) -> &'static str {
         match self {
             Self::Docker { .. } => "docker",
+            Self::Podman { .. } => "podman",
             Self::Kubernetes { .. } => "kubernetes-proxy-pod",
             Self::Vm { .. } => "vm",
         }
@@ -472,6 +478,16 @@ impl DriverFenceEvidence {
                 unexpected_networks,
             } => {
                 backend_name == "docker"
+                    && !container_id.is_empty()
+                    && network_mode == "none"
+                    && unexpected_networks.is_empty()
+            }
+            Self::Podman {
+                container_id,
+                network_mode,
+                unexpected_networks,
+            } => {
+                backend_name == "podman"
                     && !container_id.is_empty()
                     && network_mode == "none"
                     && unexpected_networks.is_empty()
@@ -557,7 +573,7 @@ impl SandboxConfirmEvidence {
             && self.seccomp.task_memory_read
             && self.seccomp.task_memory_write
             && self.seccomp.cancellation
-            && self.landlock_abi > 0
+            && self.landlock_abi >= 3
             && self.landlock_allow_deny
             && self.udp_dns_round_trip
             && self.tcp_dns_round_trip
