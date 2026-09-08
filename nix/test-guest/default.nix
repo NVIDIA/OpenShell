@@ -44,7 +44,7 @@ let
     "openshell-candidate-binaries-source"
     "openshell-candidate-rpm-source"
     "openshell-latest-release-rpm-source"
-    "gateway-podman"
+    "gateway-for-podman-compute-driver"
   ];
 
   internalProvisionerRoles = [

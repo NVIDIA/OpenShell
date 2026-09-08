@@ -51,7 +51,7 @@ nix/test-guest/
     └── selinux.yml
 └── provisioners/
     └── roles/
-        ├── gateway-podman/
+        ├── gateway-for-podman-compute-driver/
         ├── openshell-candidate-binaries-source/
         ├── openshell-binaries-contract/
         ├── openshell-candidate-rpm-source/
@@ -96,7 +96,7 @@ required by OpenShell sandbox callbacks. Ubuntu 24.04 ships Podman 4, which
 does not provide that helper.
 
 `podman-rootful` installs Podman, enables its system API socket, and records
-the selected mode for the `gateway-podman` provisioner. The provisioner then
+the selected mode for the `gateway-for-podman-compute-driver` provisioner. The provisioner then
 starts the selected OpenShell installation as root. It does not write a
 rootful-specific gateway setting; the gateway discovers the Podman socket
 available to its service account. The rootless configuration records its mode
@@ -209,7 +209,7 @@ candidate binary OpenShell state. Stage these guest paths with `--copy`:
 - `/var/lib/openshell-test-guest/artifacts/openshell-gateway`
 - `/var/lib/openshell-test-guest/artifacts/openshell-sandbox.tar`
 
-Compose it with `gateway-podman` after either Podman configuration. The role
+Compose it with `gateway-for-podman-compute-driver` after either Podman configuration. The role
 uses the recorded mode to select the corresponding service account. It
 generates configuration only for candidate binaries; RPM installations
 retain their packaged service and first-start configuration. For example, run
@@ -223,7 +223,7 @@ nix run .#test-guest -- \
   --copy ./openshell-gateway:/var/lib/openshell-test-guest/artifacts/openshell-gateway \
   --copy ./openshell-sandbox.tar:/var/lib/openshell-test-guest/artifacts/openshell-sandbox.tar \
   --provision openshell-candidate-binaries-source \
-  --provision gateway-podman \
+  --provision gateway-for-podman-compute-driver \
   -- /usr/local/bin/openshell-conformance run --plan - <<'EOF'
 version = 1
 
@@ -253,7 +253,7 @@ initializes the guest:
 
 ```shell
 --provision openshell-candidate-rpm-source \
---provision gateway-podman
+--provision gateway-for-podman-compute-driver
 ```
 
 The gateway-restart plan runs one `gateway-restart` action to verify continuity

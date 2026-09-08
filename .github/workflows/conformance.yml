@@ -178,5 +178,5 @@ jobs:
             --copy conformance-input/openshell-conformance:/tmp/openshell-conformance \
             --copy nix/test-guest/conformance-plans/gateway-restart.toml:/tmp/conformance-plan.toml \
             --provision openshell-candidate-rpm-source \
-            --provision gateway-podman \
+            --provision gateway-for-podman-compute-driver \
             -- /tmp/openshell-conformance run --plan /tmp/conformance-plan.toml

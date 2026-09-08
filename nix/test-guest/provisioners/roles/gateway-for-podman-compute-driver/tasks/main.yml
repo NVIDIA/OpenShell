@@ -25,7 +25,7 @@
       - openshell_install_source in ['binaries', 'rpm']
       - openshell_podman_mode in ['rootless', 'rootful']
     fail_msg: >-
-      gateway-podman requires an earlier OpenShell source provisioner, such as
+      gateway-for-podman-compute-driver requires an earlier OpenShell source provisioner, such as
       openshell-candidate-binaries-source, openshell-candidate-rpm-source, or
       openshell-latest-release-rpm-source, and a podman-rootless or
       podman-rootful test-guest configuration.

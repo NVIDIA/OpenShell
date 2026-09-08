@@ -212,8 +212,8 @@ for item in "${provisions[@]}"; do
 		openshell_source_count=$((openshell_source_count + 1))
 		;;
 	esac
-	if [ "${item}" = gateway-podman ] && [ -z "${podman_mode}" ]; then
-		echo "gateway-podman requires --with podman-rootful or --with podman-rootless" >&2
+	if [ "${item}" = gateway-for-podman-compute-driver ] && [ -z "${podman_mode}" ]; then
+		echo "gateway-for-podman-compute-driver requires --with podman-rootful or --with podman-rootless" >&2
 		exit 2
 	fi
 done
