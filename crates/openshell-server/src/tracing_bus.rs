@@ -4,7 +4,7 @@
 //! Capture openshell-server tracing logs for streaming over gRPC.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use openshell_core::proto::{SandboxLogLine, SandboxStreamEvent};
 use openshell_ocsf::OCSF_TARGET;
@@ -69,24 +69,41 @@ struct SeqAllocator {
 }
 
 impl SeqAllocator {
-    /// Return the next sequence number for this sandbox.
+    /// Lock the cursor space.
+    ///
+    /// Publication and teardown each hold this guard across their bus-map
+    /// mutation, which is what keeps cursors monotonic. Allocating and then
+    /// releasing would let a teardown reset the counter in between, so the
+    /// in-flight event lands in a freshly recreated entry carrying a cursor from
+    /// the old space while the next publish restarts at 1.
+    ///
+    /// The lock order is always allocator -> bus map. No path takes a bus map
+    /// lock and then reaches for the allocator, so the nesting cannot deadlock.
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, u64>> {
+        self.inner.lock().expect("seq allocator lock poisoned")
+    }
+
+    /// Take the next sequence number for this sandbox from a locked space.
     ///
     /// Seq starts at 1 so the proto default `resume_after_cursor` (0) means
     /// "from the beginning" without skipping event 1.
-    fn next(&self, sandbox_id: &str) -> u64 {
-        let mut counters = self.inner.lock().expect("seq allocator lock poisoned");
+    fn next_locked(counters: &mut HashMap<String, u64>, sandbox_id: &str) -> u64 {
         let counter = counters.entry(sandbox_id.to_string()).or_insert(1);
         let seq = *counter;
         *counter += 1;
         seq
     }
 
-    /// Drop the counter for a sandbox once its buses are torn down.
-    fn remove(&self, sandbox_id: &str) {
-        self.inner
-            .lock()
-            .expect("seq allocator lock poisoned")
-            .remove(sandbox_id);
+    /// Highest cursor handed out for this sandbox, or `0` when none is.
+    ///
+    /// Bounds the current cursor space. A resume cursor above this belongs to a
+    /// previous space (gateway restart, or the sandbox's buses were removed and
+    /// recreated), because the counter restarts at 1 with no memory of the
+    /// cursors it already issued.
+    fn highest_allocated(&self, sandbox_id: &str) -> u64 {
+        self.lock()
+            .get(sandbox_id)
+            .map_or(0, |next| next.saturating_sub(1))
     }
 }
 
@@ -163,17 +180,22 @@ impl TracingLogBus {
     /// event bus that shares this bus's cursor allocator.
     ///
     /// This drops the broadcast senders (closing any active receivers with
-    /// `RecvError::Closed`) and frees the tail buffers. Both per-sandbox maps
-    /// are cleared before the shared `SeqAllocator` entry is reset, so the
-    /// allocator is never reset while either map can still accept a publish that
-    /// references it.
+    /// `RecvError::Closed`) and frees the tail buffers.
+    ///
+    /// The whole sequence runs under the cursor-space lock, so it is atomic
+    /// against publication on either bus. Clearing the maps first is not enough
+    /// on its own: a publisher that had already allocated a cursor would insert
+    /// it into a recreated entry after the maps were cleared, and the next
+    /// publisher would restart at 1 behind it.
     pub fn remove(&self, sandbox_id: &str) {
+        let mut counters = self.seq.lock();
         {
             let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
             inner.per_id.remove(sandbox_id);
         }
+        // Takes only the platform bus map lock; never reaches for `counters`.
         self.platform_event_bus.remove(sandbox_id);
-        self.seq.remove(sandbox_id);
+        counters.remove(sandbox_id);
     }
 
     pub fn tail(&self, sandbox_id: &str, max: usize) -> Vec<SandboxStreamEvent> {
@@ -193,6 +215,16 @@ impl TracingLogBus {
             .into_iter()
             .rev()
             .collect::<Vec<SandboxStreamEvent>>()
+    }
+
+    /// Highest cursor issued in the current cursor space for this sandbox.
+    ///
+    /// `0` means nothing has been published yet. Callers resuming from a client
+    /// cursor use this to tell "caught up" apart from "cursor belongs to a
+    /// cursor space that no longer exists": an empty `tail_after` result is not
+    /// on its own proof that the cursor is still valid.
+    pub fn highest_cursor(&self, sandbox_id: &str) -> u64 {
+        self.seq.highest_allocated(sandbox_id)
     }
 
     pub fn tail_after(
@@ -227,9 +259,11 @@ impl TracingLogBus {
     const DEFAULT_TAIL: usize = 2000;
 
     fn publish(&self, sandbox_id: &str, mut event: SandboxStreamEvent, tail_cap: usize) {
-        // Allocate the cursor first; next() takes and releases its own lock
-        // before we lock `inner`, so the two locks are never nested.
-        let seq = self.seq.next(sandbox_id);
+        // Hold the cursor space across the tail insert so a teardown cannot
+        // reset the counter between allocation and insertion. Lock order is
+        // allocator -> bus map, matching `remove`.
+        let mut counters = self.seq.lock();
+        let seq = SeqAllocator::next_locked(&mut counters, sandbox_id);
         event.cursor = seq;
 
         let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
@@ -506,6 +540,55 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_publish_and_remove_keeps_cursors_monotonic() {
+        // Teardown resets the shared allocator while both buses can still
+        // accept a publish. Unless the whole sequence is atomic against
+        // publication, a publisher that allocated before the reset inserts its
+        // old cursor into a recreated entry, and the next publisher restarts at
+        // 1 behind it -- leaving a tail whose cursors go backwards.
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-race";
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+
+        let publishers: Vec<_> = (0..4)
+            .map(|_| {
+                let bus = bus.clone();
+                let stop = Arc::clone(&stop);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        bus.publish_external(make_log_event(sandbox_id, "x"));
+                    }
+                })
+            })
+            .collect();
+
+        barrier.wait();
+        // Interleave teardown with in-flight publication. Each observation is a
+        // sample of the tail mid-race; a non-monotonic one means an event was
+        // stamped from a cursor space that no longer existed when it landed.
+        for _ in 0..20_000 {
+            bus.remove(sandbox_id);
+            let cursors: Vec<u64> = bus
+                .tail(sandbox_id, usize::MAX)
+                .iter()
+                .map(|e| e.cursor)
+                .collect();
+            assert!(
+                cursors.windows(2).all(|w| w[0] < w[1]),
+                "tail cursors must stay strictly ascending, got {cursors:?}"
+            );
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for publisher in publishers {
+            publisher.join().expect("publisher thread panicked");
+        }
+    }
+
+    #[test]
     fn tracing_log_bus_subscribe_after_remove_creates_fresh_channel() {
         let bus = TracingLogBus::new();
         let sandbox_id = "sb-2";
@@ -715,9 +798,11 @@ impl PlatformEventBus {
     }
 
     pub(crate) fn publish(&self, sandbox_id: &str, mut event: SandboxStreamEvent) {
-        // Allocate before locking `inner` (same non-nested lock order as
-        // TracingLogBus::publish).
-        let seq = self.seq.next(sandbox_id);
+        // Hold the cursor space across the tail insert (same allocator -> map
+        // lock order as `TracingLogBus::publish`), so teardown cannot reset the
+        // counter underneath an in-flight publish.
+        let mut counters = self.seq.lock();
+        let seq = SeqAllocator::next_locked(&mut counters, sandbox_id);
         event.cursor = seq;
 
         let mut inner = self.inner.lock().expect("platform event bus lock poisoned");
