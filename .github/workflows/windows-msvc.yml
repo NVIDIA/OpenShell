@@ -56,7 +56,7 @@ jobs:
     env:
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
       SCCACHE_GHA_ENABLED: "true"
-      SCCACHE_GHA_VERSION: windows-msvc-${{ matrix.arch }}-prebuilt-z3-v2
+      SCCACHE_GHA_VERSION: windows-msvc-${{ matrix.arch }}
       SCCACHE_CLIENT_SIDE: "1"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
     steps:
@@ -81,8 +81,7 @@ jobs:
           # wrapper; build steps still inherit sccache from the job.
           RUSTC_WRAPPER: ""
         with:
-          # Keep the prebuilt-Z3 experiment isolated from earlier target caches.
-          shared-key: windows-msvc-${{ matrix.arch }}-prebuilt-z3-v1
+          shared-key: windows-msvc-${{ matrix.arch }}
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
@@ -114,7 +113,7 @@ jobs:
     env:
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
       SCCACHE_GHA_ENABLED: "true"
-      SCCACHE_GHA_VERSION: windows-msvc-${{ matrix.arch }}-prebuilt-z3-v2
+      SCCACHE_GHA_VERSION: windows-msvc-${{ matrix.arch }}
       SCCACHE_CLIENT_SIDE: "1"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
     steps:
@@ -137,7 +136,7 @@ jobs:
         env:
           RUSTC_WRAPPER: ""
         with:
-          shared-key: windows-msvc-${{ matrix.arch }}-prebuilt-z3-v1
+          shared-key: windows-msvc-${{ matrix.arch }}
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
@@ -168,7 +167,7 @@ jobs:
     env:
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
       SCCACHE_GHA_ENABLED: "true"
-      SCCACHE_GHA_VERSION: windows-msvc-${{ matrix.arch }}-prebuilt-z3-v2
+      SCCACHE_GHA_VERSION: windows-msvc-${{ matrix.arch }}
       SCCACHE_CLIENT_SIDE: "1"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
     steps:
@@ -188,7 +187,7 @@ jobs:
         env:
           RUSTC_WRAPPER: ""
         with:
-          shared-key: windows-msvc-${{ matrix.arch }}-prebuilt-z3-v1
+          shared-key: windows-msvc-${{ matrix.arch }}
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
