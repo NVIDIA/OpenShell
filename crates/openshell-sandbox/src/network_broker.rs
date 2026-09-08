@@ -158,6 +158,8 @@ struct DnsRelay {
 
 #[derive(Clone)]
 struct NotificationQueues {
+    accept_registrar: crate::accept_interrupt::AcceptRegistrar,
+    identity_resolver: ProcfsIdentityResolver,
     pending: mpsc::Sender<PendingTcpOpen>,
     dns_relay: DnsRelay,
     active_opens: Arc<AtomicUsize>,
@@ -167,6 +169,7 @@ struct NotificationQueues {
 /// Live broker handle retained by the sandbox boundary.
 #[derive(Clone)]
 pub struct NetworkBroker {
+    _accept_monitor: Arc<crate::accept_interrupt::AcceptMonitor>,
     pending: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingTcpOpen>>>,
     pending_dns: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingDnsQuery>>>,
     dns_address: SocketAddr,
@@ -191,6 +194,10 @@ impl NetworkBroker {
         dns_address: SocketAddr,
     ) -> io::Result<Self> {
         let listener = Arc::new(listener);
+        let monitor_listener = listener.clone();
+        let accept_monitor = Arc::new(crate::accept_interrupt::AcceptMonitor::start(move |id| {
+            monitor_listener.validate_id(id).is_ok()
+        })?);
         let (pending_tx, pending_rx) = mpsc::channel(OPEN_QUEUE_CAPACITY);
         let (pending_dns_tx, pending_dns_rx) = mpsc::channel(DNS_QUEUE_CAPACITY);
         let registry = Arc::new(Mutex::new(SocketRegistry::new(1, SOCKET_CAPACITY)?));
@@ -199,6 +206,8 @@ impl NetworkBroker {
         let dns_relay = start_dns_relay(dns_address, pending_dns_tx)?;
         let dns_address = dns_relay.address;
         let queues = NotificationQueues {
+            accept_registrar: accept_monitor.registrar(),
+            identity_resolver: ProcfsIdentityResolver::for_pid_namespace(),
             pending: pending_tx,
             dns_relay,
             active_opens,
@@ -239,6 +248,7 @@ impl NetworkBroker {
             })
             .map_err(|error| io::Error::other(format!("start network broker: {error}")))?;
         Ok(Self {
+            _accept_monitor: accept_monitor,
             pending: Arc::new(tokio::sync::Mutex::new(pending_rx)),
             pending_dns: Arc::new(tokio::sync::Mutex::new(pending_dns_rx)),
             dns_address,
@@ -458,6 +468,13 @@ fn dispatch_notification(
     queues: NotificationQueues,
 ) -> io::Result<()> {
     let syscall = i64::from(notification.syscall);
+    if matches!(syscall, libc::SYS_kill | libc::SYS_rt_sigqueueinfo) {
+        return openshell_isolation_interface::linux::process_signal::mediate_process_signal(
+            &listener,
+            notification,
+            std::process::id(),
+        );
+    }
     if syscall == libc::SYS_socket {
         return create_socket(&registry, &listener, notification);
     }
@@ -469,6 +486,7 @@ fn dispatch_notification(
             queues.pending,
             &queues.dns_relay,
             queues.active_opens,
+            &queues.identity_resolver,
         );
     }
     if syscall == libc::SYS_bind {
@@ -478,13 +496,25 @@ fn dispatch_notification(
         return listen_socket(&registry, &listener, notification);
     }
     if matches!(syscall, libc::SYS_accept | libc::SYS_accept4) {
-        return accept_socket(registry, listener, notification, queues.active_accepts);
+        return accept_socket(
+            registry,
+            listener,
+            notification,
+            queues.active_accepts,
+            queues.accept_registrar,
+        );
     }
     if matches!(
         syscall,
         libc::SYS_sendto | libc::SYS_sendmsg | libc::SYS_sendmmsg
     ) {
-        return classify_send(&registry, &listener, notification, &queues.dns_relay);
+        return classify_send(
+            &registry,
+            &listener,
+            notification,
+            &queues.dns_relay,
+            &queues.identity_resolver,
+        );
     }
     if syscall == libc::SYS_getpeername {
         return get_peer_name(&registry, &listener, notification);
@@ -571,6 +601,7 @@ fn connect_socket(
     pending: mpsc::Sender<PendingTcpOpen>,
     dns_relay: &DnsRelay,
     active_opens: Arc<AtomicUsize>,
+    identity_resolver: &ProcfsIdentityResolver,
 ) -> io::Result<()> {
     let notification_started = Instant::now();
     let fd = raw_fd(notification.args[0])?;
@@ -641,7 +672,7 @@ fn connect_socket(
         return listener.respond_value(notification.id, 0);
     }
     if destination == dns_relay.address {
-        let identity = ProcfsIdentityResolver::for_pid_namespace().resolve(notification.tid);
+        let identity = identity_resolver.resolve(notification.tid);
         let mut registry = lock(&registry);
         let entry = registry.resolve_mut(notification.tid, fd)?;
         if !matches!(
@@ -680,7 +711,7 @@ fn connect_socket(
         return Err(io::Error::from_raw_os_error(libc::EACCES));
     }
 
-    let identity = ProcfsIdentityResolver::for_pid_namespace().resolve(notification.tid);
+    let identity = identity_resolver.resolve(notification.tid);
     let (decision_tx, decision_rx) = std::sync::mpsc::sync_channel(1);
     let (relay_tx, relay_rx) = oneshot::channel();
     let slot = acquire_pending_open_slot(&active_opens)?;
@@ -891,6 +922,7 @@ fn accept_socket(
     listener: Arc<NotificationListener>,
     notification: Notification,
     active_accepts: Arc<AtomicUsize>,
+    accept_registrar: crate::accept_interrupt::AcceptRegistrar,
 ) -> io::Result<()> {
     let fd = raw_fd(notification.args[0])?;
     let flags = if i64::from(notification.syscall) == libc::SYS_accept4 {
@@ -924,14 +956,24 @@ fn accept_socket(
         .name("openshell-local-accept".to_string())
         .spawn(move || {
             let _slot = slot;
+            let registration = match accept_registrar.register(notification.id) {
+                Ok(registration) => registration,
+                Err(error) => {
+                    let _ = worker_listener.respond_errno(notification.id, error_to_errno(&error));
+                    return;
+                }
+            };
             if let Err(error) = accept_and_inject(
                 &registry,
                 &worker_listener,
                 notification,
-                flags,
-                listener_inode,
-                metadata,
-                source,
+                AcceptOperation {
+                    flags,
+                    listener_inode,
+                    metadata,
+                    source,
+                    registration,
+                },
             ) {
                 let _ = worker_listener.respond_errno(notification.id, error_to_errno(&error));
             }
@@ -940,15 +982,27 @@ fn accept_socket(
     Ok(())
 }
 
-fn accept_and_inject(
-    registry: &Mutex<SocketRegistry>,
-    listener: &NotificationListener,
-    notification: Notification,
+struct AcceptOperation {
     flags: i32,
     listener_inode: u64,
     metadata: SocketMetadata,
     source: OwnedFd,
+    registration: crate::accept_interrupt::AcceptRegistration,
+}
+
+fn accept_and_inject(
+    registry: &Mutex<SocketRegistry>,
+    listener: &NotificationListener,
+    notification: Notification,
+    operation: AcceptOperation,
 ) -> io::Result<()> {
+    let AcceptOperation {
+        flags,
+        listener_inode,
+        metadata,
+        source,
+        registration,
+    } = operation;
     let mut poll = libc::pollfd {
         fd: source.as_raw_fd(),
         events: libc::POLLIN,
@@ -963,9 +1017,14 @@ fn accept_and_inject(
     let timeout = if nonblocking {
         0
     } else {
-        i32::try_from(ACCEPT_POLL_INTERVAL.as_millis()).expect("accept poll interval fits i32")
+        i32::try_from(ACCEPT_POLL_INTERVAL.as_millis()).map_err(io::Error::other)?
     };
+    // Readiness may disappear before accept (another accept or an aborted
+    // connection). The registered watchdog interrupts a blocked syscall when
+    // its notification dies or the broker shuts down. No workload OFD flags
+    // are changed, and no worker can outlive its cancellation registration.
     loop {
+        registration.ensure_running()?;
         listener.validate_id(notification.id)?;
         // SAFETY: poll references one live pollfd for this call.
         let ready = unsafe { libc::poll(&raw mut poll, 1, timeout) };
@@ -986,8 +1045,8 @@ fn accept_and_inject(
     }
 
     let mut storage = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
-    let mut length = libc::socklen_t::try_from(size_of::<libc::sockaddr_storage>())
-        .expect("sockaddr storage size fits");
+    let mut length =
+        libc::socklen_t::try_from(size_of::<libc::sockaddr_storage>()).map_err(io::Error::other)?;
     // Always keep the broker-side descriptor close-on-exec. ADDFD separately
     // applies the workload's requested descriptor flag.
     let accepted_flags = flags | libc::SOCK_CLOEXEC;
@@ -1004,6 +1063,10 @@ fn accept_and_inject(
     if accepted < 0 {
         return Err(io::Error::last_os_error());
     }
+    // Only the blocking accept phase needs asynchronous interruption. Stop
+    // monitoring before ADDFD completes the notification, otherwise a normal
+    // successful response could be mistaken for cancellation during commit.
+    drop(registration);
     // SAFETY: successful accept4 returned one newly owned descriptor.
     let accepted = unsafe { OwnedFd::from_raw_fd(accepted) };
     // SAFETY: accept4 initialized the reported prefix of storage.
@@ -1071,6 +1134,7 @@ fn classify_send(
     listener: &NotificationListener,
     notification: Notification,
     dns_relay: &DnsRelay,
+    identity_resolver: &ProcfsIdentityResolver,
 ) -> io::Result<()> {
     let fd = raw_fd(notification.args[0])?;
     let syscall = i64::from(notification.syscall);
@@ -1149,7 +1213,7 @@ fn classify_send(
                         .is_some_and(|value| value == dns_relay.address)
                 }) =>
         {
-            let identity = ProcfsIdentityResolver::for_pid_namespace().resolve(notification.tid);
+            let identity = identity_resolver.resolve(notification.tid);
             let entry = registry.resolve_mut(notification.tid, fd)?;
             let source_fd = entry.retained_preconnect()?.as_raw_fd();
             let peer = ensure_dns_source_bound(source_fd, entry.metadata().family)?;
@@ -1395,13 +1459,12 @@ fn connect_exact(fd: RawFd, address: SocketAddr) -> io::Result<()> {
             revents: 0,
         };
         // SAFETY: poll points to one live pollfd.
-        let timeout = i32::try_from(RELAY_CONNECT_TIMEOUT.as_millis())
-            .expect("relay timeout fits poll milliseconds");
+        let timeout = i32::try_from(RELAY_CONNECT_TIMEOUT.as_millis()).map_err(io::Error::other)?;
         if unsafe { libc::poll(&raw mut poll, 1, timeout) } <= 0 {
             return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT));
         }
         let mut socket_error = 0_i32;
-        let mut size = libc::socklen_t::try_from(size_of::<i32>()).expect("SO_ERROR size fits");
+        let mut size = libc::socklen_t::try_from(size_of::<i32>()).map_err(io::Error::other)?;
         // SAFETY: getsockopt writes one i32 into live storage.
         if unsafe {
             libc::getsockopt(
@@ -1443,8 +1506,8 @@ fn bind_exact(fd: RawFd, address: SocketAddr) -> io::Result<()> {
 
 fn socket_local_addr(fd: RawFd) -> io::Result<SocketAddr> {
     let mut storage = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
-    let mut length = libc::socklen_t::try_from(size_of::<libc::sockaddr_storage>())
-        .expect("sockaddr storage size fits");
+    let mut length =
+        libc::socklen_t::try_from(size_of::<libc::sockaddr_storage>()).map_err(io::Error::other)?;
     // SAFETY: storage and length are live output buffers.
     if unsafe { libc::getsockname(fd, storage.as_mut_ptr().cast(), &raw mut length) } < 0 {
         return Err(io::Error::last_os_error());
@@ -1521,7 +1584,7 @@ fn write_socket_addr(
     let mut supplied_length = [0_u8; size_of::<libc::socklen_t>()];
     task_memory::read_exact(tid, length_address, &mut supplied_length)?;
     let supplied_length = libc::socklen_t::from_ne_bytes(supplied_length);
-    let (bytes, actual_length) = sockaddr_bytes(value);
+    let (bytes, actual_length) = sockaddr_bytes(value)?;
     let copied = usize::try_from(supplied_length)
         .unwrap_or(0)
         .min(bytes.len());
@@ -1533,56 +1596,13 @@ fn write_socket_addr(
     task_memory::write_exact(tid, length_address, &actual_length.to_ne_bytes())
 }
 
-fn sockaddr_bytes(address: SocketAddr) -> (Vec<u8>, libc::socklen_t) {
-    match address {
-        SocketAddr::V4(address) => {
-            let native = libc::sockaddr_in {
-                sin_family: libc::sa_family_t::try_from(libc::AF_INET)
-                    .expect("AF_INET fits sa_family_t"),
-                sin_port: address.port().to_be(),
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from_ne_bytes(address.ip().octets()),
-                },
-                sin_zero: [0; 8],
-            };
-            // SAFETY: native is plain initialized storage.
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    (&raw const native).cast::<u8>(),
-                    size_of::<libc::sockaddr_in>(),
-                )
-            };
-            (
-                bytes.to_vec(),
-                libc::socklen_t::try_from(size_of::<libc::sockaddr_in>())
-                    .expect("sockaddr_in size fits socklen_t"),
-            )
-        }
-        SocketAddr::V6(address) => {
-            let native = libc::sockaddr_in6 {
-                sin6_family: libc::sa_family_t::try_from(libc::AF_INET6)
-                    .expect("AF_INET6 fits sa_family_t"),
-                sin6_port: address.port().to_be(),
-                sin6_flowinfo: address.flowinfo(),
-                sin6_addr: libc::in6_addr {
-                    s6_addr: address.ip().octets(),
-                },
-                sin6_scope_id: address.scope_id(),
-            };
-            // SAFETY: native is plain initialized storage.
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    (&raw const native).cast::<u8>(),
-                    size_of::<libc::sockaddr_in6>(),
-                )
-            };
-            (
-                bytes.to_vec(),
-                libc::socklen_t::try_from(size_of::<libc::sockaddr_in6>())
-                    .expect("sockaddr_in6 size fits socklen_t"),
-            )
-        }
-    }
+fn sockaddr_bytes(address: SocketAddr) -> io::Result<(Vec<u8>, libc::socklen_t)> {
+    with_sockaddr(address, |native, length| {
+        let length_usize = usize::try_from(length).map_err(io::Error::other)?;
+        // SAFETY: with_sockaddr lends fully initialized storage for this call.
+        let bytes = unsafe { std::slice::from_raw_parts(native.cast::<u8>(), length_usize) };
+        Ok((bytes.to_vec(), length))
+    })
 }
 
 fn with_sockaddr<T>(
@@ -1592,8 +1612,7 @@ fn with_sockaddr<T>(
     match address {
         SocketAddr::V4(address) => {
             let native = libc::sockaddr_in {
-                sin_family: libc::sa_family_t::try_from(libc::AF_INET)
-                    .expect("AF_INET fits sa_family_t"),
+                sin_family: libc::sa_family_t::try_from(libc::AF_INET).map_err(io::Error::other)?,
                 sin_port: address.port().to_be(),
                 sin_addr: libc::in_addr {
                     s_addr: u32::from_ne_bytes(address.ip().octets()),
@@ -1603,13 +1622,13 @@ fn with_sockaddr<T>(
             operation(
                 (&raw const native).cast(),
                 libc::socklen_t::try_from(size_of::<libc::sockaddr_in>())
-                    .expect("sockaddr_in size fits socklen_t"),
+                    .map_err(io::Error::other)?,
             )
         }
         SocketAddr::V6(address) => {
             let native = libc::sockaddr_in6 {
                 sin6_family: libc::sa_family_t::try_from(libc::AF_INET6)
-                    .expect("AF_INET6 fits sa_family_t"),
+                    .map_err(io::Error::other)?,
                 sin6_port: address.port().to_be(),
                 sin6_flowinfo: address.flowinfo(),
                 sin6_addr: libc::in6_addr {
@@ -1620,7 +1639,7 @@ fn with_sockaddr<T>(
             operation(
                 (&raw const native).cast(),
                 libc::socklen_t::try_from(size_of::<libc::sockaddr_in6>())
-                    .expect("sockaddr_in6 size fits socklen_t"),
+                    .map_err(io::Error::other)?,
             )
         }
     }

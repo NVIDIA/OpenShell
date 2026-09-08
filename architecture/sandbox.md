@@ -25,7 +25,8 @@ The compute driver provisions separate protected configurations and one
 mutually authenticated gRPC connection over a private Unix socket, Kubernetes
 TCP Service, or VM vsock channel. Independent bidirectional `Exchange` RPCs
 carry lifecycle, exec, TCP, and forwarding traffic, while one persistent
-bidirectional `Mediate` RPC carries multiplexed DNS and UDP traffic.
+bidirectional `Mediate` RPC carries multiplexed DNS traffic. General application
+UDP is unsupported; UDP DNS remains mediated by the supervisor.
 NetworkPolicy is an outer reachability fence, not a confidentiality boundary.
 Each sandbox generation receives a fresh CA and distinct server/client leaves;
 both endpoints bind the same workload identity and immutable driver resource
@@ -48,7 +49,7 @@ replacement from granting authority.
    attaches to the sandbox, and verifies the driver's generation and evidence.
 4. The sandbox installs its seccomp notification broker and Landlock baseline,
    then reports measured confirmation. The supervisor must accept that evidence
-   before it sends the launch permit.
+before it sends the launch permit.
 5. The sandbox starts the canonical process through its single workload
    launcher. The supervisor starts SSH and registers its gateway session.
 6. Exec, signaling, PTY, DNS, TCP, and loopback-forwarding operations cross the
@@ -58,6 +59,11 @@ When the admitted main process exits, its status and retained terminal output
 remain available. The confirmed sandbox and supervisor-owned access plane continue
 to serve policy-authorized exec and loopback forwarding until explicit stop or
 delete tears down the boundary and terminates any remaining workload processes.
+
+Completed exec output handles can be reclaimed, but execution request IDs remain
+reserved for the boundary generation. The sandbox accepts at most 4,096 exec
+attempts per generation, then rejects new attempts rather than forgetting replay
+protection. A disconnected attachment does not authorize another execution.
 
 ## Isolation Layers
 
@@ -74,6 +80,12 @@ OpenShell uses overlapping controls rather than a single sandbox primitive:
 The supervisor may enrich baseline filesystem allowances for runtime-required
 paths, such as proxy support files or GPU device paths when a GPU is present.
 
+The mandatory self-protection baseline is separate from optional workload
+filesystem policy. It requires Landlock ABI v3, including pathname truncation
+protection. Rules cover individually opened root children except `/.openshell`;
+the sandbox opens entries relative to a pinned root descriptor without following
+symlinks. An image-provided alias cannot grant access to the protected subtree.
+
 ## Network and Inference
 
 See [Sandbox Limits](sandbox-limits.md) for the current numeric safety ceilings,
@@ -86,7 +98,14 @@ bounded syscall inputs from the notifying task, resolves the calling binary,
 and blocks external `connect` until the supervisor returns a policy decision
 and relay stream. Connected data stays on ordinary kernel sockets, so the
 notification path is limited to socket setup and pointer-bearing operations.
-This topology requires Linux 5.19 or newer: the sandbox treats
+Blocking listener accepts retain native workload socket flags. A broker-owned
+watchdog interrupts an accept when its seccomp notification is cancelled or the
+broker stops, including when readiness disappears before the accept syscall.
+The sandbox reserves `SIGUSR2` with a non-restarting no-op handler for these
+broker threads; startup rejects a conflicting handler. This signal disposition
+is process-global kernel state, while registrations and cancellation state are
+owned by the broker. Workload exec resets the caught handler to its default.
+This topology requires Linux 6.2 or newer for Landlock ABI v3 and treats
 `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` as mandatory so cancelled
 notifications cannot race task-memory writes.
 
