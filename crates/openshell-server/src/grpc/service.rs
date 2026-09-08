@@ -194,11 +194,29 @@ pub(super) async fn handle_list_services(
         ));
     }
 
+    let (workspace, page_query) = if req.all_workspaces {
+        require_platform_admin(&state.admin_role, &principal)?;
+        (String::new(), "all_workspaces".to_string())
+    } else {
+        let authz = authorize_workspace(
+            &state.store,
+            &state.admin_role,
+            &principal,
+            &req.workspace,
+            MinWorkspaceRole::User,
+        )
+        .await?;
+        let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+            .await?
+            .name;
+        let page_query = format!("workspace:{workspace}");
+        (workspace, page_query)
+    };
+
     let limit = super::clamp_limit(req.limit, 100, super::MAX_PAGE_SIZE);
     let use_cursor_pagination =
         req.sandbox.is_empty() && (req.offset == 0 || !page_token.is_empty());
     let endpoints: Vec<ServiceEndpoint> = if req.all_workspaces {
-        require_platform_admin(&state.admin_role, &principal)?;
         if !req.sandbox.is_empty() {
             return Err(Status::invalid_argument(
                 "sandbox filter is not supported with all_workspaces",
@@ -221,65 +239,45 @@ pub(super) async fn handle_list_services(
         } else {
             state.store.list_all_messages(limit, req.offset).await
         }
-    } else {
-        let authz = authorize_workspace(
-            &state.store,
-            &state.admin_role,
-            &principal,
-            &req.workspace,
-            MinWorkspaceRole::User,
-        )
-        .await?;
-        let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-            .await?
-            .name;
-        if use_cursor_pagination {
-            let after = if page_token.is_empty() {
-                None
-            } else {
-                Some(super::decode_list_page_token(
-                    "service.list",
-                    &format!("workspace:{workspace}"),
-                    page_token,
-                )?)
-            };
-            state
-                .store
-                .list_messages_after::<ServiceEndpoint>(&workspace, after.as_ref(), limit)
-                .await
-        } else if req.sandbox.is_empty() {
-            state
-                .store
-                .list_messages(&workspace, limit, req.offset)
-                .await
+    } else if use_cursor_pagination {
+        let after = if page_token.is_empty() {
+            None
         } else {
-            state
-                .store
-                .list_messages_with_selector(
-                    &workspace,
-                    &format!("sandbox={}", req.sandbox),
-                    limit,
-                    req.offset,
-                )
-                .await
-        }
+            Some(super::decode_list_page_token(
+                "service.list",
+                &page_query,
+                page_token,
+            )?)
+        };
+        state
+            .store
+            .list_messages_after::<ServiceEndpoint>(&workspace, after.as_ref(), limit)
+            .await
+    } else if req.sandbox.is_empty() {
+        state
+            .store
+            .list_messages(&workspace, limit, req.offset)
+            .await
+    } else {
+        state
+            .store
+            .list_messages_with_selector(
+                &workspace,
+                &format!("sandbox={}", req.sandbox),
+                limit,
+                req.offset,
+            )
+            .await
     }
     .map_err(|e| Status::internal(format!("list endpoints failed: {e}")))?;
 
     let next_page_token = if use_cursor_pagination {
         match endpoints.last() {
-            Some(endpoint) => {
-                let query = if req.all_workspaces {
-                    "all_workspaces".to_string()
-                } else {
-                    format!("workspace:{}", req.workspace)
-                };
-                super::encode_list_page_token(
-                    "service.list",
-                    &query,
-                    &service_endpoint_page_cursor(endpoint)?,
-                )?
-            }
+            Some(endpoint) => super::encode_list_page_token(
+                "service.list",
+                &page_query,
+                &service_endpoint_page_cursor(endpoint)?,
+            )?,
             None => String::new(),
         }
     } else {

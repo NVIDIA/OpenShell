@@ -4088,6 +4088,13 @@ fn provider_credential_keys(provider: &Provider) -> Vec<String> {
     keys
 }
 
+fn provider_list_json(providers: &[Provider], next_page_token: String) -> serde_json::Value {
+    serde_json::json!({
+        "providers": providers.iter().map(provider_to_json).collect::<Vec<_>>(),
+        "next_page_token": next_page_token,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn provider_list(
     server: &str,
@@ -4115,16 +4122,23 @@ pub async fn provider_list(
         })
         .await
         .into_diagnostic()?;
-    let providers = response.into_inner().providers;
+    let response = response.into_inner();
+    let next_page_token = response.next_page_token;
+    let providers = response.providers;
+    let structured = provider_list_json(&providers, next_page_token.clone());
 
     // Handle structured output formats (json, yaml)
-    if crate::output::print_output_collection(output, &providers, provider_to_json)? {
+    if crate::output::print_output_single(output, &structured, Clone::clone)? {
         return Ok(());
     }
 
     if providers.is_empty() {
         if !names_only {
             println!("No providers found.");
+        }
+        if !next_page_token.is_empty() {
+            println!();
+            println!("Next page token: {next_page_token}");
         }
         return Ok(());
     }
@@ -4136,6 +4150,10 @@ pub async fn provider_list(
             } else {
                 println!("{}", provider.object_name());
             }
+        }
+        if !next_page_token.is_empty() {
+            println!();
+            println!("Next page token: {next_page_token}");
         }
         return Ok(());
     }
@@ -4183,13 +4201,14 @@ pub async fn provider_list(
     }
 
     for provider in providers {
+        let credential_keys = provider_credential_keys(&provider);
         if all_workspaces {
             println!(
                 "{:<ws_width$}  {:<name_width$}  {:<type_width$}  {:<16}  {}",
                 provider.object_workspace(),
                 provider.object_name().to_string(),
                 provider.r#type,
-                provider.credentials.len(),
+                credential_keys.len(),
                 provider.config.len(),
             );
         } else {
@@ -4197,10 +4216,15 @@ pub async fn provider_list(
                 "{:<name_width$}  {:<type_width$}  {:<16}  {}",
                 provider.object_name().to_string(),
                 provider.r#type,
-                provider.credentials.len(),
+                credential_keys.len(),
                 provider.config.len(),
             );
         }
+    }
+
+    if !next_page_token.is_empty() {
+        println!();
+        println!("Next page token: {next_page_token}");
     }
 
     Ok(())
@@ -8861,6 +8885,14 @@ mod tests {
         assert_eq!(json["name"], "test-provider");
         assert_eq!(json["workspace"], "");
         assert_eq!(json["type"], "anthropic");
+    }
+
+    #[test]
+    fn provider_list_json_includes_next_page_token() {
+        let json = super::provider_list_json(&[], "opaque-next-token".to_string());
+
+        assert_eq!(json["providers"], serde_json::json!([]));
+        assert_eq!(json["next_page_token"], "opaque-next-token");
     }
 
     #[test]

@@ -3946,7 +3946,7 @@ pub(super) async fn handle_get_sandbox_policy_status(
     let record = record.ok_or_else(|| Status::not_found(not_found_msg))?;
 
     Ok(Response::new(GetSandboxPolicyStatusResponse {
-        revision: Some(policy_record_to_revision(&record, true)?),
+        revision: Some(policy_record_to_revision(&record, true)),
         active_version,
     }))
 }
@@ -4028,7 +4028,7 @@ pub(super) async fn handle_list_sandbox_policies(
     let revisions = records
         .iter()
         .map(|r| policy_record_to_revision(r, false))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Vec<_>>();
 
     let next_page_token = if use_cursor_pagination {
         match records.last() {
@@ -5925,10 +5925,7 @@ fn draft_chunk_record_to_proto(record: &DraftChunkRecord) -> Result<PolicyChunk,
     })
 }
 
-fn policy_record_to_revision(
-    record: &PolicyRecord,
-    include_policy: bool,
-) -> Result<SandboxPolicyRevision, Status> {
+fn policy_record_to_revision(record: &PolicyRecord, include_policy: bool) -> SandboxPolicyRevision {
     let status = match record.status.as_str() {
         "pending" => PolicyStatus::Pending,
         "loaded" => PolicyStatus::Loaded,
@@ -5938,7 +5935,7 @@ fn policy_record_to_revision(
     };
 
     match canonical_policy_record_identity(record) {
-        Ok((policy, policy_hash)) => Ok(SandboxPolicyRevision {
+        Ok((policy, policy_hash)) => SandboxPolicyRevision {
             version: u32::try_from(record.version).unwrap_or(0),
             policy_hash,
             status: status.into(),
@@ -5947,8 +5944,8 @@ fn policy_record_to_revision(
             loaded_at_ms: record.loaded_at_ms.unwrap_or(0),
             policy: include_policy.then_some(policy),
             provenance: record.provenance.clone(),
-        }),
-        Err(error) if !include_policy => {
+        },
+        Err(error) => {
             let identity_error = format!(
                 "policy revision is invalid under the current schema: {}",
                 error.message()
@@ -5963,18 +5960,17 @@ fn policy_record_to_revision(
                     }
                 },
             );
-            Ok(SandboxPolicyRevision {
+            SandboxPolicyRevision {
                 version: u32::try_from(record.version).unwrap_or(0),
-                policy_hash: String::new(),
+                policy_hash: record.policy_hash.clone(),
                 status: PolicyStatus::Failed.into(),
                 load_error,
                 created_at_ms: record.created_at_ms,
                 loaded_at_ms: record.loaded_at_ms.unwrap_or(0),
                 policy: None,
                 provenance: record.provenance.clone(),
-            })
+            }
         }
-        Err(error) => Err(error),
     }
 }
 
@@ -7045,6 +7041,178 @@ fn materialize_global_settings(
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+mod policy_current_tests {
+    use super::*;
+    use crate::auth::identity::{Identity, IdentityProvider};
+    use crate::auth::principal::{
+        Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
+    };
+    use crate::grpc::test_support::test_server_state;
+    use crate::persistence::test_store;
+    use openshell_core::proto::SandboxSpec;
+    use openshell_core::settings;
+    use std::collections::HashMap;
+    use tonic::Code;
+
+    /// Wrap a request with a user `Principal` so handler scope guards treat
+    /// the test caller as a CLI user.
+    fn with_user<T>(mut request: Request<T>) -> Request<T> {
+        request
+            .extensions_mut()
+            .insert(Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: "test-user".to_string(),
+                    display_name: None,
+                    roles: vec![],
+                    scopes: vec![],
+                    provider: IdentityProvider::Oidc,
+                },
+            }));
+        request
+    }
+
+    /// Wrap a request with a sandbox `Principal` bound to `sandbox_id`.
+    fn with_sandbox<T>(mut request: Request<T>, sandbox_id: &str) -> Request<T> {
+        request
+            .extensions_mut()
+            .insert(Principal::Sandbox(SandboxPrincipal {
+                sandbox_id: sandbox_id.to_string(),
+                source: SandboxIdentitySource::BootstrapJwt {
+                    issuer: "openshell-gateway:test".to_string(),
+                },
+                trust_domain: Some("openshell".to_string()),
+            }));
+        request
+    }
+
+    fn test_sandbox(
+        sandbox_id: &str,
+        sandbox_name: &str,
+        policy: ProtoSandboxPolicy,
+        providers: Vec<String>,
+    ) -> Sandbox {
+        Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: sandbox_id.to_string(),
+                name: sandbox_name.to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                resource_version: 1,
+                deletion_timestamp_ms: 0,
+                workspace: "default".to_string(),
+            }),
+            spec: Some(SandboxSpec {
+                providers,
+                policy: Some(policy),
+                ..Default::default()
+            }),
+            status: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn update_config_global_requires_platform_admin() {
+        use openshell_core::proto::datamodel::v1::ObjectMeta;
+        use openshell_core::proto::{WorkspaceMember, WorkspaceRole};
+
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+
+        let member = WorkspaceMember {
+            metadata: Some(ObjectMeta {
+                id: "default-admin-member-id".to_string(),
+                name: "test-user".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            principal_subject: "test-user".to_string(),
+            role: WorkspaceRole::Admin.into(),
+        };
+        state.store.put_message(&member).await.unwrap();
+
+        let err = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                setting_key: "log_level".to_string(),
+                delete_setting: true,
+                ..UpdateConfigRequest::default()
+            })),
+        )
+        .await
+        .expect_err("global setting deletes must require platform admin");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn cross_sandbox_get_sandbox_config_denied() {
+        let state = test_server_state().await;
+        let sandbox_id = "sandbox-a";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_id,
+                ProtoSandboxPolicy::default(),
+                Vec::new(),
+            ))
+            .await
+            .expect("store sandbox");
+
+        let err = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                }),
+                "sandbox-b",
+            ),
+        )
+        .await
+        .expect_err("cross-sandbox access must be denied");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[test]
+    fn merge_effective_settings_includes_unset_registered_keys() {
+        let global = StoredSettings::default();
+        let sandbox = StoredSettings::default();
+        let merged = merge_effective_settings(&global, &sandbox).unwrap();
+        for registered in settings::REGISTERED_SETTINGS {
+            let setting = merged
+                .get(registered.key)
+                .unwrap_or_else(|| panic!("missing setting {}", registered.key));
+            assert!(setting.value.is_none());
+        }
+    }
+
+    #[test]
+    fn materialize_global_settings_includes_unset_registered_keys() {
+        let global = StoredSettings::default();
+        let materialized = materialize_global_settings(&global).unwrap();
+        for registered in settings::REGISTERED_SETTINGS {
+            let setting = materialized
+                .get(registered.key)
+                .unwrap_or_else(|| panic!("missing setting {}", registered.key));
+            assert!(setting.value.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn global_settings_load_returns_default_when_empty() {
+        let store = test_store().await;
+        let settings = load_global_settings(&store).await.unwrap();
+        assert!(settings.settings.is_empty());
+        assert_eq!(settings.revision, 0);
+    }
+}
+
 /// Legacy policy tests from the pre-`main` MCP versioning shape.
 ///
 /// These are intentionally kept out of the default test build because they
@@ -7458,8 +7626,7 @@ mod legacy_mcp_tests {
                 .await
                 .expect("policy history lookup")
                 .expect("legacy policy history");
-            let revision = policy_record_to_revision(&record, true)
-                .expect("legacy history export must canonicalize");
+            let revision = policy_record_to_revision(&record, true);
             assert_eq!(revision.policy_hash, canonical_hash, "{case}");
             let exported = revision.policy.expect("exported history policy");
             assert_eq!(exported, canonical, "{case}");
@@ -7469,8 +7636,7 @@ mod legacy_mcp_tests {
                 "{case}"
             );
 
-            let listed = policy_record_to_revision(&record, false)
-                .expect("legacy history list projection must canonicalize");
+            let listed = policy_record_to_revision(&record, false);
             assert_eq!(listed.policy_hash, canonical_hash, "{case}");
             assert!(listed.policy.is_none(), "{case}");
         }
@@ -7540,11 +7706,10 @@ mod legacy_mcp_tests {
             .await
             .expect("policy history lookup")
             .expect("invalid policy history");
-        let listed_invalid = policy_record_to_revision(&record, false)
-            .expect("list projection must preserve invalid legacy history metadata");
+        let listed_invalid = policy_record_to_revision(&record, false);
         assert_eq!(listed_invalid.version, 2);
         assert_eq!(listed_invalid.status, PolicyStatus::Failed as i32);
-        assert!(listed_invalid.policy_hash.is_empty());
+        assert_eq!(listed_invalid.policy_hash, "uncanonicalized-hash");
         assert!(listed_invalid.policy.is_none());
         assert!(
             listed_invalid
@@ -7552,7 +7717,7 @@ mod legacy_mcp_tests {
                 .contains(STORED_POLICY_SOURCE_HISTORY)
         );
 
-        let detail_error = handle_get_sandbox_policy_status(
+        let detail = handle_get_sandbox_policy_status(
             &state,
             with_user(Request::new(GetSandboxPolicyStatusRequest {
                 name: "stored-invalid-history".to_string(),
@@ -7561,11 +7726,19 @@ mod legacy_mcp_tests {
             })),
         )
         .await
-        .expect_err("invalid history detail must remain fail-closed");
-        assert_eq!(detail_error.code(), Code::FailedPrecondition);
+        .expect("invalid history detail must remain listable")
+        .into_inner();
+        let detail_revision = detail
+            .revision
+            .expect("detail response should include degraded revision");
+        assert_eq!(detail.active_version, 2);
+        assert_eq!(detail_revision.version, 2);
+        assert_eq!(detail_revision.policy_hash, "uncanonicalized-hash");
+        assert_eq!(detail_revision.status, PolicyStatus::Failed as i32);
+        assert!(detail_revision.policy.is_none());
         assert!(
-            detail_error
-                .message()
+            detail_revision
+                .load_error
                 .contains(STORED_POLICY_SOURCE_HISTORY)
         );
 

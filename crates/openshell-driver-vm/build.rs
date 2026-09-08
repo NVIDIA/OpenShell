@@ -12,8 +12,22 @@ use std::{env, fs};
 fn main() {
     println!("cargo:rerun-if-env-changed=OPENSHELL_VM_RUNTIME_COMPRESSED_DIR");
 
-    if let Ok(dir) = env::var("OPENSHELL_VM_RUNTIME_COMPRESSED_DIR") {
-        println!("cargo:rerun-if-changed={dir}");
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let workspace_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"))
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .expect("workspace root not found");
+    let default_compressed_dir = workspace_root.join("target/vm-runtime-compressed");
+
+    let compressed_dir = env::var("OPENSHELL_VM_RUNTIME_COMPRESSED_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| default_compressed_dir.clone());
+
+    if compressed_dir.is_dir() {
+        println!("cargo:rerun-if-changed={}", compressed_dir.display());
         for name in &[
             "libkrun.so.zst",
             "libkrunfw.so.5.zst",
@@ -23,13 +37,9 @@ fn main() {
             "openshell-sandbox.zst",
             "umoci.zst",
         ] {
-            println!("cargo:rerun-if-changed={dir}/{name}");
+            println!("cargo:rerun-if-changed={}/{name}", compressed_dir.display());
         }
     }
-
-    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 
     let (libkrun_name, libkrunfw_name) = match target_os.as_str() {
         "macos" => ("libkrun.dylib", "libkrunfw.5.dylib"),
@@ -44,11 +54,7 @@ fn main() {
         }
     };
 
-    let compressed_dir = if let Ok(dir) = env::var("OPENSHELL_VM_RUNTIME_COMPRESSED_DIR") {
-        PathBuf::from(dir)
-    } else {
-        println!("cargo:warning=OPENSHELL_VM_RUNTIME_COMPRESSED_DIR not set");
-        println!("cargo:warning=Run: mise run vm:setup && mise run vm:supervisor");
+    if !compressed_dir.is_dir() {
         generate_stub_resources(
             &out_dir,
             &[
@@ -60,13 +66,7 @@ fn main() {
             ],
         );
         return;
-    };
-
-    assert!(
-        compressed_dir.is_dir(),
-        "Compressed runtime dir not found: {}. Run: mise run vm:setup && mise run vm:supervisor",
-        compressed_dir.display()
-    );
+    }
 
     let files = [
         (format!("{libkrun_name}.zst"), format!("{libkrun_name}.zst")),

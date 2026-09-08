@@ -1418,13 +1418,14 @@ pub async fn provider_list(
     }
 
     for provider in providers {
+        let credential_keys = provider_credential_keys(provider);
         if all_workspaces {
             println!(
                 "{:<ws_width$}  {:<name_width$}  {:<type_width$}  {:<16}  {}",
                 provider.object_workspace(),
                 provider.object_name().to_string(),
                 provider.r#type,
-                provider.credentials.len(),
+                credential_keys.len(),
                 provider.config.len(),
             );
         } else {
@@ -1432,7 +1433,7 @@ pub async fn provider_list(
                 "{:<name_width$}  {:<type_width$}  {:<16}  {}",
                 provider.object_name().to_string(),
                 provider.r#type,
-                provider.credentials.len(),
+                credential_keys.len(),
                 provider.config.len(),
             );
         }

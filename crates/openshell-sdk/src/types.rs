@@ -255,6 +255,16 @@ pub struct ListOptions {
     pub offset: u32,
     /// Optional Kubernetes-style label selector (e.g. `env=prod,team=core`).
     pub label_selector: Option<String>,
+    /// Opaque continuation token returned by the previous page.
+    pub page_token: Option<String>,
+}
+
+/// A page of list results returned by the high-level SDK.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct ListPage<T> {
+    pub items: Vec<T>,
+    pub next_page_token: String,
 }
 
 /// Options for [`crate::client::OpenShellClient::exec`].

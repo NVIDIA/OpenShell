@@ -53,7 +53,7 @@ registries = []
 
 # -- Bans ----------------------------------------------------------------------
 [bans]
-multiple-versions = "warn"
+multiple-versions = "allow"
 wildcards = "allow"
 highlight = "all"
 workspace-default-features = "allow"

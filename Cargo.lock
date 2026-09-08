@@ -2959,8 +2959,6 @@ dependencies = [
 [[package]]
 name = "jsonpath-rust"
 version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19d8fe85bd70ff715f31ce8c739194b423d79811a19602115d611a3ec85d6200"
 dependencies = [
  "lazy_static",
  "once_cell",

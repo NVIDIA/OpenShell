@@ -1,0 +1,3 @@
+[profile.ci]
+failure-output = "immediate-final"
+fail-fast = false

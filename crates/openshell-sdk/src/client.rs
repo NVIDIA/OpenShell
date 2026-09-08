@@ -15,7 +15,7 @@ use crate::raw::{AuthedGrpcClient, AuthedInferenceClient};
 use crate::refresh::{RefreshedToken, TokenSource};
 use crate::transport;
 use crate::types::{
-    ExecOptions, ExecResult, Health, ListOptions, SandboxPhase, SandboxRef, SandboxSpec,
+    ExecOptions, ExecResult, Health, ListOptions, ListPage, SandboxPhase, SandboxRef, SandboxSpec,
     SandboxTemplateCreateSpec, SandboxTemplateListOptions, SandboxWorkloadTemplate, WorkspaceRef,
 };
 use futures::StreamExt;
@@ -258,25 +258,28 @@ impl OpenShellClient {
     }
 
     /// List sandboxes.
-    pub async fn list_sandboxes(&self, opts: ListOptions) -> Result<Vec<SandboxRef>> {
+    pub async fn list_sandboxes(&self, opts: ListOptions) -> Result<ListPage<SandboxRef>> {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::ListSandboxesRequest {
                     limit: opts.limit,
                     offset: opts.offset,
                     label_selector: opts.label_selector.clone().unwrap_or_default(),
-                    page_token: String::new(),
+                    page_token: opts.page_token.clone().unwrap_or_default(),
                     workspace: String::new(),
                     all_workspaces: false,
                 };
                 async move { grpc.list_sandboxes(request).await }
             })
             .await?;
-        Ok(response
-            .sandboxes
-            .into_iter()
-            .map(SandboxRef::from_proto)
-            .collect())
+        Ok(ListPage {
+            items: response
+                .sandboxes
+                .into_iter()
+                .map(SandboxRef::from_proto)
+                .collect(),
+            next_page_token: response.next_page_token,
+        })
     }
 
     /// Delete a sandbox by name.
@@ -385,25 +388,28 @@ impl OpenShellClient {
     pub async fn list_sandboxes_all_workspaces(
         &self,
         opts: ListOptions,
-    ) -> Result<Vec<SandboxRef>> {
+    ) -> Result<ListPage<SandboxRef>> {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::ListSandboxesRequest {
                     limit: opts.limit,
                     offset: opts.offset,
                     label_selector: opts.label_selector.clone().unwrap_or_default(),
-                    page_token: String::new(),
+                    page_token: opts.page_token.clone().unwrap_or_default(),
                     workspace: String::new(),
                     all_workspaces: true,
                 };
                 async move { grpc.list_sandboxes(request).await }
             })
             .await?;
-        Ok(response
-            .sandboxes
-            .into_iter()
-            .map(SandboxRef::from_proto)
-            .collect())
+        Ok(ListPage {
+            items: response
+                .sandboxes
+                .into_iter()
+                .map(SandboxRef::from_proto)
+                .collect(),
+            next_page_token: response.next_page_token,
+        })
     }
 
     /// Create a new workspace.
@@ -444,23 +450,26 @@ impl OpenShellClient {
     }
 
     /// List workspaces.
-    pub async fn list_workspaces(&self, opts: ListOptions) -> Result<Vec<WorkspaceRef>> {
+    pub async fn list_workspaces(&self, opts: ListOptions) -> Result<ListPage<WorkspaceRef>> {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::ListWorkspacesRequest {
                     limit: opts.limit,
                     offset: opts.offset,
                     label_selector: opts.label_selector.clone().unwrap_or_default(),
-                    page_token: String::new(),
+                    page_token: opts.page_token.clone().unwrap_or_default(),
                 };
                 async move { grpc.list_workspaces(request).await }
             })
             .await?;
-        Ok(response
-            .workspaces
-            .into_iter()
-            .map(WorkspaceRef::from_proto)
-            .collect())
+        Ok(ListPage {
+            items: response
+                .workspaces
+                .into_iter()
+                .map(WorkspaceRef::from_proto)
+                .collect(),
+            next_page_token: response.next_page_token,
+        })
     }
 
     /// Delete a workspace by name.
@@ -756,7 +765,7 @@ impl WorkspaceScopedClient {
     }
 
     /// List sandboxes in this workspace.
-    pub async fn list_sandboxes(&self, opts: ListOptions) -> Result<Vec<SandboxRef>> {
+    pub async fn list_sandboxes(&self, opts: ListOptions) -> Result<ListPage<SandboxRef>> {
         let response = self
             .client
             .unary(|mut grpc| {
@@ -764,18 +773,21 @@ impl WorkspaceScopedClient {
                     limit: opts.limit,
                     offset: opts.offset,
                     label_selector: opts.label_selector.clone().unwrap_or_default(),
-                    page_token: String::new(),
+                    page_token: opts.page_token.clone().unwrap_or_default(),
                     workspace: self.workspace.clone(),
                     all_workspaces: false,
                 };
                 async move { grpc.list_sandboxes(request).await }
             })
             .await?;
-        Ok(response
-            .sandboxes
-            .into_iter()
-            .map(SandboxRef::from_proto)
-            .collect())
+        Ok(ListPage {
+            items: response
+                .sandboxes
+                .into_iter()
+                .map(SandboxRef::from_proto)
+                .collect(),
+            next_page_token: response.next_page_token,
+        })
     }
 
     /// Delete a sandbox by name in this workspace.

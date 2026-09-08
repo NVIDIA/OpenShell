@@ -346,7 +346,7 @@ impl OpenShell for TestOpenShell {
                 sandbox_with_phase("alpha", proto::SandboxPhase::Ready),
                 sandbox_with_phase("beta", proto::SandboxPhase::Provisioning),
             ],
-            next_page_token: String::new(),
+            next_page_token: "next-sandbox-page".to_string(),
         }))
     }
 
@@ -806,7 +806,7 @@ impl OpenShell for TestOpenShell {
                 workspace_proto("default", proto::datamodel::v1::WorkspacePhase::Active),
                 workspace_proto("staging", proto::datamodel::v1::WorkspacePhase::Active),
             ],
-            next_page_token: String::new(),
+            next_page_token: "next-workspace-page".to_string(),
         }))
     }
 
@@ -1043,17 +1043,20 @@ async fn list_sandboxes_propagates_filters() {
         limit: 25,
         offset: 5,
         label_selector: Some("team=core".to_string()),
+        page_token: Some("opaque-page-token".to_string()),
     };
     let items = client.list_sandboxes(opts).await.unwrap();
-    assert_eq!(items.len(), 2);
-    assert_eq!(items[0].name, "alpha");
-    assert_eq!(items[0].phase, SandboxPhase::Ready);
-    assert_eq!(items[1].phase, SandboxPhase::Provisioning);
+    assert_eq!(items.items.len(), 2);
+    assert_eq!(items.items[0].name, "alpha");
+    assert_eq!(items.items[0].phase, SandboxPhase::Ready);
+    assert_eq!(items.items[1].phase, SandboxPhase::Provisioning);
+    assert_eq!(items.next_page_token, "next-sandbox-page");
 
     let observed = state.last_list_request.lock().await.clone().unwrap();
     assert_eq!(observed.limit, 25);
     assert_eq!(observed.offset, 5);
     assert_eq!(observed.label_selector, "team=core");
+    assert_eq!(observed.page_token, "opaque-page-token");
 }
 
 #[tokio::test]
@@ -1387,7 +1390,8 @@ async fn workspace_scoped_list_passes_workspace() {
 
     let ws = client.workspace("dev");
     let items = ws.list_sandboxes(ListOptions::default()).await.unwrap();
-    assert_eq!(items.len(), 2);
+    assert_eq!(items.items.len(), 2);
+    assert_eq!(items.next_page_token, "next-sandbox-page");
 
     let observed = state.last_list_request.lock().await.clone().unwrap();
     assert_eq!(observed.workspace, "dev");
@@ -1462,7 +1466,8 @@ async fn list_sandboxes_all_workspaces_sets_flag() {
         .list_sandboxes_all_workspaces(ListOptions::default())
         .await
         .unwrap();
-    assert_eq!(items.len(), 2);
+    assert_eq!(items.items.len(), 2);
+    assert_eq!(items.next_page_token, "next-sandbox-page");
 
     let observed = state.last_list_request.lock().await.clone().unwrap();
     assert!(observed.all_workspaces);
@@ -1512,9 +1517,10 @@ async fn list_workspaces_returns_all() {
         .list_workspaces(ListOptions::default())
         .await
         .unwrap();
-    assert_eq!(workspaces.len(), 2);
-    assert_eq!(workspaces[0].name, "default");
-    assert_eq!(workspaces[1].name, "staging");
+    assert_eq!(workspaces.items.len(), 2);
+    assert_eq!(workspaces.items[0].name, "default");
+    assert_eq!(workspaces.items[1].name, "staging");
+    assert_eq!(workspaces.next_page_token, "next-workspace-page");
 }
 
 #[tokio::test]

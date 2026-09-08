@@ -644,11 +644,34 @@ pub(super) async fn handle_list_sandboxes(
             "page_token is currently supported only for unfiltered sandbox listings",
         ));
     }
+    if !page_token.is_empty() && request.offset > 0 {
+        return Err(Status::invalid_argument(
+            "page_token cannot be combined with an explicit offset",
+        ));
+    }
+
+    let (workspace, page_query) = if request.all_workspaces {
+        require_platform_admin(&state.admin_role, &principal)?;
+        (String::new(), "all_workspaces".to_string())
+    } else {
+        let authz = authorize_workspace(
+            &state.store,
+            &state.admin_role,
+            &principal,
+            &request.workspace,
+            MinWorkspaceRole::User,
+        )
+        .await?;
+        let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+            .await?
+            .name;
+        let page_query = format!("workspace:{workspace}");
+        (workspace, page_query)
+    };
 
     let use_cursor_pagination =
         request.label_selector.is_empty() && (request.offset == 0 || !page_token.is_empty());
     let sandboxes: Vec<Sandbox> = if request.all_workspaces {
-        require_platform_admin(&state.admin_role, &principal)?;
         if use_cursor_pagination {
             let after = if page_token.is_empty() {
                 None
@@ -679,24 +702,13 @@ pub(super) async fn handle_list_sandboxes(
                 .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
         }
     } else {
-        let authz = authorize_workspace(
-            &state.store,
-            &state.admin_role,
-            &principal,
-            &request.workspace,
-            MinWorkspaceRole::User,
-        )
-        .await?;
-        let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-            .await?
-            .name;
         if use_cursor_pagination {
             let after = if page_token.is_empty() {
                 None
             } else {
                 Some(decode_list_page_token(
                     "sandbox.list",
-                    &format!("workspace:{workspace}"),
+                    &page_query,
                     page_token,
                 )?)
             };
@@ -731,12 +743,7 @@ pub(super) async fn handle_list_sandboxes(
     let next_page_token = if use_cursor_pagination {
         match sandboxes.last() {
             Some(sandbox) => {
-                let query = if request.all_workspaces {
-                    "all_workspaces".to_string()
-                } else {
-                    format!("workspace:{}", request.workspace)
-                };
-                encode_list_page_token("sandbox.list", &query, &sandbox_page_cursor(sandbox)?)?
+                encode_list_page_token("sandbox.list", &page_query, &sandbox_page_cursor(sandbox)?)?
             }
             None => String::new(),
         }

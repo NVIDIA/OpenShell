@@ -172,3 +172,6 @@ strip = true
 [profile.dev]
 # Faster compile times for dev builds
 debug = 1
+
+[patch.crates-io]
+jsonpath-rust = { path = "third_party/jsonpath-rust-0.5.1" }

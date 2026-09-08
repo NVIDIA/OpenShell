@@ -477,7 +477,7 @@ impl OpenShell for TestOpenShell {
             .collect::<Vec<_>>();
         Ok(Response::new(ListProvidersResponse {
             providers,
-            next_page_token: String::new(),
+            next_page_token: "next-provider-page".to_string(),
         }))
     }
 
