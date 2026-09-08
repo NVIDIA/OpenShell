@@ -23,9 +23,10 @@ fn main() {
             .expect("workspace root not found");
     let default_compressed_dir = workspace_root.join("target/vm-runtime-compressed");
 
-    let compressed_dir = env::var("OPENSHELL_VM_RUNTIME_COMPRESSED_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| default_compressed_dir.clone());
+    let compressed_dir = env::var("OPENSHELL_VM_RUNTIME_COMPRESSED_DIR").map_or_else(
+        |_| default_compressed_dir.clone(),
+        PathBuf::from,
+    );
 
     if compressed_dir.is_dir() {
         println!("cargo:rerun-if-changed={}", compressed_dir.display());
