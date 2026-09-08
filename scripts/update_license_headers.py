@@ -54,6 +54,7 @@ EXCLUDE_DIRS: set[str] = {
     "target",
     "e2e/rust/target",
     "architecture/plans",
+    "third_party",
     "scripts/lint-mermaid/node_modules",
     ".venv",
     ".git",
