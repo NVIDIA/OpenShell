@@ -1310,11 +1310,16 @@ mod tests {
             (issuer.clone(), test_oidc_config(&issuer))
         }
 
-        async fn cache_from_jwks(jwks: serde_json::Value) -> (JwksCache, String, OidcConfig) {
+        async fn cache_from_jwks(
+            jwks: serde_json::Value,
+        ) -> (JwksCache, String, OidcConfig, MockServer) {
             let server = MockServer::start().await;
             let (issuer, config) = mount_oidc(&server, jwks).await;
             let cache = JwksCache::new(&config).await.unwrap();
-            (cache, issuer, config)
+            // Keep the pooled wiremock server checked out until the caller has
+            // finished using the cache. A kid miss can trigger another JWKS
+            // request after this helper returns.
+            (cache, issuer, config, server)
         }
 
         #[tokio::test]
@@ -1326,7 +1331,7 @@ mod tests {
             let jwks = serde_json::json!({
                 "keys": [rsa.jwk, es256.jwk, es384.jwk, eddsa.jwk]
             });
-            let (cache, issuer, config) = cache_from_jwks(jwks).await;
+            let (cache, issuer, config, _server) = cache_from_jwks(jwks).await;
 
             for (name, key) in [
                 ("rsa", &rsa),
@@ -1350,7 +1355,7 @@ mod tests {
                     signing.jwk,
                 ]
             });
-            let (cache, issuer, config) = cache_from_jwks(jwks).await;
+            let (cache, issuer, config, _server) = cache_from_jwks(jwks).await;
             let token = sign_token(&signing, &issuer, &config.audience, "user-1");
             assert!(cache.validate_token(&token).await.is_ok());
         }
@@ -1508,19 +1513,30 @@ mod tests {
                 .await;
 
             let mut config = test_oidc_config(&issuer);
-            config.jwks_ttl_secs = 1; // 1s TTL -> 3s grace period.
+            // Use a large real-time window, then place the cache timestamps
+            // explicitly on either side of it. This keeps scheduler delays
+            // from changing which branch the test exercises.
+            config.jwks_ttl_secs = 60;
             let cache = JwksCache::new(&config).await.unwrap();
             let token = sign_token(&good, &issuer, &config.audience, "user-1");
             assert!(cache.validate_token(&token).await.is_ok());
 
             // Past the TTL but within the grace period: a scheduled refresh
             // sees the now-empty JWKS, but the cached key stays trusted.
-            tokio::time::sleep(Duration::from_millis(1200)).await;
+            *cache.last_refresh.write().await = Instant::now()
+                .checked_sub(cache.ttl + Duration::from_secs(1))
+                .unwrap();
             assert!(cache.validate_token(&token).await.is_ok());
 
             // Past the grace period with the JWKS still empty: the stale
             // key must finally be evicted.
-            tokio::time::sleep(Duration::from_millis(2500)).await;
+            let grace = cache.ttl.saturating_mul(STALE_KEY_GRACE_MULTIPLIER);
+            *cache.last_refresh.write().await = Instant::now()
+                .checked_sub(cache.ttl + Duration::from_secs(1))
+                .unwrap();
+            *cache.last_nonempty_refresh.write().await = Instant::now()
+                .checked_sub(grace + Duration::from_secs(1))
+                .unwrap();
             let err = cache.validate_token(&token).await.unwrap_err();
             assert_eq!(err.code(), tonic::Code::Unauthenticated);
         }
@@ -1582,7 +1598,17 @@ mod tests {
             });
             let unknown_kid_token = encode(&header, &claims, &good.encoding_key).unwrap();
 
-            for _ in 0..5 {
+            let previous_refresh = *cache.last_kid_miss_refresh.read().await;
+            let err = cache.validate_token(&unknown_kid_token).await.unwrap_err();
+            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert!(*cache.last_kid_miss_refresh.read().await > previous_refresh);
+
+            // Keep the remaining lookups deterministically inside the same
+            // cooldown window, even if the test task is descheduled while the
+            // rest of the server suite runs in parallel.
+            *cache.last_kid_miss_refresh.write().await =
+                Instant::now().checked_add(Duration::from_secs(60)).unwrap();
+            for _ in 0..4 {
                 let err = cache.validate_token(&unknown_kid_token).await.unwrap_err();
                 assert_eq!(err.code(), tonic::Code::Unauthenticated);
             }
@@ -1601,7 +1627,7 @@ mod tests {
         async fn header_alg_mismatch_rejected() {
             let ec = ec_test_key("ec", "P-256");
             let jwks = serde_json::json!({ "keys": [ec.jwk] });
-            let (cache, issuer, config) = cache_from_jwks(jwks).await;
+            let (cache, issuer, config, _server) = cache_from_jwks(jwks).await;
             let token = sign_token(&ec, &issuer, &config.audience, "user-1");
             let forged = token_with_header_alg(&token, Algorithm::HS256);
             let err = cache.validate_token(&forged).await.unwrap_err();
@@ -1612,7 +1638,7 @@ mod tests {
         async fn missing_sub_claim_rejected() {
             let key = rsa_test_key("rsa");
             let jwks = serde_json::json!({ "keys": [key.jwk] });
-            let (cache, issuer, config) = cache_from_jwks(jwks).await;
+            let (cache, issuer, config, _server) = cache_from_jwks(jwks).await;
             let mut header = Header::new(key.algorithm);
             header.kid = Some(key.kid.clone());
             let claims = serde_json::json!({
@@ -1631,7 +1657,7 @@ mod tests {
             let mut bad = signing.jwk.clone();
             bad["alg"] = serde_json::json!("ES256");
             let jwks = serde_json::json!({ "keys": [bad] });
-            let (cache, issuer, config) = cache_from_jwks(jwks).await;
+            let (cache, issuer, config, _server) = cache_from_jwks(jwks).await;
             let token = sign_token(&signing, &issuer, &config.audience, "user-1");
             let err = cache.validate_token(&token).await.unwrap_err();
             assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -1649,7 +1675,7 @@ mod tests {
                 Algorithm::RS512,
             );
             let jwks = serde_json::json!({ "keys": [key.jwk.clone()] });
-            let (cache, issuer, config) = cache_from_jwks(jwks).await;
+            let (cache, issuer, config, _server) = cache_from_jwks(jwks).await;
 
             let token = sign_token(&key, &issuer, &config.audience, "user-1");
             let result = cache.validate_token(&token).await;
@@ -1672,7 +1698,7 @@ mod tests {
             let key = rsa_test_key("rsa-no-alg");
             assert!(key.jwk.get("alg").is_none());
             let jwks = serde_json::json!({ "keys": [key.jwk.clone()] });
-            let (cache, issuer, config) = cache_from_jwks(jwks).await;
+            let (cache, issuer, config, _server) = cache_from_jwks(jwks).await;
             let token = sign_token(&key, &issuer, &config.audience, "user-1");
             assert!(cache.validate_token(&token).await.is_ok());
         }
@@ -1688,7 +1714,7 @@ mod tests {
             let mut sign_key = rsa_test_key_secondary("sign-key");
             sign_key.jwk["key_ops"] = serde_json::json!(["sign"]);
             let jwks = serde_json::json!({ "keys": [verify_key.jwk, sign_key.jwk] });
-            let (cache, issuer, config) = cache_from_jwks(jwks).await;
+            let (cache, issuer, config, _server) = cache_from_jwks(jwks).await;
 
             let verify_token = sign_token(&verify_key, &issuer, &config.audience, "verify-user");
             assert!(cache.validate_token(&verify_token).await.is_ok());
@@ -1706,7 +1732,7 @@ mod tests {
             let mut key = rsa_test_key("mixed-ops");
             key.jwk["key_ops"] = serde_json::json!(["sign", "encrypt"]);
             let jwks = serde_json::json!({ "keys": [key.jwk] });
-            let (cache, issuer, config) = cache_from_jwks(jwks).await;
+            let (cache, issuer, config, _server) = cache_from_jwks(jwks).await;
             let token = sign_token(&key, &issuer, &config.audience, "user-1");
             let err = cache.validate_token(&token).await.unwrap_err();
             assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -1719,7 +1745,7 @@ mod tests {
             enc_ops["kid"] = serde_json::json!("enc-ops");
             enc_ops["key_ops"] = serde_json::json!(["encrypt"]);
             let jwks = serde_json::json!({ "keys": [enc_ops, signing.jwk] });
-            let (cache, issuer, config) = cache_from_jwks(jwks).await;
+            let (cache, issuer, config, _server) = cache_from_jwks(jwks).await;
             let token = sign_token(&signing, &issuer, &config.audience, "user-1");
             assert!(cache.validate_token(&token).await.is_ok());
         }
@@ -1731,7 +1757,7 @@ mod tests {
             enc["use"] = serde_json::json!("enc");
             enc["kid"] = serde_json::json!("enc-key");
             let jwks = serde_json::json!({ "keys": [enc, signing.jwk] });
-            let (cache, issuer, config) = cache_from_jwks(jwks).await;
+            let (cache, issuer, config, _server) = cache_from_jwks(jwks).await;
             let token = sign_token(&signing, &issuer, &config.audience, "user-1");
             assert!(cache.validate_token(&token).await.is_ok());
         }
@@ -1743,7 +1769,7 @@ mod tests {
             let mut second_jwk = second.jwk.clone();
             second_jwk["kid"] = serde_json::json!("dup");
             let jwks = serde_json::json!({ "keys": [first.jwk, second_jwk] });
-            let (cache, issuer, config) = cache_from_jwks(jwks).await;
+            let (cache, issuer, config, _server) = cache_from_jwks(jwks).await;
 
             let first_token = sign_token(&first, &issuer, &config.audience, "first-user");
             assert!(cache.validate_token(&first_token).await.is_ok());
@@ -1766,7 +1792,7 @@ mod tests {
             let rsa = rsa_test_key("conflict");
             let eddsa = ed25519_test_key("conflict");
             let jwks = serde_json::json!({ "keys": [rsa.jwk, eddsa.jwk] });
-            let (cache, issuer, config) = cache_from_jwks(jwks).await;
+            let (cache, issuer, config, _server) = cache_from_jwks(jwks).await;
 
             let rsa_token = sign_token(&rsa, &issuer, &config.audience, "rsa-user");
             let err = cache.validate_token(&rsa_token).await.unwrap_err();
