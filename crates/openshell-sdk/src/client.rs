@@ -1203,17 +1203,23 @@ fn map_status(status: tonic::Status) -> SdkError {
 /// Warnings are recoverable loss notices with no cursor, so they never advance
 /// it. Status snapshots and draft-policy updates are not part of the log/event
 /// stream and are dropped (`None`).
+///
+/// `cursor` is a high-water mark, not the last cursor seen. The gateway reads
+/// the log and platform sources independently during live delivery, so arrival
+/// order can differ from cursor order. Taking the max keeps the resume point
+/// monotonic; assigning directly would let a later lower-cursor event rewind it
+/// and replay already-delivered events after a reconnect.
 fn convert_event(event: proto::SandboxStreamEvent, cursor: &mut u64) -> Option<WatchEvent> {
     match event.payload? {
         proto::sandbox_stream_event::Payload::Log(line) => {
-            *cursor = event.cursor;
+            *cursor = (*cursor).max(event.cursor);
             Some(WatchEvent::Log {
                 line: line.into(),
                 cursor: event.cursor,
             })
         }
         proto::sandbox_stream_event::Payload::Event(platform) => {
-            *cursor = event.cursor;
+            *cursor = (*cursor).max(event.cursor);
             Some(WatchEvent::Event {
                 event: platform.into(),
                 cursor: event.cursor,

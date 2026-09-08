@@ -1545,6 +1545,11 @@ message WatchSandboxRequest {
   // delivery. If the requested cursor has already been trimmed from the
   // server's buffer, the resume is unrecoverable and the stream terminates with
   // OUT_OF_RANGE (see SandboxStreamWarning for the recoverable case).
+  //
+  // Cursors are only meaningful within one cursor space. A gateway restart, or
+  // teardown of the sandbox's buffers, starts a new space numbered from 1. A
+  // cursor above everything the current space has issued is rejected with
+  // OUT_OF_RANGE rather than silently suppressing live events beneath it.
   uint64 resume_after_cursor = 11;
 }
 

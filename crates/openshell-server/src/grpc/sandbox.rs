@@ -1544,6 +1544,23 @@ pub(super) async fn handle_watch_sandbox(
                 // unrecoverable gap -> terminate with a documented status.
                 use openshell_core::proto::sandbox_stream_event::Payload;
 
+                // A cursor above everything this space has issued cannot be
+                // resumed: a gateway restart or bus teardown restarts the
+                // allocator at 1 with no record of the cursors it already gave
+                // out. The buses look merely empty, so `tail_after` reports no
+                // gap -- treating that as "caught up" would pin the cutoff to a
+                // stale cursor and silently swallow every live event beneath it.
+                let highest_cursor = state.tracing_log_bus.highest_cursor(&sandbox_id);
+                if resume_after_cursor > highest_cursor {
+                    let _ = tx
+                        .send(Err(Status::out_of_range(format!(
+                            "resume cursor {resume_after_cursor} is no longer available; earliest resumable cursor is {}",
+                            highest_cursor + 1
+                        ))))
+                        .await;
+                    return;
+                }
+
                 let log_replay = if follow_logs {
                     Some(
                         state
@@ -3851,6 +3868,50 @@ mod tests {
         );
 
         // Stream ends after the terminal status.
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resume_from_reset_cursor_space_terminates_out_of_range() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("reset", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        seed_log_lines(&state, &id, 5);
+        // Teardown resets the shared allocator, so the next publish starts over
+        // at cursor 1 -- the same as a gateway restart from the client's view.
+        state.tracing_log_bus.remove(&id);
+        seed_log_lines(&state, &id, 2);
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                // Valid in the previous cursor space, unreachable in this one.
+                resume_after_cursor: 5,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        let snap = stream.next().await.unwrap().unwrap();
+        assert_eq!(snap.cursor, 0);
+
+        let err = stream
+            .next()
+            .await
+            .unwrap()
+            .expect_err("a cursor from a reset space must terminate the stream");
+        assert_eq!(err.code(), tonic::Code::OutOfRange, "{err:?}");
+
+        // The events published after the reset must never be silently dropped
+        // as "already delivered" duplicates.
         assert!(stream.next().await.is_none());
     }
 

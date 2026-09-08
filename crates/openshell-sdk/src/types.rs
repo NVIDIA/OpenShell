@@ -95,13 +95,21 @@ impl From<proto::ServiceStatus> for ServiceStatus {
 
 impl From<proto::SandboxLogLine> for LogLine {
     fn from(value: proto::SandboxLogLine) -> Self {
+        // The wire contract treats an empty source as "gateway" for backward
+        // compatibility with pre-`source` producers. Normalize here so callers
+        // never have to special-case the empty string.
+        let source = if value.source.is_empty() {
+            "gateway".to_string()
+        } else {
+            value.source
+        };
         Self {
             sandbox_id: value.sandbox_id,
             timestamp_ms: value.timestamp_ms,
             level: value.level,
             target: value.target,
             message: value.message,
-            source: value.source,
+            source,
             fields: value.fields,
         }
     }

@@ -1753,6 +1753,71 @@ async fn watch_logs_resumes_after_reconnect() {
 }
 
 #[tokio::test]
+async fn watch_logs_resumes_from_highest_cursor_when_arrival_is_unordered() {
+    // The gateway reads the log and platform sources independently during live
+    // delivery, so arrival order can differ from cursor order. The resume point
+    // must be the highest cursor seen, not the last one.
+    let state = Arc::new(MockState {
+        phase_sequence: vec![proto::SandboxPhase::Ready],
+        watch_script: vec![
+            WatchDial {
+                events: vec![log_event(3, "c"), log_event(1, "a")],
+                end: DialEnd::Err(tonic::Code::Unavailable),
+            },
+            WatchDial {
+                events: vec![log_event(4, "d")],
+                end: DialEnd::Clean,
+            },
+        ],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let stream = client.watch_logs("my-box", watch_opts());
+    tokio::pin!(stream);
+    for want in [3u64, 1, 4] {
+        assert!(
+            matches!(stream.next().await.unwrap().unwrap(), WatchEvent::Log { cursor, .. } if cursor == want)
+        );
+    }
+    assert!(stream.next().await.is_none());
+
+    let reqs = state.last_watch_requests.lock().await;
+    assert_eq!(reqs.len(), 2);
+    // Cursor 1 arrived last but must not rewind the resume point to 1, which
+    // would make the gateway replay cursors 2 and 3 all over again.
+    assert_eq!(reqs[1].resume_after_cursor, 3);
+}
+
+#[tokio::test]
+async fn watch_logs_normalizes_empty_log_source_to_gateway() {
+    let mut event = log_event(1, "a");
+    if let Some(proto::sandbox_stream_event::Payload::Log(ref mut line)) = event.payload {
+        line.source = String::new();
+    }
+
+    let state = Arc::new(MockState {
+        phase_sequence: vec![proto::SandboxPhase::Ready],
+        watch_script: vec![WatchDial {
+            events: vec![event],
+            end: DialEnd::Clean,
+        }],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let stream = client.watch_logs("my-box", watch_opts());
+    tokio::pin!(stream);
+    let WatchEvent::Log { line, .. } = stream.next().await.unwrap().unwrap() else {
+        panic!("expected a log event");
+    };
+    // The wire contract treats an omitted source as "gateway".
+    assert_eq!(line.source, "gateway");
+}
+
+#[tokio::test]
 async fn watch_logs_retries_initial_dial_failure() {
     let state = Arc::new(MockState {
         phase_sequence: vec![proto::SandboxPhase::Ready],
