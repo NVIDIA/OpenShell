@@ -361,6 +361,8 @@ pub fn install_workload_listener() -> io::Result<NotificationListener> {
         libc::SYS_sendmmsg,
         libc::SYS_getpeername,
         libc::SYS_setsockopt,
+        libc::SYS_kill,
+        libc::SYS_rt_sigqueueinfo,
     ])
 }
 
@@ -496,14 +498,18 @@ fn probe_task_memory_copy() -> io::Result<()> {
     let source = 0x1122_3344_5566_7788_u64;
     let tid = std::process::id();
     let mut source_bytes = [0_u8; size_of::<u64>()];
-    super::task_memory::read_exact(tid, std::ptr::addr_of!(source) as u64, &mut source_bytes)?;
+    crate::linux::task_memory::read_exact(
+        tid,
+        std::ptr::addr_of!(source) as u64,
+        &mut source_bytes,
+    )?;
     let mut copied = u64::from_ne_bytes(source_bytes);
     if copied != source {
         return Err(io::Error::other("task-memory probe read wrong value"));
     }
 
     let replacement = 0xaabb_ccdd_eeff_0011_u64;
-    super::task_memory::write_exact(
+    crate::linux::task_memory::write_exact(
         tid,
         std::ptr::addr_of_mut!(copied) as u64,
         &replacement.to_ne_bytes(),
