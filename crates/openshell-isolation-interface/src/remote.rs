@@ -5,6 +5,7 @@
 
 #![allow(unsafe_code)]
 
+#[cfg(test)]
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::mem::size_of;
@@ -31,15 +32,14 @@ use openshell_core::proto::isolation::v1::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::Notify;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::boundary_protocol::{
     AgentSpecWire, BoundaryClientTls, BoundaryTopology, BoundaryTransport, DnsQueryResultWire,
-    ExecSpecWire, ExitStatusWire, MAX_CONTROL_FRAME_BYTES, Request, RequestEnvelope, Response,
-    ResponseEnvelope, STREAM_DNS_ACK, STREAM_DNS_RESPONSE, STREAM_EXIT, STREAM_STDERR,
-    STREAM_STDIN, STREAM_STDIN_CLOSED, STREAM_STDOUT, SandboxPolicyWire, SignalWire, decode_frame,
-    encode_frame, read_stream_frame, validate_resource_claims, write_stream_frame,
+    ExecSpecWire, MAX_CONTROL_FRAME_BYTES, Request, RequestEnvelope, Response, ResponseEnvelope,
+    STREAM_EXIT, STREAM_STDERR, STREAM_STDIN, STREAM_STDIN_CLOSED, STREAM_STDOUT,
+    SandboxPolicyWire, SignalWire, decode_frame, encode_frame, read_stream_frame,
+    validate_resource_claims, write_stream_frame,
 };
 use crate::mediation::{self, DnsQueryWire, MediationFrame, MediationFrameKind};
 
@@ -608,47 +608,6 @@ impl BoundaryPortForward for RemotePortForward {
 struct RemoteExecProcess {
     client: Arc<BoundaryClient>,
     process_id: String,
-    exit: Arc<RemoteExit>,
-}
-
-struct RemoteExit {
-    result: std::sync::Mutex<Option<Result<BoundaryExitStatus, String>>>,
-    changed: Notify,
-}
-
-impl RemoteExit {
-    fn new() -> Self {
-        Self {
-            result: std::sync::Mutex::new(None),
-            changed: Notify::new(),
-        }
-    }
-
-    fn set(&self, result: Result<BoundaryExitStatus, String>) {
-        let mut current = self
-            .result
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if current.is_none() {
-            *current = Some(result);
-            self.changed.notify_waiters();
-        }
-    }
-
-    async fn wait(&self) -> Result<BoundaryExitStatus, BackendError> {
-        loop {
-            let changed = self.changed.notified();
-            let result = self
-                .result
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            if let Some(result) = result {
-                return result.map_err(BackendError::Terminated);
-            }
-            changed.await;
-        }
-    }
 }
 
 #[async_trait]
@@ -658,7 +617,12 @@ impl BoundaryProcess for RemoteExecProcess {
     }
 
     async fn wait(&self) -> Result<BoundaryExitStatus, BackendError> {
-        self.exit.wait().await
+        RemoteProcess {
+            client: self.client.clone(),
+            process_id: self.process_id.clone(),
+        }
+        .wait()
+        .await
     }
 
     async fn signal(&self, signal: BoundarySignal) -> Result<(), BackendError> {
@@ -718,19 +682,16 @@ async fn open_exec_session(
     let (stdin, stdin_pump) = tokio::io::duplex(64 * 1024);
     let (stdout, stdout_pump) = tokio::io::duplex(64 * 1024);
     let (stderr, stderr_pump) = tokio::io::duplex(64 * 1024);
-    let exit = Arc::new(RemoteExit::new());
     tokio::spawn(pump_exec_input(stdin_pump, network_writer));
-    tokio::spawn(pump_exec_responses(
+    tokio::spawn(pump_process_responses(
         network_reader,
         stdout_pump,
         stderr_pump,
-        exit.clone(),
     ));
 
     let process: Arc<dyn BoundaryProcess> = Arc::new(RemoteExecProcess {
         client: client.clone(),
         process_id: process_id.clone(),
-        exit,
     });
     let terminal: Option<Arc<dyn BoundaryTerminal>> = if pty {
         Some(Arc::new(RemoteTerminal { client, process_id }))
@@ -773,56 +734,9 @@ async fn pump_exec_input(
     }
 }
 
-async fn pump_exec_responses(
-    mut network: tokio::io::ReadHalf<BoundaryDuplexStream>,
-    mut stdout: tokio::io::DuplexStream,
-    mut stderr: tokio::io::DuplexStream,
-    exit: Arc<RemoteExit>,
-) {
-    loop {
-        match read_stream_frame(&mut network).await {
-            Ok(Some((STREAM_STDOUT, payload))) => {
-                if stdout.write_all(&payload).await.is_err() {
-                    exit.set(Err("boundary exec stdout consumer closed".to_string()));
-                    return;
-                }
-            }
-            Ok(Some((STREAM_STDERR, payload))) => {
-                if stderr.write_all(&payload).await.is_err() {
-                    exit.set(Err("boundary exec stderr consumer closed".to_string()));
-                    return;
-                }
-            }
-            Ok(Some((STREAM_EXIT, payload))) => {
-                let result = serde_json::from_slice::<ExitStatusWire>(&payload)
-                    .map(BoundaryExitStatus::from)
-                    .map_err(|error| format!("decode boundary exec exit: {error}"));
-                exit.set(result);
-                return;
-            }
-            Ok(Some((channel, _))) => {
-                exit.set(Err(format!(
-                    "boundary exec returned unexpected stream channel {channel}"
-                )));
-                return;
-            }
-            Ok(None) => {
-                exit.set(Err(
-                    "boundary exec stream closed before exit status".to_string()
-                ));
-                return;
-            }
-            Err(error) => {
-                exit.set(Err(format!("read boundary exec stream: {error}")));
-                return;
-            }
-        }
-    }
-}
-
 /// Pulls boundary proxy connections over independent HTTP/2 streams.
 ///
-/// DNS and UDP control messages share the compact persistent mediation
+/// DNS control messages share the compact persistent mediation
 /// session, but TCP byte streams use HTTP/2's native multiplexing. Nesting all
 /// TCP connections inside one application-level writer creates avoidable
 /// head-of-line blocking during concurrent TLS handshakes.
@@ -873,74 +787,14 @@ struct RemoteDnsMediation {
 #[async_trait]
 impl DnsMediationSource for RemoteDnsMediation {
     async fn accept(&self) -> Result<MediatedDnsQuery, BackendError> {
-        if self.client.topology.multiplexed {
-            loop {
-                let session = self.client.mediation_session().await?;
-                match session.accept_dns().await {
-                    Ok(query) => return Ok(query),
-                    Err(BackendError::Unavailable(_)) if !session.is_healthy() => {}
-                    Err(error) => return Err(error),
-                }
+        loop {
+            let session = self.client.mediation_session().await?;
+            match session.accept_dns().await {
+                Ok(query) => return Ok(query),
+                Err(BackendError::Unavailable(_)) if !session.is_healthy() => {}
+                Err(error) => return Err(error),
             }
         }
-        let (stream, response) = self.client.open_exchange(Request::AcceptDns).await?;
-        let Response::DnsQuery {
-            request,
-            transport,
-            identity,
-            timing,
-        } = response
-        else {
-            return Err(unexpected_response("dns_query", &response));
-        };
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(complete_dns_query(stream, response_rx));
-        Ok(MediatedDnsQuery {
-            request,
-            transport,
-            binary_identity: identity.into_result(),
-            timing: MediationTiming {
-                sandbox_notification_to_queue: Duration::from_micros(
-                    timing.notification_to_queue_us,
-                ),
-                sandbox_queue_wait: Duration::from_micros(timing.queue_wait_us),
-                supervisor_received_at: Instant::now(),
-            },
-            response: response_tx,
-        })
-    }
-}
-
-async fn complete_dns_query(
-    mut boundary: BoundaryDuplexStream,
-    response: tokio::sync::oneshot::Receiver<Result<Vec<u8>, BackendError>>,
-) {
-    let result = match response.await {
-        Ok(Ok(response)) => DnsQueryResultWire::Response(response),
-        Ok(Err(error)) => DnsQueryResultWire::Error(error.to_string()),
-        Err(_) => DnsQueryResultWire::Error("DNS mediation was cancelled".to_string()),
-    };
-    let payload = match serde_json::to_vec(&result) {
-        Ok(payload) => payload,
-        Err(error) => {
-            tracing::warn!(%error, "encode mediated DNS response failed: {error}");
-            return;
-        }
-    };
-    if let Err(error) = write_stream_frame(&mut boundary, STREAM_DNS_RESPONSE, &payload).await {
-        tracing::warn!(%error, "write mediated DNS response failed: {error}");
-        return;
-    }
-    match tokio::time::timeout(REQUEST_TIMEOUT, read_stream_frame(&mut boundary)).await {
-        Ok(Ok(Some((STREAM_DNS_ACK, payload)))) if payload.is_empty() => {}
-        Ok(Ok(Some((channel, _)))) => {
-            tracing::warn!(channel, "unexpected mediated DNS acknowledgement channel");
-        }
-        Ok(Ok(None)) => tracing::warn!("boundary closed before acknowledging DNS response"),
-        Ok(Err(error)) => {
-            tracing::warn!(%error, "read mediated DNS acknowledgement failed: {error}");
-        }
-        Err(_) => tracing::warn!("timed out waiting for mediated DNS acknowledgement"),
     }
 }
 
@@ -988,9 +842,6 @@ struct OutboundMediationFrame {
     payload: Vec<u8>,
 }
 
-type MediationRoutes =
-    Arc<tokio::sync::Mutex<HashMap<u64, tokio::sync::mpsc::Sender<MediationFrame>>>>;
-
 struct ClientMediationSession {
     dns: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<MediatedDnsQuery>>,
     healthy: Arc<AtomicBool>,
@@ -1031,7 +882,6 @@ async fn run_client_mediation(
     let (mut reader, mut writer) = tokio::io::split(stream);
     let (outbound_tx, mut outbound_rx) =
         tokio::sync::mpsc::channel::<OutboundMediationFrame>(MEDIATION_EVENT_QUEUE);
-    let routes = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let writer_task = async {
         while let Some(frame) = outbound_rx.recv().await {
             mediation::write_frame(&mut writer, frame.kind, frame.stream_id, &frame.payload)
@@ -1041,7 +891,7 @@ async fn run_client_mediation(
     };
     let reader_task = async {
         while let Some(frame) = mediation::read_frame(&mut reader).await? {
-            dispatch_client_mediation_frame(frame, &dns_tx, &outbound_tx, &routes).await?;
+            dispatch_client_mediation_frame(frame, &dns_tx, &outbound_tx).await?;
         }
         Ok::<(), std::io::Error>(())
     };
@@ -1051,7 +901,6 @@ async fn run_client_mediation(
         result = &mut writer_task => result,
         result = &mut reader_task => result,
     };
-    routes.lock().await.clear();
     result
 }
 
@@ -1059,7 +908,6 @@ async fn dispatch_client_mediation_frame(
     frame: MediationFrame,
     dns_tx: &tokio::sync::mpsc::Sender<MediatedDnsQuery>,
     outbound: &tokio::sync::mpsc::Sender<OutboundMediationFrame>,
-    routes: &MediationRoutes,
 ) -> std::io::Result<()> {
     match frame.kind {
         MediationFrameKind::DnsQuery => {
@@ -1107,17 +955,7 @@ async fn dispatch_client_mediation_frame(
                     )
                 })?;
         }
-        MediationFrameKind::StreamClosed => {
-            let route = routes.lock().await.get(&frame.stream_id).cloned();
-            if let Some(route) = route {
-                let _ = route.send(frame).await;
-            }
-        }
-        MediationFrameKind::NetworkOpen
-        | MediationFrameKind::NetworkDecision
-        | MediationFrameKind::NetworkData
-        | MediationFrameKind::NetworkEof
-        | MediationFrameKind::DnsResponse => {
+        MediationFrameKind::DnsResponse => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
@@ -1178,7 +1016,9 @@ impl BoundaryClient {
                 Err(error) => return Err(error),
             }
         }
-        unreachable!("bounded wait reconnect loop always returns")
+        Err(BackendError::Unavailable(
+            "boundary wait retry budget exhausted".to_string(),
+        ))
     }
 
     async fn call_stream(
@@ -1250,11 +1090,7 @@ impl BoundaryClient {
         envelope: &RequestEnvelope,
     ) -> Result<(BoundaryDuplexStream, Response), BackendError> {
         let request_id = envelope.request_id.clone();
-        let mut stream = if self.topology.multiplexed {
-            self.open_grpc_stream(GrpcStreamKind::Exchange).await?
-        } else {
-            self.connect_boundary().await?
-        };
+        let mut stream = self.open_grpc_stream(GrpcStreamKind::Exchange).await?;
         let frame = encode_frame(envelope)
             .map_err(|error| BackendError::Process(format!("encode control request: {error}")))?;
         stream.write_all(&frame).await.map_err(|error| {
@@ -1326,7 +1162,9 @@ impl BoundaryClient {
                 Err(error) => return Err(error),
             }
         }
-        unreachable!("bounded mediation reconnect loop always returns")
+        Err(BackendError::Unavailable(
+            "boundary mediation retry budget exhausted".to_string(),
+        ))
     }
 
     async fn open_mediation_session(&self) -> Result<Arc<ClientMediationSession>, BackendError> {
@@ -1390,17 +1228,7 @@ impl BoundaryClient {
         Ok(channel)
     }
 
-    async fn connect_boundary(&self) -> Result<BoundaryDuplexStream, BackendError> {
-        let deadline = tokio::time::Instant::now() + CONNECT_RETRY_TIMEOUT;
-        loop {
-            match self.connect_boundary_once().await {
-                Ok(stream) => return Ok(stream),
-                Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
-                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
-            }
-        }
-    }
-
+    #[cfg(test)]
     async fn connect_boundary_once(&self) -> Result<BoundaryDuplexStream, BackendError> {
         connect_boundary_once(&self.topology).await
     }
@@ -1651,7 +1479,7 @@ mod tests {
     use std::task::{Context, Poll};
 
     use super::*;
-    use crate::boundary_protocol::generate_boundary_mutual_tls_material;
+    use crate::boundary_protocol::{ExitStatusWire, generate_boundary_mutual_tls_material};
     use openshell_core::policy::{
         FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
     };
@@ -1683,6 +1511,7 @@ mod tests {
     #[derive(Clone)]
     struct TestGrpcBoundary {
         wait_for_half_close: bool,
+        expected_token: String,
         requests: Arc<std::sync::atomic::AtomicUsize>,
     }
 
@@ -1702,6 +1531,7 @@ mod tests {
             let mut inbound = request.into_inner();
             let wait_for_half_close = self.wait_for_half_close;
             let requests = self.requests.clone();
+            let expected_token = self.expected_token.clone();
             let (outbound, outbound_rx) = tokio::sync::mpsc::channel(1);
             tokio::spawn(async move {
                 let mut frame = Vec::new();
@@ -1733,8 +1563,28 @@ mod tests {
                     };
                     match encode_frame(&ResponseEnvelope {
                         request_id: envelope.request_id,
-                        response: Response::Confirmed {
-                            evidence: Box::new(test_confirmation_evidence()),
+                        response: if envelope.bootstrap_token != expected_token
+                            || envelope.boundary_id != "sandbox-1"
+                        {
+                            Response::Error {
+                                kind: "denied".to_string(),
+                                message: "control authentication failed".to_string(),
+                            }
+                        } else if matches!(envelope.request, Request::Wait { .. }) {
+                            Response::Exited {
+                                status: ExitStatusWire::Exited(23),
+                            }
+                        } else if matches!(envelope.request, Request::Exec { .. }) {
+                            Response::ExecStarted {
+                                process_id: "test-generation:exec:1".to_string(),
+                                pty: false,
+                            }
+                        } else if matches!(envelope.request, Request::AttachProcess { .. }) {
+                            Response::ProcessAttached { terminal: false }
+                        } else {
+                            Response::Confirmed {
+                                evidence: Box::new(test_confirmation_evidence()),
+                            }
                         },
                     }) {
                         Ok(response) => response,
@@ -1779,6 +1629,7 @@ mod tests {
         let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let service = TestGrpcBoundary {
             wait_for_half_close: true,
+            expected_token: "a".repeat(32),
             requests,
         };
         let server = tokio::spawn(async move {
@@ -1807,83 +1658,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_dns_exchange_returns_supervisor_response() {
-        let socket_path = std::env::temp_dir().join(format!(
-            "openshell-dns-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let certificate = test_certificate();
-        let server_config = certificate.server_config.clone();
-        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+    async fn persistent_dns_exchange_returns_supervisor_response() {
+        let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+        let session = ClientMediationSession::start(Box::new(client_stream));
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut stream = tokio_rustls::TlsAcceptor::from(server_config)
-                .accept(stream)
-                .await
-                .unwrap();
-            let declared = stream.read_u32().await.unwrap() as usize;
-            let mut frame = vec![0_u8; 4 + declared];
-            frame[..4].copy_from_slice(&u32::try_from(declared).unwrap().to_be_bytes());
-            stream.read_exact(&mut frame[4..]).await.unwrap();
-            let request: RequestEnvelope = decode_frame(&frame).unwrap();
-            assert_eq!(request.request, Request::AcceptDns);
-            let response = encode_frame(&ResponseEnvelope {
-                request_id: request.request_id,
-                response: Response::DnsQuery {
-                    request: vec![1, 2, 3],
-                    transport: crate::contract::DnsTransport::Udp,
-                    identity: crate::boundary_protocol::BinaryIdentityWire {
-                        binary_path: Some(PathBuf::from("/usr/bin/dig")),
-                        binary_digest: Some("a".repeat(64)),
-                        ancestors: Vec::new(),
-                        cmdline_paths: Vec::new(),
-                        resolve_error: None,
-                    },
-                    timing: crate::boundary_protocol::MediationTimingWire::default(),
+            let query = DnsQueryWire {
+                request: vec![1, 2, 3],
+                transport: crate::contract::DnsTransport::Udp,
+                identity: crate::boundary_protocol::BinaryIdentityWire {
+                    binary_path: Some(PathBuf::from("/usr/bin/dig")),
+                    binary_digest: Some("a".repeat(64)),
+                    ancestors: Vec::new(),
+                    cmdline_paths: Vec::new(),
+                    resolve_error: None,
                 },
-            })
+                timing: crate::boundary_protocol::MediationTimingWire::default(),
+            };
+            mediation::write_frame(
+                &mut server_stream,
+                MediationFrameKind::DnsQuery,
+                42,
+                &mediation::encode_json(&query).unwrap(),
+            )
+            .await
             .unwrap();
-            stream.write_all(&response).await.unwrap();
-            let (channel, payload) = read_stream_frame(&mut stream).await.unwrap().unwrap();
-            assert_eq!(channel, STREAM_DNS_RESPONSE);
+            let reply = mediation::read_frame(&mut server_stream)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply.kind, MediationFrameKind::DnsResponse);
+            assert_eq!(reply.stream_id, 42);
             assert_eq!(
-                serde_json::from_slice::<DnsQueryResultWire>(&payload).unwrap(),
+                mediation::decode_json::<DnsQueryResultWire>(&reply.payload).unwrap(),
                 DnsQueryResultWire::Response(vec![4, 5, 6])
             );
-            write_stream_frame(&mut stream, STREAM_DNS_ACK, &[])
-                .await
-                .unwrap();
         });
-        let client = Arc::new(BoundaryClient::new(BoundaryTopology {
-            boundary_id: "sandbox-1".to_string(),
-            generation: "test-generation".to_string(),
-            session_epoch: "test-session".to_string(),
-            workload_identity: sandbox().identity,
-            transport: BoundaryTransport::Unix {
-                socket_path: socket_path.clone(),
-                tls: certificate.client_tls,
-            },
-            multiplexed: false,
-            host_gateway_ip: None,
-            resource_claims: std::collections::BTreeMap::new(),
-            driver_fence: test_driver_fence(),
-            bootstrap_token: "a".repeat(32),
-        }));
-        let source = RemoteDnsMediation { client };
-        let query = source.accept().await.unwrap();
+        let query = session.accept_dns().await.unwrap();
         assert_eq!(query.request, [1, 2, 3]);
-        assert_eq!(query.transport, crate::contract::DnsTransport::Udp);
         assert_eq!(
             query.binary_identity.unwrap().binary_path,
             PathBuf::from("/usr/bin/dig")
         );
         query.response.send(Ok(vec![4, 5, 6])).unwrap();
         server.await.unwrap();
-        let _ = std::fs::remove_file(socket_path);
     }
 
     struct TestCertificate {
@@ -1937,7 +1754,6 @@ mod tests {
             session_epoch: "test-session".to_string(),
             workload_identity: sandbox().identity,
             transport: BoundaryTransport::TlsTcp { address, tls },
-            multiplexed: false,
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
             driver_fence: test_driver_fence(),
@@ -1949,47 +1765,34 @@ mod tests {
         certificate: Arc<rustls::ServerConfig>,
         expected_token: String,
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test TLS boundary");
-        let address = listener.local_addr().expect("read test listener address");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept TLS control client");
-            let Ok(mut stream) = tokio_rustls::TlsAcceptor::from(certificate)
+            let (stream, _) = listener.accept().await.unwrap();
+            let Ok(stream) = tokio_rustls::TlsAcceptor::from(certificate)
                 .accept(stream)
                 .await
             else {
                 return;
             };
-            let declared_u32 = stream.read_u32().await.expect("read request length");
-            let declared = declared_u32 as usize;
-            let mut frame = vec![0_u8; 4 + declared];
-            frame[..4].copy_from_slice(&declared_u32.to_be_bytes());
-            stream
-                .read_exact(&mut frame[4..])
-                .await
-                .expect("read request frame");
-            let request: RequestEnvelope = decode_frame(&frame).expect("decode request");
-            let response = if request.boundary_id == "sandbox-1"
-                && request.bootstrap_token == expected_token
-            {
-                Response::Confirmed {
-                    evidence: Box::new(test_confirmation_evidence()),
-                }
-            } else {
-                Response::Error {
-                    kind: "denied".to_string(),
-                    message: "control authentication failed".to_string(),
-                }
-            };
-            let frame = encode_frame(&ResponseEnvelope {
-                request_id: request.request_id,
-                response,
-            })
-            .expect("encode response");
-            stream.write_all(&frame).await.expect("write response");
+            serve_test_grpc(Box::new(stream), expected_token).await;
         });
         (address, task)
+    }
+
+    async fn serve_test_grpc(stream: BoundaryDuplexStream, expected_token: String) {
+        let service = TestGrpcBoundary {
+            wait_for_half_close: false,
+            expected_token,
+            requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        tonic::transport::Server::builder()
+            .add_service(IsolationBoundaryServer::new(service))
+            .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(
+                stream,
+            ))]))
+            .await
+            .unwrap();
     }
 
     fn sandbox() -> SandboxContext {
@@ -2048,7 +1851,7 @@ mod tests {
                 task_memory_write: true,
                 cancellation: true,
             },
-            landlock_abi: 1,
+            landlock_abi: 3,
             landlock_allow_deny: true,
             udp_dns_round_trip: true,
             tcp_dns_round_trip: true,
@@ -2072,7 +1875,6 @@ mod tests {
                 socket_path: PathBuf::from("/tmp/vsock.sock"),
                 tls: test_certificate().client_tls,
             },
-            multiplexed: false,
             host_gateway_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             resource_claims: std::collections::BTreeMap::new(),
             driver_fence: test_driver_fence(),
@@ -2094,7 +1896,6 @@ mod tests {
                 socket_path: PathBuf::from("/tmp/vsock.sock"),
                 tls: test_certificate().client_tls,
             },
-            multiplexed: false,
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
             driver_fence: test_driver_fence(),
@@ -2117,7 +1918,6 @@ mod tests {
                 address: "0.0.0.0:5500".parse().expect("valid address"),
                 tls: test_certificate().client_tls,
             },
-            multiplexed: false,
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
             driver_fence: test_driver_fence(),
@@ -2140,7 +1940,6 @@ mod tests {
                 address: "10.42.0.7:5500".parse().expect("valid address"),
                 tls: test_certificate().client_tls,
             },
-            multiplexed: false,
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
             driver_fence: test_driver_fence(),
@@ -2186,10 +1985,47 @@ mod tests {
                 evidence: Box::new(test_confirmation_evidence()),
             }
         );
-        server.await.expect("TLS test server");
+        server.abort();
     }
 
-    struct TestTlsIo(tokio_rustls::server::TlsStream<tokio::net::TcpStream>);
+    #[tokio::test]
+    async fn exec_wait_survives_output_loss_and_reattachment() {
+        let certificate = test_certificate();
+        let (address, server) = spawn_tls_boundary(certificate.server_config, "a".repeat(32)).await;
+        let client = Arc::new(BoundaryClient::new(tls_topology(
+            address,
+            certificate.client_tls,
+            &"a".repeat(32),
+        )));
+        let session = open_exec_session(
+            client,
+            ExecSpec {
+                program: "/bin/true".to_string(),
+                args: Vec::new(),
+                env: Vec::new(),
+                workdir: None,
+                pty: false,
+            },
+        )
+        .await
+        .unwrap();
+        // The test peer closes its I/O stream without an exit frame. Neither
+        // that loss nor a dropped reader can invalidate the process handle.
+        drop(session.stdin);
+        drop(session.stdout);
+        drop(session.stderr);
+        let attachment = session.process.attach().await.unwrap();
+        drop(attachment);
+        for _ in 0..2 {
+            assert_eq!(
+                session.process.wait().await.unwrap(),
+                BoundaryExitStatus::Exited(23)
+            );
+        }
+        server.abort();
+    }
+
+    struct TestTlsIo(BoundaryDuplexStream);
 
     impl tokio::io::AsyncRead for TestTlsIo {
         fn poll_read(
@@ -2245,6 +2081,7 @@ mod tests {
         let handled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let service = TestGrpcBoundary {
             wait_for_half_close: false,
+            expected_token: "a".repeat(32),
             requests: handled.clone(),
         };
         let server = tokio::spawn(async move {
@@ -2260,7 +2097,7 @@ mod tests {
                     tonic::transport::Server::builder()
                         .add_service(IsolationBoundaryServer::new(service))
                         .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(
-                            TestTlsIo(stream),
+                            TestTlsIo(Box::new(stream)),
                         )]))
                         .await
                         .expect("serve test gRPC connection");
@@ -2276,7 +2113,6 @@ mod tests {
                 address,
                 tls: certificate.client_tls,
             },
-            multiplexed: true,
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
             driver_fence: test_driver_fence(),
@@ -2328,7 +2164,7 @@ mod tests {
                 .expect("large TLS request"),
             Response::Confirmed { .. }
         ));
-        server.await.expect("TLS test server");
+        server.abort();
     }
 
     #[tokio::test]
@@ -2345,28 +2181,12 @@ mod tests {
         let server_config = certificate.server_config;
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind test socket");
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept TLS control client");
-            let mut stream = tokio_rustls::TlsAcceptor::from(server_config)
+            let (stream, _) = listener.accept().await.unwrap();
+            let stream = tokio_rustls::TlsAcceptor::from(server_config)
                 .accept(stream)
                 .await
-                .expect("accept TLS session");
-            let declared_u32 = stream.read_u32().await.expect("read request length");
-            let declared = declared_u32 as usize;
-            let mut frame = vec![0_u8; 4 + declared];
-            frame[..4].copy_from_slice(&declared_u32.to_be_bytes());
-            stream
-                .read_exact(&mut frame[4..])
-                .await
-                .expect("read request frame");
-            let request: RequestEnvelope = decode_frame(&frame).expect("decode request");
-            let frame = encode_frame(&ResponseEnvelope {
-                request_id: request.request_id,
-                response: Response::Confirmed {
-                    evidence: Box::new(test_confirmation_evidence()),
-                },
-            })
-            .expect("encode response");
-            stream.write_all(&frame).await.expect("write response");
+                .unwrap();
+            serve_test_grpc(Box::new(stream), "a".repeat(32)).await;
         });
         let context = sandbox();
         let client = BoundaryClient::new(BoundaryTopology {
@@ -2378,7 +2198,6 @@ mod tests {
                 socket_path: socket_path.clone(),
                 tls: certificate.client_tls,
             },
-            multiplexed: false,
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
             driver_fence: test_driver_fence(),
@@ -2403,7 +2222,7 @@ mod tests {
             .expect("large Unix TLS request"),
             Response::Confirmed { .. }
         ));
-        server.await.expect("TLS test server");
+        server.abort();
         let _ = std::fs::remove_file(socket_path);
     }
 
@@ -2425,7 +2244,7 @@ mod tests {
             client.exchange(Request::Confirm).await,
             Err(BackendError::Denied(_))
         ));
-        server.await.expect("TLS test server");
+        server.abort();
     }
 
     #[tokio::test]

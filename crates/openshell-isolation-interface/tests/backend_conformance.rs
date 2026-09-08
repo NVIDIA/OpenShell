@@ -390,7 +390,7 @@ fn confirmation_evidence() -> SandboxConfirmEvidence {
             task_memory_write: true,
             cancellation: true,
         },
-        landlock_abi: 1,
+        landlock_abi: 3,
         landlock_allow_deny: true,
         udp_dns_round_trip: true,
         tcp_dns_round_trip: true,
