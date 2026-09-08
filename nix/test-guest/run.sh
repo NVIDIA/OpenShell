@@ -13,7 +13,7 @@ Usage:
 
 Options:
   --distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
-  --with NAME         Apply a configuration; repeatable (docker, podman-rootless, selinux, snapd)
+  --with NAME         Apply a configuration; repeatable (docker, podman-rootful, podman-rootless, selinux, snapd)
   --provision NAME    Apply a post-artifact system provisioner; repeatable
   --install PATH      Install a .deb or .rpm package; repeatable
   --copy SRC:DEST[:MODE]
@@ -177,17 +177,32 @@ fi
 # shellcheck disable=SC1090
 . "${OPENSHELL_TEST_GUEST_DISTROS}/${distro}"
 
-	for item in "${configurations[@]}"; do
-		if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
+podman_mode=
+for item in "${configurations[@]}"; do
+	if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
 		[ ! -f "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}/${item}" ]; then
 		echo "unknown configuration: ${item:-<empty>}" >&2
 		exit 2
 	fi
+	case "${item}" in
+	podman-rootful | podman-rootless)
+		item_podman_mode=${item#podman-}
+		if [ -n "${podman_mode}" ] && [ "${podman_mode}" != "${item_podman_mode}" ]; then
+			echo "podman-rootful and podman-rootless configurations are mutually exclusive" >&2
+			exit 2
+		fi
+		podman_mode=${item_podman_mode}
+		;;
+	esac
 done
 for item in "${provisions[@]}"; do
 	if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
 		[ ! -d "${OPENSHELL_TEST_GUEST_PROVISIONERS}/${item}" ]; then
 		echo "unknown provisioner: ${item:-<empty>}" >&2
+		exit 2
+	fi
+	if [ "${item}" = gateway-podman ] && [ -z "${podman_mode}" ]; then
+		echo "gateway-podman requires --with podman-rootful or --with podman-rootless" >&2
 		exit 2
 	fi
 done

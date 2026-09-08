@@ -27,11 +27,11 @@ use openshell_core::proto::compute::v1::{
     GatewayListenerRequirement as ProtoGatewayListenerRequirement, GetCapabilitiesRequest,
     GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
     GetSandboxRequest, GpuResourceRequirements as DriverGpuResourceRequirements,
-    ListSandboxesRequest, ResourceRequirements as DriverSandboxResourceRequirements,
-    StartSandboxRequest, StopSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent,
-    WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
-    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
-    watch_sandboxes_event,
+    ListSandboxesRequest, ResourceCapabilities as DriverResourceCapabilities,
+    ResourceRequirements as DriverSandboxResourceRequirements, StartSandboxRequest,
+    StopSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
+    compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
+    gateway_listener_requirement::Selector, watch_sandboxes_event,
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
@@ -305,6 +305,8 @@ pub struct ComputeDriverInfoSnapshot {
     pub supports_sandbox_authentication: bool,
     /// Whether the driver reports runtime readiness without a supervisor session.
     pub driver_reports_runtime_readiness: bool,
+    /// Static portable resource request forms from the startup capability snapshot.
+    pub resource_capabilities: Option<DriverResourceCapabilities>,
 }
 
 /// Interval between store-vs-backend reconciliation sweeps.
@@ -653,6 +655,7 @@ impl ComputeRuntime {
             gateway_manages_lifecycle: capabilities.gateway_manages_lifecycle,
             supports_sandbox_authentication: capabilities.supports_sandbox_authentication,
             driver_reports_runtime_readiness: capabilities.driver_reports_runtime_readiness,
+            resource_capabilities: capabilities.resource_capabilities,
         };
         let default_image = capabilities.default_image;
         let gateway_listener_requirements = match driver
@@ -4655,6 +4658,7 @@ impl ComputeDriver for NoopTestDriver {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: self.sandbox_authentication.is_some(),
                 driver_reports_runtime_readiness: false,
+                resource_capabilities: None,
             },
         ))
     }
@@ -4799,6 +4803,7 @@ pub async fn new_test_runtime_with_driver(
             gateway_manages_lifecycle: false,
             supports_sandbox_authentication,
             driver_reports_runtime_readiness: false,
+            resource_capabilities: None,
         },
         telemetry_compute_driver: TelemetryComputeDriver::custom(),
         driver_process: None,
@@ -4977,6 +4982,7 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
+                resource_capabilities: None,
             }))
         }
 
@@ -5318,6 +5324,7 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
+                resource_capabilities: None,
             }))
         }
 
@@ -5528,6 +5535,7 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
+                resource_capabilities: None,
             },
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process: None,
