@@ -9,11 +9,15 @@
 //! backends behind `dyn` with no enum over concrete state, and that one driver
 //! runs both unchanged.
 
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
-use std::sync::Mutex;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use super::*;
+use async_trait::async_trait;
+use openshell_isolation_interface::contract::*;
+use tokio::sync::oneshot;
 
 // ---------------------------------------------------------------------------
 // Marker kinds: two materially different backends.
@@ -211,10 +215,11 @@ impl<K: MockKind> BoundBoundary for MockBound<K> {
         self.source.clone()
     }
     async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError> {
-        Ok(ConfirmedBoundary::new(
+        ConfirmedBoundary::try_new(
             Box::new(MockReady::<K> { _k: PhantomData }),
             confirmation_evidence(),
-        ))
+            &workload_identity(),
+        )
     }
 }
 
@@ -389,8 +394,8 @@ async fn drive(
     let _ingress = bound.network_mediation_source();
     assert_eq!(bound.host_gateway_ip(), None);
     let confirmed = bound.confirm().await?;
-    confirmed.evidence.validate(&sandbox_ctx().identity)?;
-    confirmed.boundary.start_agent().await
+    confirmed.evidence().validate(&sandbox_ctx().identity)?;
+    confirmed.into_boundary().start_agent().await
 }
 
 // ---------------------------------------------------------------------------
@@ -466,6 +471,36 @@ async fn one_driver_runs_both_backends() {
     );
 }
 
+#[test]
+fn confirmation_constructor_rejects_incomplete_evidence() {
+    let mut evidence = confirmation_evidence();
+    evidence.seccomp.cancellation = false;
+    let result = ConfirmedBoundary::try_new(
+        Box::new(MockReady::<Primary> { _k: PhantomData }),
+        evidence,
+        &workload_identity(),
+    );
+    assert!(matches!(result, Err(BackendError::Confirm(_))));
+}
+
+#[test]
+fn confirmation_constructor_rejects_another_workload_identity() {
+    let expected = ResolvedWorkloadIdentity::new(
+        1001,
+        1001,
+        vec![1001],
+        "policy".to_string(),
+        "sha256:test".to_string(),
+    )
+    .unwrap();
+    let result = ConfirmedBoundary::try_new(
+        Box::new(MockReady::<Primary> { _k: PhantomData }),
+        confirmation_evidence(),
+        &expected,
+    );
+    assert!(matches!(result, Err(BackendError::Confirm(_))));
+}
+
 #[tokio::test]
 async fn one_boundary_termination_does_not_change_another_boundary() {
     let reg = registry();
@@ -519,7 +554,11 @@ async fn runtime_interfaces_survive_lifecycle_consumption() {
     // The retained Arc must remain usable afterward.
     let source = bound.network_mediation_source();
     let confirmed = bound.confirm().await.expect("confirm");
-    let _running = confirmed.boundary.start_agent().await.expect("start");
+    let _running = confirmed
+        .into_boundary()
+        .start_agent()
+        .await
+        .expect("start");
 
     let conn = source.accept().await.expect("accept after consumption");
     let identity = conn.binary_identity.expect("identity resolves");
