@@ -30,6 +30,8 @@ pub struct LocalBoundaryExec {
     provider_credentials: ProviderCredentialState,
     user_environment: HashMap<String, String>,
     runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
+    #[cfg(target_os = "linux")]
+    launcher: openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
 }
 
 impl LocalBoundaryExec {
@@ -42,6 +44,8 @@ impl LocalBoundaryExec {
         provider_credentials: ProviderCredentialState,
         user_environment: HashMap<String, String>,
         runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
+        #[cfg(target_os = "linux")]
+        launcher: openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
     ) -> Self {
         Self {
             policy,
@@ -50,6 +54,8 @@ impl LocalBoundaryExec {
             provider_credentials,
             user_environment,
             runtime,
+            #[cfg(target_os = "linux")]
+            launcher,
         }
     }
 
@@ -138,8 +144,9 @@ impl LocalBoundaryExec {
         #[cfg(target_os = "linux")]
         let mut child_registry = crate::managed_children::lock();
         #[cfg(target_os = "linux")]
-        let mut child = crate::process::spawn_std_command_with_workload_launcher(command)
-            .map_err(|error| BackendError::Process(error.to_string()))?;
+        let mut child =
+            crate::process::spawn_std_command_with_workload_launcher(&self.launcher, command)
+                .map_err(|error| BackendError::Process(error.to_string()))?;
         #[cfg(not(target_os = "linux"))]
         let mut child = command
             .spawn()
@@ -248,8 +255,9 @@ impl LocalBoundaryExec {
         #[cfg(target_os = "linux")]
         let mut child_registry = crate::managed_children::lock();
         #[cfg(target_os = "linux")]
-        let mut child = crate::process::spawn_std_command_with_workload_launcher(command)
-            .map_err(|error| BackendError::Process(error.to_string()))?;
+        let mut child =
+            crate::process::spawn_std_command_with_workload_launcher(&self.launcher, command)
+                .map_err(|error| BackendError::Process(error.to_string()))?;
         #[cfg(not(target_os = "linux"))]
         let mut child = command
             .spawn()
@@ -495,22 +503,15 @@ impl BoundaryProcess for LocalExecProcess {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::sync::Once;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn executor() -> LocalBoundaryExec {
-        static LAUNCHER: Once = Once::new();
-        LAUNCHER.call_once(|| {
-            let (launcher, listener) =
-                openshell_isolation_interface::linux::workload_launcher::start()
-                    .expect("start test workload launcher");
-            std::thread::spawn(move || {
-                while let Ok(notification) = listener.receive() {
-                    let _ = listener.respond_errno(notification.id, libc::EPERM);
-                }
-            });
-            crate::process::configure_workload_launcher(launcher)
-                .expect("configure test workload launcher");
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start test workload launcher");
+        std::thread::spawn(move || {
+            while let Ok(notification) = listener.receive() {
+                let _ = listener.respond_errno(notification.id, libc::EPERM);
+            }
         });
         LocalBoundaryExec::new(
             SandboxPolicy {
@@ -530,6 +531,7 @@ mod tests {
             ),
             HashMap::new(),
             crate::boundary_io::BoundaryRuntimeState::new(),
+            launcher,
         )
     }
 

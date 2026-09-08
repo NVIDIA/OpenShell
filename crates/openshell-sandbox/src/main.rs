@@ -108,15 +108,47 @@ fn validate_workspace(_args: &[String]) -> Result<()> {
 fn run_capability_probe() -> Result<()> {
     let (qualification, report) = qualify_runtime()?;
     debug_assert!(qualification.seccomp.notification_round_trip);
-    println!("{report}");
+    println!("{}", serde_json::to_string(&report).into_diagnostic()?);
     Ok(())
 }
 
 /// Actively qualify every kernel primitive used by the capability-free
 /// sandbox. Callers decide whether to emit the resulting diagnostic report.
 #[cfg(target_os = "linux")]
+#[derive(serde::Serialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "diagnostic report records independent active probes"
+)]
+struct QualificationReport {
+    qualified: bool,
+    uid: u32,
+    gid: u32,
+    supplementary_groups: Vec<u32>,
+    capabilities_zero: bool,
+    no_new_privileges: bool,
+    sandbox_dumpable: bool,
+    child_dumpable: bool,
+    child_core_limit_zero: bool,
+    same_uid_self_protection: bool,
+    landlock_abi: u32,
+    landlock_allow_deny: bool,
+    seccomp_notification: bool,
+    seccomp_addfd_send: bool,
+    task_memory_copy: bool,
+    connected_send_fast_path: bool,
+    socket_virtualization: bool,
+    dns_relay_bind: bool,
+    udp_dns_round_trip: bool,
+    tcp_dns_round_trip: bool,
+    tcp_allow_round_trip: bool,
+    tcp_deny_round_trip: bool,
+    wait_killable_recv: bool,
+}
+
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, serde_json::Value)> {
+fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, QualificationReport)> {
     use miette::Context as _;
 
     let uid = nix::unistd::geteuid().as_raw();
@@ -168,8 +200,10 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, serde_j
     let landlock_abi = openshell_isolation_interface::linux::landlock::abi_version()
         .into_diagnostic()
         .wrap_err("Landlock ABI probe")?;
-    if landlock_abi == 0 {
-        return Err(miette::miette!("Landlock ABI version is zero"));
+    if landlock_abi < 3 {
+        return Err(miette::miette!(
+            "sandbox self-protection requires Landlock ABI v3 or newer (including truncation), found v{landlock_abi}"
+        ));
     }
 
     let groups = nix::unistd::getgroups()
@@ -177,31 +211,31 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, serde_j
         .into_iter()
         .map(nix::unistd::Gid::as_raw)
         .collect::<Vec<_>>();
-    let report = serde_json::json!({
-        "qualified": true,
-        "uid": uid,
-        "gid": gid,
-        "supplementary_groups": groups,
-        "capabilities_zero": true,
-        "no_new_privileges": true,
-        "sandbox_dumpable": false,
-        "child_dumpable": true,
-        "child_core_limit_zero": true,
-        "same_uid_self_protection": true,
-        "landlock_abi": landlock_abi,
-        "landlock_allow_deny": true,
-        "seccomp_notification": notification.notification_round_trip(),
-        "seccomp_addfd_send": notification.addfd_send(),
-        "task_memory_copy": notification.task_memory_copy(),
-        "connected_send_fast_path": notification.connected_send_fast_path(),
-        "socket_virtualization": true,
-        "dns_relay_bind": true,
-        "udp_dns_round_trip": true,
-        "tcp_dns_round_trip": true,
-        "tcp_allow_round_trip": true,
-        "tcp_deny_round_trip": true,
-        "wait_killable_recv": notification.wait_killable_recv,
-    });
+    let report = QualificationReport {
+        qualified: true,
+        uid,
+        gid,
+        supplementary_groups: groups,
+        capabilities_zero: true,
+        no_new_privileges: true,
+        sandbox_dumpable: false,
+        child_dumpable: true,
+        child_core_limit_zero: true,
+        same_uid_self_protection: true,
+        landlock_abi,
+        landlock_allow_deny: true,
+        seccomp_notification: notification.notification_round_trip(),
+        seccomp_addfd_send: notification.addfd_send(),
+        task_memory_copy: notification.task_memory_copy(),
+        connected_send_fast_path: notification.connected_send_fast_path(),
+        socket_virtualization: true,
+        dns_relay_bind: true,
+        udp_dns_round_trip: true,
+        tcp_dns_round_trip: true,
+        tcp_allow_round_trip: true,
+        tcp_deny_round_trip: true,
+        wait_killable_recv: notification.wait_killable_recv,
+    };
     let qualification = openshell_sandbox::RuntimeQualification {
         seccomp: openshell_isolation_interface::contract::SeccompEvidence {
             new_listener: notification.notification_round_trip(),
