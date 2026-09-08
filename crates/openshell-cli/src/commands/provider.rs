@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(dead_code)]
+
 use crate::color::Colorize;
 use crate::commands::common::{
     format_epoch_ms, format_optional_epoch_ms, parse_credential_expiry_pairs,
@@ -1418,14 +1420,13 @@ pub async fn provider_list(
     }
 
     for provider in providers {
-        let credential_keys = provider_credential_keys(provider);
         if all_workspaces {
             println!(
                 "{:<ws_width$}  {:<name_width$}  {:<type_width$}  {:<16}  {}",
                 provider.object_workspace(),
                 provider.object_name().to_string(),
                 provider.r#type,
-                credential_keys.len(),
+                provider_credential_keys(&provider).len(),
                 provider.config.len(),
             );
         } else {
@@ -1433,7 +1434,7 @@ pub async fn provider_list(
                 "{:<name_width$}  {:<type_width$}  {:<16}  {}",
                 provider.object_name().to_string(),
                 provider.r#type,
-                credential_keys.len(),
+                provider_credential_keys(&provider).len(),
                 provider.config.len(),
             );
         }

@@ -1129,6 +1129,10 @@ message GetSandboxTemplateRequest {
   string workspace = 2;
 }
 
+// ListSandboxTemplatesRequest lists reusable sandbox workload templates.
+// Result set is bounded: templates are admin-managed catalog entries with
+// low expected cardinality (O(tens) per workspace). Opaque page_token
+// support is tracked as a follow-up in #3047.
 message ListSandboxTemplatesRequest {
   uint32 limit = 1;
   uint32 offset = 2;
@@ -1169,6 +1173,8 @@ message GetSandboxRequest {
 // List sandboxes request.
 message ListSandboxesRequest {
   uint32 limit = 1;
+  // Deprecated: ignored when page_token is set. Use page_token for stable
+  // cursor-based pagination across concurrent inserts and deletes.
   uint32 offset = 2;
   // Optional label selector for filtering (format: "key1=value1,key2=value2").
   string label_selector = 3;
@@ -1188,6 +1194,9 @@ message ListSandboxesResponse {
 }
 
 // List providers attached to a sandbox request.
+// ListSandboxProvidersRequest lists providers attached to a specific sandbox.
+// Result set is bounded: a sandbox can attach at most MAX_PROVIDERS providers,
+// so this response is always a complete list and does not require pagination.
 message ListSandboxProvidersRequest {
   // Sandbox name (canonical lookup key).
   string sandbox_name = 1;
@@ -1348,7 +1357,8 @@ message ListServicesRequest {
   string sandbox = 1;
   // Page size. Zero uses the server default.
   uint32 limit = 2;
-  // Page offset.
+  // Deprecated: ignored when page_token is set. Use page_token for stable
+  // cursor-based pagination across concurrent inserts and deletes.
   uint32 offset = 3;
   // Workspace scope. Empty defaults to "default".
   string workspace = 4;
@@ -1624,6 +1634,8 @@ message GetProviderRequest {
 // List providers request.
 message ListProvidersRequest {
   uint32 limit = 1;
+  // Deprecated: ignored when page_token is set. Use page_token for stable
+  // cursor-based pagination across concurrent inserts and deletes.
   uint32 offset = 2;
   // Workspace scope. Empty defaults to "default".
   string workspace = 3;
@@ -1663,6 +1675,10 @@ message ListProvidersResponse {
 }
 
 // List provider type profiles request.
+// ListProviderProfilesRequest lists provider type profiles.
+// Result set is bounded: profiles are system-built-in or admin-managed entries
+// with low expected cardinality (O(tens) per provider type). Opaque page_token
+// support is tracked as a follow-up in #3047.
 message ListProviderProfilesRequest {
   uint32 limit = 1;
   uint32 offset = 2;
@@ -2285,6 +2301,8 @@ message ListSandboxPoliciesRequest {
   // Sandbox name (canonical lookup key). Ignored when global is true.
   string name = 1;
   uint32 limit = 2;
+  // Deprecated: ignored when page_token is set. Use page_token for stable
+  // cursor-based pagination across concurrent inserts and deletes.
   uint32 offset = 3;
   // List global policy revisions instead of sandbox-scoped ones.
   bool global = 4;
@@ -3006,6 +3024,8 @@ message GetWorkspaceResponse {
 // List workspaces request.
 message ListWorkspacesRequest {
   uint32 limit = 1;
+  // Deprecated: ignored when page_token is set. Use page_token for stable
+  // cursor-based pagination across concurrent inserts and deletes.
   uint32 offset = 2;
   // Optional label selector for filtering (format: "key1=value1,key2=value2").
   string label_selector = 3;
@@ -3096,6 +3116,8 @@ message ListWorkspaceMembersRequest {
   // Workspace name.
   string workspace = 1;
   uint32 limit = 2;
+  // Deprecated: ignored when page_token is set. Use page_token for stable
+  // cursor-based pagination across concurrent inserts and deletes.
   uint32 offset = 3;
   // Opaque continuation token returned by the previous page.
   string page_token = 4;
