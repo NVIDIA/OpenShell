@@ -52,7 +52,7 @@ Cursors are only meaningful within one cursor space. A gateway restart begins a 
 
 On reconnect, a client passes the highest cursor it processed as the resume point. The gateway replays only events after that cursor — logs and platform events merged in cursor order — then resumes live delivery. The handoff from replay to live delivery is exact: an event buffered while the stream was reopening is delivered once, never twice. It is not a guarantee that nothing was lost — a warning event or an `OUT_OF_RANGE` status still reports loss, both before and after a reconnect.
 
-Replay is emitted in cursor order. During live delivery the log and platform event sources are read independently, so events from different sources can interleave; order across sources by `cursor` rather than by arrival.
+Replay is emitted in cursor order. Live delivery merges the log and platform event sources by cursor before emitting, so events normally arrive in ascending cursor order. The gateway does not delay an event to wait for a lower cursor that has not been published yet, so a cursor can still arrive late under concurrent publication. Treat `cursor` as the ordering key rather than arrival order, and track the highest cursor seen as the resume point.
 
 ## Direct Filesystem Access
 

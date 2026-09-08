@@ -1669,7 +1669,7 @@ pub(super) async fn handle_watch_sandbox(
             }
 
             loop {
-                tokio::select! {
+                let first = tokio::select! {
                     () = tx.closed() => {
                         return;
                     }
@@ -1714,71 +1714,109 @@ pub(super) async fn handle_watch_sandbox(
                                 return;
                             }
                         }
+                        // Status snapshots carry cursor 0 and are outside the
+                        // resumable cursor space, so they never join a batch.
+                        continue;
                     }
+                    // Both resumable sources feed one cursor space, so neither
+                    // can be emitted on its own: `select!` picks an arbitrary
+                    // ready branch, which would emit a higher cursor ahead of a
+                    // lower one waiting on the other source. Take whichever woke
+                    // us as the start of a batch and merge below.
                     res = async {
                         match log_rx.as_mut() {
                             Some(rx) => rx.recv().await,
                             None => future::pending().await,
                         }
-                    } => {
-                        match res {
-                            Ok(evt) => {
-                                // Skip events already delivered by the tail/replay phase.
-                                if evt.cursor != 0 && evt.cursor <= replay_cutoff {
-                                    continue;
-                                }
-                                if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(ref log)) = evt.payload {
-                                    if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
-                                        continue;
-                                    }
-                                    if !level_matches(&log.level, &log_min_level) {
-                                        continue;
-                                    }
-                                }
-                                if tx.send(Ok(evt)).await.is_err() {
-                                    return;
-                                }
-                            }
-                            Err(broadcast::error::RecvError::Lagged(n)) => {
-                                // Lag is recoverable: surface a warning and keep streaming.
-                                if tx.send(Ok(crate::sandbox_watch::lag_warning_event(n))).await.is_err() {
-                                    return;
-                                }
-                            },
-                            Err(broadcast::error::RecvError::Closed) => {
-                                let _ = tx.send(Err(Status::cancelled("stream closed"))).await;
-                                return;
-                            }
-                        }
-                    }
+                    } => res,
                     res = async {
                         match platform_rx.as_mut() {
                             Some(rx) => rx.recv().await,
                             None => future::pending().await,
                         }
-                    } => {
-                        match res {
-                            Ok(evt) => {
-                                // Skip events already delivered by the tail/replay phase.
-                                if evt.cursor != 0 && evt.cursor <= replay_cutoff {
-                                    continue;
-                                }
-                                if tx.send(Ok(evt)).await.is_err() {
-                                    return;
-                                }
-                            }
-                            Err(broadcast::error::RecvError::Lagged(n)) => {
-                                // Lag is recoverable: surface a warning and keep streaming.
-                                if tx.send(Ok(crate::sandbox_watch::lag_warning_event(n))).await.is_err() {
-                                    return;
-                                }
-                            },
-                            Err(broadcast::error::RecvError::Closed) => {
-                                let _ = tx.send(Err(Status::cancelled("stream closed"))).await;
-                                return;
+                    } => res,
+                };
+
+                let mut batch = Vec::new();
+                match first {
+                    Ok(evt) => batch.push(evt),
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // Lag is recoverable: surface a warning and keep streaming.
+                        if tx
+                            .send(Ok(crate::sandbox_watch::lag_warning_event(n)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        let _ = tx.send(Err(Status::cancelled("stream closed"))).await;
+                        return;
+                    }
+                }
+
+                // Drain what is already queued on both sources. Anything ready
+                // now was published before the event we just took, so sorting
+                // the batch restores cursor order without waiting on either
+                // source. Events published after this drain are not held back:
+                // strict global ordering would mean delaying every event to see
+                // whether a lower cursor still arrives.
+                let mut lagged = 0u64;
+                let mut closed = false;
+                for rx in [log_rx.as_mut(), platform_rx.as_mut()]
+                    .into_iter()
+                    .flatten()
+                {
+                    loop {
+                        match rx.try_recv() {
+                            Ok(evt) => batch.push(evt),
+                            Err(broadcast::error::TryRecvError::Empty) => break,
+                            // Keep draining: the receiver is usable after a skip.
+                            Err(broadcast::error::TryRecvError::Lagged(n)) => lagged += n,
+                            Err(broadcast::error::TryRecvError::Closed) => {
+                                closed = true;
+                                break;
                             }
                         }
                     }
+                }
+
+                batch.sort_by_key(|evt| evt.cursor);
+
+                for evt in batch {
+                    // Skip events already delivered by the tail/replay phase.
+                    if evt.cursor != 0 && evt.cursor <= replay_cutoff {
+                        continue;
+                    }
+                    if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
+                        ref log,
+                    )) = evt.payload
+                    {
+                        if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
+                            continue;
+                        }
+                        if !level_matches(&log.level, &log_min_level) {
+                            continue;
+                        }
+                    }
+                    if tx.send(Ok(evt)).await.is_err() {
+                        return;
+                    }
+                }
+
+                if lagged > 0
+                    && tx
+                        .send(Ok(crate::sandbox_watch::lag_warning_event(lagged)))
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
+                if closed {
+                    let _ = tx.send(Err(Status::cancelled("stream closed"))).await;
+                    return;
                 }
             }
         },
@@ -3787,6 +3825,49 @@ mod tests {
             got.push(stream.next().await.unwrap().unwrap().cursor);
         }
         assert_eq!(got, vec![2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn live_delivery_orders_events_across_sources_by_cursor() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("liveorder", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        let id = sandbox.object_id().to_string();
+
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: id.clone(),
+                follow_logs: true,
+                follow_events: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = response.into_inner();
+        // Draining the snapshot proves the producer reached the live loop, so
+        // it is subscribed to both buses before anything below is published.
+        let snap = stream.next().await.unwrap().unwrap();
+        assert_eq!(snap.cursor, 0);
+
+        // Publish without awaiting in between. On the current-thread runtime
+        // the producer cannot interleave, so both channels hold ready events
+        // when it next polls -- the state where `select!` picks arbitrarily and
+        // would otherwise emit a log cursor ahead of a lower platform cursor.
+        for i in 0..5 {
+            seed_log_lines(&state, &id, 1); // odd cursors
+            seed_platform_event(&state, &id, &format!("e{i}")); // even cursors
+        }
+
+        let mut got = Vec::new();
+        for _ in 0..10 {
+            got.push(stream.next().await.unwrap().unwrap().cursor);
+        }
+        assert_eq!(got, (1..=10).collect::<Vec<u64>>());
     }
 
     #[tokio::test]
