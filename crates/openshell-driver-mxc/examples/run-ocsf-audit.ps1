@@ -300,6 +300,7 @@ finally {
 
   $consumerStarted = [bool]($logText | Select-String -SimpleMatch "consumer started" -Quiet)
   $consumerFailed  = [bool]($logText | Select-String -SimpleMatch "ETW audit consumer failed to start" -Quiet)
+  $consumerOverloaded = [bool]($logText | Select-String -SimpleMatch "ETW audit queue overloaded" -Quiet)
 
   # Locate the durable OCSF JSONL audit log and tally by OCSF class.
   $jsonlFiles = @(Get-ChildItem -Path $resultDir -Filter "openshell-ocsf*.log" -ErrorAction SilentlyContinue)
@@ -351,7 +352,7 @@ finally {
   $findingsObserved = @($findingEvents.Values | Where-Object { $_ }).Count
   $classesSeen      = @($classCounts.Keys | Where-Object { $classCounts[$_] -gt 0 }).Count
   $workloadCompleted = Test-Path $helloPath -PathType Leaf
-  if ($passed) { $passed = $consumerStarted -and $workloadCompleted -and ($jsonlCount -gt 0) -and ($jsonlBad -eq 0) -and ($coreObserved -eq $coreExpected) }
+  if ($passed) { $passed = $consumerStarted -and (-not $consumerOverloaded) -and $workloadCompleted -and ($jsonlCount -gt 0) -and ($jsonlBad -eq 0) -and ($coreObserved -eq $coreExpected) }
 
   $verdict      = if ($passed) { "PASS" } else { "FAIL" }
   $classLines   = foreach ($uid in @(6002, 5019, 1007, 2004)) { "  [{0}] {1,-28} : {2}" -f $uid, $classNames[$uid], $classCounts[$uid] }
@@ -367,6 +368,7 @@ machine          : $env:COMPUTERNAME
 user             : $env:USERNAME   (admin=$admin  perfLogUsers=$plu)
 verdict          : $verdict
 event coverage   : $coreObserved of $coreExpected expected event types fired   (+ $findingsObserved anomaly finding(s))
+queue overload   : $(if ($consumerOverloaded) { 'YES - ETW records dropped; audit coverage gap' } else { 'no dropped ETW records observed' })
 proxy            : $(if ($proxyOn) { 'on (full event set)' } else { 'off (-NoProxy; omits egress proxy event)' })
 workload output  : $(if ($workloadCompleted) { $helloPath } else { '(missing)' })
 wxc_exec         : $WxcExecPath
@@ -396,7 +398,8 @@ Files in this bundle ($resultDir):
 
 What PASS means: the gateway launched sandbox(es), the in-process ETW consumer
 started, decoded the Sandboxing provider, attributed each event to a sandbox_id,
-mapped them to OCSF, and wrote a durable JSONL audit log covering all $coreExpected
+reported no callback-queue overload, mapped events to OCSF, and wrote a durable
+JSONL audit log covering all $coreExpected
 expected event types across $classesSeen OCSF class(es) - the full Windows OCSF path
 end-to-end, at parity with the Linux pipeline.
 "@

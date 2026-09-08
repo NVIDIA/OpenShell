@@ -52,7 +52,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -93,6 +93,20 @@ const SESSION_NAME_PREFIX: &str = "OpenShell-MXC-ETW";
 /// Separates multiple backend constructions in one process even if their clocks
 /// resolve to the same instant.
 static SESSION_SEQUENCE: AtomicU32 = AtomicU32::new(0);
+
+/// The Sandboxing provider normally emits only a small group of records per
+/// sandbox creation. This allows several thousand records of burst headroom
+/// without permitting sustained system-wide ETW activity to grow memory without
+/// bound.
+const EVENT_QUEUE_CAPACITY: usize = 4096;
+
+/// A second bound covers variable-size TraceLogging payloads. Queue accounting
+/// includes owned event data, extended-data descriptors, and their copied bytes.
+const EVENT_QUEUE_BYTE_CAPACITY: usize = 16 * 1024 * 1024;
+
+/// Emit the first overload warning immediately, then coalesce additional drops
+/// while the consumer remains behind.
+const OVERLOAD_WARNING_INTERVAL: Duration = Duration::from_secs(30);
 
 /// `EVENT_CONTROL_CODE_ENABLE_PROVIDER`.
 const EVENT_CONTROL_CODE_ENABLE_PROVIDER: u32 = 1;
@@ -146,6 +160,9 @@ struct RawEtwEvent {
     /// Owned backing buffers for each extended-data item, index-aligned with
     /// `ext_items`.
     ext_bufs: Vec<Vec<u8>>,
+    /// Bytes reserved against [`EVENT_QUEUE_BYTE_CAPACITY`] while this record is
+    /// waiting in the channel.
+    queued_bytes: usize,
 }
 
 // SAFETY: every field is either a `Vec` or a POD Windows struct whose only
@@ -239,6 +256,57 @@ struct CaptureHealth {
     /// The `WIN32_ERROR` code `ProcessTrace` returned (0 == `ERROR_SUCCESS`).
     /// Only meaningful once `stopped` is set.
     exit_code: AtomicU32,
+    /// Records rejected by the bounded callback queue. A non-zero value means
+    /// the OCSF audit trail has a coverage gap.
+    dropped_events: AtomicU64,
+    /// Approximate owned bytes currently waiting in the callback queue.
+    queued_bytes: AtomicUsize,
+    /// Largest observed value of `queued_bytes`, retained for diagnostics.
+    queue_high_water_bytes: AtomicUsize,
+}
+
+struct CallbackContext {
+    tx: mpsc::SyncSender<RawEtwEvent>,
+    health: Arc<CaptureHealth>,
+}
+
+#[derive(Default)]
+struct OverloadReporter {
+    last_reported_drops: u64,
+    last_warning: Option<Instant>,
+}
+
+impl OverloadReporter {
+    fn report_if_due(&mut self, health: &CaptureHealth, force: bool) -> bool {
+        let dropped_events = health.dropped_events.load(Ordering::Relaxed);
+        if dropped_events == self.last_reported_drops {
+            return false;
+        }
+
+        let now = Instant::now();
+        if !force
+            && self
+                .last_warning
+                .is_some_and(|last| now.duration_since(last) < OVERLOAD_WARNING_INTERVAL)
+        {
+            return false;
+        }
+
+        let dropped_since_last_warning = dropped_events - self.last_reported_drops;
+        self.last_reported_drops = dropped_events;
+        self.last_warning = Some(now);
+        tracing::warn!(
+            target: "mxc_etw",
+            dropped_events,
+            dropped_since_last_warning,
+            queued_bytes = health.queued_bytes.load(Ordering::Relaxed),
+            queue_high_water_bytes = health.queue_high_water_bytes.load(Ordering::Relaxed),
+            queue_capacity_events = EVENT_QUEUE_CAPACITY,
+            queue_capacity_bytes = EVENT_QUEUE_BYTE_CAPACITY,
+            "MXC ETW audit queue overloaded; events were dropped and audit coverage has a gap"
+        );
+        true
+    }
 }
 
 /// A running real-time ETW session plus its worker threads. Dropping (or calling
@@ -279,6 +347,11 @@ impl EtwSession {
     pub fn is_capture_alive(&self) -> bool {
         !self.health.stopped.load(Ordering::SeqCst)
     }
+
+    /// Number of ETW records rejected by the callback queue's count or byte limit.
+    pub fn dropped_event_count(&self) -> u64 {
+        self.health.dropped_events.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for EtwSession {
@@ -292,15 +365,15 @@ impl Drop for EtwSession {
 /// an `OpenTraceW` failure is surfaced synchronously (review #4) rather than
 /// dying silently on the worker after `start_session` already returned `Ok`.
 ///
-/// SAFETY (`Send`): the contained raw `Sender` pointer and trace handle are only
-/// ever touched by the single pump thread that takes ownership of this struct;
-/// the boxed `Sender` lives until that thread reclaims it after `ProcessTrace`
-/// returns, and `name` (the `LoggerName` buffer `OpenTraceW` referenced) is kept
-/// alive for the whole `ProcessTrace` duration.
+/// SAFETY (`Send`): the contained callback-context pointer and trace handle are
+/// only ever touched by the single pump thread that takes ownership of this
+/// struct; the boxed context lives until that thread reclaims it after
+/// `ProcessTrace` returns, and `name` (the `LoggerName` buffer `OpenTraceW`
+/// referenced) is kept alive for the whole `ProcessTrace` duration.
 struct OpenedTrace {
     handle: PROCESSTRACE_HANDLE,
     name: Vec<u16>,
-    tx_ptr: *mut mpsc::Sender<RawEtwEvent>,
+    callback_context: *mut CallbackContext,
 }
 unsafe impl Send for OpenedTrace {}
 
@@ -319,11 +392,14 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
     let handle = start_trace_session(&session_name)?;
     enable_provider(handle, &session_name)?;
 
-    let (tx, rx) = mpsc::channel::<RawEtwEvent>();
+    let health = Arc::new(CaptureHealth::default());
+    let consumer_health = health.clone();
+    let (tx, rx) = mpsc::sync_channel::<RawEtwEvent>(EVENT_QUEUE_CAPACITY);
 
     let consumer_thread = std::thread::Builder::new()
         .name("etw-ocsf-consumer".into())
         .spawn(move || {
+            let mut overload_reporter = OverloadReporter::default();
             // Decode off the pump thread: the callback only copies bytes, so the
             // real-time buffers drain fast and the create burst isn't dropped.
             //
@@ -334,6 +410,7 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
             loop {
                 match rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(mut raw) => {
+                        release_queue_bytes(&consumer_health, raw.queued_bytes);
                         match decode_raw(&mut raw) {
                             Some(ev) => process_event(&index, ev),
                             None => tracing::debug!(
@@ -345,9 +422,16 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
                             ),
                         }
                         drain_and_emit(&index);
+                        overload_reporter.report_if_due(&consumer_health, false);
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => drain_and_emit(&index),
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        drain_and_emit(&index);
+                        overload_reporter.report_if_due(&consumer_health, false);
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        overload_reporter.report_if_due(&consumer_health, true);
+                        break;
+                    }
                 }
             }
             // Final drain on shutdown so anything still resolvable is emitted.
@@ -362,20 +446,23 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
     // synchronous call, so we can return its failure to the caller instead of
     // reporting the session "started" and then having the worker die silently.
     // Only the *blocking* `ProcessTrace` runs on the pump thread. On failure we
-    // reclaim the boxed Sender (which disconnects the consumer's channel so it
-    // exits), stop the session, and join the consumer before returning `Err`.
-    let tx_ptr = Box::into_raw(Box::new(tx));
-    let opened = match open_trace(&session_name, tx_ptr) {
+    // reclaim the boxed callback context (which disconnects the consumer's
+    // channel so it exits), stop the session, and join the consumer before
+    // returning `Err`.
+    let callback_context = Box::into_raw(Box::new(CallbackContext {
+        tx,
+        health: health.clone(),
+    }));
+    let opened = match open_trace(&session_name, callback_context) {
         Ok(o) => o,
         Err(e) => {
-            unsafe { drop(Box::from_raw(tx_ptr)) };
+            unsafe { drop(Box::from_raw(callback_context)) };
             stop_session(handle, &session_name);
             let _ = consumer_thread.join();
             return Err(e);
         }
     };
 
-    let health = Arc::new(CaptureHealth::default());
     let pump_health = health.clone();
     let pump_thread = match std::thread::Builder::new()
         .name("etw-ocsf-pump".into())
@@ -384,8 +471,9 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
         Ok(t) => t,
         Err(e) => {
             // The trace is open but we couldn't spawn the pump. Stop the session,
-            // reclaim the boxed Sender so the consumer disconnects, and join it.
-            unsafe { drop(Box::from_raw(tx_ptr)) };
+            // reclaim the boxed callback context so the consumer disconnects,
+            // and join it.
+            unsafe { drop(Box::from_raw(callback_context)) };
             stop_session(handle, &session_name);
             let _ = consumer_thread.join();
             return Err(format!("failed to spawn ETW pump thread: {e}"));
@@ -548,14 +636,14 @@ fn stop_session(handle: u64, session_name: &str) {
 // ---------------------------------------------------------------------------
 
 /// Open the real-time consumer with `OpenTraceW` on the **caller** thread so the
-/// result is synchronous (review #4). `tx_ptr` is the boxed event `Sender`; on
-/// failure the caller reclaims it (we do not drop it here). On success the boxed
-/// `Sender` and the `LoggerName` buffer are handed to the returned [`OpenedTrace`]
-/// so they outlive the subsequent blocking `ProcessTrace`.
+/// result is synchronous (review #4). `callback_context` is the boxed queue
+/// sender + health counters; on failure the caller reclaims it (we do not drop it
+/// here). On success it and the `LoggerName` buffer are handed to the returned
+/// [`OpenedTrace`] so they outlive the subsequent blocking `ProcessTrace`.
 #[allow(clippy::field_reassign_with_default)]
 fn open_trace(
     session_name: &str,
-    tx_ptr: *mut mpsc::Sender<RawEtwEvent>,
+    callback_context: *mut CallbackContext,
 ) -> Result<OpenedTrace, String> {
     let mut name = session_name_wide(session_name);
 
@@ -564,7 +652,7 @@ fn open_trace(
     logfile.Anonymous1.ProcessTraceMode =
         PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
     logfile.Anonymous2.EventRecordCallback = Some(event_record_callback);
-    logfile.Context = tx_ptr.cast::<c_void>();
+    logfile.Context = callback_context.cast::<c_void>();
 
     let handle = unsafe { OpenTraceW(&mut logfile) };
     if handle.Value == u64::MAX {
@@ -577,13 +665,13 @@ fn open_trace(
     Ok(OpenedTrace {
         handle,
         name,
-        tx_ptr,
+        callback_context,
     })
 }
 
 /// Run the blocking `ProcessTrace` pump for an already-opened trace, then clean
 /// up. Owns [`OpenedTrace`] for its whole lifetime so the `LoggerName` buffer and
-/// boxed `Sender` stay valid until `ProcessTrace` returns.
+/// boxed callback context stay valid until `ProcessTrace` returns.
 ///
 /// `ProcessTrace` blocks until the session stops. A deliberate stop (via
 /// [`EtwSession::stop`], which sets `health.stopping`) is normal; any *other*
@@ -593,7 +681,7 @@ fn run_trace(opened: OpenedTrace, health: Arc<CaptureHealth>) {
     let OpenedTrace {
         handle,
         name,
-        tx_ptr,
+        callback_context,
     } = opened;
 
     let status = unsafe { ProcessTrace(&[handle], None, None) };
@@ -619,7 +707,7 @@ fn run_trace(opened: OpenedTrace, health: Arc<CaptureHealth>) {
 
     unsafe {
         let _ = CloseTrace(handle);
-        drop(Box::from_raw(tx_ptr));
+        drop(Box::from_raw(callback_context));
     }
     // Keep the LoggerName buffer alive until ProcessTrace has fully returned.
     drop(name);
@@ -633,16 +721,103 @@ unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD)
         return;
     }
 
-    // Hot path: copy raw bytes only, then hand off. No TDH decode here — keeping
-    // this callback cheap is what stops ETW dropping the create burst.
-    let tx = unsafe { &*(event.UserContext as *const mpsc::Sender<RawEtwEvent>) };
-    let raw = unsafe { copy_raw(event_record) };
-    let _ = tx.send(raw);
+    // Hot path: reserve bounded queue memory, copy raw bytes, then use a
+    // non-blocking send. No TDH decode or logging runs here. Overload is counted
+    // atomically and reported by the consumer thread so ETW's pump never waits
+    // for decoding, disk, or tracing sinks.
+    let context = unsafe { &*(event.UserContext as *const CallbackContext) };
+    let Some(queued_bytes) = (unsafe { raw_event_queued_bytes(event_record) }) else {
+        record_queue_drop(&context.health);
+        return;
+    };
+    if !try_reserve_queue_bytes(&context.health, queued_bytes) {
+        record_queue_drop(&context.health);
+        return;
+    }
+    let raw = unsafe { copy_raw(event_record, queued_bytes) };
+    try_enqueue_raw(context, raw);
+}
+
+/// Approximate the owned memory that [`copy_raw`] will allocate, including the
+/// event wrapper, vector storage, and copied ETW payloads. `None` means integer
+/// overflow; callers reject that event without allocating it.
+unsafe fn raw_event_queued_bytes(event_record: *const EVENT_RECORD) -> Option<usize> {
+    let event = unsafe { &*event_record };
+    let ext_count = event.ExtendedDataCount as usize;
+    let ext_item_bytes = ext_count.checked_mul(size_of::<EVENT_HEADER_EXTENDED_DATA_ITEM>())?;
+    let ext_vec_bytes = ext_count.checked_mul(size_of::<Vec<u8>>())?;
+    let user_data_bytes = if event.UserData.is_null() {
+        0
+    } else {
+        event.UserDataLength as usize
+    };
+
+    let mut bytes = size_of::<RawEtwEvent>()
+        .checked_add(ext_item_bytes)?
+        .checked_add(ext_vec_bytes)?
+        .checked_add(user_data_bytes)?;
+
+    if !event.ExtendedData.is_null() {
+        for index in 0..ext_count {
+            let item = unsafe { &*event.ExtendedData.add(index) };
+            if item.DataPtr != 0 {
+                bytes = bytes.checked_add(item.DataSize as usize)?;
+            }
+        }
+    }
+    Some(bytes)
+}
+
+fn try_reserve_queue_bytes(health: &CaptureHealth, event_bytes: usize) -> bool {
+    if event_bytes > EVENT_QUEUE_BYTE_CAPACITY {
+        return false;
+    }
+
+    match health
+        .queued_bytes
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
+            queued
+                .checked_add(event_bytes)
+                .filter(|total| *total <= EVENT_QUEUE_BYTE_CAPACITY)
+        }) {
+        Ok(previous) => {
+            health
+                .queue_high_water_bytes
+                .fetch_max(previous + event_bytes, Ordering::Relaxed);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn release_queue_bytes(health: &CaptureHealth, event_bytes: usize) {
+    let previous = health
+        .queued_bytes
+        .fetch_sub(event_bytes, Ordering::Relaxed);
+    debug_assert!(
+        previous >= event_bytes,
+        "ETW queue byte accounting underflow"
+    );
+}
+
+fn record_queue_drop(health: &CaptureHealth) {
+    health.dropped_events.fetch_add(1, Ordering::Relaxed);
+}
+
+fn try_enqueue_raw(context: &CallbackContext, raw: RawEtwEvent) -> bool {
+    match context.tx.try_send(raw) {
+        Ok(()) => true,
+        Err(mpsc::TrySendError::Full(raw) | mpsc::TrySendError::Disconnected(raw)) => {
+            release_queue_bytes(&context.health, raw.queued_bytes);
+            record_queue_drop(&context.health);
+            false
+        }
+    }
 }
 
 /// Deep-copy a kernel `EVENT_RECORD` into an owned, `Send` [`RawEtwEvent`].
 /// Runs in the ETW callback, so it does the minimum: byte copies, no decode.
-unsafe fn copy_raw(event_record: *const EVENT_RECORD) -> RawEtwEvent {
+unsafe fn copy_raw(event_record: *const EVENT_RECORD, queued_bytes: usize) -> RawEtwEvent {
     let ev = unsafe { &*event_record };
     let header = ev.EventHeader;
 
@@ -675,6 +850,7 @@ unsafe fn copy_raw(event_record: *const EVENT_RECORD) -> RawEtwEvent {
         user_data,
         ext_items,
         ext_bufs,
+        queued_bytes,
     }
 }
 
@@ -1675,6 +1851,69 @@ fn wide_str_at(buf: &[u8], offset: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_raw_event(queued_bytes: usize) -> RawEtwEvent {
+        RawEtwEvent {
+            header: EVENT_HEADER::default(),
+            user_data: Vec::new(),
+            ext_items: Vec::new(),
+            ext_bufs: Vec::new(),
+            queued_bytes,
+        }
+    }
+
+    #[test]
+    fn stalled_consumer_keeps_callback_queue_bounded_and_counts_drops() {
+        const EXTRA_EVENTS: usize = 17;
+        let health = Arc::new(CaptureHealth::default());
+        let (tx, _stalled_rx) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+        let context = CallbackContext {
+            tx,
+            health: health.clone(),
+        };
+        let event_bytes = size_of::<RawEtwEvent>();
+
+        for attempt in 0..(EVENT_QUEUE_CAPACITY + EXTRA_EVENTS) {
+            assert!(try_reserve_queue_bytes(&health, event_bytes));
+            let accepted = try_enqueue_raw(&context, empty_raw_event(event_bytes));
+            assert_eq!(accepted, attempt < EVENT_QUEUE_CAPACITY);
+        }
+
+        assert_eq!(
+            health.dropped_events.load(Ordering::Relaxed),
+            EXTRA_EVENTS as u64
+        );
+        assert_eq!(
+            health.queued_bytes.load(Ordering::Relaxed),
+            EVENT_QUEUE_CAPACITY * event_bytes
+        );
+        assert!(health.queue_high_water_bytes.load(Ordering::Relaxed) <= EVENT_QUEUE_BYTE_CAPACITY);
+    }
+
+    #[test]
+    fn event_larger_than_queue_byte_budget_is_rejected_before_copy() {
+        let health = CaptureHealth::default();
+
+        assert!(!try_reserve_queue_bytes(
+            &health,
+            EVENT_QUEUE_BYTE_CAPACITY + 1
+        ));
+        assert_eq!(health.queued_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn overload_reporter_warns_immediately_then_rate_limits() {
+        let health = CaptureHealth::default();
+        let mut reporter = OverloadReporter::default();
+
+        assert!(!reporter.report_if_due(&health, false));
+        health.dropped_events.store(2, Ordering::Relaxed);
+        assert!(reporter.report_if_due(&health, false));
+        health.dropped_events.store(3, Ordering::Relaxed);
+        assert!(!reporter.report_if_due(&health, false));
+        assert!(reporter.report_if_due(&health, true));
+        assert_eq!(reporter.last_reported_drops, 3);
+    }
 
     #[test]
     fn gateway_processes_and_restarts_use_distinct_session_names() {

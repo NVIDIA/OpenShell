@@ -66,6 +66,12 @@ gateway's capture. Graceful shutdown stops the session by its owned handle. A
 force-killed gateway can leave a stale session; the audit example removes only
 matching sessions whose encoded owner process is no longer running.
 
+The ETW callback uses a non-blocking queue capped at 4,096 records and 16 MiB
+of copied event data. Records that exceed either limit are dropped instead of
+blocking the ETW pump or growing gateway memory. The gateway emits an immediate
+warning identifying the audit coverage gap and rate-limits follow-up warnings
+to once every 30 seconds while overload continues.
+
 ## Prerequisites (live runs)
 
 - Windows 11 Insider build ≥ 26300.8553
