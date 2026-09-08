@@ -3760,6 +3760,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "openshell-binary-identity"
+version = "0.0.0"
+dependencies = [
+ "openshell-isolation-interface",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "openshell-bootstrap"
 version = "0.0.0"
 dependencies = [
@@ -4175,8 +4183,25 @@ name = "openshell-isolation-interface"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "hyper-util",
+ "libc",
  "openshell-core",
+ "rcgen",
+ "rustix 1.1.4",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "socket2",
+ "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tower 0.5.3",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -5562,6 +5587,7 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "time",
+ "x509-parser",
  "yasna",
 ]
 
@@ -8633,6 +8659,7 @@ dependencies = [
  "lazy_static",
  "nom",
  "oid-registry",
+ "ring",
  "rusticata-macros",
  "thiserror 1.0.69",
  "time",

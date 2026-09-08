@@ -359,6 +359,17 @@ impl ProviderCredentialState {
     ///    here so SDKs can read them at startup.
     /// 3. Everything else stays as placeholders for proxy-time resolution.
     pub fn child_env_with_gcp_resolved(&self) -> HashMap<String, String> {
+        self.child_env_snapshot_with_gcp_resolved().1
+    }
+
+    /// Return the current revision and its workload-facing environment from
+    /// one state snapshot.
+    ///
+    /// Remote isolation boundaries use the pair as a revisioned update.  The
+    /// revision must describe the exact environment sent across the boundary,
+    /// so callers must not obtain the two values through separate lock
+    /// acquisitions.
+    pub fn child_env_snapshot_with_gcp_resolved(&self) -> (u64, HashMap<String, String>) {
         use crate::google_cloud;
 
         let inner = self
@@ -376,7 +387,7 @@ impl ProviderCredentialState {
             .any(|key| env.contains_key(*key) && inner.non_secret_environment_keys.contains(*key));
 
         if !has_gcp_metadata && !has_gcp_config {
-            return env;
+            return (inner.current.revision, env);
         }
 
         if has_gcp_metadata {
@@ -414,7 +425,44 @@ impl ProviderCredentialState {
             }
         }
 
-        env
+        (inner.current.revision, env)
+    }
+
+    /// Compare and install a workload-facing environment snapshot.
+    ///
+    /// Provider environment revisions are opaque content identities, not
+    /// ordered counters. The expected revision makes retries idempotent while
+    /// rejecting updates based on a stale view of the boundary state.
+    pub fn compare_and_install_child_env_snapshot(
+        &self,
+        expected_revision: u64,
+        revision: u64,
+        mut child_env: HashMap<String, String>,
+    ) -> u64 {
+        let mut inner = self
+            .inner
+            .write()
+            .expect("provider credential state poisoned");
+        if revision == inner.current.revision || expected_revision != inner.current.revision {
+            return inner.current.revision;
+        }
+
+        for key in &inner.suppressed_keys {
+            child_env.remove(key);
+        }
+        inner.current = Arc::new(ProviderCredentialSnapshot {
+            revision,
+            child_env,
+            dynamic_credentials: HashMap::new(),
+        });
+        inner.generations.clear();
+        inner.current_resolver = None;
+        inner.combined_resolver = None;
+        inner.non_secret_environment_keys.clear();
+        inner.static_credential_bindings.clear();
+        inner.known_static_credential_keys.clear();
+        inner.static_credential_identity_epochs.clear();
+        revision
     }
 
     /// Return the GCP token placeholder and its remaining lifetime in seconds.
@@ -2115,6 +2163,40 @@ mod tests {
             state.resolver().is_none(),
             "child-env snapshots must not install provider resolver material"
         );
+    }
+
+    #[test]
+    fn child_env_snapshot_update_uses_opaque_revision_cas() {
+        let state = ProviderCredentialState::from_child_env_snapshot(
+            4,
+            HashMap::from([("TOKEN".to_string(), "four".to_string())]),
+        );
+
+        assert_eq!(
+            state.compare_and_install_child_env_snapshot(
+                4,
+                6,
+                HashMap::from([("TOKEN".to_string(), "six".to_string())]),
+            ),
+            6
+        );
+        assert_eq!(
+            state.compare_and_install_child_env_snapshot(
+                4,
+                5,
+                HashMap::from([("TOKEN".to_string(), "stale".to_string())]),
+            ),
+            6
+        );
+        assert_eq!(
+            state.compare_and_install_child_env_snapshot(6, 2, HashMap::new()),
+            2,
+            "opaque revisions may move numerically backwards"
+        );
+
+        let (revision, env) = state.child_env_snapshot_with_gcp_resolved();
+        assert_eq!(revision, 2);
+        assert!(env.is_empty(), "an empty snapshot must revoke the old env");
     }
 
     #[test]
