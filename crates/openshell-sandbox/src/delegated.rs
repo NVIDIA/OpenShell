@@ -28,18 +28,14 @@ fn ocsf_ctx() -> &'static openshell_ocsf::SandboxContext {
 /// inside its boundary.
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
 pub async fn spawn_workload(
+    launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
     program: &str,
     args: &[String],
     workdir: Option<&str>,
     timeout_secs: u64,
     interactive: bool,
-    _sandbox_id: Option<&str>,
-    _openshell_endpoint: Option<&str>,
-    _ssh_socket_path: Option<String>,
-    _shared_ssh_socket: bool,
     policy: &SandboxPolicy,
     entrypoint_pid: Arc<AtomicU32>,
-    entrypoint_started_tx: Option<tokio::sync::oneshot::Sender<u32>>,
     provider_credentials: ProviderCredentialState,
     provider_env: std::collections::HashMap<String, String>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
@@ -80,10 +76,12 @@ pub async fn spawn_workload(
             provider_credentials,
             user_environment,
             boundary_runtime.clone(),
+            launcher.clone(),
         ));
 
     #[cfg(target_os = "linux")]
     let mut handle = ProcessHandle::spawn(
+        launcher,
         program,
         args,
         &workspace,
@@ -105,9 +103,6 @@ pub async fn spawn_workload(
     )?;
 
     entrypoint_pid.store(handle.pid(), Ordering::Release);
-    if let Some(sender) = entrypoint_started_tx {
-        let _ = sender.send(handle.pid());
-    }
     let main_session = crate::main_session::MainSession::new(handle.take_io(), handle.pid());
     let (terminal, signal_lock) = handle.signaling_state();
     boundary_runtime

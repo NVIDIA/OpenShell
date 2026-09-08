@@ -24,8 +24,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-#[cfg(target_os = "linux")]
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tracing::{debug, info};
@@ -422,33 +420,10 @@ fn validate_capability_bounding_set_clear(
 }
 
 #[cfg(target_os = "linux")]
-static WORKLOAD_LAUNCHER: OnceLock<
-    openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
-> = OnceLock::new();
-
-/// Install the sandbox-owned launcher that every later workload spawn must
-/// traverse. A second launcher would create a second listener generation and
-/// is therefore rejected.
-#[cfg(target_os = "linux")]
-pub fn configure_workload_launcher(
-    launcher: openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
-) -> std::io::Result<()> {
-    WORKLOAD_LAUNCHER.set(launcher).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "workload launcher was already configured",
-        )
-    })
-}
-
-#[cfg(target_os = "linux")]
-pub fn spawn_command_with_workload_launcher(mut cmd: Command) -> std::io::Result<Child> {
-    let launcher = WORKLOAD_LAUNCHER.get().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotConnected,
-            "sandbox workload launcher is not configured",
-        )
-    })?;
+pub fn spawn_command_with_workload_launcher(
+    launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+    mut cmd: Command,
+) -> std::io::Result<Child> {
     let runtime = tokio::runtime::Handle::current();
     launcher.execute(move || {
         let _guard = runtime.enter();
@@ -458,14 +433,9 @@ pub fn spawn_command_with_workload_launcher(mut cmd: Command) -> std::io::Result
 
 #[cfg(target_os = "linux")]
 pub fn spawn_std_command_with_workload_launcher(
+    launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
     mut cmd: std::process::Command,
 ) -> std::io::Result<std::process::Child> {
-    let launcher = WORKLOAD_LAUNCHER.get().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotConnected,
-            "sandbox workload launcher is not configured",
-        )
-    })?;
     launcher.execute(move || cmd.spawn())?
 }
 
@@ -500,6 +470,7 @@ impl ProcessHandle {
     #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
+        launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
         program: &str,
         args: &[String],
         workspace: &ResolvedWorkspace,
@@ -509,6 +480,7 @@ impl ProcessHandle {
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
         Self::spawn_impl(
+            launcher,
             program,
             args,
             workspace,
@@ -549,6 +521,7 @@ impl ProcessHandle {
     #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_arguments)]
     fn spawn_impl(
+        launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
         program: &str,
         args: &[String],
         workspace: &ResolvedWorkspace,
@@ -674,7 +647,7 @@ impl ProcessHandle {
         // or interpreter, and is a common failure on images that lack the
         // requested shell/binary (e.g. bash on Alpine).
         #[cfg(target_os = "linux")]
-        let mut child = spawn_command_with_workload_launcher(cmd)
+        let mut child = spawn_command_with_workload_launcher(launcher, cmd)
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to spawn sandbox entrypoint process '{program}'"))?;
         #[cfg(not(target_os = "linux"))]
