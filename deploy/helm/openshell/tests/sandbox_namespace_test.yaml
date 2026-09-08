@@ -57,6 +57,41 @@ tests:
           path: metadata.namespace
           value: other-ns
 
+  - it: grants PodDisruptionBudget cleanup and ownership adoption while protection is disabled
+    template: templates/role.yaml
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - policy
+            resources:
+              - poddisruptionbudgets
+            verbs:
+              - delete
+              - get
+              - list
+              - patch
+
+  - it: grants PodDisruptionBudget mutation access while protection is enabled
+    template: templates/role.yaml
+    set:
+      server.disruptionProtection.enabled: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - policy
+            resources:
+              - poddisruptionbudgets
+            verbs:
+              - delete
+              - get
+              - list
+              - patch
+              - create
+
   - it: uses explicit sandboxNamespace for sandbox RoleBinding
     template: templates/rolebinding.yaml
     set:

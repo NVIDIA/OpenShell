@@ -31,6 +31,20 @@ rules:
       - get
       - list
       - watch
+  - apiGroups:
+      - policy
+    resources:
+      - poddisruptionbudgets
+    verbs:
+      - delete
+      - get
+      - list
+      # Keep metadata-only gateway ownership adoption available for existing
+      # PDBs even while admission of new protection requests is disabled.
+      - patch
+      {{- if .Values.server.disruptionProtection.enabled }}
+      - create
+      {{- end }}
   # Per-sandbox identity: TokenReview authenticates the projected token from
   # the configured sandbox service account, then the gateway resolves the
   # returned pod name and UID to the pod's `openshell.ai/sandbox-id`

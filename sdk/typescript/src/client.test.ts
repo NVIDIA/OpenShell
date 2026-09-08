@@ -245,6 +245,26 @@ describe('create', () => {
     expect(created.spec?.tty).toBe(true);
   });
 
+  it('sends the curated disruption protection duration', async () => {
+    let created: { spec?: { disruptionProtection?: { duration?: { seconds?: bigint } } } } = {};
+    const sandbox = client({
+      createSandbox: (req) => {
+        created = req;
+        return readySandbox('sb', 'sb-id');
+      },
+    });
+
+    await sandbox.create({ disruptionProtectionSeconds: 3600 });
+    expect(created.spec?.disruptionProtection?.duration?.seconds).toBe(3600n);
+  });
+
+  it('rejects an invalid curated disruption protection duration', async () => {
+    const sandbox = client({ createSandbox: () => readySandbox('sb', 'sb-id') });
+    await expect(sandbox.create({ disruptionProtectionSeconds: 0 })).rejects.toMatchObject({
+      code: 'invalid_config',
+    });
+  });
+
   it('rawSpec reaches an ungated field and overrides a curated one', async () => {
     let created: {
       spec?: {

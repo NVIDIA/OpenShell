@@ -49,6 +49,7 @@ fn test_sandbox() -> DriverSandbox {
             command: Vec::new(),
             tty: false,
             await_main_process_attachment: false,
+            disruption_protection: None,
         }),
         status: None,
         workspace: String::new(),

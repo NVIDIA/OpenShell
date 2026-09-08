@@ -24,8 +24,8 @@ use openshell_core::proto::{
     DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DeleteSandboxTemplateRequest, DeleteSandboxTemplateResponse, DeleteServiceRequest,
     DeleteServiceResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse, EditDraftChunkRequest,
-    EditDraftChunkResponse, ExchangeProviderSubjectTokenRequest,
+    DetachSandboxProviderRequest, DetachSandboxProviderResponse, DisruptionProtectionCapability,
+    EditDraftChunkRequest, EditDraftChunkResponse, ExchangeProviderSubjectTokenRequest,
     ExchangeProviderSubjectTokenResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
     ExposeServiceRequest, FinalizeMainProcessExitRequest, FinalizeMainProcessExitResponse,
     GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse, GetDraftHistoryRequest,
@@ -264,6 +264,13 @@ impl OpenShell for OpenShellService {
                         .resource_capabilities
                         .as_ref()
                         .map(|resources| public_resource_capabilities(*resources)),
+                    disruption_protection: driver.disruption_protection.as_ref().map(
+                        |capability| DisruptionProtectionCapability {
+                            support: capability.support,
+                            enabled: capability.enabled,
+                            max_duration: capability.max_duration,
+                        },
+                    ),
                 }),
             })
             .collect();

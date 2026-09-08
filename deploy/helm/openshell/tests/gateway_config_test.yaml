@@ -257,6 +257,23 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\.managed_ssh_ingress\].*?enabled\s*=\s*true.*?gateway_namespace\s*=\s*"my-namespace".*?gateway_pod_selector\s*=.*?app\.kubernetes\.io/name.*?openshell'
 
+  - it: disables sandbox disruption protection by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.disruption_protection\].*?enabled\s*=\s*false.*?max_duration\s*=\s*"24h"'
+
+  - it: renders sandbox disruption protection operator limits
+    template: templates/gateway-config.yaml
+    set:
+      server.disruptionProtection.enabled: true
+      server.disruptionProtection.maxDuration: 4h
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.disruption_protection\].*?enabled\s*=\s*true.*?max_duration\s*=\s*"4h"'
+
   - it: renders sandbox image pull secrets under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml
     set:

@@ -142,35 +142,39 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         _request: Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
-        self.rpc_tracer
-            .trace(openshell_otel::rpc::LIST_SANDBOXES, async {
-                let sandboxes = self
-                    .driver
-                    .list_sandboxes()
-                    .await
-                    .map_err(Status::internal)?;
-                Ok(Response::new(ListSandboxesResponse { sandboxes }))
-            })
-            .await
+        Box::pin(
+            self.rpc_tracer
+                .trace(openshell_otel::rpc::LIST_SANDBOXES, async {
+                    let sandboxes = self
+                        .driver
+                        .list_sandboxes()
+                        .await
+                        .map_err(Status::internal)?;
+                    Ok(Response::new(ListSandboxesResponse { sandboxes }))
+                }),
+        )
+        .await
     }
 
     async fn create_sandbox(
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<CreateSandboxResponse>, Status> {
-        self.rpc_tracer
-            .trace(openshell_otel::rpc::CREATE_SANDBOX, async {
-                let sandbox = request
-                    .into_inner()
-                    .sandbox
-                    .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-                self.driver
-                    .create_sandbox(&sandbox)
-                    .await
-                    .map_err(|e| Status::from(openshell_core::ComputeDriverError::from(e)))?;
-                Ok(Response::new(CreateSandboxResponse {}))
-            })
-            .await
+        Box::pin(
+            self.rpc_tracer
+                .trace(openshell_otel::rpc::CREATE_SANDBOX, async {
+                    let sandbox = request
+                        .into_inner()
+                        .sandbox
+                        .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
+                    self.driver
+                        .create_sandbox(&sandbox)
+                        .await
+                        .map_err(|e| Status::from(openshell_core::ComputeDriverError::from(e)))?;
+                    Ok(Response::new(CreateSandboxResponse {}))
+                }),
+        )
+        .await
     }
 
     async fn stop_sandbox(

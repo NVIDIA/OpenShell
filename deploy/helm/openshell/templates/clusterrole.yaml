@@ -72,6 +72,21 @@ rules:
       - pods
     verbs:
       - get
+  # PDB access spans workspace namespaces in managed/operator modes. Keep
+  # cleanup and metadata-only gateway ownership adoption available when new
+  # requests are disabled so stale managed PDBs can still expire or be removed.
+  - apiGroups:
+      - policy
+    resources:
+      - poddisruptionbudgets
+    verbs:
+      - delete
+      - get
+      - list
+      - patch
+      {{- if .Values.server.disruptionProtection.enabled }}
+      - create
+      {{- end }}
   {{- end }}
   {{- $copiedSecretNames := list }}
   {{- if and (ne $workspaceMode "shared") (not .Values.server.disableTls) }}
