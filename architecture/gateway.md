@@ -276,7 +276,6 @@ The gateway API is organized around platform objects and operational streams:
 | Sandbox lifecycle | Create, list, delete, watch, exec, SSH session bootstrap, ForwardTcp service forwarding. |
 | Providers | Store provider records, discover credentials, resolve runtime environment. |
 | Policy and settings | Get effective sandbox config, update sandbox policy, manage global settings. |
-| Inference | Set gateway-level model/provider config and resolve sandbox route bundles. |
 | Observability | Push sandbox logs, stream sandbox status and logs to clients. |
 
 Domain objects use shared metadata: stable server-generated IDs, human-readable

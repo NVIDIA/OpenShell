@@ -18,6 +18,10 @@ const BINDING_PROVIDER_A_NAME: &str = "e2e-static-endpoint-binding-provider-a";
 const BINDING_PROVIDER_B_NAME: &str = "e2e-static-endpoint-binding-provider-b";
 const BINDING_PROFILE_A_ID: &str = "e2e-static-endpoint-binding-a";
 const BINDING_PROFILE_B_ID: &str = "e2e-static-endpoint-binding-b";
+const NATIVE_OPENAI_PROVIDER_NAME: &str = "e2e-native-openai-provider";
+const NATIVE_ANTHROPIC_PROVIDER_NAME: &str = "e2e-native-anthropic-provider";
+const NATIVE_OPENAI_PROFILE_ID: &str = "e2e-native-openai";
+const NATIVE_ANTHROPIC_PROFILE_ID: &str = "e2e-native-anthropic";
 
 async fn run_cli(args: &[&str]) -> Result<String, String> {
     let mut cmd = openshell_cmd();
@@ -87,6 +91,17 @@ impl HostServer {
         response_body: &str,
         expected_authorization: Option<&str>,
     ) -> Result<Self, String> {
+        Self::start_with_header_check(
+            response_body,
+            expected_authorization.map(|value| ("Authorization", value)),
+        )
+        .await
+    }
+
+    async fn start_with_header_check(
+        response_body: &str,
+        expected_header: Option<(&str, &str)>,
+    ) -> Result<Self, String> {
         let listener = TcpListener::bind(("0.0.0.0", 0))
             .await
             .map_err(|e| format!("bind host test server: {e}"))?;
@@ -95,14 +110,15 @@ impl HostServer {
             .map_err(|e| format!("read host test server address: {e}"))?
             .port();
         let response_body = response_body.as_bytes().to_vec();
-        let expected_authorization = expected_authorization.map(str::to_string);
+        let expected_header =
+            expected_header.map(|(name, value)| (name.to_string(), value.to_string()));
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
                 let body = response_body.clone();
-                let expected_authorization = expected_authorization.clone();
+                let expected_header = expected_header.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0_u8; 1024];
@@ -119,12 +135,12 @@ impl HostServer {
                         }
                     }
 
-                    let body = expected_authorization.map_or(body, |expected| {
+                    let body = expected_header.map_or(body, |(name, expected)| {
                         let request = String::from_utf8_lossy(&request);
                         format!(
                             r#"{{"authorized":{}}}"#,
                             request.lines().any(|line| {
-                                line.eq_ignore_ascii_case(&format!("Authorization: {expected}"))
+                                line.eq_ignore_ascii_case(&format!("{name}: {expected}"))
                             })
                         )
                         .into_bytes()
@@ -144,6 +160,47 @@ impl HostServer {
 
         Ok(Self { port, task })
     }
+}
+
+fn write_native_inference_profile(
+    id: &str,
+    display_name: &str,
+    env_var: &str,
+    auth_style: &str,
+    header_name: &str,
+    host: &str,
+    port: u16,
+) -> Result<NamedTempFile, String> {
+    let mut file = TempFileBuilder::new()
+        .suffix(".yaml")
+        .tempfile()
+        .map_err(|e| format!("create native inference profile: {e}"))?;
+    let profile = format!(
+        r#"id: {id}
+display_name: {display_name}
+category: inference
+inference_capable: true
+credentials:
+  - name: api_key
+    env_vars: [{env_var}]
+    required: true
+    auth_style: {auth_style}
+    header_name: {header_name}
+endpoints:
+  - host: {host}
+    port: {port}
+    path: /v1/**
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries: [/usr/bin/curl]
+"#
+    );
+    file.write_all(profile.as_bytes())
+        .map_err(|e| format!("write native inference profile: {e}"))?;
+    file.flush()
+        .map_err(|e| format!("flush native inference profile: {e}"))?;
+    Ok(file)
 }
 
 fn write_binding_profile(
@@ -337,6 +394,150 @@ async fn sandbox_reaches_host_openshell_internal_via_host_gateway_alias() {
         "expected sandbox to receive host echo response:\n{}",
         guard.create_output
     );
+}
+
+#[tokio::test]
+async fn provider_native_inference_uses_profile_endpoints_without_legacy_alias() {
+    let openai_server =
+        HostServer::start_with_header_check("", Some(("Authorization", "Bearer openai-secret")))
+            .await
+            .expect("start OpenAI-compatible test server");
+    let anthropic_server =
+        HostServer::start_with_header_check("", Some(("X-Api-Key", "anthropic-secret")))
+            .await
+            .expect("start Anthropic-compatible test server");
+    let openai_profile = write_native_inference_profile(
+        NATIVE_OPENAI_PROFILE_ID,
+        "E2E native OpenAI",
+        "OPENAI_API_KEY",
+        "bearer",
+        "authorization",
+        "host.openshell.internal",
+        openai_server.port,
+    )
+    .expect("write OpenAI-compatible profile");
+    let anthropic_profile = write_native_inference_profile(
+        NATIVE_ANTHROPIC_PROFILE_ID,
+        "E2E native Anthropic",
+        "ANTHROPIC_API_KEY",
+        "header",
+        "x-api-key",
+        "host.openshell.internal",
+        anthropic_server.port,
+    )
+    .expect("write Anthropic-compatible profile");
+    let openai_profile_path = openai_profile.path().to_string_lossy().into_owned();
+    let anthropic_profile_path = anthropic_profile.path().to_string_lossy().into_owned();
+
+    delete_provider(NATIVE_OPENAI_PROVIDER_NAME).await;
+    delete_provider(NATIVE_ANTHROPIC_PROVIDER_NAME).await;
+    delete_provider_profile(NATIVE_OPENAI_PROFILE_ID).await;
+    delete_provider_profile(NATIVE_ANTHROPIC_PROFILE_ID).await;
+    run_cli(&[
+        "provider",
+        "profile",
+        "import",
+        "--file",
+        &openai_profile_path,
+    ])
+    .await
+    .expect("import OpenAI-compatible profile");
+    run_cli(&[
+        "provider",
+        "profile",
+        "import",
+        "--file",
+        &anthropic_profile_path,
+    ])
+    .await
+    .expect("import Anthropic-compatible profile");
+    run_cli(&[
+        "provider",
+        "create",
+        "--name",
+        NATIVE_OPENAI_PROVIDER_NAME,
+        "--type",
+        NATIVE_OPENAI_PROFILE_ID,
+        "--credential",
+        "OPENAI_API_KEY=openai-secret",
+    ])
+    .await
+    .expect("create OpenAI-compatible provider");
+    run_cli(&[
+        "provider",
+        "create",
+        "--name",
+        NATIVE_ANTHROPIC_PROVIDER_NAME,
+        "--type",
+        NATIVE_ANTHROPIC_PROFILE_ID,
+        "--credential",
+        "ANTHROPIC_API_KEY=anthropic-secret",
+    ])
+    .await
+    .expect("create Anthropic-compatible provider");
+
+    let command = format!(
+        r#"openai=$(curl --silent --show-error --fail --max-time 15 -H "Authorization: Bearer $OPENAI_API_KEY" http://host.openshell.internal:{}/v1/chat/completions); anthropic=$(curl --silent --show-error --fail --max-time 15 -H "X-Api-Key: $ANTHROPIC_API_KEY" http://host.openshell.internal:{}/v1/messages); if curl --silent --show-error --fail --connect-timeout 2 --max-time 5 -o /dev/null https://inference.local/v1/models; then legacy=unexpected-success; else legacy=blocked; fi; printf 'OPENAI=%s ANTHROPIC=%s LEGACY=%s\n' "$openai" "$anthropic" "$legacy""#,
+        openai_server.port, anthropic_server.port
+    );
+    let mut guard = SandboxGuard::create(&[
+        "--provider",
+        NATIVE_OPENAI_PROVIDER_NAME,
+        "--provider",
+        NATIVE_ANTHROPIC_PROVIDER_NAME,
+        "--no-auto-providers",
+        "--",
+        "sh",
+        "-c",
+        &command,
+    ])
+    .await
+    .expect("run provider-native inference requests");
+
+    assert!(
+        guard
+            .create_output
+            .contains(r#"OPENAI={"authorized":true}"#),
+        "OpenAI-compatible request should use its native profile endpoint:\n{}",
+        guard.create_output
+    );
+    assert!(
+        guard
+            .create_output
+            .contains(r#"ANTHROPIC={"authorized":true}"#),
+        "Anthropic-compatible request should use its native profile endpoint:\n{}",
+        guard.create_output
+    );
+    assert!(
+        guard.create_output.contains("LEGACY=blocked"),
+        "inference.local must not retain special routing behavior:\n{}",
+        guard.create_output
+    );
+    let logs = run_cli(&[
+        "logs",
+        &guard.name,
+        "-n",
+        "500",
+        "--since",
+        "2m",
+        "--source",
+        "sandbox",
+    ])
+    .await
+    .expect("fetch native inference sandbox logs");
+    assert!(
+        !guard.create_output.contains("openai-secret")
+            && !guard.create_output.contains("anthropic-secret")
+            && !logs.contains("openai-secret")
+            && !logs.contains("anthropic-secret"),
+        "native provider credentials must not appear in output or logs"
+    );
+
+    guard.cleanup().await;
+    delete_provider(NATIVE_OPENAI_PROVIDER_NAME).await;
+    delete_provider(NATIVE_ANTHROPIC_PROVIDER_NAME).await;
+    delete_provider_profile(NATIVE_OPENAI_PROFILE_ID).await;
+    delete_provider_profile(NATIVE_ANTHROPIC_PROFILE_ID).await;
 }
 
 #[tokio::test]

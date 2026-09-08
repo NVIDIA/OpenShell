@@ -271,7 +271,24 @@ session token with `--secret-material-env aws_session_token=AWS_SESSION_TOKEN`.
 It requires the `aws_access_key_id` and `aws_secret_access_key` pair.
 
 Use the generic `aws` profile type for multi-service access and scope endpoints
-via sandbox network policy. Use `aws-s3` for S3-specific endpoint rules.
+via sandbox network policy. Use `aws-s3` for S3-specific endpoint rules. Use
+`aws-bedrock` for native regional Bedrock Runtime endpoints:
+
+```shell
+openshell provider create \
+  --name bedrock-prod \
+  --type aws-bedrock \
+  --from-existing
+
+openshell sandbox create \
+  --provider bedrock-prod \
+  --env AWS_REGION=us-east-1
+```
+
+The Bedrock profile allows regional `bedrock-runtime` endpoints and applies
+proxy-side SigV4 body signing. Set `AWS_REGION` or `AWS_DEFAULT_REGION` as an
+application environment variable so the AWS SDK selects the intended native
+endpoint; the endpoint hostname also determines the signing region.
 
 The proxy re-signs requests using SigV4 before forwarding to AWS. Both curl and
 Python boto3 are supported.
@@ -422,7 +439,7 @@ The following provider types are supported.
 | Type | Environment Variables Injected | Typical Use |
 |---|---|---|
 | `anthropic` | `ANTHROPIC_API_KEY` | Anthropic API |
-| `aws-bedrock` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION` | Declarative schema for future direct Bedrock support. The built-in profile grants no endpoint access; use a custom endpoint-bearing profile for a bridge. |
+| `aws-bedrock` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | Native regional Bedrock Runtime APIs with proxy-side SigV4 body signing. Set the SDK region through the sandbox environment. |
 | `claude` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` | Claude Code, Anthropic API |
 | `codex` | `OPENAI_API_KEY` | OpenAI Codex |
 | `copilot` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` | GitHub Copilot CLI |

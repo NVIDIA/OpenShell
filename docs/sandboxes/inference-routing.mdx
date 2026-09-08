@@ -32,7 +32,7 @@ openshell sandbox create --provider openai-prod
 You can also attach it to an existing sandbox:
 
 ```shell
-openshell provider attach openai-prod --sandbox my-sandbox
+openshell sandbox provider attach my-sandbox openai-prod
 ```
 
 The OpenAI profile allows the native `api.openai.com` endpoint and binds
@@ -86,14 +86,17 @@ openshell provider profile import -f ollama-profile.yaml
 openshell provider create \
     --name ollama \
     --type ollama-openai \
-    --credential OPENAI_API_KEY=unused \
-    --config OPENAI_BASE_URL=http://host.openshell.internal:11434/v1
-openshell sandbox create --provider ollama
+    --credential OPENAI_API_KEY=unused
+openshell sandbox create \
+    --provider ollama \
+    --env OPENAI_BASE_URL=http://host.openshell.internal:11434/v1
 ```
 
 Add the agent or client binary paths it needs to the custom profile. See
 [Provider Profiles](/providers/profiles) for the complete schema and update
-workflow.
+workflow. Provider config is gateway-side metadata; it does not set application
+environment variables. Pass the native SDK's base URL through `--env` or the
+application's own configuration.
 
 ## Migration from Managed Inference Routes
 

@@ -5502,6 +5502,24 @@ binaries:
     }
 
     #[test]
+    fn aws_bedrock_profile_provides_sigv4_endpoint_bindings() {
+        let bedrock = builtin_profile("aws-bedrock");
+        let credential_env_vars = bedrock.credential_env_vars();
+
+        assert!(credential_env_vars.contains(&"AWS_ACCESS_KEY_ID"));
+        assert!(credential_env_vars.contains(&"AWS_SECRET_ACCESS_KEY"));
+        assert!(
+            bedrock.endpoints.iter().any(|endpoint| {
+                endpoint.host == "bedrock-runtime.*.amazonaws.com"
+                    && endpoint.credential_signing == "sigv4:body"
+                    && endpoint.signing_service == "bedrock"
+            }),
+            "Bedrock profile should authorize native regional endpoints with SigV4"
+        );
+        assert!(!bedrock.binaries.is_empty());
+    }
+
+    #[test]
     fn aws_profile_declares_additional_outputs() {
         for id in ["aws", "aws-s3"] {
             let profile = builtin_profile(id);

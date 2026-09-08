@@ -10394,6 +10394,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_config_accepts_sigv4_covered_by_bedrock_profile() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_aws_provider("bedrock-prod", "aws-bedrock"))
+            .await
+            .unwrap();
+        let mut sandbox = test_sandbox(
+            "sb-signing-bedrock",
+            "signing-bedrock",
+            ProtoSandboxPolicy::default(),
+            vec!["bedrock-prod".to_string()],
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let mut policy = test_sigv4_policy("bedrock-runtime.us-east-1.amazonaws.com", None);
+        let endpoint = &mut policy.network_policies.get_mut("aws").unwrap().endpoints[0];
+        endpoint.access = "read-write".to_string();
+        endpoint.enforcement = "enforce".to_string();
+        endpoint.credential_signing = "sigv4:body".to_string();
+        endpoint.signing_service = "bedrock".to_string();
+
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "signing-bedrock".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(policy),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("Bedrock profile covers its native regional SigV4 endpoint");
+    }
+
+    #[tokio::test]
     async fn update_config_rejects_sigv4_outside_endpointful_aws_profile_boundary() {
         let state = test_server_state().await;
         state

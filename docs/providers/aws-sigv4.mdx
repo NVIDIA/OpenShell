@@ -12,7 +12,7 @@ AWS SigV4 credential signing lets sandbox agents call AWS services (Bedrock, S3,
 ## Prerequisites
 
 - A provider with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` credentials configured. Optionally include `AWS_SESSION_TOKEN` for STS temporary credentials.
-- An endpointless `aws` provider profile when the sandbox policy defines the service endpoints, or an endpoint-bearing service profile such as `aws-s3`.
+- An endpointless `aws` provider profile when the sandbox policy defines the service endpoints, or an endpoint-bearing service profile such as `aws-s3` or `aws-bedrock`.
 - A sandbox policy with `credential_signing` enabled on the target endpoint. For the endpointless `aws` profile, the endpoint must also set `credential_binding.provider` to the attached provider name.
 
 ## Provider Setup

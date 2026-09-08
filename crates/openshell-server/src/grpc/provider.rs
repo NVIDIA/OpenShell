@@ -44,8 +44,8 @@ const GATEWAY_SPIFFE_WORKLOAD_API_SOCKET: &str = "OPENSHELL_GATEWAY_SPIFFE_WORKL
 
 /// Redact credential values from a provider before returning it in a gRPC
 /// response.  Key names are preserved so callers can display credential counts
-/// and key listings.  Internal server paths (inference routing, sandbox env
-/// injection) read credentials from the store directly and are unaffected.
+/// and key listings. Internal server paths that resolve sandbox provider
+/// credentials read from the store directly and are unaffected.
 fn redact_provider_credentials(mut provider: Provider) -> Provider {
     for value in provider.credentials.values_mut() {
         *value = "REDACTED".to_string();
@@ -2981,7 +2981,7 @@ pub(super) fn provider_profile_endpoints_are_active(
         return true;
     }
     let (base_url_keys, default_base_url): (&[&str], &str) = match profile.id.as_str() {
-        "openai" => (&["OPENAI_BASE_URL"], "https://api.openai.com"),
+        "openai" => (&["OPENAI_BASE_URL"], "https://api.openai.com/v1"),
         "anthropic" => (&["ANTHROPIC_BASE_URL"], "https://api.anthropic.com"),
         _ => return true,
     };
@@ -10161,6 +10161,39 @@ mod tests {
                     .contains_key(credential_key)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_binds_openai_key_for_canonical_base_url() {
+        let store = test_store().await;
+        let mut provider = provider_with_credential_value(
+            "canonical-openai",
+            "openai",
+            "OPENAI_API_KEY",
+            "openai-key",
+        );
+        provider.config.insert(
+            "OPENAI_BASE_URL".to_string(),
+            "https://api.openai.com/v1/".to_string(),
+        );
+        create_provider_record(&store, "default", provider)
+            .await
+            .unwrap();
+
+        let result =
+            resolve_provider_environment(&store, "default", &["canonical-openai".to_string()])
+                .await
+                .unwrap();
+
+        assert_eq!(
+            result.get("OPENAI_API_KEY"),
+            Some(&"openai-key".to_string())
+        );
+        assert!(
+            result
+                .static_credential_bindings
+                .contains_key("OPENAI_API_KEY")
+        );
     }
 
     #[tokio::test]

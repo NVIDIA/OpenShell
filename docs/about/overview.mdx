@@ -34,7 +34,7 @@ OpenShell applies defense in depth across the following policy domains.
 | Filesystem | Prevents reads/writes outside allowed paths. | Locked at sandbox creation. |
 | Network | Blocks unauthorized outbound connections. | Hot-reloadable at runtime. |
 | Process | Blocks privilege escalation and dangerous syscalls. | Locked at sandbox creation. |
-| Inference | Reroutes model API calls to controlled backends. | Hot-reloadable at runtime. |
+| Credential binding | Keeps provider secrets outside the agent process and limits their use to approved endpoints. | Applied to attached providers. |
 
 For details, refer to [Customize Sandbox Policies](/sandboxes/policies) and [Default Policy](/reference/default-policy).
 

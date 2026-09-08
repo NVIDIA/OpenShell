@@ -42,6 +42,7 @@ Check the application configuration before probing the network:
 - OpenAI-compatible clients should use the endpoint required by the provider, usually ending in `/v1`.
 - Anthropic clients must use the provider's Messages API endpoint and expected environment variables.
 - Vertex AI clients must construct the native regional or global Vertex endpoint and select a supported protocol.
+- AWS Bedrock clients must set an SDK region and use the regional `bedrock-runtime` endpoint; the `aws-bedrock` profile applies proxy-side SigV4 signing.
 - The application, not OpenShell, selects the model and timeout.
 - The request authority must match the CONNECT tunnel host and effective port.
 
@@ -78,10 +79,15 @@ Example provider creation after importing an `ollama-openai` profile:
 openshell provider create \
   --name ollama \
   --type ollama-openai \
-  --credential OPENAI_API_KEY=unused \
-  --config OPENAI_BASE_URL=http://host.openshell.internal:11434/v1
-openshell sandbox provider attach <sandbox-name> ollama
+  --credential OPENAI_API_KEY=unused
+openshell sandbox create \
+  --provider ollama \
+  --env OPENAI_BASE_URL=http://host.openshell.internal:11434/v1
 ```
+
+Provider `--config` values are gateway-side metadata and are not exported to the
+application. Configure the base URL through the application, a sandbox
+environment variable at creation, or a per-command `sandbox exec --env` value.
 
 If the gateway is remote, `host.openshell.internal` refers to the gateway host, not the user's workstation. Run the model beside that gateway or use a network-reachable address explicitly allowed by the profile.
 

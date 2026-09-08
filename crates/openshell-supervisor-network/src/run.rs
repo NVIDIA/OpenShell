@@ -4,10 +4,10 @@
 //! Networking stack startup for the sandbox.
 //!
 //! Builds the network namespace (Linux), the CONNECT proxy with TLS L7
-//! interception, the inference context, and wires the proxy to the
-//! caller-supplied denial-event channel. Returns a [`Networking`] handle
-//! whose RAII fields keep the proxy task alive for the lifetime of the
-//! sandbox supervisor.
+//! interception and provider credential resolution, and wires the proxy to
+//! the caller-supplied denial-event channel. Returns a [`Networking`] handle
+//! whose RAII fields keep the proxy task alive for the lifetime of the sandbox
+//! supervisor.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;

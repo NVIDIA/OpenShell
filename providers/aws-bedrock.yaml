@@ -4,37 +4,55 @@
 id: aws-bedrock
 display_name: AWS Bedrock
 description: |
-  Anthropic + Mistral + Llama models served via the AWS Bedrock InvokeModel API.
-
-  This built-in profile is declarative only. It does not grant egress or
-  inject credentials because OpenShell does not sign AWS requests. Import an
-  endpoint-bearing custom profile and use an AWS-capable client in the sandbox
-  to access Bedrock directly.
+  Native AWS Bedrock Runtime APIs with proxy-side SigV4 credential signing.
 category: inference
 inference_capable: true
 credentials:
-  # Declarative-only. None are required or injected by this profile.
   - name: aws_access_key_id
-    description: AWS access key ID (unused by this built-in profile)
+    description: AWS access key ID
     env_vars: [AWS_ACCESS_KEY_ID]
-    required: false
+    required: true
   - name: aws_secret_access_key
-    description: AWS secret access key (unused by this built-in profile)
+    description: AWS secret access key
     env_vars: [AWS_SECRET_ACCESS_KEY]
-    required: false
+    required: true
   - name: aws_session_token
     description: Optional session token for temporary credentials (STS, IAM Roles for Service Accounts)
     env_vars: [AWS_SESSION_TOKEN]
     required: false
-  - name: aws_region
-    description: AWS region (unused by this built-in profile)
-    env_vars: [AWS_REGION, AWS_DEFAULT_REGION]
-    required: false
 discovery:
-  # The built-in profile does not consume AWS credentials, so
-  # `--from-existing` does not scan for them.
-  credentials: []
-# Endpoints and binaries are intentionally empty. Use a custom profile to
-# declare the exact Bedrock endpoint and authorized client binaries.
-endpoints: []
-binaries: []
+  credentials: [aws_access_key_id, aws_secret_access_key, aws_session_token]
+endpoints:
+  - host: "bedrock-runtime.*.amazonaws.com"
+    port: 443
+    protocol: rest
+    tls: terminate
+    access: read-write
+    enforcement: enforce
+    credential_signing: sigv4:body
+    signing_service: bedrock
+  - host: "bedrock-runtime-fips.*.amazonaws.com"
+    port: 443
+    protocol: rest
+    tls: terminate
+    access: read-write
+    enforcement: enforce
+    credential_signing: sigv4:body
+    signing_service: bedrock
+  - host: "bedrock-runtime.*.amazonaws.com.cn"
+    port: 443
+    protocol: rest
+    tls: terminate
+    access: read-write
+    enforcement: enforce
+    credential_signing: sigv4:body
+    signing_service: bedrock
+binaries:
+  - /sandbox/.venv/bin/python
+  - /sandbox/.venv/bin/python3
+  - /sandbox/.uv/python/**
+  - /usr/bin/python3
+  - /usr/bin/python3.*
+  - /usr/bin/curl
+  - /usr/local/bin/aws
+  - /bin/bash

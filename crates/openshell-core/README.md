@@ -38,18 +38,6 @@ Labels follow Kubernetes-style key and value conventions:
 
 Validate labels at API ingress before persisting objects.
 
-## Inference Profiles
-
-Provider inference profiles live in this crate so the gateway, sandbox, and
-router agree on provider defaults. Profiles define:
-
-- Auth header style.
-- Default upstream headers.
-- Client-supplied passthrough headers.
-
-Do not duplicate provider-specific inference behavior in callers. Add shared
-behavior here, then consume it from the gateway, sandbox, and router.
-
 ## Middleware Contracts
 
 Built-in supervisor middleware identifiers, host-selector matching, and pure

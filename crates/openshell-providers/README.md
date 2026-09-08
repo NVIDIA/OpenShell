@@ -22,7 +22,7 @@ out of the CLI and gateway control flow.
 - Injecting credentials into sandbox child processes.
 - Routing inference requests.
 
-Those are owned by the gateway, sandbox supervisor, and router.
+Those are owned by the gateway and sandbox supervisor.
 
 ## Security Notes
 

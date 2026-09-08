@@ -4,9 +4,9 @@
 //! Networking component of the `OpenShell` supervisor.
 //!
 //! Owns the egress proxy, L7 enforcement, OPA policy engine, identity cache,
-//! inference routing, and TLS interception. The denial-event channel is
-//! owned by the orchestrator; this crate produces denials but does not
-//! aggregate them.
+//! provider credential resolution, and TLS interception. The denial-event
+//! channel is owned by the orchestrator; this crate produces denials but does
+//! not aggregate them.
 
 pub mod identity;
 pub mod l7;
