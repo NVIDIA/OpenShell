@@ -271,7 +271,7 @@ SPIFFE JWT-SVIDs for dynamic provider token grants:
 `openshell.local` and adds a `ClusterSPIFFEID` that maps sandbox pod
 annotations to `spiffe://openshell.local/openshell/sandbox/<sandbox-id>`.
 OpenShell mounts the SPIFFE CSI Workload API socket at
-`/spiffe-workload-api/spire-agent.sock` into sandbox pods for provider token
+`/spiffe-workload-api/spire-agent.sock` only into supervisor Pods for provider token
 grants. Supervisor-to-gateway authentication remains on the Kubernetes
 ServiceAccount bootstrap and gateway-minted sandbox JWT path; the selected
 Kubernetes compute driver validates the projected token before the gateway

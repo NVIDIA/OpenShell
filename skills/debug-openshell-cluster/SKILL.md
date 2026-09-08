@@ -225,6 +225,8 @@ Common findings:
   upgrade.
 - Sandbox runtime image exits before printing `openshell-sandbox --version`: verify the configured image contains a static executable at `/openshell-sandbox`.
 - A sandbox with explicit `protocol: tcp` endpoints fails before workload readiness: confirm the selected isolation backend advertises TCP mediation, then inspect the sandbox and supervisor logs for protected-channel setup or listener failures. A driver that cannot supply the required outer egress fence and authenticated runtime channel must reject the policy before starting the agent.
+- Supervisor runtime validation fails: verify `supervisor_image` contains a static `/openshell-supervisor` executable from the same release as the sandbox runtime.
+- The sandbox fails its enforcement probe: inspect the sandbox log for the exact nested seccomp user-notification, task-memory, Landlock, loopback DNS, or socket-injection check that failed. Do not add capabilities or switch to an unconfined seccomp profile; use a runtime whose default profile permits the unprivileged probe.
 - A GPU sandbox fails because Docker reports no discovered NVIDIA CDI devices: verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. Restart `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs, then restart or reload Docker and re-check `docker info`.
 
 During a graceful gateway restart, Docker, Podman, and VM sandboxes with
@@ -427,7 +429,7 @@ If `server.providerTokenGrants.spiffe.enabled=true`, the gateway should still
 render `[openshell.gateway.gateway_jwt]` and mount the `sandbox-jwt` Secret.
 SPIRE is used by both the gateway and sandbox supervisors for dynamic provider
 token grants. The gateway pod must mount the `spiffe-workload-api` CSI volume
-and set `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`; sandbox pods must
+and set `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`; supervisor Pods must
 receive the matching Workload API socket from the Kubernetes driver config.
 The gateway verifies supervisor JWT-SVIDs from JWT bundles fetched through this
 Workload API socket, not from the SPIRE OIDC discovery endpoint.
@@ -595,6 +597,17 @@ kubectl -n <sandbox-namespace> get pod,service,secret,networkpolicy -l openshell
 kubectl -n <sandbox-namespace> logs <workload-pod> -c agent --tail=200
 kubectl -n <sandbox-namespace> logs <supervisor-pod> --tail=200
 ```
+
+Creation and recovery fail closed. A missing Secret leaves both pods inert; a
+missing or unobserved workload fence must prevent the driver from releasing the
+Sandbox; and readiness requires both Agent Sandbox readiness and an Available
+supervisor Deployment. Its exec readiness check succeeds only after the
+supervisor has attached, confirmed enforcement, started or resumed the
+workload, and registered the gateway access plane. Use both Pod logs for
+bootstrap errors. An `EPERM` during enforcement setup means the runtime blocked
+a required unprivileged seccomp, task-memory, or Landlock operation. Do not add
+capabilities, gateway egress, or credentials to the workload Pod as a
+workaround.
 
 #### Corporate upstream proxy
 

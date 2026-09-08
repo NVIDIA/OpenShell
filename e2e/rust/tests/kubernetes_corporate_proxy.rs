@@ -6,7 +6,7 @@
 //! Kubernetes wiring coverage for authenticated corporate forward proxies.
 //!
 //! The shell wrapper configures the gateway before it starts, creates the
-//! credential Secret, and forces sidecar topology. This test starts a proxy
+//! credential Secret, and enables proxy-pod topology. This test starts a proxy
 //! and an HTTPS upstream on the host visible to sandbox pods, then proves that
 //! a permitted request uses authenticated CONNECT while a policy-denied port
 //! never reaches the proxy.
