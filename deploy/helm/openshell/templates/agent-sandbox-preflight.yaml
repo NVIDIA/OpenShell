@@ -2,7 +2,13 @@
 SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0
 */}}
-{{- if .Values.agentSandbox.preflight.enabled }}
+{{- /*
+cni.only installs just the node-level CNI singleton — no gateway workload and no
+sandbox pods — so it does not depend on the Agent Sandbox API. Skip the preflight
+there so the CNI installer can be deployed on clusters that do not (yet) run the
+Agent Sandbox controller.
+*/}}
+{{- if and .Values.agentSandbox.preflight.enabled (not .Values.cni.only) }}
 {{- $v1beta1 := or (.Capabilities.APIVersions.Has "agents.x-k8s.io/v1beta1") (.Capabilities.APIVersions.Has "agents.x-k8s.io/v1beta1/Sandbox") }}
 {{- $v1alpha1 := or (.Capabilities.APIVersions.Has "agents.x-k8s.io/v1alpha1") (.Capabilities.APIVersions.Has "agents.x-k8s.io/v1alpha1/Sandbox") }}
 {{- if not (or $v1beta1 $v1alpha1) }}

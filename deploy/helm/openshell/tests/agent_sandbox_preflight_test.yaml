@@ -10,3 +10,13 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "Agent Sandbox is required but neither agents.x-k8s.io/v1beta1 nor agents.x-k8s.io/v1alpha1 is served"
+
+  # A standalone CNI install renders no gateway and no sandboxes, so it must not
+  # require the Agent Sandbox API to be served by the cluster.
+  - it: skips the preflight in cni-only mode
+    set:
+      cni.only: true
+      cni.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
