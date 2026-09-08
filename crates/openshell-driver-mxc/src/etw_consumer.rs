@@ -50,7 +50,7 @@
     clippy::doc_markdown
 )]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -1127,7 +1127,8 @@ fn format_property_value(
 /// - from there we learn `identity → sandbox_id` and (`SandboxEngineCreate`)
 ///   `activity_id → sandbox_id`, so the payload-keyless `SandboxConfig`
 ///   (no identity/CV) resolves via the ETW `ActivityId` it shares.
-/// - `commandLine` and a per-pid "last resolved" value are fallbacks.
+/// - command text never establishes ownership, and the PID anchor is retired as
+///   soon as the monitored `wxc-exec` child exits.
 /// An ETW event that could not yet be attributed, held so it can be replayed
 /// once its sandbox's attribution is seeded.
 struct PendingEvent {
@@ -1155,6 +1156,12 @@ const PENDING_TTL: Duration = Duration::from_secs(5);
 /// is treated as a *different* (recycled) owner and the PID match is refused.
 const REPLAY_PID_GRACE: Duration = Duration::from_secs(2);
 
+/// Keep already-established strong correlations briefly after `wxc-exec` exits
+/// so ETW records that were in flight can still be attributed. The consumer's
+/// periodic pending drain prunes them after the same horizon used for late event
+/// replay.
+const RETIRED_CORRELATION_TTL: Duration = PENDING_TTL;
+
 /// A `wxc-exec` PID registration: which sandbox owns the PID and *when* it was
 /// registered. The timestamp lets the replay path (see [`AttributionIndex::
 /// resolve_replay`]) reject a PID that was recycled to a different sandbox after
@@ -1162,6 +1169,10 @@ const REPLAY_PID_GRACE: Duration = Duration::from_secs(2);
 struct PidReg {
     sid: String,
     at: Instant,
+    /// Whether an event buffered just before this registration may use the PID.
+    /// A recently retired or reassigned PID makes that race ambiguous, so only
+    /// its strong identity/activity/CV correlators remain eligible for replay.
+    replay_before_registration: bool,
 }
 
 #[derive(Default)]
@@ -1170,19 +1181,18 @@ pub(crate) struct AttributionIndex {
     by_identity: HashMap<String, String>,
     by_activity: HashMap<String, String>,
     by_cv: HashMap<String, String>,
-    /// Command line → sandbox_id, but **only while that command line is unique**.
-    /// The instant a second sandbox registers the same command line it is moved to
-    /// [`Self::ambiguous_cmds`] and removed here, so an ambiguous command can never
-    /// misroute an event. Command line is a weak, last-resort key for exactly this
-    /// reason (two sandboxes commonly run the identical agent command).
-    by_cmd: HashMap<String, String>,
-    /// Command lines seen for more than one sandbox — never usable for resolution.
-    ambiguous_cmds: std::collections::HashSet<String>,
-    last_pid_sid: HashMap<u32, String>,
+    /// Sandboxes whose driver-owned `wxc-exec` process has exited. Their strong
+    /// correlations remain authoritative only until the recorded instant plus
+    /// [`RETIRED_CORRELATION_TTL`].
+    retired_sandboxes: HashMap<String, Instant>,
+    /// Recently retired PID generations. Tombstones prevent a buffered event
+    /// from binding to a quickly recycled PID's new owner and expire once every
+    /// event from the prior generation must have aged out.
+    retired_pids: HashMap<u32, Instant>,
     names: HashMap<String, String>,
     /// Sandboxes for which a lifecycle [6002] row has already been emitted, so
     /// the two redundant create events don't double-count.
-    lifecycle_emitted: std::collections::HashSet<String>,
+    lifecycle_emitted: HashSet<String>,
     /// Events that arrived before their sandbox's attribution was seeded. ETW
     /// delivers the create/config burst the instant `wxc-exec` starts, which can
     /// race the driver's `register_launch`; rather than drop those events we hold
@@ -1197,70 +1207,131 @@ impl AttributionIndex {
     }
 
     /// Register a launched sandbox. `wxc_pid` (the process we spawned) is the
-    /// primary anchor — unique *while that process is alive* (Windows won't reuse
-    /// a live PID). `command_line` is only a weak fallback and is dropped the
-    /// moment it stops being unique (see [`Self::ambiguous_cmds`]).
-    pub fn register_launch(
-        &mut self,
-        sandbox_id: &str,
-        sandbox_name: &str,
-        wxc_pid: u32,
-        command_line: &str,
-    ) {
+    /// only initial authority anchor and remains authoritative only while that
+    /// process is alive. Events resolved through it establish the strong
+    /// identity/activity/CV correlations used for the rest of the create burst.
+    pub fn register_launch(&mut self, sandbox_id: &str, sandbox_name: &str, wxc_pid: u32) {
+        let now = Instant::now();
+        self.purge_expired_retirements(now);
+        let previous = self
+            .by_pid
+            .get(&wxc_pid)
+            .map(|registration| registration.sid.clone());
+        let replay_before_registration =
+            previous.is_none() && !self.retired_pids.contains_key(&wxc_pid);
+
         // PID-reuse guard: if this PID still maps to a *different* sandbox, the
         // prior sandbox was never `forget()`-ten (e.g. a crash skipped `delete`)
-        // and Windows has recycled the number. Rebind to the new owner and drop
-        // the stale per-PID "last resolved" hint so it can't misroute.
-        if let Some(prev) = self.by_pid.get(&wxc_pid) {
-            if prev.sid != sandbox_id {
+        // and Windows has recycled the number. Rebind to the new owner, expire
+        // the prior owner's strong correlations on the normal late-event horizon,
+        // and refuse PID-only replay across the ambiguous generation boundary.
+        if let Some(prev_sid) = previous.as_deref() {
+            if prev_sid != sandbox_id {
                 tracing::warn!(
                     target: "mxc_etw",
                     pid = wxc_pid,
-                    prev = %prev.sid,
+                    prev = %prev_sid,
                     new = %sandbox_id,
                     "wxc-exec PID reused before prior sandbox was forgotten; rebinding attribution"
                 );
+                self.retired_sandboxes
+                    .entry(prev_sid.to_string())
+                    .or_insert(now);
+                self.retired_pids.insert(wxc_pid, now);
             }
         }
         self.by_pid.insert(
             wxc_pid,
             PidReg {
                 sid: sandbox_id.to_string(),
-                at: Instant::now(),
+                at: now,
+                replay_before_registration,
             },
         );
-        self.last_pid_sid.remove(&wxc_pid);
-
-        // Command line is only trustworthy while unique. Promote to `by_cmd` on
-        // first sight; on a second, different owner, demote to ambiguous forever.
-        if !command_line.is_empty() && !self.ambiguous_cmds.contains(command_line) {
-            match self.by_cmd.get(command_line) {
-                Some(existing) if existing != sandbox_id => {
-                    self.by_cmd.remove(command_line);
-                    self.ambiguous_cmds.insert(command_line.to_string());
-                }
-                Some(_) => {} // same owner re-registering; keep
-                None => {
-                    self.by_cmd
-                        .insert(command_line.to_string(), sandbox_id.to_string());
-                }
-            }
-        }
+        self.retired_sandboxes.remove(sandbox_id);
 
         self.names
             .insert(sandbox_id.to_string(), sandbox_name.to_string());
     }
 
+    /// Retire a driver-owned PID after its monitored child exits. The exact
+    /// sandbox match prevents a delayed monitor from removing a recycled PID's
+    /// newer registration. Strong correlations remain for a short late-event
+    /// window, but PID-only events stop resolving immediately.
+    pub fn retire_launch(&mut self, sandbox_id: &str, wxc_pid: u32) {
+        let matches_owner = self
+            .by_pid
+            .get(&wxc_pid)
+            .is_some_and(|registration| registration.sid == sandbox_id);
+        if !matches_owner {
+            return;
+        }
+
+        self.by_pid.remove(&wxc_pid);
+        let now = Instant::now();
+        self.retired_pids.insert(wxc_pid, now);
+        if !self
+            .by_pid
+            .values()
+            .any(|registration| registration.sid == sandbox_id)
+        {
+            self.retired_sandboxes.insert(sandbox_id.to_string(), now);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn has_live_pid_for_sandbox(&self, sandbox_id: &str) -> bool {
+        self.by_pid
+            .values()
+            .any(|registration| registration.sid == sandbox_id)
+    }
+
     /// Drop all keys for a finished sandbox to bound memory.
     pub fn forget(&mut self, sandbox_id: &str) {
-        self.by_pid.retain(|_, r| r.sid != sandbox_id);
+        let now = Instant::now();
+        let retired_pids = self
+            .by_pid
+            .iter()
+            .filter_map(|(pid, registration)| (registration.sid == sandbox_id).then_some(*pid))
+            .collect::<Vec<_>>();
+        for pid in retired_pids {
+            self.by_pid.remove(&pid);
+            self.retired_pids.insert(pid, now);
+        }
         self.by_identity.retain(|_, v| v != sandbox_id);
         self.by_activity.retain(|_, v| v != sandbox_id);
         self.by_cv.retain(|_, v| v != sandbox_id);
-        self.by_cmd.retain(|_, v| v != sandbox_id);
-        self.last_pid_sid.retain(|_, v| v != sandbox_id);
+        self.retired_sandboxes.remove(sandbox_id);
         self.names.remove(sandbox_id);
         self.lifecycle_emitted.remove(sandbox_id);
+    }
+
+    fn purge_expired_retirements(&mut self, now: Instant) {
+        self.retired_pids.retain(|_, retired_at| {
+            now.checked_duration_since(*retired_at)
+                .map_or(true, |age| age < PENDING_TTL)
+        });
+
+        let expired_sandboxes = self
+            .retired_sandboxes
+            .iter()
+            .filter_map(|(sandbox_id, retired_at)| {
+                now.checked_duration_since(*retired_at)
+                    .is_some_and(|age| age >= RETIRED_CORRELATION_TTL)
+                    .then(|| sandbox_id.clone())
+            })
+            .collect::<HashSet<_>>();
+        if expired_sandboxes.is_empty() {
+            return;
+        }
+
+        self.by_identity
+            .retain(|_, sid| !expired_sandboxes.contains(sid));
+        self.by_activity
+            .retain(|_, sid| !expired_sandboxes.contains(sid));
+        self.by_cv.retain(|_, sid| !expired_sandboxes.contains(sid));
+        self.retired_sandboxes
+            .retain(|sid, _| !expired_sandboxes.contains(sid));
     }
 
     /// Returns `true` the first time a lifecycle row should be emitted for this
@@ -1281,10 +1352,10 @@ impl AttributionIndex {
     /// Resolve an event to a `sandbox_id` via any known key, then cross-link the
     /// other keys it carries so later keyless events attribute correctly.
     fn resolve(&mut self, ev: &DecodedEtwEvent) -> Option<String> {
+        self.purge_expired_retirements(Instant::now());
         let identity = ev.identity();
         let cv = ev.cv_base();
         let activity = guid_key(&ev.activity_id);
-        let cmd = ev.get_unquoted("commandLine");
 
         let sid = self
             .by_pid
@@ -1300,21 +1371,18 @@ impl AttributionIndex {
                     .as_ref()
                     .and_then(|a| self.by_activity.get(a).cloned())
             })
-            .or_else(|| cv.as_ref().and_then(|c| self.by_cv.get(c).cloned()))
-            .or_else(|| cmd.as_ref().and_then(|c| self.by_cmd.get(c).cloned()))
-            .or_else(|| self.last_pid_sid.get(&ev.process_id).cloned())?;
+            .or_else(|| cv.as_ref().and_then(|c| self.by_cv.get(c).cloned()))?;
 
-        self.cross_link(&sid, identity, cv, activity, ev.process_id);
+        self.cross_link(&sid, identity, cv, activity);
         Some(sid)
     }
 
     /// Resolve a *buffered* (replayed) event. Unlike [`Self::resolve`], this is
-    /// hardened against PID recycling and command-line ambiguity that can occur
-    /// during the buffer window ([`PENDING_TTL`]):
+    /// hardened against PID recycling that can occur during the buffer window
+    /// ([`PENDING_TTL`]):
     ///
-    /// - It **never** falls back to `by_cmd` or `last_pid_sid` — both are
-    ///   recycle-/ambiguity-prone and a stale entry could bind a buffered event
-    ///   to the wrong sandbox.
+    /// - Command lines and persistent per-PID hints are never authority keys on
+    ///   either the live or replay path.
     /// - A `by_pid` match is only trusted if the PID's registration is not newer
     ///   than the buffered event by more than [`REPLAY_PID_GRACE`]. If the PID
     ///   was recycled to a *different* sandbox after this event was captured, the
@@ -1326,6 +1394,7 @@ impl AttributionIndex {
     /// always trusted — they are cross-linked from the driver-owned PID anchor
     /// and are not reused across sandboxes.
     fn resolve_replay(&mut self, ev: &DecodedEtwEvent, buffered_at: Instant) -> Option<String> {
+        self.purge_expired_retirements(Instant::now());
         let identity = ev.identity();
         let cv = ev.cv_base();
         let activity = guid_key(&ev.activity_id);
@@ -1343,8 +1412,10 @@ impl AttributionIndex {
                 self.by_pid.get(&ev.process_id).and_then(|r| {
                     // Refuse a PID that was (re)registered well after this event
                     // was buffered — that registration belongs to a recycled PID
-                    // owned by a different sandbox, not this event's emitter.
-                    if r.at <= buffered_at + REPLAY_PID_GRACE {
+                    // owned by a different sandbox, not this event's emitter. A
+                    // recent retirement/reassignment is ambiguous even within
+                    // the ordinary registration grace window.
+                    if r.replay_before_registration && r.at <= buffered_at + REPLAY_PID_GRACE {
                         Some(r.sid.clone())
                     } else {
                         None
@@ -1352,7 +1423,7 @@ impl AttributionIndex {
                 })
             })?;
 
-        self.cross_link(&sid, identity, cv, activity, ev.process_id);
+        self.cross_link(&sid, identity, cv, activity);
         Some(sid)
     }
 
@@ -1364,7 +1435,6 @@ impl AttributionIndex {
         identity: Option<String>,
         cv: Option<String>,
         activity: Option<String>,
-        pid: u32,
     ) {
         if let Some(i) = identity {
             self.by_identity.entry(i).or_insert_with(|| sid.to_string());
@@ -1375,7 +1445,6 @@ impl AttributionIndex {
         if let Some(a) = activity {
             self.by_activity.entry(a).or_insert_with(|| sid.to_string());
         }
-        self.last_pid_sid.insert(pid, sid.to_string());
     }
 
     /// Hold an event that didn't resolve yet, evicting expired and (if needed)
@@ -1405,6 +1474,7 @@ impl AttributionIndex {
     /// aged past [`PENDING_TTL`] still unresolved. Callers emit the returned
     /// events *after* releasing the index lock.
     fn drain_resolved(&mut self) -> Vec<(String, String, DecodedEtwEvent)> {
+        self.purge_expired_retirements(Instant::now());
         if self.pending.is_empty() {
             return Vec::new();
         }
@@ -1989,7 +2059,7 @@ mod tests {
         );
 
         // Driver seeds attribution for the wxc-exec pid we spawned.
-        idx.register_launch("sbx-1", "my-sandbox", 1234, "agent --run");
+        idx.register_launch("sbx-1", "my-sandbox", 1234);
 
         // The buffered event now attributes and is returned for emit, in order.
         let ready = idx.drain_resolved();
@@ -2022,7 +2092,7 @@ mod tests {
     #[test]
     fn buffered_event_replays_via_crosslink() {
         let mut idx = AttributionIndex::new();
-        idx.register_launch("sbx-9", "s9", 4321, "agent");
+        idx.register_launch("sbx-9", "s9", 4321);
 
         // First event carries the pid + an activity id → resolves and cross-links
         // the activity id to sbx-9.
@@ -2043,39 +2113,78 @@ mod tests {
     #[test]
     fn pid_reuse_rebinds_to_new_sandbox() {
         let mut idx = AttributionIndex::new();
-        idx.register_launch("sbx-A", "A", 1000, "agent --a");
+        idx.register_launch("sbx-A", "A", 1000);
         let ev_a = mk_event(1000, "CreateProcessInSandbox");
         assert_eq!(idx.resolve(&ev_a).as_deref(), Some("sbx-A"));
 
         // A leaks (delete never ran). PID 1000 is recycled for B.
-        idx.register_launch("sbx-B", "B", 1000, "agent --b");
+        idx.register_launch("sbx-B", "B", 1000);
+        idx.retire_launch("sbx-A", 1000);
         let ev_b = mk_event(1000, "CreateProcessInSandbox");
         assert_eq!(idx.resolve(&ev_b).as_deref(), Some("sbx-B"));
     }
 
-    // Shailendra #1 (cmd ambiguity): two sandboxes running the identical command
-    // line must not let that command line resolve anything (it's ambiguous); a
-    // unique command line still works as a fallback.
+    // Command text is user-controlled and may match unrelated host activity, so
+    // it must never establish sandbox ownership even when currently unique.
     #[test]
-    fn duplicate_command_line_is_not_used_for_resolution() {
+    fn command_line_is_never_used_for_resolution() {
         let mut idx = AttributionIndex::new();
-        idx.register_launch("sbx-1", "s1", 11, "agent --run");
-        idx.register_launch("sbx-2", "s2", 22, "agent --run"); // same cmd → ambiguous
+        idx.register_launch("sbx-1", "s1", 11);
 
-        // Event carrying ONLY the duplicate command line (unknown pid, no
-        // identity/activity) must NOT resolve — refusing beats misrouting.
+        // An unrelated provider event carrying the exact workload command but no
+        // driver-owned PID or strong correlator must remain unattributed.
         let mut only_cmd = mk_event(999, "SandboxConfig");
         only_cmd
             .props
             .push(("commandLine".into(), "\"agent --run\"".into()));
         assert!(idx.resolve(&only_cmd).is_none());
+    }
 
-        // A still-unique command line resolves via the fallback as before.
-        idx.register_launch("sbx-3", "s3", 33, "agent --unique");
-        let mut uniq = mk_event(998, "SandboxConfig");
-        uniq.props
-            .push(("commandLine".into(), "\"agent --unique\"".into()));
-        assert_eq!(idx.resolve(&uniq).as_deref(), Some("sbx-3"));
+    #[test]
+    fn retired_pid_is_not_used_before_sandbox_deletion() {
+        let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-1", "s1", 11);
+
+        let anchor = mk_event(11, "CreateProcessInSandbox");
+        assert_eq!(idx.resolve(&anchor).as_deref(), Some("sbx-1"));
+        idx.retire_launch("sbx-1", 11);
+
+        let mut stale = mk_event(11, "SandboxConfig");
+        stale
+            .props
+            .push(("commandLine".into(), "\"agent --run\"".into()));
+        assert!(
+            idx.resolve(&stale).is_none(),
+            "a completed wxc-exec PID and matching command text must not confer ownership"
+        );
+    }
+
+    #[test]
+    fn retired_strong_correlations_expire_after_late_event_window() {
+        let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-1", "s1", 11);
+
+        let mut anchor = mk_event(11, "CreateProcessInSandbox");
+        anchor.activity_id = GUID::from_u128(0xABCD);
+        assert_eq!(idx.resolve(&anchor).as_deref(), Some("sbx-1"));
+        idx.retire_launch("sbx-1", 11);
+
+        let mut late = mk_event(999, "SandboxConfig");
+        late.activity_id = anchor.activity_id;
+        assert_eq!(
+            idx.resolve(&late).as_deref(),
+            Some("sbx-1"),
+            "an established strong correlator should cover in-flight ETW records"
+        );
+
+        idx.retired_sandboxes.insert(
+            "sbx-1".into(),
+            Instant::now() - RETIRED_CORRELATION_TTL - Duration::from_millis(1),
+        );
+        assert!(
+            idx.resolve(&late).is_none(),
+            "strong correlators must stop conferring ownership after the late-event window"
+        );
     }
 
     // CodeRabbit (replay PID recycle): a buffered event whose only key is a PID
@@ -2090,11 +2199,32 @@ mod tests {
         let buffered_at = Instant::now() - Duration::from_secs(3);
 
         // PID 1000 is recycled and registered to a brand-new sandbox *now*.
-        idx.register_launch("sbx-new", "new", 1000, "agent");
+        idx.register_launch("sbx-new", "new", 1000);
 
         assert!(
             idx.resolve_replay(&ev, buffered_at).is_none(),
             "stale PID-only event must not bind to the recycled PID's new owner"
+        );
+    }
+
+    #[test]
+    fn quickly_recycled_pid_is_not_used_for_pre_registration_replay() {
+        let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-old", "old", 1000);
+        idx.retire_launch("sbx-old", 1000);
+
+        let buffered_at = Instant::now();
+        let ambiguous = mk_event(1000, "CreateProcessInSandbox");
+        idx.register_launch("sbx-new", "new", 1000);
+
+        assert!(
+            idx.resolve_replay(&ambiguous, buffered_at).is_none(),
+            "a retirement boundary makes pre-registration PID replay ambiguous"
+        );
+        assert_eq!(
+            idx.resolve(&ambiguous).as_deref(),
+            Some("sbx-new"),
+            "the new live PID registration remains authoritative"
         );
     }
 
@@ -2105,7 +2235,7 @@ mod tests {
         let mut idx = AttributionIndex::new();
         let ev = mk_event(1000, "CreateProcessInSandbox");
         let buffered_at = Instant::now();
-        idx.register_launch("sbx-1", "s1", 1000, "agent");
+        idx.register_launch("sbx-1", "s1", 1000);
         assert_eq!(
             idx.resolve_replay(&ev, buffered_at).as_deref(),
             Some("sbx-1"),
@@ -2113,23 +2243,17 @@ mod tests {
         );
     }
 
-    // Replay must not lean on the weak fallbacks (`by_cmd` / `last_pid_sid`):
-    // a buffered event whose only match is a command line is refused on replay
-    // (it would be resolved on the live path, but is too weak to trust after a
-    // buffering delay).
+    // Command text is not an authority key on the replay path either.
     #[test]
-    fn replay_ignores_weak_fallbacks() {
+    fn command_line_is_not_used_for_replay() {
         let mut idx = AttributionIndex::new();
-        idx.register_launch("sbx-1", "s1", 11, "agent --unique");
+        idx.register_launch("sbx-1", "s1", 11);
 
         let mut only_cmd = mk_event(999, "SandboxConfig");
         only_cmd
             .props
             .push(("commandLine".into(), "\"agent --unique\"".into()));
 
-        // Live path would resolve it via by_cmd...
-        // (not asserted here to avoid mutating cross-links)
-        // ...but the replay path refuses the weak command-line key.
         assert!(idx.resolve_replay(&only_cmd, Instant::now()).is_none());
     }
 }

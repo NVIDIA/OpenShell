@@ -796,11 +796,11 @@ async fn run_lifecycle(
         // `delete` cannot remove the sandbox after we register (which would leave
         // a stale key). The `wxc-exec` pid we just spawned is the collision-proof
         // anchor that ties the `Sandboxing` provider's events back to this
-        // `sandbox_id` (command line is a fallback matcher). No-op unless the ETW
-        // consumer is running.
+        // `sandbox_id` while the child is alive. Command text is never an
+        // attribution key. No-op unless the ETW consumer is running.
         if let Some(pid) = child.id() {
             if let Ok(mut idx) = attribution.lock() {
-                idx.register_launch(&sandbox_id, &sandbox_name, pid, &command_line);
+                idx.register_launch(&sandbox_id, &sandbox_name, pid);
             }
         }
 
@@ -810,6 +810,7 @@ async fn run_lifecycle(
         entry.monitor_task = Some(tokio::spawn(monitor_exec(
             registry.clone(),
             watch_tx.clone(),
+            attribution.clone(),
             sandbox.clone(),
             sandbox_id.clone(),
             cancel_rx,
@@ -822,13 +823,15 @@ async fn run_lifecycle(
 async fn monitor_exec(
     registry: Arc<Mutex<HashMap<String, SandboxEntry>>>,
     watch_tx: Arc<broadcast::Sender<WatchSandboxesEvent>>,
+    attribution: Arc<std::sync::Mutex<crate::etw_consumer::AttributionIndex>>,
     sandbox: DriverSandbox,
     sandbox_id: String,
     mut cancel_rx: watch::Receiver<bool>,
     mut child: tokio::process::Child,
 ) {
+    let wxc_pid = child.id();
     let status = tokio::select! {
-        status = child.wait() => status,
+        status = child.wait() => Some(status),
         changed = cancel_rx.changed() => {
             let should_kill = changed.is_ok() && *cancel_rx.borrow_and_update();
             if should_kill {
@@ -839,8 +842,21 @@ async fn monitor_exec(
                 // harmless and guarantees the OS process handle is reaped.
                 let _ = child.wait().await;
             }
-            return;
+            None
         }
+    };
+
+    // A Windows PID is authoritative only while the exact driver-owned child is
+    // alive. Retire it on every monitor exit path, including cancellation, before
+    // Windows can recycle it while the sandbox remains in the registry.
+    if let Some(pid) = wxc_pid
+        && let Ok(mut idx) = attribution.lock()
+    {
+        idx.retire_launch(&sandbox_id, pid);
+    }
+
+    let Some(status) = status else {
+        return;
     };
 
     match status {
@@ -1128,6 +1144,14 @@ mod lifecycle_tests {
         assert!(
             completed.is_some(),
             "sandbox should remain Ready=True (AgentCompleted) after a successful exec, never demote to Error"
+        );
+        assert!(
+            !backend
+                .attribution
+                .lock()
+                .unwrap()
+                .has_live_pid_for_sandbox("sb-pos"),
+            "the process monitor must retire the wxc-exec PID before publishing completion"
         );
     }
 

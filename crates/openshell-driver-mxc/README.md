@@ -72,6 +72,12 @@ blocking the ETW pump or growing gateway memory. The gateway emits an immediate
 warning identifying the audit coverage gap and rate-limits follow-up warnings
 to once every 30 seconds while overload continues.
 
+Audit attribution bootstraps only from the driver-owned `wxc-exec` PID while
+that child is alive; command text is never an ownership key. The process monitor
+retires the PID at exit. Identity, activity, and correlation-vector links learned
+from the live PID remain available for five seconds so already in-flight ETW
+records can arrive, then the consumer removes them.
+
 ## Prerequisites (live runs)
 
 - Windows 11 Insider build ≥ 26300.8553

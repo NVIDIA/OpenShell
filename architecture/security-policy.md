@@ -379,3 +379,7 @@ Never log secrets, credentials, bearer tokens, or query parameters in OCSF
 messages. OCSF JSONL output may be shipped to external systems.
 MXC ETW process events record executable identity but omit command-line
 arguments from both structured fields and messages.
+MXC ETW attribution never treats command text as ownership evidence. It uses the
+driver-owned `wxc-exec` PID only while that child is alive, then retains only
+established identity, activity, and correlation-vector links for a five-second
+late-event window.
