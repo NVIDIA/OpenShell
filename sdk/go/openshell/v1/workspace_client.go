@@ -54,11 +54,7 @@ func (w *workspaceClient) List(ctx context.Context, opts ...ListOptions) ([]*Wor
 		if opts[0].Limit < 0 {
 			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
 		}
-		if opts[0].Offset < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "offset must not be negative"}
-		}
 		req.Limit = uint32(opts[0].Limit)
-		req.Offset = uint32(opts[0].Offset)
 		req.LabelSelector = opts[0].LabelSelector
 	}
 
@@ -142,11 +138,7 @@ func (w *workspaceClient) ListMembers(ctx context.Context, workspace string, opt
 		if opts[0].Limit < 0 {
 			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
 		}
-		if opts[0].Offset < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "offset must not be negative"}
-		}
 		req.Limit = uint32(opts[0].Limit)
-		req.Offset = uint32(opts[0].Offset)
 	}
 
 	resp, err := w.client.ListWorkspaceMembers(ctx, req)
