@@ -261,8 +261,8 @@ across the restart.
 
 `openshell-binaries-contract`, `openshell-rpm-contract`, and
 `openshell-rpm-source` are internal composition roles used by the public source
-provisioners. They are listed for the runner's role resolution but are not
-normal `--provision` entry points.
+provisioners. They are available only as dependencies of public source roles,
+not as `--provision` entry points.
 
 Versioned plans under `nix/test-guest/conformance-plans/` bind conformance
 scenarios to the stable action-command contracts installed by provisioners.

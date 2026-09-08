@@ -34,6 +34,7 @@ if [ "${OPENSHELL_TEST_GUEST_RUNTIME:-}" != 1 ] ||
 	[ ! -d "${OPENSHELL_TEST_GUEST_DISTROS:-}" ] ||
 	[ ! -d "${OPENSHELL_TEST_GUEST_CONFIGURATIONS:-}" ] ||
 	[ ! -d "${OPENSHELL_TEST_GUEST_PROVISIONERS:-}" ] ||
+	[ ! -d "${OPENSHELL_TEST_GUEST_PUBLIC_PROVISIONERS:-}" ] ||
 	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_LIB:-}" ] ||
 	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_RUNNER:-}" ]; then
 	echo "run this script through 'nix run .#test-guest -- ...'" >&2
@@ -155,7 +156,7 @@ if [ "${list}" -eq 1 ]; then
 		printf '  %s\n' "${entry##*/}"
 	done
 	echo "Provisions:"
-	for entry in "${OPENSHELL_TEST_GUEST_PROVISIONERS}"/*; do
+	for entry in "${OPENSHELL_TEST_GUEST_PUBLIC_PROVISIONERS}"/*; do
 		if [ -d "${entry}" ]; then
 			printf '  %s\n' "${entry##*/}"
 		fi
@@ -199,7 +200,7 @@ openshell_source_count=0
 candidate_binaries_source_requested=false
 for item in "${provisions[@]}"; do
 	if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
-		[ ! -d "${OPENSHELL_TEST_GUEST_PROVISIONERS}/${item}" ]; then
+		[ ! -d "${OPENSHELL_TEST_GUEST_PUBLIC_PROVISIONERS}/${item}" ]; then
 		echo "unknown provisioner: ${item:-<empty>}" >&2
 		exit 2
 	fi

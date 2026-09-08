@@ -40,15 +40,20 @@ let
     "podman-rootless/ubuntu.yml"
   ];
 
-  provisionerRoles = [
+  publicProvisionerRoles = [
     "openshell-candidate-binaries-source"
-    "openshell-binaries-contract"
     "openshell-candidate-rpm-source"
-    "openshell-rpm-contract"
     "openshell-latest-release-rpm-source"
-    "openshell-rpm-source"
     "gateway-podman"
   ];
+
+  internalProvisionerRoles = [
+    "openshell-binaries-contract"
+    "openshell-rpm-contract"
+    "openshell-rpm-source"
+  ];
+
+  provisionerRoles = publicProvisionerRoles ++ internalProvisionerRoles;
 
   mkDistroProfile =
     name: distro:
@@ -85,6 +90,13 @@ let
     }) provisionerRoles
   );
 
+  publicProvisionerCatalog = pkgs.linkFarm "openshell-test-guest-public-provisioners" (
+    map (name: {
+      inherit name;
+      path = ./provisioners/roles/${name};
+    }) publicProvisionerRoles
+  );
+
   runtimeInputs = [
     qemu
     pkgs.python3Packages.ansible-core
@@ -105,6 +117,7 @@ let
     export OPENSHELL_TEST_GUEST_DISTROS=${distroCatalog}
     export OPENSHELL_TEST_GUEST_CONFIGURATIONS=${configurationCatalog}
     export OPENSHELL_TEST_GUEST_PROVISIONERS=${provisionerCatalog}
+    export OPENSHELL_TEST_GUEST_PUBLIC_PROVISIONERS=${publicProvisionerCatalog}
     export OPENSHELL_TEST_GUEST_CACHE_LIB=${./cache-lib.sh}
     export OPENSHELL_TEST_GUEST_CACHE_RUNNER=${./cache.sh}
     export OPENSHELL_TEST_GUEST_CACHE_SEAL=${./cache-seal.sh}
