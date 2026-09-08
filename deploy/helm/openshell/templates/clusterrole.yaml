@@ -72,6 +72,7 @@ rules:
       - pods
     verbs:
       - get
+      - patch
   {{- end }}
   {{- $copiedSecretNames := list }}
   {{- if and (ne $workspaceMode "shared") (not .Values.server.disableTls) }}
@@ -83,6 +84,23 @@ rules:
   {{- $copiedSecretNames = append $copiedSecretNames .name }}
   {{- end }}
   {{- end }}
+  {{- end }}
+  {{- if ne $workspaceMode "shared" }}
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "delete", "get", "list", "patch", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "delete", "get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "delete", "get", "list"]
   {{- end }}
   {{- $copiedSecretNames = uniq $copiedSecretNames }}
   {{- if $copiedSecretNames }}

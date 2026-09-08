@@ -131,19 +131,12 @@ impl MainProcessConfig {
 /// Deployment-controlled telemetry toggle propagated to the sandbox supervisor.
 pub const TELEMETRY_ENABLED: &str = "OPENSHELL_TELEMETRY_ENABLED";
 
-/// Supervisor pod/runtime topology. Kubernetes sidecar mode sets this to
-/// `"sidecar"`; the default combined supervisor path omits it.
-pub const SUPERVISOR_TOPOLOGY: &str = "OPENSHELL_SUPERVISOR_TOPOLOGY";
-
 /// The isolation backend admitted by the deployment configuration (RFC 0012).
 ///
 /// Delivered on a channel separate from the topology descriptor so descriptor
 /// verification against the admitted backend is not self-referential. Required
 /// whenever a topology descriptor is supplied.
 pub const ADMITTED_ISOLATION_BACKEND: &str = "OPENSHELL_ADMITTED_ISOLATION_BACKEND";
-
-/// Network enforcement backend selected by the compute driver.
-pub const NETWORK_ENFORCEMENT_MODE: &str = "OPENSHELL_NETWORK_ENFORCEMENT_MODE";
 
 /// Comma-separated runtime networking capabilities supplied by the compute
 /// driver. Capabilities describe substrate the shared supervisor may activate;
@@ -152,20 +145,6 @@ pub const NETWORK_RUNTIME_CAPABILITIES: &str = "OPENSHELL_NETWORK_RUNTIME_CAPABI
 
 /// Driver capability for policy-gated DNS and transparent TCP interception.
 pub const POLICY_DNS_TRANSPARENT_TCP_CAPABILITY: &str = "policy-dns-transparent-tcp";
-
-/// Whether network policy evaluation must bind requests to the peer binary.
-///
-/// The default when unset is `"required"`. Kubernetes sidecar experiments may
-/// set this to `"relaxed"` to enforce endpoint and L7 policy without per-binary
-/// `/proc` identity binding.
-pub const NETWORK_BINARY_IDENTITY: &str = "OPENSHELL_NETWORK_BINARY_IDENTITY";
-
-/// Unix socket used by Kubernetes sidecar topology for local coordination.
-///
-/// The network sidecar owns gateway credentials and serves policy/provider
-/// state over this socket instead of exposing gateway credentials to the agent
-/// container.
-pub const SIDECAR_CONTROL_SOCKET: &str = "OPENSHELL_SIDECAR_CONTROL_SOCKET";
 
 /// Optional TLS server name override used when connecting to the gateway.
 pub const GATEWAY_TLS_SERVER_NAME: &str = "OPENSHELL_GATEWAY_TLS_SERVER_NAME";
