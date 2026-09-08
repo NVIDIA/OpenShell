@@ -7,14 +7,13 @@
 //! transport so one busy connection cannot head-of-line block another.
 
 use std::io;
-use std::net::SocketAddr;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::boundary_protocol::{BinaryIdentityWire, MediationTimingWire};
-use crate::contract::{DnsTransport, NetworkSocketMetadata};
+use crate::contract::DnsTransport;
 
 const HEADER_BYTES: usize = 13;
 const MAX_METADATA_BYTES: usize = 256 * 1024;
@@ -23,13 +22,8 @@ const MAX_FRAME_BYTES: usize = MAX_METADATA_BYTES;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MediationFrameKind {
-    NetworkOpen = 1,
-    NetworkDecision = 2,
-    NetworkData = 3,
-    StreamClosed = 4,
     DnsQuery = 5,
     DnsResponse = 6,
-    NetworkEof = 7,
 }
 
 impl TryFrom<u8> for MediationFrameKind {
@@ -37,13 +31,8 @@ impl TryFrom<u8> for MediationFrameKind {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            1 => Ok(Self::NetworkOpen),
-            2 => Ok(Self::NetworkDecision),
-            3 => Ok(Self::NetworkData),
-            4 => Ok(Self::StreamClosed),
             5 => Ok(Self::DnsQuery),
             6 => Ok(Self::DnsResponse),
-            7 => Ok(Self::NetworkEof),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown mediation frame kind {value}"),
@@ -57,15 +46,6 @@ pub struct MediationFrame {
     pub kind: MediationFrameKind,
     pub stream_id: u64,
     pub payload: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct NetworkOpenWire {
-    pub identity: BinaryIdentityWire,
-    pub destination: SocketAddr,
-    pub socket: NetworkSocketMetadata,
-    pub policy_generation: u64,
-    pub timing: MediationTimingWire,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -125,8 +105,16 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
     }
     reader.read_exact(&mut header[1..]).await?;
     let kind = MediationFrameKind::try_from(header[0])?;
-    let stream_id = u64::from_be_bytes(header[1..9].try_into().expect("fixed header"));
-    let length = u32::from_be_bytes(header[9..13].try_into().expect("fixed header")) as usize;
+    let stream_id = u64::from_be_bytes(
+        header[1..9]
+            .try_into()
+            .map_err(|_| io::Error::other("invalid stream ID header"))?,
+    );
+    let length = u32::from_be_bytes(
+        header[9..13]
+            .try_into()
+            .map_err(|_| io::Error::other("invalid payload length header"))?,
+    ) as usize;
     if length > MAX_FRAME_BYTES.max(MAX_METADATA_BYTES) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -152,7 +140,7 @@ mod tests {
         let send = tokio::spawn(async move {
             write_frame(
                 &mut writer,
-                MediationFrameKind::NetworkData,
+                MediationFrameKind::DnsResponse,
                 42,
                 &[0, 1, 2, 255],
             )
@@ -160,7 +148,7 @@ mod tests {
             .unwrap();
         });
         let frame = read_frame(&mut reader).await.unwrap().unwrap();
-        assert_eq!(frame.kind, MediationFrameKind::NetworkData);
+        assert_eq!(frame.kind, MediationFrameKind::DnsResponse);
         assert_eq!(frame.stream_id, 42);
         assert_eq!(frame.payload, vec![0, 1, 2, 255]);
         send.await.unwrap();

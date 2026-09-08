@@ -13,7 +13,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
 use rustix::fs::fstat;
 
-use super::proc_fd;
+use crate::linux::proc_fd;
 
 /// Stable identity for one mediated socket within a listener generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

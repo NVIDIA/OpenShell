@@ -37,10 +37,6 @@ pub const STREAM_EXIT: u8 = 3;
 pub const STREAM_STDIN_CLOSED: u8 = 4;
 /// Supervisor decision for a staged seccomp-mediated TCP open.
 pub const STREAM_NETWORK_DECISION: u8 = 5;
-/// Supervisor response for one sandbox-local DNS relay exchange.
-pub const STREAM_DNS_RESPONSE: u8 = 6;
-/// Boundary acknowledgement that a mediated DNS response was committed.
-pub const STREAM_DNS_ACK: u8 = 7;
 pub const MAX_STREAM_FRAME_BYTES: usize = 64 * 1024;
 /// Control-side endpoint for a driver-provisioned boundary.
 /// Supervisor-side mutual-TLS identity for one sandbox generation.
@@ -202,8 +198,6 @@ pub struct BoundaryTopology {
     pub workload_identity: crate::contract::ResolvedWorkloadIdentity,
     /// Driver-provisioned control endpoint.
     pub transport: BoundaryTransport,
-    /// Multiplex logical exchanges over one authenticated gRPC connection.
-    pub multiplexed: bool,
     /// Trusted dial target for well-known host-gateway aliases, when the
     /// network supervisor cannot use the boundary's resolver view.
     #[serde(default)]
@@ -226,7 +220,6 @@ impl fmt::Debug for BoundaryTopology {
             .field("generation", &self.generation)
             .field("session_epoch", &"<redacted>")
             .field("transport", &self.transport)
-            .field("multiplexed", &self.multiplexed)
             .field("host_gateway_ip", &self.host_gateway_ip)
             .field("resource_claims", &self.resource_claims)
             .field("driver_fence", &self.driver_fence)
@@ -265,8 +258,6 @@ pub struct BoundaryConfig {
     pub bootstrap_token: String,
     /// Driver-provisioned listener.
     pub listener: BoundaryListener,
-    /// Serve the protected protocol as multiplexed gRPC streams.
-    pub multiplexed: bool,
     /// Immutable coordinates the boundary requires from the control-side
     /// topology descriptor before accepting attachment.
     #[serde(default)]
@@ -298,7 +289,6 @@ impl fmt::Debug for BoundaryConfig {
             .field("session_epoch", &"<redacted>")
             .field("bootstrap_token", &"<redacted>")
             .field("listener", &self.listener)
-            .field("multiplexed", &self.multiplexed)
             .field("resource_claims", &self.resource_claims)
             .field("resource_claim_files", &self.resource_claim_files)
             .field("workload_identity", &self.workload_identity)
@@ -501,7 +491,6 @@ pub enum Request {
     /// plane.
     OpenMediation,
     AcceptNetwork,
-    AcceptDns,
 }
 
 impl Request {
@@ -610,7 +599,6 @@ impl fmt::Debug for Request {
                 .finish(),
             Self::OpenMediation => formatter.write_str("OpenMediation"),
             Self::AcceptNetwork => formatter.write_str("AcceptNetwork"),
-            Self::AcceptDns => formatter.write_str("AcceptDns"),
         }
     }
 }
@@ -658,12 +646,6 @@ pub enum Response {
         destination: std::net::SocketAddr,
         socket: crate::contract::NetworkSocketMetadata,
         policy_generation: u64,
-        timing: MediationTimingWire,
-    },
-    DnsQuery {
-        request: Vec<u8>,
-        transport: crate::contract::DnsTransport,
-        identity: BinaryIdentityWire,
         timing: MediationTimingWire,
     },
     Error {
