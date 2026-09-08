@@ -23,7 +23,7 @@ set -euo pipefail
 # `defaults-without-telemetry`.
 CRATES=(
   openshell-gateway
-  openshell-sandbox
+  openshell-supervisor
   openshell-driver-vm
 )
 

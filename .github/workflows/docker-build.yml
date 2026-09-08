@@ -12,6 +12,10 @@ on:
       binary:
         required: true
         type: string
+      additional-binary:
+        required: false
+        type: string
+        default: ""
       target-suffix:
         required: true
         type: string
@@ -54,6 +58,7 @@ jobs:
         with:
           component: ${{ inputs.component }}
           binary: ${{ inputs.binary }}
+          additional-binary: ${{ inputs['additional-binary'] }}
           triple: ${{ matrix.rust_arch }}-${{ inputs['target-suffix'] }}
           arch: ${{ matrix.arch }}
           platform: ${{ matrix.platform }}
