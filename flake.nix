@@ -105,6 +105,9 @@
           cross-aarch64-linux-musl = import ./nix/devShells/cross-aarch64-linux-musl.nix {
             inherit pkgs rust-overlay commonDevShellPackages;
           };
+          cross-aarch64-linux-gnu = import ./nix/devShells/cross-aarch64-linux-gnu.nix {
+            inherit pkgs rust-overlay commonDevShellPackages;
+          };
         }
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           glibc-2-28 = import ./nix/devShells/glibc-2-28.nix {
@@ -124,5 +127,6 @@
       # Cross-shell names describe the Linux target, rather than the Darwin
       # execution platform that runs their toolchains.
       crossShells.aarch64-darwin.aarch64-linux.musl = perSystem.devShells.aarch64-darwin.cross-aarch64-linux-musl;
+      crossShells.aarch64-darwin.aarch64-linux.gnu = perSystem.devShells.aarch64-darwin.cross-aarch64-linux-gnu;
     };
 }

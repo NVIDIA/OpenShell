@@ -88,6 +88,12 @@ ELF binary is intended for a Linux guest VM; this shell is not a Linux runtime
 environment and does not replace `devShells.aarch64-linux.musl`, which remains
 the native Linux shell used in ARM64 Linux CI.
 
+`nix develop .#crossShells.aarch64-darwin.aarch64-linux.gnu` provides the
+corresponding gateway shell. Its Cargo shim uses Zig's glibc 2.28 target while
+Cargo writes artifacts beneath `target/aarch64-unknown-linux-gnu/`. It supplies
+a Nix-built static ARM64 Z3 library, matching the default-feature gateway CI
+build without enabling `bundled-z3`.
+
 OpenShell uses different Linux libc environments for different host artifacts.
 The standalone `openshell` CLI is built as a static musl binary so it can run on
 a wide range of Linux distributions without depending on the host's glibc. Host
