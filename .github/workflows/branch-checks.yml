@@ -153,6 +153,10 @@ jobs:
           cache-bin: "false"
           cmd-format: nix develop .#devShells.${{ matrix.system }}.default -c {0}
 
+      - name: Verify Cargo lockfiles
+        if: matrix.system == 'x86_64-linux'
+        run: tasks/scripts/check-cargo-lockfiles.sh
+
       - name: Format
         run: |
           cargo fmt --all -- --check
@@ -162,10 +166,10 @@ jobs:
 
       - name: Lint
         run: |
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo clippy --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings
-          cargo check --manifest-path examples/governance-interceptor/Cargo.toml --all-targets
-          cargo check --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings
+          cargo check --locked --manifest-path examples/governance-interceptor/Cargo.toml --all-targets
+          cargo check --locked --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets
 
       - name: Test
         env:
