@@ -61,6 +61,7 @@ jobs:
             flake.nix
             flake.lock
             tasks/scripts/trivy-scan.sh
+            tasks/scripts/trivy-scan-test.sh
             .github/workflows/trivy-changes.yml
 
   scan:
@@ -92,10 +93,27 @@ jobs:
       - name: Set up Nix
         uses: ./.github/actions/setup-nix
 
+      - name: Test report comparison
+        run: tasks/scripts/trivy-scan-test.sh
+
+      - name: Validate candidate ignore policy
+        run: tasks/scripts/trivy-scan.sh validate-ignore
+
+      # Ignore-policy changes take effect only after merge. Applying the
+      # baseline policy to both scans prevents a candidate from exempting a new
+      # finding in the same change that introduces it.
+      - name: Prepare baseline ignore policy
+        run: |
+          if [ -f .trivy-base/.trivyignore.yaml ]; then
+            cp .trivy-base/.trivyignore.yaml "$RUNNER_TEMP/trivy-baseline-ignore.yaml"
+          else
+            printf 'misconfigurations: []\n' >"$RUNNER_TEMP/trivy-baseline-ignore.yaml"
+          fi
+
       - name: Scan baseline
         env:
           TRIVY_SOURCE_ROOT: ${{ github.workspace }}/.trivy-base
-          TRIVY_IGNORE_FILE: ${{ github.workspace }}/.trivyignore.yaml
+          TRIVY_IGNORE_FILE: ${{ runner.temp }}/trivy-baseline-ignore.yaml
           TRIVY_REPORT_DIR: ${{ runner.temp }}/trivy-base
         run: |
           mkdir -p "$TRIVY_REPORT_DIR"
@@ -103,6 +121,7 @@ jobs:
 
       - name: Scan candidate
         env:
+          TRIVY_IGNORE_FILE: ${{ runner.temp }}/trivy-baseline-ignore.yaml
           TRIVY_REPORT_DIR: ${{ runner.temp }}/trivy-head
         run: |
           mkdir -p "$TRIVY_REPORT_DIR"

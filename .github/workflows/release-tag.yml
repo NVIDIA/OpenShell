@@ -747,28 +747,6 @@ jobs:
           app-version: ${{ needs.compute-versions.outputs.semver }}
           release-kind: public
 
-  # Scans what this run published, so it can only follow publication and cannot
-  # gate it. Findings stay informational; a scanner that cannot run still fails.
-  # SARIF upload is off here because the run's ref is a tag: Code Scanning keys
-  # alerts by ref, and Release Dev already publishes them against main. The
-  # scope is still granted because the called jobs declare it unconditionally.
-  scan-released-artifacts:
-    needs: [compute-versions, release-helm]
-    permissions:
-      contents: read
-      packages: read
-      security-events: write
-    uses: ./.github/workflows/trivy-scan.yml
-    with:
-      upload-sarif: false
-      images: |
-        ghcr.io/nvidia/openshell/gateway:${{ needs.compute-versions.outputs.semver }}
-        ghcr.io/nvidia/openshell/supervisor:${{ needs.compute-versions.outputs.semver }}
-      charts: |
-        oci://ghcr.io/nvidia/openshell/helm-chart:${{ needs.compute-versions.outputs.semver }}
-        oci://ghcr.io/nvidia/openshell/openshell-workspace:${{ needs.compute-versions.outputs.semver }}
-    secrets: inherit
-
   trigger-wheel-publish:
     name: Trigger Wheel Publish
     needs: [compute-versions, release]

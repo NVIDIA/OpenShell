@@ -83,64 +83,23 @@ nix develop --command zizmor --offline --persona=regular --min-severity=high --n
 
 ## Artifact scanning
 
-`Trivy Scan` differs from the reports above in what it looks at rather than in
-how it reports: it scans what a release publishes instead of what a change
-contains — the final container images, the Helm charts, the final image
-Dockerfiles, and the raw Kubernetes manifests. Nix provides Trivy and Helm, and
-the jobs run on GitHub-hosted runners like the other scanners.
+`Trivy Scan` is a self-contained `workflow_dispatch`/`workflow_call` step. It
+always scans deployment configuration and optionally scans supplied OCI image
+and chart references. It is not wired into a release workflow; a future analysis
+orchestrator can call it directly.
 
-Findings are informational for now, while we learn what the scanner reports in
-practice. They raise a warning and the run stays green; a scanner that cannot
-run still fails, so a broken scan cannot look clean. The `fail-on-findings`
-input flips that to a hard failure once the findings have been worked through.
+The single job scans `deploy/`, every Helm CI values fixture, requested packaged
+charts, and both Linux architectures of each requested image. Findings are
+informational by default, but scanner failures still fail the job and
+`fail-on-findings` enables enforcement. Reports retain every severity; the gate
+uses `HIGH,CRITICAL` by default. Each SARIF report has a unique automation ID so
+the report directory can be uploaded in one operation.
 
-The workflow is reusable and takes OCI references as input, so it knows nothing
-about how a release is assembled. `HIGH` and `CRITICAL` are what get reported as
-findings; everything below is listed without comment. Image scanning
-additionally ignores vulnerabilities with no upstream fix, because a base-image
-CVE without a patch would otherwise be permanent noise. That option does not
-apply to misconfigurations.
+`.trivyignore.yaml` is reserved for false positives. Every entry must use at
+least one `**/<concrete-basename>` path; `yq` and `jq` validate this structure
+before scanning.
 
-`release-dev.yml` and `release-tag.yml` both call it once publication has
-finished, passing the images and the two charts that run published. Because it
-scans published artifacts, it can only follow publication and never gates it —
-no release waits on the result. Release Dev uploads SARIF against `main`; the
-tag release keeps reports as artifacts only, since Code Scanning keys alerts by
-ref and a tag ref would duplicate what `main` already shows. Findings remain
-informational there too: with four checks reporting today, `fail-on-findings`
-would break every release, so flipping it stays a separate change.
-
-The configuration scan targets `deploy/` in one pass, which covers both charts,
-the published Dockerfiles and the raw manifests. The macOS Dockerfiles export a
-binary from `FROM scratch` and the CI image is toolchain rather than a release
-artifact, so both are skipped.
-
-Chart coverage additionally depends on value combinations. The chart defaults
-render 10 of the chart's 19 templates, while some conditional resources only
-render with overrides stored under `deploy/helm/openshell/ci/values-*.yaml`.
-The scan exercises each of these CI fixtures to cover resources such as the
-high-availability Deployment, Gateway API objects, OpenShift Route, and broader
-workspace-mode ClusterRole. These fixtures are test inputs, not a set of
-separately supported product profiles.
-
-Exceptions live in `.trivyignore.yaml`, one justification per entry. Trivy
-auto-loads a plain `.trivyignore` but not the YAML variant, so the scripts pass
-`--ignorefile` explicitly. An entry qualifies only when the finding is wrong:
-the condition it reports is not true of this repository, or it is an artifact of
-how the scan renders the chart. Hardening we have not done and risks we have
-accepted stay in the report, where they can be seen and argued about, even when
-that means the gate fails.
-
-Four checks report today: `KSV-0014` (`readOnlyRootFilesystem` unset on the
-gateway container), `KSV-0041` and `KSV-0056` (RBAC grants the managed workspace
-mode needs and that RBAC cannot express more narrowly), and `DS-0002` (the
-supervisor image runs as root by design). Resolving or consciously accepting
-each of those is what has to happen before `fail-on-findings` is worth turning
-on.
-
-Scans write full-severity reports and never fail on findings, so a report is
-always available to upload; a separate `gate` step re-reads them and applies the
-threshold. Run them locally with:
+Run the scanner locally with:
 
 ```shell
 nix develop --command tasks/scripts/trivy-scan.sh config
@@ -150,17 +109,15 @@ nix develop --command tasks/scripts/trivy-scan.sh gate
 
 ### Pull-request change gate
 
-`Trivy Changes` runs directly on pull requests and merge groups. It detects
-changes to Helm charts, release Dockerfiles, the raw Kubernetes manifests, and
-the Trivy tooling — deletions included — then scans both the base revision and
-the candidate with the same scanner logic. The check
-fails only when the candidate introduces a new `HIGH` or `CRITICAL`
-misconfiguration, so existing findings do not block unrelated work. Reports
-from both revisions are retained as workflow artifacts.
+`Trivy Changes` scans the base and candidate when a pull request or merge group
+changes deployment configuration or scanner inputs. It fails only for new
+`HIGH` or `CRITICAL` misconfigurations and retains both report sets.
 
-This check analyzes Helm and Dockerfile configuration. It does not build
-container images, so package and operating-system CVEs remain the responsibility
-of the release-artifact image scan.
+The candidate ignore file is validated, but the baseline policy applies to both
+scans so a change cannot exempt its own finding. Existing profiles are compared
+independently; a new profile reuses the maximum known occurrence count. Invalid
+Trivy reports fail closed. Image package and operating-system CVEs remain the
+responsibility of the standalone scan.
 
 ## Commit signing
 
@@ -292,7 +249,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/workflows/codeql.yml` | Runs nightly informational CodeQL analysis on `main` for Rust and the Go, Python, and TypeScript SDKs and retains SARIF artifacts. |
 | `.github/workflows/codex-security.yml` | Scans the cumulative diff from the previous stable release to each pre-release candidate and publishes train-scoped SARIF on `main`. |
 | `.github/workflows/trivy-changes.yml` | Blocks pull requests and merge groups that introduce new High or Critical Helm or Dockerfile misconfigurations. |
-| `.github/workflows/trivy-scan.yml` | Reusable scan of published container images and deployment configuration. Findings are informational by default and can be configured to fail the workflow. |
+| `.github/workflows/trivy-scan.yml` | Manual or reusable scan of supplied OCI image/chart references and deployment configuration. Findings are informational by default and can be configured to fail the workflow. |
 
 ## Release workflows
 

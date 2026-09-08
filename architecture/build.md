@@ -441,108 +441,47 @@ implemented yet.
 
 ## Artifact Scanning
 
-Trivy runs in two places: a reusable release-artifact workflow and a
-pull-request change gate.
+Two entry points share `tasks/scripts/trivy-scan.sh`: a standalone analysis
+workflow and a pull-request change gate. Nix supplies Trivy, Helm and `yq`.
 
-### Release Artifacts
+### Standalone Scan
 
-`.github/workflows/trivy-scan.yml` is reusable and takes OCI references as
-input, so it has no knowledge of how a release is assembled. Nix supplies both
-Trivy and Helm, and the jobs stay on GitHub-hosted runners like the other
-scanners.
+`.github/workflows/trivy-scan.yml` runs only from `workflow_dispatch` or
+`workflow_call` and takes OCI references as inputs, so it knows nothing about
+how an artifact was assembled or published. Neither release workflow calls it
+and no publication job depends on it; the intended consumer is a later
+analysis-orchestration workflow.
 
-Both release workflows call it after their Helm publication step, passing the
-images and every chart that run published. Scanning published artifacts means it
-can only follow publication, so it reports on a release rather than gating one:
-no publication job depends on the result. Findings stay informational while four
-checks report, because `fail-on-findings` would otherwise break every release.
+A single job, `OpenShell / Trivy (informational)`, always scans the deployment
+configuration in its own checkout and adds OCI images and packaged charts when
+the caller supplies references. Trivy defaults to the runner's platform, so each
+platform of a multi-arch tag is scanned separately, and packaged charts need
+`helm pull` because Trivy has no OCI artifact target. Findings only warn, while
+a scanner that cannot run fails the job; `fail-on-findings` makes them fatal.
 
-Findings are informational during the observation phase: they warn and the run
-stays green, while a scanner that cannot run still fails. The `fail-on-findings`
-input turns them into failures, which is a prerequisite for wiring the workflow
-into a release `needs:` rather than something to do at the same time.
-
-Two scopes, with deliberately different reporting semantics:
-
-- **Images.** `HIGH` and `CRITICAL` are reported, and vulnerabilities with no
-  upstream fix are ignored. Without that exclusion a base-image CVE with no
-  available patch would be permanent noise, and a gate nobody can act on once
-  findings start failing. Published tags are multi-arch indexes and Trivy
-  defaults to the runner's own platform, so each architecture is scanned
-  separately.
-- **Configuration.** The same severity threshold, but the unfixed exclusion does not
-  apply to misconfigurations. One pass over `deploy/` covers both charts, the
-  published Dockerfiles and the raw manifests. Coverage then depends on value
-  combinations: the chart defaults render 10 of the chart's 19 templates, so
-  CI value fixtures exercise conditional resources such as the high-availability
-  Deployment, Gateway API objects, OpenShift Route, and broader workspace-mode
-  ClusterRole. Each fixture is scanned on its own, and each packaged chart is
-  scanned from its published OCI reference to cover the artifacts consumers
-  actually install.
-
-Trivy has no OCI artifact target, and `trivy image` rejects the Helm config media
-type, so a packaged chart has to be fetched with `helm pull` before it can be
-scanned. Trivy reports locations relative to the scanned target, so
-`tasks/scripts/trivy-scan.sh` rewrites SARIF URIs to repository-relative paths;
-without that, Code Scanning resolves alerts against files that do not exist. The
-prefix comes from whichever chart declares the published name rather than from a
-fixed directory, because a chart's published name is not its directory name and
-the two charts share template filenames: a hardcoded prefix would report
-`openshell-workspace` alerts against the gateway chart's `role.yaml`. That
-rewrite and the profile loop are the only repository-specific logic: severity
-filtering, the pass/fail decision and the summary table all come from
-`trivy convert --exit-code`, so nothing reimplements counting.
-
-`.trivyignore.yaml` holds exceptions, and the bar for adding one is that the
-finding is wrong: the condition it reports is not true of this repository, or it
-is an artifact of how the scan renders the chart. Hardening that has not been
-done and risks that have been accepted stay in the report instead, so the
-scanner keeps describing the real posture rather than a curated one. Trivy
-auto-loads a plain `.trivyignore` but not the YAML variant, so the scripts pass
-`--ignorefile` explicitly.
-
-That bar means four checks report today: `KSV-0014`, `KSV-0041`, `KSV-0056` and
-`DS-0002`. Reports are written before findings are evaluated, so a warning or a
-failure still publishes SARIF and artifacts. Introducing the tooling and settling
-its findings are separate changes, in that order.
+The whole report directory uploads to Code Scanning in one operation, so each
+report carries a unique `automationDetails.id`, and SARIF URIs — which Trivy
+emits relative to the scanned target — are rewritten to repository-relative
+paths. Exceptions live in `.trivyignore.yaml`, passed with `--ignorefile`, and
+must use `**/<concrete-basename>` paths, the only shape both scan targets
+report; `validate-ignore` checks that structurally with `yq` and `jq`.
 
 ### Pull-Request Change Gate
 
-`.github/workflows/trivy-changes.yml` gates changes rather than releases. It
-runs on `pull_request` and `merge_group`; `workflow_dispatch` takes explicit
-base and head SHAs for diagnostics. A detection job decides whether the change
-touches `deploy/docker/**`, `deploy/helm/**`, `deploy/kube/**`, or the scanner
-inputs themselves (`.trivyignore.yaml`, `flake.nix`, `flake.lock`,
-`tasks/scripts/trivy-scan.sh`, and the workflow file); the watched paths track
-what the scan covers, so a change to the raw manifests cannot land unscanned.
-Detection counts deletions and treats a failed diff as a
-failure, so removing the scanner, a value fixture, or the ignore file cannot skip
-the scan behind a passing status.
+`.github/workflows/trivy-changes.yml` runs on `pull_request` and `merge_group`;
+`workflow_dispatch` takes explicit base and head SHAs. It scans the baseline and
+candidate trees with the candidate's scanner and fails only on newly introduced
+`HIGH` or `CRITICAL` misconfigurations, behind a stable
+`OpenShell / Trivy Changes` status that succeeds when nothing relevant changed,
+so the check can be required unconditionally. It builds no image, so image CVEs
+need the standalone scan. Three invariants:
 
-When it does, the scan job checks out both the baseline and the candidate and
-runs the candidate's `trivy-scan.sh config` over each tree with the candidate's
-`.trivyignore.yaml`, so a scanner or ignore-policy change is judged by its own
-rules on both sides. `gate-config-diff` then compares semantic finding
-identities — rule ID, target, namespace, message, and cause
-provider/service/resource — together with how many times each occurs. Line
-numbers stay out of the identity so that edits which merely move a finding do not
-look new, and the count stops a second offending block from hiding behind an
-identity the baseline already reports: `KSV-0041` covers two rules of the
-workspace-mode ClusterRole today, so a third fails. Counts are taken per report
-and reduced with `max`, never summed, so a new value fixture rendering the same
-templates adds no debt. The four findings above therefore keep reporting without
-blocking every pull request, while a newly introduced `HIGH` or `CRITICAL`
-misconfiguration fails the check. Both report sets are uploaded as workflow
-artifacts.
-
-The `result` job publishes a stable `OpenShell / Trivy Changes` status that
-succeeds when no relevant files changed, so the check can be required
-unconditionally.
-
-This gate scans Helm and Dockerfile configuration only. It builds no image, so
-it cannot detect OS or package CVEs in the image a change would produce.
-Final-image vulnerability scanning stays with the release-artifact workflow
-above.
+- A structurally invalid Trivy report is an error, not an empty finding set.
+- Findings compare per profile against the same baseline profile, by semantic
+  identity and count rather than line number; a profile absent from the baseline
+  falls back to that identity's maximum across all profiles.
+- The candidate's ignore file is validated, but the baseline's policy applies to
+  both scans, so an exemption takes effect only after merge.
 
 See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
 

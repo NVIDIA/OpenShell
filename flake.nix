@@ -61,6 +61,7 @@
           syft
           trivy
           uv
+          yq-go
           zizmor
           zstd
         ];

@@ -5,24 +5,8 @@
 
 set -euo pipefail
 
-# Scan release artifacts with Trivy.
-#
-#   trivy-scan.sh config [--chart-ref <oci-ref>]...
-#   trivy-scan.sh images <image-ref> [<image-ref>...]
-#   trivy-scan.sh gate
-#   trivy-scan.sh gate-config-diff <baseline-reports> <candidate-reports>
-#
 # `config` and `images` write full-severity reports and never fail on findings,
-# so a report is always available to upload. `gate` then re-reads those reports
-# and fails if any finding reaches TRIVY_SEVERITY.
-#
-# Environment:
-#   TRIVY_SEVERITY        severities that fail `gate` (default HIGH,CRITICAL)
-#   TRIVY_IGNORE_UNFIXED  skip image vulnerabilities with no fix (default true)
-#   TRIVY_PLATFORMS       image platforms (default "linux/amd64 linux/arm64")
-#   TRIVY_REPORT_DIR      output directory (default reports/trivy)
-#   TRIVY_SOURCE_ROOT     source tree to scan (default repository root)
-#   TRIVY_IGNORE_FILE     ignore file to apply (default repository copy)
+# then `gate` applies TRIVY_SEVERITY (default HIGH,CRITICAL).
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SOURCE_ROOT="${TRIVY_SOURCE_ROOT:-${REPO_ROOT}}"
@@ -34,20 +18,50 @@ REPORT_DIR="${TRIVY_REPORT_DIR:-reports/trivy}"
 IGNORE_UNFIXED="${TRIVY_IGNORE_UNFIXED:-true}"
 PLATFORMS="${TRIVY_PLATFORMS:-linux/amd64 linux/arm64}"
 
-# Rendering the chart outside a cluster cannot satisfy the Agent Sandbox API
-# discovery check, and that template calls `fail`.
+# Disable cluster discovery while rendering charts offline.
 PREFLIGHT_OFF=(--helm-set agentSandbox.preflight.enabled=false)
 
-# These Dockerfiles produce no runnable image: the macOS ones export a binary
-# from `FROM scratch`, and the CI image is toolchain, not a release artifact.
+# These Dockerfiles do not produce release runtime images.
 SKIP_DOCKERFILES=(
   --skip-files 'deploy/docker/Dockerfile.ci'
   --skip-files 'deploy/docker/Dockerfile.*-macos'
 )
 
-# Run one scan. Reports keep every severity; `gate` applies the threshold.
-# `prefix` is prepended to SARIF locations, which Trivy reports relative to the
-# scanned target while Code Scanning resolves them from the repository root.
+# Reject ignore entries broader than one concrete basename.
+validate_ignore_file() {
+  [ -f "${IGNORE_FILE}" ] || {
+    echo "Error: Trivy ignore file not found: ${IGNORE_FILE}" >&2
+    return 2
+  }
+
+  command -v yq >/dev/null || {
+    echo "Error: yq not on PATH; run inside 'nix develop'" >&2
+    return 2
+  }
+  if ! yq --output-format json '.' "${IGNORE_FILE}" |
+    jq -e '
+      (.misconfigurations // []) as $entries
+      | (($entries | type) == "array")
+        and all($entries[];
+          . as $entry
+          | (($entry.id | type) == "string")
+            and (($entry.paths | type) == "array")
+            and (($entry.paths | length) > 0)
+            and all($entry.paths[];
+              . as $path
+              | (($path | type) == "string")
+                and ($path | startswith("**/"))
+                and (($path | ltrimstr("**/") | length) > 0)
+                and (($path | ltrimstr("**/") | test("[/*?\\[\\]]")) | not)
+            )
+        )
+    ' >/dev/null; then
+    echo "Error: every Trivy ignore must use at least one '**/<concrete-basename>' path" >&2
+    return 2
+  fi
+}
+
+# Run one scan and normalize its SARIF metadata and repository path.
 scan() {
   local subcommand=$1 slug=$2 prefix=$3
   shift 3
@@ -60,24 +74,23 @@ scan() {
     --format sarif --output "${REPORT_DIR}/${slug}.sarif" \
     "${REPORT_DIR}/${slug}.json"
 
-  if [ -n "${prefix}" ]; then
-    jq --arg p "${prefix}" '
-      (.. | objects | select(has("artifactLocation")) | .artifactLocation.uri)
-        |= $p + (. | sub("^[^:]*\\.tgz:"; ""))
+  jq --arg p "${prefix}" --arg automation_id "trivy/${slug}/" '
+    .runs[] |= (.automationDetails.id = $automation_id)
+    | if $p == "" then
+        .
+      else
+        (.. | objects | select(has("artifactLocation")) | .artifactLocation.uri)
+          |= $p + (. | sub("^[^:]*\\.tgz:"; ""))
+      end
     ' "${REPORT_DIR}/${slug}.sarif" >"${REPORT_DIR}/${slug}.sarif.tmp"
-    mv "${REPORT_DIR}/${slug}.sarif.tmp" "${REPORT_DIR}/${slug}.sarif"
-  fi
+  mv "${REPORT_DIR}/${slug}.sarif.tmp" "${REPORT_DIR}/${slug}.sarif"
 }
 
-# Scanning deploy/ in one pass covers both charts, the published Dockerfiles and
-# the raw manifests, and keeps every reported path relative to the same root.
+# Scan deploy/ defaults and conditional Helm fixtures.
 scan_config() {
   scan config config-defaults deploy/ "${PREFLIGHT_OFF[@]}" \
     "${SKIP_DOCKERFILES[@]}" deploy
 
-  # The chart defaults render 10 of its 19 templates. The high-availability
-  # Deployment, the Gateway API objects, the OpenShift Route and the wider
-  # workspace-mode ClusterRole only render under CI value fixtures.
   local values fixture
   for values in deploy/helm/openshell/ci/values-*.yaml; do
     fixture="$(basename "${values}" .yaml | sed 's/^values-//')"
@@ -86,9 +99,7 @@ scan_config() {
   done
 }
 
-# Trivy has no OCI artifact target and rejects the Helm config media type, so a
-# published chart has to be pulled before it can be scanned. It reads the
-# archive directly, and skips secret scanning on packaged charts.
+# Trivy needs a local chart archive rather than an OCI reference.
 scan_packaged_chart() {
   local ref=$1
   if [[ "${ref}" != *:* || "${ref##*/}" != *:* ]]; then
@@ -96,11 +107,6 @@ scan_packaged_chart() {
     exit 2
   fi
 
-  # A published chart name is not its directory name — the gateway chart is
-  # `helm-chart` under deploy/helm/openshell — and both published charts share
-  # template filenames. Resolving the SARIF prefix and the report slug from the
-  # chart that declares the published name keeps `openshell-workspace` alerts off
-  # the gateway chart's `role.yaml` instead of silently reattributing them.
   local repo chart_name chart_dir="" candidate dir
   repo="${ref%:*}"
   chart_name="${repo##*/}"
@@ -130,8 +136,6 @@ scan_images() {
 
   local image platform slug
   for image in "$@"; do
-    # Published tags are multi-arch indexes and Trivy defaults to the runner's
-    # own platform, so each architecture needs its own scan.
     for platform in ${PLATFORMS}; do
       slug="image-$(printf '%s' "${image#*/}-${platform}" | tr -cs 'A-Za-z0-9._-' '-')"
       scan image "${slug}" "" --platform "${platform}" --scanners vuln \
@@ -140,14 +144,9 @@ scan_images() {
   done
 }
 
-# Re-read the reports and apply the threshold. The table doubles as the run
-# summary, so nothing here reimplements counting.
 gate() {
   local report result findings=0
 
-  # `find` rather than `compgen -G`: compgen belongs to bash's programmable
-  # completion, which the non-interactive bash in the Nix dev shell does not
-  # ship, so it fails with "command not found" there.
   if [ -z "$(find "${REPORT_DIR}" -maxdepth 1 -name '*.json' -print -quit)" ]; then
     echo "Error: no reports in ${REPORT_DIR}; run 'config' or 'images' first" >&2
     exit 2
@@ -192,49 +191,58 @@ collect_config_findings() {
     return 2
   fi
 
-  # One identity can cover several offending blocks: the key deliberately omits
-  # line numbers, so two rules in the same ClusterRole granting `secrets` are
-  # indistinguishable. Occurrences are therefore counted per report and reduced
-  # with `max`, never summed, because every value fixture scans the same tree and
-  # repeats its findings across reports while a template repeats them within one.
-  jq -s --arg severities "${SEVERITY}" '
-    [
-      .[]
-      | [
-          .Results[]? as $result
-          | $result.Misconfigurations[]?
-          | .Severity as $severity
-          | select(($severities | split(",") | index($severity)) != null)
-          | {
-              key: ([
-                .ID,
-                $result.Target,
-                (.Namespace // ""),
-                (.Message // ""),
-                (.CauseMetadata.Provider // ""),
-                (.CauseMetadata.Service // ""),
-                (.CauseMetadata.Resource // "")
-              ] | @json),
-              severity: .Severity,
-              id: .ID,
-              target: $result.Target,
-              title: .Title
-            }
-        ]
-      | group_by(.key)
-      | map(.[0] + { count: length })
-      | .[]
-    ]
-    | group_by(.key)
-    | map(max_by(.count))
-  ' "${report_dir}"/*.json
+  # Preserve report/profile identity while counting repeated findings.
+  local report profile
+  {
+    for report in "${report_dir}"/*.json; do
+      profile="$(basename "${report}" .json)"
+      jq --arg profile "${profile}" --arg severities "${SEVERITY}" '
+        if .SchemaVersion != 2
+          or ((.ArtifactName | type) != "string")
+          or ((.ArtifactType | type) != "string")
+          or (.Results != null and ((.Results | type) != "array"))
+        then
+          error("invalid Trivy JSON report: " + $profile)
+        else
+          {
+            profile: $profile,
+            findings: ([
+              .Results[]? as $result
+              | $result.Misconfigurations[]?
+              | .Severity as $severity
+              | select(($severities | split(",") | index($severity)) != null)
+              | ([
+                  .ID,
+                  $result.Target,
+                  (.Namespace // ""),
+                  (.Message // ""),
+                  (.CauseMetadata.Provider // ""),
+                  (.CauseMetadata.Service // ""),
+                  (.CauseMetadata.Resource // "")
+                ] | @json) as $semantic_key
+              | {
+                  key: ([$profile, $semantic_key] | @json),
+                  semantic_key: $semantic_key,
+                  profile: $profile,
+                  severity: .Severity,
+                  id: .ID,
+                  target: $result.Target,
+                  title: .Title
+                }
+            ]
+            | group_by(.key)
+            | map(.[0] + { count: length }))
+          }
+        end
+      ' "${report}"
+    done
+  } | jq -s '{
+    profiles: map(.profile),
+    findings: (map(.findings) | add // [])
+  }'
 }
 
-# Compare semantic finding identities instead of line numbers, so unrelated
-# edits that move a finding do not make existing debt look newly introduced.
-# Identities carry an occurrence count rather than mere presence, so adding a
-# second offending block under an identity the baseline already reports still
-# fails.
+# Compare semantic identities and occurrence counts, excluding line numbers.
 gate_config_diff() (
   set -euo pipefail
 
@@ -249,10 +257,22 @@ gate_config_diff() (
   collect_config_findings "${baseline_dir}" >"${baseline}"
   collect_config_findings "${candidate_dir}" >"${candidate}"
   jq --slurpfile baseline "${baseline}" '
-    ($baseline[0] | map({ (.key): .count }) | add // {}) as $known
+    ($baseline[0].findings | map({ (.key): .count }) | add // {}) as $by_profile
+    | ($baseline[0].profiles) as $known_profiles
+    | ($baseline[0].findings
+      | group_by(.semantic_key)
+      | map({
+          key: .[0].semantic_key,
+          value: (map(.count) | max)
+        })
+      | from_entries) as $across_profiles
     | [
-        .[]
-        | (($known[.key]) // 0) as $before
+        .findings[]
+        | . as $finding
+        | (if ($known_profiles | index($finding.profile)) != null
+          then (($by_profile[$finding.key]) // 0)
+          else (($across_profiles[$finding.semantic_key]) // 0)
+          end) as $before
         | select(.count > $before)
         | . + { baseline_count: $before, new_count: (.count - $before) }
       ]
@@ -270,7 +290,7 @@ gate_config_diff() (
 
   echo "::error::Trivy reported ${finding_count} new configuration finding(s) at ${SEVERITY}."
   jq -r '.[]
-    | "::error::[\(.severity)] \(.id) in deploy/\(.target): \(.title)"
+    | "::error::[\(.severity)] \(.id) in \(.profile) (deploy/\(.target)): \(.title)"
       + " (\(.new_count) new, \(.baseline_count) in baseline)"' \
     "${new_findings}"
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
@@ -278,7 +298,8 @@ gate_config_diff() (
       echo "### New Trivy configuration findings"
       echo
       jq -r '.[]
-        | "- **\(.severity)** `\(.id)` in `deploy/\(.target)`: \(.title)"
+        | "- **\(.severity)** `\(.id)` in `\(.profile)`"
+          + " (`deploy/\(.target)`): \(.title)"
           + " (\(.new_count) new, \(.baseline_count) in baseline)"' \
         "${new_findings}"
     } >>"${GITHUB_STEP_SUMMARY}"
@@ -286,16 +307,21 @@ gate_config_diff() (
   exit 10
 )
 
-command -v trivy >/dev/null || { echo "Error: trivy not on PATH; run inside 'nix develop'" >&2; exit 2; }
+require_trivy() {
+  command -v trivy >/dev/null || {
+    echo "Error: trivy not on PATH; run inside 'nix develop'" >&2
+    exit 2
+  }
+}
 
 case "${1:-}" in
   config)
     shift
+    require_trivy
+    validate_ignore_file
     mkdir -p "${REPORT_DIR}"
     scan_config
-    # A release publishes every chart under deploy/helm, so `--chart-ref`
-    # repeats. Unparsed arguments are rejected rather than ignored: a misspelled
-    # flag would otherwise leave the packaged charts unscanned and still exit 0.
+    # Reject unparsed arguments so requested charts cannot be silently skipped.
     while [ "${1:-}" = "--chart-ref" ]; do
       [ -n "${2:-}" ] || { echo "Error: --chart-ref needs a value" >&2; exit 2; }
       scan_packaged_chart "$2"
@@ -306,10 +332,13 @@ case "${1:-}" in
   images)
     shift
     [ $# -gt 0 ] || { echo "Error: images needs at least one reference" >&2; exit 2; }
+    require_trivy
+    validate_ignore_file
     mkdir -p "${REPORT_DIR}"
     scan_images "$@"
     ;;
   gate)
+    require_trivy
     gate
     ;;
   gate-config-diff)
@@ -320,6 +349,9 @@ case "${1:-}" in
     }
     gate_config_diff "$1" "$2"
     ;;
+  validate-ignore)
+    validate_ignore_file
+    ;;
   *)
     cat >&2 <<'USAGE'
 Usage:
@@ -327,6 +359,7 @@ Usage:
   trivy-scan.sh images <image-ref> [<image-ref>...]
   trivy-scan.sh gate
   trivy-scan.sh gate-config-diff <baseline-reports> <candidate-reports>
+  trivy-scan.sh validate-ignore
 USAGE
     exit 2
     ;;
