@@ -1151,7 +1151,7 @@ fn install_nft_rules(netns: &Path, proxy_uid: u32, nft: &str) -> Result<()> {
     let body = generate_sidecar_bypass_ruleset(proxy_uid, Some("openshell:cni-sidecar:"));
     let ruleset =
         format!("table inet {OPENSHELL_TABLE} {{}}\ndelete table inet {OPENSHELL_TABLE}\n{body}");
-    run_nft_ruleset_in_netns(netns, &nft, &ruleset)
+    run_nft_ruleset_in_netns(netns, nft, &ruleset)
 }
 
 /// Read-only check that the bypass-prevention rules are present AND structurally
@@ -1162,12 +1162,11 @@ fn install_nft_rules(netns: &Path, proxy_uid: u32, nft: &str) -> Result<()> {
 /// and TCP/UDP rejection on both address families.
 #[cfg(target_os = "linux")]
 fn verify_rules(netns: &Path, proxy_uid: u32) -> Result<()> {
-    if let Some(nft) = find_nft() {
-        if let Ok(dump) =
+    if let Some(nft) = find_nft()
+        && let Ok(dump) =
             run_command_capture_in_netns(netns, &nft, &["list", "table", "inet", OPENSHELL_TABLE])
-        {
-            return verify_nft_ruleset(&dump, proxy_uid);
-        }
+    {
+        return verify_nft_ruleset(&dump, proxy_uid);
     }
     if let Some(iptables) = find_iptables() {
         return verify_iptables_rules(netns, &iptables, proxy_uid);
@@ -1219,7 +1218,7 @@ fn verify_iptables_rules(netns: &Path, backend: &IptablesBackend, proxy_uid: u32
     Ok(())
 }
 
-/// Confirms the OUTPUT chain jumps to OPENSHELL_OUTPUT and that chain contains the
+/// Confirms the OUTPUT chain jumps to `OPENSHELL_OUTPUT` and that chain contains the
 /// proxy-UID exemption plus TCP and UDP rejection, for one iptables family.
 #[cfg(target_os = "linux")]
 fn verify_iptables_family(
@@ -1336,7 +1335,11 @@ pub fn netns_probe_ipv6() -> Result<()> {
     }
 }
 
+// Best-effort teardown: both backends swallow their own failures because CNI DEL
+// must stay idempotent. The Result is kept so the signature matches the non-Linux
+// twin and DEL can grow fallible cleanup later.
 #[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_wraps)]
 fn cleanup_rules(netns: &Path) -> Result<()> {
     if let Some(nft) = find_nft() {
         let _ = cleanup_nft_rules(netns, &nft);
