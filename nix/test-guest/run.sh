@@ -195,17 +195,32 @@ for item in "${configurations[@]}"; do
 		;;
 	esac
 done
+openshell_source_count=0
+candidate_binaries_source_requested=false
 for item in "${provisions[@]}"; do
 	if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
 		[ ! -d "${OPENSHELL_TEST_GUEST_PROVISIONERS}/${item}" ]; then
 		echo "unknown provisioner: ${item:-<empty>}" >&2
 		exit 2
 	fi
+	if [ "${item}" = openshell-candidate-binaries-source ]; then
+		candidate_binaries_source_requested=true
+	fi
+	case "${item}" in
+	openshell-*-source)
+		openshell_source_count=$((openshell_source_count + 1))
+		;;
+	esac
 	if [ "${item}" = gateway-podman ] && [ -z "${podman_mode}" ]; then
 		echo "gateway-podman requires --with podman-rootful or --with podman-rootless" >&2
 		exit 2
 	fi
 done
+
+if [ "${candidate_binaries_source_requested}" = true ] && [ "${openshell_source_count}" -ne 1 ]; then
+	echo "openshell-candidate-binaries-source cannot be combined with another OpenShell source" >&2
+	exit 2
+fi
 
 if [ -n "${requested_ssh_port}" ] && {
 	[[ ! ${requested_ssh_port} =~ ^[0-9]+$ ]] ||
