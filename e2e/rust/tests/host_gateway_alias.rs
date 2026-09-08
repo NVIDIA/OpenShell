@@ -82,6 +82,14 @@ struct HostServer {
     task: JoinHandle<()>,
 }
 
+#[derive(Clone)]
+struct ExpectedRequest {
+    header: (String, String),
+    method: Option<String>,
+    path: Option<String>,
+    json_body: Option<serde_json::Value>,
+}
+
 impl HostServer {
     async fn start(response_body: &str) -> Result<Self, String> {
         Self::start_with_auth_check(response_body, None).await
@@ -102,6 +110,37 @@ impl HostServer {
         response_body: &str,
         expected_header: Option<(&str, &str)>,
     ) -> Result<Self, String> {
+        let expected_request = expected_header.map(|(name, value)| ExpectedRequest {
+            header: (name.to_string(), value.to_string()),
+            method: None,
+            path: None,
+            json_body: None,
+        });
+        Self::start_with_request_check(response_body, expected_request).await
+    }
+
+    async fn start_with_json_request_check(
+        expected_header: (&str, &str),
+        method: &str,
+        path: &str,
+        json_body: serde_json::Value,
+    ) -> Result<Self, String> {
+        Self::start_with_request_check(
+            "",
+            Some(ExpectedRequest {
+                header: (expected_header.0.to_string(), expected_header.1.to_string()),
+                method: Some(method.to_string()),
+                path: Some(path.to_string()),
+                json_body: Some(json_body),
+            }),
+        )
+        .await
+    }
+
+    async fn start_with_request_check(
+        response_body: &str,
+        expected_request: Option<ExpectedRequest>,
+    ) -> Result<Self, String> {
         let listener = TcpListener::bind(("0.0.0.0", 0))
             .await
             .map_err(|e| format!("bind host test server: {e}"))?;
@@ -110,19 +149,17 @@ impl HostServer {
             .map_err(|e| format!("read host test server address: {e}"))?
             .port();
         let response_body = response_body.as_bytes().to_vec();
-        let expected_header =
-            expected_header.map(|(name, value)| (name.to_string(), value.to_string()));
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
                 let body = response_body.clone();
-                let expected_header = expected_header.clone();
+                let expected_request = expected_request.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0_u8; 1024];
-                    loop {
+                    let header_end = loop {
                         let Ok(read) = stream.read(&mut buf).await else {
                             return;
                         };
@@ -130,18 +167,64 @@ impl HostServer {
                             return;
                         }
                         request.extend_from_slice(&buf[..read]);
-                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                            break;
+                        if let Some(position) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            break position + 4;
                         }
+                    };
+
+                    let request_head = String::from_utf8_lossy(&request[..header_end]).into_owned();
+                    let content_length = request_head
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find_map(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or_default();
+                    while request.len() < header_end + content_length {
+                        let Ok(read) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..read]);
                     }
 
-                    let body = expected_header.map_or(body, |(name, expected)| {
-                        let request = String::from_utf8_lossy(&request);
+                    let body = expected_request.map_or(body, |expected| {
+                        let mut request_line = request_head
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .split_whitespace();
+                        let method = request_line.next().unwrap_or_default();
+                        let path = request_line.next().unwrap_or_default();
+                        let header_matches = request_head.lines().any(|line| {
+                            line.eq_ignore_ascii_case(&format!(
+                                "{}: {}",
+                                expected.header.0, expected.header.1
+                            ))
+                        });
+                        let method_matches = expected
+                            .method
+                            .as_deref()
+                            .is_none_or(|expected| method == expected);
+                        let path_matches = expected
+                            .path
+                            .as_deref()
+                            .is_none_or(|expected| path == expected);
+                        let body_matches = expected.json_body.as_ref().is_none_or(|expected| {
+                            serde_json::from_slice::<serde_json::Value>(
+                                &request[header_end..header_end + content_length],
+                            )
+                            .is_ok_and(|actual| actual == *expected)
+                        });
                         format!(
                             r#"{{"authorized":{}}}"#,
-                            request.lines().any(|line| {
-                                line.eq_ignore_ascii_case(&format!("{name}: {expected}"))
-                            })
+                            header_matches && method_matches && path_matches && body_matches
                         )
                         .into_bytes()
                     });
@@ -398,14 +481,29 @@ async fn sandbox_reaches_host_openshell_internal_via_host_gateway_alias() {
 
 #[tokio::test]
 async fn provider_native_inference_uses_profile_endpoints_without_legacy_alias() {
-    let openai_server =
-        HostServer::start_with_header_check("", Some(("Authorization", "Bearer openai-secret")))
-            .await
-            .expect("start OpenAI-compatible test server");
-    let anthropic_server =
-        HostServer::start_with_header_check("", Some(("X-Api-Key", "anthropic-secret")))
-            .await
-            .expect("start Anthropic-compatible test server");
+    let openai_server = HostServer::start_with_json_request_check(
+        ("Authorization", "Bearer openai-secret"),
+        "POST",
+        "/v1/chat/completions",
+        serde_json::json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}],
+        }),
+    )
+    .await
+    .expect("start OpenAI-compatible test server");
+    let anthropic_server = HostServer::start_with_json_request_check(
+        ("X-Api-Key", "anthropic-secret"),
+        "POST",
+        "/v1/messages",
+        serde_json::json!({
+            "model": "claude-test",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hello"}],
+        }),
+    )
+    .await
+    .expect("start Anthropic-compatible test server");
     let openai_profile = write_native_inference_profile(
         NATIVE_OPENAI_PROFILE_ID,
         "E2E native OpenAI",
@@ -477,7 +575,10 @@ async fn provider_native_inference_uses_profile_endpoints_without_legacy_alias()
     .expect("create Anthropic-compatible provider");
 
     let command = format!(
-        r#"openai=$(curl --silent --show-error --fail --max-time 15 -H "Authorization: Bearer $OPENAI_API_KEY" http://host.openshell.internal:{}/v1/chat/completions); anthropic=$(curl --silent --show-error --fail --max-time 15 -H "X-Api-Key: $ANTHROPIC_API_KEY" http://host.openshell.internal:{}/v1/messages); if curl --silent --show-error --fail --connect-timeout 2 --max-time 5 -o /dev/null https://inference.local/v1/models; then legacy=unexpected-success; else legacy=blocked; fi; printf 'OPENAI=%s ANTHROPIC=%s LEGACY=%s\n' "$openai" "$anthropic" "$legacy""#,
+        r#"openai=$(curl --silent --show-error --fail --max-time 15 -H "Content-Type: application/json" -H "Authorization: Bearer $OPENAI_API_KEY" --data '{{"model":"gpt-test","messages":[{{"role":"user","content":"hello"}}]}}' http://host.openshell.internal:{}/v1/chat/completions)
+anthropic=$(curl --silent --show-error --fail --max-time 15 -H "Content-Type: application/json" -H "X-Api-Key: $ANTHROPIC_API_KEY" -H "Anthropic-Version: 2023-06-01" --data '{{"model":"claude-test","max_tokens":16,"messages":[{{"role":"user","content":"hello"}}]}}' http://host.openshell.internal:{}/v1/messages)
+if curl --silent --show-error --fail --connect-timeout 2 --max-time 5 -o /dev/null https://inference.local/v1/models; then legacy=unexpected-success; else legacy=blocked; fi
+printf 'OPENAI=%s ANTHROPIC=%s LEGACY=%s\n' "$openai" "$anthropic" "$legacy""#,
         openai_server.port, anthropic_server.port
     );
     let mut guard = SandboxGuard::create(&[
