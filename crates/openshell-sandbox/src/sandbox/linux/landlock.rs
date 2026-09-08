@@ -8,11 +8,8 @@ use landlock::{
     Ruleset, RulesetAttr, RulesetCreatedAttr,
 };
 use miette::{IntoDiagnostic, Result};
-use openshell_core::policy::{
-    FilesystemPolicy, LandlockCompatibility, LandlockPolicy, NetworkPolicy, ProcessPolicy,
-    SandboxPolicy,
-};
-use std::os::fd::AsFd;
+use openshell_core::policy::{LandlockCompatibility, SandboxPolicy};
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
@@ -136,43 +133,75 @@ pub fn prepare_current_user(
 /// hierarchy. Entries the final UID cannot open are already inaccessible and
 /// are safely omitted by [`PathOpenMode::CurrentUser`].
 pub fn prepare_capability_free_baseline() -> Result<PreparedRuleset> {
-    let read_write = capability_free_baseline_paths(Path::new("/"))?;
-    if read_write.is_empty() {
+    prepare_capability_free_baseline_at(Path::new("/"))
+}
+
+fn prepare_capability_free_baseline_at(root: &Path) -> Result<PreparedRuleset> {
+    // Unlike optional filesystem policy, self-protection must cover pathname
+    // truncation as well as opens. Never silently downgrade this ABI requirement.
+    let abi = ABI::V3;
+    let access = AccessFs::from_all(abi);
+    let mut ruleset = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(access)
+        .into_diagnostic()?
+        .create()
+        .into_diagnostic()?;
+    let entries = capability_free_baseline_entries(root)?;
+    if entries.is_empty() {
         return Err(miette::miette!(
             "capability-free Landlock baseline found no usable root entries"
         ));
     }
-
-    let policy = SandboxPolicy {
-        version: 0,
-        filesystem: FilesystemPolicy {
-            read_only: Vec::new(),
-            read_write,
-            include_workdir: false,
-        },
-        network: NetworkPolicy::default(),
-        landlock: LandlockPolicy {
-            compatibility: LandlockCompatibility::HardRequirement,
-        },
-        process: ProcessPolicy::default(),
-    };
-    prepare_with_path_open_mode(&policy, None, PathOpenMode::CurrentUser)?.ok_or_else(|| {
-        miette::miette!("capability-free Landlock baseline unexpectedly produced no ruleset")
+    for (_, fd) in entries {
+        let allowed = access_for_path_fd(&fd, access, abi)?;
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(fd, allowed))
+            .into_diagnostic()?;
+    }
+    Ok(PreparedRuleset {
+        ruleset,
+        compatibility: LandlockCompatibility::HardRequirement,
     })
 }
 
-fn capability_free_baseline_paths(root: &Path) -> Result<Vec<PathBuf>> {
+fn capability_free_baseline_entries(root: &Path) -> Result<Vec<(PathBuf, OwnedFd)>> {
+    use rustix::fs::{Mode, OFlags, open, openat};
     const PRIVATE_ROOT: &str = ".openshell";
 
-    let mut paths = Vec::new();
+    let root_fd = open(
+        root,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .into_diagnostic()?;
+    let mut entries = Vec::new();
     for entry in std::fs::read_dir(root).into_diagnostic()? {
         let entry = entry.into_diagnostic()?;
-        if entry.file_name() != PRIVATE_ROOT {
-            paths.push(entry.path());
+        if entry.file_name() == PRIVATE_ROOT {
+            continue;
         }
+        // Open relative to the pinned root and classify this exact descriptor.
+        // O_PATH|O_NOFOLLOW opens a symlink itself, never its target. A root
+        // alias to `/` or `/.openshell` therefore cannot broaden the allowlist.
+        let fd = match openat(
+            &root_fd,
+            entry.file_name(),
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::ACCESS) => continue,
+            Err(error) => return Err(error).into_diagnostic(),
+        };
+        let stat = rustix::fs::fstat(&fd).into_diagnostic()?;
+        if rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Symlink {
+            continue;
+        }
+        entries.push((entry.path(), fd));
     }
-    paths.sort();
-    Ok(paths)
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(entries)
 }
 
 fn prepare_with_path_open_mode(
@@ -236,7 +265,10 @@ fn prepare_with_path_open_mode(
     }
 
     let total_paths = read_only.len() + read_write.len();
-    let abi = ABI::V2;
+    // Read-only policy must also deny pathname truncation. The mandatory
+    // baseline already qualifies ABI v3; optional best-effort policy keeps its
+    // independent compatibility behavior for other callers.
+    let abi = ABI::V3;
     openshell_ocsf::ocsf_emit!(
         openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
             .severity(openshell_ocsf::SeverityId::Informational)
@@ -402,7 +434,7 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
 /// files and device nodes in hard-requirement mode. Classifying through the
 /// same `PathFd` used by the rule avoids a pathname TOCTOU race.
 fn access_for_path_fd(
-    path_fd: &PathFd,
+    path_fd: &impl AsFd,
     requested_access: BitFlags<AccessFs>,
     abi: ABI,
 ) -> Result<BitFlags<AccessFs>> {
@@ -537,7 +569,7 @@ fn compat_level(level: &LandlockCompatibility) -> CompatLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::policy::{FilesystemPolicy, LandlockPolicy};
+    use openshell_core::policy::{FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy};
 
     fn hard_requirement_policy(read_only: Vec<PathBuf>, read_write: Vec<PathBuf>) -> SandboxPolicy {
         SandboxPolicy {
@@ -579,13 +611,85 @@ mod tests {
             std::fs::create_dir(root.path().join(name)).unwrap();
         }
 
-        let paths = capability_free_baseline_paths(root.path()).unwrap();
+        std::os::unix::fs::symlink(root.path(), root.path().join("root-alias")).unwrap();
+        std::os::unix::fs::symlink(
+            root.path().join(".openshell"),
+            root.path().join("private-alias"),
+        )
+        .unwrap();
+        let paths: Vec<_> = capability_free_baseline_entries(root.path())
+            .unwrap()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
         assert_eq!(
             paths,
             ["bin", "etc", "sandbox"]
                 .map(|name| root.path().join(name))
                 .to_vec()
         );
+    }
+
+    #[test]
+    fn capability_free_baseline_denies_alias_reads_and_path_truncation() {
+        if !matches!(probe_availability(), LandlockAvailability::Available { abi } if abi >= 3) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let public = root.path().join("public");
+        let private = root.path().join(".openshell");
+        std::fs::create_dir(&public).unwrap();
+        std::fs::create_dir(&private).unwrap();
+        std::fs::write(public.join("sentinel"), b"allowed").unwrap();
+        std::fs::write(private.join("secret"), b"protected").unwrap();
+        std::os::unix::fs::symlink(root.path(), root.path().join("root-alias")).unwrap();
+        std::os::unix::fs::symlink(&private, root.path().join("private-alias")).unwrap();
+        let path = root.path().to_path_buf();
+        std::thread::spawn(move || {
+            enforce(prepare_capability_free_baseline_at(&path).unwrap()).unwrap();
+            assert_eq!(
+                std::fs::read(path.join("public/sentinel")).unwrap(),
+                b"allowed"
+            );
+            for name in [
+                ".openshell/secret",
+                "root-alias/.openshell/secret",
+                "private-alias/secret",
+            ] {
+                let target = path.join(name);
+                assert_eq!(
+                    std::fs::read(&target).unwrap_err().kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+                let target = std::ffi::CString::new(target.as_os_str().as_encoded_bytes()).unwrap();
+                // SAFETY: target is a live, NUL-terminated path. The syscall
+                // tests pathname truncation without opening a file first.
+                #[allow(unsafe_code)]
+                let result = unsafe { libc::truncate(target.as_ptr(), 0) };
+                assert_eq!(result, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+            }
+            let policy = hard_requirement_policy(vec![path.join("public")], Vec::new());
+            enforce(prepare_current_user(&policy, None).unwrap().unwrap()).unwrap();
+            let read_only =
+                std::ffi::CString::new(path.join("public/sentinel").as_os_str().as_encoded_bytes())
+                    .unwrap();
+            // SAFETY: live NUL-terminated pathname; optional read-only policy
+            // must handle truncation independently of the protected baseline.
+            #[allow(unsafe_code)]
+            let truncated = unsafe { libc::truncate(read_only.as_ptr(), 0) };
+            assert_eq!(truncated, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        })
+        .join()
+        .unwrap();
+        assert_eq!(std::fs::read(private.join("secret")).unwrap(), b"protected");
     }
     fn tailored_access(path: &Path, requested_access: BitFlags<AccessFs>) -> BitFlags<AccessFs> {
         let path_fd = PathFd::new(path).unwrap();

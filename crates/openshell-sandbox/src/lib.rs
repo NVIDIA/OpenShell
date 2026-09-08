@@ -3,6 +3,8 @@
 
 //! Capability-free in-workload sandbox boundary.
 
+#[cfg(target_os = "linux")]
+mod accept_interrupt;
 pub mod boundary_exec;
 pub mod boundary_io;
 mod boundary_server;
@@ -16,7 +18,7 @@ pub mod main_session;
 pub mod managed_children;
 #[cfg(target_os = "linux")]
 mod network_broker;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod process;
 mod pty;
 pub mod sandbox;

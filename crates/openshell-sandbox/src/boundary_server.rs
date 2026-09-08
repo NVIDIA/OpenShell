@@ -13,12 +13,12 @@ use std::path::Path;
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::Path;
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::mem::size_of;
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd as _, OwnedFd};
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+    use std::path::Path;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
@@ -52,11 +52,10 @@ mod linux {
         AgentSpecWire, BinaryIdentityWire, BoundaryConfig,
         BoundaryListener as BoundaryListenerConfig, DnsQueryResultWire, ExecSpecWire,
         ExitStatusWire, MediationTimingWire, OutputWindowWire, ProcessKindWire,
-        ProcessSnapshotWire, Request, RequestEnvelope, Response, ResponseEnvelope, STREAM_DNS_ACK,
-        STREAM_DNS_RESPONSE, STREAM_EXIT, STREAM_NETWORK_DECISION, STREAM_STDERR, STREAM_STDIN,
-        STREAM_STDIN_CLOSED, STREAM_STDOUT, SandboxPolicyWire, SessionSnapshotWire, SignalWire,
-        encode_frame, read_frame, read_stream_frame, validate_resource_claims, write_frame,
-        write_stream_frame,
+        ProcessSnapshotWire, Request, RequestEnvelope, Response, ResponseEnvelope, STREAM_EXIT,
+        STREAM_NETWORK_DECISION, STREAM_STDERR, STREAM_STDIN, STREAM_STDIN_CLOSED, STREAM_STDOUT,
+        SandboxPolicyWire, SessionSnapshotWire, SignalWire, encode_frame, read_frame,
+        read_stream_frame, validate_resource_claims, write_frame, write_stream_frame,
     };
 
     const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -120,8 +119,6 @@ mod linux {
             .map_err(|error| format!("install sandbox process prelude: {error}"))?;
         let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
             .map_err(|error| format!("start sandbox workload launcher: {error}"))?;
-        crate::process::configure_workload_launcher(launcher.clone())
-            .map_err(|error| format!("configure sandbox workload launcher: {error}"))?;
         let network_broker = NetworkBroker::start(listener)
             .map_err(|error| format!("start sandbox network broker: {error}"))?;
         let process_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -135,7 +132,7 @@ mod linux {
             launcher,
             qualification,
         ));
-        serve(&config.listener, config.multiplexed, runtime)
+        serve(&config.listener, runtime)
     }
 
     fn make_boundary_nondumpable() -> Result<(), String> {
@@ -256,7 +253,7 @@ mod linux {
             let expected = config
                 .resource_claims
                 .get(claim)
-                .expect("validated resource-claim file key");
+                .ok_or_else(|| format!("resource claim file has no expected value: {claim}"))?;
             let observed = std::fs::read_to_string(path).map_err(|error| {
                 format!(
                     "read runtime resource claim {claim} from {}: {error}",
@@ -348,11 +345,7 @@ mod linux {
         Ok(())
     }
 
-    fn serve(
-        config: &BoundaryListenerConfig,
-        multiplexed: bool,
-        runtime: Arc<BoundaryRuntime>,
-    ) -> Result<(), String> {
+    fn serve(config: &BoundaryListenerConfig, runtime: Arc<BoundaryRuntime>) -> Result<(), String> {
         let listener = ControlListener::bind(config)
             .map_err(|error| format!("bind boundary control listener: {error}"))?;
         let active_connections = Arc::new(AtomicUsize::new(0));
@@ -381,7 +374,7 @@ mod linux {
                                 return;
                             }
                         };
-                        let result = if multiplexed {
+                        let result = {
                             let stream = match stream.into_tokio() {
                                 Ok(stream) => stream,
                                 Err(error) => {
@@ -392,8 +385,6 @@ mod linux {
                             runtime
                                 .process_runtime
                                 .block_on(serve_grpc(stream, runtime.clone()))
-                        } else {
-                            serve_one(stream, &runtime)
                         };
                         if let Err(error) = result {
                             tracing::warn!(%error, "Boundary control session failed: {error}");
@@ -417,7 +408,7 @@ mod linux {
         tonic::transport::Server::builder()
             .max_concurrent_streams(
                 u32::try_from(MAX_CONTROL_CONNECTIONS)
-                    .expect("control connection limit fits in HTTP/2 settings"),
+                    .map_err(|error| format!("invalid control connection limit: {error}"))?,
             )
             .initial_stream_window_size(16 * 1024 * 1024)
             .initial_connection_window_size(16 * 1024 * 1024)
@@ -490,7 +481,7 @@ mod linux {
             let runtime = self.runtime.clone();
             tokio::task::spawn_blocking(move || {
                 let stream = ControlStream::Grpc {
-                    stream: Some(stream),
+                    stream,
                     runtime: runtime.process_runtime.clone(),
                 };
                 if let Err(error) = serve_one(stream, &runtime) {
@@ -946,67 +937,6 @@ mod linux {
                 })?;
                 return Ok(());
             }
-            Request::AcceptDns => {
-                let broker = runtime.network_accept_context()?;
-                let request_id = request.request_id;
-                runtime.process_runtime.block_on(async move {
-                    let mut stream = stream.into_tokio()?;
-                    let mut disconnect_probe = [0_u8; 1];
-                    let pending = tokio::select! {
-                        biased;
-                        read = stream.read(&mut disconnect_probe) => {
-                            match read {
-                                Ok(0) => return Ok(()),
-                                Ok(_) => return Err("control sent data before DNS mediation response".to_string()),
-                                Err(error) => return Err(format!("watch DNS mediation control stream: {error}")),
-                            }
-                        }
-                        pending = broker.accept_dns() => pending
-                            .map_err(|error| format!("accept sandbox DNS query: {error}"))?,
-                    };
-                    let response = encode_frame(&ResponseEnvelope {
-                        request_id,
-                        response: Response::DnsQuery {
-                            request: pending.request.clone(),
-                            transport: pending.transport,
-                            identity: BinaryIdentityWire::from(pending.identity.clone()),
-                            timing: MediationTimingWire {
-                                notification_to_queue_us: duration_micros(
-                                    pending.notification_to_queue,
-                                ),
-                                queue_wait_us: duration_micros(pending.queued_at.elapsed()),
-                            },
-                        },
-                    })
-                    .map_err(|error| format!("encode DNS mediation response: {error}"))?;
-                    stream
-                        .write_all(&response)
-                        .await
-                        .map_err(|error| format!("write DNS mediation response: {error}"))?;
-                    let Some((channel, payload)) = read_stream_frame(&mut stream)
-                        .await
-                        .map_err(|error| format!("read DNS mediation result: {error}"))?
-                    else {
-                        return Err("control disconnected before DNS response".to_string());
-                    };
-                    if channel != STREAM_DNS_RESPONSE {
-                        return Err(format!("unexpected DNS response channel {channel}"));
-                    }
-                    let result: DnsQueryResultWire = serde_json::from_slice(&payload)
-                        .map_err(|error| format!("decode DNS mediation result: {error}"))?;
-                    let result = match result {
-                        DnsQueryResultWire::Response(response) => Ok(response),
-                        DnsQueryResultWire::Error(error) => Err(io::Error::other(error)),
-                    };
-                    pending
-                        .complete(result)
-                        .map_err(|error| format!("complete sandbox DNS query: {error}"))?;
-                    write_stream_frame(&mut stream, STREAM_DNS_ACK, &[])
-                        .await
-                        .map_err(|error| format!("acknowledge sandbox DNS response: {error}"))
-                })?;
-                return Ok(());
-            }
             _ => {}
         }
         let response = ResponseEnvelope {
@@ -1034,6 +964,10 @@ mod linux {
         mediation_active: AtomicBool,
         next_mediation_stream_id: AtomicU64,
         exec_handles: Mutex<std::collections::HashMap<String, ExecHandle>>,
+        /// Never evicted within a boundary generation. Reclaiming process I/O
+        /// must not make an old command executable again. At capacity, reject
+        /// new commands instead of silently weakening at-most-once execution.
+        exec_requests: Mutex<std::collections::HashSet<String>>,
         replay_ledger: Mutex<ReplayLedger>,
         network_broker: NetworkBroker,
         workload_launcher:
@@ -1050,6 +984,27 @@ mod linux {
         session: Arc<MainSession>,
         attached: Arc<AtomicBool>,
         status: Arc<Mutex<Option<ExitStatusWire>>>,
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn reserve_exec_request(
+        requests: &mut std::collections::HashSet<String>,
+        request_id: &str,
+    ) -> Result<(), Response> {
+        if requests.contains(request_id) {
+            return Err(guest_error(
+                "denied",
+                "exec request has expired; it cannot be executed again",
+            ));
+        }
+        if requests.len() >= MAX_REPLAY_LEDGER_ENTRIES {
+            return Err(guest_error(
+                "unavailable",
+                "boundary generation exec request limit reached",
+            ));
+        }
+        requests.insert(request_id.to_owned());
+        Ok(())
     }
 
     struct StartedExec {
@@ -1206,6 +1161,7 @@ mod linux {
                 mediation_active: AtomicBool::new(false),
                 next_mediation_stream_id: AtomicU64::new(1),
                 exec_handles: Mutex::new(std::collections::HashMap::new()),
+                exec_requests: Mutex::new(std::collections::HashSet::new()),
                 replay_ledger: Mutex::new(ReplayLedger::default()),
                 network_broker,
                 workload_launcher,
@@ -1305,8 +1261,7 @@ mod linux {
                 Request::Exec { .. }
                 | Request::AttachProcess { .. }
                 | Request::PortForward { .. }
-                | Request::AcceptNetwork
-                | Request::AcceptDns => {
+                | Request::AcceptNetwork => {
                     guest_error("invalid", "streaming request used on control path")
                 }
             };
@@ -1387,6 +1342,10 @@ mod linux {
                         "retained exec process limit reached",
                     ));
                 }
+            }
+            {
+                let mut requests = lock(&self.exec_requests);
+                reserve_exec_request(&mut requests, request_id)?;
             }
             let session = self
                 .process_runtime
@@ -1733,7 +1692,7 @@ mod linux {
             };
             let mut state = lock(&self.state);
             let requested = StartedAgent {
-                sandbox_id: sandbox_id.clone(),
+                sandbox_id,
                 spec: spec.clone(),
                 policy: policy.clone(),
                 ca_cert: ca_cert.clone(),
@@ -1774,18 +1733,21 @@ mod linux {
             }
             let launch = ManagedProcessLaunch {
                 process_id: format!("{}:main:0", self.config.generation),
-                sandbox_id,
                 spec,
                 policy,
                 provider_env_revision,
                 provider_env,
                 ca_file_paths,
             };
-            let process =
-                match ManagedProcess::spawn(&self.process_runtime, launch, prepared.clone()) {
-                    Ok(process) => Arc::new(process),
-                    Err(error) => return guest_error("failed", error),
-                };
+            let process = match ManagedProcess::spawn(
+                &self.process_runtime,
+                &self.workload_launcher,
+                launch,
+                prepared.clone(),
+            ) {
+                Ok(process) => Arc::new(process),
+                Err(error) => return guest_error("failed", error),
+            };
             let process_id = process.process_id();
             *lock(&self.started_agent) = Some(requested);
             *state = RuntimeState::Running(process);
@@ -2072,7 +2034,6 @@ mod linux {
 
     struct ManagedProcessLaunch {
         process_id: String,
-        sandbox_id: String,
         spec: AgentSpecWire,
         policy: openshell_core::policy::SandboxPolicy,
         provider_env_revision: u64,
@@ -2101,12 +2062,12 @@ mod linux {
     impl ManagedProcess {
         fn spawn(
             runtime: &tokio::runtime::Handle,
+            launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
             launch: ManagedProcessLaunch,
             _prepared: PreparedBoundary,
         ) -> Result<Self, String> {
             let ManagedProcessLaunch {
                 process_id,
-                sandbox_id,
                 spec,
                 policy,
                 provider_env_revision,
@@ -2122,18 +2083,14 @@ mod linux {
             );
             let mut spawned = runtime
                 .block_on(spawn_workload(
+                    launcher,
                     &spec.program,
                     &spec.args,
                     spec.workdir.as_deref(),
                     spec.timeout_secs,
                     spec.interactive,
-                    Some(&sandbox_id),
-                    None,
-                    None,
-                    false,
                     &policy,
                     entrypoint_pid,
-                    None,
                     provider_credentials.clone(),
                     provider_env,
                     ca_file_paths,
@@ -2176,12 +2133,14 @@ mod linux {
         fn wait(&self) -> ProcessExit {
             let (state, changed) = &*self.exit;
             let mut exit = lock(state);
-            while exit.is_none() {
+            loop {
+                if let Some(result) = exit.as_ref() {
+                    return result.clone();
+                }
                 exit = changed
                     .wait(exit)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
-            exit.as_ref().expect("exit checked above").clone()
         }
 
         fn signal(&self, signal: SignalWire) -> Result<(), String> {
@@ -2618,17 +2577,15 @@ mod linux {
             server_config: Arc<rustls::ServerConfig>,
         },
         Tls {
-            stream: Option<
-                Box<
-                    tokio_rustls::server::TlsStream<
-                        openshell_isolation_interface::contract::BoundaryDuplexStream,
-                    >,
+            stream: Box<
+                tokio_rustls::server::TlsStream<
+                    openshell_isolation_interface::contract::BoundaryDuplexStream,
                 >,
             >,
             runtime: tokio::runtime::Handle,
         },
         Grpc {
-            stream: Option<tokio::io::DuplexStream>,
+            stream: tokio::io::DuplexStream,
             runtime: tokio::runtime::Handle,
         },
         #[cfg(test)]
@@ -2658,45 +2615,36 @@ mod linux {
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
             })?;
             Ok(Self::Tls {
-                stream: Some(Box::new(stream)),
+                stream: Box::new(stream),
                 runtime: runtime.clone(),
             })
         }
 
         fn set_timeout(&self, timeout: Duration) -> io::Result<()> {
             let _ = timeout;
-            if matches!(self, Self::Tls { .. } | Self::Grpc { .. }) {
-                return Ok(());
-            }
-            if matches!(self, Self::PendingTls { .. }) {
-                return Err(io::Error::new(
+            match self {
+                Self::Tls { .. } | Self::Grpc { .. } => Ok(()),
+                Self::PendingTls { .. } => Err(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "boundary TLS stream has not completed its handshake",
-                ));
+                )),
+                #[cfg(test)]
+                Self::TestUnix(stream) => {
+                    stream.set_read_timeout(Some(timeout))?;
+                    stream.set_write_timeout(Some(timeout))
+                }
             }
-            #[cfg(test)]
-            if let Self::TestUnix(stream) = self {
-                stream.set_read_timeout(Some(timeout))?;
-                return stream.set_write_timeout(Some(timeout));
-            }
-            unreachable!("all established sandbox streams use mutual TLS")
         }
 
         fn into_tokio(
             self,
         ) -> Result<openshell_isolation_interface::contract::BoundaryDuplexStream, String> {
             match self {
-                Self::Tls { mut stream, .. } => Ok(stream
-                    .take()
-                    .expect("boundary TLS stream can only be converted once")),
+                Self::Tls { stream, .. } => Ok(stream),
                 Self::PendingTls { .. } => {
                     Err("boundary TLS stream has not completed its handshake".to_string())
                 }
-                Self::Grpc { mut stream, .. } => Ok(Box::new(
-                    stream
-                        .take()
-                        .expect("gRPC boundary stream can only be converted once"),
-                )),
+                Self::Grpc { stream, .. } => Ok(Box::new(stream)),
                 #[cfg(test)]
                 Self::TestUnix(stream) => {
                     stream
@@ -2714,34 +2662,22 @@ mod linux {
         fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
             match self {
                 Self::Tls { stream, runtime } => runtime.block_on(async {
-                    tokio::time::timeout(
-                        CONTROL_IO_TIMEOUT,
-                        stream
-                            .as_mut()
-                            .expect("boundary TLS stream must be present")
-                            .read(buffer),
-                    )
-                    .await
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::TimedOut, "boundary TLS read timed out")
-                    })?
+                    tokio::time::timeout(CONTROL_IO_TIMEOUT, stream.read(buffer))
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "boundary TLS read timed out")
+                        })?
                 }),
                 Self::PendingTls { .. } => Err(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "boundary TLS stream has not completed its handshake",
                 )),
                 Self::Grpc { stream, runtime } => runtime.block_on(async {
-                    tokio::time::timeout(
-                        CONTROL_IO_TIMEOUT,
-                        stream
-                            .as_mut()
-                            .expect("gRPC boundary stream must be present")
-                            .read(buffer),
-                    )
-                    .await
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::TimedOut, "gRPC boundary read timed out")
-                    })?
+                    tokio::time::timeout(CONTROL_IO_TIMEOUT, stream.read(buffer))
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "gRPC boundary read timed out")
+                        })?
                 }),
                 #[cfg(test)]
                 Self::TestUnix(stream) => stream.read(buffer),
@@ -2753,34 +2689,22 @@ mod linux {
         fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
             match self {
                 Self::Tls { stream, runtime } => runtime.block_on(async {
-                    tokio::time::timeout(
-                        CONTROL_IO_TIMEOUT,
-                        stream
-                            .as_mut()
-                            .expect("boundary TLS stream must be present")
-                            .write(buffer),
-                    )
-                    .await
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::TimedOut, "boundary TLS write timed out")
-                    })?
+                    tokio::time::timeout(CONTROL_IO_TIMEOUT, stream.write(buffer))
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "boundary TLS write timed out")
+                        })?
                 }),
                 Self::PendingTls { .. } => Err(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "boundary TLS stream has not completed its handshake",
                 )),
                 Self::Grpc { stream, runtime } => runtime.block_on(async {
-                    tokio::time::timeout(
-                        CONTROL_IO_TIMEOUT,
-                        stream
-                            .as_mut()
-                            .expect("gRPC boundary stream must be present")
-                            .write(buffer),
-                    )
-                    .await
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::TimedOut, "gRPC boundary write timed out")
-                    })?
+                    tokio::time::timeout(CONTROL_IO_TIMEOUT, stream.write(buffer))
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "gRPC boundary write timed out")
+                        })?
                 }),
                 #[cfg(test)]
                 Self::TestUnix(stream) => stream.write(buffer),
@@ -2790,34 +2714,22 @@ mod linux {
         fn flush(&mut self) -> io::Result<()> {
             match self {
                 Self::Tls { stream, runtime } => runtime.block_on(async {
-                    tokio::time::timeout(
-                        CONTROL_IO_TIMEOUT,
-                        stream
-                            .as_mut()
-                            .expect("boundary TLS stream must be present")
-                            .flush(),
-                    )
-                    .await
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::TimedOut, "boundary TLS flush timed out")
-                    })?
+                    tokio::time::timeout(CONTROL_IO_TIMEOUT, stream.flush())
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "boundary TLS flush timed out")
+                        })?
                 }),
                 Self::PendingTls { .. } => Err(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "boundary TLS stream has not completed its handshake",
                 )),
                 Self::Grpc { stream, runtime } => runtime.block_on(async {
-                    tokio::time::timeout(
-                        CONTROL_IO_TIMEOUT,
-                        stream
-                            .as_mut()
-                            .expect("gRPC boundary stream must be present")
-                            .flush(),
-                    )
-                    .await
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::TimedOut, "gRPC boundary flush timed out")
-                    })?
+                    tokio::time::timeout(CONTROL_IO_TIMEOUT, stream.flush())
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "gRPC boundary flush timed out")
+                        })?
                 }),
                 #[cfg(test)]
                 Self::TestUnix(stream) => stream.flush(),
@@ -2831,6 +2743,21 @@ mod linux {
         use openshell_isolation_interface::boundary_protocol::{
             BoundaryClientTls, BoundaryServerTls, generate_boundary_mutual_tls_material,
         };
+
+        #[test]
+        fn exec_tombstones_outlive_retained_handles_and_fail_closed_at_capacity() {
+            let mut requests = std::collections::HashSet::new();
+            reserve_exec_request(&mut requests, "first").unwrap();
+            // Process/I/O retention is deliberately not consulted by this
+            // ledger: dropping all handles cannot make this ID executable.
+            assert!(reserve_exec_request(&mut requests, "first").is_err());
+            for index in 1..MAX_REPLAY_LEDGER_ENTRIES {
+                reserve_exec_request(&mut requests, &format!("request-{index}")).unwrap();
+            }
+            assert!(reserve_exec_request(&mut requests, "overflow").is_err());
+            assert!(requests.contains("first"));
+            assert_eq!(requests.len(), MAX_REPLAY_LEDGER_ENTRIES);
+        }
 
         #[test]
         fn replay_ledger_evicts_oldest_records_without_disabling_control() {
@@ -2937,7 +2864,6 @@ mod linux {
                     control_port: 5500,
                     tls: placeholder_server_tls(),
                 },
-                multiplexed: false,
                 resource_claims: std::collections::BTreeMap::new(),
                 resource_claim_files: std::collections::BTreeMap::new(),
                 workload_identity: test_workload_identity(),
@@ -3086,8 +3012,6 @@ mod linux {
             let (launcher, listener) =
                 openshell_isolation_interface::linux::workload_launcher::start()
                     .expect("start test listener");
-            crate::process::configure_workload_launcher(launcher.clone())
-                .expect("configure test workload launcher");
             (
                 NetworkBroker::start_for_test(listener).expect("start test network broker"),
                 launcher,
@@ -3157,7 +3081,6 @@ mod linux {
                     control_port: 5500,
                     tls: placeholder_server_tls(),
                 },
-                multiplexed: false,
                 resource_claims: std::collections::BTreeMap::new(),
                 resource_claim_files: std::collections::BTreeMap::new(),
                 workload_identity: test_workload_identity(),
@@ -3183,7 +3106,6 @@ mod linux {
                     control_port: 5500,
                     tls: placeholder_server_tls(),
                 },
-                multiplexed: false,
                 resource_claims: std::collections::BTreeMap::from([(
                     "kubernetes.pod_uid".to_string(),
                     "pod-uid-a".to_string(),
@@ -3224,7 +3146,6 @@ mod linux {
                         address: "127.0.0.1:5500".parse().expect("control address"),
                         tls: placeholder_server_tls(),
                     },
-                    multiplexed: true,
                     resource_claims: std::collections::BTreeMap::new(),
                     resource_claim_files: std::collections::BTreeMap::new(),
                     workload_identity: test_workload_identity(),
@@ -3396,7 +3317,6 @@ mod linux {
                         address: "127.0.0.1:5500".parse().expect("control address"),
                         tls: placeholder_server_tls(),
                     },
-                    multiplexed: false,
                     resource_claims: std::collections::BTreeMap::new(),
                     resource_claim_files: std::collections::BTreeMap::new(),
                     workload_identity: test_workload_identity(),
@@ -3643,9 +3563,9 @@ mod linux {
             let process = Arc::new(
                 ManagedProcess::spawn(
                     process_runtime.handle(),
+                    &workload_launcher,
                     ManagedProcessLaunch {
                         process_id: "generation-retained:main:0".to_string(),
-                        sandbox_id: "sandbox-retained".to_string(),
                         spec: agent_spec.clone(),
                         policy,
                         provider_env_revision: 0,
@@ -3666,7 +3586,6 @@ mod linux {
                         address: "127.0.0.1:5500".parse().expect("control address"),
                         tls: placeholder_server_tls(),
                     },
-                    multiplexed: false,
                     resource_claims: std::collections::BTreeMap::new(),
                     resource_claim_files: std::collections::BTreeMap::new(),
                     workload_identity: test_workload_identity(),
@@ -3811,7 +3730,7 @@ mod linux {
                 .start_exec(
                     &sleep_request.request_id,
                     &sleep_request.payload_digest,
-                    sleep_spec,
+                    sleep_spec.clone(),
                 )
                 .expect("reattach exec after response loss");
             assert_eq!(replayed.process_id, retained_id);
@@ -3820,6 +3739,17 @@ mod linux {
             assert_eq!(
                 boundary.signal_exec(&retained_id, SignalWire::Kill),
                 Response::Signaled
+            );
+            lock(&boundary.exec_handles).remove(&retained_id);
+            assert!(
+                boundary
+                    .start_exec(
+                        &sleep_request.request_id,
+                        &sleep_request.payload_digest,
+                        sleep_spec,
+                    )
+                    .is_err(),
+                "an evicted exec request must never start a second process"
             );
 
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -3863,7 +3793,12 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::run_boundary;
+pub fn run_boundary(
+    config_path: &Path,
+    qualification: crate::RuntimeQualification,
+) -> Result<(), String> {
+    linux::run_boundary(config_path, qualification)
+}
 
 #[cfg(not(target_os = "linux"))]
 pub fn run_boundary(
