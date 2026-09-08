@@ -3,6 +3,10 @@
 
 # Rust check, lint, and format tasks
 
+["perf:seccomp"]
+description = "Compare native and sandbox-filtered TCP and DNS performance"
+run = "cargo run --release -p openshell-sandbox --features perf-harness --bin openshell-seccomp-perf --"
+
 ["rust:check"]
 description = "Check all Rust crates for errors"
 depends = ["rust:lockfiles:check"]
