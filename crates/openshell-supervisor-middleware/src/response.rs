@@ -1476,7 +1476,7 @@ fn permitted_body_modes(
     {
         modes.push(HttpResponseBodyMode::WholeBodyBytes as i32);
     }
-    if entry.max_payload_bytes >= 2 {
+    if entry.max_payload_bytes > 0 {
         modes.push(HttpResponseBodyMode::StreamBytes as i32);
     }
     modes
@@ -2213,6 +2213,24 @@ mod tests {
             }],
             connection_nominated_headers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn stream_mode_requires_only_one_byte_of_payload_capacity() {
+        let mut described = DescribedChainEntry {
+            entry: entry(OnError::FailClosed),
+            service: None,
+            binding: None,
+            max_payload_bytes: 1,
+            timeout: Duration::from_millis(500),
+        };
+
+        let modes = permitted_body_modes(&input(200), &described, None);
+        assert!(modes.contains(&(HttpResponseBodyMode::StreamBytes as i32)));
+
+        described.max_payload_bytes = 0;
+        let modes = permitted_body_modes(&input(200), &described, None);
+        assert!(!modes.contains(&(HttpResponseBodyMode::StreamBytes as i32)));
     }
 
     #[tokio::test]
