@@ -1,0 +1,12 @@
+#cloud-config
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+users:
+  - name: tmachine
+    plain_text_passwd: tmachine
+    lock_passwd: false
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+ssh_pwauth: true
+power_state:
+  mode: poweroff
