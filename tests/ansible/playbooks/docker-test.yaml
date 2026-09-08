@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Test Docker
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: List Docker containers
+      ansible.builtin.command:
+        argv:
+          - docker
+          - ps
+      changed_when: false

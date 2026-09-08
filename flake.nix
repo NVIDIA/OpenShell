@@ -45,28 +45,35 @@
           overlays = [ (import rust-overlay) ];
         };
         testGuestPkgs = import nixpkgs-test-guest { inherit system; };
-        commonDevShellPackages = with pkgs; [
-          actionlint
-          cargo-auditable
-          cargo-deny
-          cargo-nextest
-          # Assemble Debian artifacts on macOS and Linux.
-          dpkg
-          # Build and inspect ext4 images in VM driver tests.
-          e2fsprogs
-          git
-          # Required to find packages.
-          pkg-config
-          # Coverage.
-          lcov
-          kubernetes-helm
-          syft
-          trivy
-          uv
-          yq-go
-          zizmor
-          zstd
-        ];
+        commonDevShellPackages =
+          with pkgs;
+          [
+            actionlint
+            cargo-auditable
+            cargo-deny
+            cargo-nextest
+            # Assemble Debian artifacts on macOS and Linux.
+            dpkg
+            # Build and inspect ext4 images in VM driver tests.
+            e2fsprogs
+            git
+            # Required to find packages.
+            pkg-config
+            # Coverage.
+            lcov
+            kubernetes-helm
+            syft
+            trivy
+            uv
+            yq-go
+            zizmor
+            zstd
+          ]
+          ++ pkgs.lib.optionals (system == "x86_64-linux") [
+            pkgs.python3Packages.ansible-core
+            pkgs.sshpass
+            testMachines.package
+          ];
         treefmtEval = treefmt-nix.lib.evalModule pkgs {
           projectRootFile = "flake.nix";
           programs.nixfmt.enable = true;
@@ -114,17 +121,30 @@
           qemuPkgs = testGuestPkgs;
           firmwarePkgs = testGuestPkgs;
         };
+        testMachines =
+          if system == "x86_64-linux" then import ./tests/config.nix { inherit pkgs; } else null;
       in
       {
         apps.test-guest = testGuest.app;
         apps.test-guest-cache = testGuest.cacheApp;
 
-        packages.vm-runtime = vmRuntime;
+        packages = {
+          vm-runtime = vmRuntime;
+        }
+        // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          tmachine = testMachines.package;
+          tmachine-config = testMachines.config;
+          tmachine-unwrapped = testMachines.unwrapped;
+        };
 
         devShells.default = pkgs.mkShellNoCC {
           packages = [ rustToolchain ] ++ commonDevShellPackages;
 
           env = pkgs.lib.foldl' (env: toolchain: env // toolchain.env) { } (builtins.attrValues toolchains);
+
+          shellHook = pkgs.lib.optionalString (system == "x86_64-linux") ''
+            export ANSIBLE_CONFIG="$(git rev-parse --show-toplevel)/tests/ansible/ansible.cfg"
+          '';
         };
 
         formatter = treefmtEval.config.build.wrapper;
