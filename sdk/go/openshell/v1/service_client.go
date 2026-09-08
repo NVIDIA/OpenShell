@@ -54,11 +54,7 @@ func (s *serviceClient) List(ctx context.Context, workspace, sandboxName string,
 		if opts[0].Limit < 0 {
 			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
 		}
-		if opts[0].Offset < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "offset must not be negative"}
-		}
 		req.Limit = uint32(opts[0].Limit)
-		req.Offset = uint32(opts[0].Offset)
 		req.AllWorkspaces = opts[0].AllWorkspaces
 	}
 
