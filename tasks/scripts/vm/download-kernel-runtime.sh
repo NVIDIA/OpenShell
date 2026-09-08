@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Download pre-built VM kernel runtime artifacts from the vm-runtime GitHub
+# Download pre-built VM kernel runtime artifacts from the capability-free
+# vm-runtime GitHub
 # Release and stage them for the openshell-driver-vm cargo build.
 #
 # This script is used by driver release CI and can also be used locally
@@ -12,7 +13,7 @@
 #   ./download-kernel-runtime.sh [--platform PLATFORM]
 #
 # Environment:
-#   VM_RUNTIME_RELEASE_TAG  - GitHub Release tag (default: vm-runtime)
+#   VM_RUNTIME_RELEASE_TAG  - GitHub Release tag (default: vm-runtime-capability-free)
 #   GITHUB_REPOSITORY       - owner/repo (default: NVIDIA/OpenShell)
 #   OPENSHELL_VM_RUNTIME_COMPRESSED_DIR - Output directory (default: target/vm-runtime-compressed)
 #
@@ -25,7 +26,7 @@ source "${SCRIPT_DIR}/_lib.sh"
 ROOT="$(vm_lib_root)"
 source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env" 2>/dev/null || true
 
-RELEASE_TAG="${VM_RUNTIME_RELEASE_TAG:-vm-runtime}"
+RELEASE_TAG="${VM_RUNTIME_RELEASE_TAG:-vm-runtime-capability-free}"
 REPO="${GITHUB_REPOSITORY:-NVIDIA/OpenShell}"
 OUTPUT_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-compressed}"
 UMOCI_VERSION="${UMOCI_VERSION:-v0.6.0}"
@@ -45,7 +46,7 @@ while [[ $# -gt 0 ]]; do
             echo "Platforms: linux-aarch64, linux-x86_64, darwin-aarch64"
             echo ""
             echo "Environment:"
-            echo "  VM_RUNTIME_RELEASE_TAG              Release tag (default: vm-runtime)"
+            echo "  VM_RUNTIME_RELEASE_TAG              Release tag (default: vm-runtime-capability-free)"
             echo "  GITHUB_REPOSITORY                   owner/repo (default: NVIDIA/OpenShell)"
             echo "  OPENSHELL_VM_RUNTIME_COMPRESSED_DIR Output directory"
             exit 0

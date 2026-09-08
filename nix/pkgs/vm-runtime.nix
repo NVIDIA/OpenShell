@@ -13,38 +13,35 @@ let
     {
       x86_64-linux = {
         platform = "linux-x86_64";
-        hash = "sha256-dw3Lc7IapCyNeE7j6dnlgd/b8Yc91/7IOi3XJORyILQ=";
+        hash = "sha256-dJauQnv4L+rT003rJfFPbrJNsQwoWpX61X3GlBkuIog=";
         artifacts = [
           "libkrun.so"
           "libkrunfw.so.5"
-          "gvproxy"
           "umoci"
         ];
       };
       aarch64-linux = {
         platform = "linux-aarch64";
-        hash = "sha256-aJDuDb7AsuH9R+AyXA/JIxE9fJmZ5kP0Lkhg6F0Ot5A=";
+        hash = "sha256-VvqnmAClehcU1IifoZsd4XrSI6N2Hlu1dskNuPQxME4=";
         artifacts = [
           "libkrun.so"
           "libkrunfw.so.5"
-          "gvproxy"
           "umoci"
         ];
       };
       aarch64-darwin = {
         platform = "darwin-aarch64";
-        hash = "sha256-BDSeY5XGDozaBZzHTiQQX90jzsSc6shJZs5zdzludX0=";
+        hash = "sha256-orr16ZuCLQ5b2Uwg1NuobjLMpmxZjaGwmb+i/QZ5TZM=";
         artifacts = [
           "libkrun.dylib"
           "libkrunfw.5.dylib"
-          "gvproxy"
           "umoci"
         ];
       };
     }
     .${stdenv.hostPlatform.system};
   archive = fetchurl {
-    url = "https://github.com/NVIDIA/OpenShell/releases/download/vm-runtime/vm-runtime-${runtime.platform}.tar.zst";
+    url = "https://github.com/NVIDIA/OpenShell/releases/download/vm-runtime-capability-free/vm-runtime-${runtime.platform}.tar.zst";
     inherit (runtime) hash;
   };
 in
@@ -59,7 +56,6 @@ stdenv.mkDerivation {
 
     mkdir -p "$out"
     tar --extract --file ${archive} --directory "$out"
-
     mkdir -p "$out/compressed"
     for artifact in ${lib.escapeShellArgs runtime.artifacts}; do
       zstd -19 -T1 "$out/$artifact" -o "$out/compressed/$artifact.zst"
