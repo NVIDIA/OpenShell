@@ -149,8 +149,17 @@ pub type SandboxWorkloadTemplateSpec = proto::SandboxWorkloadTemplateSpec;
 /// Portable sandbox workload configuration for template-backed sandboxes.
 pub type SandboxWorkloadConfig = proto::SandboxWorkloadConfig;
 
-/// Portable resource requirements for template-backed sandboxes.
-pub type SandboxResources = proto::SandboxResources;
+/// Portable resource requirements shared by inline and template-backed sandboxes.
+pub type ResourceRequirements = proto::ResourceRequirements;
+
+/// CPU resource requirements for a sandbox workload.
+pub type CpuResourceRequirements = proto::CpuResourceRequirements;
+
+/// Memory resource requirements for a sandbox workload.
+pub type MemoryResourceRequirements = proto::MemoryResourceRequirements;
+
+/// GPU resource requirements for a sandbox workload.
+pub type GpuResourceRequirements = proto::GpuResourceRequirements;
 
 /// Desired service level for sandboxes created from a template.
 pub type SandboxServiceLevel = proto::SandboxServiceLevel;

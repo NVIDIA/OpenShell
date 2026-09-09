@@ -25,7 +25,7 @@ pub use openshell_core::proto::{
     DeleteSandboxRequest, DeleteSandboxTemplateRequest, DeleteWorkspaceRequest, ExecSandboxRequest,
     GetSandboxRequest, GetSandboxTemplateRequest, GetWorkspaceRequest, HealthRequest,
     ListProvidersRequest, ListSandboxTemplatesRequest, ListSandboxesRequest, ListWorkspacesRequest,
-    Sandbox, SandboxPhase as ProtoSandboxPhase, SandboxResources, SandboxServiceLevel,
+    ResourceRequirements, Sandbox, SandboxPhase as ProtoSandboxPhase, SandboxServiceLevel,
     SandboxSpec as ProtoSandboxSpec, SandboxStartup, SandboxTemplate, SandboxTemplateResponse,
     SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance,
     SandboxWorkloadTemplateSpec, ServiceStatus as ProtoServiceStatus, StartSandboxRequest,

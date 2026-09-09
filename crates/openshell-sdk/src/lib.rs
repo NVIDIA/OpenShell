@@ -49,7 +49,8 @@ pub use error::SdkError;
 pub use pagination::{Page, Pager};
 pub use refresh::{Refresh, RefreshError, RefreshedToken, TokenSource};
 pub use types::{
-    ExecOptions, ExecResult, Health, ListOptions, SandboxPhase, SandboxRef, SandboxResources,
+    CpuResourceRequirements, ExecOptions, ExecResult, GpuResourceRequirements, Health, ListOptions,
+    MemoryResourceRequirements, ResourceRequirements, SandboxPhase, SandboxRef,
     SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplateCreateSpec,
     SandboxTemplateListOptions, SandboxWorkloadConfig, SandboxWorkloadTemplate,
     SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec, ServiceStatus, WorkspaceRef,
