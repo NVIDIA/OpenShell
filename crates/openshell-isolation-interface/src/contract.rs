@@ -831,7 +831,11 @@ pub struct MediatedDnsQuery {
     pub request: Vec<u8>,
     /// Workload DNS transport.
     pub transport: DnsTransport,
-    /// Identity of the process that issued the DNS request.
+    /// Identity of the process that issued the DNS request when the backend
+    /// can observe it authoritatively. Native socket-write adapters report a
+    /// resolution error because the relay cannot prove which descriptor
+    /// holder sent a datagram. Consumers must never treat unavailable
+    /// identity as a binary-policy grant.
     pub binary_identity: Result<BinaryIdentity, ResolveError>,
     /// Single-use response channel owned by the backend adapter.
     pub response: oneshot::Sender<Result<Vec<u8>, BackendError>>,
