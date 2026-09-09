@@ -152,6 +152,9 @@ func (m *mockSandboxResolver) Get(_ context.Context, _, name string) (*Sandbox, 
 func (m *mockSandboxResolver) List(_ context.Context, _ string, _ ...ListOptions) ([]*Sandbox, error) {
 	return nil, nil
 }
+func (m *mockSandboxResolver) ListAll(_ context.Context, _ ...ListOptions) ([]*Sandbox, error) {
+	return nil, nil
+}
 func (m *mockSandboxResolver) Delete(_ context.Context, _, _ string) error { return nil }
 func (m *mockSandboxResolver) AttachProvider(_ context.Context, _, _, _ string, _ uint64) (*AttachProviderResult, error) {
 	return nil, nil

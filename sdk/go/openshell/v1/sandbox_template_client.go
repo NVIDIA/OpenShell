@@ -30,8 +30,8 @@ func (s *sandboxTemplateClient) Create(ctx context.Context, workspace string, te
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: err.Error()}
 	}
 	resp, err := s.client.CreateSandboxTemplate(ctx, &pb.CreateSandboxTemplateRequest{
-		Template:  protoTemplate,
-		Workspace: workspace,
+		Template:       protoTemplate,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -41,8 +41,8 @@ func (s *sandboxTemplateClient) Create(ctx context.Context, workspace string, te
 
 func (s *sandboxTemplateClient) Get(ctx context.Context, workspace, name string) (*SandboxWorkloadTemplate, error) {
 	resp, err := s.client.GetSandboxTemplate(ctx, &pb.GetSandboxTemplateRequest{
-		Name:      name,
-		Workspace: workspace,
+		Name:           name,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -52,8 +52,16 @@ func (s *sandboxTemplateClient) Get(ctx context.Context, workspace, name string)
 
 func (s *sandboxTemplateClient) List(ctx context.Context, workspace string, opts ...ListOptions) ([]*SandboxWorkloadTemplate, error) {
 	req := &pb.ListSandboxTemplatesRequest{
-		Workspace: workspace,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	}
+	return s.list(ctx, req, opts...)
+}
+
+func (s *sandboxTemplateClient) ListAll(ctx context.Context, opts ...ListOptions) ([]*SandboxWorkloadTemplate, error) {
+	return s.list(ctx, &pb.ListSandboxTemplatesRequest{WorkspaceScope: allWorkspacesScope()}, opts...)
+}
+
+func (s *sandboxTemplateClient) list(ctx context.Context, req *pb.ListSandboxTemplatesRequest, opts ...ListOptions) ([]*SandboxWorkloadTemplate, error) {
 	if len(opts) > 0 {
 		if opts[0].Limit < 0 {
 			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
@@ -64,10 +72,6 @@ func (s *sandboxTemplateClient) List(ctx context.Context, workspace string, opts
 		req.Limit = uint32(opts[0].Limit)
 		req.Offset = uint32(opts[0].Offset)
 		req.LabelSelector = opts[0].LabelSelector
-		req.AllWorkspaces = opts[0].AllWorkspaces
-		if req.AllWorkspaces {
-			req.Workspace = ""
-		}
 	}
 
 	resp, err := s.client.ListSandboxTemplates(ctx, req)
@@ -84,8 +88,8 @@ func (s *sandboxTemplateClient) List(ctx context.Context, workspace string, opts
 
 func (s *sandboxTemplateClient) Delete(ctx context.Context, workspace, name string) (bool, error) {
 	resp, err := s.client.DeleteSandboxTemplate(ctx, &pb.DeleteSandboxTemplateRequest{
-		Name:      name,
-		Workspace: workspace,
+		Name:           name,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return false, converter.FromGRPCError(err)

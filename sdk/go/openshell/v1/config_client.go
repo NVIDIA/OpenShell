@@ -58,7 +58,9 @@ func (c *configClient) Update(ctx context.Context, workspace string, update *Con
 	if convErr != nil {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: convErr.Error()}
 	}
-	req.Workspace = workspace
+	if !req.GetGlobal() {
+		req.WorkspaceScope = namedWorkspaceScope(workspace)
+	}
 	resp, err := c.client.UpdateConfig(ctx, req)
 	if err != nil {
 		return nil, converter.FromGRPCError(err)

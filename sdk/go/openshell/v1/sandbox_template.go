@@ -41,5 +41,6 @@ type SandboxTemplateInterface interface {
 	Create(ctx context.Context, workspace string, template *SandboxWorkloadTemplate) (*SandboxWorkloadTemplate, error)
 	Get(ctx context.Context, workspace, name string) (*SandboxWorkloadTemplate, error)
 	List(ctx context.Context, workspace string, opts ...ListOptions) ([]*SandboxWorkloadTemplate, error)
+	ListAll(ctx context.Context, opts ...ListOptions) ([]*SandboxWorkloadTemplate, error)
 	Delete(ctx context.Context, workspace, name string) (bool, error)
 }

@@ -21,11 +21,11 @@ func newServiceClient(conn grpc.ClientConnInterface) *serviceClient {
 
 func (s *serviceClient) Expose(ctx context.Context, workspace, sandboxName, serviceName string, targetPort uint32, domain bool) (*ServiceEndpoint, error) {
 	resp, err := s.client.ExposeService(ctx, &pb.ExposeServiceRequest{
-		Sandbox:    sandboxName,
-		Service:    serviceName,
-		TargetPort: targetPort,
-		Domain:     domain,
-		Workspace:  workspace,
+		Sandbox:        sandboxName,
+		Service:        serviceName,
+		TargetPort:     targetPort,
+		Domain:         domain,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -35,9 +35,9 @@ func (s *serviceClient) Expose(ctx context.Context, workspace, sandboxName, serv
 
 func (s *serviceClient) Get(ctx context.Context, workspace, sandboxName, serviceName string) (*ServiceEndpoint, error) {
 	resp, err := s.client.GetService(ctx, &pb.GetServiceRequest{
-		Sandbox:   sandboxName,
-		Service:   serviceName,
-		Workspace: workspace,
+		Sandbox:        sandboxName,
+		Service:        serviceName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -47,9 +47,17 @@ func (s *serviceClient) Get(ctx context.Context, workspace, sandboxName, service
 
 func (s *serviceClient) List(ctx context.Context, workspace, sandboxName string, opts ...ListOptions) ([]*ServiceEndpoint, error) {
 	req := &pb.ListServicesRequest{
-		Sandbox:   sandboxName,
-		Workspace: workspace,
+		Sandbox:        sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	}
+	return s.list(ctx, req, opts...)
+}
+
+func (s *serviceClient) ListAll(ctx context.Context, opts ...ListOptions) ([]*ServiceEndpoint, error) {
+	return s.list(ctx, &pb.ListServicesRequest{WorkspaceScope: allWorkspacesScope()}, opts...)
+}
+
+func (s *serviceClient) list(ctx context.Context, req *pb.ListServicesRequest, opts ...ListOptions) ([]*ServiceEndpoint, error) {
 	if len(opts) > 0 {
 		if opts[0].Limit < 0 {
 			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
@@ -59,7 +67,6 @@ func (s *serviceClient) List(ctx context.Context, workspace, sandboxName string,
 		}
 		req.Limit = uint32(opts[0].Limit)
 		req.Offset = uint32(opts[0].Offset)
-		req.AllWorkspaces = opts[0].AllWorkspaces
 	}
 
 	resp, err := s.client.ListServices(ctx, req)
@@ -76,9 +83,9 @@ func (s *serviceClient) List(ctx context.Context, workspace, sandboxName string,
 
 func (s *serviceClient) Delete(ctx context.Context, workspace, sandboxName, serviceName string) error {
 	_, err := s.client.DeleteService(ctx, &pb.DeleteServiceRequest{
-		Sandbox:   sandboxName,
-		Service:   serviceName,
-		Workspace: workspace,
+		Sandbox:        sandboxName,
+		Service:        serviceName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return converter.FromGRPCError(err)

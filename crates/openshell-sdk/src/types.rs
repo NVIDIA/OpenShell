@@ -167,8 +167,6 @@ pub struct SandboxTemplateListOptions {
     pub offset: u32,
     /// Optional label selector in `key=value,key2=value2` form.
     pub label_selector: String,
-    /// List templates across all workspaces.
-    pub all_workspaces: bool,
 }
 
 /// Reference to a sandbox owned by the gateway.

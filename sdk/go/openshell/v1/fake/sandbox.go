@@ -447,14 +447,18 @@ func (c *fakeSandboxClient) Get(_ context.Context, workspace, name string) (*typ
 
 // List returns all sandboxes. ListOptions are accepted for interface
 // compatibility but filtering is not implemented.
-func (c *fakeSandboxClient) List(_ context.Context, workspace string, opts ...v1.ListOptions) ([]*types.Sandbox, error) {
+func (c *fakeSandboxClient) List(_ context.Context, workspace string, _ ...v1.ListOptions) ([]*types.Sandbox, error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
-	if len(opts) > 0 && opts[0].AllWorkspaces {
-		return c.store.ListAll(), nil
-	}
 	return c.store.List(workspace), nil
+}
+
+func (c *fakeSandboxClient) ListAll(_ context.Context, _ ...v1.ListOptions) ([]*types.Sandbox, error) {
+	if c.closedFunc() {
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+	}
+	return c.store.ListAll(), nil
 }
 
 // Stop transitions a sandbox to the Stopped phase.

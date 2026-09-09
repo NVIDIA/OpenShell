@@ -42,6 +42,17 @@ from openshell.sandbox import (
 )
 
 
+def _request_workspace(request: Any) -> str | None:
+    scope = request.workspace_scope
+    if scope.WhichOneof("selection") == "workspace":
+        return cast("str", scope.workspace)
+    return None
+
+
+def _request_selects_all_workspaces(request: Any) -> bool:
+    return request.workspace_scope.WhichOneof("selection") == "all_workspaces"
+
+
 def _client_credentials_fixture() -> dict[str, Any]:
     return json.loads(
         (
@@ -1981,7 +1992,9 @@ class _FakeSandboxStub:
         _ = timeout
         return SimpleNamespace(
             sandbox=_make_sandbox_proto(
-                "sandbox-1", request.name, workspace=request.workspace or "default"
+                "sandbox-1",
+                request.name,
+                workspace=_request_workspace(request) or "default",
             )
         )
 
@@ -2006,7 +2019,7 @@ class _FakeSandboxStub:
                 "sandbox-1",
                 request.name,
                 phase=openshell_pb2.SANDBOX_PHASE_STOPPED,
-                workspace=request.workspace,
+                workspace=_request_workspace(request) or "default",
             )
         )
 
@@ -2022,7 +2035,7 @@ class _FakeSandboxStub:
                 "sandbox-1",
                 request.name,
                 phase=openshell_pb2.SANDBOX_PHASE_STARTING,
-                workspace=request.workspace,
+                workspace=_request_workspace(request) or "default",
             )
         )
 
@@ -2038,7 +2051,7 @@ class _FakeSandboxStub:
                 "sandbox-1",
                 request.name or "generated",
                 dict(request.labels),
-                workspace=request.workspace or "default",
+                workspace=_request_workspace(request) or "default",
             )
         )
 
@@ -2071,7 +2084,7 @@ class _FakeSandboxStub:
         return SimpleNamespace(
             template=_make_workload_template_proto(
                 request.name,
-                workspace=request.workspace or "default",
+                workspace=_request_workspace(request) or "default",
             )
         )
 
@@ -2217,7 +2230,7 @@ def test_sandbox_template_create_builds_template_from_public_fields() -> None:
 
     assert created.metadata.name == "gpu-kata"
     assert stub.create_template_request is not None
-    assert stub.create_template_request.workspace == "default"
+    assert _request_workspace(stub.create_template_request) == "default"
     template = stub.create_template_request.template
     assert template.metadata.name == "gpu-kata"
     assert dict(template.metadata.labels) == {"team": "runtime"}
@@ -2361,7 +2374,7 @@ def test_sandbox_template_client_crud_forwards_requests() -> None:
 
     assert created.metadata.name == "gpu-kata"
     assert stub.create_template_request is not None
-    assert stub.create_template_request.workspace == "default"
+    assert _request_workspace(stub.create_template_request) == "default"
     assert (
         stub.create_template_request.template.spec.workload.image
         == "ghcr.io/test/gpu-kata:latest"
@@ -2377,34 +2390,34 @@ def test_sandbox_template_client_crud_forwards_requests() -> None:
     assert got.metadata.name == "gpu-kata"
     assert stub.get_template_request is not None
     assert stub.get_template_request.name == "gpu-kata"
-    assert stub.get_template_request.workspace == "default"
+    assert _request_workspace(stub.get_template_request) == "default"
 
     listed = client.list(
         workspace="default", limit=50, offset=10, label_selector="team=runtime"
     )
     assert len(listed) == 1
     assert stub.list_template_request is not None
-    assert stub.list_template_request.workspace == "default"
+    assert _request_workspace(stub.list_template_request) == "default"
     assert stub.list_template_request.limit == 50
     assert stub.list_template_request.offset == 10
     assert stub.list_template_request.label_selector == "team=runtime"
-    assert not stub.list_template_request.all_workspaces
+    assert not _request_selects_all_workspaces(stub.list_template_request)
 
     assert client.delete("gpu-kata", workspace="default") is True
     assert stub.delete_template_request is not None
     assert stub.delete_template_request.name == "gpu-kata"
-    assert stub.delete_template_request.workspace == "default"
+    assert _request_workspace(stub.delete_template_request) == "default"
 
 
-def test_sandbox_template_list_for_all_workspaces_clears_workspace() -> None:
+def test_sandbox_template_list_for_all_workspaces_selects_all() -> None:
     stub = _FakeSandboxStub()
     client = _template_client_with_fake_stub(stub)
 
     client.list_for_all_workspaces(limit=100, offset=5, label_selector="team=runtime")
 
     assert stub.list_template_request is not None
-    assert stub.list_template_request.all_workspaces
-    assert stub.list_template_request.workspace == ""
+    assert _request_selects_all_workspaces(stub.list_template_request)
+    assert _request_workspace(stub.list_template_request) is None
     assert stub.list_template_request.limit == 100
     assert stub.list_template_request.offset == 5
     assert stub.list_template_request.label_selector == "team=runtime"
@@ -2417,13 +2430,13 @@ def test_stop_and_start_forward_workspace_and_return_phase() -> None:
     stopped = client.stop("job-1", workspace="team-a")
     assert stub.stop_request is not None
     assert stub.stop_request.name == "job-1"
-    assert stub.stop_request.workspace == "team-a"
+    assert _request_workspace(stub.stop_request) == "team-a"
     assert stopped.phase == openshell_pb2.SANDBOX_PHASE_STOPPED
 
     starting = client.start("job-1", workspace="team-a")
     assert stub.start_request is not None
     assert stub.start_request.name == "job-1"
-    assert stub.start_request.workspace == "team-a"
+    assert _request_workspace(stub.start_request) == "team-a"
     assert starting.phase == openshell_pb2.SANDBOX_PHASE_STARTING
 
 
@@ -2449,7 +2462,7 @@ def test_wait_ready_handles_terminal_main_process_results(
                     "sandbox-1",
                     request.name,
                     phase=phase,
-                    workspace=request.workspace,
+                    workspace=_request_workspace(request) or "default",
                 )
             )
 
@@ -2471,7 +2484,7 @@ def test_create_without_args_sends_empty_metadata() -> None:
     assert stub.create_request is not None
     assert stub.create_request.name == ""
     assert dict(stub.create_request.labels) == {}
-    assert stub.create_request.workspace == "default"
+    assert _request_workspace(stub.create_request) == "default"
 
 
 def test_create_copies_caller_labels() -> None:
@@ -2508,7 +2521,7 @@ def test_list_forwards_label_selector() -> None:
 
     assert stub.list_request is not None
     assert stub.list_request.label_selector == "aiq=deep-research"
-    assert stub.list_request.workspace == "default"
+    assert _request_workspace(stub.list_request) == "default"
 
 
 def test_list_without_selector_sends_empty_string() -> None:
@@ -2725,7 +2738,7 @@ def test_create_passes_workspace_to_proto() -> None:
     ref = client.create(workspace="staging", name="job-1")
 
     assert stub.create_request is not None
-    assert stub.create_request.workspace == "staging"
+    assert _request_workspace(stub.create_request) == "staging"
     assert ref.workspace == "staging"
 
 
@@ -2736,7 +2749,7 @@ def test_get_passes_workspace_to_proto() -> None:
     ref = client.get("job-1", workspace="production")
 
     assert stub.get_request is not None
-    assert stub.get_request.workspace == "production"
+    assert _request_workspace(stub.get_request) == "production"
     assert ref.workspace == "production"
 
 
@@ -2748,7 +2761,7 @@ def test_delete_passes_workspace_to_proto() -> None:
 
     assert result is True
     assert stub.delete_request is not None
-    assert stub.delete_request.workspace == "staging"
+    assert _request_workspace(stub.delete_request) == "staging"
 
 
 def test_list_for_all_workspaces_sets_flag() -> None:
@@ -2758,8 +2771,8 @@ def test_list_for_all_workspaces_sets_flag() -> None:
     client.list_for_all_workspaces()
 
     assert stub.list_request is not None
-    assert stub.list_request.all_workspaces is True
-    assert stub.list_request.workspace == ""
+    assert _request_selects_all_workspaces(stub.list_request)
+    assert _request_workspace(stub.list_request) is None
 
 
 def test_list_with_workspace_passes_workspace() -> None:
@@ -2769,8 +2782,8 @@ def test_list_with_workspace_passes_workspace() -> None:
     client.list(workspace="staging")
 
     assert stub.list_request is not None
-    assert stub.list_request.workspace == "staging"
-    assert stub.list_request.all_workspaces is False
+    assert _request_workspace(stub.list_request) == "staging"
+    assert not _request_selects_all_workspaces(stub.list_request)
 
 
 def test_sandbox_ref_includes_workspace_from_proto() -> None:
@@ -2809,4 +2822,4 @@ def test_sandbox_session_delete_passes_workspace() -> None:
     session.delete()
 
     assert stub.delete_request is not None
-    assert stub.delete_request.workspace == "staging"
+    assert _request_workspace(stub.delete_request) == "staging"

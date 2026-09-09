@@ -30,6 +30,9 @@ if err != nil {
 for _, svc := range services {
     fmt.Printf("  %s -> port %d (%s)\n", svc.ServiceName, svc.TargetPort, svc.URL)
 }
+
+// Platform Admin only: list services across all workspaces
+allServices, err := client.Services().ListAll(ctx)
 ```
 
 ## Delete

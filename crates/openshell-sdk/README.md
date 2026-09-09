@@ -46,6 +46,7 @@ mTLS (client certificates) is not supported.
 `health`, `create_sandbox`, `get_sandbox`, `list_sandboxes`, `delete_sandbox`,
 `create_sandbox_from_template`, `create_sandbox_template`,
 `get_sandbox_template`, `list_sandbox_templates`, `delete_sandbox_template`,
+`list_sandboxes_all_workspaces`, `list_sandbox_templates_all_workspaces`,
 `wait_ready`, `wait_deleted`, and `exec`. Curated types (`SandboxSpec`,
 `SandboxRef`, `Health`, `ListOptions`, `SandboxTemplateListOptions`,
 `ExecOptions`, `SandboxPhase`) use SDK-shaped enums rather than raw proto
@@ -53,6 +54,10 @@ integers where practical. Reusable template resources are exposed as
 `SandboxWorkloadTemplate` proto aliases so callers can populate the full
 portable workload shape and driver config. Failures map to a typed `SdkError`
 with a discriminable kind.
+
+Curated calls without a workspace argument explicitly select the `default`
+workspace. Cross-workspace listing uses the separate `*_all_workspaces`
+methods and requires Platform Admin access.
 
 ```rust
 use openshell_sdk::{

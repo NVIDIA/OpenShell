@@ -106,6 +106,14 @@ func (c *fakeSandboxTemplateClient) Get(_ context.Context, workspace, name strin
 }
 
 func (c *fakeSandboxTemplateClient) List(_ context.Context, workspace string, opts ...v1.ListOptions) ([]*types.SandboxWorkloadTemplate, error) {
+	return c.list(workspace, false, opts...)
+}
+
+func (c *fakeSandboxTemplateClient) ListAll(_ context.Context, opts ...v1.ListOptions) ([]*types.SandboxWorkloadTemplate, error) {
+	return c.list("", true, opts...)
+}
+
+func (c *fakeSandboxTemplateClient) list(workspace string, allWorkspaces bool, opts ...v1.ListOptions) ([]*types.SandboxWorkloadTemplate, error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
@@ -120,7 +128,7 @@ func (c *fakeSandboxTemplateClient) List(_ context.Context, workspace string, op
 		}
 	}
 	var templates []*types.SandboxWorkloadTemplate
-	if options.AllWorkspaces {
+	if allWorkspaces {
 		templates = c.store.ListAll()
 	} else {
 		templates = c.store.List(workspace)

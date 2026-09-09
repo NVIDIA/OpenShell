@@ -7,6 +7,26 @@ package openshell.datamodel.v1;
 
 import "options.proto";
 
+// Selects the workspace scope for a public API request.
+//
+// Requests that operate on one workspace require a non-empty `workspace`.
+// Cross-workspace list requests additionally accept `all_workspaces`. The
+// containing request documents which selections it supports; an omitted
+// selector is invalid for workspace-scoped operations.
+message WorkspaceSelector {
+  oneof selection {
+    // One explicitly named workspace. Use `default` to select the gateway's
+    // default workspace; an empty name is invalid.
+    string workspace = 1;
+    // All workspaces the caller is authorized to access. Only supported by
+    // requests that explicitly document cross-workspace behavior.
+    AllWorkspaces all_workspaces = 2;
+  }
+}
+
+// Marker for the all-workspaces selector variant.
+message AllWorkspaces {}
+
 // Kubernetes-style metadata shared by all top-level OpenShell domain objects.
 //
 // This structure provides consistent metadata (identity, labels, annotations,

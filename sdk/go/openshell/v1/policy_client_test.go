@@ -650,7 +650,7 @@ func TestPolicyGetStatus_WithGlobal(t *testing.T) {
 	mock.mu.Lock()
 	assert.True(t, mock.lastStatusReq.GetGlobal())
 	assert.Empty(t, mock.lastStatusReq.GetName())
-	assert.Empty(t, mock.lastStatusReq.GetWorkspace())
+	assert.Nil(t, mock.lastStatusReq.GetWorkspaceScope())
 	mock.mu.Unlock()
 }
 
@@ -676,7 +676,7 @@ func TestPolicyGetStatus_WithGlobalIgnoresNonEmptyName(t *testing.T) {
 	mock.mu.Lock()
 	assert.True(t, mock.lastStatusReq.GetGlobal())
 	assert.Equal(t, "some-sandbox", mock.lastStatusReq.GetName())
-	assert.Equal(t, "some-workspace", mock.lastStatusReq.GetWorkspace())
+	assert.Nil(t, mock.lastStatusReq.GetWorkspaceScope())
 	mock.mu.Unlock()
 }
 
@@ -731,7 +731,7 @@ func TestPolicyGetStatus_WithoutGlobal_PreservesExistingBehavior(t *testing.T) {
 	// Verify global flag is false by default.
 	mock.mu.Lock()
 	assert.False(t, mock.lastStatusReq.GetGlobal())
-	assert.Equal(t, "default", mock.lastStatusReq.GetWorkspace())
+	assert.Equal(t, "default", mock.lastStatusReq.GetWorkspaceScope().GetWorkspace())
 	assert.Equal(t, "my-sandbox", mock.lastStatusReq.GetName())
 	mock.mu.Unlock()
 }
@@ -780,7 +780,7 @@ func TestPolicyList(t *testing.T) {
 
 	// Verify request was forwarded (no pagination options).
 	mock.mu.Lock()
-	assert.Equal(t, "default", mock.lastListReq.GetWorkspace())
+	assert.Equal(t, "default", mock.lastListReq.GetWorkspaceScope().GetWorkspace())
 	assert.Equal(t, uint32(0), mock.lastListReq.GetLimit())
 	assert.Equal(t, uint32(0), mock.lastListReq.GetOffset())
 	mock.mu.Unlock()
@@ -855,7 +855,7 @@ func TestPolicyList_WithGlobal(t *testing.T) {
 	// Verify global flag was forwarded in the proto request.
 	mock.mu.Lock()
 	assert.True(t, mock.lastListReq.GetGlobal())
-	assert.Empty(t, mock.lastListReq.GetWorkspace())
+	assert.Nil(t, mock.lastListReq.GetWorkspaceScope())
 	mock.mu.Unlock()
 }
 
@@ -877,7 +877,7 @@ func TestPolicyList_WithGlobalIgnoresWorkspace(t *testing.T) {
 
 	mock.mu.Lock()
 	assert.True(t, mock.lastListReq.GetGlobal())
-	assert.Equal(t, "some-workspace", mock.lastListReq.GetWorkspace())
+	assert.Nil(t, mock.lastListReq.GetWorkspaceScope())
 	mock.mu.Unlock()
 }
 
@@ -928,7 +928,7 @@ func TestPolicyList_WithoutGlobal_PreservesExistingBehavior(t *testing.T) {
 	// Verify global flag is false by default.
 	mock.mu.Lock()
 	assert.False(t, mock.lastListReq.GetGlobal())
-	assert.Equal(t, "default", mock.lastListReq.GetWorkspace())
+	assert.Equal(t, "default", mock.lastListReq.GetWorkspaceScope().GetWorkspace())
 	mock.mu.Unlock()
 }
 

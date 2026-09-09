@@ -999,6 +999,9 @@ func (r *flippableResolver) Create(context.Context, string, string, *SandboxSpec
 func (r *flippableResolver) List(context.Context, string, ...ListOptions) ([]*Sandbox, error) {
 	panic("not implemented")
 }
+func (r *flippableResolver) ListAll(context.Context, ...ListOptions) ([]*Sandbox, error) {
+	panic("not implemented")
+}
 func (r *flippableResolver) Delete(context.Context, string, string) error {
 	panic("not implemented")
 }

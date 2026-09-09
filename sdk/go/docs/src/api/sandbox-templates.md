@@ -97,8 +97,8 @@ templates, err := client.SandboxTemplates().List(ctx, "default", v1.ListOptions{
     Offset: 0,
 })
 
-allTemplates, err := client.SandboxTemplates().List(ctx, "", v1.ListOptions{
-    AllWorkspaces: true,
+allTemplates, err := client.SandboxTemplates().ListAll(ctx, v1.ListOptions{
+    Limit: 50,
 })
 ```
 

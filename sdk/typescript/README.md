@@ -190,9 +190,9 @@ await client.sandboxTemplates.list({ workspace: 'default', limit: 100 })
 await client.sandboxTemplates.delete('python', { workspace: 'default' })
 ```
 
-Use `allWorkspaces: true` on `list()` for a platform-admin view. The SDK clears
-the workspace field in that request because the gateway treats `workspace` and
-`allWorkspaces` as mutually exclusive.
+Use `allWorkspaces: true` on `list()` for a platform-admin view. The
+discriminated option type makes `workspace` and `allWorkspaces` mutually
+exclusive. Omitting both options explicitly selects the `default` workspace.
 
 ## Surface and roadmap
 

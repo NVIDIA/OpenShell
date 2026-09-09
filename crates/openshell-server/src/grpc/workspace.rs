@@ -70,7 +70,7 @@ fn membership_filter_subject<'a>(
     }
 }
 
-fn validate_workspace_name(name: &str) -> Result<(), Status> {
+pub fn validate_workspace_name(name: &str) -> Result<(), Status> {
     if name.is_empty() {
         return Err(Status::invalid_argument("workspace name is required"));
     }

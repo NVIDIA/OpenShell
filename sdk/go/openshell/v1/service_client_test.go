@@ -30,6 +30,7 @@ type mockServiceServer struct {
 	getErr    error
 	listErr   error
 	deleteErr error
+	lastList  *pb.ListServicesRequest
 }
 
 func newMockServiceServer() *mockServiceServer {
@@ -85,6 +86,7 @@ func (s *mockServiceServer) GetService(_ context.Context, req *pb.GetServiceRequ
 func (s *mockServiceServer) ListServices(_ context.Context, req *pb.ListServicesRequest) (*pb.ListServicesResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.lastList = req
 	if s.listErr != nil {
 		return nil, s.listErr
 	}
@@ -264,6 +266,20 @@ func TestServiceList_WithOptions(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Len(t, endpoints, 1)
+}
+
+func TestServiceListAll_SelectsAllWorkspaces(t *testing.T) {
+	mock := newMockServiceServer()
+	client, cleanup := setupServiceTest(t, mock)
+	defer cleanup()
+
+	endpoints, err := client.ListAll(context.Background(), ListOptions{Limit: 10})
+
+	require.NoError(t, err)
+	assert.Empty(t, endpoints)
+	require.NotNil(t, mock.lastList)
+	assert.Empty(t, mock.lastList.GetSandbox())
+	assert.NotNil(t, mock.lastList.GetWorkspaceScope().GetAllWorkspaces())
 }
 
 func TestServiceList_Error(t *testing.T) {
