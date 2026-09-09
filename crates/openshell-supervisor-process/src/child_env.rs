@@ -443,8 +443,13 @@ mod tests {
     #[test]
     fn startup_snippets_are_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let profile_path = dir.path().join("etc/profile.d/openshell-path.sh");
-        let home = dir.path().join("sandbox");
+        // macOS commonly exposes its temporary directory through `/var`, a
+        // symlink to `/private/var`. Use the canonical directory because the
+        // startup-file writer deliberately refuses to traverse symlinked
+        // ancestors.
+        let root = dir.path().canonicalize().expect("canonical tempdir");
+        let profile_path = root.join("etc/profile.d/openshell-path.sh");
+        let home = root.join("sandbox");
         std::fs::create_dir_all(&home).expect("home dir");
         let bashrc_path = home.join(".bashrc");
         std::fs::write(
