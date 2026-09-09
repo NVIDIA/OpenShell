@@ -441,10 +441,17 @@ job republishes the analysis job's outcome as the
 required statuses, so they do not gate merges.
 
 Codex Security findings are informational during the observation phase, and the
-workflow only reports on candidates that already exist. Creating pre-release
-tags and gating stable promotion on qualification results are part of
-[RFC 0014](../rfc/0014-release-stability/release-qualification.md) and are not
-implemented yet.
+workflow only reports on candidates that already exist. Gating stable promotion
+on qualification results remains proposed in
+[RFC 0014](../rfc/0014-release-stability/release-qualification.md).
+
+`release-auto-tag.yml` runs daily at 16:00 Europe/Zurich (including daylight saving
+time changes) and supports manual dispatch.
+Maintainers choose the next version by creating `vX.Y.Z-pre.1`. The workflow
+increments the highest release series' pre-release number on `main` only when
+that seed exists, its stable tag does not exist, and new commits are available.
+It never chooses a minor or patch version or creates the initial seed. After
+pushing the tag, it explicitly dispatches `release-tag.yml` to build the candidate.
 
 ## Artifact Scanning
 
