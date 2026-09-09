@@ -156,8 +156,11 @@ fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
 /// Handles Cloudflare Access and OIDC auth modes by loading the stored token
 /// and setting it on `TlsOptions`. For OIDC, automatically refreshes the token
 /// if it's near expiry.
-fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
-    let _ = apply_auth_with_status(tls, gateway_name);
+fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) -> Result<()> {
+    if let Some(error) = apply_auth_with_status(tls, gateway_name) {
+        return Err(miette::miette!(error));
+    }
+    Ok(())
 }
 
 /// Apply stored authentication and return a user-facing preparation failure,
@@ -206,12 +209,17 @@ fn apply_auth_with_status(tls: &mut TlsOptions, gateway_name: &str) -> Option<St
                     }
                     Err(e) => {
                         tracing::warn!("OIDC token refresh failed: {e}");
-                        // Use the expired token anyway — server will reject it
-                        // with a clear error prompting re-login.
-                        tls.oidc_token = Some(bundle.access_token);
-                        Some(format!(
-                            "OIDC token refresh failed; run `openshell gateway login {gateway_name}`"
-                        ))
+                        if openshell_bootstrap::oidc_token::is_token_actually_expired(&bundle) {
+                            Some(format!(
+                                "OIDC token refresh failed: {e}\ncached OIDC token has expired; run `openshell gateway login {gateway_name}`"
+                            ))
+                        } else {
+                            tls.oidc_token = Some(bundle.access_token);
+                            eprintln!(
+                                "Warning: OIDC token refresh failed; continuing with the cached token: {e}"
+                            );
+                            None
+                        }
                     }
                 }
             } else {
@@ -1355,16 +1363,17 @@ enum SandboxCommands {
         #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs"])]
         template: Option<String>,
 
-        /// Sandbox source: a community sandbox name (e.g., `ollama`), a path
-        /// to a Dockerfile or directory containing one, or a full container
+        /// Sandbox source: a community sandbox name (e.g., `ollama`), a rootfs
+        /// tar archive (`.tar`, `.tar.gz`, or `.tgz`), or a full container
         /// image reference (e.g., `myregistry.com/img:tag`).
         ///
         /// Community names are resolved to
         /// `ghcr.io/nvidia/openshell-community/sandboxes/<name>:latest`
         /// (override the prefix with `OPENSHELL_COMMUNITY_REGISTRY`).
         ///
-        /// When given a Dockerfile or directory, the image is built into the
-        /// local Docker daemon before creating the sandbox.
+        /// To use a local Dockerfile, build and tag it with the container
+        /// engine used by your local gateway, then pass the resulting image
+        /// reference here. A rootfs tar is staged for the VM compute driver.
         #[arg(long, value_hint = ValueHint::AnyPath)]
         from: Option<String>,
 
@@ -2381,12 +2390,6 @@ fn run_main() -> Result<()> {
 
 #[allow(clippy::large_stack_frames)] // CLI dispatch holds many futures; run on an expanded Windows stack.
 async fn run_async() -> Result<()> {
-    // Install the rustls crypto provider before completion runs — completers may
-    // establish TLS connections to the gateway.
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|e| miette::miette!("failed to install rustls crypto provider: {e:?}"))?;
-
     CompleteEnv::with_factory(Cli::command).complete();
 
     let cli = Cli::parse();
@@ -2506,7 +2509,7 @@ async fn run_async() -> Result<()> {
             GatewayCommands::Info { output } => {
                 if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
                     let mut tls = tls.with_gateway_name(&ctx.name);
-                    apply_auth(&mut tls, &ctx.name);
+                    apply_auth(&mut tls, &ctx.name)?;
                     run::gateway_info(&ctx.name, &ctx.endpoint, &tls, output.as_str()).await?;
                 } else {
                     run::gateway_info_not_configured()?;
@@ -2574,7 +2577,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Whoami { output }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
             run::whoami(&ctx.endpoint, &tls, output.as_str()).await?;
         }
 
@@ -2677,7 +2680,7 @@ async fn run_async() -> Result<()> {
             } => {
                 let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                 let mut tls = tls.with_gateway_name(&ctx.name);
-                apply_auth(&mut tls, &ctx.name);
+                apply_auth(&mut tls, &ctx.name)?;
                 let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                 let local = local.unwrap_or_else(|| target_port.to_string());
                 run::service_forward_tcp(
@@ -2699,7 +2702,7 @@ async fn run_async() -> Result<()> {
                 let spec = openshell_core::forward::ForwardSpec::parse(&port)?;
                 let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                 let mut tls = tls.with_gateway_name(&ctx.name);
-                apply_auth(&mut tls, &ctx.name);
+                apply_auth(&mut tls, &ctx.name)?;
                 let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                 run::sandbox_forward(
                     &ctx.endpoint,
@@ -2730,7 +2733,7 @@ async fn run_async() -> Result<()> {
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
             match command {
                 ServiceCommands::Expose {
                     sandbox,
@@ -2792,7 +2795,7 @@ async fn run_async() -> Result<()> {
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
             run::sandbox_logs(
                 &ctx.endpoint,
@@ -2816,7 +2819,7 @@ async fn run_async() -> Result<()> {
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
             match policy_cmd {
                 PolicyCommands::Set {
                     name,
@@ -2970,7 +2973,7 @@ async fn run_async() -> Result<()> {
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
 
             match settings_cmd {
                 SettingsCommands::Get { name, global, json } => {
@@ -3049,7 +3052,7 @@ async fn run_async() -> Result<()> {
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
             match draft_cmd {
                 DraftCommands::Get { name, status } => {
                     let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
@@ -3124,7 +3127,7 @@ async fn run_async() -> Result<()> {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
             match command {
                 InferenceCommands::Set {
                     provider,
@@ -3275,7 +3278,7 @@ async fn run_async() -> Result<()> {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
-                    apply_auth(&mut tls, &ctx.name);
+                    apply_auth(&mut tls, &ctx.name)?;
                     let exit_code = Box::pin(run::sandbox_create(
                         endpoint,
                         &ctx.name,
@@ -3318,7 +3321,7 @@ async fn run_async() -> Result<()> {
                 } => {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
-                    apply_auth(&mut tls, &ctx.name);
+                    apply_auth(&mut tls, &ctx.name)?;
                     let local = std::path::Path::new(&local_path);
                     run::sandbox_upload(
                         &ctx.endpoint,
@@ -3338,7 +3341,7 @@ async fn run_async() -> Result<()> {
                 } => {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
-                    apply_auth(&mut tls, &ctx.name);
+                    apply_auth(&mut tls, &ctx.name)?;
                     let local_dest = dest.as_deref().unwrap_or(".");
                     eprintln!("Downloading sandbox:{sandbox_path} -> {local_dest}");
                     run::sandbox_sync_down(
@@ -3356,7 +3359,7 @@ async fn run_async() -> Result<()> {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
-                    apply_auth(&mut tls, &ctx.name);
+                    apply_auth(&mut tls, &ctx.name)?;
                     match other {
                         SandboxCommands::Create { .. }
                         | SandboxCommands::Upload { .. }
@@ -3615,7 +3618,7 @@ async fn run_async() -> Result<()> {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
 
             match command {
                 WorkspaceCommands::Create { name, labels } => {
@@ -3681,7 +3684,7 @@ async fn run_async() -> Result<()> {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
 
             match command {
                 ProviderCommands::Create {
@@ -3896,7 +3899,7 @@ async fn run_async() -> Result<()> {
         Some(Commands::Term { theme }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
             let channel = openshell_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
             let interceptor = openshell_core::auth::EdgeAuthInterceptor::new(
                 tls.oidc_token.as_deref(),
@@ -3940,7 +3943,7 @@ async fn run_async() -> Result<()> {
                         None => tls,
                     };
                     if let Some(ref g) = gateway_name_opt {
-                        apply_auth(&mut effective_tls, g);
+                        apply_auth(&mut effective_tls, g)?;
                     }
                     run::sandbox_ssh_proxy(&gw, &sid, &tok, &effective_tls).await?;
                 }
@@ -3959,7 +3962,7 @@ async fn run_async() -> Result<()> {
                         meta.gateway_endpoint
                     };
                     let mut tls = tls.with_gateway_name(&g);
-                    apply_auth(&mut tls, &g);
+                    apply_auth(&mut tls, &g)?;
                     run::sandbox_ssh_proxy_by_name(&endpoint, &n, &tls, &cli.workspace).await?;
                 }
                 // Legacy name mode with --server only (no --gateway-name).
@@ -4230,11 +4233,6 @@ mod tests {
                 "Dockerfile",
             ),
             (
-                vec!["openshell", "sandbox", "create", "--from", "Do"],
-                4,
-                "Dockerfile",
-            ),
-            (
                 vec![
                     "openshell",
                     "sandbox",
@@ -4459,20 +4457,12 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_create_and_download_use_path_value_hints() {
+    fn sandbox_download_uses_path_value_hint() {
         let cmd = Cli::command();
         let sandbox = cmd
             .get_subcommands()
             .find(|c| c.get_name() == "sandbox")
             .expect("missing sandbox subcommand");
-        let create = sandbox
-            .get_subcommands()
-            .find(|c| c.get_name() == "create")
-            .expect("missing create subcommand");
-        let from = create
-            .get_arguments()
-            .find(|arg| arg.get_id() == "from")
-            .expect("missing from argument");
         let download = sandbox
             .get_subcommands()
             .find(|c| c.get_name() == "download")
@@ -4482,7 +4472,6 @@ mod tests {
             .find(|arg| arg.get_id() == "dest")
             .expect("missing dest argument");
 
-        assert_eq!(from.get_value_hint(), ValueHint::AnyPath);
         assert_eq!(dest.get_value_hint(), ValueHint::AnyPath);
     }
 
@@ -4645,7 +4634,7 @@ mod tests {
             store_edge_token("edge-gateway", "token-123").unwrap();
 
             let mut tls = TlsOptions::default();
-            apply_auth(&mut tls, "edge-gateway");
+            apply_auth(&mut tls, "edge-gateway").unwrap();
 
             assert_eq!(tls.edge_token.as_deref(), Some("token-123"));
         });

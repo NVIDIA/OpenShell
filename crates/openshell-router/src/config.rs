@@ -9,7 +9,7 @@ pub use openshell_core::inference::AuthHeader;
 
 use crate::RouterError;
 
-pub const DEFAULT_ROUTE_TIMEOUT: Duration = Duration::from_secs(60);
+pub const DEFAULT_ROUTE_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RouterConfig {

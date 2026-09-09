@@ -417,7 +417,7 @@ mod tests {
     }
 
     fn pair() -> (SandboxJwtIssuer, SandboxJwtAuthenticator) {
-        pair_with_ttl(Duration::from_secs(3600))
+        pair_with_ttl(Duration::from_hours(1))
     }
 
     fn pair_with_ttl(ttl: Duration) -> (SandboxJwtIssuer, SandboxJwtAuthenticator) {
@@ -472,7 +472,7 @@ mod tests {
             mat.signing_key_pem.as_bytes(),
             mat.kid.clone(),
             "test-gateway",
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
         )
         .expect("issuer");
         let auth = SandboxJwtAuthenticator::from_pem(
@@ -582,7 +582,7 @@ mod tests {
             mat.signing_key_pem.as_bytes(),
             mat.kid.clone(),
             "g",
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
         )
         .unwrap();
         let auth =
@@ -623,7 +623,7 @@ mod tests {
                 &extension_audience("urn:openshell:extension:middleware:scanner"),
                 ExtensionCallerKind::Gateway,
                 None,
-                Duration::from_secs(300),
+                Duration::from_mins(5),
             )
             .expect("gateway token");
         let mut validation = Validation::new(Algorithm::EdDSA);
@@ -644,7 +644,7 @@ mod tests {
                 &extension_audience("urn:openshell:extension:middleware:scanner"),
                 ExtensionCallerKind::Supervisor,
                 Some("sandbox-a"),
-                Duration::from_secs(300),
+                Duration::from_mins(5),
             )
             .expect("supervisor token");
         let claims = decode::<ExtensionJwtClaims>(&supervisor.token, &decoding_key, &validation)
@@ -662,7 +662,7 @@ mod tests {
             mat.signing_key_pem.as_bytes(),
             mat.kid.clone(),
             "gateway-a",
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
         )
         .expect("issuer");
 
@@ -671,7 +671,7 @@ mod tests {
                 &extension_audience("urn:openshell:extension:middleware:scanner"),
                 ExtensionCallerKind::Gateway,
                 None,
-                Duration::from_secs(300),
+                Duration::from_mins(5),
             )
             .expect("extension token");
         assert_eq!(
@@ -704,7 +704,7 @@ mod tests {
                 &extension_audience("service-a"),
                 ExtensionCallerKind::Gateway,
                 None,
-                Duration::from_secs(60),
+                Duration::from_mins(1),
             )
             .expect("token");
         let decoding_key = DecodingKey::from_ed_pem(mat.public_key_pem.as_bytes()).unwrap();
@@ -722,7 +722,7 @@ mod tests {
                 &extension_audience("openshell-gateway:test-gateway"),
                 ExtensionCallerKind::Supervisor,
                 Some("sandbox-a"),
-                Duration::from_secs(60),
+                Duration::from_mins(1),
             )
             .expect_err("gateway sandbox audience must be reserved");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
@@ -755,7 +755,7 @@ mod tests {
                     &extension_audience("service"),
                     ExtensionCallerKind::Supervisor,
                     None,
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 )
                 .is_err()
         );
@@ -765,7 +765,7 @@ mod tests {
                     &extension_audience("service"),
                     ExtensionCallerKind::Gateway,
                     Some("sandbox-a"),
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 )
                 .is_err()
         );

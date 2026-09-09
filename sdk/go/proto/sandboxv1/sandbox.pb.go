@@ -955,22 +955,13 @@ func (x *NetworkEndpoint) GetProviderCredentialed() bool {
 }
 
 // MCP options are grouped so MCP-specific policy can grow without adding more
-// top-level NetworkEndpoint fields. Current enforcement targets the active
-// 2025-11-25 Streamable HTTP/tools behavior, while preserving space for
-// version-profile policy if OpenShell adopts 2026-07-28 draft behavior later.
-//
-// Planned policy extensions should use OpenShell-owned static definitions for
-// MCP method/version profiles rather than treating dependency enums as the
-// policy contract. Candidate profile checks include request metadata/header
-// validation, response/SSE introspection, trusted annotation handling,
-// resultType/cache metadata validation, x-mcp-header tool-definition checks,
-// and subscriptions/listen handling.
+// top-level NetworkEndpoint fields. OpenShell owns the supported revision
+// profiles instead of treating dependency enums as the policy contract.
 //
 // Sources:
-// - https://modelcontextprotocol.io/specification/2025-11-25/server/tools
-// - https://modelcontextprotocol.io/specification/draft/changelog
-// - https://modelcontextprotocol.io/specification/draft/basic/transports/streamable-http
-// - https://modelcontextprotocol.io/specification/draft/server/tools
+// - https://modelcontextprotocol.io/specification/2025-03-26/basic/transports
+// - https://modelcontextprotocol.io/specification/2025-06-18/basic/transports
+// - https://modelcontextprotocol.io/specification/2025-11-25/basic/transports
 type McpOptions struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Hardening boundary for tools/call params.name. When unset or true, the
@@ -985,8 +976,21 @@ type McpOptions struct {
 	// MCP-family methods at the method layer unless a tool-name policy narrows
 	// tools/call. When unset or false, explicit method rules are required.
 	AllowAllKnownMcpMethods *bool `protobuf:"varint,2,opt,name=allow_all_known_mcp_methods,json=allowAllKnownMcpMethods,proto3,oneof" json:"allow_all_known_mcp_methods,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	// Exact MCP protocol revisions accepted by the endpoint's policy schema.
+	// Authors may omit this field. Because proto3 repeated fields do not retain
+	// presence, omission reaches protobuf ingress as an empty list. Checked
+	// normalization materializes OpenShell's pinned default revision
+	// "2025-11-25" before producing canonical downstream state, which is always
+	// nonempty.
+	//
+	// An explicit nonempty list remains an exact allowlist. Duplicates, moving
+	// aliases such as "draft" and "latest", and unknown dates are invalid.
+	// Normalization stores valid values in canonical semantic order. These
+	// values identify core revisions; they do not enable separate SEP overlays
+	// or select runtime parsing and forwarding behavior.
+	Versions      []string `protobuf:"bytes,3,rep,name=versions,proto3" json:"versions,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *McpOptions) Reset() {
@@ -1031,6 +1035,13 @@ func (x *McpOptions) GetAllowAllKnownMcpMethods() bool {
 		return *x.AllowAllKnownMcpMethods
 	}
 	return false
+}
+
+func (x *McpOptions) GetVersions() []string {
+	if x != nil {
+		return x.Versions
+	}
+	return nil
 }
 
 // Trusted GraphQL operation classification.
@@ -2136,11 +2147,12 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x15provider_credentialed\x18\x1a \x01(\bR\x14providerCredentialed\x1ar\n" +
 	"\x1cGraphqlPersistedQueriesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
-	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.GraphqlOperationR\x05value:\x028\x01\"\xb6\x01\n" +
+	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.GraphqlOperationR\x05value:\x028\x01\"\xd2\x01\n" +
 	"\n" +
 	"McpOptions\x12/\n" +
 	"\x11strict_tool_names\x18\x01 \x01(\bH\x00R\x0fstrictToolNames\x88\x01\x01\x12A\n" +
-	"\x1ballow_all_known_mcp_methods\x18\x02 \x01(\bH\x01R\x17allowAllKnownMcpMethods\x88\x01\x01B\x14\n" +
+	"\x1ballow_all_known_mcp_methods\x18\x02 \x01(\bH\x01R\x17allowAllKnownMcpMethods\x88\x01\x01\x12\x1a\n" +
+	"\bversions\x18\x03 \x03(\tR\bversionsB\x14\n" +
 	"\x12_strict_tool_namesB\x1e\n" +
 	"\x1c_allow_all_known_mcp_methods\"x\n" +
 	"\x10GraphqlOperation\x12%\n" +

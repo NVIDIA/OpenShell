@@ -178,6 +178,6 @@ jobs:
             --copy conformance-input/openshell-conformance:/tmp/openshell-conformance \
             --copy nix/test-guest/conformance-plans/gateway-upgrade-restart.toml:/tmp/conformance-plan.toml \
             --provision openshell-rpm-latest-release \
-            --provision gateway-rootless-podman \
+            --provision gateway-podman \
             --provision openshell-rpm-gateway-upgrade \
             -- /tmp/openshell-conformance run --plan /tmp/conformance-plan.toml

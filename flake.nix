@@ -57,8 +57,11 @@
           pkg-config
           # Coverage.
           lcov
+          kubernetes-helm
           syft
+          trivy
           uv
+          yq-go
           zizmor
           zstd
         ];

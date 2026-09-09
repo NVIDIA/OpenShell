@@ -510,11 +510,18 @@ function deadlineOptions(remainingMs: number, signal?: AbortSignal): CallOptions
   };
 }
 
-// Translate a poll failure at the wait boundary: caller cancellation and
-// deadline expiry become explicit SdkErrors; anything else propagates.
-function mapWaitError(err: unknown, name: string, deadline: number, signal?: AbortSignal): SdkError {
+// Translate a poll failure at the wait boundary: caller cancellation and the
+// poll's deadline signal both become explicit SdkErrors; anything else propagates.
+function mapWaitError(
+  err: unknown,
+  name: string,
+  deadline: number,
+  signal?: AbortSignal,
+  pollSignal?: AbortSignal,
+): SdkError {
   if (signal?.aborted) return new SdkError('connect', `wait for sandbox '${name}' aborted`);
-  if (Date.now() >= deadline) return new SdkError('connect', `timed out waiting for sandbox '${name}'`);
+  if (pollSignal?.aborted || Date.now() >= deadline)
+    return new SdkError('connect', `timed out waiting for sandbox '${name}'`);
   return err instanceof SdkError ? err : fromConnect(err);
 }
 
@@ -829,13 +836,14 @@ export class SandboxClient {
       if (signal?.aborted) throw new SdkError('connect', `wait for sandbox '${name}' aborted`);
       if (Date.now() >= deadline) throw new SdkError('connect', `timed out waiting for sandbox '${name}'`);
       let ref: SandboxRef;
+      const pollOptions = deadlineOptions(deadline - Date.now(), signal);
       try {
         ref = await this.get(name, {
-          ...deadlineOptions(deadline - Date.now(), signal),
+          ...pollOptions,
           workspace: options?.workspace,
         });
       } catch (e) {
-        throw mapWaitError(e, name, deadline, signal);
+        throw mapWaitError(e, name, deadline, signal, pollOptions.signal);
       }
       if (ref.phase === 'ready' || ref.phase === 'completed') return ref;
       if (ref.phase === 'stopped') throw new SdkError('connect', `sandbox '${name}' stopped before becoming ready`);
@@ -855,11 +863,12 @@ export class SandboxClient {
     for (;;) {
       if (signal?.aborted) throw new SdkError('connect', `wait for sandbox '${name}' aborted`);
       if (Date.now() >= deadline) throw new SdkError('connect', `timed out waiting for sandbox '${name}' to delete`);
+      const pollOptions = deadlineOptions(deadline - Date.now(), signal);
       try {
-        await this.get(name, { ...deadlineOptions(deadline - Date.now(), signal), workspace: options?.workspace });
+        await this.get(name, { ...pollOptions, workspace: options?.workspace });
       } catch (e) {
         if (e instanceof SdkError && e.code === 'not_found') return;
-        throw mapWaitError(e, name, deadline, signal);
+        throw mapWaitError(e, name, deadline, signal, pollOptions.signal);
       }
       if (Date.now() >= deadline) throw new SdkError('connect', `timed out waiting for sandbox '${name}' to delete`);
       await waitSleep(delay, deadline, signal);
@@ -1404,10 +1413,11 @@ export class SandboxClient {
     let delay = 100;
     for (;;) {
       let config: SandboxConfig;
+      const pollOptions = deadlineOptions(deadline - Date.now());
       try {
-        config = await this.getConfig(name, { ...deadlineOptions(deadline - Date.now()), workspace });
+        config = await this.getConfig(name, { ...pollOptions, workspace });
       } catch (e) {
-        if (Date.now() >= deadline) {
+        if (pollOptions.signal?.aborted || Date.now() >= deadline) {
           throw new SdkError('connect', `timed out waiting for policy '${policyHash}' on sandbox '${name}'`);
         }
         throw e instanceof SdkError ? e : fromConnect(e);

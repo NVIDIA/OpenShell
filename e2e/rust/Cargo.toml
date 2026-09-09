@@ -59,6 +59,11 @@ path = "tests/custom_image.rs"
 required-features = ["e2e-docker"]
 
 [[test]]
+name = "rootfs_tar"
+path = "tests/rootfs_tar.rs"
+required-features = ["e2e-vm"]
+
+[[test]]
 name = "docker_preflight"
 path = "tests/docker_preflight.rs"
 required-features = ["e2e-docker"]
@@ -206,7 +211,7 @@ futures-util = "0.3"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 prost = "0.14"
 tokio = { version = "1.43", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
@@ -217,7 +222,7 @@ hex = "0.4"
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yml = "0.0.12"
+serde_yml = { package = "noyalib", version = "0.0.28", default-features = false, features = ["std", "compat-serde-yaml"] }
 tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"
 tower = "0.5"

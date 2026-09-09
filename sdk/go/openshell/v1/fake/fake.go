@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1"
+	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/options"
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 )
 
@@ -97,9 +98,7 @@ func NewClient(opts ...ClientOption) *Client {
 	fc.workspaces = newFakeWorkspaceClient(fc.workspaceStore, fc.memberStore, fc.isClosed)
 	fc.inference = newFakeInferenceClient(fc.isClosed)
 
-	for _, opt := range opts {
-		opt(fc)
-	}
+	options.Apply(fc, opts)
 
 	return fc
 }

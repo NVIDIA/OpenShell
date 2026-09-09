@@ -4,7 +4,7 @@
 //! Request validation helpers for the gRPC service.
 //!
 //! All functions in this module are pure — they take proto types or primitives
-//! and return `Result<(), Status>`.  No server state is required.
+//! and return validated values or `Status` errors. No server state is required.
 
 #![allow(clippy::result_large_err)] // Validation returns Result<_, Status>
 
@@ -332,8 +332,33 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
                 "template.driver_config serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
             )));
         }
+        reject_gateway_owned_driver_config_keys(s)?;
     }
 
+    Ok(())
+}
+
+/// `driver_config` fields the gateway resolves and writes itself.
+///
+/// A caller who could set these would hand a raw host path straight to a
+/// privileged compute driver. Clients name a staging token instead, and the
+/// gateway substitutes the path it allocated.
+const GATEWAY_OWNED_DRIVER_CONFIG_KEYS: &[&str] = &["rootfs_tar_path"];
+
+fn reject_gateway_owned_driver_config_keys(config: &prost_types::Struct) -> Result<(), Status> {
+    for (driver_name, value) in &config.fields {
+        let Some(prost_types::value::Kind::StructValue(driver_config)) = value.kind.as_ref() else {
+            continue;
+        };
+        for key in GATEWAY_OWNED_DRIVER_CONFIG_KEYS {
+            if driver_config.fields.contains_key(*key) {
+                return Err(Status::invalid_argument(format!(
+                    "template.driver_config.{driver_name}.{key} is set by the gateway \
+                     and cannot be supplied by the caller"
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -876,6 +901,19 @@ pub(super) fn validate_policy_safety(policy: &ProtoSandboxPolicy) -> Result<(), 
         )));
     }
     Ok(())
+}
+
+/// Validate a policy and return the canonical value safe to hash and persist.
+///
+/// Validation runs before canonicalization so sorting cannot hide duplicate or
+/// unsupported MCP revisions. Callers must use the returned value because the
+/// input may carry an equivalent but noncanonical revision order.
+pub(super) fn validate_and_canonicalize_policy(
+    policy: ProtoSandboxPolicy,
+) -> Result<ProtoSandboxPolicy, Status> {
+    openshell_policy::validate_and_canonicalize_sandbox_policy(policy).map_err(|error| {
+        Status::invalid_argument(format!("policy contains unsafe content: {error}"))
+    })
 }
 
 /// Validate that user-authored policy does not use provider-derived rule keys.
@@ -2253,5 +2291,44 @@ mod tests {
         };
         let err = validate_exec_request_fields(&req).unwrap_err();
         assert!(err.message().contains("newline"));
+    }
+
+    fn driver_config(json: &str) -> prost_types::Struct {
+        let serde_json::Value::Object(fields) =
+            serde_json::from_str::<serde_json::Value>(json).expect("valid json")
+        else {
+            panic!("driver_config test input must be a JSON object");
+        };
+        openshell_core::proto_struct::json_object_to_struct(fields).expect("encodable")
+    }
+
+    /// The security boundary: only the gateway may name a host path for the
+    /// compute driver. A direct API request that supplies one is refused.
+    #[test]
+    fn rejects_caller_supplied_rootfs_tar_path() {
+        for json in [
+            r#"{"vm":{"rootfs_tar_path":"/etc/passwd"}}"#,
+            r#"{"vm":{"rootfs_tar_path":"/dev/zero"}}"#,
+            // Driver-agnostic: no driver block may carry a gateway-owned key.
+            r#"{"docker":{"rootfs_tar_path":"/etc/shadow"}}"#,
+        ] {
+            let err = reject_gateway_owned_driver_config_keys(&driver_config(json))
+                .expect_err("a caller-supplied rootfs_tar_path must be rejected");
+            assert_eq!(err.code(), Code::InvalidArgument, "{json}: {err}");
+            assert!(err.message().contains("rootfs_tar_path"), "{json}: {err}");
+        }
+    }
+
+    #[test]
+    fn accepts_driver_config_without_gateway_owned_keys() {
+        for json in [
+            r#"{"vm":{"rootfs_tar_staging_token":"tok-abc"}}"#,
+            r#"{"vm":{"gpu_device_ids":["0000:2d:00.0"]}}"#,
+            r#"{"kubernetes":{"pod":{"nodeName":"gpu-1"}}}"#,
+            r"{}",
+        ] {
+            reject_gateway_owned_driver_config_keys(&driver_config(json))
+                .unwrap_or_else(|err| panic!("{json} should be accepted: {err}"));
+        }
     }
 }

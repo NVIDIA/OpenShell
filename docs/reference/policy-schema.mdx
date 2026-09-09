@@ -182,7 +182,8 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `persisted_queries` | string | No | GraphQL hash-only behavior for `protocol: graphql` and GraphQL-over-WebSocket operation policy. Default is `deny`; use `allow_registered` only with `graphql_persisted_queries`. |
 | `graphql_persisted_queries` | map | No | Trusted GraphQL persisted-query registry keyed by hash or saved-query ID. Values contain `operation_type`, optional `operation_name`, and optional root `fields`. |
 | `graphql_max_body_bytes` | integer | No | Maximum GraphQL-over-HTTP request body bytes buffered for inspection. Defaults to `65536`. |
-| `mcp` | object | No | MCP endpoint options for `protocol: mcp`. MCP endpoints must set a concrete `host` and `port` or `ports`; `protocol: mcp` alone is invalid and is not treated as a wildcard endpoint. |
+| `mcp` | object | No | MCP endpoint options for `protocol: mcp`. Omit this key to use all MCP endpoint defaults, including the exact `2025-11-25` revision; `mcp: null` is invalid. The object is rejected on other protocols. Every MCP endpoint must still set a concrete `host` and `port` or `ports`; an entry containing only `protocol: mcp` is invalid and is not treated as a wildcard endpoint. |
+| `mcp.versions` | list of string | No | Nonempty allowlist of exact supported MCP core revisions: `2025-03-26`, `2025-06-18`, and `2025-11-25`. Omission resolves to the exact allowlist `["2025-11-25"]`; it never means latest or all known revisions. The key must be absent to use this default; `versions: null` and `versions: []` are invalid. Use an explicit nonempty list only for intentional compatibility or downgrade control. The exact floor is `2025-03-26`; this is a closed set, not a date range. Values must be unique and contain no extra whitespace. Moving aliases such as `draft` and `latest`, unknown dates, and named SEP overlays are not accepted. OpenShell stores the materialized list in semantic order. The sessionless `2026-07-28` revision is not accepted until its distinct per-request runtime contract is supported. This field declares compatibility but does not yet select request parsing or forwarding behavior. For an unsupported revision, omit `protocol` and `mcp` only when deliberate uninspected L4 passthrough is an acceptable weaker boundary. |
 | `mcp.max_body_bytes` | integer | No | Maximum MCP JSON-RPC-over-HTTP request body bytes buffered for inspection. Defaults to `65536`. |
 | `mcp.strict_tool_names` | bool | No | Defaults to `true`. Requires `tools/call` `params.name` values to match `^[A-Za-z0-9_.-]{1,128}$` before policy evaluation. Set to `false` only for compatibility with MCP servers that intentionally use non-recommended tool names. Wildcard `tool` matchers require this to remain enabled. |
 | `mcp.allow_all_known_mcp_methods` | bool | No | Defaults to `false`. When `true`, enables the endpoint MCP method profile: omitted `rules` allow all MCP-family methods and all tools before `deny_rules`, and omitted rule `method` uses that profile. When unset or `false`, explicit MCP method rules are required; rules with `tool` or `params.name` must set `method: tools/call`. |
@@ -201,6 +202,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 - `mcp` and `json-rpc` reject `access` presets; use explicit `rules`.
 - `json-rpc` requires explicit `rules` with `allow.method`.
 - `mcp` requires `rules` unless `mcp.allow_all_known_mcp_methods: true`.
+- YAML defaulting requires the `mcp` or `mcp.versions` key to be absent. Explicit `mcp: null`, `versions: null`, and `versions: []` values are rejected. At protobuf ingress, an empty repeated `versions` field means omission and resolves to `["2025-11-25"]` because protobuf repeated fields do not preserve field presence.
 - `deny_rules` require `protocol`. For non-MCP protocols, `deny_rules` also require `rules` or `access` to define the base allow set. MCP `deny_rules` may omit both when `mcp.allow_all_known_mcp_methods: true` supplies the base allow set.
 - `rules: []` (empty list) is rejected; use `access: full` or remove `rules`.
 - Non-empty `rules` must contain at least one effective allow clause; rules where every entry lacks an allow are rejected as deny-all.
@@ -342,7 +344,7 @@ Do not combine `method`, `path`, or `query` with `operation_type`, `operation_na
 
 ##### MCP Allow And Deny Rules (`protocol: mcp`)
 
-MCP rules match sandbox-to-server MCP Streamable HTTP request bodies by MCP method and optional tool selectors. OpenShell parses the underlying JSON-RPC 2.0 envelope, validates known MCP request and notification params, and preserves unknown extension methods as policy-addressable literal method strings. Until OpenShell exposes explicit MCP version profiles, `mcp.allow_all_known_mcp_methods` defaults to `false`, so endpoints require explicit MCP method rules. Set `mcp.allow_all_known_mcp_methods: true` to enable the endpoint method profile; in that mode, rules can omit `method`, and tool selectors are normalized to `tools/call` internally. By default, `tools/call` `params.name` must match the MCP-recommended tool-name pattern `^[A-Za-z0-9_.-]{1,128}$`; configure `mcp.strict_tool_names: false` on the endpoint only to allow a server that intentionally uses names outside that pattern. Wildcard `tool` matchers require `mcp.strict_tool_names` to remain enabled. JSON-RPC responses and server-to-client MCP messages on response bodies or SSE streams are relayed but are not currently parsed for policy enforcement.
+MCP rules match sandbox-to-server MCP Streamable HTTP request bodies by MCP method and optional tool selectors. OpenShell parses the underlying JSON-RPC 2.0 envelope, validates known MCP request and notification params, and preserves unknown extension methods as policy-addressable literal method strings. An endpoint that omits `mcp.versions`, including one that omits the entire `mcp` object, immediately resolves to the exact `2025-11-25` allowlist. Canonical serialization and stored policy data contain that explicit materialized list, so adding another supported revision cannot widen the normalized policy. The schema validates and canonicalizes an explicit nonempty allowlist as an advanced compatibility or downgrade control, but it does not yet use the allowlist to select request parsing or forwarding behavior. Later runtime negotiation must select one server-confirmed revision from the allowlist and apply only that profile, never a union or fallback. `mcp.allow_all_known_mcp_methods` defaults to `false`, so endpoints require explicit MCP method rules. Set it to `true` to enable the endpoint method profile; in that mode, rules can omit `method`, and tool selectors are normalized to `tools/call` internally. By default, `tools/call` `params.name` must match the MCP-recommended tool-name pattern `^[A-Za-z0-9_.-]{1,128}$`; configure `mcp.strict_tool_names: false` on the endpoint only to allow a server that intentionally uses names outside that pattern. Wildcard `tool` matchers require `mcp.strict_tool_names` to remain enabled. JSON-RPC responses and server-to-client MCP messages on response bodies or SSE streams are relayed but are not currently parsed for policy enforcement.
 
 Use `rules` for MCP allow rules and `deny_rules` for MCP deny rules. Deny rules take precedence over allow rules. If an MCP endpoint sets `mcp.allow_all_known_mcp_methods: true` and omits `rules`, OpenShell allows all MCP-family methods and all tools, then applies any `deny_rules`. Otherwise, the endpoint must define explicit rules. A broad allow or deny rule whose method matcher includes `tools/call` cannot be combined with tool-specific allow rules because it would bypass or erase the tool filter; add `tool` or `params.name` to scope `tools/call`, or remove the tool-specific rules. In a batch request, one denied call denies the full batch.
 
@@ -381,6 +383,15 @@ endpoints:
       - method: tools/call
         tool: execute_code
 ```
+
+This example omits `mcp.versions`, so OpenShell materializes `["2025-11-25"]`. To authorize an intentional compatibility range for an older server, set an explicit nonempty allowlist:
+
+```yaml showLineNumbers={false}
+mcp:
+  versions: ["2025-03-26", "2025-11-25"]
+```
+
+OpenShell canonicalizes an explicit list in semantic order. Later runtime negotiation selects one allowed revision and applies only that profile; it does not combine the profiles.
 
 ##### JSON-RPC Allow Rule (`protocol: json-rpc`)
 

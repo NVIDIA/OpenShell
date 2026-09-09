@@ -7558,6 +7558,7 @@ network_policies:
             graphql_max_body_bytes: 0,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             mcp_strict_tool_names: true,
+            mcp_versions: Vec::new(),
             allow_encoded_slash,
             websocket_credential_rewrite: false,
             request_body_credential_rewrite: false,
@@ -7932,7 +7933,7 @@ network_policies:
             .await
         });
 
-        let scenario = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let scenario = tokio::time::timeout(std::time::Duration::from_mins(1), async {
             app.write_all(
                 b"GET /ws HTTP/1.1\r\nHost: api.example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\r\n",
             )
@@ -8002,6 +8003,7 @@ network_policies:
             graphql_max_body_bytes: 0,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             mcp_strict_tool_names: true,
+            mcp_versions: Vec::new(),
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
@@ -8204,6 +8206,7 @@ network_policies:
             graphql_max_body_bytes: 0,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             mcp_strict_tool_names: true,
+            mcp_versions: Vec::new(),
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
@@ -8330,6 +8333,7 @@ network_policies:
             graphql_max_body_bytes: 0,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             mcp_strict_tool_names: true,
+            mcp_versions: Vec::new(),
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,

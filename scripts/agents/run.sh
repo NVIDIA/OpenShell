@@ -683,7 +683,38 @@ File.open(dockerfile_path, "a") do |file|
 end
 RUBY
 
-    SANDBOX_FROM="$build_dockerfile"
+    # Build into the local engine selected by the gateway. Without this,
+    # auto-detection can choose Podman while the gateway uses Docker (or vice
+    # versa), leaving the image unavailable to the gateway.
+    local gateway_info
+    if ! gateway_info="$("$OPENSHELL_BIN" --gateway "$GATEWAY" gateway info --output json)"; then
+        fail "failed to determine compute driver for gateway '$GATEWAY'"
+    fi
+    local gateway_engine
+    if ! gateway_engine="$(printf '%s' "$gateway_info" | ruby -rjson -e '
+        drivers = JSON.parse(STDIN.read).fetch("compute_drivers", []).map { |driver| driver.fetch("name") }
+        abort "gateway must report exactly one compute driver" unless drivers.length == 1
+        puts drivers.first.downcase
+    ')"; then
+        fail "gateway '$GATEWAY' did not report exactly one compute driver"
+    fi
+    case "$gateway_engine" in
+        docker|podman) ;;
+        *) fail "gateway '$GATEWAY' uses compute driver '$gateway_engine'; agent launcher local image builds require Docker or Podman" ;;
+    esac
+    if [[ -n "${CONTAINER_ENGINE:-}" ]] && [[ "$(printf '%s' "$CONTAINER_ENGINE" | tr '[:upper:]' '[:lower:]')" != "$gateway_engine" ]]; then
+        fail "CONTAINER_ENGINE=$CONTAINER_ENGINE conflicts with gateway '$GATEWAY' compute driver '$gateway_engine'"
+    fi
+    CONTAINER_ENGINE="$gateway_engine"
+    export CONTAINER_ENGINE
+
+    # Source after setting CONTAINER_ENGINE so the helper validates the
+    # gateway-selected engine instead of auto-detecting another engine.
+    source "$ROOT_DIR/tasks/scripts/container-engine.sh"
+    local image_tag="openshell/agent-${AGENT_ID}:$(date +%s)"
+    log "Building sandbox image '$image_tag' with $CONTAINER_ENGINE."
+    ce_build --load --file "$build_dockerfile" --tag "$image_tag" "$build_context"
+    SANDBOX_FROM="$image_tag"
 }
 
 log "Staging immutable sandbox payload from '$SANDBOX_FROM'."

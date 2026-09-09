@@ -8,7 +8,7 @@ name = "openshell-supervisor-middleware-content-guard"
 description = "Example OpenShell supervisor middleware service"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.94"
 license = "Apache-2.0"
 publish = false
 

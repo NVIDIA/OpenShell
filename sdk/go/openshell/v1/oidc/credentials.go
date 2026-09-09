@@ -16,6 +16,7 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/gateway"
+	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/options"
 )
 
 // ClientCredentials performs a non-interactive OAuth2 client credentials
@@ -37,9 +38,7 @@ func ClientCredentials(ctx context.Context, opts ...LoginOption) (*oauth2.Token,
 
 func resolveClientCredentialsConfig(opts ...LoginOption) (*loginConfig, error) {
 	cfg := &loginConfig{}
-	for _, opt := range opts {
-		opt(cfg)
-	}
+	options.Apply(cfg, opts)
 	cfg.applyDefaults()
 
 	// Client credentials should not send interactive scopes by default.

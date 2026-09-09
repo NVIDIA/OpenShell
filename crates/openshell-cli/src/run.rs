@@ -44,11 +44,11 @@ use openshell_bootstrap::{
 };
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::proto::{
-    ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
-    CreateSandboxRequest, CreateSandboxTemplateRequest, CreateSshSessionRequest,
-    DeleteInferenceRouteRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
-    DeleteServiceRequest, ExecSandboxRequest, ExposeServiceRequest, GetCurrentUserRequest,
-    GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
+    ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, BeginRootfsTarStagingRequest,
+    ClearDraftChunksRequest, CreateSandboxRequest, CreateSandboxTemplateRequest,
+    CreateSshSessionRequest, DeleteInferenceRouteRequest, DeleteSandboxRequest,
+    DeleteSandboxTemplateRequest, DeleteServiceRequest, ExecSandboxRequest, ExposeServiceRequest,
+    GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
     GetInferenceRouteRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
     GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
     GetSandboxTemplateRequest, GetServiceRequest, GpuResourceRequirements,
@@ -525,28 +525,25 @@ pub async fn sandbox_create(
         ));
     }
 
-    // Resolve the --from flag into a container image reference, building from
-    // a Dockerfile first if necessary. Template creates resolve workload shape
-    // on the gateway and skip local image handling.
-    let image: Option<String> = if template.is_some() {
-        None
+    // Resolve the --from flag into a container image reference, or stage a
+    // rootfs tar on the gateway and retain its staging token. Template creates
+    // resolve workload shape on the gateway and skip --from.
+    let (image, rootfs_tar_token): (Option<String>, Option<String>) = if template.is_some() {
+        (None, None)
     } else {
         match from {
             Some(val) => {
                 let resolved = resolve_from(val)?;
                 match resolved {
-                    ResolvedSource::Image(img) => Some(img),
-                    ResolvedSource::Dockerfile {
-                        dockerfile,
-                        context,
-                    } => {
-                        let tag =
-                            build_from_dockerfile(&dockerfile, &context, gateway_name).await?;
-                        Some(tag)
+                    ResolvedSource::Image(img) => (Some(img), None),
+                    ResolvedSource::RootfsTar { path } => {
+                        let token =
+                            stage_rootfs_tar(gateway_name, &mut client, workspace, &path).await?;
+                        (None, Some(token))
                     }
                 }
             }
-            None => None,
+            None => (None, None),
         }
     };
     let inferred_types: Vec<String> = inferred_provider_type(command).into_iter().collect();
@@ -565,7 +562,7 @@ pub async fn sandbox_create(
     } else {
         None
     };
-    let driver_config = if template.is_none() {
+    let mut driver_config = if template.is_none() {
         driver_config_json
             .map(parse_driver_config_json)
             .transpose()?
@@ -573,7 +570,14 @@ pub async fn sandbox_create(
         None
     };
 
-    let inline_template = if image.is_some() || resource_limits.is_some() || driver_config.is_some()
+    if let Some(token) = &rootfs_tar_token {
+        driver_config = Some(merge_rootfs_tar_driver_config(driver_config, token)?);
+    }
+
+    let inline_template = if image.is_some()
+        || resource_limits.is_some()
+        || driver_config.is_some()
+        || rootfs_tar_token.is_some()
     {
         Some(SandboxTemplate {
             image: image.unwrap_or_default(),
@@ -1144,181 +1148,249 @@ pub async fn sandbox_create(
 enum ResolvedSource {
     /// A ready-to-use container image reference.
     Image(String),
-    /// A Dockerfile that must be built before creating the sandbox.
-    Dockerfile {
-        dockerfile: PathBuf,
-        context: PathBuf,
-    },
+    /// A flat rootfs tar archive (`.tar`, `.tar.gz`, `.tgz`) to stage for the
+    /// VM compute driver.
+    RootfsTar { path: PathBuf },
 }
 
-/// Classify the `--from` value into an image reference or a Dockerfile that
-/// needs building.
+/// Classify the `--from` value into an image reference or a rootfs tar to stage
+/// for the VM driver.
 ///
 /// Resolution order:
-/// 1. Existing file whose name contains "Dockerfile" → build from file.
-/// 2. Existing directory that contains a `Dockerfile` → build from directory.
-/// 3. Missing explicit local paths → local error, not image pull.
-/// 4. Value contains `/`, `:`, or `.` → treat as a full image reference.
-/// 5. Otherwise → community sandbox name, expanded via the registry prefix.
+/// 1. Existing file with `.tar`, `.tar.gz`, or `.tgz` extension → rootfs tar archive.
+/// 2. Local Dockerfile and directory paths → an actionable build-and-tag error.
+/// 3. Other explicit local paths → an actionable error.
+/// 4. Full image reference or community sandbox name → resolve as an image.
 fn resolve_from(value: &str) -> Result<ResolvedSource> {
     let path = Path::new(value);
 
-    // 1. Existing file that looks like a Dockerfile.
-    if path.is_file() {
-        if filename_looks_like_dockerfile(path) {
-            let dockerfile = path
-                .canonicalize()
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to resolve path: {}", path.display()))?;
-            let context = dockerfile
-                .parent()
-                .ok_or_else(|| miette::miette!("Dockerfile has no parent directory"))?
-                .to_path_buf();
-            return Ok(ResolvedSource::Dockerfile {
-                dockerfile,
-                context,
-            });
-        }
+    if path.is_file() && filename_looks_like_rootfs_tar(path) {
+        let tar_path = path
+            .canonicalize()
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to resolve path: {}", path.display()))?;
+        return Ok(ResolvedSource::RootfsTar { path: tar_path });
+    }
 
-        if value_looks_like_local_source(value) {
+    if value_looks_like_local_path(value) {
+        if !path.exists() && filename_looks_like_rootfs_tar(path) {
             return Err(miette::miette!(
-                "local --from file is not a Dockerfile: {}",
+                "local --from path does not exist: {}",
                 path.display()
             ));
         }
-    }
 
-    // 2. Existing directory containing a Dockerfile.
-    if path.is_dir() {
-        let candidate = path.join("Dockerfile");
-        if candidate.is_file() {
-            let context = path
-                .canonicalize()
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to resolve path: {}", path.display()))?;
-            let dockerfile = context.join("Dockerfile");
-            return Ok(ResolvedSource::Dockerfile {
-                dockerfile,
-                context,
-            });
-        }
+        let build_context = if path.is_dir() {
+            path.display().to_string()
+        } else {
+            path.parent()
+                .map(|p| p.display().to_string())
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| ".".to_string())
+        };
         return Err(miette::miette!(
-            "No Dockerfile found in directory: {}",
-            path.display()
+            "'--from' no longer builds local Dockerfiles or directories: {}\n\
+             Build and tag the image with the container engine used by the gateway, then pass the resulting image reference:\n  \
+             docker build -t <image> {}  # Docker gateway\n  \
+             podman build -t <image> {}  # Podman gateway\n  \
+             openshell sandbox create --from <image>\n\
+             If the gateway cannot access the selected engine's local image store (for example, a remote or Kubernetes gateway), push the image to a registry that the gateway can pull from.",
+            path.display(),
+            build_context,
+            build_context,
         ));
     }
 
-    if path.exists() {
-        return Err(miette::miette!(
-            "local --from path is not a regular file or directory: {}",
-            path.display()
-        ));
-    }
-
-    // 3. Missing explicit local paths should fail locally. Otherwise values
-    // like `./Dockerfile` reach the gateway as image references and fail as
-    // Docker pull errors.
-    if value_looks_like_local_source(value) {
-        return Err(miette::miette!(
-            "local --from path does not exist: {}\n\
-             Use an existing Dockerfile, a directory containing Dockerfile, or a container image reference.",
-            path.display()
-        ));
-    }
-
-    // 4. Full image reference or community sandbox name — delegate to shared
-    //    resolution in openshell-core.
+    // Full image reference or community sandbox name — delegate to shared
+    // resolution in openshell-core.
     Ok(ResolvedSource::Image(
         openshell_core::image::resolve_community_image(value),
     ))
 }
 
-fn filename_looks_like_dockerfile(path: &Path) -> bool {
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // already lowercased
+fn filename_looks_like_rootfs_tar(path: &Path) -> bool {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
     let lower = name.to_lowercase();
-    lower.contains("dockerfile") || lower.ends_with(".dockerfile")
+    lower.ends_with(".tar.gz") || lower.ends_with(".tar") || lower.ends_with(".tgz")
 }
 
-fn value_looks_like_local_source(value: &str) -> bool {
-    value_is_explicit_local_path(value) || value_looks_like_bare_dockerfile_name(value)
-}
-
-fn value_is_explicit_local_path(value: &str) -> bool {
+fn value_looks_like_local_path(value: &str) -> bool {
     let path = Path::new(value);
     path.is_absolute()
         || matches!(value, "." | "..")
         || value.starts_with("./")
         || value.starts_with("../")
         || value.starts_with("~/")
+        || value_looks_like_bare_dockerfile_name(value)
 }
 
 fn value_looks_like_bare_dockerfile_name(value: &str) -> bool {
-    !value.contains('/') && !value.contains(':') && filename_looks_like_dockerfile(Path::new(value))
+    !value.contains('/')
+        && !value.contains(':')
+        && Path::new(value)
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().to_lowercase().contains("dockerfile"))
 }
 
-fn dockerfile_sources_supported_for_gateway(metadata: Option<&GatewayMetadata>) -> bool {
+fn rootfs_tar_sources_supported_for_gateway(metadata: Option<&GatewayMetadata>) -> bool {
     !metadata.is_some_and(|metadata| metadata.is_remote)
 }
 
-/// Build a Dockerfile and return the local Docker tag.
+/// Ask the gateway for a staging slot, then copy the archive into it.
 ///
-/// Package-managed local gateways use the same Docker daemon that the CLI
-/// builds into, so the tag is passed through directly and the active compute
-/// driver resolves it.
-async fn build_from_dockerfile(
-    dockerfile: &Path,
-    context: &Path,
+/// The gateway owns the destination: it allocates a request-scoped directory
+/// and returns a single-use token. We never name a path of our own choosing,
+/// so a request cannot reach for another caller's archive or an arbitrary host
+/// file. Returns the token to pass on `CreateSandbox`.
+async fn stage_rootfs_tar(
     gateway_name: &str,
+    client: &mut crate::tls::GrpcClient,
+    workspace: &str,
+    tar_path: &Path,
 ) -> Result<String> {
     let metadata = get_gateway_metadata(gateway_name);
-    if !dockerfile_sources_supported_for_gateway(metadata.as_ref()) {
+    if !rootfs_tar_sources_supported_for_gateway(metadata.as_ref()) {
         return Err(miette!(
-            "local Dockerfile sources are only supported for local gateways; gateway '{}' is remote",
+            "local rootfs tar sources are only supported for local gateways; gateway '{}' is remote",
             gateway_name
         ));
     }
 
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let tag = format!("openshell/sandbox-from:{timestamp}");
+    let file_name = tar_path
+        .file_name()
+        .ok_or_else(|| miette!("rootfs tar path has no filename"))?
+        .to_string_lossy()
+        .into_owned();
+    let source_meta = tokio::fs::metadata(tar_path)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read {}", tar_path.display()))?;
 
+    // The gateway rejects a driver that cannot take rootfs tar sources, and an
+    // archive over its configured limit, before allocating anything.
+    let slot = client
+        .begin_rootfs_tar_staging(BeginRootfsTarStagingRequest {
+            workspace: workspace.to_string(),
+            file_name,
+            size_bytes: source_meta.len(),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to allocate a rootfs tar staging slot on the gateway")?
+        .into_inner();
+
+    let staged_path = PathBuf::from(&slot.upload_path);
     eprintln!(
-        "Building image {} from {}",
-        tag.cyan(),
-        dockerfile.display()
-    );
-    eprintln!("  {} {}", "Context:".dimmed(), context.display());
-    eprintln!("  {} {}", "Gateway:".dimmed(), gateway_name);
-    eprintln!();
-
-    let mut on_log = |msg: String| {
-        eprintln!("  {msg}");
-    };
-
-    openshell_bootstrap::build::build_local_image(
-        dockerfile,
-        &tag,
-        context,
-        &HashMap::new(),
-        &mut on_log,
-    )
-    .await?;
-
-    eprintln!();
-    eprintln!(
-        "{} Image {} is available in the local Docker daemon for gateway '{}'.",
-        "✓".green().bold(),
-        tag.cyan(),
+        "Staging rootfs tar {} for gateway '{}'",
+        tar_path.display().to_string().cyan(),
         gateway_name,
     );
+    // Enforced while streaming, so an archive that grows after the size check
+    // above still cannot exceed the limit.
+    if let Err(err) = copy_with_byte_limit(tar_path, &staged_path, slot.max_bytes).await {
+        // The staging directory belongs to the gateway, which reclaims it when
+        // the slot expires. Removing it here would reach into its state.
+        return Err(miette!(
+            "failed to stage rootfs tar to {}: {err}",
+            staged_path.display()
+        ));
+    }
     eprintln!();
 
-    Ok(tag)
+    Ok(slot.staging_token)
+}
+
+/// Copy `src` to `dst`, aborting if total bytes written exceeds `limit`.
+/// A limit of 0 disables enforcement.
+async fn copy_with_byte_limit(
+    src: &Path,
+    dst: &Path,
+    limit: u64,
+) -> std::result::Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut reader = tokio::fs::File::open(src)
+        .await
+        .map_err(|e| format!("open source: {e}"))?;
+    let mut writer = tokio::fs::File::create(dst)
+        .await
+        .map_err(|e| format!("create destination: {e}"))?;
+
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if limit > 0 && total > limit {
+            return Err(format!(
+                "{} exceeds the {} byte limit",
+                src.display(),
+                limit
+            ));
+        }
+        writer
+            .write_all(&buf[..n])
+            .await
+            .map_err(|e| format!("write: {e}"))?;
+    }
+    Ok(())
+}
+
+/// `driver_config` key for the VM compute driver. The gateway forwards only
+/// `template.driver_config.<driver_name>` to the selected driver, so VM
+/// settings must be nested under this key or they are dropped.
+const VM_DRIVER_CONFIG_KEY: &str = "vm";
+/// VM `driver_config` field naming the gateway-issued staging slot. The
+/// gateway swaps it for the resolved archive path before the driver sees it.
+const ROOTFS_TAR_TOKEN_FIELD: &str = "rootfs_tar_staging_token";
+
+/// Merge the staging token into `driver_config.vm`, preserving any VM settings
+/// the caller already supplied through `--driver-config-json`.
+fn merge_rootfs_tar_driver_config(
+    base: Option<prost_types::Struct>,
+    staging_token: &str,
+) -> Result<prost_types::Struct> {
+    use prost_types::{Struct, Value, value::Kind};
+
+    let mut config = base.unwrap_or_default();
+    let vm = config
+        .fields
+        .entry(VM_DRIVER_CONFIG_KEY.to_string())
+        .or_insert_with(|| Value {
+            kind: Some(Kind::StructValue(Struct::default())),
+        });
+
+    let Some(Kind::StructValue(vm_config)) = vm.kind.as_mut() else {
+        return Err(miette!(
+            "--driver-config-json '{VM_DRIVER_CONFIG_KEY}' must be an object"
+        ));
+    };
+
+    if vm_config.fields.contains_key(ROOTFS_TAR_TOKEN_FIELD) {
+        return Err(miette!(
+            "--driver-config-json already sets {VM_DRIVER_CONFIG_KEY}.{ROOTFS_TAR_TOKEN_FIELD}; \
+             remove it or drop the rootfs tar from --from"
+        ));
+    }
+
+    vm_config.fields.insert(
+        ROOTFS_TAR_TOKEN_FIELD.to_string(),
+        Value {
+            kind: Some(Kind::StringValue(staging_token.to_string())),
+        },
+    );
+
+    Ok(config)
 }
 
 /// Load sandbox policy YAML.
@@ -5965,25 +6037,26 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 #[cfg(test)]
 mod tests {
     use super::{
-        PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
-        dockerfile_sources_supported_for_gateway, format_endpoint, format_log_line, git_sync_files,
-        has_main_process_result, parse_cli_setting_value, parse_credential_expiry_cli_value,
-        parse_driver_config_json, parse_secret_material_env_pairs, policy_revision_list_json,
-        policy_revision_to_json, provisioning_timeout_message, ready_false_condition_message,
-        resolve_from, sandbox_should_persist, sandbox_upload_plan, service_endpoint_to_json,
-        service_expose_status_error, service_url_for_gateway, workspace_member_to_json,
+        PolicyGetView, ProvisioningStep, build_sandbox_resource_limits, format_endpoint,
+        format_log_line, git_sync_files, has_main_process_result, parse_cli_setting_value,
+        parse_credential_expiry_cli_value, parse_driver_config_json,
+        parse_secret_material_env_pairs, policy_revision_list_json, policy_revision_to_json,
+        provisioning_timeout_message, ready_false_condition_message, resolve_from,
+        rootfs_tar_sources_supported_for_gateway, sandbox_should_persist, sandbox_upload_plan,
+        service_endpoint_to_json, service_expose_status_error, service_url_for_gateway,
+        workspace_member_to_json,
     };
     use crate::TEST_ENV_LOCK;
     use crate::commands::common::{
         parse_credential_expiry_pairs, parse_credential_pairs, progress_step_from_metadata,
     };
     use crate::test_utils::EnvVarGuard;
+    use openshell_bootstrap::GatewayMetadata;
     use std::fs;
     use std::path::Path;
     use std::process::Command;
     use tonic::Status;
 
-    use openshell_bootstrap::GatewayMetadata;
     use openshell_core::progress::{
         PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX,
         PROGRESS_STEP_STARTING_SANDBOX,
@@ -6486,49 +6559,77 @@ mod tests {
     }
 
     #[test]
-    fn resolve_from_classifies_existing_dockerfile_path() {
+    fn resolve_from_rejects_existing_dockerfile_path() {
         let temp = tempfile::tempdir().expect("failed to create tempdir");
         let dockerfile = temp.path().join("Dockerfile");
         fs::write(&dockerfile, "FROM scratch\n").expect("failed to write Dockerfile");
 
-        match resolve_from(dockerfile.to_str().expect("temp path is not UTF-8"))
-            .expect("expected Dockerfile source")
-        {
-            super::ResolvedSource::Dockerfile {
-                dockerfile: resolved,
-                context,
-            } => {
-                assert_eq!(
-                    resolved,
-                    dockerfile
-                        .canonicalize()
-                        .expect("failed to canonicalize Dockerfile")
-                );
-                assert_eq!(
-                    context,
-                    temp.path()
-                        .canonicalize()
-                        .expect("failed to canonicalize context")
-                );
-            }
-            super::ResolvedSource::Image(image) => {
-                panic!("expected Dockerfile source, got image {image}");
-            }
-        }
+        let err = resolve_from(dockerfile.to_str().expect("temp path is not UTF-8"))
+            .expect_err("expected local Dockerfile path to be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("no longer builds local Dockerfiles or directories"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("docker build -t <image>"),
+            "expected actionable build guidance: {err}"
+        );
+        assert!(
+            err.to_string().contains("podman build -t <image>"),
+            "expected Podman build guidance: {err}"
+        );
     }
 
     #[test]
-    fn resolve_from_rejects_missing_explicit_dockerfile_path() {
+    fn resolve_from_rejects_missing_explicit_local_path() {
         let temp = tempfile::tempdir().expect("failed to create tempdir");
         let missing = temp.path().join("Dockerfile");
 
         let err = resolve_from(missing.to_str().expect("temp path is not UTF-8"))
-            .expect_err("expected missing Dockerfile path to be rejected");
+            .expect_err("expected missing explicit local path to be rejected");
 
         assert!(
-            err.to_string().contains("local --from path does not exist"),
+            err.to_string()
+                .contains("no longer builds local Dockerfiles or directories"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_from_rejects_bare_dockerfile_name() {
+        let err = resolve_from("Dockerfile").expect_err("expected bare Dockerfile to be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("no longer builds local Dockerfiles or directories"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_from_keeps_bare_community_name_when_local_directory_matches() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("create tempdir");
+        fs::create_dir(temp.path().join("python")).expect("create matching directory");
+        let original_dir = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(temp.path()).expect("enter tempdir");
+
+        let result = resolve_from("python");
+
+        std::env::set_current_dir(original_dir).expect("restore current directory");
+        match result.expect("bare community name should not be a local path") {
+            super::ResolvedSource::Image(image) => assert_eq!(
+                image,
+                "ghcr.io/nvidia/openshell-community/sandboxes/python:latest"
+            ),
+            other @ super::ResolvedSource::RootfsTar { .. } => {
+                panic!("expected image source, got {other:?}");
+            }
+        }
     }
 
     #[test]
@@ -6537,14 +6638,195 @@ mod tests {
 
         match resolve_from(image_ref).expect("expected image source") {
             super::ResolvedSource::Image(image) => assert_eq!(image, image_ref),
-            super::ResolvedSource::Dockerfile { .. } => {
-                panic!("expected image ref, got Dockerfile source");
+            other @ super::ResolvedSource::RootfsTar { .. } => {
+                panic!("expected image ref, got {other:?}");
             }
         }
     }
 
     #[test]
-    fn dockerfile_sources_are_rejected_for_remote_gateways() {
+    fn resolve_from_classifies_tar_archive() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        let archive = temp.path().join("rootfs.tar");
+        fs::write(&archive, b"fake tar content").expect("failed to write archive");
+
+        match resolve_from(archive.to_str().expect("temp path is not UTF-8"))
+            .expect("expected RootfsTar source")
+        {
+            super::ResolvedSource::RootfsTar { path } => {
+                assert_eq!(
+                    path,
+                    archive
+                        .canonicalize()
+                        .expect("failed to canonicalize archive")
+                );
+            }
+            other @ super::ResolvedSource::Image(_) => {
+                panic!("expected RootfsTar source, got {other:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_from_classifies_tar_gz_archive() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        let archive = temp.path().join("rootfs.tar.gz");
+        fs::write(&archive, b"fake tar.gz content").expect("failed to write archive");
+
+        match resolve_from(archive.to_str().expect("temp path is not UTF-8"))
+            .expect("expected RootfsTar source")
+        {
+            super::ResolvedSource::RootfsTar { path } => {
+                assert_eq!(
+                    path,
+                    archive
+                        .canonicalize()
+                        .expect("failed to canonicalize archive")
+                );
+            }
+            other @ super::ResolvedSource::Image(_) => {
+                panic!("expected RootfsTar source, got {other:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_from_classifies_tgz_archive() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        let archive = temp.path().join("rootfs.tgz");
+        fs::write(&archive, b"fake tgz content").expect("failed to write archive");
+
+        match resolve_from(archive.to_str().expect("temp path is not UTF-8"))
+            .expect("expected RootfsTar source")
+        {
+            super::ResolvedSource::RootfsTar { path } => {
+                assert_eq!(
+                    path,
+                    archive
+                        .canonicalize()
+                        .expect("failed to canonicalize archive")
+                );
+            }
+            other @ super::ResolvedSource::Image(_) => {
+                panic!("expected RootfsTar source, got {other:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_from_rejects_missing_tar_archive() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        let missing = temp.path().join("missing.tar");
+
+        let err = resolve_from(missing.to_str().expect("temp path is not UTF-8"))
+            .expect_err("expected missing archive to be rejected");
+
+        assert!(
+            err.to_string().contains("local --from path does not exist"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn filename_looks_like_rootfs_tar_detects_extensions() {
+        use super::filename_looks_like_rootfs_tar;
+        assert!(filename_looks_like_rootfs_tar(Path::new("rootfs.tar")));
+        assert!(filename_looks_like_rootfs_tar(Path::new("rootfs.tar.gz")));
+        assert!(filename_looks_like_rootfs_tar(Path::new("rootfs.tgz")));
+        assert!(filename_looks_like_rootfs_tar(Path::new("IMAGE.TAR")));
+        assert!(filename_looks_like_rootfs_tar(Path::new("my-image.TAR.GZ")));
+        assert!(!filename_looks_like_rootfs_tar(Path::new("Dockerfile")));
+        assert!(!filename_looks_like_rootfs_tar(Path::new("image.zip")));
+    }
+
+    /// The gateway forwards only `template.driver_config.<driver_name>` to the
+    /// selected driver, so a top-level key is silently dropped and the archive
+    /// never reaches the VM driver.
+    #[test]
+    fn rootfs_tar_driver_config_nests_under_vm_key() {
+        use prost_types::value::Kind;
+
+        let config =
+            super::merge_rootfs_tar_driver_config(None, "tok-abc").expect("merge should succeed");
+
+        assert_eq!(
+            config.fields.keys().collect::<Vec<_>>(),
+            vec!["vm"],
+            "rootfs tar config must live under the vm driver key"
+        );
+        let Some(Kind::StructValue(vm)) = config.fields["vm"].kind.as_ref() else {
+            panic!("vm entry must be an object");
+        };
+        let Some(Kind::StringValue(token)) = vm.fields["rootfs_tar_staging_token"].kind.as_ref()
+        else {
+            panic!("rootfs_tar_staging_token must be a string");
+        };
+        assert_eq!(token, "tok-abc");
+        assert!(
+            !vm.fields.contains_key("rootfs_tar_path"),
+            "the CLI never names a host path; the gateway resolves one"
+        );
+    }
+
+    #[test]
+    fn rootfs_tar_driver_config_preserves_existing_vm_settings() {
+        use prost_types::value::Kind;
+
+        let base = parse_driver_config_json(
+            r#"{"vm":{"gpu_device_ids":["0000:2d:00.0"]},"docker":{"userns":"host"}}"#,
+        )
+        .expect("valid driver config json");
+
+        let config = super::merge_rootfs_tar_driver_config(Some(base), "tok-abc")
+            .expect("merge should succeed");
+
+        // The sibling driver block survives untouched.
+        assert!(config.fields.contains_key("docker"));
+
+        let Some(Kind::StructValue(vm)) = config.fields["vm"].kind.as_ref() else {
+            panic!("vm entry must be an object");
+        };
+        assert!(
+            vm.fields.contains_key("gpu_device_ids"),
+            "pre-existing vm settings must not be clobbered"
+        );
+        let Some(Kind::StringValue(token)) = vm.fields["rootfs_tar_staging_token"].kind.as_ref()
+        else {
+            panic!("rootfs_tar_staging_token must be a string");
+        };
+        assert_eq!(token, "tok-abc");
+    }
+
+    #[test]
+    fn rootfs_tar_driver_config_rejects_caller_supplied_token() {
+        let base = parse_driver_config_json(r#"{"vm":{"rootfs_tar_staging_token":"stolen"}}"#)
+            .expect("valid driver config json");
+
+        let err = super::merge_rootfs_tar_driver_config(Some(base), "tok-abc")
+            .expect_err("a caller-supplied staging token must not be silently overwritten");
+
+        assert!(
+            err.to_string()
+                .contains("already sets vm.rootfs_tar_staging_token"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rootfs_tar_driver_config_rejects_non_object_vm_block() {
+        let base = parse_driver_config_json(r#"{"vm":"nonsense"}"#).expect("valid json object");
+
+        let err = super::merge_rootfs_tar_driver_config(Some(base), "tok-abc")
+            .expect_err("a non-object vm block must be rejected");
+
+        assert!(
+            err.to_string().contains("must be an object"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rootfs_tar_sources_are_rejected_for_remote_gateways() {
         let metadata = GatewayMetadata {
             name: "remote".to_string(),
             gateway_endpoint: "https://gateway.example.com".to_string(),
@@ -6559,11 +6841,11 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(!dockerfile_sources_supported_for_gateway(Some(&metadata)));
+        assert!(!rootfs_tar_sources_supported_for_gateway(Some(&metadata)));
     }
 
     #[test]
-    fn dockerfile_sources_are_allowed_for_local_gateways() {
+    fn rootfs_tar_sources_are_allowed_for_local_gateways() {
         let metadata = GatewayMetadata {
             name: "local".to_string(),
             gateway_endpoint: "http://127.0.0.1:8080".to_string(),
@@ -6578,8 +6860,8 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(dockerfile_sources_supported_for_gateway(Some(&metadata)));
-        assert!(dockerfile_sources_supported_for_gateway(None));
+        assert!(rootfs_tar_sources_supported_for_gateway(Some(&metadata)));
+        assert!(rootfs_tar_sources_supported_for_gateway(None));
     }
 
     #[test]

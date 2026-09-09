@@ -413,7 +413,21 @@ impl OpaEngine {
         entrypoint_pid: u32,
         require_binary_identity: bool,
     ) -> Result<Self> {
-        let ambiguities = openshell_policy::find_endpoint_ambiguities(proto);
+        // Protobuf cannot distinguish an omitted repeated MCP version field
+        // from an empty one. Canonicalize before any runtime consumer reads
+        // the policy so both representations select the pinned default.
+        let proto = openshell_policy::validate_and_canonicalize_sandbox_policy(proto.clone())
+            .map_err(|error| {
+                let errors = error
+                    .violations()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                miette::miette!("policy validation failed:\n{errors}")
+            })?;
+
+        let ambiguities = openshell_policy::find_endpoint_ambiguities(&proto);
         if !ambiguities.is_empty() {
             return Err(miette::miette!(
                 "network endpoint ambiguity validation failed:\n{}",
@@ -426,16 +440,7 @@ impl OpaEngine {
         }
 
         emit_binary_identity_mode(require_binary_identity, "proto");
-        if let Err(violations) = openshell_policy::validate_sandbox_policy(proto) {
-            let errors = violations
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Err(miette::miette!("policy validation failed:\n{errors}"));
-        }
-
-        let data_json_str = proto_to_opa_data_json(proto, entrypoint_pid);
+        let data_json_str = proto_to_opa_data_json(&proto, entrypoint_pid);
 
         // Parse back to Value for preprocessing, then re-serialize
         let mut data: serde_json::Value = serde_json::from_str(&data_json_str)
@@ -1502,6 +1507,28 @@ fn normalize_l7_config_aliases(data: &mut serde_json::Value) -> Vec<String> {
             for stanza in L7ConfigStanza::ALL {
                 normalize_l7_config_alias(&mut errors, ep_obj, &loc, stanza);
             }
+
+            // The nested MCP stanza is optional, but the runtime projection is
+            // not. Materialize the pinned default at this YAML boundary so a
+            // missing alias cannot later look like corrupted runtime state.
+            if ep_obj
+                .get("protocol")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|protocol| protocol.eq_ignore_ascii_case("mcp"))
+                && !ep_obj.contains_key("mcp_versions")
+            {
+                match openshell_policy::l7_config_alias_runtime_fields(
+                    L7ConfigStanza::Mcp,
+                    serde_json::json!({}),
+                ) {
+                    Ok(fields) => {
+                        for (field, value) in fields {
+                            ep_obj.insert(field.to_string(), value);
+                        }
+                    }
+                    Err(error) => errors.push(format!("{loc}.mcp: {error}")),
+                }
+            }
         }
     }
 
@@ -1526,6 +1553,15 @@ fn normalize_l7_config_alias(
         Ok(fields) => {
             ep.remove(key);
             for (field, value) in fields {
+                if stanza == L7ConfigStanza::Mcp
+                    && field == "mcp_versions"
+                    && ep.contains_key(field)
+                {
+                    errors.push(format!(
+                        "{loc}: mcp.versions and mcp_versions cannot both be set"
+                    ));
+                    continue;
+                }
                 ep.entry(field.to_string()).or_insert(value);
             }
         }
@@ -1931,29 +1967,48 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                             .iter()
                             .map(|r| {
                                 let a = r.allow.as_ref();
-                                let mut allow = serde_json::json!({
-                                    "method": a.map_or("", |a| &a.method),
-                                    "path": a.map_or("", |a| &a.path),
-                                    "command": a.map_or("", |a| &a.command),
-                                    "operation_type": a.map_or("", |a| &a.operation_type),
-                                    "operation_name": a.map_or("", |a| &a.operation_name),
-                                });
-                                if let Some(a) = a
-                                    && !a.fields.is_empty()
-                                {
-                                    allow["fields"] = a.fields.clone().into();
+                                let mut allow = serde_json::Map::new();
+                                if let Some(a) = a {
+                                    // Proto3 represents absent scalar selectors as empty
+                                    // strings. Omit them so protobuf and YAML rules expose
+                                    // the same selector families to runtime validation.
+                                    if !a.method.is_empty() {
+                                        allow.insert("method".to_string(), a.method.clone().into());
+                                    }
+                                    if !a.path.is_empty() {
+                                        allow.insert("path".to_string(), a.path.clone().into());
+                                    }
+                                    if !a.command.is_empty() {
+                                        allow
+                                            .insert("command".to_string(), a.command.clone().into());
+                                    }
+                                    if !a.operation_type.is_empty() {
+                                        allow.insert(
+                                            "operation_type".to_string(),
+                                            a.operation_type.clone().into(),
+                                        );
+                                    }
+                                    if !a.operation_name.is_empty() {
+                                        allow.insert(
+                                            "operation_name".to_string(),
+                                            a.operation_name.clone().into(),
+                                        );
+                                    }
+                                    if !a.fields.is_empty() {
+                                        allow.insert("fields".to_string(), a.fields.clone().into());
+                                    }
                                 }
                                 let query = a.map_or_else(serde_json::Map::new, |allow| {
                                     l7_matchers_to_json(&allow.query)
                                 });
                                 if !query.is_empty() {
-                                    allow["query"] = query.into();
+                                    allow.insert("query".to_string(), query.into());
                                 }
                                 let params = a.map_or_else(serde_json::Map::new, |allow| {
                                     l7_matchers_to_json(&allow.params)
                                 });
                                 if !params.is_empty() {
-                                    allow["params"] = params.into();
+                                    allow.insert("params".to_string(), params.into());
                                 }
                                 serde_json::json!({ "allow": allow })
                             })
@@ -2059,6 +2114,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                         ep["json_rpc_max_body_bytes"] = e.json_rpc_max_body_bytes.into();
                     }
                     if let Some(mcp) = &e.mcp {
+                        if e.protocol.eq_ignore_ascii_case("mcp") {
+                            ep["mcp_versions"] = mcp.versions.clone().into();
+                        }
                         if let Some(strict_tool_names) = mcp.strict_tool_names {
                             ep["mcp_strict_tool_names"] = strict_tool_names.into();
                         }
@@ -2192,8 +2250,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
 mod tests {
     use super::*;
 
+    use openshell_core::mcp::DEFAULT_MCP_PROTOCOL_VERSION;
     use openshell_core::proto::{
-        FilesystemPolicy as ProtoFs, L7Allow, L7QueryMatcher, L7Rule, NetworkBinary,
+        FilesystemPolicy as ProtoFs, L7Allow, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
         NetworkEndpoint, NetworkMiddlewareConfig, NetworkPolicyRule, ProcessPolicy as ProtoProc,
         SandboxPolicy as ProtoSandboxPolicy,
     };
@@ -2261,6 +2320,112 @@ mod tests {
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         }
+    }
+
+    fn defaultable_mcp_proto(mcp: Option<McpOptions>) -> ProtoSandboxPolicy {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "mcp".to_string(),
+            NetworkPolicyRule {
+                name: "mcp".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "mcp.example.com".to_string(),
+                    port: 443,
+                    protocol: "mcp".to_string(),
+                    mcp,
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: "tools/list".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        policy
+    }
+
+    fn projected_allow(
+        protocol: &str,
+        allow: L7Allow,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            network_policies: std::collections::HashMap::from([(
+                "selector_projection".to_string(),
+                NetworkPolicyRule {
+                    name: "selector_projection".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        protocol: protocol.to_string(),
+                        rules: vec![L7Rule { allow: Some(allow) }],
+                        ..Default::default()
+                    }],
+                    binaries: vec![],
+                },
+            )]),
+            ..Default::default()
+        };
+        let projected: serde_json::Value = serde_json::from_str(&proto_to_opa_data_json(&proto, 0))
+            .expect("protobuf policy projection must produce JSON");
+        projected["network_policies"]["selector_projection"]["endpoints"][0]["rules"][0]["allow"]
+            .as_object()
+            .expect("projected allow rule must be an object")
+            .clone()
+    }
+
+    #[test]
+    fn proto_projection_omits_absent_allow_selectors() {
+        let allow = projected_allow(
+            "websocket",
+            L7Allow {
+                operation_type: "subscription".to_string(),
+                operation_name: "NewMessages".to_string(),
+                fields: vec!["messageAdded".to_string()],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            allow,
+            serde_json::json!({
+                "operation_type": "subscription",
+                "operation_name": "NewMessages",
+                "fields": ["messageAdded"],
+            })
+            .as_object()
+            .expect("expected object")
+            .clone()
+        );
+    }
+
+    #[test]
+    fn proto_projection_preserves_nonempty_allow_selectors() {
+        let allow = projected_allow(
+            "rest",
+            L7Allow {
+                method: "POST".to_string(),
+                path: "/repos/**".to_string(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            allow,
+            serde_json::json!({
+                "method": "POST",
+                "path": "/repos/**",
+            })
+            .as_object()
+            .expect("expected object")
+            .clone()
+        );
     }
 
     const POLICY_DNS_SNAPSHOT_DATA: &str = r#"
@@ -3898,6 +4063,10 @@ network_policies:
                     path: "/mcp".to_string(),
                     protocol: "mcp".to_string(),
                     enforcement: "enforce".to_string(),
+                    mcp: Some(McpOptions {
+                        versions: vec![DEFAULT_MCP_PROTOCOL_VERSION.as_str().to_string()],
+                        ..Default::default()
+                    }),
                     rules: vec![L7Rule {
                         allow: Some(L7Allow {
                             method: "tools/call".to_string(),
@@ -4824,6 +4993,7 @@ network_policies:
         protocol: mcp
         enforcement: enforce
         mcp:
+          versions: ["2025-11-25", "2025-03-26"]
           strict_tool_names: false
         rules:
           - allow:
@@ -4847,6 +5017,151 @@ network_policies:
         let l7 = crate::l7::parse_l7_config(&config).expect("parse l7 config");
         assert_eq!(l7.protocol, crate::l7::L7Protocol::Mcp);
         assert!(!l7.mcp_strict_tool_names);
+        assert_eq!(
+            l7.mcp_versions,
+            vec![
+                openshell_core::mcp::McpProtocolVersion::V2025_03_26,
+                openshell_core::mcp::McpProtocolVersion::V2025_11_25,
+            ]
+        );
+    }
+
+    #[test]
+    fn yaml_load_accepts_mixed_case_mcp_protocol_with_default_versions() {
+        let data = r#"
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: MCP
+        rules:
+          - allow:
+              method: tools/list
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from yaml");
+        let input = NetworkInput {
+            host: "mcp.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let config = engine
+            .query_endpoint_config(&input)
+            .expect("query endpoint config")
+            .expect("expected MCP endpoint config");
+        let l7 = crate::l7::parse_l7_config(&config).expect("parse L7 endpoint config");
+
+        assert_eq!(l7.mcp_versions, vec![DEFAULT_MCP_PROTOCOL_VERSION]);
+    }
+
+    #[test]
+    fn yaml_load_rejects_invalid_flat_mcp_versions_before_activation() {
+        for (case, versions) in [
+            ("empty", "[]"),
+            ("non-string", "[1]"),
+            ("unsupported", "[\"2026-01-01\"]"),
+            ("duplicate", "[\"2025-11-25\", \"2025-11-25\"]"),
+            ("non-canonical", "[\"2025-11-25\", \"2025-03-26\"]"),
+        ] {
+            let data = format!(
+                r#"
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: mcp
+        mcp_versions: {versions}
+        rules:
+          - allow:
+              method: tools/list
+    binaries:
+      - {{ path: /usr/bin/curl }}
+"#
+            );
+
+            let Err(error) = OpaEngine::from_strings(TEST_POLICY, &data) else {
+                panic!("invalid MCP runtime metadata must reject activation: {case}");
+            };
+            assert!(
+                error.to_string().contains("mcp.versions"),
+                "{case}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_load_rejects_nested_and_flat_mcp_version_collision() {
+        let data = r#"
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: mcp
+        mcp_versions: ["2025-03-26"]
+        mcp:
+          versions: ["2025-11-25"]
+        rules:
+          - allow:
+              method: tools/list
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+
+        let Err(error) = OpaEngine::from_strings(TEST_POLICY, data) else {
+            panic!("ambiguous MCP revision sources must reject activation");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("mcp.versions and mcp_versions cannot both be set"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn yaml_load_rejects_mcp_versions_on_non_mcp_protocols() {
+        for mcp_fields in [
+            "mcp:\n          versions: [\"2025-11-25\"]",
+            "mcp_versions: [\"2025-11-25\"]",
+        ] {
+            let data = format!(
+                r#"
+network_policies:
+  json_rpc:
+    name: json_rpc
+    endpoints:
+      - host: rpc.example.com
+        port: 443
+        protocol: json-rpc
+        {mcp_fields}
+        rules:
+          - allow:
+              method: ping
+    binaries:
+      - {{ path: /usr/bin/curl }}
+"#
+            );
+
+            let Err(error) = OpaEngine::from_strings(TEST_POLICY, &data) else {
+                panic!("MCP revision policy must not apply to generic JSON-RPC");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("mcp.versions is only valid for protocol mcp"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -5264,6 +5579,90 @@ network_policies:
         assert!(message.contains("wildcard"));
         assert!(message.contains("exact"));
         assert!(message.contains("tls"));
+    }
+
+    #[test]
+    fn proto_load_accepts_defaultable_mcp_versions_with_mixed_case_protocol() {
+        let mut implicit_defaults = defaultable_mcp_proto(None);
+        implicit_defaults
+            .network_policies
+            .get_mut("mcp")
+            .expect("defaultable MCP fixture contains the MCP policy")
+            .endpoints[0]
+            .protocol = "Mcp".to_string();
+        let explicit_defaults = defaultable_mcp_proto(Some(McpOptions::default()));
+
+        for policy in [implicit_defaults, explicit_defaults] {
+            let engine = OpaEngine::from_proto(&policy)
+                .expect("supervisor ingress must materialize the pinned MCP revision");
+            let input = NetworkInput {
+                host: "mcp.example.com".into(),
+                port: 443,
+                binary_path: PathBuf::from("/usr/bin/curl"),
+                binary_sha256: "unused".into(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            let config = engine
+                .query_endpoint_config(&input)
+                .expect("query endpoint config")
+                .expect("expected MCP endpoint config");
+            let l7 = crate::l7::parse_l7_config(&config).expect("parse L7 endpoint config");
+            assert_eq!(
+                l7.mcp_versions,
+                vec![DEFAULT_MCP_PROTOCOL_VERSION],
+                "protobuf ingress must preserve the materialized default through OPA"
+            );
+        }
+    }
+
+    #[test]
+    fn proto_load_projects_canonical_mcp_versions_to_l7_config() {
+        let policy = defaultable_mcp_proto(Some(McpOptions {
+            versions: vec!["2025-11-25".to_string(), "2025-03-26".to_string()],
+            ..Default::default()
+        }));
+        let engine = OpaEngine::from_proto(&policy).expect("valid MCP policy");
+        let input = NetworkInput {
+            host: "mcp.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let config = engine
+            .query_endpoint_config(&input)
+            .expect("query endpoint config")
+            .expect("expected MCP endpoint config");
+        let l7 = crate::l7::parse_l7_config(&config).expect("parse L7 endpoint config");
+
+        assert_eq!(
+            l7.mcp_versions,
+            vec![
+                openshell_core::mcp::McpProtocolVersion::V2025_03_26,
+                openshell_core::mcp::McpProtocolVersion::V2025_11_25,
+            ],
+            "protobuf ingress must preserve the canonical allowlist through OPA"
+        );
+    }
+
+    #[test]
+    fn proto_load_rejects_unsupported_mcp_versions() {
+        let policy = defaultable_mcp_proto(Some(McpOptions {
+            versions: vec!["latest".to_string()],
+            ..Default::default()
+        }));
+
+        let Err(error) = OpaEngine::from_proto(&policy) else {
+            panic!("canonicalization must not repair an unsupported MCP revision");
+        };
+        let error = error.to_string();
+        assert!(error.contains("policy validation failed"), "{error}");
+        assert!(
+            error.contains("unsupported protocol version 'latest'"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

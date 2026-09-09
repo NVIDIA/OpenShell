@@ -822,7 +822,8 @@ AND EXISTS (
         )
         .unwrap();
 
-        let mut query = sqlx::query(&sql)
+        // Label paths above escape SQL quotes; all values remain bound parameters.
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(object_type)
             .bind(member_type)
             .bind(member_name);

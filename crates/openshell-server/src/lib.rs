@@ -98,7 +98,7 @@ struct GatewayExtensionCredential {
 
 fn extension_token_ttl(issuer: &auth::sandbox_jwt::SandboxJwtIssuer) -> Duration {
     if issuer.ttl().is_zero() {
-        Duration::from_secs(15 * 60)
+        Duration::from_mins(15)
     } else {
         issuer.ttl().min(MAX_EXTENSION_TOKEN_TTL)
     }
@@ -703,9 +703,9 @@ pub(crate) async fn run_server(
     }
 
     state.compute.spawn_watchers(shutdown_rx.clone());
-    ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
+    ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
-    provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_secs(60));
+    provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
 
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
@@ -1610,9 +1610,8 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::{
-        compute::GatewayListenerRequirement,
-        gateway_listener::GatewayListenerSpec,
-        tls_test_utils::{generate_test_certs_with_ca, install_rustls_provider},
+        compute::GatewayListenerRequirement, gateway_listener::GatewayListenerSpec,
+        tls_test_utils::generate_test_certs_with_ca,
     };
 
     static DETECTION_PROBE_ORDER: LazyLock<Mutex<Vec<&'static str>>> =
@@ -1642,7 +1641,7 @@ mod tests {
                 material.signing_key_pem.as_bytes(),
                 material.kid,
                 "gateway-a",
-                Duration::from_secs(900),
+                Duration::from_mins(15),
             )
             .expect("issuer"),
         )
@@ -1773,8 +1772,6 @@ mod tests {
     }
 
     fn test_tls_acceptor() -> (TempDir, TlsAcceptor) {
-        install_rustls_provider();
-
         let dir = tempdir().expect("failed to create tempdir");
         generate_test_certs_with_ca(dir.path());
 

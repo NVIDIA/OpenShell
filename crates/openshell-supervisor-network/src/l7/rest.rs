@@ -811,7 +811,7 @@ where
 
 /// Default wall-clock bound shared by whole-body stages in one response.
 pub(crate) const DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(120);
+    std::time::Duration::from_mins(2);
 
 /// Context retained from request evaluation for the matching response hook.
 pub(crate) struct HttpResponseMiddlewareRelay<'a> {
@@ -7658,7 +7658,7 @@ mod tests {
             method,
             script,
             on_error,
-            std::time::Duration::from_secs(120),
+            std::time::Duration::from_mins(2),
         )
         .await
     }

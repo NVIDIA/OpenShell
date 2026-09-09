@@ -7,7 +7,7 @@ your local machine through port forwarding.
 ## Prerequisites
 
 - A running OpenShell gateway (`mise run gateway:docker` for local development)
-- Docker daemon running
+- Docker or Podman running, matching the gateway driver
 
 ## What's in this example
 
@@ -18,17 +18,27 @@ your local machine through port forwarding.
 
 ## Quick start
 
-### 1. Create a sandbox from the Dockerfile with port forwarding
+### 1. Build the image and create a sandbox with port forwarding
 
 ```bash
+# Docker gateway
+docker build -t openshell-byoc:latest examples/bring-your-own-container
 openshell sandbox create \
-    --from examples/bring-your-own-container/Dockerfile \
+    --from openshell-byoc:latest \
+    --forward 8080 \
+    -- python /sandbox/app.py
+
+# Podman gateway
+podman build -t localhost/openshell-byoc:latest examples/bring-your-own-container
+openshell sandbox create \
+    --from localhost/openshell-byoc:latest \
     --forward 8080 \
     -- python /sandbox/app.py
 ```
 
-The `--from` flag accepts a Dockerfile path. The CLI builds the image,
-pushes it into the cluster, and creates the sandbox in one step.
+Build the Dockerfile with the container engine used by your local gateway
+before creating the sandbox, then pass its image reference to `--from`. For a
+remote gateway, push the image to a registry that the gateway can pull from.
 
 The `--forward 8080` flag opens an SSH tunnel so `localhost:8080` on your
 machine reaches the REST API inside the sandbox.

@@ -584,15 +584,16 @@ Review the proposed scope, candidate hash, prover findings, and application erro
 
 Build a custom container image and run it as a sandbox.
 
-### Create a sandbox from a Dockerfile
+### Create a sandbox from a pre-built image
 
 ```bash
-openshell sandbox create --from ./Dockerfile --name my-app
+docker build -t my-app:latest .
+openshell sandbox create --from my-app:latest --name my-app
 ```
 
-The `--from` flag accepts a Dockerfile path, a directory containing a Dockerfile, a full image reference such as `myregistry.com/img:tag`, or a community sandbox name such as `ollama`.
+The `--from` flag accepts an existing full image reference such as `myregistry.com/img:tag`, or a community sandbox name such as `ollama`. Build local Dockerfiles first with the same container engine as the local gateway, then pass the image tag.
 
-Local Dockerfile and directory builds require a local gateway because the CLI builds through the local Docker daemon. Use a registry image reference for remote gateways. Bare community names resolve under `ghcr.io/nvidia/openshell-community/sandboxes` unless `OPENSHELL_COMMUNITY_REGISTRY` overrides the prefix.
+Use `docker build -t my-app:latest` for Docker gateways. For Podman gateways, use `podman build -t localhost/my-app:latest` and pass `localhost/my-app:latest` to `--from`. For remote gateways, push the image to a registry reachable by the gateway. Bare community names resolve under `ghcr.io/nvidia/openshell-community/sandboxes` unless `OPENSHELL_COMMUNITY_REGISTRY` overrides the prefix.
 
 For Docker and Podman gateways, custom images should declare a non-root OCI
 `USER`. Each explicit `process.run_as_user` or `process.run_as_group` policy
@@ -621,7 +622,7 @@ Manage or iterate on the sandbox:
 openshell forward list
 openshell forward stop 8080 my-app
 openshell sandbox delete my-app
-openshell sandbox create --from ./Dockerfile --name my-app --forward 8080
+openshell sandbox create --from my-app:latest --name my-app --forward 8080
 ```
 
 Use structured output when automation needs the tracked forward metadata and
@@ -638,7 +639,7 @@ the forwarded socket.
 Create and forward in one command:
 
 ```bash
-openshell sandbox create --from ./Dockerfile --forward 8080 -- ./start-server.sh
+openshell sandbox create --from my-app:latest --forward 8080 -- ./start-server.sh
 ```
 
 The `--forward` flag starts a background port forward before the command runs.
@@ -746,7 +747,7 @@ openshell gateway add https://gateway.example.com --name production
 openshell gateway remove local
 ```
 
-`https://` registrations default to edge authentication. Use `gateway login` and `gateway logout` to refresh or clear stored authentication. For an OIDC gateway, supply `--oidc-issuer` and, when needed, `--oidc-client-id`, `--oidc-audience`, and `--oidc-scopes`. For remote mTLS gateways, use `--remote USER@HOST` or an `ssh://` endpoint.
+`https://` registrations default to edge authentication. Use `gateway login` and `gateway logout` to refresh or clear stored authentication. For an OIDC gateway, supply `--oidc-issuer` and, when needed, `--oidc-client-id`, `--oidc-audience`, and `--oidc-scopes`. If automatic OIDC refresh fails, protected commands stop before sending an RPC and direct the user to run `openshell gateway login <name>`; `openshell status` still reports gateway reachability and authentication separately. For remote mTLS gateways, use `--remote USER@HOST` or an `ssh://` endpoint.
 
 For one-off automation, `--gateway-endpoint URL` connects directly without stored metadata. Limit `--gateway-insecure` to explicitly trusted development endpoints.
 

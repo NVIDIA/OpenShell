@@ -472,7 +472,7 @@ mod tests {
         );
         assert_eq!(
             routes[1].timeout,
-            Duration::from_secs(120),
+            Duration::from_mins(2),
             "timeout_secs=120 should map to 120s"
         );
     }

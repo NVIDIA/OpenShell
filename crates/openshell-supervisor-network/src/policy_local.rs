@@ -85,7 +85,7 @@ const MAX_DENIAL_LINE_BYTES: usize = 4096;
 
 #[derive(Debug)]
 pub struct PolicyLocalContext {
-    current_policy: Arc<RwLock<Option<ProtoSandboxPolicy>>>,
+    current_policy: Arc<RwLock<Option<Arc<ProtoSandboxPolicy>>>>,
     agent_proposals: AgentProposals,
     gateway_endpoint: Option<String>,
     sandbox_name: Option<String>,
@@ -120,7 +120,7 @@ impl PolicyLocalContext {
         workspace_rx: tokio::sync::watch::Receiver<String>,
     ) -> Self {
         Self {
-            current_policy: Arc::new(RwLock::new(current_policy)),
+            current_policy: Arc::new(RwLock::new(current_policy.map(Arc::new))),
             agent_proposals,
             gateway_endpoint,
             sandbox_name,
@@ -130,7 +130,10 @@ impl PolicyLocalContext {
     }
 
     pub async fn set_current_policy(&self, policy: ProtoSandboxPolicy) {
-        *self.current_policy.write().await = Some(policy);
+        // Every successful reload receives a distinct Arc, including an
+        // identical policy installed again. Waiters use pointer identity to
+        // decide whether the installed snapshot needs another coverage scan.
+        *self.current_policy.write().await = Some(Arc::new(policy));
     }
 
     pub fn workspace(&self) -> String {
@@ -887,18 +890,41 @@ async fn wait_for_local_policy_to_cover(
     proposed_rule: &NetworkPolicyRule,
     deadline: tokio::time::Instant,
 ) -> bool {
+    wait_for_local_policy_to_cover_with(
+        ctx,
+        proposed_rule,
+        deadline,
+        openshell_policy::policy_covers_rule,
+    )
+    .await
+}
+
+async fn wait_for_local_policy_to_cover_with<F>(
+    ctx: &PolicyLocalContext,
+    proposed_rule: &NetworkPolicyRule,
+    deadline: tokio::time::Instant,
+    covers_rule: F,
+) -> bool
+where
+    F: Fn(&ProtoSandboxPolicy, &NetworkPolicyRule) -> bool,
+{
     const TICK: std::time::Duration = std::time::Duration::from_millis(200);
+    let mut checked_snapshot: Option<Arc<ProtoSandboxPolicy>> = None;
     loop {
-        // Clone the snapshot out of the RwLock before running coverage —
-        // otherwise the read guard is held across `policy_covers_rule`'s
-        // iteration of `network_policies`, serializing a writer (supervisor
-        // reload) on the very thing we're waiting for. Clone-per-tick on
-        // a few-KB struct is cheap for the bounded wait window here.
+        // Clone only the Arc while holding the lock. Coverage runs once for
+        // each installed snapshot and never holds the read guard, so reloads
+        // cannot block behind a full network-policy scan.
         let snapshot = ctx.current_policy.read().await.clone();
         if let Some(policy) = snapshot.as_ref()
-            && openshell_policy::policy_covers_rule(policy, proposed_rule)
+            && checked_snapshot
+                .as_ref()
+                .is_none_or(|checked| !Arc::ptr_eq(checked, policy))
         {
-            return true;
+            let covered = covers_rule(policy, proposed_rule);
+            checked_snapshot = Some(Arc::clone(policy));
+            if covered {
+                return true;
+            }
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -2083,7 +2109,7 @@ mod tests {
             let policy = ctx.current_policy.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                *policy.write().await = Some(policy_with_rule(NetworkPolicyRule {
+                *policy.write().await = Some(Arc::new(policy_with_rule(NetworkPolicyRule {
                     name: "unrelated".to_string(),
                     endpoints: vec![NetworkEndpoint {
                         host: "api.example.com".to_string(),
@@ -2095,7 +2121,7 @@ mod tests {
                         path: "/usr/bin/curl".to_string(),
                         ..Default::default()
                     }],
-                }));
+                })));
             })
         };
 
@@ -2136,7 +2162,7 @@ mod tests {
             let target = proposed.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                *policy.write().await = Some(policy_with_rule(target));
+                *policy.write().await = Some(Arc::new(policy_with_rule(target)));
             })
         };
 
@@ -2182,6 +2208,81 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_millis(800),
             "should not extend past deadline by much; took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_checks_unchanged_policy_snapshot_once() {
+        let proposed = proposed_curl_rule_for_github();
+        let ctx = PolicyLocalContext::new(
+            Some(ProtoSandboxPolicy {
+                version: 1,
+                ..Default::default()
+            }),
+            None,
+            None,
+            AgentProposals::new(false),
+            test_workspace_rx(),
+        );
+        let checks = std::cell::Cell::new(0_u32);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(650);
+
+        let reloaded = wait_for_local_policy_to_cover_with(&ctx, &proposed, deadline, |_, _| {
+            checks.set(checks.get() + 1);
+            false
+        })
+        .await;
+
+        assert!(!reloaded);
+        assert_eq!(
+            checks.get(),
+            1,
+            "an unchanged snapshot must be checked once"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_checks_each_installed_snapshot_once() {
+        let proposed = proposed_curl_rule_for_github();
+        let empty_policy = ProtoSandboxPolicy {
+            version: 1,
+            ..Default::default()
+        };
+        let ctx = Arc::new(PolicyLocalContext::new(
+            Some(empty_policy.clone()),
+            None,
+            None,
+            AgentProposals::new(false),
+            test_workspace_rx(),
+        ));
+        let reloads = Arc::clone(&ctx);
+        let covering_rule = proposed.clone();
+        let installations = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            reloads.set_current_policy(empty_policy).await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            reloads
+                .set_current_policy(policy_with_rule(covering_rule))
+                .await;
+        });
+        let checks = std::cell::Cell::new(0_u32);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+
+        let reloaded =
+            wait_for_local_policy_to_cover_with(&ctx, &proposed, deadline, |policy, rule| {
+                checks.set(checks.get() + 1);
+                openshell_policy::policy_covers_rule(policy, rule)
+            })
+            .await;
+        installations
+            .await
+            .expect("policy installation task must complete");
+
+        assert!(reloaded, "the covering snapshot must complete the wait");
+        assert_eq!(
+            checks.get(),
+            3,
+            "initial, identical replacement, and covering snapshots need one check each"
         );
     }
 

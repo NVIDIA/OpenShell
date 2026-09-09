@@ -255,7 +255,7 @@ build_component_for_arch() {
     if [[ -n "$build_rustflags" ]]; then
       export RUSTFLAGS="$build_rustflags"
     fi
-    CARGO_INCREMENTAL=0 mise x -- "${cargo_env[@]}" "${cargo_subcommand[@]}" "${args[@]}"
+    CARGO_INCREMENTAL=0 mise x -- ${cargo_env[@]+"${cargo_env[@]}"} "${cargo_subcommand[@]}" "${args[@]}"
   )
 
   cargo_output_dir="$(cd "$ROOT" && mise x -- cargo metadata --format-version=1 --no-deps | jq -er '.target_directory')"

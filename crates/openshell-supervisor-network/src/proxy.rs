@@ -145,7 +145,7 @@ const MAX_STREAMING_BODY: usize = 1024;
 /// between "thinking" and output phases. 120s provides headroom while still
 /// catching genuinely stuck streams.
 #[cfg(not(test))]
-const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
 // Exercise idle-timeout truncation without slowing the full package test suite.
 #[cfg(test)]
 const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
@@ -6931,7 +6931,7 @@ network_policies:
             ))
             .await
         });
-        let scenario = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let scenario = tokio::time::timeout(std::time::Duration::from_mins(1), async {
             let (client, upstream) = tokio::join!(client, upstream);
             client.expect("join plaintext WebSocket client");
             assert_eq!(
@@ -7454,6 +7454,7 @@ network_policies:
             graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             mcp_strict_tool_names: true,
+            mcp_versions: Vec::new(),
             allow_encoded_slash: false,
             websocket_credential_rewrite,
             request_body_credential_rewrite: false,
@@ -8863,6 +8864,7 @@ network_policies:
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
                     json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
                     mcp_strict_tool_names: true,
+                    mcp_versions: Vec::new(),
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,
@@ -8883,6 +8885,7 @@ network_policies:
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
                     json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
                     mcp_strict_tool_names: true,
+                    mcp_versions: Vec::new(),
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,

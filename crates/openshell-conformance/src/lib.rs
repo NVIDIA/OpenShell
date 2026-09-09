@@ -92,7 +92,7 @@ pub fn default_scenarios() -> impl Iterator<Item = &'static Scenario> {
         .filter(|scenario| !scenario.requires_plan)
 }
 
-const CLEANUP_TIMEOUT: Duration = Duration::from_secs(120);
+const CLEANUP_TIMEOUT: Duration = Duration::from_mins(2);
 pub const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 const GATEWAY_STATUS_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 const GATEWAY_STATUS_INTERVAL: Duration = Duration::from_secs(2);

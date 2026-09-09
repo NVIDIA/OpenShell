@@ -37,6 +37,7 @@ pub struct Router {
 
 impl Router {
     pub fn new() -> Result<Self, RouterError> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
             .build()

@@ -52,6 +52,17 @@ pub fn openshell_sandbox_label_selector() -> String {
 /// being relaunched.
 pub const CONDITION_EXITED: &str = "ContainerExited";
 
+/// Ready-condition reason when the supervisor rejects an image-provided OCI
+/// working directory because the sandbox identity lacks the required access.
+pub const CONDITION_WORKSPACE_VALIDATION_FAILED: &str = "WorkspaceValidationFailed";
+
+/// Supervisor exit status reserved for OCI workspace validation failures.
+///
+/// Local container drivers translate this status into
+/// [`CONDITION_WORKSPACE_VALIDATION_FAILED`] so users receive the specific
+/// provisioning failure rather than a generic container exit.
+pub const SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED: i32 = 78;
+
 /// Ready-condition reason when a container was terminated by an external signal.
 ///
 /// SIGKILL/SIGTERM (exit 137/143) is what a Podman/Docker machine or daemon

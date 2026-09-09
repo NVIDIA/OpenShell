@@ -306,7 +306,7 @@ echo 'eval "$(~/.local/bin/mise activate zsh)"' >> ~/.zshrc
 
 Project requirements:
 
-- Rust 1.90+
+- Rust 1.94+
 - Python 3.11+
 - Docker (running)
 - CMake 3.16+ (only required when building with the `bundled-z3` feature)
