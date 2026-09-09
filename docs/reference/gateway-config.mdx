@@ -106,7 +106,8 @@ disable_tls = false
 # Shared driver defaults. These inherit into [openshell.drivers.<name>] tables
 # when the driver-specific table does not override them.
 default_image           = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
-# Defaults to the gateway version; override to pin a specific build.
+# Defaults to the gateway version. Custom builds must match the gateway's
+# internal supervisor protocol revision; mismatched peers reject the session.
 # supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
 client_tls_secret_name  = "openshell-client-tls"
 service_account_name    = "openshell-sandbox"

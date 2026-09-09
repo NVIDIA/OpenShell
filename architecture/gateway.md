@@ -654,6 +654,24 @@ successful create therefore yields an immediately usable provider; failures roll
 back the provider record. Service-account JSON and private keys remain gateway-side
 refresh bootstrap material; sandboxes receive minted access tokens instead.
 
+## Supervisor configuration routing
+
+Committed configuration mutations publish component and scope identifiers,
+never configuration payloads, to a bounded coalescing scheduler. The scheduler
+builds the latest full snapshot for each affected active sandbox. An async
+router owns session lookup, message sizing, sequence allocation, and enqueue.
+Its local implementation uses the process-local supervisor registry. A future
+HA implementation can resolve the gateway that owns a session and forward the
+same typed message without changing mutation handlers.
+
+Polling remains authoritative during the first rollout stage. Snapshot build,
+fanout, or enqueue failure cannot fail a mutation that already committed.
+Provider snapshots may contain credentials and must not be
+persisted or included in logs.
+
+See [sandbox configuration delivery](sandbox.md#supervisor-configuration-delivery)
+for bootstrap, revision, and supervisor application semantics.
+
 ## Supervisor Relay
 
 Sandbox workloads maintain an outbound supervisor session to the gateway. This

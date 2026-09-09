@@ -1084,6 +1084,36 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)
         Ok(())
     }
 
+    pub async fn put_initial_policy_revision(
+        &self,
+        record: &PolicyRecord,
+        workspace: &str,
+    ) -> PersistenceResult<()> {
+        let wrapped_payload = policy_payload_from_record(record)?;
+        sqlx::query(
+            r#"
+INSERT INTO "objects" (
+    "object_type", "id", "scope", "version", "status", "payload", "created_at_ms", "updated_at_ms", "workspace"
+)
+SELECT ?1, ?2, ?3, 1, ?4, ?5, ?6, ?6, ?7
+WHERE EXISTS (SELECT 1 FROM "objects" WHERE "object_type" = 'sandbox' AND "id" = ?3)
+  AND NOT EXISTS (SELECT 1 FROM "objects" WHERE "object_type" = ?1 AND "scope" = ?3)
+ON CONFLICT DO NOTHING
+"#,
+        )
+        .bind(POLICY_OBJECT_TYPE)
+        .bind(&record.id)
+        .bind(&record.sandbox_id)
+        .bind(&record.status)
+        .bind(wrapped_payload)
+        .bind(record.created_at_ms)
+        .bind(workspace)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
     pub async fn put_policy_revision_atomic(
         &self,
         write: &AtomicPolicyRevisionWrite,

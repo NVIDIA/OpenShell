@@ -2434,6 +2434,21 @@ async fn authorize_and_resolve_profile_workspace(
     }
 }
 
+fn publish_provider_change(state: &Arc<ServerState>, workspace: &str) {
+    if workspace.is_empty() {
+        crate::config_delivery::publish_all_connected(
+            state,
+            crate::config_delivery::ConfigComponents::ALL,
+        );
+    } else {
+        crate::config_delivery::publish_workspace_components(
+            state,
+            workspace,
+            crate::config_delivery::ConfigComponents::ALL,
+        );
+    }
+}
+
 pub(super) async fn handle_create_provider(
     state: &Arc<ServerState>,
     request: Request<CreateProviderRequest>,
@@ -2493,6 +2508,7 @@ pub(super) async fn handle_create_provider(
                 LifecycleOperation::Create,
                 TelemetryOutcome::Success,
             );
+            publish_provider_change(state, &workspace);
             Ok(Response::new(ProviderResponse {
                 provider: Some(provider),
             }))
@@ -2755,6 +2771,7 @@ pub(super) async fn handle_import_provider_profiles(
             stored.profile.unwrap_or_default(),
             resource_version,
         ));
+        publish_provider_change(state, &workspace);
     }
 
     Ok(Response::new(ImportProviderProfilesResponse {
@@ -2885,6 +2902,7 @@ pub(super) async fn handle_update_provider_profiles(
     }
     let resource_version = stored_profile_resource_version(&stored);
     let profile = profile_response_payload(stored.profile.unwrap_or_default(), resource_version);
+    publish_provider_change(state, &workspace);
 
     Ok(Response::new(UpdateProviderProfilesResponse {
         diagnostics: Vec::new(),
@@ -2974,6 +2992,9 @@ pub(super) async fn handle_delete_provider_profile(
         .delete_by_name(StoredProviderProfile::object_type(), &workspace, &id)
         .await
         .map_err(|e| Status::internal(format!("delete provider profile failed: {e}")))?;
+    if deleted {
+        publish_provider_change(state, &workspace);
+    }
 
     Ok(Response::new(DeleteProviderProfileResponse { deleted }))
 }
@@ -3754,6 +3775,7 @@ pub(super) async fn handle_update_provider(
                 LifecycleOperation::Update,
                 TelemetryOutcome::Success,
             );
+            publish_provider_change(state, &workspace);
             Ok(Response::new(ProviderResponse {
                 provider: Some(provider),
             }))
@@ -4673,8 +4695,17 @@ pub(super) async fn handle_configure_provider_refresh(
             profile_workspace: String::new(),
             credential_handles: HashMap::new(),
         };
-        update_provider_record_with_catalog(state.store.as_ref(), &catalog, &workspace, updated)
-            .await?;
+        let result = update_provider_record_with_catalog(
+            state.store.as_ref(),
+            &catalog,
+            &workspace,
+            updated,
+        )
+        .await;
+        publish_provider_change(state, &workspace);
+        result?;
+    } else {
+        publish_provider_change(state, &workspace);
     }
 
     Ok(Response::new(ConfigureProviderRefreshResponse {
@@ -4718,6 +4749,7 @@ pub(super) async fn handle_rotate_provider_credential(
         credential_key,
     )
     .await?;
+    publish_provider_change(state, &workspace);
 
     Ok(Response::new(RotateProviderCredentialResponse {
         status: Some(crate::provider_refresh::refresh_status_from_state(
@@ -4800,14 +4832,13 @@ pub(super) async fn handle_delete_provider_refresh(
         credential_key,
     )
     .await?;
-
     // A refresh co-manages the expiry of its primary credential and every pinned
     // additional output. Clear each expiry this refresh still owns, leaving
     // independently updated ones in place. The equality check and removal run
     // inside the CAS closure so they see the current stored provider — deciding
     // from the snapshot read above would let a concurrent rotation or provider
     // update land between the read and the write and then be clobbered (CWE-362).
-    if let Some(refresh_state) = existing_refresh_state
+    let expiry_cleanup = if let Some(refresh_state) = existing_refresh_state
         && refresh_state.expires_at_ms > 0
     {
         let refresh_expires_at_ms = refresh_state.expires_at_ms;
@@ -4824,8 +4855,15 @@ pub(super) async fn handle_delete_provider_refresh(
                 Status::internal(format!(
                     "clear refresh-owned credential expiries failed: {e}"
                 ))
-            })?;
+            })
+            .map(|_| ())
+    } else {
+        Ok(())
+    };
+    if deleted_refresh_state {
+        publish_provider_change(state, &workspace);
     }
+    expiry_cleanup?;
 
     Ok(Response::new(DeleteProviderRefreshResponse {
         deleted: deleted_refresh_state,
@@ -4866,6 +4904,9 @@ pub(super) async fn handle_delete_provider(
                 LifecycleOperation::Delete,
                 outcome,
             );
+            if deleted {
+                publish_provider_change(state, &workspace);
+            }
             Ok(Response::new(DeleteProviderResponse { deleted }))
         }
         Err(err) => {

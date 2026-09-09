@@ -94,3 +94,10 @@ pub fn all_workspaces_selector() -> WorkspaceSelector {
         )),
     }
 }
+
+/// Exact protocol revision required between a gateway and its supervisor.
+///
+/// The supervisor stream is an internal, version-locked deployment contract.
+/// Bump this when either peer can no longer honor the previous stream
+/// semantics.
+pub const SUPERVISOR_PROTOCOL_REVISION: u32 = 1;

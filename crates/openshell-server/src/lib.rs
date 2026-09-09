@@ -17,6 +17,7 @@ mod auth;
 pub mod certgen;
 pub mod cli;
 mod compute;
+mod config_delivery;
 pub mod config_file;
 mod credentials;
 mod defaults;
@@ -301,6 +302,11 @@ pub struct ServerState {
     /// Set once graceful gateway shutdown begins so stream handlers can
     /// distinguish expected transport closes from runtime failures.
     pub(crate) gateway_shutting_down: AtomicBool,
+    /// Per-sandbox scheduler for coalesced supervisor configuration delivery.
+    pub(crate) config_delivery_queue: config_delivery::ConfigDeliveryQueue,
+
+    /// Routing boundary for local or remote supervisor configuration delivery.
+    pub(crate) supervisor_config_router: Arc<dyn config_delivery::SupervisorConfigRouter>,
 
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
@@ -356,6 +362,12 @@ fn is_benign_connection_close(error: &(dyn std::error::Error + 'static)) -> bool
 }
 
 impl ServerState {
+    /// Return the configuration delivery boundary for supervisor sessions.
+    #[must_use]
+    pub fn supervisor_config_router(&self) -> Arc<dyn config_delivery::SupervisorConfigRouter> {
+        Arc::clone(&self.supervisor_config_router)
+    }
+
     /// Create new server state.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
@@ -404,6 +416,9 @@ impl ServerState {
             .oidc
             .as_ref()
             .map_or_else(String::new, |oidc| oidc.admin_role.clone());
+        let supervisor_config_router: Arc<dyn config_delivery::SupervisorConfigRouter> = Arc::new(
+            config_delivery::LocalSupervisorConfigRouter::new(Arc::clone(&supervisor_sessions)),
+        );
         Self {
             config,
             store,
@@ -418,6 +433,8 @@ impl ServerState {
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
+            config_delivery_queue: config_delivery::ConfigDeliveryQueue::default(),
+            supervisor_config_router,
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
@@ -679,6 +696,10 @@ pub(crate) async fn run_server(
     }
 
     let state = Arc::new(state);
+
+    grpc::policy::backfill_legacy_policy_history(&state)
+        .await
+        .map_err(|error| Error::execution(error.to_string()))?;
 
     // Reconcile local-driver running intent before watchers spawn so their
     // first snapshots observe the post-start backend state. Explicitly stopped
