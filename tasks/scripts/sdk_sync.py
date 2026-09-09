@@ -73,15 +73,15 @@ Fix proto drift in the {display_name} SDK.
 
 ## Context
 
-The root `proto/` directory has changed and the {display_name} SDK's generated bindings are out of sync. The drifted files are: {drifted_names}.
+The {display_name} SDK's proto drift check detected drift. The drifted files are: {drifted_names}.
 {build_context}
 
 ## Steps
 
 1. **Regenerate bindings**: Run `mise run {proto_task}` to regenerate language-specific bindings from the updated protos.
-2. **Fix compilation errors**: Read the build log above. Update the SDK source code to handle new/changed/removed proto fields:
+2. **Fix compilation errors, if any**: Consult the build log if available. Update the SDK source code as needed to handle new/changed/removed proto fields:
 {source_dirs}
-3. **Fix test failures**: Update tests that assert on proto types that changed shape.
+3. **Fix test failures, if any**: Update tests that assert on proto types that changed shape.
 4. **Verify**: Run `mise run {build_task}` and `mise run {test_task}` until both pass.
 5. **Create a PR**: Commit all changes and create a PR referencing this issue.
 
@@ -165,6 +165,19 @@ def _render_agent_section(
             "The build log above shows the exact error. Your job is to fix the "
             f"{display_name} SDK code so it compiles and passes tests with the updated protos."
         )
+    elif build_report and build_report.get("success") is True:
+        if sdk == "go":
+            build_context = (
+                "\nRegeneration, build, and tests passed in CI, but the "
+                "committed bindings still need to be regenerated and committed."
+            )
+        else:
+            build_context = (
+                "\nThe subsequent regeneration, typecheck, and tests passed in CI. "
+                "Generated TypeScript bindings are gitignored; rerun "
+                f"`mise run {paths['drift_task']}` to confirm compatibility "
+                "before changing SDK source."
+            )
     else:
         build_context = "\nThe SDK build status is unknown. Check if it compiles after regeneration."
 
@@ -205,26 +218,59 @@ def _run_cmd(
 
 
 def _ensure_label(repo: str, label: str, description: str) -> None:
-    check = _run_cmd(["gh", "label", "view", label, "--repo", repo], capture=True)
+    check = _run_cmd(
+        [
+            "gh",
+            "label",
+            "list",
+            "--repo",
+            repo,
+            "--search",
+            label,
+            "--limit",
+            "20",
+            "--json",
+            "name",
+        ],
+        capture=True,
+    )
     if check.returncode != 0:
-        result = _run_cmd(
-            [
-                "gh",
-                "label",
-                "create",
-                label,
-                "--repo",
-                repo,
-                "--description",
-                description,
-                "--color",
-                "D93F0B",
-            ],
-            capture=True,
+        details = check.stderr.strip() or "unknown error"
+        raise RuntimeError(f"Failed to look up label '{label}' in {repo}: {details}")
+    try:
+        labels = json.loads(check.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"Invalid label list for {repo}: {error.msg}") from error
+    if not isinstance(labels, list) or any(
+        not isinstance(item, dict) or not isinstance(item.get("name"), str)
+        for item in labels
+    ):
+        raise RuntimeError(f"Invalid label list for {repo}: expected label names")
+    # GitHub's search is fuzzy; similar SDK labels do not establish existence.
+    if any(item["name"].casefold() == label.casefold() for item in labels):
+        return
+    if len(labels) >= 20:
+        raise RuntimeError(
+            f"Label search for '{label}' in {repo} was truncated; cannot confirm absence"
         )
-        if result.returncode != 0:
-            details = result.stderr.strip() or "unknown error"
-            raise RuntimeError(f"Failed to create label '{label}': {details}")
+    result = _run_cmd(
+        [
+            "gh",
+            "label",
+            "create",
+            label,
+            "--repo",
+            repo,
+            "--description",
+            description,
+            "--color",
+            "D93F0B",
+        ],
+        capture=True,
+    )
+    if result.returncode != 0:
+        details = result.stderr.strip() or "unknown error"
+        raise RuntimeError(f"Failed to create label '{label}': {details}")
 
 
 def _find_open_issue(repo: str, label: str) -> dict | None:
@@ -239,20 +285,44 @@ def _find_open_issue(repo: str, label: str) -> dict | None:
             label,
             "--state",
             "open",
+            "--limit",
+            "1",
             "--json",
             "url,number",
-            "--jq",
-            ".[0]",
         ],
         capture=True,
     )
-    if result.returncode == 0 and result.stdout.strip():
-        try:
-            data = json.loads(result.stdout.strip())
-            return {"url": data["url"], "number": str(data["number"])}
-        except (json.JSONDecodeError, KeyError, TypeError):
-            pass
-    return None
+    context = f"for {repo} with label '{label}'"
+    if result.returncode != 0:
+        details = result.stderr.strip() or "no stderr"
+        raise RuntimeError(
+            f"Failed to list open issues {context} "
+            f"(exit code {result.returncode}): {details}"
+        )
+    try:
+        issues = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"Invalid issue list {context}: expected JSON array ({error.msg})"
+        ) from error
+    if not isinstance(issues, list):
+        raise RuntimeError(f"Invalid issue list {context}: expected JSON array")
+    if not issues:
+        return None
+
+    issue = issues[0]
+    if not isinstance(issue, dict):
+        raise RuntimeError(f"Invalid issue list {context}: expected issue object")
+    url = issue.get("url")
+    number = issue.get("number")
+    if (
+        not isinstance(url, str)
+        or not url.strip()
+        or type(number) is not int
+        or number <= 0
+    ):
+        raise RuntimeError(f"Invalid issue list {context}: invalid issue URL or number")
+    return {"url": url, "number": str(number)}
 
 
 # --- public functions ---
@@ -348,18 +418,23 @@ def _manage_issue(
 # --- CLI ---
 
 
-def _load_json_arg(value: str) -> dict | list:
-    if value == "-":
-        return json.load(sys.stdin)
-    return json.loads(value)
+def _load_json_arg(value: str) -> dict:
+    report = json.load(sys.stdin) if value == "-" else json.loads(value)
+    if not isinstance(report, dict):
+        raise ValueError("Expected report to be a JSON object")
+    return report
 
 
 def cmd_manage_issue(args: argparse.Namespace) -> int:
-    drift_report = _load_json_arg(args.drift_report)
-    build_report = None
-    if args.build_report:
-        build_report = _load_json_arg(args.build_report)
-    result = manage_issue(drift_report, build_report, args.sdk, args.repo, args.label)
+    try:
+        drift_report = _load_json_arg(args.drift_report)
+        build_report = _load_json_arg(args.build_report) if args.build_report else None
+    except ValueError as error:
+        result = {"issue_url": "", "action": "error", "reason": str(error)}
+    else:
+        result = manage_issue(
+            drift_report, build_report, args.sdk, args.repo, args.label
+        )
     print(json.dumps(result))
     return 1 if result.get("action") == "error" else 0
 

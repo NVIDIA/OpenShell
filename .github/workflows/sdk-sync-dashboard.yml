@@ -59,7 +59,7 @@ jobs:
         run: |
           mkdir -p report
           mise run "$DRIFT_TASK" > report/drift.json 2> report/drift.stderr || true
-          if ! jq -e 'has("synced") and (.synced | type == "boolean")' report/drift.json >/dev/null 2>&1; then
+          if ! jq -e 'type == "object" and has("synced") and (.synced | type == "boolean") and (has("error") | not)' report/drift.json >/dev/null 2>&1; then
             jq -n --arg sdk "$SDK_NAME" '{sdk:$sdk, has_drift:"error", build_failed:"false"}' > report/status.json
             exit 0
           fi
@@ -100,6 +100,7 @@ jobs:
       matrix:
         sdk: ${{ fromJSON(needs.load_config.outputs.matrix) }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: sdk-sync-${{ matrix.sdk.name }}
@@ -115,35 +116,44 @@ jobs:
           echo "::error::Drift detection failed for ${{ matrix.sdk.name }} SDK"
           cat report/drift.stderr
           exit 1
-      - if: steps.status.outputs.has_drift == 'true' && steps.status.outputs.build_failed == 'true'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install tools
-        if: steps.status.outputs.has_drift == 'true' && steps.status.outputs.build_failed == 'true'
+        if: steps.status.outputs.has_drift == 'true'
         run: mise install --locked
       - name: Create or update drift issue
-        if: steps.status.outputs.has_drift == 'true' && steps.status.outputs.build_failed == 'true'
+        if: steps.status.outputs.has_drift == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set +e
           RESULT=$(uv run python tasks/scripts/sdk_sync.py manage-issue \
             --drift-report "$(cat report/drift.json)" \
             --build-report "$(cat report/build.json)" \
             --sdk "${{ matrix.sdk.name }}" \
             --repo "$GITHUB_REPOSITORY" \
             --label "${{ matrix.sdk.label }}")
-          echo "$RESULT" | jq .
-          ACTION=$(echo "$RESULT" | jq -r '.action // "unknown"')
-          if [ "$ACTION" = "error" ] || [ "$ACTION" = "unknown" ]; then
+          STATUS=$?
+          set -e
+          if ! printf '%s\n' "$RESULT" | jq .; then
+            printf '%s\n' "$RESULT"
+          fi
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::Issue management command failed with exit code $STATUS"
+            exit "$STATUS"
+          fi
+          if ! ACTION=$(printf '%s\n' "$RESULT" | jq -er '.action // "unknown"'); then
+            ACTION=unknown
+          fi
+          if [ "$ACTION" != "created" ] && [ "$ACTION" != "updated" ]; then
             echo "::error::Issue management for ${{ matrix.sdk.name }} failed: $ACTION"
             exit 1
           fi
       - name: Close resolved drift issue
-        if: steps.status.outputs.has_drift == 'false' || (steps.status.outputs.has_drift == 'true' && steps.status.outputs.build_failed == 'false')
+        if: steps.status.outputs.has_drift == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           ISSUE=$(gh issue list --repo "$GITHUB_REPOSITORY" --label "${{ matrix.sdk.label }}" --state open --json number --jq '.[0].number')
           if [ -n "$ISSUE" ]; then
-            gh issue close "$ISSUE" --repo "$GITHUB_REPOSITORY" --comment "SDK builds and tests pass after proto regeneration. Closing automatically."
+            gh issue close "$ISSUE" --repo "$GITHUB_REPOSITORY" --comment "The SDK proto drift check passed. Closing automatically."
             echo "Closed issue #$ISSUE"
           fi
