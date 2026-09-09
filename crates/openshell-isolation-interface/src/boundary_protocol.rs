@@ -5,8 +5,9 @@
 //!
 //! Drivers choose and provision the transport, but they do not redefine the
 //! process lifecycle, streaming, identity, or authentication messages.  The
-//! control and boundary roles exchange these length-delimited JSON frames over
-//! a private Unix socket, authenticated TCP connection, or virtio-vsock stream.
+//! supervisor and sandbox exchange these length-delimited JSON frames inside
+//! gRPC streams on one mutually authenticated connection. The driver chooses
+//! the underlying private Unix socket, TCP connection, or virtio-vsock stream.
 
 use std::fmt;
 use std::io;
@@ -649,7 +650,7 @@ pub enum Response {
         timing: MediationTimingWire,
     },
     Error {
-        kind: String,
+        kind: BoundaryErrorKind,
         message: String,
     },
 }
@@ -701,31 +702,41 @@ pub enum DnsQueryResultWire {
     Error(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundaryErrorKind {
+    Invalid,
+    Denied,
+    Unavailable,
+    Terminated,
+    Process,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BinaryIdentityWire {
-    pub binary_path: Option<PathBuf>,
-    pub binary_digest: Option<String>,
-    pub ancestors: Vec<PathBuf>,
-    pub cmdline_paths: Vec<PathBuf>,
-    pub resolve_error: Option<String>,
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BinaryIdentityWire {
+    Resolved {
+        binary_path: PathBuf,
+        binary_digest: Option<Sha256Digest>,
+        ancestors: Vec<PathBuf>,
+        cmdline_paths: Vec<PathBuf>,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 impl From<Result<BinaryIdentity, ResolveError>> for BinaryIdentityWire {
     fn from(identity: Result<BinaryIdentity, ResolveError>) -> Self {
         match identity {
-            Ok(identity) => Self {
-                binary_path: Some(identity.binary_path),
-                binary_digest: identity.binary_digest.map(|digest| digest.to_string()),
+            Ok(identity) => Self::Resolved {
+                binary_path: identity.binary_path,
+                binary_digest: identity.binary_digest,
                 ancestors: identity.ancestors,
                 cmdline_paths: identity.cmdline_paths,
-                resolve_error: None,
             },
-            Err(error) => Self {
-                binary_path: None,
-                binary_digest: None,
-                ancestors: Vec::new(),
-                cmdline_paths: Vec::new(),
-                resolve_error: Some(error.to_string()),
+            Err(error) => Self::Failed {
+                message: error.to_string(),
             },
         }
     }
@@ -733,22 +744,20 @@ impl From<Result<BinaryIdentity, ResolveError>> for BinaryIdentityWire {
 
 impl BinaryIdentityWire {
     pub fn into_result(self) -> Result<BinaryIdentity, ResolveError> {
-        if let Some(error) = self.resolve_error {
-            return Err(ResolveError::Failed(error));
+        match self {
+            Self::Resolved {
+                binary_path,
+                binary_digest,
+                ancestors,
+                cmdline_paths,
+            } => Ok(BinaryIdentity {
+                binary_path,
+                binary_digest,
+                ancestors,
+                cmdline_paths,
+            }),
+            Self::Failed { message } => Err(ResolveError::Failed(message)),
         }
-        let binary_path = self.binary_path.ok_or_else(|| {
-            ResolveError::Failed("boundary identity omitted binary path".to_string())
-        })?;
-        let binary_digest = self
-            .binary_digest
-            .map(|digest| digest.parse::<Sha256Digest>())
-            .transpose()?;
-        Ok(BinaryIdentity {
-            binary_path,
-            binary_digest,
-            ancestors: self.ancestors,
-            cmdline_paths: self.cmdline_paths,
-        })
     }
 }
 
@@ -1086,6 +1095,46 @@ pub enum FrameError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_identity_wire_rejects_ambiguous_or_invalid_shapes() {
+        for encoded in [
+            r#"{"result":"resolved","ancestors":[],"cmdline_paths":[]}"#,
+            r#"{"result":"resolved","binary_path":"/bin/tool","binary_digest":"invalid","ancestors":[],"cmdline_paths":[]}"#,
+            r#"{"result":"failed","message":"unavailable","binary_path":"/bin/tool"}"#,
+        ] {
+            assert!(serde_json::from_str::<BinaryIdentityWire>(encoded).is_err());
+        }
+        let identity = BinaryIdentityWire::from(Ok(BinaryIdentity {
+            binary_path: PathBuf::from("/bin/tool"),
+            binary_digest: Some("a".repeat(64).parse().unwrap()),
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+        }));
+        let encoded = serde_json::to_vec(&identity).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<BinaryIdentityWire>(&encoded).unwrap(),
+            identity
+        );
+    }
+
+    #[test]
+    fn boundary_error_kind_rejects_unknown_values() {
+        assert!(serde_json::from_str::<BoundaryErrorKind>(r#""unkown""#).is_err());
+        for kind in [
+            BoundaryErrorKind::Invalid,
+            BoundaryErrorKind::Denied,
+            BoundaryErrorKind::Unavailable,
+            BoundaryErrorKind::Terminated,
+            BoundaryErrorKind::Process,
+        ] {
+            let encoded = serde_json::to_vec(&kind).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<BoundaryErrorKind>(&encoded).unwrap(),
+                kind
+            );
+        }
+    }
 
     #[test]
     fn request_round_trips_and_redacts_token() {

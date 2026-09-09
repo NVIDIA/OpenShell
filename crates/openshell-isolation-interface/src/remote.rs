@@ -31,6 +31,7 @@ use openshell_core::proto::isolation::v1::{
     BoundaryChunk, isolation_boundary_client::IsolationBoundaryClient,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -361,7 +362,10 @@ impl ReadyBoundary for RemoteReady {
         };
         let (provider_env_revision, provider_env) = self
             .provider_credentials
-            .child_env_snapshot_with_gcp_resolved();
+            .child_env_snapshot_with_gcp_resolved()
+            .map_err(|error| {
+                BackendError::Process(format!("snapshot provider environment: {error}"))
+            })?;
         let response = self
             .client
             .call_idempotent(Request::StartAgent {
@@ -555,7 +559,10 @@ impl BoundaryExec for RemoteExec {
         for _ in 0..3 {
             let (revision, provider_env) = self
                 .provider_credentials
-                .child_env_snapshot_with_gcp_resolved();
+                .child_env_snapshot_with_gcp_resolved()
+                .map_err(|error| {
+                    BackendError::Process(format!("snapshot provider environment: {error}"))
+                })?;
             let response = self
                 .client
                 .call_idempotent(Request::UpdateProviderEnvironment {
@@ -1127,7 +1134,7 @@ impl BoundaryClient {
             )));
         }
         let response = match response.response {
-            Response::Error { kind, message } => Err(guest_error(&kind, message)),
+            Response::Error { kind, message } => Err(guest_error(kind, message)),
             response => Ok(response),
         }?;
         Ok((stream, response))
@@ -1192,7 +1199,7 @@ impl BoundaryClient {
         }
         match response.response {
             Response::MediationReady => {}
-            Response::Error { kind, message } => return Err(guest_error(&kind, message)),
+            Response::Error { kind, message } => return Err(guest_error(kind, message)),
             response => return Err(unexpected_response("mediation_ready", &response)),
         }
         Ok(ClientMediationSession::start(stream))
@@ -1251,6 +1258,7 @@ async fn connect_boundary_once(
     topology: &BoundaryTopology,
 ) -> Result<BoundaryDuplexStream, BackendError> {
     let (stream, tls): (BoundaryDuplexStream, &BoundaryClientTls) = match &topology.transport {
+        #[cfg(unix)]
         BoundaryTransport::Unix { socket_path, tls } => {
             let stream = UnixStream::connect(socket_path).await.map_err(|error| {
                 BackendError::Unavailable(format!(
@@ -1259,6 +1267,12 @@ async fn connect_boundary_once(
                 ))
             })?;
             (Box::new(stream), tls)
+        }
+        #[cfg(not(unix))]
+        BoundaryTransport::Unix { .. } => {
+            return Err(BackendError::Unavailable(
+                "Unix boundary transport requires a Unix host".to_string(),
+            ));
         }
         BoundaryTransport::TlsTcp { address, tls } => {
             let stream = openshell_core::net::connect_tcp_nodelay_best_effort(&[*address])
@@ -1461,14 +1475,15 @@ fn unexpected_response(expected: &str, response: &Response) -> BackendError {
     ))
 }
 
-fn guest_error(kind: &str, message: String) -> BackendError {
+fn guest_error(kind: crate::boundary_protocol::BoundaryErrorKind, message: String) -> BackendError {
+    use crate::boundary_protocol::BoundaryErrorKind;
     let message = format!("boundary process leaf: {message}");
     match kind {
-        "invalid" => BackendError::Descriptor(message),
-        "denied" => BackendError::Denied(message),
-        "unavailable" => BackendError::Unavailable(message),
-        "terminated" => BackendError::Terminated(message),
-        _ => BackendError::Process(message),
+        BoundaryErrorKind::Invalid => BackendError::Descriptor(message),
+        BoundaryErrorKind::Denied => BackendError::Denied(message),
+        BoundaryErrorKind::Unavailable => BackendError::Unavailable(message),
+        BoundaryErrorKind::Terminated => BackendError::Terminated(message),
+        BoundaryErrorKind::Process => BackendError::Process(message),
     }
 }
 
@@ -1567,7 +1582,7 @@ mod tests {
                             || envelope.boundary_id != "sandbox-1"
                         {
                             Response::Error {
-                                kind: "denied".to_string(),
+                                kind: crate::boundary_protocol::BoundaryErrorKind::Denied,
                                 message: "control authentication failed".to_string(),
                             }
                         } else if matches!(envelope.request, Request::Wait { .. }) {
@@ -1665,12 +1680,11 @@ mod tests {
             let query = DnsQueryWire {
                 request: vec![1, 2, 3],
                 transport: crate::contract::DnsTransport::Udp,
-                identity: crate::boundary_protocol::BinaryIdentityWire {
-                    binary_path: Some(PathBuf::from("/usr/bin/dig")),
-                    binary_digest: Some("a".repeat(64)),
+                identity: crate::boundary_protocol::BinaryIdentityWire::Resolved {
+                    binary_path: PathBuf::from("/usr/bin/dig"),
+                    binary_digest: Some("a".repeat(64).parse().unwrap()),
                     ancestors: Vec::new(),
                     cmdline_paths: Vec::new(),
-                    resolve_error: None,
                 },
                 timing: crate::boundary_protocol::MediationTimingWire::default(),
             };
@@ -2167,6 +2181,7 @@ mod tests {
         server.abort();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn tls_unix_flushes_large_control_requests_before_reading_response() {
         let socket_path = std::env::temp_dir().join(format!(
