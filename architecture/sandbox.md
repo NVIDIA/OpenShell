@@ -64,6 +64,10 @@ Completed exec output handles can be reclaimed, but execution request IDs remain
 reserved for the boundary generation. The sandbox accepts at most 4,096 exec
 attempts per generation, then rejects new attempts rather than forgetting replay
 protection. A disconnected attachment does not authorize another execution.
+While an exec handle is retained, independent waits return its stable exit or
+signal status, whether or not an output attachment is open or the main process
+has exited. Waiting never holds the exec registry lock, so other operations can
+still signal or attach to the process.
 
 ## Isolation Layers
 
