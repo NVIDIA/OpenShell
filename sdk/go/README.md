@@ -28,7 +28,9 @@ patterns will look familiar:
 - **Watch primitives**: channel-based watchers with `ResultChan()` and `Stop()`,
   identical to `watch.Interface` in client-go
 - **Functional options**: variadic option patterns for list filtering,
-  pagination, and watch configuration
+  pagination, and watch configuration. Nil options are silently ignored
+  at every entry point, so conditional option lists are safe to pass
+  without filtering out nil entries.
 - **Composable auth with token refresh**: wraps `oauth2.TokenSource` for
   automatic token caching and coalesced refresh, following the k8s client-go
   `cachingTokenSource` pattern
