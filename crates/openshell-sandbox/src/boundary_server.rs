@@ -1807,6 +1807,19 @@ mod linux {
         }
 
         fn wait(&self, process_id: &str) -> Response {
+            let exec = lock(&self.exec_handles)
+                .get(process_id)
+                .map(|handle| handle.process.clone());
+            if let Some(process) = exec {
+                // Wait independently of the output attachment. Retain the
+                // process, not the registry lock, while its exit is pending.
+                return match self.process_runtime.block_on(process.wait()) {
+                    Ok(status) => Response::Exited {
+                        status: status.into(),
+                    },
+                    Err(error) => guest_error(BoundaryErrorKind::Process, error.to_string()),
+                };
+            }
             let process = match self.running_process(process_id) {
                 Ok(process) => process,
                 Err(response) => return response,
@@ -3530,6 +3543,15 @@ mod linux {
             });
             assert_eq!(output, "reconnected");
             drop(exec);
+            for _ in 0..2 {
+                assert_eq!(
+                    boundary.wait(&exec_id),
+                    Response::Exited {
+                        status: ExitStatusWire::Exited(0),
+                    },
+                    "exec status must remain available after its output attachment closes"
+                );
+            }
             let Response::Attached { snapshot } = boundary.attach(policy.clone()) else {
                 panic!("reconnect attach did not return a session snapshot");
             };
@@ -3773,6 +3795,15 @@ mod linux {
                 boundary.signal_exec(&retained_id, SignalWire::Kill),
                 Response::Signaled
             );
+            for _ in 0..2 {
+                assert_eq!(
+                    boundary.wait(&retained_id),
+                    Response::Exited {
+                        status: ExitStatusWire::Signaled(libc::SIGKILL),
+                    },
+                    "independent waits must preserve a retained exec's signal status"
+                );
+            }
             lock(&boundary.exec_handles).remove(&retained_id);
             assert!(
                 boundary
@@ -3790,6 +3821,46 @@ mod linux {
                 std::thread::sleep(Duration::from_millis(10));
             }
             assert!(process.has_exited(), "canonical process did not exit");
+            assert_eq!(
+                boundary.wait(&process.process_id()),
+                Response::Exited {
+                    status: ExitStatusWire::Exited(0),
+                }
+            );
+            for exit_code in [0, 7] {
+                let spec = ExecSpecWire {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), format!("exit {exit_code}")],
+                    env: Vec::new(),
+                    workdir: None,
+                    pty: false,
+                };
+                let request = RequestEnvelope::new(
+                    "sandbox-retained".to_string(),
+                    "a".repeat(32),
+                    Request::Exec { spec: spec.clone() },
+                )
+                .expect("build exec status request");
+                let exec = boundary
+                    .start_exec(&request.request_id, &request.payload_digest, spec)
+                    .expect("start exec after canonical exit");
+                for _ in 0..2 {
+                    assert_eq!(
+                        boundary.wait(&exec.process_id),
+                        Response::Exited {
+                            status: ExitStatusWire::Exited(exit_code),
+                        },
+                        "wait must work independently of attachment consumption and main exit"
+                    );
+                }
+            }
+            assert!(matches!(
+                boundary.wait("generation-retained:exec:unknown"),
+                Response::Error {
+                    kind: BoundaryErrorKind::Invalid,
+                    ..
+                }
+            ));
 
             let mut session = process_runtime
                 .block_on(
