@@ -195,8 +195,9 @@ returns to the workload. Response stages select header-only, whole-body, or
 streaming mode independently. The relay preserves upstream framing for a
 header-only chain and owns normalized downstream framing only when body bytes
 can change. Whole-body stages delay commitment and share one non-resetting,
-supervisor-wide accumulation deadline. Body stages receive a final body result
-and then one trailer exchange; trailer mutations can only change or remove
+120-second accumulation deadline per response, defined in the response relay.
+Body stages receive a final body result and then one trailer exchange;
+trailer mutations can only change or remove
 existing, non-protected names. Intentional blocks return the canonical 403
 before commitment and abort delivery without injected bytes after commitment. Streaming input units flush after bounded coalescing even within a
 content-length body or transfer chunk. Coalescing cancels only input acquisition;

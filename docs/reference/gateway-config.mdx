@@ -131,9 +131,6 @@ provider_profile_sources = [
 
 # Operator-run supervisor middleware. The gRPC endpoint must be reachable from
 # both the gateway and sandbox supervisors.
-[openshell.supervisor]
-http_response_whole_body_timeout = "120s"
-
 [[openshell.supervisor.middleware]]
 name = "local-content-guard"
 grpc_endpoint = "https://host.openshell.internal:50051"
@@ -293,11 +290,6 @@ The gateway flushes buffered spans during shutdown, so spans from in-flight requ
 Register operator-run supervisor middleware services with one or more `[[openshell.supervisor.middleware]]` entries. Registration is static and operator-owned; changing it requires restarting the gateway.
 
 ```toml
-[openshell.supervisor]
-# One non-resetting wall-clock limit for response accumulation and whole-body
-# middleware barriers. Accepts a positive integer followed by ms, s, or m.
-http_response_whole_body_timeout = "120s"
-
 [[openshell.supervisor.middleware]]
 name = "local-content-guard"
 grpc_endpoint = "https://host.openshell.internal:50051"
@@ -317,7 +309,7 @@ The gateway connects to every registered service and validates `Describe` before
 
 Response middleware also has an 8 MiB aggregate retained-body limit per response session across stage buffers and pending output. This limit is separate from each service's `max_payload_bytes` and cannot be configured. A replacement that exceeds the available budget follows the stage's `on_error` policy. Fail-open disables that stage and forwards its original input; fail-closed returns 502 before commitment or stops delivery after commitment. Streaming inputs flush after a short coalescing window without waiting for an entire upstream transfer chunk.
 
-`http_response_whole_body_timeout` is a supervisor-wide safety bound, not a middleware RPC timeout. It defaults to `120s` and accepts a positive integer followed by `ms`, `s`, or `m`. The timer starts after ordered response preflight selects a `WHOLE_BODY_BYTES` stage and before OpenShell reads the first response body byte. It does not reset as chunks arrive. It ends after the normalized body reaches end of stream and every whole-body barrier produces output. On expiry, each active whole-body stage follows its configured `on_error` policy: fail-open releases OpenShell-owned bytes through later stages, while fail-closed returns the canonical pre-commit 502 response. Changing this field requires restarting the gateway.
+Whole-body response inspection has a fixed 120-second deadline shared by all whole-body stages in one response, separate from middleware RPC timeouts. The timer starts after ordered response preflight selects a `WHOLE_BODY_BYTES` stage and before OpenShell reads the first response body byte. It does not reset as chunks arrive. It ends after the normalized body reaches end of stream and every whole-body barrier produces output. On expiry, each active whole-body stage follows its configured `on_error` policy: fail-open releases OpenShell-owned bytes through later stages, while fail-closed returns the canonical pre-commit 502 response.
 
 The service `grpc_endpoint` supports plaintext `http://` and TLS `https://`. HTTPS uses the platform trust store unless `tls_ca_cert_path` names a certificate-only PEM bundle. OpenShell rejects bundles containing private keys, loads the certificates at gateway startup, and distributes only public certificates to sandbox supervisors; normal TLS hostname verification still applies. `audience` sets the exact audience for gateway-minted service tokens and defaults to `urn:openshell:extension:middleware:<name>`. After authenticated `Describe` succeeds, OpenShell treats a non-empty manifest `expected_audience` as a consistency assertion and refuses to start when it differs from the configured audience. A strict verifier may reject an incorrect audience before returning the manifest.
 

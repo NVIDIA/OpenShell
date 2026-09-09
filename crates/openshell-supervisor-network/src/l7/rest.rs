@@ -809,6 +809,10 @@ where
     relay_http_request_with_response_middleware_guarded(req, client, upstream, options, None).await
 }
 
+/// Default wall-clock bound shared by whole-body stages in one response.
+pub(crate) const DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(120);
+
 /// Context retained from request evaluation for the matching response hook.
 pub(crate) struct HttpResponseMiddlewareRelay<'a> {
     pub(crate) chain: &'a [openshell_supervisor_middleware::ChainEntry],
@@ -7625,7 +7629,7 @@ mod tests {
             },
             policy_name: "test-policy",
             generation_guard: None,
-            whole_body_timeout: std::time::Duration::from_secs(120),
+            whole_body_timeout: DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
         }
     }
 

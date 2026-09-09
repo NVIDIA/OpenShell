@@ -304,9 +304,6 @@ pub struct ServerState {
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
 
-    /// Supervisor-wide response whole-body accumulation timeout.
-    pub http_response_whole_body_timeout_ms: u64,
-
     /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
     pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
 
@@ -422,8 +419,6 @@ impl ServerState {
             gateway_shutting_down: AtomicBool::new(false),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
-            http_response_whole_body_timeout_ms:
-                openshell_core::DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT_MS,
             oidc_cache,
             sandbox_jwt_issuer: None,
             sandbox_jwt_authenticator: None,
@@ -662,14 +657,6 @@ pub(crate) async fn run_server(
         supervisor_sessions,
         oidc_cache,
         credentials,
-    );
-    state.http_response_whole_body_timeout_ms = config_file.as_ref().map_or(
-        openshell_core::DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT_MS,
-        |file| {
-            file.openshell
-                .supervisor
-                .http_response_whole_body_timeout_ms()
-        },
     );
     state.middleware_registry = middleware_registry;
     state.gateway_interceptors = gateway_interceptors;

@@ -347,7 +347,7 @@ pub(crate) fn http_response_middleware_relay<'a>(
         },
         policy_name: &ctx.policy_name,
         generation_guard,
-        whole_body_timeout: crate::http_response_whole_body_timeout(),
+        whole_body_timeout: super::rest::DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
     }
 }
 
