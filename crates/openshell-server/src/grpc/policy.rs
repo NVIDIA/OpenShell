@@ -85,7 +85,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 use tracing::{debug, info, warn};
 
 use super::validation::{
@@ -2351,7 +2351,7 @@ async fn resolve_sandbox_by_name_for_principal(
             };
             crate::auth::guard::ensure_sandbox_scope(principal, sandbox.object_id()).map_err(
                 |status| {
-                    if status.code() == tonic::Code::PermissionDenied {
+                    if status.code() == Code::PermissionDenied {
                         Status::permission_denied("sandbox not found or not owned by caller")
                     } else {
                         status
@@ -2621,13 +2621,16 @@ impl InitialPolicyHistoryStatus {
 
 /// Insert the version-one policy baseline if this sandbox still has no policy
 /// history. This never modifies an existing revision or apply result.
+///
+/// Returns `true` when a baseline was written. Stored policies that fail the
+/// current validation rules are rejected with `FailedPrecondition`.
 pub async fn initialize_policy_history(
     store: &Store,
     sandbox: &Sandbox,
     status: InitialPolicyHistoryStatus,
-) -> Result<(), Status> {
+) -> Result<bool, Status> {
     let Some(policy) = sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref()) else {
-        return Ok(());
+        return Ok(false);
     };
     if store
         .get_latest_policy(sandbox.object_id())
@@ -2635,7 +2638,7 @@ pub async fn initialize_policy_history(
         .map_err(|error| Status::internal(format!("read policy history failed: {error}")))?
         .is_some()
     {
-        return Ok(());
+        return Ok(false);
     }
     let policy =
         validate_and_canonicalize_stored_policy(policy.clone(), STORED_POLICY_SOURCE_SPEC)?;
@@ -2656,15 +2659,22 @@ pub async fn initialize_policy_history(
             sandbox.object_workspace(),
         )
         .await
-        .map_err(|error| Status::internal(format!("initialize policy history failed: {error}")))
+        .map_err(|error| Status::internal(format!("initialize policy history failed: {error}")))?;
+    Ok(true)
 }
 
 /// Create policy-history baselines for sandboxes written by older gateways.
 ///
-/// Snapshot reads stay pure once this startup repair has completed.
+/// Snapshot reads stay pure once this startup repair has completed. A stored
+/// policy that no longer passes validation is skipped rather than blocking
+/// gateway startup; that sandbox keeps the pre-repair behavior where its own
+/// configuration reads report the validation failure. Store errors remain
+/// fatal.
 pub async fn backfill_legacy_policy_history(state: &Arc<ServerState>) -> Result<(), Status> {
     const PAGE_SIZE: u32 = 1000;
     let mut offset = 0;
+    let mut repaired = 0_usize;
+    let mut skipped = 0_usize;
     loop {
         let sandboxes = state
             .store
@@ -2673,23 +2683,38 @@ pub async fn backfill_legacy_policy_history(state: &Arc<ServerState>) -> Result<
             .map_err(|error| {
                 Status::internal(format!("list sandboxes for policy repair failed: {error}"))
             })?;
-        if sandboxes.is_empty() {
-            return Ok(());
-        }
         let count = u32::try_from(sandboxes.len()).unwrap_or(PAGE_SIZE);
         for sandbox in sandboxes {
-            initialize_policy_history(
+            match initialize_policy_history(
                 state.store.as_ref(),
                 &sandbox,
                 InitialPolicyHistoryStatus::Loaded,
             )
-            .await?;
+            .await
+            {
+                Ok(true) => repaired += 1,
+                Ok(false) => {}
+                Err(status) if status.code() == Code::FailedPrecondition => {
+                    skipped += 1;
+                    warn!(
+                        sandbox_id = %sandbox.object_id(),
+                        workspace = %sandbox.object_workspace(),
+                        error = %status.message(),
+                        "skipping policy history repair for invalid stored policy"
+                    );
+                }
+                Err(status) => return Err(status),
+            }
         }
         if count < PAGE_SIZE {
-            return Ok(());
+            break;
         }
         offset = offset.saturating_add(count);
     }
+    if repaired > 0 || skipped > 0 {
+        info!(repaired, skipped, "legacy policy history repair complete");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -5383,7 +5408,7 @@ async fn handle_approve_all_draft_chunks_inner(
         .await
         {
             Ok(evaluation) => evaluation,
-            Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+            Err(status) if status.code() == Code::FailedPrecondition => {
                 info!(
                     sandbox_id = %sandbox_id,
                     chunk_id = %chunk.id,
@@ -7362,7 +7387,6 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tonic::Code;
 
     /// Wrap a request with a user `Principal` so handler scope guards treat
     /// the test caller as a CLI user. Most handler tests exercise
@@ -11277,6 +11301,77 @@ mod tests {
                 .is_none(),
             "snapshot reads must not create policy history"
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_policy_history_repair_skips_invalid_stored_policy() {
+        use openshell_core::proto::LandlockPolicy;
+
+        let state = test_server_state().await;
+        let valid_policy = test_policy_with_rule("valid", "valid.example.com");
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-valid-legacy",
+                "valid-legacy",
+                valid_policy.clone(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let mut invalid_policy = test_policy_with_rule("invalid", "invalid.example.com");
+        invalid_policy.landlock = Some(LandlockPolicy {
+            compatibility: "best-effort".to_string(),
+        });
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-invalid-legacy",
+                "invalid-legacy",
+                invalid_policy,
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        backfill_legacy_policy_history(&state)
+            .await
+            .expect("one invalid stored policy must not block startup repair");
+
+        let repaired = state
+            .store
+            .get_latest_policy("sb-valid-legacy")
+            .await
+            .unwrap()
+            .expect("valid legacy sandbox gets a baseline");
+        assert_eq!(repaired.version, 1);
+        assert_eq!(repaired.status, "loaded");
+        assert_eq!(
+            repaired.policy_hash,
+            deterministic_policy_hash(&valid_policy)
+        );
+        assert!(
+            state
+                .store
+                .get_latest_policy("sb-invalid-legacy")
+                .await
+                .unwrap()
+                .is_none(),
+            "invalid stored policy must not be persisted as history"
+        );
+
+        let error = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    sandbox_id: "sb-invalid-legacy".to_string(),
+                }),
+                "sb-invalid-legacy",
+            ),
+        )
+        .await
+        .expect_err("invalid stored policy still fails only its own config read");
+        assert_eq!(error.code(), Code::FailedPrecondition);
     }
 
     #[tokio::test]
