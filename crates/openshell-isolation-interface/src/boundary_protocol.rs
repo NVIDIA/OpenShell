@@ -484,7 +484,7 @@ pub enum Request {
         cols: u16,
         rows: u16,
     },
-    PortForward {
+    LoopbackConnect {
         host: std::net::IpAddr,
         port: u16,
     },
@@ -593,8 +593,8 @@ impl fmt::Debug for Request {
                 .field("cols", cols)
                 .field("rows", rows)
                 .finish(),
-            Self::PortForward { host, port } => formatter
-                .debug_struct("PortForward")
+            Self::LoopbackConnect { host, port } => formatter
+                .debug_struct("LoopbackConnect")
                 .field("host", host)
                 .field("port", port)
                 .finish(),
