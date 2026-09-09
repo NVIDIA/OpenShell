@@ -21,7 +21,7 @@ use openshell_core::proto::{
     RelayOpenResult, ReportMainProcessExitRequest, SupervisorHeartbeat, SupervisorHello,
     SupervisorMessage, TcpRelayTarget, gateway_message, relay_open, supervisor_message,
 };
-use openshell_isolation_interface::contract::{BoundaryPortForward, LoopbackTarget};
+use openshell_isolation_interface::contract::{BoundaryLoopbackConnector, LoopbackTarget};
 use openshell_ocsf::{
     ActivityId, ConnectionInfo, Endpoint, NetworkActivityBuilder, OcsfEvent, SandboxContext,
     SeverityId, StatusId, ocsf_emit,
@@ -276,7 +276,7 @@ pub fn spawn(
     endpoint: String,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
-    port_forward: Arc<dyn BoundaryPortForward>,
+    port_forward: Arc<dyn BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     instance_id: String,
@@ -298,7 +298,7 @@ pub fn spawn_with_readiness(
     endpoint: String,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
-    port_forward: Arc<dyn BoundaryPortForward>,
+    port_forward: Arc<dyn BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     instance_id: String,
@@ -324,7 +324,7 @@ struct SessionConfig {
     endpoint: String,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
-    port_forward: Arc<dyn BoundaryPortForward>,
+    port_forward: Arc<dyn BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     instance_id: String,
@@ -509,7 +509,7 @@ pub async fn finalize_main_process_exit(
 struct GatewayMessageContext<'a> {
     sandbox_id: &'a str,
     ssh_socket_path: &'a std::path::Path,
-    port_forward: &'a Arc<dyn BoundaryPortForward>,
+    port_forward: &'a Arc<dyn BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
     channel: &'a grpc_client::AuthedChannel,
     tx: &'a mpsc::Sender<SupervisorMessage>,
@@ -597,7 +597,7 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
 async fn handle_relay_open(
     relay_open: RelayOpen,
     ssh_socket_path: &std::path::Path,
-    port_forward: Arc<dyn BoundaryPortForward>,
+    port_forward: Arc<dyn BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
     channel: grpc_client::AuthedChannel,
     tx: mpsc::Sender<SupervisorMessage>,
@@ -752,7 +752,7 @@ async fn send_relay_open_result(
 async fn open_target(
     relay_open: &RelayOpen,
     ssh_socket_path: &std::path::Path,
-    port_forward: &Arc<dyn BoundaryPortForward>,
+    port_forward: &Arc<dyn BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
 ) -> Result<Box<dyn TargetStream>, Box<dyn std::error::Error + Send + Sync>> {
     match relay_open.target.as_ref() {
@@ -777,7 +777,7 @@ async fn open_target(
 
 async fn open_tcp_target(
     target: &TcpRelayTarget,
-    port_forward: &Arc<dyn BoundaryPortForward>,
+    port_forward: &Arc<dyn BoundaryLoopbackConnector>,
 ) -> Result<Box<dyn TargetStream>, Box<dyn std::error::Error + Send + Sync>> {
     let host = normalize_tcp_target_host(target)?;
     let port = u16::try_from(target.port).map_err(|_| "tcp target port must fit in u16")?;
@@ -879,11 +879,11 @@ mod ocsf_event_tests {
     use super::*;
 
     #[cfg(target_os = "linux")]
-    struct UnusedPortForward;
+    struct UnusedLoopbackConnector;
 
     #[cfg(target_os = "linux")]
     #[async_trait::async_trait]
-    impl BoundaryPortForward for UnusedPortForward {
+    impl BoundaryLoopbackConnector for UnusedLoopbackConnector {
         async fn connect(
             &self,
             _target: LoopbackTarget,
@@ -1137,7 +1137,7 @@ mod ocsf_event_tests {
 
         // The SSH relay path does not use the port-forward (that is the TCP
         // target path); connect from the supervisor's own namespace.
-        let port_forward: Arc<dyn BoundaryPortForward> = Arc::new(UnusedPortForward);
+        let port_forward: Arc<dyn BoundaryLoopbackConnector> = Arc::new(UnusedLoopbackConnector);
 
         let trusted = open_target(&relay, &socket, &port_forward, Some(std::process::id()))
             .await
