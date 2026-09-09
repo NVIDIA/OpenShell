@@ -835,6 +835,15 @@ impl HttpResponseSession {
 }
 
 impl ChainRunner {
+    /// Apply selected stages' failure policies when valid HTTP cannot be encoded
+    /// in the middleware protocol. The caller must validate HTTP safety first.
+    pub fn http_response_input_unrepresentable(
+        &self,
+        entries: &[DescribedChainEntry],
+    ) -> HttpResponsePreflightOutcome {
+        response_preflight_input_failure(entries, Vec::new(), "response_input_unrepresentable")
+    }
+
     pub async fn preflight_http_response(
         &self,
         entries: &[ChainEntry],
@@ -844,7 +853,13 @@ impl ChainRunner {
         if described.is_empty() {
             return Ok(empty_preflight_outcome(input.headers));
         }
-        validate_preflight_input(&input)?;
+        if validate_preflight_input(&input).is_err() {
+            return Ok(response_preflight_input_failure(
+                &described,
+                input.headers,
+                "response_input_over_capacity",
+            ));
+        }
         let session_admission = match self.try_reserve_middleware_session() {
             MiddlewareSessionAdmission::Admitted(admission) => admission,
             MiddlewareSessionAdmission::AtCapacity => {
@@ -1730,6 +1745,7 @@ fn response_failure_category(reason: &str) -> &'static str {
     } else if matches!(
         reason,
         "bodyless_response"
+            | "response_input_unrepresentable"
             | "partial_response"
             | "content_coding_not_identity"
             | "cache_control_no_transform"
@@ -1792,6 +1808,22 @@ fn blocked_preflight_outcome(
         invocations,
         session_capacity_exhausted: false,
     }
+}
+
+fn response_preflight_input_failure(
+    entries: &[DescribedChainEntry],
+    headers: Vec<HttpHeader>,
+    reason: &str,
+) -> HttpResponsePreflightOutcome {
+    let mut outcome = empty_preflight_outcome(headers);
+    for entry in entries {
+        if let Some(reason) = collect_preflight_failure(entry, reason, &mut outcome.invocations) {
+            outcome.allowed = false;
+            outcome.reason = reason;
+            break;
+        }
+    }
+    outcome
 }
 
 fn response_session_capacity_exhausted(
@@ -2286,6 +2318,53 @@ mod tests {
             }],
             connection_nominated_headers: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn response_preflight_envelope_limits_obey_selected_stage_policies() {
+        let runner = ChainRunner::new(Arc::new(ResponseService {
+            script: Script::HeadersOnly,
+        }));
+        for limit in 0..4 {
+            let mut input = input(200);
+            match limit {
+                0 => input.context.request_id = "x".repeat(MAX_MIDDLEWARE_CONTEXT_BYTES + 1),
+                1 => input.target.path = "x".repeat(MAX_MIDDLEWARE_TARGET_BYTES + 1),
+                2 => input.headers = vec![input.headers[0].clone(); MAX_MIDDLEWARE_HEADERS + 1],
+                _ => input.headers[0].value = "x".repeat(MAX_MIDDLEWARE_HEADER_BYTES + 1),
+            }
+            for last_policy in [OnError::FailOpen, OnError::FailClosed] {
+                let entries = [entry(OnError::FailOpen), entry(last_policy)];
+                let outcome = runner
+                    .preflight_http_response(&entries, input.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(outcome.allowed, last_policy == OnError::FailOpen);
+                assert_eq!(outcome.headers, input.headers);
+                assert!(outcome.session.is_none());
+                assert_eq!(outcome.invocations.len(), 2);
+                assert!(
+                    outcome
+                        .invocations
+                        .iter()
+                        .all(|invocation| invocation.failed && invocation.stage_disabled)
+                );
+                assert_eq!(
+                    outcome.invocations[1].failure_category.as_deref(),
+                    Some("payload_capacity")
+                );
+            }
+        }
+        let described = runner
+            .describe_http_response_chain(&[entry(OnError::FailOpen), entry(OnError::FailClosed)])
+            .await
+            .unwrap();
+        let outcome = runner.http_response_input_unrepresentable(&described);
+        assert!(!outcome.allowed);
+        assert_eq!(outcome.invocations.len(), 2);
+        assert!(outcome.invocations.iter().all(|invocation| {
+            invocation.failure_category.as_deref() == Some("response_not_inspectable")
+        }));
     }
 
     #[test]

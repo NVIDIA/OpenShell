@@ -144,6 +144,8 @@ See [Policy Schema](/reference/policy-schema#network-middleware) for the complet
 | `fail_closed` | Denies the HTTP request or closes the WebSocket when the stage fails. This is the default. |
 | `fail_open` | Skips the failed HTTP stage. For a broken WebSocket stage stream, disables that stage for the rest of the connection and continues the remaining chain. |
 
+A valid upstream response can exceed the middleware envelope limits or contain header bytes that the middleware protocol cannot represent. OpenShell relays the original response when every selected response stage uses `fail_open`; any selected `fail_closed` stage causes the canonical 502 delivery failure. Malformed or unsafe HTTP does not qualify for this bypass.
+
 Use `fail_open` only when bypassing the middleware preserves the intended security policy. OpenShell emits a detection finding when a failed stage is bypassed and a separate state-change finding when a WebSocket stage is disabled for the session.
 
 Capability coverage is separate from failure handling. A host-matched HTTP-only attachment does not join the WebSocket chain, regardless of `on_error`. Binary messages are outside the V1 text-message binding and pass through even when a selected stage is `fail_closed`. OpenShell records both states as informational coverage events so operators do not mistake pass-through traffic for inspected traffic. If a deployment requires all WebSocket message classes to be inspected, V1 cannot express that requirement.

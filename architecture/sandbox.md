@@ -192,6 +192,12 @@ middleware registry validates implementation-owned config. The generic
 registry and chain runner live in `openshell-supervisor-middleware`; first-party
 implementations live in `openshell-supervisor-middleware-builtins`.
 
+Valid HTTP that cannot fit the response middleware protocol, including non-UTF-8
+header values or an oversized preflight envelope, fails each selected stage
+according to its `on_error` policy. An all-fail-open chain relays the original
+bytes; a fail-closed stage prevents delivery. The relay validates HTTP syntax
+and protected trailer declarations before allowing this bypass.
+
 The same selected chain can inspect the matching final HTTP response before it
 returns to the workload. Response stages select header-only, whole-body, or
 streaming mode independently. The relay preserves upstream framing for a

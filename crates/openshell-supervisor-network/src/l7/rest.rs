@@ -3393,10 +3393,12 @@ where
         .await
     {
         Ok(described) if described.is_empty() => return Ok(None),
-        Ok(_) => parse_response_head_for_middleware(header_bytes),
+        Ok(described) => {
+            parse_response_head_for_middleware(header_bytes).map(|parsed| (described, parsed))
+        }
         Err(error) => Err(error),
     };
-    let parsed = match parsed {
+    let (described, parsed) = match parsed {
         Ok(parsed) => parsed,
         Err(error) => {
             debug!(error = %error, "HTTP response head normalization failed");
@@ -3430,11 +3432,17 @@ where
         headers: parsed.headers,
         connection_nominated_headers: parsed.connection_nominated,
     };
-    let preflight = match middleware
-        .runner
-        .preflight_http_response(middleware.chain, input)
-        .await
-    {
+    let preflight_result = if parsed.representable {
+        middleware
+            .runner
+            .preflight_http_response(middleware.chain, input)
+            .await
+    } else {
+        Ok(middleware
+            .runner
+            .http_response_input_unrepresentable(&described))
+    };
+    let preflight = match preflight_result {
         Ok(preflight) => preflight,
         Err(error) => {
             debug!(error = %error, "HTTP response middleware preflight failed");
@@ -3503,11 +3511,11 @@ where
         &preflight.invocations,
     );
 
-    let status_line = response_status_line(header_bytes)?;
     let Some(mut session) = preflight.session else {
         if preflight.headers == original_headers {
             return Ok(None);
         }
+        let status_line = response_status_line(header_bytes)?;
         let outcome = relay_headers_only_response(
             request_method,
             upstream,
@@ -3525,6 +3533,7 @@ where
         return Ok(Some(outcome));
     };
 
+    let status_line = response_status_line(header_bytes)?;
     let supports_chunked_response = !status_line.starts_with("HTTP/1.0 ");
     let bodiless = is_bodiless_response(request_method, status_code);
     if bodiless {
@@ -4127,15 +4136,18 @@ fn emit_http_response_middleware_failure(
 
 #[derive(Debug)]
 struct ParsedResponseHead {
+    representable: bool,
     headers: Vec<HttpHeader>,
     connection_nominated: Vec<String>,
     declared_trailers: Vec<String>,
 }
 
 fn parse_response_head_for_middleware(header_bytes: &[u8]) -> Result<ParsedResponseHead> {
-    let header = std::str::from_utf8(header_bytes)
-        .map_err(|_| miette!("HTTP response headers contain invalid UTF-8"))?;
-    if parse_status_code(header).is_none() {
+    // Lossy decoding preserves ASCII syntax and control bytes for validation.
+    // Never pass replacement text to middleware or use it for delivery.
+    let header = String::from_utf8_lossy(header_bytes);
+    let representable = std::str::from_utf8(header_bytes).is_ok();
+    if parse_status_code(&header).is_none() {
         return Err(miette!("HTTP response status line is malformed"));
     }
     let mut nominated = HashSet::new();
@@ -4187,7 +4199,8 @@ fn parse_response_head_for_middleware(header_bytes: &[u8]) -> Result<ParsedRespo
     let mut connection_nominated: Vec<_> = nominated.into_iter().collect();
     connection_nominated.sort();
     Ok(ParsedResponseHead {
-        headers,
+        representable,
+        headers: if representable { headers } else { Vec::new() },
         connection_nominated,
         declared_trailers,
     })
@@ -7634,7 +7647,7 @@ mod tests {
     }
 
     async fn run_response_middleware_relay(
-        response: &'static [u8],
+        response: &[u8],
         method: &str,
         script: ResponseRelayScript,
     ) -> (Result<RelayOutcome>, Vec<u8>) {
@@ -7648,7 +7661,7 @@ mod tests {
     }
 
     async fn run_response_middleware_relay_with_error(
-        response: &'static [u8],
+        response: &[u8],
         method: &str,
         script: ResponseRelayScript,
         on_error: openshell_supervisor_middleware::OnError,
@@ -7664,7 +7677,7 @@ mod tests {
     }
 
     async fn run_response_middleware_relay_with_timeout(
-        response: &'static [u8],
+        response: &[u8],
         method: &str,
         script: ResponseRelayScript,
         on_error: openshell_supervisor_middleware::OnError,
@@ -7673,8 +7686,9 @@ mod tests {
         let (runner, chain) = response_middleware_fixture_with_error(script, on_error);
         let (mut upstream_read, mut upstream_write) = tokio::io::duplex(16 * 1024);
         let (mut client_read, mut client_write) = tokio::io::duplex(16 * 1024);
+        let response = response.to_vec();
         tokio::spawn(async move {
-            upstream_write.write_all(response).await.unwrap();
+            upstream_write.write_all(&response).await.unwrap();
             upstream_write.shutdown().await.unwrap();
         });
         let mut middleware = response_middleware_context(&runner, &chain, method);
@@ -8251,6 +8265,60 @@ mod tests {
         let delivered = String::from_utf8(delivered).unwrap();
         assert!(delivered.starts_with("HTTP/1.1 200 OK\r\n"), "{delivered}");
         assert!(!delivered.contains("502 Bad Gateway"), "{delivered}");
+    }
+
+    #[tokio::test]
+    async fn response_middleware_unrepresentable_input_obeys_failure_policy() {
+        let mut many_headers = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n".to_vec();
+        for _ in 0..=openshell_supervisor_middleware::MAX_MIDDLEWARE_HEADERS {
+            many_headers.extend_from_slice(b"X-Extra: value\r\n");
+        }
+        many_headers.extend_from_slice(b"\r\nok");
+        for response in [
+            b"HTTP/1.1 200 OK\r\nX-Legacy: \xff\r\nContent-Length: 2\r\n\r\nok".as_slice(),
+            many_headers.as_slice(),
+        ] {
+            for on_error in [
+                openshell_supervisor_middleware::OnError::FailOpen,
+                openshell_supervisor_middleware::OnError::FailClosed,
+            ] {
+                let (outcome, delivered) = run_response_middleware_relay_with_error(
+                    response,
+                    "GET",
+                    ResponseRelayScript::HeadersOnly,
+                    on_error,
+                )
+                .await;
+                if on_error == openshell_supervisor_middleware::OnError::FailOpen {
+                    assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
+                    assert_eq!(delivered, response);
+                } else {
+                    assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+                    assert!(delivered.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
+                    assert!(
+                        String::from_utf8(delivered)
+                            .unwrap()
+                            .contains("response_delivery_failed")
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_middleware_obs_text_does_not_bypass_unsafe_headers() {
+        for response in [
+            b"HTTP/1.1 200 OK\r\nX-Legacy: \xff\r\nBad Name: value\r\nContent-Length: 2\r\n\r\nok".as_slice(),
+            b"HTTP/1.1 200 OK\r\nX-Legacy: \xff\x00\r\nContent-Length: 2\r\n\r\nok".as_slice(),
+            b"HTTP/1.1 200 OK\r\nX-Legacy: \xff\r\nTrailer: content-length\r\nContent-Length: 2\r\n\r\nok".as_slice(),
+        ] {
+            let (outcome, delivered) = run_response_middleware_relay_with_error(
+                response, "GET", ResponseRelayScript::HeadersOnly,
+                openshell_supervisor_middleware::OnError::FailOpen,
+            ).await;
+            assert!(matches!(outcome.unwrap(), RelayOutcome::Consumed));
+            assert!(delivered.starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"));
+        }
     }
 
     #[tokio::test]
