@@ -11,6 +11,8 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -47,10 +49,20 @@ fn reserve_signal() -> io::Result<()> {
 
 #[derive(Default)]
 struct State {
-    workers: Mutex<HashMap<u64, libc::pthread_t>>,
+    workers: Mutex<HashMap<u64, RegisteredThread>>,
     changed: Condvar,
     stopped: AtomicBool,
 }
+
+// musl represents pthread_t as an opaque pointer, unlike glibc's integer. It
+// is only passed back to pthread_kill, never dereferenced by this module.
+struct RegisteredThread(libc::pthread_t);
+
+// SAFETY: POSIX permits signaling a live pthread from another thread. The
+// handle is accessed only under State::workers, and the owning worker removes
+// its registration under that same mutex before returning. AcceptRegistration
+// cannot move to another thread, so its Drop cannot outlive the owning worker.
+unsafe impl Send for RegisteredThread {}
 
 pub struct AcceptMonitor {
     state: Arc<State>,
@@ -117,11 +129,12 @@ impl AcceptRegistrar {
                 "duplicate accept notification registration",
             ));
         }
-        workers.insert(notification_id, thread);
+        workers.insert(notification_id, RegisteredThread(thread));
         self.0.changed.notify_one();
         Ok(AcceptRegistration {
             state: self.0.clone(),
             notification_id,
+            owning_thread: PhantomData,
         })
     }
 }
@@ -129,6 +142,9 @@ impl AcceptRegistrar {
 pub struct AcceptRegistration {
     state: Arc<State>,
     notification_id: u64,
+    // Drop must run on the registering thread before its pthread_t can expire.
+    // No Rc is allocated; this marker makes the guard neither Send nor Sync.
+    owning_thread: PhantomData<Rc<()>>,
 }
 
 impl AcceptRegistration {
@@ -155,12 +171,12 @@ fn monitor(state: &State, valid: impl Fn(u64) -> bool) {
         if stopped && workers.is_empty() {
             return;
         }
-        for (&notification_id, &thread) in &*workers {
+        for (&notification_id, thread) in &*workers {
             if stopped || !valid(notification_id) {
                 // SAFETY: the registration lock pins this live pthread_t.
                 // Repeated interrupts close the check-to-accept race: a signal
                 // received before accept cannot leave a later accept stranded.
-                let _ = unsafe { libc::pthread_kill(thread, INTERRUPT_SIGNAL) };
+                let _ = unsafe { libc::pthread_kill(thread.0, INTERRUPT_SIGNAL) };
             }
         }
         workers = if workers.is_empty() {
@@ -189,6 +205,25 @@ mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn registrar_crosses_threads_but_registration_ends_before_worker_exit() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AcceptRegistrar>();
+
+        let monitor = AcceptMonitor::start(|_| true).unwrap();
+        let registrar = monitor.registrar();
+        std::thread::spawn(move || {
+            let registration = registrar.register(3).unwrap();
+            assert!(registrar.register(3).is_err());
+            assert!(lock(&registrar.0.workers).contains_key(&3));
+            drop(registration);
+            assert!(lock(&registrar.0.workers).is_empty());
+        })
+        .join()
+        .unwrap();
+        assert!(lock(&monitor.state.workers).is_empty());
+    }
 
     #[test]
     fn cancellation_interrupts_competing_accept_after_readiness_was_consumed() {
