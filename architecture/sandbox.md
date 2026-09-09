@@ -27,6 +27,17 @@ TCP Service, or VM vsock channel. Independent bidirectional `Exchange` RPCs
 carry lifecycle, exec, TCP, and forwarding traffic, while one persistent
 bidirectional `Mediate` RPC carries multiplexed DNS traffic. General application
 UDP is unsupported; UDP DNS remains mediated by the supervisor.
+The sandbox probes HTTP/2 connection liveness every five seconds and closes
+connections that miss a ten-second acknowledgement deadline. Closing a
+connection cancels its stream bridges before releasing the exclusive DNS
+mediation lease; an authenticated replacement waits for release instead of
+preempting a live supervisor. Idle healthy connections remain usable.
+Unauthenticated TLS handshakes have a separate bounded asynchronous pool and
+five-second deadline, never consuming authenticated control slots or threads.
+The socket broker reserves the TCP control-listener port against workload
+connections, including loopback aliases. Unix control listeners reject workload
+descendants using kernel peer credentials and process ancestry, while ordinary
+workload loopback and Unix services remain available.
 NetworkPolicy is an outer reachability fence, not a confidentiality boundary.
 Each sandbox generation receives a fresh CA and distinct server/client leaves;
 both endpoints bind the same workload identity and immutable driver resource
