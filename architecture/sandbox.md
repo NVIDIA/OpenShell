@@ -504,12 +504,15 @@ Polling remains the only path that changes runtime state and repairs dropped or
 unavailable delivery. The gateway serializes construction per sandbox and
 component, and coalesces repeated mutations into the latest full snapshot. An
 enqueue result means only that the local stream queue accepted the message. A
-bounded scope fanout scheduler coalesces repeated workspace and global changes.
-Snapshot construction has a deadline, and the gateway rejects encoded stream
-messages that approach the transport decoder limit. A
-later migration will apply these payloads directly and acknowledge their exact
-revisions before removing supervisor polling. At that point, the gateway will
-require a valid bootstrap before marking a session ready.
+bounded scope fanout scheduler coalesces repeated workspace and global changes,
+and a semaphore sized from the database pool bounds how many snapshots build
+at once so a fleet-wide change cannot saturate the store or credential
+backends. Snapshot construction has a deadline that starts once a build holds a
+permit, and the gateway rejects encoded stream messages that approach the
+transport decoder limit. A later migration will apply these payloads directly
+and acknowledge their exact revisions before removing supervisor polling. At
+that point, the gateway will require a valid bootstrap before marking a session
+ready.
 
 ## Policy Revision Acknowledgement
 

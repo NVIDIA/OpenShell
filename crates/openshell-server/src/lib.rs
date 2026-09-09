@@ -419,6 +419,8 @@ impl ServerState {
         let supervisor_config_router: Arc<dyn config_delivery::SupervisorConfigRouter> = Arc::new(
             config_delivery::LocalSupervisorConfigRouter::new(Arc::clone(&supervisor_sessions)),
         );
+        let config_delivery_queue =
+            config_delivery::ConfigDeliveryQueue::for_db_connections(store.max_connections());
         Self {
             config,
             store,
@@ -433,7 +435,7 @@ impl ServerState {
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
-            config_delivery_queue: config_delivery::ConfigDeliveryQueue::default(),
+            config_delivery_queue,
             supervisor_config_router,
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),

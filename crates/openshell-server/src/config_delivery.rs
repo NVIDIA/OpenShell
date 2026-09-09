@@ -13,6 +13,7 @@ use metrics::counter;
 use openshell_core::proto::{
     ConfigBootstrap, ProviderEnvironmentSnapshot, Sandbox, SandboxConfigSnapshot,
 };
+use tokio::sync::Semaphore;
 use tonic::{Code, Status};
 use tracing::warn;
 
@@ -26,6 +27,11 @@ use crate::supervisor_session::SupervisorSessionRegistry;
 pub const MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES: usize = 3 * 1024 * 1024;
 const CONFIG_SNAPSHOT_BUILD_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_ACTIVE_FANOUT_WORKERS: usize = 64;
+/// Concurrent snapshot builds allowed per pooled database connection. Builds
+/// are short bursts of small queries, so a little oversubscription keeps the
+/// pool busy without stacking every waiter on the acquire timeout.
+const SNAPSHOT_BUILDS_PER_DB_CONNECTION: usize = 2;
+const MIN_CONCURRENT_SNAPSHOT_BUILDS: usize = 4;
 
 /// One complete configuration component awaiting delivery to a supervisor.
 #[derive(Clone)]
@@ -181,13 +187,65 @@ struct FanoutKey {
 /// The map entry is also the worker lease. Its boolean is set when another
 /// mutation arrives during a build or route operation. The worker then rebuilds
 /// the current full snapshot once, regardless of how many mutations arrived.
-#[derive(Debug, Default)]
+///
+/// Workers are spawned eagerly so coalescing stays exact, but snapshot
+/// construction itself is bounded by `build_permits`. A fleet-wide change
+/// therefore queues on the semaphore instead of saturating the database pool
+/// and credential backends all at once.
+#[derive(Debug)]
 pub struct ConfigDeliveryQueue {
     pending: Mutex<HashMap<DeliveryKey, bool>>,
     fanout_pending: Mutex<HashMap<FanoutKey, bool>>,
+    build_permits: Semaphore,
+}
+
+impl Default for ConfigDeliveryQueue {
+    fn default() -> Self {
+        Self::new(MIN_CONCURRENT_SNAPSHOT_BUILDS)
+    }
 }
 
 impl ConfigDeliveryQueue {
+    #[must_use]
+    pub fn new(max_concurrent_builds: usize) -> Self {
+        Self {
+            pending: Mutex::default(),
+            fanout_pending: Mutex::default(),
+            build_permits: Semaphore::new(max_concurrent_builds.max(1)),
+        }
+    }
+
+    /// Size the build bound from the persistence pool that every build reads.
+    #[must_use]
+    pub fn for_db_connections(max_connections: u32) -> Self {
+        let max_connections = usize::try_from(max_connections).unwrap_or(usize::MAX);
+        Self::new(
+            max_connections
+                .saturating_mul(SNAPSHOT_BUILDS_PER_DB_CONNECTION)
+                .max(MIN_CONCURRENT_SNAPSHOT_BUILDS),
+        )
+    }
+
+    #[cfg(test)]
+    fn max_concurrent_builds(&self) -> usize {
+        self.build_permits.available_permits()
+    }
+
+    /// Run one snapshot build under the concurrency bound. The deadline starts
+    /// only once a permit is held so queued builds do not spend their budget
+    /// waiting.
+    async fn run_bounded_build<T>(
+        &self,
+        build: impl Future<Output = T>,
+    ) -> Result<T, tokio::time::error::Elapsed> {
+        let _permit = self
+            .build_permits
+            .acquire()
+            .await
+            .expect("snapshot build semaphore is never closed");
+        tokio::time::timeout(CONFIG_SNAPSHOT_BUILD_TIMEOUT, build).await
+    }
+
     fn enqueue(&self, key: DeliveryKey) -> bool {
         let mut pending = self.pending.lock().unwrap();
         match pending.entry(key) {
@@ -337,16 +395,16 @@ fn enqueue_sandbox(state: &Arc<ServerState>, sandbox_id: &str, components: Confi
 }
 
 async fn publish_sandbox_component_now(state: &Arc<ServerState>, key: &DeliveryKey) {
-    let sandbox = match state.store.get_message::<Sandbox>(&key.sandbox_id).await {
-        Ok(Some(sandbox)) => sandbox,
-        Ok(None) => return,
-        Err(_) => {
-            record_build_failure(&key.sandbox_id, "sandbox", Code::Internal);
-            return;
-        }
-    };
     let component = key.component.name();
     let build = async {
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>(&key.sandbox_id)
+            .await
+            .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?;
+        let Some(sandbox) = sandbox else {
+            return Ok(None);
+        };
         match key.component {
             ConfigComponentKind::SandboxConfig => build_sandbox_config_snapshot(state, &sandbox)
                 .await
@@ -357,9 +415,11 @@ async fn publish_sandbox_component_now(state: &Arc<ServerState>, key: &DeliveryK
                     .map(SupervisorConfigMessage::ProviderEnvironment)
             }
         }
+        .map(Some)
     };
-    match tokio::time::timeout(CONFIG_SNAPSHOT_BUILD_TIMEOUT, build).await {
-        Ok(Ok(message)) => {
+    match state.config_delivery_queue.run_bounded_build(build).await {
+        Ok(Ok(None)) => {}
+        Ok(Ok(Some(message))) => {
             let disposition = state
                 .supervisor_config_router()
                 .deliver(&key.sandbox_id, message)
@@ -478,6 +538,8 @@ fn record_build_failure(sandbox_id: &str, component: &'static str, error_code: C
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::grpc::{OpenShellService, test_support::test_server_state};
     use openshell_core::proto::{
@@ -506,6 +568,88 @@ mod tests {
         assert!(queue.finish_pass(&key));
         queue.take(&key);
         assert!(!queue.finish_pass(&key));
+    }
+
+    #[test]
+    fn build_bound_is_sized_from_the_database_pool() {
+        assert_eq!(
+            ConfigDeliveryQueue::for_db_connections(10).max_concurrent_builds(),
+            20
+        );
+        assert_eq!(
+            ConfigDeliveryQueue::for_db_connections(1).max_concurrent_builds(),
+            MIN_CONCURRENT_SNAPSHOT_BUILDS
+        );
+        assert_eq!(ConfigDeliveryQueue::new(0).max_concurrent_builds(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_builds_never_exceed_the_permit_count() {
+        const PERMITS: usize = 4;
+        const BUILDS: usize = 40;
+        let queue = Arc::new(ConfigDeliveryQueue::new(PERMITS));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let workers = (0..BUILDS)
+            .map(|_| {
+                let queue = Arc::clone(&queue);
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                tokio::spawn(async move {
+                    queue
+                        .run_bounded_build(async {
+                            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            active.fetch_sub(1, Ordering::SeqCst);
+                        })
+                        .await
+                        .expect("build must not time out");
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.await.unwrap();
+        }
+
+        assert_eq!(peak.load(Ordering::SeqCst), PERMITS);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(queue.max_concurrent_builds(), PERMITS);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn build_deadline_starts_after_a_permit_is_held() {
+        let queue = Arc::new(ConfigDeliveryQueue::new(1));
+        let almost_deadline = CONFIG_SNAPSHOT_BUILD_TIMEOUT
+            .checked_sub(Duration::from_secs(1))
+            .unwrap();
+        let first = {
+            let queue = Arc::clone(&queue);
+            tokio::spawn(async move {
+                queue
+                    .run_bounded_build(tokio::time::sleep(almost_deadline))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        let second = queue.run_bounded_build(tokio::time::sleep(almost_deadline));
+
+        let (first, second) = tokio::join!(first, second);
+        assert!(first.unwrap().is_ok());
+        assert!(
+            second.is_ok(),
+            "waiting for a permit must not consume the build deadline"
+        );
+
+        assert!(
+            queue
+                .run_bounded_build(tokio::time::sleep(
+                    CONFIG_SNAPSHOT_BUILD_TIMEOUT + Duration::from_secs(1),
+                ))
+                .await
+                .is_err()
+        );
     }
 
     #[test]

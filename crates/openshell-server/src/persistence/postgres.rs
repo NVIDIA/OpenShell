@@ -45,6 +45,10 @@ impl PostgresStore {
         Ok(Self { pool })
     }
 
+    pub fn max_connections(&self) -> u32 {
+        self.pool.options().get_max_connections()
+    }
+
     pub async fn migrate(&self) -> PersistenceResult<()> {
         POSTGRES_MIGRATOR
             .run(&self.pool)
