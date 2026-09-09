@@ -12,7 +12,7 @@ use crate::config::CDI_GPU_DEVICE_ALL;
 use crate::proto::ResourceRequirements as SandboxResourceRequirements;
 use crate::proto::compute::v1::{
     GpuResourceRequirements as DriverGpuResourceRequirements,
-    ResourceRequirements as DriverResourceRequirements,
+    ResourceRequirements as DriverSandboxResourceRequirements,
 };
 
 /// Return whether sandbox resource requirements request a GPU.
@@ -53,7 +53,7 @@ pub fn effective_driver_gpu_count(
 /// Return the requested compute-driver GPU requirements, if present.
 #[must_use]
 pub fn driver_gpu_requirements(
-    resources: Option<&DriverResourceRequirements>,
+    resources: Option<&DriverSandboxResourceRequirements>,
 ) -> Option<&DriverGpuResourceRequirements> {
     resources.and_then(|resources| resources.gpu.as_ref())
 }

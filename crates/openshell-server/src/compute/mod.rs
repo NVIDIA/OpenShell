@@ -21,14 +21,15 @@ use futures::{Stream, StreamExt};
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
 use openshell_core::proto::compute::v1::{
-    AuthenticateSandboxRequest, CreateSandboxRequest, DeleteSandboxRequest, DeleteWorkspaceRequest,
-    DeleteWorkspaceResponse, DriverCondition, DriverPlatformEvent, DriverResourceRequirements,
-    DriverSandbox, DriverSandboxSpec, DriverSandboxStatus, DriverSandboxTemplate,
-    EnsureWorkspaceRequest, EnsureWorkspaceResponse,
+    AuthenticateSandboxRequest, CpuResourceRequirements as DriverCpuResourceRequirements,
+    CreateSandboxRequest, DeleteSandboxRequest, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
+    DriverCondition, DriverPlatformEvent, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
+    DriverSandboxTemplate, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
     GatewayListenerRequirement as ProtoGatewayListenerRequirement, GetCapabilitiesRequest,
     GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
     GetSandboxRequest, GpuResourceRequirements as DriverGpuResourceRequirements,
-    ListSandboxesRequest, ResourceCapabilities as DriverResourceCapabilities,
+    ListSandboxesRequest, MemoryResourceRequirements as DriverMemoryResourceRequirements,
+    ResourceCapabilities as DriverResourceCapabilities,
     ResourceRequirements as DriverSandboxResourceRequirements, StartSandboxRequest,
     StopSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
     compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
@@ -3925,6 +3926,17 @@ fn driver_sandbox_spec_from_public(
                     .gpu
                     .as_ref()
                     .map(|gpu| DriverGpuResourceRequirements { count: gpu.count }),
+                cpu: requirements
+                    .cpu
+                    .as_ref()
+                    .map(|cpu| DriverCpuResourceRequirements {
+                        limit: cpu.limit.clone(),
+                    }),
+                memory: requirements.memory.as_ref().map(|memory| {
+                    DriverMemoryResourceRequirements {
+                        limit: memory.limit.clone(),
+                    }
+                }),
             }
         }),
         sandbox_token: String::new(),
@@ -3943,7 +3955,6 @@ fn driver_sandbox_template_from_public(
         agent_socket_path: template.agent_socket.clone(),
         labels: template.labels.clone(),
         environment: template.environment.clone(),
-        resources: extract_typed_resources(&template.resources),
         platform_config: build_platform_config(template),
         driver_config: select_driver_config(&template.driver_config, driver_name)?,
         user_namespaces: template.user_namespaces,
@@ -4038,50 +4049,6 @@ fn select_driver_config(
     }
 }
 
-/// Extract typed CPU/memory quantities from the public `resources` Struct.
-///
-/// The public API exposes resources as an untyped `google.protobuf.Struct`
-/// with the Kubernetes limits/requests shape. We pull out the well-known
-/// keys into the typed `DriverResourceRequirements` message.
-fn extract_typed_resources(
-    resources: &Option<prost_types::Struct>,
-) -> Option<DriverResourceRequirements> {
-    fn get_quantity(s: &prost_types::Struct, section: &str, key: &str) -> String {
-        s.fields
-            .get(section)
-            .and_then(|v| match v.kind.as_ref() {
-                Some(prost_types::value::Kind::StructValue(inner)) => inner.fields.get(key),
-                _ => None,
-            })
-            .and_then(|v| match v.kind.as_ref() {
-                Some(prost_types::value::Kind::StringValue(val)) => Some(val.clone()),
-                _ => None,
-            })
-            .unwrap_or_default()
-    }
-
-    let s = resources.as_ref()?;
-
-    let req = DriverResourceRequirements {
-        cpu_request: get_quantity(s, "requests", "cpu"),
-        cpu_limit: get_quantity(s, "limits", "cpu"),
-        memory_request: get_quantity(s, "requests", "memory"),
-        memory_limit: get_quantity(s, "limits", "memory"),
-    };
-
-    // Return None when all fields are empty so drivers can distinguish
-    // "no resource requirements" from "zero requirements".
-    if req.cpu_request.is_empty()
-        && req.cpu_limit.is_empty()
-        && req.memory_request.is_empty()
-        && req.memory_limit.is_empty()
-    {
-        None
-    } else {
-        Some(req)
-    }
-}
-
 /// Build the opaque `platform_config` Struct from platform-specific public
 /// template fields (`runtime_class_name`, annotations) plus any resource fields
 /// beyond CPU/memory.
@@ -4122,9 +4089,8 @@ fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Stru
         );
     }
 
-    // Pass through any resource fields that do not map to the typed
-    // DriverResourceRequirements so platform-specific drivers can still see
-    // custom resources such as GPU limits.
+    // Pass through resource fields that do not use legacy CPU/memory keys so
+    // platform-specific drivers can still see custom native resources.
     if let Some(res) = build_platform_resources_config(&template.resources) {
         fields.insert(
             "resources_raw".to_string(),
@@ -4995,6 +4961,8 @@ mod tests {
         let public = SandboxSpec {
             resource_requirements: Some(openshell_core::proto::ResourceRequirements {
                 gpu: Some(openshell_core::proto::GpuResourceRequirements { count: Some(2) }),
+                cpu: None,
+                memory: None,
             }),
             ..Default::default()
         };
@@ -5008,6 +4976,41 @@ mod tests {
             .and_then(|requirements| requirements.gpu.as_ref())
             .expect("driver GPU requirement should be set");
         assert_eq!(gpu.count, Some(2));
+    }
+
+    #[test]
+    fn driver_sandbox_spec_from_public_preserves_cpu_and_memory_requirements() {
+        let public = SandboxSpec {
+            resource_requirements: Some(openshell_core::proto::ResourceRequirements {
+                gpu: None,
+                cpu: Some(openshell_core::proto::CpuResourceRequirements {
+                    limit: "500m".to_string(),
+                }),
+                memory: Some(openshell_core::proto::MemoryResourceRequirements {
+                    limit: "2Gi".to_string(),
+                }),
+            }),
+            ..Default::default()
+        };
+
+        let driver = driver_sandbox_spec_from_public(&public, "test-driver")
+            .expect("driver spec should map");
+
+        let requirements = driver
+            .resource_requirements
+            .as_ref()
+            .expect("driver resource requirements should be set");
+        assert_eq!(
+            requirements.cpu.as_ref().map(|cpu| cpu.limit.as_str()),
+            Some("500m")
+        );
+        assert_eq!(
+            requirements
+                .memory
+                .as_ref()
+                .map(|memory| memory.limit.as_str()),
+            Some("2Gi")
+        );
     }
 
     #[test]
@@ -6746,6 +6749,8 @@ mod tests {
             Some(&SandboxSpec {
                 resource_requirements: Some(openshell_core::proto::ResourceRequirements {
                     gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
+                    cpu: None,
+                    memory: None,
                 }),
                 ..Default::default()
             }),
@@ -9927,6 +9932,8 @@ mod tests {
             spec: Some(SandboxSpec {
                 resource_requirements: Some(openshell_core::proto::ResourceRequirements {
                     gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
+                    cpu: None,
+                    memory: None,
                 }),
                 ..Default::default()
             }),
