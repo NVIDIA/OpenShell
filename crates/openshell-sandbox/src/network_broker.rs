@@ -21,7 +21,7 @@ use openshell_isolation_interface::contract::{
 };
 use openshell_isolation_interface::linux::seccomp_notify::{Notification, NotificationListener};
 use openshell_isolation_interface::linux::socket_registry::{
-    InetFamily, InetKind, SocketMetadata, SocketRegistry, SocketState,
+    InetFamily, InetKind, SocketIdentity, SocketMetadata, SocketRegistry, SocketState,
 };
 use openshell_isolation_interface::linux::task_memory;
 use tokio::sync::{mpsc, oneshot};
@@ -38,6 +38,7 @@ const DNS_RELAY_ADDRESS: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new
     53,
 ));
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const NETWORK_DECISION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 struct PendingOpenSlot(Arc<AtomicUsize>);
@@ -105,7 +106,6 @@ pub struct PendingTcpOpen {
     pub(crate) queued_at: Instant,
     decision: std::sync::mpsc::SyncSender<NetworkOpenResult>,
     relay: oneshot::Receiver<io::Result<TcpStream>>,
-    _slot: PendingOpenSlot,
 }
 
 impl PendingTcpOpen {
@@ -152,8 +152,37 @@ impl PendingDnsQuery {
 #[derive(Clone)]
 struct DnsRelay {
     address: SocketAddr,
-    udp_attribution: Arc<Mutex<HashMap<SocketAddr, Result<BinaryIdentity, ResolveError>>>>,
-    tcp_attribution: Arc<Mutex<HashMap<SocketAddr, Result<BinaryIdentity, ResolveError>>>>,
+    udp_admissions: Arc<Mutex<HashMap<SocketAddr, SocketIdentity>>>,
+    tcp_admissions: Arc<Mutex<HashMap<SocketAddr, SocketIdentity>>>,
+}
+
+fn dns_sender_identity() -> Result<BinaryIdentity, ResolveError> {
+    // Native writes can come from an inheriting process or after execve. A
+    // connect-time identity (or a later procfs holder scan) cannot identify
+    // the sender of an already queued query. Never assert that it can.
+    Err(ResolveError::Failed(
+        "DNS sender identity is unavailable for kernel-driven socket writes".to_string(),
+    ))
+}
+
+fn register_dns_socket(
+    admissions: &Mutex<HashMap<SocketAddr, SocketIdentity>>,
+    peer: SocketAddr,
+    identity: SocketIdentity,
+) -> io::Result<()> {
+    let mut admissions = lock(admissions);
+    if admissions.len() >= SOCKET_CAPACITY && !admissions.contains_key(&peer) {
+        let installed =
+            openshell_isolation_interface::linux::proc_fd::installed_socket_inodes_excluding(
+                std::process::id(),
+            )?;
+        admissions.retain(|_, socket| installed.contains(&socket.inode));
+        if admissions.len() >= SOCKET_CAPACITY {
+            return Err(io::Error::from_raw_os_error(libc::EMFILE));
+        }
+    }
+    admissions.insert(peer, identity);
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -164,6 +193,7 @@ struct NotificationQueues {
     dns_relay: DnsRelay,
     active_opens: Arc<AtomicUsize>,
     active_accepts: Arc<AtomicUsize>,
+    decision_timeout: Duration,
 }
 
 /// Live broker handle retained by the sandbox boundary.
@@ -193,6 +223,14 @@ impl NetworkBroker {
         listener: NotificationListener,
         dns_address: SocketAddr,
     ) -> io::Result<Self> {
+        Self::start_with_decision_timeout(listener, dns_address, NETWORK_DECISION_TIMEOUT)
+    }
+
+    fn start_with_decision_timeout(
+        listener: NotificationListener,
+        dns_address: SocketAddr,
+        decision_timeout: Duration,
+    ) -> io::Result<Self> {
         let listener = Arc::new(listener);
         let monitor_listener = listener.clone();
         let accept_monitor = Arc::new(crate::accept_interrupt::AcceptMonitor::start(move |id| {
@@ -212,6 +250,7 @@ impl NetworkBroker {
             dns_relay,
             active_opens,
             active_accepts,
+            decision_timeout,
         };
         let healthy = Arc::new(AtomicBool::new(true));
         let broker_healthy = healthy.clone();
@@ -296,13 +335,13 @@ fn start_dns_relay(
     pending: mpsc::Sender<PendingDnsQuery>,
 ) -> io::Result<DnsRelay> {
     let (udp, tcp, address) = bind_dns_relay_sockets(address)?;
-    let udp_attribution = Arc::new(Mutex::new(HashMap::new()));
-    let tcp_attribution = Arc::new(Mutex::new(HashMap::new()));
+    let udp_admissions = Arc::new(Mutex::new(HashMap::new()));
+    let tcp_admissions = Arc::new(Mutex::new(HashMap::new()));
     let active_workers = Arc::new(AtomicUsize::new(0));
     let relay = DnsRelay {
         address,
-        udp_attribution: Arc::clone(&udp_attribution),
-        tcp_attribution: Arc::clone(&tcp_attribution),
+        udp_admissions: Arc::clone(&udp_admissions),
+        tcp_admissions: Arc::clone(&tcp_admissions),
     };
 
     let udp_active_workers = Arc::clone(&active_workers);
@@ -312,10 +351,10 @@ fn start_dns_relay(
         .spawn(move || {
             let mut request = vec![0_u8; u16::MAX as usize];
             while let Ok((length, peer)) = udp.recv_from(&mut request) {
-                let Some(identity) = lock(&udp_attribution).get(&peer).cloned() else {
-                    tracing::warn!(%peer, "dropping DNS datagram from unattributed socket");
+                if !lock(&udp_admissions).contains_key(&peer) {
+                    tracing::warn!(%peer, "dropping DNS datagram from unregistered socket");
                     continue;
-                };
+                }
                 let Ok(worker_slot) = acquire_pending_dns_slot(&udp_active_workers) else {
                     tracing::warn!(%peer, "dropping DNS datagram because the worker quota is full");
                     continue;
@@ -324,7 +363,7 @@ fn start_dns_relay(
                 let query = PendingDnsQuery {
                     request: request[..length].to_vec(),
                     transport: DnsTransport::Udp,
-                    identity,
+                    identity: dns_sender_identity(),
                     notification_to_queue: Duration::ZERO,
                     queued_at: Instant::now(),
                     response: response_tx,
@@ -358,11 +397,12 @@ fn start_dns_relay(
                 }) else {
                     break;
                 };
-                let identity = lock(&tcp_attribution).get(&peer).cloned();
-                let Some(identity) = identity else {
-                    tracing::warn!(%peer, "dropping DNS stream from unattributed socket");
+                // One admission authorizes exactly one accepted TCP stream;
+                // no peer mapping needs to outlive this accept.
+                if lock(&tcp_admissions).remove(&peer).is_none() {
+                    tracing::warn!(%peer, "dropping DNS stream from unregistered socket");
                     continue;
-                };
+                }
                 let Ok(worker_slot) = acquire_pending_dns_slot(&tcp_active_workers) else {
                     tracing::warn!(%peer, "dropping DNS stream because the worker quota is full");
                     continue;
@@ -372,7 +412,7 @@ fn start_dns_relay(
                     .name("openshell-dns-tcp-query".to_string())
                     .spawn(move || {
                         let _worker_slot = worker_slot;
-                        serve_dns_tcp(stream, identity, tcp_pending);
+                        serve_dns_tcp(stream, tcp_pending);
                     });
             }
         })
@@ -419,11 +459,7 @@ fn pending_try_send(
     })
 }
 
-fn serve_dns_tcp(
-    mut stream: TcpStream,
-    identity: Result<BinaryIdentity, ResolveError>,
-    pending: mpsc::Sender<PendingDnsQuery>,
-) {
+fn serve_dns_tcp(mut stream: TcpStream, pending: mpsc::Sender<PendingDnsQuery>) {
     use std::io::{Read as _, Write as _};
 
     let _ = stream.set_read_timeout(Some(DNS_QUERY_TIMEOUT));
@@ -444,7 +480,7 @@ fn serve_dns_tcp(
         let query = PendingDnsQuery {
             request,
             transport: DnsTransport::Tcp,
-            identity: identity.clone(),
+            identity: dns_sender_identity(),
             notification_to_queue: Duration::ZERO,
             queued_at: Instant::now(),
             response: response_tx,
@@ -479,15 +515,7 @@ fn dispatch_notification(
         return create_socket(&registry, &listener, notification);
     }
     if syscall == libc::SYS_connect {
-        return connect_socket(
-            registry,
-            listener,
-            notification,
-            queues.pending,
-            &queues.dns_relay,
-            queues.active_opens,
-            &queues.identity_resolver,
-        );
+        return connect_socket(registry, listener, notification, queues);
     }
     if syscall == libc::SYS_bind {
         return bind_socket(&registry, &listener, notification);
@@ -508,13 +536,7 @@ fn dispatch_notification(
         syscall,
         libc::SYS_sendto | libc::SYS_sendmsg | libc::SYS_sendmmsg
     ) {
-        return classify_send(
-            &registry,
-            &listener,
-            notification,
-            &queues.dns_relay,
-            &queues.identity_resolver,
-        );
+        return classify_send(&registry, &listener, notification, &queues.dns_relay);
     }
     if syscall == libc::SYS_getpeername {
         return get_peer_name(&registry, &listener, notification);
@@ -598,11 +620,16 @@ fn connect_socket(
     registry: Arc<Mutex<SocketRegistry>>,
     listener: Arc<NotificationListener>,
     notification: Notification,
-    pending: mpsc::Sender<PendingTcpOpen>,
-    dns_relay: &DnsRelay,
-    active_opens: Arc<AtomicUsize>,
-    identity_resolver: &ProcfsIdentityResolver,
+    queues: NotificationQueues,
 ) -> io::Result<()> {
+    let NotificationQueues {
+        pending,
+        dns_relay,
+        active_opens,
+        identity_resolver,
+        decision_timeout,
+        ..
+    } = queues;
     let notification_started = Instant::now();
     let fd = raw_fd(notification.args[0])?;
     let address_family =
@@ -634,12 +661,12 @@ fn connect_socket(
     }
     let destination =
         read_socket_addr(notification.tid, notification.args[1], notification.args[2])?;
-    let (kind, socket_cookie, nonblocking) = {
+    let (kind, socket_identity, nonblocking) = {
         let registry = lock(&registry);
         let entry = registry.resolve(notification.tid, fd)?;
         (
             entry.metadata().kind,
-            entry.identity().cookie,
+            entry.identity(),
             entry.metadata().nonblocking,
         )
     };
@@ -672,7 +699,6 @@ fn connect_socket(
         return listener.respond_value(notification.id, 0);
     }
     if destination == dns_relay.address {
-        let identity = identity_resolver.resolve(notification.tid);
         let mut registry = lock(&registry);
         let entry = registry.resolve_mut(notification.tid, fd)?;
         if !matches!(
@@ -683,13 +709,13 @@ fn connect_socket(
         }
         let source_fd = entry.retained_preconnect()?.as_raw_fd();
         let peer = ensure_dns_source_bound(source_fd, entry.metadata().family)?;
-        let attribution = match kind {
-            InetKind::Tcp => &dns_relay.tcp_attribution,
-            InetKind::DnsUdp => &dns_relay.udp_attribution,
+        let admissions = match kind {
+            InetKind::Tcp => &dns_relay.tcp_admissions,
+            InetKind::DnsUdp => &dns_relay.udp_admissions,
         };
-        lock(attribution).insert(peer, identity);
+        register_dns_socket(admissions, peer, entry.identity())?;
         if let Err(error) = connect_exact(source_fd, destination) {
-            lock(attribution).remove(&peer);
+            lock(admissions).remove(&peer);
             return Err(error);
         }
         entry.set_state(match kind {
@@ -720,7 +746,7 @@ fn connect_socket(
             destination,
             identity,
             socket: NetworkSocketMetadata {
-                socket_cookie,
+                socket_cookie: socket_identity.cookie,
                 nonblocking,
                 process_generation: u64::from(notification.tid),
             },
@@ -728,7 +754,6 @@ fn connect_socket(
             queued_at: Instant::now(),
             decision: decision_tx,
             relay: relay_rx,
-            _slot: slot,
         })
         .map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => io::Error::from_raw_os_error(libc::EAGAIN),
@@ -740,15 +765,24 @@ fn connect_socket(
     std::thread::Builder::new()
         .name("openshell-network-open".to_string())
         .spawn(move || {
-            let result = decision_rx.recv().unwrap_or(NetworkOpenResult::Denied {
-                errno: libc::ECANCELED,
-            });
+            // The worker owns its quota: an unresponsive supervisor must not
+            // retain a blocked syscall or worker slot indefinitely.
+            let _slot = slot;
+            let result = await_network_decision(&decision_rx, decision_timeout);
             match result {
                 NetworkOpenResult::Denied { errno } => {
                     let _ = worker_listener.respond_errno(notification.id, errno);
                 }
                 NetworkOpenResult::RelayReady => {
-                    match establish_relay(&registry, notification.tid, fd, destination) {
+                    match worker_listener.validate_id(notification.id).and_then(|()| {
+                        establish_relay(
+                            &registry,
+                            notification.tid,
+                            fd,
+                            socket_identity,
+                            destination,
+                        )
+                    }) {
                         Ok(stream) => {
                             let result = worker_listener
                                 .respond_value(notification.id, 0)
@@ -766,6 +800,20 @@ fn connect_socket(
         })
         .map_err(|error| io::Error::other(format!("start network-open worker: {error}")))?;
     Ok(())
+}
+
+fn await_network_decision(
+    decision: &std::sync::mpsc::Receiver<NetworkOpenResult>,
+    timeout: Duration,
+) -> NetworkOpenResult {
+    decision
+        .recv_timeout(timeout)
+        .unwrap_or_else(|error| NetworkOpenResult::Denied {
+            errno: match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => libc::ETIMEDOUT,
+                std::sync::mpsc::RecvTimeoutError::Disconnected => libc::ECANCELED,
+            },
+        })
 }
 
 fn ensure_dns_source_bound(fd: RawFd, family: InetFamily) -> io::Result<SocketAddr> {
@@ -794,6 +842,7 @@ fn establish_relay(
     registry: &Mutex<SocketRegistry>,
     tid: u32,
     fd: RawFd,
+    expected_socket: SocketIdentity,
     destination: SocketAddr,
 ) -> io::Result<TcpStream> {
     let relay = TcpListener::bind(match destination {
@@ -805,6 +854,9 @@ fn establish_relay(
     let expected_peer = {
         let mut registry = lock(registry);
         let entry = registry.resolve_mut(tid, fd)?;
+        if entry.identity() != expected_socket {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
         connect_exact(entry.retained_preconnect()?.as_raw_fd(), relay_address)?;
         let expected_peer = socket_local_addr(entry.retained_preconnect()?.as_raw_fd())?;
         entry.set_state(SocketState::Connected {
@@ -1134,7 +1186,6 @@ fn classify_send(
     listener: &NotificationListener,
     notification: Notification,
     dns_relay: &DnsRelay,
-    identity_resolver: &ProcfsIdentityResolver,
 ) -> io::Result<()> {
     let fd = raw_fd(notification.args[0])?;
     let syscall = i64::from(notification.syscall);
@@ -1213,13 +1264,12 @@ fn classify_send(
                         .is_some_and(|value| value == dns_relay.address)
                 }) =>
         {
-            let identity = identity_resolver.resolve(notification.tid);
             let entry = registry.resolve_mut(notification.tid, fd)?;
             let source_fd = entry.retained_preconnect()?.as_raw_fd();
             let peer = ensure_dns_source_bound(source_fd, entry.metadata().family)?;
-            lock(&dns_relay.udp_attribution).insert(peer, identity);
+            register_dns_socket(&dns_relay.udp_admissions, peer, entry.identity())?;
             if let Err(error) = connect_exact(source_fd, dns_relay.address) {
-                lock(&dns_relay.udp_attribution).remove(&peer);
+                lock(&dns_relay.udp_admissions).remove(&peer);
                 return Err(error);
             }
             for message in &messages {
@@ -1664,6 +1714,166 @@ mod tests {
     use super::*;
     use std::io::{Read as _, Write as _};
     use std::os::unix::net::{UnixListener, UnixStream};
+
+    #[test]
+    fn relay_rejects_descriptor_replaced_after_policy_decision() {
+        let metadata = SocketMetadata {
+            family: InetFamily::V4,
+            kind: InetKind::Tcp,
+            close_on_exec: true,
+            nonblocking: false,
+            creator_generation: 1,
+        };
+        let mut registry = SocketRegistry::new(1, 2).unwrap();
+        let mut create = || {
+            // SAFETY: a successful socket call returns a new owned descriptor.
+            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            assert!(fd >= 0);
+            let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+            let installed = duplicate_close_on_exec(fd).unwrap();
+            let tentative = registry.stage(socket, metadata).unwrap();
+            let identity = registry.commit(tentative).unwrap();
+            (installed, identity)
+        };
+        let (original, original_identity) = create();
+        let (replacement, replacement_identity) = create();
+        // SAFETY: both descriptors are live; replace only the test-owned FD.
+        assert_eq!(
+            unsafe { libc::dup2(replacement.as_raw_fd(), original.as_raw_fd()) },
+            original.as_raw_fd()
+        );
+        let registry = Mutex::new(registry);
+        let error = establish_relay(
+            &registry,
+            std::process::id(),
+            original.as_raw_fd(),
+            original_identity,
+            "203.0.113.7:443".parse().unwrap(),
+        )
+        .expect_err("an approval for the old socket must not connect its replacement");
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        let registry = lock(&registry);
+        let entry = registry
+            .resolve(std::process::id(), original.as_raw_fd())
+            .unwrap();
+        assert_eq!(entry.identity(), replacement_identity);
+        assert_eq!(entry.state(), &SocketState::Created);
+        assert_eq!(
+            socket_local_addr(replacement.as_raw_fd()).unwrap().port(),
+            0
+        );
+    }
+
+    #[test]
+    fn external_connect_times_out_when_supervisor_retains_the_decision() {
+        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+            .expect("start workload launcher");
+        let broker = NetworkBroker::start_with_decision_timeout(
+            listener,
+            "127.0.0.1:0".parse().unwrap(),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        let client = std::thread::spawn(move || {
+            launcher
+                .execute(|| TcpStream::connect("203.0.113.7:443"))
+                .unwrap()
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let pending = runtime.block_on(broker.accept()).unwrap();
+        // Keep the request alive: channel disconnection must not be what
+        // releases the workload's blocked connect.
+        let error = client
+            .join()
+            .unwrap()
+            .expect_err("unanswered connect must time out");
+        assert_eq!(error.raw_os_error(), Some(libc::ETIMEDOUT));
+        assert!(
+            runtime
+                .block_on(pending.complete(NetworkOpenResult::RelayReady))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn dns_admissions_reclaim_closed_sockets_at_the_bound() {
+        let admissions = Mutex::new(HashMap::new());
+        let stale = SocketIdentity {
+            listener_generation: 1,
+            inode: 0,
+            cookie: 1,
+        };
+        for port in 1..=SOCKET_CAPACITY {
+            lock(&admissions).insert(
+                SocketAddr::from(([127, 0, 0, 1], u16::try_from(port).unwrap())),
+                stale,
+            );
+        }
+        let peer = "127.0.0.1:50000".parse().unwrap();
+        register_dns_socket(&admissions, peer, stale).unwrap();
+        assert_eq!(lock(&admissions).len(), 1);
+        assert_eq!(lock(&admissions).get(&peer), Some(&stale));
+    }
+
+    #[test]
+    fn inherited_dns_socket_after_exec_never_claims_the_connecting_binary() {
+        use std::process::{Command, Stdio};
+
+        for transport in [DnsTransport::Udp, DnsTransport::Tcp] {
+            let (launcher, listener) =
+                openshell_isolation_interface::linux::workload_launcher::start().unwrap();
+            let broker = NetworkBroker::start_for_test(listener).unwrap();
+            let address = broker.dns_address();
+            let child = std::thread::spawn(move || {
+                launcher
+                    .execute(move || -> io::Result<()> {
+                        let (socket, script): (OwnedFd, &str) = match transport {
+                            DnsTransport::Udp => {
+                                let socket = UdpSocket::bind("127.0.0.1:0")?;
+                                socket.connect(address)?;
+                                (socket.into(), "printf dns >&0")
+                            }
+                            DnsTransport::Tcp => (
+                                TcpStream::connect(address)?.into(),
+                                "printf '\\000\\003dns' >&0",
+                            ),
+                        };
+                        // The socket was connected by this executable. A forked
+                        // child inherits it, execs a different binary, and writes
+                        // without a new connect or a destination-bearing send.
+                        let status = Command::new("/bin/sh")
+                            .args(["-c", script])
+                            .stdin(Stdio::from(socket))
+                            .status()?;
+                        if !status.success() {
+                            return Err(io::Error::other("DNS-writing child failed"));
+                        }
+                        Ok(())
+                    })
+                    .unwrap()
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let query = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), broker.accept_dns())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            });
+            assert_eq!(query.transport, transport);
+            assert!(matches!(
+                query.identity,
+                Err(ResolveError::Failed(ref message)) if message.contains("unavailable")
+            ));
+            query.complete(Ok(Vec::new())).unwrap();
+            child.join().unwrap().unwrap();
+        }
+    }
 
     #[test]
     fn pending_external_open_slots_are_bounded_and_reusable() {
