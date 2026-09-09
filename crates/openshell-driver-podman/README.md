@@ -30,6 +30,14 @@ The supervisor joins the workload's **user namespace only** to preserve UID/GID
 mapping for shared-volume access. PID, mount, and network namespaces remain
 separate. The channel volume uses shared SELinux relabeling (`:z`).
 
+Before starting either container, the driver uploads volume-relative archives
+directly to the channel and workspace volume destinations. A rootfs upload on a
+stopped Podman container does not populate nested named volumes. Restart restores
+only the channel bootstrap into the existing channel volume, preserving the
+workspace. The workload starts before the supervisor so its user namespace exists
+when the supervisor joins it; a stopped supervisor resolves that namespace again
+on its next start.
+
 The runtime must pass the sandbox's unprivileged enforcement probe, including
 nested seccomp notification and Landlock. Unsupported runtime defaults fail
 closed; do not switch to an unconfined profile or add capabilities.
@@ -77,7 +85,7 @@ children, never the supervisor process.
 
 ## Lifecycle and readiness
 
-Create builds both stopped containers and stages both private archives before
+Create builds both stopped containers and stages the private archives before
 starting either container. The sandbox does not execute the agent until the
 supervisor authenticates and confirms the common boundary contract. Failed
 creation removes only containers created by that attempt, then cleans up

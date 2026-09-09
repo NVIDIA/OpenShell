@@ -1016,7 +1016,14 @@ impl PodmanComputeDriver {
                         child_env,
                     )?;
                     self.client
-                        .copy_to_container(&workload_id, archives.workload)
+                        .copy_to_container(
+                            &workload_id,
+                            crate::isolation::CHANNEL_ROOT,
+                            archives.channel,
+                        )
+                        .await?;
+                    self.client
+                        .copy_to_container(&workload_id, "/sandbox", archives.workspace)
                         .await?;
                     specs.supervisor.join_user_namespace(&workload_id);
                     let supervisor_id = self
@@ -1025,7 +1032,7 @@ impl PodmanComputeDriver {
                         .await?;
                     created_supervisor = Some(supervisor_id.clone());
                     self.client
-                        .copy_to_container(&supervisor_id, archives.supervisor)
+                        .copy_to_container(&supervisor_id, "/", archives.supervisor)
                         .await?;
                     // Both resources and private files exist before either
                     // container can run. Only the trusted sandbox starts here;
@@ -1312,7 +1319,9 @@ impl PodmanComputeDriver {
                 .await?;
             let bundle =
                 extract_first_tar_entry(&archive).map_err(ComputeDriverError::Precondition)?;
-            self.client.copy_to_container(&container_id, bundle).await?;
+            self.client
+                .copy_to_container(&container_id, crate::isolation::CHANNEL_ROOT, bundle)
+                .await?;
             self.client.verify_isolation_fence(&container_id).await?;
             self.client.start_container(&container_id).await?;
             if let Err(error) = self.client.start_container(&supervisor).await {
@@ -1906,6 +1915,24 @@ mod tests {
             .await
             .expect("start should succeed");
         start_handle.await.expect("start stub should finish");
+        let restart_requests = start_requests.lock().unwrap().clone();
+        assert_eq!(
+            restart_requests
+                .iter()
+                .filter(|request| request.starts_with("PUT "))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![format!(
+                "PUT {}",
+                api_path("/libpod/containers/ctr-1/archive?path=%2F.openshell%2Fchannel")
+            )]
+        );
+        assert!(
+            !restart_requests
+                .iter()
+                .any(|request| request.contains("/volumes/create")
+                    || request.contains("/containers/create"))
+        );
         assert_eq!(
             start_requests
                 .lock()
@@ -2054,7 +2081,7 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
-        let (socket_path, _requests, handle) = spawn_podman_stub(
+        let (socket_path, requests, handle) = spawn_podman_stub(
             "trace-create",
             create_setup_responses(false)
                 .into_iter()
@@ -2074,6 +2101,22 @@ mod tests {
             .await
             .expect("create should succeed");
         handle.await.expect("stub should finish");
+        let uploads: Vec<_> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.starts_with("PUT "))
+            .cloned()
+            .collect();
+        assert_eq!(
+            uploads,
+            [
+                "/libpod/containers/workload/archive?path=%2F.openshell%2Fchannel",
+                "/libpod/containers/workload/archive?path=%2Fsandbox",
+                "/libpod/containers/supervisor/archive?path=%2F",
+            ]
+            .map(|path| format!("PUT {}", api_path(path)))
+        );
         provider.force_flush().unwrap();
 
         let spans = exporter.get_finished_spans().unwrap();
@@ -3121,7 +3164,18 @@ mod tests {
 
     fn restart_responses() -> Vec<StubResponse> {
         let mut archive = tar::Builder::new(Vec::new());
-        let bundle = tar::Builder::new(Vec::new()).into_inner().unwrap();
+        let identity = openshell_isolation_interface::contract::ResolvedWorkloadIdentity::new(
+            1000,
+            1001,
+            vec![],
+            "image".into(),
+            "sha256:image".into(),
+        )
+        .unwrap();
+        let bundle =
+            crate::isolation::bootstrap_archives("sandbox-1", "ctr-1", &identity, HashMap::new())
+                .unwrap()
+                .channel;
         let mut header = tar::Header::new_gnu();
         header.set_size(bundle.len() as u64);
         header.set_mode(0o600);
@@ -3136,7 +3190,7 @@ mod tests {
                 r#"{"Id":"supervisor","Name":"supervisor","State":{"Status":"exited","Running":false},"Config":{}}"#,
             ),
             StubResponse::new(StatusCode::OK, archive.into_inner().unwrap()),
-            StubResponse::new(StatusCode::OK, ""), // restore bootstrap
+            StubResponse::new(StatusCode::OK, "").with_archive_members(channel_archive_members()),
             fence_response(),
             StubResponse::new(StatusCode::NO_CONTENT, ""), // workload start
             StubResponse::new(StatusCode::NO_CONTENT, ""), // supervisor start
@@ -3234,11 +3288,23 @@ mod tests {
         vec![
             created_response("workload"),
             fence_response(),
-            StubResponse::new(StatusCode::OK, ""), // workload archive
+            StubResponse::new(StatusCode::OK, "").with_archive_members(channel_archive_members()),
+            StubResponse::new(StatusCode::OK, "").with_archive_members(&["."]),
             created_response("supervisor"),
             StubResponse::new(StatusCode::OK, ""), // supervisor archive
             StubResponse::new(StatusCode::NO_CONTENT, ""), // workload start
             StubResponse::new(StatusCode::NO_CONTENT, ""), // supervisor start
+        ]
+    }
+
+    fn channel_archive_members() -> &'static [&'static str] {
+        &[
+            ".",
+            "sandbox",
+            "sandbox/bootstrap.json",
+            "sandbox/server.crt",
+            "sandbox/server.key",
+            "sandbox/client-ca.crt",
         ]
     }
 
@@ -3320,7 +3386,7 @@ mod tests {
             "create-start-fail",
             create_setup_responses(true)
                 .into_iter()
-                .chain(create_launch_responses().into_iter().take(6))
+                .chain(create_launch_responses().into_iter().take(7))
                 .chain([
                     StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "supervisor start failed"),
                     StubResponse::new(StatusCode::NO_CONTENT, ""), // supervisor
