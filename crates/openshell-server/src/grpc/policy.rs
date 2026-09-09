@@ -7278,17 +7278,43 @@ mod tests {
     }
 
     #[test]
-    fn stored_policy_decode_splits_legacy_advisor_binary_provenance() {
+    fn stored_policy_decode_migrates_legacy_provenance_and_preserves_unknown_fields() {
+        #[derive(Clone, PartialEq, Message)]
+        struct FutureStoredNetworkBinary {
+            #[prost(string, tag = "1")]
+            path: String,
+            #[prost(bool, tag = "2")]
+            advisor_proposed: bool,
+            #[prost(string, tag = "99")]
+            future_metadata: String,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct FutureStoredNetworkPolicyRule {
+            #[prost(string, tag = "1")]
+            name: String,
+            #[prost(message, repeated, tag = "2")]
+            endpoints: Vec<NetworkEndpoint>,
+            #[prost(message, repeated, tag = "3")]
+            binaries: Vec<FutureStoredNetworkBinary>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct FutureStoredSandboxPolicy {
+            #[prost(map = "string, message", tag = "5")]
+            network_policies: HashMap<String, FutureStoredNetworkPolicyRule>,
+        }
+
         #[derive(Clone, PartialEq, Message)]
         struct LegacyStoredPolicyRevisionPayload {
             #[prost(message, optional, tag = "1")]
-            policy: Option<LegacyStoredSandboxPolicy>,
+            policy: Option<FutureStoredSandboxPolicy>,
         }
 
-        let legacy = LegacyStoredSandboxPolicy {
+        let legacy = FutureStoredSandboxPolicy {
             network_policies: HashMap::from([(
                 "cargo_registry".to_string(),
-                LegacyStoredNetworkPolicyRule {
+                FutureStoredNetworkPolicyRule {
                     name: "cargo-registry".to_string(),
                     endpoints: vec![NetworkEndpoint {
                         host: "index.crates.io".to_string(),
@@ -7296,13 +7322,15 @@ mod tests {
                         ..Default::default()
                     }],
                     binaries: vec![
-                        LegacyStoredNetworkBinary {
+                        FutureStoredNetworkBinary {
                             path: "/usr/bin/cargo".to_string(),
                             advisor_proposed: false,
+                            future_metadata: "keep-explicit".to_string(),
                         },
-                        LegacyStoredNetworkBinary {
+                        FutureStoredNetworkBinary {
                             path: "/usr/bin/curl".to_string(),
                             advisor_proposed: true,
+                            future_metadata: "keep-advisor".to_string(),
                         },
                     ],
                 },
@@ -7319,6 +7347,24 @@ mod tests {
             1,
             "loaded".to_string(),
             &wrapped,
+            1,
+        )
+        .unwrap();
+        let rewrapped = crate::policy_store::policy_payload_from_record(&record).unwrap();
+        let future_payload = LegacyStoredPolicyRevisionPayload::decode(rewrapped.as_slice())
+            .expect("rewrapped policy should retain unknown nested fields");
+        let future_rule = &future_payload.policy.unwrap().network_policies["cargo_registry"];
+        assert!(!future_rule.binaries[0].advisor_proposed);
+        assert_eq!(future_rule.binaries[0].future_metadata, "keep-explicit");
+        assert!(future_rule.binaries[1].advisor_proposed);
+        assert_eq!(future_rule.binaries[1].future_metadata, "keep-advisor");
+
+        let record = crate::policy_store::policy_record_from_parts(
+            "revision-2".to_string(),
+            "sandbox-1".to_string(),
+            1,
+            "loaded".to_string(),
+            &rewrapped,
             1,
         )
         .unwrap();
