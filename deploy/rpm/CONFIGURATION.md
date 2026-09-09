@@ -37,8 +37,11 @@ prevents unexpected driver selection if Docker is also installed on the host.
 Edit `~/.config/openshell/gateway.toml` directly. The package-owned template at
 `/usr/share/openshell-gateway/gateway.toml.default` is not read at runtime and
 may change during an RPM upgrade. The active user copy is preserved. During a
-schema-v2 upgrade, the service replaces only an exact package-generated v1
-copy; it never rewrites an edited configuration.
+schema-v2 upgrade, the service replaces only the recognized package-generated
+v1 copy; it never rewrites an edited configuration. Before generating
+certificates or starting the gateway, the service runs
+`openshell-gateway config preflight` against the effective configuration and
+stops if validation fails.
 
 To apply environment variable overrides that persist across upgrades without
 editing the TOML file, add them to `~/.config/openshell/gateway.env`:

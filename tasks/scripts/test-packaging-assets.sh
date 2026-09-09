@@ -57,6 +57,7 @@ assert_contains \
 assert_contains \
   "$spec" \
   'ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir ${OPENSHELL_LOCAL_TLS_DIR} --server-san host.openshell.internal'
+assert_contains "$spec" 'ExecStartPre=/usr/bin/openshell-gateway config preflight'
 assert_not_contains "$spec" '%%S/openshell/tls'
 
 # Schema-v2 package startup wiring.
@@ -76,6 +77,14 @@ assert_not_contains "$snap_wrapper" "[ -f \"\$CANONICAL_CONFIG_FILE\" ]"
 bash "$ROOT/tasks/scripts/test-snap-gateway-wrapper.sh" "$snap_wrapper"
 if ! awk '/config preflight/ { seen = 1 } /generate-certs/ { exit !seen }' "$service"; then
   echo "FAIL: Debian preflight must precede certificate generation" >&2
+  exit 1
+fi
+if ! awk \
+  '/^ExecStartPre=.*gateway-migrate-config / { migrated = 1 } \
+   /^ExecStartPre=\/usr\/bin\/openshell-gateway config preflight$/ { preflight = migrated } \
+   /^ExecStartPre=\/usr\/bin\/openshell-gateway generate-certs/ { exit !(preflight && migrated) }' \
+  "$spec"; then
+  echo "FAIL: RPM migration and preflight must precede certificate generation" >&2
   exit 1
 fi
 

@@ -170,6 +170,7 @@ def test_rpm_spec_seeds_and_migrates_gateway_defaults() -> None:
     assert "migrate-gateway-config.sh" in spec
     assert "gateway.toml.default.v1" in spec
     assert "%{name}-gateway-migrate-config" in spec
+    assert "ExecStartPre=/usr/bin/openshell-gateway config preflight" in spec
     assert "Environment=OPENSHELL_LOCAL_TLS_DIR=%%h/.local/state/openshell/tls" in spec
     assert (
         "openshell-gateway generate-certs --output-dir ${OPENSHELL_LOCAL_TLS_DIR}"
@@ -204,16 +205,23 @@ def test_deb_user_service_uses_gateway_defaults_without_config_helper() -> None:
     assert "--db-url" not in unit
 
 
-def test_rpm_migration_exec_start_pre_argument_order() -> None:
+def test_rpm_exec_start_pre_argument_and_execution_order() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     spec = (repo_root / "openshell.spec").read_text(encoding="utf-8")
 
-    assert (
+    migration = (
         "ExecStartPre=%{_libexecdir}/%{name}-gateway-migrate-config "
         "%%E/openshell/gateway.toml "
         "/usr/share/openshell-gateway/gateway.toml.default "
         "/usr/share/openshell-gateway/gateway.toml.default.v1"
-    ) in spec
+    )
+    preflight = "ExecStartPre=/usr/bin/openshell-gateway config preflight"
+    certs = "ExecStartPre=/usr/bin/openshell-gateway generate-certs"
+
+    assert migration in spec
+    assert preflight in spec
+    assert certs in spec
+    assert spec.index(migration) < spec.index(preflight) < spec.index(certs)
 
 
 def test_schema_v2_debian_and_snap_preflight_wiring() -> None:

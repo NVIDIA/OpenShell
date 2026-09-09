@@ -136,6 +136,10 @@ Type=exec
 # %%E expands to $XDG_CONFIG_HOME (~/.config) in user units.
 ExecStartPre=%{_libexecdir}/%{name}-gateway-migrate-config %%E/openshell/gateway.toml /usr/share/openshell-gateway/gateway.toml.default /usr/share/openshell-gateway/gateway.toml.default.v1
 
+# Reject an invalid selected configuration before generating certificates or
+# starting the gateway. The environment file below applies to every command.
+ExecStartPre=/usr/bin/openshell-gateway config preflight
+
 # Auto-generate PKI on first start if not present.
 # The default local TLS dir uses %%h because %%S resolves differently across
 # systemd user-manager versions. gateway.env may override this path.
