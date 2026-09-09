@@ -1946,8 +1946,8 @@ def _make_workload_template_proto(
     template.metadata.name = name
     template.metadata.workspace = workspace
     template.spec.workload.image = f"ghcr.io/test/{name}:latest"
-    template.spec.workload.resources.cpu = "1"
-    template.spec.workload.resources.memory = "512Mi"
+    template.spec.workload.resources.cpu.limit = "1"
+    template.spec.workload.resources.memory.limit = "512Mi"
     return template
 
 
@@ -2224,8 +2224,8 @@ def test_sandbox_template_create_builds_template_from_public_fields() -> None:
     assert dict(template.metadata.annotations) == {"owner": "platform"}
     assert template.spec.workload.image == "ghcr.io/test/gpu-kata:latest"
     assert dict(template.spec.workload.environment) == {"FEATURE_FLAG": "on"}
-    assert template.spec.workload.resources.cpu == "1"
-    assert template.spec.workload.resources.memory == "512Mi"
+    assert template.spec.workload.resources.cpu.limit == "1"
+    assert template.spec.workload.resources.memory.limit == "512Mi"
     assert template.spec.workload.resources.gpu.count == 2
     assert template.spec.driver_config["kubernetes"]["runtime_class_name"] == "kata"
 
