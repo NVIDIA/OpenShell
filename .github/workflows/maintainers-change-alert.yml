@@ -26,11 +26,11 @@ jobs:
     steps:
       # Default branch only. The helper must be the reviewed version, not
       # whatever the pull request happens to contain.
-      - name: Check out the approval helper
+      - name: Check out the change-alert helper
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
-          sparse-checkout: tasks/scripts/core_approval.py
+          sparse-checkout: tasks/scripts/alert_maintainer_change.py
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
@@ -76,15 +76,15 @@ jobs:
           fetch_maintainers "$BASE_SHA" before.md
           fetch_maintainers "$HEAD_SHA" after.md
 
-          python3 tasks/scripts/core_approval.py diff \
+          python3 tasks/scripts/alert_maintainer_change.py \
             --before before.md --after after.md > body.md
           cat body.md >> "$GITHUB_STEP_SUMMARY"
 
           # Update the existing comment rather than stacking one per push.
           # This marker must stay identical to COMMENT_MARKER in
-          # tasks/scripts/core_approval.py, which emits it as the first line of
-          # the body. If they drift, the lookup below silently stops matching
-          # and every push stacks another comment.
+          # tasks/scripts/alert_maintainer_change.py, which emits it as the
+          # first line of the body. If they drift, the lookup below silently
+          # stops matching and every push stacks another comment.
           COMMENT_ID=$(gh api --paginate "repos/$GH_REPO/issues/$PR_NUMBER/comments" \
             --jq '.[] | select(.body | startswith("<!-- maintainer-approval-delta -->")) | .id' \
             | head -n 1)

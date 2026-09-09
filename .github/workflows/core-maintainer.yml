@@ -36,7 +36,7 @@ jobs:
           ref: main
           sparse-checkout: |
             MAINTAINERS.md
-            tasks/scripts/core_approval.py
+            tasks/scripts/check_maintainer_approval.py
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
@@ -68,6 +68,6 @@ jobs:
           # Exits non-zero when no maintainer's latest decisive review is an
           # approval, and when MAINTAINERS.md yields no handles. That exit code
           # is the check result; nothing is posted anywhere.
-          python3 tasks/scripts/core_approval.py decide \
+          python3 tasks/scripts/check_maintainer_approval.py \
             --maintainers MAINTAINERS.md \
             --reviews reviews.json
