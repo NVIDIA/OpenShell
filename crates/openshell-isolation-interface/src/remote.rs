@@ -303,7 +303,6 @@ impl BoundBoundary for RemoteBound {
         let Response::Confirmed { evidence } = response else {
             return Err(unexpected_response("confirmed_with_evidence", &response));
         };
-        evidence.validate(&self.identity)?;
         if evidence.generation != self.generation
             || evidence.session_epoch != self.session_epoch
             || evidence.resource_claims != self.resource_claims
@@ -314,7 +313,7 @@ impl BoundBoundary for RemoteBound {
                     .to_string(),
             ));
         }
-        Ok(ConfirmedBoundary::new(
+        ConfirmedBoundary::try_new(
             Box::new(RemoteReady {
                 client: self.client,
                 agent: self.agent,
@@ -324,7 +323,8 @@ impl BoundBoundary for RemoteBound {
                 provider_credentials: self.provider_credentials,
             }),
             *evidence,
-        ))
+            &self.identity,
+        )
     }
 }
 
