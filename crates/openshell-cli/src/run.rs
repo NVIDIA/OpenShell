@@ -2454,7 +2454,7 @@ pub async fn sandbox_template_create(
                     labels,
                     resource_version: 0,
                     annotations,
-                    workspace: "default".to_string(),
+                    workspace: workspace.to_string(),
                     deletion_timestamp_ms: 0,
                 }),
                 spec: Some(SandboxWorkloadTemplateSpec {

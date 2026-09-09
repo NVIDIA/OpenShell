@@ -1745,7 +1745,7 @@ async fn sandbox_create_with_template_sends_workload_template_name() {
 }
 
 #[tokio::test]
-async fn sandbox_template_create_sends_workload_template_resource() {
+async fn sandbox_template_create_sends_non_default_workspace_in_scope_and_metadata() {
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();
     let xdg_dir = tempfile::tempdir().unwrap();
@@ -1766,7 +1766,7 @@ async fn sandbox_template_create_sends_workload_template_resource() {
         HashMap::from([("owner".to_string(), "platform".to_string())]),
         HashMap::from([("FEATURE_FLAG".to_string(), "on".to_string())]),
         "table",
-        "default",
+        "team-a",
         &tls,
     )
     .await
@@ -1776,13 +1776,11 @@ async fn sandbox_template_create_sends_workload_template_resource() {
     let request = requests
         .first()
         .expect("template create request should be recorded");
-    assert_eq!(
-        selected_workspace(&request.workspace_scope),
-        Some("default")
-    );
+    assert_eq!(selected_workspace(&request.workspace_scope), Some("team-a"));
     let template = request.template.as_ref().expect("template should be sent");
     let metadata = template.metadata.as_ref().expect("metadata should be sent");
     assert_eq!(metadata.name, "gpu-kata");
+    assert_eq!(metadata.workspace, "team-a");
     assert_eq!(metadata.labels.get("team"), Some(&"runtime".to_string()));
     assert_eq!(
         metadata.annotations.get("owner"),
