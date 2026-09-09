@@ -261,7 +261,7 @@ pub struct SandboxContext {
 }
 
 /// The agent workload to run inside the boundary.
-pub use crate::AgentSpec;
+use crate::AgentSpec;
 
 /// Maps backend name to its implementation. This is the only lookup by name;
 /// supervisor lifecycle never branches on a concrete backend, and resolution
@@ -851,8 +851,23 @@ pub struct BinaryIdentity {
 
 /// A SHA-256 digest, kept typed so the identity field is not coupled to its
 /// textual encoding or forced to repeat the algorithm in its name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct Sha256Digest([u8; 32]);
+
+impl TryFrom<String> for Sha256Digest {
+    type Error = ResolveError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<Sha256Digest> for String {
+    fn from(value: Sha256Digest) -> Self {
+        value.to_string()
+    }
+}
 
 impl Sha256Digest {
     /// Return the raw digest bytes.
