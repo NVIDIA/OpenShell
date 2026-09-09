@@ -72,6 +72,22 @@ When a hot reload changes rules, the supervisor publishes a new policy generatio
 | `network_policies` | Dynamic | Controls outbound traffic from the sandbox, including native model-provider endpoints. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br />Every outbound connection passes through the network supervisor, which queries the [policy engine](/about/how-it-works#core-components) with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. Attached provider profiles can contribute endpoint and binary entries to the effective policy. <br />For endpoints with `protocol: rest`, the proxy auto-detects TLS and terminates it so each HTTP request can be checked against that endpoint's `rules` (method and path). For endpoints with `protocol: websocket`, the proxy validates the RFC 6455 upgrade and evaluates `GET` rules for the handshake plus either `WEBSOCKET_TEXT` rules for raw client text messages or GraphQL operation rules for GraphQL-over-WebSocket messages. Set `websocket_credential_rewrite: true` only when a WebSocket or REST compatibility endpoint must keep placeholder credentials in sandbox-owned text frames and resolve them at the OpenShell relay boundary. <br />Endpoints with `protocol: tcp` allow ordinary DNS resolution and native TCP connections without inspecting payloads. Endpoints without `protocol` retain L4 passthrough through an explicit proxy. <br />If no endpoint matches, the connection is denied. |
 | `network_middlewares` | Dynamic | Declares keyed HTTP and WebSocket middleware configs. After network and L7 policy admit a request or upgrade, OpenShell matches each config's host selectors independently and runs matching entries by their unique ascending `order` before credential injection. WebSocket-capable entries continue on complete client text messages. |
 
+When REST body credential rewriting is disabled, OpenShell forwards placeholder
+text unchanged if trusted metadata identifies an unknown key or a valid credential
+bound to a different host, port, or path. For example, a documentation example
+referencing an unknown `KEY`, or a GitHub placeholder in an OpenAI conversation,
+does not trigger a body denial. OpenShell does not substitute the secret.
+
+A placeholder bound to the destination still fails closed, including inside quoted
+tool output. Known invalid or revoked references and unavailable classification
+metadata also fail closed. The local HTTP 403 response uses the error code
+`credential_placeholder_in_request_body`. Remove the offending reference from
+conversation history before retrying; if metadata is unavailable, restore provider
+access first. Do not enable body rewriting or `allow_uninspected_credentials` just
+to forward conversation text. Malformed placeholder candidates and candidates
+longer than 4096 wire bytes are denied. Authentication headers and HTTP trailers
+retain their credential restrictions.
+
 ## Supervisor Middleware
 
 Supervisor middleware can inspect, deny, or replace admitted HTTP request bodies and client WebSocket text messages before provider credentials are injected. Middleware selection is independent of the `network_policies` rule that admitted the traffic: each keyed `network_middlewares` entry matches the destination host through `endpoints.include` and `endpoints.exclude`.

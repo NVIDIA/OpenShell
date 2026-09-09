@@ -144,13 +144,23 @@ requires removing the endpoint or replacing the policy.
 
 The network supervisor independently enforces the same boundary. Credentialed
 WebSocket upgrades use the parsed relay, binary frames fail closed, and text
-placeholders require rewrite. REST bodies can continue streaming when body
-rewrite is disabled, but the relay withholds enough trailing bytes to detect a
-placeholder split across reads before forwarding its marker. Explicitly opted-in
+placeholders require rewrite. REST bodies continue streaming when body rewrite is disabled. The relay holds
+complete placeholder candidates until a request-scoped metadata snapshot can
+classify them. Authoritatively unknown keys and valid credentials with a current
+binding outside the destination host, port, and path pass unchanged. Destination-bound
+references, revoked or invalid identities, and unavailable classification state
+fail closed. Classification never substitutes secret values and shares the request's
+credential revision; stale credential or policy generations terminate forwarding.
+Candidates are limited to 4096 wire bytes, including percent encoding. Malformed
+or oversized candidates fail closed; HTTP trailers retain prefix-based rejection. Explicitly opted-in
 endpoints retain raw passthrough behavior.
 
+Body denials return `credential_placeholder_in_request_body` in a local HTTP 403
+response and discard any partially written upstream request. Safe preceding bytes
+may already have reached upstream.
+
 Denials emit both the relevant network activity and a detection finding. Events
-identify only the destination, policy, and traffic surface; they never include
+identify only the destination, policy, traffic surface, and controlled denial reason; they never include
 credential names, placeholders, body content, or secret values.
 
 Credential provenance is gateway-derived and deliberately absent from the policy

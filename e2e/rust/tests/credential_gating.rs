@@ -540,6 +540,8 @@ async fn handle_http_probe(
     if expected_total.is_some_and(|expected| received.len() >= expected) {
         let result = if observation.saw_secret && !observation.saw_placeholder {
             "BODY_REWRITTEN"
+        } else if observation.saw_placeholder && !observation.saw_secret {
+            "BODY_TEXT"
         } else {
             "BODY_BAD"
         };
@@ -890,6 +892,65 @@ async fn assert_rest_body_backstop(server: &HttpProbeServer) -> Result<(), Strin
     Ok(())
 }
 
+async fn assert_conversation_placeholders_pass() -> Result<(), String> {
+    // The attached provider is bound to the original probe's port. This second
+    // endpoint permits REST requests but cannot resolve that provider's token.
+    let server = HttpProbeServer::start().await?;
+    let policy = write_policy(
+        server.port,
+        EndpointMode::RestBody { rewrite: false },
+        CredentialSource::ProviderProfile,
+    )?;
+    let policy_path = policy.path().to_str().ok_or("invalid policy path")?;
+    for unknown in [true, false] {
+        let mut script = body_client_script(server.port)
+            .replace("import os", "import json\nimport os")
+            .replace("body = (\"prefix-\" + token + \"-suffix\").encode(\"utf-8\")", "body = json.dumps({'input': [{'type': 'function_call_output', 'output': 'Token: ' + token}]}).encode('utf-8')")
+            .replace("print(\"BODY_REWRITTEN\" if b\"BODY_REWRITTEN\" in response else \"BODY_DENIED\")", "print('BODY_TEXT' if b'BODY_TEXT' in response else 'BODY_DENIED')");
+        if unknown {
+            script = script.replace(
+                &format!("token = os.environ[{TOKEN_ENV:?}]"),
+                "token = 'openshell:resolve:env:KEY'",
+            );
+        }
+        // Replay the same conversation after its tool output is retained.
+        let mut replay_script = String::from("for replay in range(2):\n");
+        for line in script.lines() {
+            replay_script.push_str("    ");
+            replay_script.push_str(line);
+            replay_script.push('\n');
+        }
+        script = replay_script;
+        let mut sandbox = SandboxGuard::create(&[
+            "--policy",
+            policy_path,
+            "--provider",
+            PROVIDER_NAME,
+            "--",
+            "python3",
+            "-c",
+            &script,
+        ])
+        .await?;
+        let output = sandbox.create_output.clone();
+        sandbox.cleanup().await;
+        assert_eq!(
+            output.matches("BODY_TEXT").count(),
+            2,
+            "conversation did not survive replay: {output}"
+        );
+        assert!(!output.contains(TEST_SECRET));
+    }
+    let observations = server.wait_for_observations(4).await;
+    assert_eq!(observations.len(), 4);
+    assert!(
+        observations
+            .iter()
+            .all(|observation| observation.saw_placeholder && !observation.saw_secret)
+    );
+    Ok(())
+}
+
 async fn assert_websocket_binary_denied(server: &BinaryWebSocketProbeServer) -> Result<(), String> {
     let policy = write_base_policy()?;
     let policy_path = policy
@@ -933,6 +994,7 @@ async fn credentialed_endpoint_gates_work_end_to_end() {
 
     let result = async {
         assert_rest_body_backstop(&server).await?;
+        assert_conversation_placeholders_pass().await?;
         assert_websocket_binary_denied(&websocket_server).await
     }
     .await;

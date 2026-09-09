@@ -3650,6 +3650,7 @@ fn endpoint_secret_resolver(
 }
 
 struct ForwardEndpointCredentials {
+    body_classifier: Option<Arc<secrets::body::BodyCredentialClassifier>>,
     resolver: Option<Arc<SecretResolver>>,
     revision: Option<u64>,
 }
@@ -3664,12 +3665,14 @@ fn endpoint_credentials_for_request(
     let Some(credentials) = provider_credentials else {
         return ForwardEndpointCredentials {
             resolver: fallback,
+            body_classifier: None,
             revision: None,
         };
     };
-    let (resolver, revision) =
-        credentials.resolver_for_endpoint_with_revision(host, port, canonical_path);
+    let (resolver, body_classifier, revision) =
+        credentials.resolver_and_body_classifier_for_endpoint(host, port, canonical_path);
     ForwardEndpointCredentials {
+        body_classifier,
         resolver,
         revision: Some(revision),
     }
@@ -3975,6 +3978,7 @@ fn complete_chunked_body_prefix_len(bytes: &[u8]) -> Option<usize> {
 }
 
 struct ForwardRelayOptions<'a> {
+    body_classifier: Option<&'a secrets::body::BodyCredentialClassifier>,
     generation_guard: &'a PolicyGenerationGuard,
     credential_generation: Option<crate::l7::rest::CredentialGenerationGuard<'a>>,
     websocket_extensions: crate::l7::rest::WebSocketExtensionMode,
@@ -4021,6 +4025,7 @@ where
         upstream,
         crate::l7::rest::RelayRequestOptions {
             resolver: options.secret_resolver,
+            body_classifier: options.body_classifier,
             credential_generation: options.credential_generation,
             generation_guard: Some(options.generation_guard),
             websocket_extensions: options.websocket_extensions,
@@ -5330,6 +5335,7 @@ async fn handle_forward_proxy(
             credential_generation,
             websocket_extensions,
             secret_resolver: secret_resolver.as_deref(),
+            body_classifier: endpoint_credentials.body_classifier.as_deref(),
             request_body_credential_rewrite,
             deny_uninspected_credentials,
             credential_signing,
@@ -5342,6 +5348,16 @@ async fn handle_forward_proxy(
     .await;
     let outcome_result = match outcome_result {
         Err(report) => {
+            if let Some(error) = report.downcast_ref::<secrets::body::BodyCredentialError>() {
+                if let Some(session) = middleware_session.take() {
+                    session
+                        .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
+                        .await;
+                }
+                let _ = upstream.shutdown().await;
+                crate::l7::relay::reject_body_credential(client, *error).await?;
+                return Ok(());
+            }
             if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>() {
                 if let Some(session) = middleware_session.take() {
                     session
@@ -7427,6 +7443,7 @@ network_policies:
             ForwardRelayOptions {
                 generation_guard: &guard,
                 credential_generation: None,
+                body_classifier: None,
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: resolver,
                 request_body_credential_rewrite,
@@ -7692,6 +7709,7 @@ network_policies:
                 ForwardRelayOptions {
                     generation_guard: guard,
                     credential_generation: None,
+                    body_classifier: None,
                     websocket_extensions,
                     secret_resolver: None,
                     request_body_credential_rewrite: false,
@@ -10133,6 +10151,7 @@ network_policies:
             ForwardRelayOptions {
                 generation_guard: &guard,
                 credential_generation: None,
+                body_classifier: None,
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: Some(&resolver),
                 request_body_credential_rewrite: true,
@@ -10214,6 +10233,7 @@ network_policies:
             ForwardRelayOptions {
                 generation_guard: &guard,
                 credential_generation: None,
+                body_classifier: None,
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: Some(&resolver),
                 request_body_credential_rewrite: false,
@@ -10303,6 +10323,7 @@ network_policies:
             ForwardRelayOptions {
                 generation_guard: &guard,
                 credential_generation: None,
+                body_classifier: None,
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: None,
                 request_body_credential_rewrite: false,
@@ -10353,6 +10374,7 @@ network_policies:
             ForwardRelayOptions {
                 generation_guard: &guard,
                 credential_generation: None,
+                body_classifier: None,
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: None,
                 request_body_credential_rewrite: false,
