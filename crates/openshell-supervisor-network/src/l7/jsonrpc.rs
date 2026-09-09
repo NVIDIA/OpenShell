@@ -86,6 +86,54 @@ pub(crate) async fn parse_jsonrpc_http_request<C: AsyncRead + AsyncWrite + Unpin
     Ok(Some(JsonRpcHttpRequest { request, info }))
 }
 
+/// Reinspect a fully buffered JSON-RPC-family HTTP request after middleware.
+///
+/// Initial inspection normalizes chunked bodies to `Content-Length` and keeps
+/// the complete body after the raw header block. Middleware rebuilding keeps
+/// that representation, so a final pre-forward check can use the exact header
+/// and body bytes that the upstream will receive without reading the client
+/// stream again.
+pub(crate) fn inspect_buffered_jsonrpc_http_request(
+    request: &L7Request,
+    inspection_options: JsonRpcInspectionOptions,
+) -> Result<JsonRpcRequestInfo> {
+    if jsonrpc_receive_stream_request(request) {
+        return Ok(JsonRpcRequestInfo::receive_stream());
+    }
+
+    let header_end = request
+        .raw_header
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| miette::miette!("HTTP request headers are missing the CRLF terminator"))?
+        + 4;
+    let body = &request.raw_header[header_end..];
+    match request.body_length {
+        crate::l7::provider::BodyLength::None if body.is_empty() => {}
+        crate::l7::provider::BodyLength::ContentLength(length) => {
+            let length = usize::try_from(length)
+                .map_err(|_| miette::miette!("HTTP request body length exceeds platform limit"))?;
+            if body.len() != length {
+                return Err(miette::miette!(
+                    "buffered HTTP request body length does not match Content-Length"
+                ));
+            }
+        }
+        crate::l7::provider::BodyLength::None => {
+            return Err(miette::miette!(
+                "buffered HTTP request has bytes without body framing"
+            ));
+        }
+        crate::l7::provider::BodyLength::Chunked => {
+            return Err(miette::miette!(
+                "buffered JSON-RPC request retained chunked framing"
+            ));
+        }
+    }
+
+    Ok(parse_jsonrpc_body_with_options(body, inspection_options))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonRpcRequestInfo {
     /// Calls found in the request body. Responses and receive-stream GETs have
@@ -169,6 +217,12 @@ pub struct JsonRpcCallInfo {
     /// MCP `tools/call` tool name when known. Generic JSON-RPC leaves this
     /// unset because params are not inspected.
     pub tool: Option<String>,
+    /// Whether this call is a JSON-RPC notification without an `id`.
+    ///
+    /// MCP initialization is a request, so transport code uses this bit to
+    /// avoid treating an extension notification named `initialize` as the
+    /// header-exempt initialization exchange.
+    pub is_notification: bool,
 }
 
 impl JsonRpcRequestInfo {
@@ -365,6 +419,7 @@ fn parse_jsonrpc_call(
         method: method.to_string(),
         params: HashMap::new(),
         tool: None,
+        is_notification: value.get("id").is_none(),
     })
 }
 
@@ -421,6 +476,7 @@ fn parse_mcp_call(
             method: mcp_request.method_name().to_string(),
             params,
             tool,
+            is_notification: false,
         });
     }
 
@@ -441,6 +497,7 @@ fn parse_mcp_call(
         method: notification.method,
         params: HashMap::new(),
         tool: None,
+        is_notification: true,
     })
 }
 

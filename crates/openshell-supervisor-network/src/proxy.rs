@@ -4651,9 +4651,8 @@ async fn handle_forward_proxy(
                 raw_header: forward_request_bytes,
                 body_length,
             };
-            if crate::l7::jsonrpc::jsonrpc_receive_stream_request(&jsonrpc_request) {
-                forward_request_bytes = jsonrpc_request.raw_header;
-                Some(crate::l7::jsonrpc::JsonRpcRequestInfo::receive_stream())
+            let info = if crate::l7::jsonrpc::jsonrpc_receive_stream_request(&jsonrpc_request) {
+                crate::l7::jsonrpc::JsonRpcRequestInfo::receive_stream()
             } else {
                 let body = match crate::l7::http::read_body_for_inspection(
                     client,
@@ -4686,12 +4685,28 @@ async fn handle_forward_proxy(
                         return Ok(());
                     }
                 };
-                forward_request_bytes = jsonrpc_request.raw_header;
-                Some(crate::l7::jsonrpc::parse_jsonrpc_body_with_options(
+                crate::l7::jsonrpc::parse_jsonrpc_body_with_options(
                     &body,
                     crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(&l7_config.config),
-                ))
+                )
+            };
+            // Forward HTTP shares the MCP transport gate with CONNECT before
+            // method authorization. Borrow the buffered request so checking
+            // the version does not copy the inspected body.
+            if !crate::l7::relay::enforce_mcp_protocol_version(
+                &l7_config.config,
+                &jsonrpc_request,
+                &info,
+                client,
+                &l7_ctx,
+                &telemetry_path,
+            )
+            .await?
+            {
+                return Ok(());
             }
+            forward_request_bytes = jsonrpc_request.raw_header;
+            Some(info)
         } else {
             None
         };
@@ -5157,6 +5172,38 @@ async fn handle_forward_proxy(
             }
             return Ok(());
         }
+    };
+
+    // Middleware and credential rewriting can change request headers. Check
+    // the final origin-form bytes after hop-by-hop sanitization, before an
+    // upstream connection exists, so forwarding preserves the MCP decision.
+    let rewritten = match forward_l7_reeval.as_ref() {
+        Some((config, _)) if config.protocol == crate::l7::L7Protocol::Mcp => {
+            let request = crate::l7::rest::request_from_buffered_http(
+                method,
+                middleware_path,
+                &upstream_target,
+                rewritten,
+            )?;
+            if !crate::l7::relay::enforce_final_mcp_protocol_version(
+                config,
+                &request,
+                client,
+                &l7_ctx,
+                &telemetry_path,
+            )
+            .await?
+            {
+                if let Some(session) = middleware_session.take() {
+                    session
+                        .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
+                        .await;
+                }
+                return Ok(());
+            }
+            request.raw_header
+        }
+        _ => rewritten,
     };
 
     if let Err(e) = forward_generation_guard.ensure_current() {
@@ -5810,6 +5857,158 @@ network_policies: {}
                 response.starts_with(b"HTTP/1.1 400 Bad Request"),
                 "malformed request for {host} must fail at ingress"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_mcp_forwarding_preserves_initialization_and_selected_revision() {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: handler identity binding requires /proc (Linux)");
+            return;
+        }
+        let Some(upstream_ip) = non_loopback_test_ipv4() else {
+            eprintln!("skipping: no routable non-loopback IPv4 test address");
+            return;
+        };
+
+        for (body, version_header) in [
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
+                "",
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+                "MCP-Protocol-Version: 2025-11-25\r\n",
+            ),
+        ] {
+            let upstream_listener = TcpListener::bind((upstream_ip, 0))
+                .await
+                .expect("bind MCP upstream listener");
+            let upstream_port = upstream_listener.local_addr().unwrap().port();
+            let executable = std::env::current_exe().expect("current executable");
+            let data = format!(
+                r#"
+network_middlewares:
+  inspect:
+    middleware: openshell/regex
+    on_error: fail_closed
+    endpoints:
+      include: ["{upstream_ip}"]
+network_policies:
+  mcp-upstream:
+    name: mcp-upstream
+    endpoints:
+      - host: "{upstream_ip}"
+        port: {upstream_port}
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        rules:
+          - allow:
+              method: initialize
+          - allow:
+              method: tools/list
+    binaries:
+      - {{ path: "{executable}" }}
+"#,
+                executable = executable.display(),
+            );
+            let engine = Arc::new(
+                OpaEngine::from_strings(include_str!("../data/sandbox-policy.rego"), &data)
+                    .expect("load MCP policy"),
+            );
+            let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+                openshell_supervisor_middleware_builtins::services(),
+                Vec::new(),
+            )
+            .await
+            .expect("connect built-in middleware");
+            engine
+                .replace_middleware_registry(registry)
+                .expect("install built-in middleware");
+
+            let upstream = tokio::spawn(async move {
+                let (mut socket, _) = upstream_listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 2048];
+                loop {
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(count, 0, "MCP request closed before its body completed");
+                    request.extend_from_slice(&chunk[..count]);
+                    if let Some(header_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|end| end + 4)
+                        && request.len() >= header_end + body.len()
+                    {
+                        assert_eq!(&request[header_end..], body.as_bytes());
+                        break;
+                    }
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+                String::from_utf8(request).expect("UTF-8 MCP request")
+            });
+            let proxy_listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind proxy listener");
+            let proxy_address = proxy_listener.local_addr().unwrap();
+            let target = format!("http://{upstream_ip}:{upstream_port}/mcp");
+            let request = format!(
+                "POST {target} HTTP/1.1\r\nHost: {upstream_ip}:{upstream_port}\r\nContent-Type: application/json\r\n{version_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let client = tokio::spawn(async move {
+                let mut socket = TcpStream::connect(proxy_address).await.unwrap();
+                let mut response = Vec::new();
+                socket.read_to_end(&mut response).await.unwrap();
+                response
+            });
+            let (mut proxy_connection, _) = proxy_listener.accept().await.unwrap();
+
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                handle_forward_proxy(
+                    "POST",
+                    &target,
+                    request.as_bytes(),
+                    request.len(),
+                    &mut proxy_connection,
+                    engine,
+                    Arc::new(BinaryIdentityCache::new()),
+                    Arc::new(AtomicU32::new(std::process::id())),
+                    None,
+                    AgentProposals::default(),
+                    Arc::new(None),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("MCP forwarding should complete")
+            .expect("handle valid MCP request");
+            drop(proxy_connection);
+
+            let response = client.await.expect("join MCP client");
+            assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+            let forwarded = upstream.await.expect("join MCP upstream");
+            assert!(forwarded.starts_with("POST /mcp HTTP/1.1\r\n"));
+            if version_header.is_empty() {
+                assert!(
+                    !forwarded
+                        .to_ascii_lowercase()
+                        .contains("mcp-protocol-version:")
+                );
+            } else {
+                assert!(forwarded.contains(version_header));
+            }
         }
     }
 
