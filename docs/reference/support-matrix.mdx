@@ -84,12 +84,18 @@ To override the default image references, use Helm values:
 
 ## Kernel Requirements
 
-OpenShell enforces sandbox isolation through two Linux kernel security modules:
+The sandbox boundary requires the following Linux kernel facilities, including
+when it runs inside a container or microVM:
 
 | Module                                                         | Requirement | Details                                                                                                                                                                                                                                          |
 | -------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| [Landlock LSM](https://docs.kernel.org/security/landlock.html) | Recommended | Enforces filesystem access restrictions at the kernel level. The `best_effort` compatibility mode uses the highest Landlock ABI the host kernel supports. The `hard_requirement` mode fails sandbox creation if the required ABI is unavailable. |
-| seccomp                                                        | Required    | Filters dangerous system calls. Available on all modern Linux kernels (3.17+).                                                                                                                                                                   |
+| [Landlock LSM](https://docs.kernel.org/security/landlock.html) | Required | ABI 3 or newer, introduced in Linux 6.2, with Landlock enabled. The mandatory baseline protects private channel and bootstrap files, including against truncation. A filesystem policy's `best_effort` setting never disables this baseline. |
+| seccomp | Required | Nested user-notification filters and atomic `SECCOMP_IOCTL_NOTIF_ADDFD` with `SECCOMP_ADDFD_FLAG_SEND`, usable under the runtime's existing seccomp profile without added capabilities. The sandbox actively probes these operations before admitting the workload. |
+
+A kernel version alone does not establish support. A disabled Landlock LSM or a
+runtime profile that blocks the required seccomp operations causes launch to
+fail closed. An upstream Linux 6.2 or newer kernel provides the required
+Landlock ABI; distribution backports must pass the same active qualification.
 
 On macOS, these kernel modules run inside the Docker Desktop Linux VM, not on the host kernel.
 

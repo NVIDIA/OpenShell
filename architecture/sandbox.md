@@ -538,3 +538,23 @@ engine with a gateway policy revision.
   `Error/MainProcessFailed`. Infrastructure failures also use `Error`, with a
   distinct condition reason and no fabricated canonical-process result. Runtime
   restart policies must not replace the canonical process.
+
+## Shared Boundary Primitives
+
+`openshell-isolation-interface` owns the common boundary protocol and Linux
+mechanisms. Drivers provide the protected transport and immutable resource
+identity; they do not implement their own process or network protocol. All
+remote traffic uses one mutually authenticated gRPC connection. Independent
+streams carry process control, exec output, and TCP bytes; a persistent
+`Mediate` stream carries DNS queries and supervisor-produced answers. There is
+no alternate raw-TLS application protocol or general UDP framing.
+
+The shared process-signal mediator resolves each positive target PID or TID to
+its thread-group leader, excludes the sandbox leader, retains a pidfd, and sends
+the signal through that descriptor. It never continues the original numeric-PID
+syscall after inspection. This prevents TID aliases or PID reuse from turning an
+agent signal into a signal to the sandbox. Ordinary mediated `kill` reports the
+broker as its sender, not the original calling agent's `SI_USER` identity.
+Queued signals preserve permitted application siginfo payloads; they cannot
+forge kernel-generated or `SI_TKILL` codes. Programs requiring original sender
+identity must account for this mediation boundary.

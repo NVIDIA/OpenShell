@@ -407,7 +407,11 @@ impl ProviderCredentialState {
     ///    here so SDKs can read them at startup.
     /// 3. Everything else stays as placeholders for proxy-time resolution.
     pub fn child_env_with_gcp_resolved(&self) -> HashMap<String, String> {
-        self.child_env_snapshot_with_gcp_resolved().1
+        let inner = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned");
+        Self::resolve_child_env_snapshot(&inner).1
     }
 
     /// Return the current revision and its workload-facing environment from
@@ -417,13 +421,21 @@ impl ProviderCredentialState {
     /// revision must describe the exact environment sent across the boundary,
     /// so callers must not obtain the two values through separate lock
     /// acquisitions.
-    pub fn child_env_snapshot_with_gcp_resolved(&self) -> (u64, HashMap<String, String>) {
-        use crate::google_cloud;
-
+    pub fn child_env_snapshot_with_gcp_resolved(
+        &self,
+    ) -> std::io::Result<(u64, HashMap<String, String>)> {
         let inner = self
             .inner
             .read()
-            .expect("provider credential state poisoned");
+            .map_err(|_| std::io::Error::other("provider credential state poisoned"))?;
+        Ok(Self::resolve_child_env_snapshot(&inner))
+    }
+
+    fn resolve_child_env_snapshot(
+        inner: &ProviderCredentialStateInner,
+    ) -> (u64, HashMap<String, String>) {
+        use crate::google_cloud;
+
         let mut env = inner.current.child_env.clone();
 
         let has_gcp_metadata = env.contains_key("GCE_METADATA_HOST")
@@ -486,13 +498,13 @@ impl ProviderCredentialState {
         expected_revision: u64,
         revision: u64,
         mut child_env: HashMap<String, String>,
-    ) -> u64 {
+    ) -> std::io::Result<u64> {
         let mut inner = self
             .inner
             .write()
-            .expect("provider credential state poisoned");
+            .map_err(|_| std::io::Error::other("provider credential state poisoned"))?;
         if revision == inner.current.revision || expected_revision != inner.current.revision {
-            return inner.current.revision;
+            return Ok(inner.current.revision);
         }
 
         for key in &inner.suppressed_keys {
@@ -510,7 +522,7 @@ impl ProviderCredentialState {
         inner.static_credential_bindings.clear();
         inner.known_static_credential_keys.clear();
         inner.static_credential_identity_epochs.clear();
-        revision
+        Ok(revision)
     }
 
     /// Return the GCP token placeholder and its remaining lifetime in seconds.
@@ -2383,30 +2395,56 @@ mod tests {
         );
 
         assert_eq!(
-            state.compare_and_install_child_env_snapshot(
-                4,
-                6,
-                HashMap::from([("TOKEN".to_string(), "six".to_string())]),
-            ),
+            state
+                .compare_and_install_child_env_snapshot(
+                    4,
+                    6,
+                    HashMap::from([("TOKEN".to_string(), "six".to_string())]),
+                )
+                .unwrap(),
             6
         );
         assert_eq!(
-            state.compare_and_install_child_env_snapshot(
-                4,
-                5,
-                HashMap::from([("TOKEN".to_string(), "stale".to_string())]),
-            ),
+            state
+                .compare_and_install_child_env_snapshot(
+                    4,
+                    5,
+                    HashMap::from([("TOKEN".to_string(), "stale".to_string())]),
+                )
+                .unwrap(),
             6
         );
         assert_eq!(
-            state.compare_and_install_child_env_snapshot(6, 2, HashMap::new()),
+            state
+                .compare_and_install_child_env_snapshot(6, 2, HashMap::new())
+                .unwrap(),
             2,
             "opaque revisions may move numerically backwards"
         );
 
-        let (revision, env) = state.child_env_snapshot_with_gcp_resolved();
+        let (revision, env) = state.child_env_snapshot_with_gcp_resolved().unwrap();
         assert_eq!(revision, 2);
         assert!(env.is_empty(), "an empty snapshot must revoke the old env");
+    }
+
+    #[test]
+    fn poisoned_environment_update_returns_error_without_recovering_state() {
+        let state = ProviderCredentialState::from_child_env_snapshot(4, HashMap::new());
+        let poison = state.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poison.inner.write().unwrap();
+                panic!("poison state during mutation");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(
+            state
+                .compare_and_install_child_env_snapshot(4, 5, HashMap::new())
+                .is_err()
+        );
+        assert!(state.child_env_snapshot_with_gcp_resolved().is_err());
     }
 
     #[test]
