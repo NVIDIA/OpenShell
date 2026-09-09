@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use crate::AgentSpec;
 use crate::contract::{
     BackendError, BoundBoundary, BoundaryDuplexStream, BoundaryExec, BoundaryExitStatus,
-    BoundaryInput, BoundaryOutput, BoundaryPortForward, BoundaryProcess, BoundarySignal,
+    BoundaryInput, BoundaryLoopbackConnector, BoundaryOutput, BoundaryProcess, BoundarySignal,
     BoundaryTerminal, ConfirmedBoundary, DnsMediationSource, ExecSession, ExecSpec,
     IsolationBackend, LoopbackTarget, MediatedDnsQuery, MediationTiming, NetworkMediationSource,
     NetworkOpenResult, PendingNetworkOpen, ProcessAttachment, ReadyBoundary, RunningBoundary,
@@ -396,7 +396,7 @@ impl ReadyBoundary for RemoteReady {
                 provider_credentials: self.provider_credentials,
                 boundary_revision: tokio::sync::Mutex::new(provider_env_revision),
             }),
-            port_forward: Arc::new(RemotePortForward {
+            loopback_connector: Arc::new(RemoteLoopbackConnector {
                 client: self.client,
             }),
         }))
@@ -406,7 +406,7 @@ impl ReadyBoundary for RemoteReady {
 struct RemoteRunning {
     process: Arc<RemoteProcess>,
     exec: Arc<RemoteExec>,
-    port_forward: Arc<RemotePortForward>,
+    loopback_connector: Arc<RemoteLoopbackConnector>,
 }
 
 impl RunningBoundary for RemoteRunning {
@@ -418,8 +418,8 @@ impl RunningBoundary for RemoteRunning {
         self.exec.clone()
     }
 
-    fn port_forward(&self) -> Arc<dyn BoundaryPortForward> {
-        self.port_forward.clone()
+    fn loopback_connector(&self) -> Arc<dyn BoundaryLoopbackConnector> {
+        self.loopback_connector.clone()
     }
 }
 
@@ -591,16 +591,16 @@ impl BoundaryExec for RemoteExec {
     }
 }
 
-struct RemotePortForward {
+struct RemoteLoopbackConnector {
     client: Arc<BoundaryClient>,
 }
 
 #[async_trait]
-impl BoundaryPortForward for RemotePortForward {
+impl BoundaryLoopbackConnector for RemoteLoopbackConnector {
     async fn connect(&self, target: LoopbackTarget) -> Result<BoundaryDuplexStream, BackendError> {
         let (stream, response) = self
             .client
-            .call_stream(Request::PortForward {
+            .call_stream(Request::LoopbackConnect {
                 host: target.host(),
                 port: target.port(),
             })
