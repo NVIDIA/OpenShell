@@ -89,11 +89,6 @@ The gateway connects to the operator-provided endpoint; it does not provision
 or supervise the remote driver. The operator must protect the socket so only
 the gateway uid can access it.
 
-Sandbox create supports `--cpu` and `--memory` for per-sandbox compute sizing.
-Docker and Podman apply them as runtime limits. Kubernetes applies them as both
-container requests and limits. The VM driver accepts the fields but currently
-ignores them.
-
 Sandbox create also accepts experimental driver-owned config through
 `--driver-config-json`. The value is a JSON object keyed by driver name. The
 gateway forwards only the block for the active driver, so a Kubernetes gateway
@@ -132,6 +127,33 @@ request. The VM driver accepts `gpu_device_ids`, for example
 `{"vm":{"gpu_device_ids":["0000:2d:00.0"]}}`; the current VM implementation
 accepts at most one entry and allows either `--gpu` or `--gpu 1` when
 `gpu_device_ids` is set.
+
+## Portable Resource Requirements
+
+CPU, memory, and GPU requests use the typed
+`SandboxSpec.resource_requirements` API:
+
+- `cpu.limit` contains a portable CPU quantity such as `500m` or `2`.
+- `memory.limit` contains a portable memory quantity such as `512Mi` or `4Gi`.
+- `gpu` indicates a GPU request and can include an optional count.
+
+Reusable workload templates use this same message at
+`SandboxWorkloadConfig.resources`. The gateway copies those typed requirements
+into the resolved sandbox spec when a sandbox is created from a template.
+
+| Driver | CPU and memory behavior |
+|---|---|
+| Docker | Converts typed limits to native container CPU and memory limits. |
+| Podman | Converts typed limits to native container CPU and memory limits. |
+| Kubernetes | Applies each typed value as both the container request and limit. |
+| VM | Rejects typed CPU and memory requirements. Configure gateway-wide `vcpus` and `mem_mib` instead. |
+| MXC | Rejects typed CPU and memory requirements. |
+
+The historical inline `SandboxTemplate.resources` remains available for platform-native resource
+fields that do not have a portable representation. Do not place CPU or memory
+under its `limits` or `requests` sections. The gateway rejects `limits.cpu`,
+`limits.memory`, `requests.cpu`, and `requests.memory` and directs the caller to
+the corresponding typed field.
 
 ## Resource Capability Reporting
 

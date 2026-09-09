@@ -253,20 +253,21 @@ delete, reconciliation removes the row; otherwise it can remain `Deleting`.
 | VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Managed endpoint-backed driver. The gateway spawns `openshell-driver-vm`, waits for its Unix socket, and then consumes it through the same remote `compute_driver.proto` path used by unmanaged endpoint drivers. The VM driver boots a cached bootstrap `rootfs.ext4`, prepares requested OCI images inside a bootstrap VM with `umoci`, attaches the prepared image disk read-only, and gives each sandbox a writable `overlay.ext4` for merged-root changes and runtime material. The driver persists each accepted launch request beside the overlay and restarts those VMs on driver startup without recreating the overlay. |
 | Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a custom `compute_drivers = ["<name>"]` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--drivers <name>` with `--compute-driver-socket=<path>`. A launch-time endpoint may use a canonical built-in name to preserve its driver-config key while replacing in-process construction. The gateway connects to an operator-provisioned UDS, snapshots `GetCapabilities`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
 
-Per-sandbox CPU and memory values currently enter the driver layer through
-template resource limits. Docker and Podman apply them as runtime limits.
-Kubernetes mirrors each limit into the matching request. VM accepts the fields
-but currently ignores them.
+Per-sandbox CPU, memory, and GPU requirements enter the driver layer through
+the typed `ResourceRequirements` message. Docker and Podman apply CPU and
+memory as runtime limits. Kubernetes mirrors each limit into the matching
+request. VM and MXC reject unsupported CPU and memory requirements instead of
+silently ignoring them.
 
 Reusable sandbox workload templates are resolved before the compute-driver
 boundary. Drivers do not receive a separate template resource; the gateway
 lowers the selected `SandboxWorkloadTemplate` into the existing sandbox spec
 and validates that spec before calling `ValidateSandboxCreate` or
-`CreateSandbox`. Template CPU and memory become the same typed resource limits
-described above. Template GPU settings become `ResourceRequirements`, preserving
-the driver's default GPU assignment when the count is omitted. Template
-`driver_config` remains a driver-keyed envelope until the compute layer selects
-the active driver block and forwards only that block to the driver.
+`CreateSandbox`. `SandboxWorkloadConfig.resources` reuses the public
+`ResourceRequirements` message, so the gateway clones the typed requirements
+directly into the resolved sandbox spec. Template `driver_config` remains a
+driver-keyed envelope until the compute layer selects the active driver block
+and forwards only that block to the driver.
 
 Docker and Podman also accept per-sandbox driver-config mounts for existing
 runtime-managed named volumes and tmpfs mounts. Podman additionally accepts
@@ -304,9 +305,17 @@ disjoint lifecycle ownership. A shared-mode gateway can target one external
 namespace, while operator mode maps workspace names to multiple
 platform-provisioned namespaces.
 
-Resource requirements enter the driver layer through `SandboxSpec.resource_requirements`. This includes a set of GPU requirements, where a user
-can request a specific number of GPUs or the driver-specific default behaviour.
-For all in-tree drivers, this is equivalent to selecting a single GPU.
+Resource requirements enter the driver layer through `SandboxSpec.resource_requirements`,
+which carries typed GPU, CPU, and memory requirements as portable sandbox-sizing intent.
+GPU requests let a user ask for a specific number of GPUs or the driver-specific default
+behaviour; for all in-tree drivers, an unspecified count is equivalent to selecting a
+single GPU. CPU and memory requests use Kubernetes-style quantity strings (e.g. `"500m"`,
+`"4Gi"`). Docker, Podman, and Kubernetes apply typed CPU/memory requirements as native
+resource limits; the VM and MXC drivers reject typed CPU/memory requirements with a clear
+error until sizing support lands there, rather than silently ignoring them.
+`SandboxTemplate.resources` remains a platform-native escape hatch for non-portable fields
+only — CPU/memory keys under it are rejected in favor of
+`resource_requirements.cpu`/`resource_requirements.memory`.
 
 VM runtime state paths are derived only from driver-validated sandbox IDs
 matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a
