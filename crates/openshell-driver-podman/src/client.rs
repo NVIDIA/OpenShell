@@ -483,13 +483,17 @@ impl PodmanClient {
     pub(crate) async fn copy_to_container(
         &self,
         name: &str,
+        destination: &str,
         archive: Vec<u8>,
     ) -> Result<(), PodmanApiError> {
         validate_name(name)?;
         let (status, bytes) = self
             .request_raw(
                 hyper::Method::PUT,
-                &format!("/libpod/containers/{name}/archive?path=/"),
+                &format!(
+                    "/libpod/containers/{name}/archive?path={}",
+                    url_encode(destination)
+                ),
                 "application/x-tar",
                 archive.into(),
             )
