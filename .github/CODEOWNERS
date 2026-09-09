@@ -4,8 +4,8 @@
 # Vouch list — maintainers only (bot commits bypass, but manual edits need review)
 .github/VOUCHED.td @NVIDIA/openshell-codeowners
 
-# Merge enforcement — these paths decide who can merge. They keep an explicit
-# owner so the rules below survive the wildcard above being scoped down.
+# Merge enforcement — these paths decide who can merge, so they keep an explicit
+# owner independent of any broad ownership rule above.
 #
 # A workflow triggered by pull_request_review runs the pull request's copy of
 # the workflow file, not the one on main, so a contributor can rewrite the
@@ -16,10 +16,14 @@
 #
 # The whole workflows directory is covered, not just the approval gate, because
 # any workflow can claim a required check context or ask for a broader token.
-/.github/workflows/ @NVIDIA/openshell-codeowners
-/.github/actions/ @NVIDIA/openshell-codeowners
-/.github/CODEOWNERS @NVIDIA/openshell-codeowners
-/.github/zizmor.yml @NVIDIA/openshell-codeowners
-/MAINTAINERS.md @NVIDIA/openshell-codeowners
-/tasks/scripts/check_maintainer_approval.py @NVIDIA/openshell-codeowners
-/tasks/scripts/alert_maintainer_change.py @NVIDIA/openshell-codeowners
+#
+# The three logins are named alongside the team because they are outside
+# collaborators and cannot join it. Owning these paths by team alone would mean
+# no Red Hat maintainer could approve a change to the merge gate.
+/.github/workflows/ @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/.github/actions/ @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/.github/CODEOWNERS @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/.github/zizmor.yml @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/MAINTAINERS.md @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/tasks/scripts/check_maintainer_approval.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
+/tasks/scripts/alert_maintainer_change.py @NVIDIA/openshell-codeowners @mrunalp @sjenning @derekwaynecarr
