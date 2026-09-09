@@ -120,8 +120,6 @@ for stable compiler cache keys. The target-cache action runs its metadata step
 with `RUSTC_WRAPPER` cleared so cache maintenance does not depend on sccache.
 Hosted jobs use an isolated `RUSTUP_HOME` containing the pinned toolchain so
 unused toolchains in runner images cannot change the target-cache restore key.
-CI logs sccache write failures alongside its hit/miss statistics to distinguish
-backend failures from ordinary cache misses.
 
 The lane uses `mise run --skip-tools windows:*` because Windows Rust comes from
 rustup and linking comes from Visual Studio Build Tools. Mise orchestrates the
