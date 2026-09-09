@@ -870,15 +870,20 @@ fn format_endpoint_details(endpoint: &NetworkEndpoint) -> Vec<String> {
 
 /// Why a proposed endpoint is broader than the denial that prompted it.
 ///
-/// An L4 endpoint allows the whole TCP port. A REST endpoint with no allow
-/// rules, or with an allow rule that leaves the method or path unset — rendered
-/// as `*` by `format_allow_rule` — still permits far more than the single
-/// request that was denied. Protocols other than REST scope on `command`
-/// instead, so they are left alone rather than warned about incorrectly.
+/// An endpoint with no protocol is not a raw tunnel: per
+/// `openshell_policy::agent_authored_transport_rejection`, omitting the protocol
+/// keeps the explicit proxy, which terminates TLS and canonicalizes the HTTP
+/// authority, while `protocol: tcp` and `tls: skip` cannot be agent-authored at
+/// all. What it lacks is any method or path constraint, so every request to the
+/// host and port is permitted. A REST endpoint with no allow rules, or with an
+/// allow rule that leaves the method or path unset — rendered as `*` by
+/// `format_allow_rule` — is broad for the same reason. Protocols other than REST
+/// scope on `command` instead, so they are left alone rather than warned about
+/// incorrectly.
 fn scope_warning(endpoint: &NetworkEndpoint) -> Option<&'static str> {
     if endpoint.protocol.trim().is_empty() {
         return Some(
-            "L4 rule: allows every connection to this host and port, not only the denied request",
+            "no protocol set: every request to this host and port is allowed, not only the denied one",
         );
     }
     if !endpoint.protocol.eq_ignore_ascii_case("rest") {
@@ -1455,9 +1460,9 @@ mod tests {
     }
 
     #[test]
-    fn l4_endpoint_is_flagged_as_unscoped() {
+    fn endpoint_without_a_protocol_is_flagged_as_unscoped() {
         let warning = scope_warning(&scoped_endpoint("", vec![]));
-        assert!(warning.is_some_and(|w| w.starts_with("L4 rule:")));
+        assert!(warning.is_some_and(|w| w.starts_with("no protocol set:")));
     }
 
     #[test]
@@ -1494,8 +1499,8 @@ mod tests {
     fn scope_warning_is_rendered_in_the_detail_popup() {
         let (screen, _) = render(&chunk_with(scoped_endpoint("", vec![])), 80, 24, 0);
         assert!(
-            squash(&screen).contains("allows every connection to this host and port"),
-            "L4 warning should appear in the popup"
+            squash(&screen).contains("every request to this host and port is allowed"),
+            "missing-protocol warning should appear in the popup"
         );
     }
 
@@ -1504,7 +1509,10 @@ mod tests {
         let endpoint = scoped_endpoint("rest", vec![allow_rule("GET", "/repos/**")]);
         let (screen, _) = render(&chunk_with(endpoint), 80, 24, 0);
         let seen = squash(&screen);
-        assert!(!seen.contains("allows every"), "unexpected warning: {seen}");
+        assert!(
+            !seen.contains("every request to this"),
+            "unexpected warning: {seen}"
+        );
         assert!(!seen.contains("no method or path scope"));
     }
 }
