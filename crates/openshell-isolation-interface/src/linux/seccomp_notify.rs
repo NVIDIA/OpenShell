@@ -300,7 +300,7 @@ impl NotificationListener {
             srcfd,
             newfd: 0,
             newfd_flags: if close_on_exec {
-                u32::try_from(libc::O_CLOEXEC).expect("O_CLOEXEC fits u32")
+                u32::try_from(libc::O_CLOEXEC).map_err(io::Error::other)?
             } else {
                 0
             },
@@ -460,7 +460,7 @@ fn probe_addfd_send() -> io::Result<()> {
                 size_of::<u64>(),
             )
         };
-        let word_size = isize::try_from(size_of::<u64>()).expect("u64 size fits isize");
+        let word_size = isize::try_from(size_of::<u64>()).map_err(io::Error::other)?;
         if read != word_size || value != 7 {
             return Err(io::Error::other("injected eventfd was not usable"));
         }
@@ -560,7 +560,7 @@ fn probe_connected_sendto_fast_path() -> io::Result<()> {
                 0,
             )
         };
-        if sent != isize::try_from(direct.len()).expect("probe length fits isize") {
+        if sent != isize::try_from(direct.len()).map_err(io::Error::other)? {
             return Err(io::Error::last_os_error());
         }
 
@@ -573,17 +573,14 @@ fn probe_connected_sendto_fast_path() -> io::Result<()> {
                 payload.len(),
             )
         };
-        if read != isize::try_from(payload.len()).expect("probe length fits isize")
-            || &payload != direct
-        {
+        if read != isize::try_from(payload.len()).map_err(io::Error::other)? || &payload != direct {
             return Err(io::Error::other(
                 "connected sendto fast path did not relay data",
             ));
         }
 
         let destination = libc::sockaddr_un {
-            sun_family: libc::sa_family_t::try_from(libc::AF_UNIX)
-                .expect("AF_UNIX fits sa_family_t"),
+            sun_family: libc::sa_family_t::try_from(libc::AF_UNIX).map_err(io::Error::other)?,
             sun_path: [0; 108],
         };
         // SAFETY: all pointers refer to live values. This deliberately
@@ -596,7 +593,7 @@ fn probe_connected_sendto_fast_path() -> io::Result<()> {
                 0,
                 std::ptr::addr_of!(destination).cast(),
                 libc::socklen_t::try_from(size_of::<libc::sa_family_t>())
-                    .expect("sockaddr family size fits socklen_t"),
+                    .map_err(io::Error::other)?,
             )
         };
         if result != -1 || io::Error::last_os_error().raw_os_error() != Some(libc::EACCES) {
@@ -677,8 +674,8 @@ fn receive_probe_notification(listener: &NotificationListener) -> io::Result<Not
         events: libc::POLLIN | libc::POLLHUP,
         revents: 0,
     };
-    let timeout = i32::try_from(PROBE_NOTIFICATION_TIMEOUT.as_millis())
-        .expect("probe timeout fits poll milliseconds");
+    let timeout =
+        i32::try_from(PROBE_NOTIFICATION_TIMEOUT.as_millis()).map_err(io::Error::other)?;
     // SAFETY: descriptor points to one live pollfd for the duration of poll.
     let ready = unsafe { libc::poll(&raw mut descriptor, 1, timeout) };
     if ready < 0 {
