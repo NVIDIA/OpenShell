@@ -122,7 +122,8 @@ pub fn resolve_identity(
 }
 
 pub struct BootstrapArchives {
-    pub workload: Vec<u8>,
+    pub channel: Vec<u8>,
+    pub workspace: Vec<u8>,
     pub supervisor: Vec<u8>,
 }
 
@@ -194,28 +195,22 @@ pub fn bootstrap_archives(
         workload_identity: identity.clone(),
         driver_fence,
     };
-    let mut workload = Archive::new(identity);
-    workload.directory(".openshell", 0o755, false)?;
-    workload.directory(".openshell/channel", 0o755, false)?;
-    workload.directory(".openshell/channel/sandbox", 0o711, true)?;
-    workload.directory("sandbox", 0o700, true)?;
-    workload.file(
-        BOOTSTRAP_PATH,
+    // Libpod resolves the requested upload destination once for a stopped
+    // container. Archive entries must be relative to the selected named volume,
+    // not rootfs paths that the volume would shadow on container start.
+    let mut channel = Archive::new(identity);
+    channel.directory(".", 0o755, false)?;
+    channel.directory("sandbox", 0o711, true)?;
+    channel.file(
+        "sandbox/bootstrap.json",
         &serde_json::to_vec(&config).map_err(invalid)?,
     )?;
-    workload.file(
-        "/.openshell/channel/sandbox/server.crt",
-        tls.sandbox_certificate_pem.as_bytes(),
-    )?;
-    workload.file(
-        "/.openshell/channel/sandbox/server.key",
-        tls.sandbox_private_key_pem.as_bytes(),
-    )?;
-    workload.file(
-        "/.openshell/channel/sandbox/client-ca.crt",
-        tls.ca_certificate_pem.as_bytes(),
-    )?;
-    let workload = workload.finish()?;
+    channel.file("sandbox/server.crt", tls.sandbox_certificate_pem.as_bytes())?;
+    channel.file("sandbox/server.key", tls.sandbox_private_key_pem.as_bytes())?;
+    channel.file("sandbox/client-ca.crt", tls.ca_certificate_pem.as_bytes())?;
+    let channel = channel.finish()?;
+    let mut workspace = Archive::new(identity);
+    workspace.directory(".", 0o700, true)?;
     let mut supervisor = Archive::new(identity);
     supervisor.directory(".openshell", 0o755, false)?;
     supervisor.directory(".openshell/supervisor", 0o700, true)?;
@@ -223,9 +218,10 @@ pub fn bootstrap_archives(
         TOPOLOGY_PATH,
         &serde_json::to_vec(&topology).map_err(invalid)?,
     )?;
-    supervisor.file(RESTART_BUNDLE_PATH, &workload)?;
+    supervisor.file(RESTART_BUNDLE_PATH, &channel)?;
     Ok(BootstrapArchives {
-        workload,
+        channel,
+        workspace: workspace.finish()?,
         supervisor: supervisor.finish()?,
     })
 }
@@ -337,15 +333,20 @@ mod tests {
         .unwrap();
         let archives =
             bootstrap_archives("sandbox", "container", &identity, HashMap::new()).unwrap();
-        let workload = files(&archives.workload);
+        let workload = files(&archives.channel);
         let supervisor = files(&archives.supervisor);
+        let mut workspace = tar::Archive::new(archives.workspace.as_slice());
+        let mut entries = workspace.entries().unwrap();
+        let root = entries.next().unwrap().unwrap();
+        assert_eq!(root.path().unwrap().as_ref(), std::path::Path::new("."));
+        assert!(root.header().entry_type().is_dir());
+        assert_eq!(root.header().uid().unwrap(), u64::from(identity.uid));
+        assert_eq!(root.header().gid().unwrap(), u64::from(identity.gid));
+        assert_eq!(root.header().mode().unwrap(), 0o700);
+        assert!(entries.next().is_none());
         assert_eq!(workload.len(), 4);
         assert_eq!(supervisor.len(), 2);
-        assert!(
-            workload
-                .keys()
-                .all(|path| path.starts_with(".openshell/channel/sandbox"))
-        );
+        assert!(workload.keys().all(|path| path.starts_with("sandbox")));
         assert!(
             supervisor
                 .keys()
@@ -353,7 +354,7 @@ mod tests {
         );
         let config: BoundaryConfig = serde_json::from_slice(
             workload
-                .get(&PathBuf::from(BOOTSTRAP_PATH.trim_start_matches('/')))
+                .get(&PathBuf::from("sandbox/bootstrap.json"))
                 .unwrap(),
         )
         .unwrap();
@@ -375,7 +376,7 @@ mod tests {
             supervisor
                 .get(&PathBuf::from(RESTART_BUNDLE_PATH.trim_start_matches('/')))
                 .unwrap(),
-            &archives.workload
+            &archives.channel
         );
     }
 }
