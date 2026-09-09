@@ -50,9 +50,10 @@ pub use error::SdkError;
 pub use pagination::{Page, Pager};
 pub use refresh::{Refresh, RefreshError, RefreshedToken, TokenSource};
 pub use types::{
-    DeleteOptions, DeletionOutcome, DeletionResult, ExecOptions, ExecResult, Health, ListOptions,
-    SandboxPhase, SandboxRef, SandboxResources, SandboxServiceLevel, SandboxSpec, SandboxStartup,
-    SandboxTemplateCreateSpec, SandboxTemplateListOptions, SandboxWorkloadConfig,
-    SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec,
-    ServiceStatus, WorkspaceRef,
+    CpuResourceRequirements, DeleteOptions, DeletionOutcome, DeletionResult, ExecOptions,
+    ExecResult, GpuResourceRequirements, Health, ListOptions, MemoryResourceRequirements,
+    ResourceRequirements, SandboxPhase, SandboxRef, SandboxResources, SandboxServiceLevel,
+    SandboxSpec, SandboxStartup, SandboxTemplateCreateSpec, SandboxTemplateListOptions,
+    SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance,
+    SandboxWorkloadTemplateSpec, ServiceStatus, WorkspaceRef,
 };
