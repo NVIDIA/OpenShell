@@ -273,13 +273,16 @@ func TestSandboxCreate_DefaultGPURequest(t *testing.T) {
 	defer cleanup()
 
 	result, err := client.Create(context.Background(), "default", "gpu-sandbox", &SandboxSpec{
-		GPU: true,
+		ResourceRequirements: &ResourceRequirements{
+			GPU: &GPUResourceRequirements{},
+		},
 	}, nil)
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
-	assert.True(t, result.Spec.GPU)
-	assert.Nil(t, result.Spec.GPUCount)
+	require.NotNil(t, result.Spec.ResourceRequirements)
+	require.NotNil(t, result.Spec.ResourceRequirements.GPU)
+	assert.Nil(t, result.Spec.ResourceRequirements.GPU.Count)
 
 	mock.mu.Lock()
 	defer mock.mu.Unlock()
@@ -311,7 +314,9 @@ func TestSandboxCreateFromTemplateRejectsGPUOverrideBeforeRPC(t *testing.T) {
 	defer cleanup()
 
 	_, err := client.CreateFromTemplate(context.Background(), "default", "bad", "gpu-kata", &SandboxSpec{
-		GPU: true,
+		ResourceRequirements: &ResourceRequirements{
+			GPU: &GPUResourceRequirements{},
+		},
 	}, nil)
 
 	require.Error(t, err)

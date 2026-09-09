@@ -15,6 +15,18 @@ type Sandbox = types.Sandbox
 // SandboxSpec holds the desired state of a sandbox.
 type SandboxSpec = types.SandboxSpec
 
+// ResourceRequirements holds portable compute requirements for a sandbox.
+type ResourceRequirements = types.ResourceRequirements
+
+// GPUResourceRequirements holds GPU requirements for a sandbox.
+type GPUResourceRequirements = types.GPUResourceRequirements
+
+// CPUResourceRequirements holds a portable CPU limit for a sandbox.
+type CPUResourceRequirements = types.CPUResourceRequirements
+
+// MemoryResourceRequirements holds a portable memory limit for a sandbox.
+type MemoryResourceRequirements = types.MemoryResourceRequirements
+
 // SandboxTemplate defines the container template for a sandbox.
 type SandboxTemplate = types.SandboxTemplate
 

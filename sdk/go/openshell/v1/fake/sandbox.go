@@ -49,12 +49,35 @@ func copySandboxSpec(s types.SandboxSpec) types.SandboxSpec {
 		t := copySandboxTemplate(*s.Template)
 		s.Template = &t
 	}
-	if s.GPUCount != nil {
-		v := *s.GPUCount
-		s.GPUCount = &v
-	}
+	s.ResourceRequirements = copyResourceRequirements(s.ResourceRequirements)
 	s.Policy = copySandboxPolicy(s.Policy)
 	return s
+}
+
+// copyResourceRequirements returns a deep copy of a ResourceRequirements
+// pointer. All nested pointer fields are duplicated to prevent aliasing.
+func copyResourceRequirements(rr *types.ResourceRequirements) *types.ResourceRequirements {
+	if rr == nil {
+		return nil
+	}
+	cp := *rr
+	if rr.GPU != nil {
+		gpu := *rr.GPU
+		if rr.GPU.Count != nil {
+			v := *rr.GPU.Count
+			gpu.Count = &v
+		}
+		cp.GPU = &gpu
+	}
+	if rr.CPU != nil {
+		cpu := *rr.CPU
+		cp.CPU = &cpu
+	}
+	if rr.Memory != nil {
+		mem := *rr.Memory
+		cp.Memory = &mem
+	}
+	return &cp
 }
 
 // copySandboxPolicy returns a deep copy of a SandboxPolicy pointer.
@@ -391,7 +414,7 @@ func validateTemplateCreateSpec(spec *types.SandboxSpec) error {
 	if spec == nil {
 		return nil
 	}
-	if spec.LogLevel != "" || len(spec.Environment) > 0 || spec.Template != nil || spec.GPU || spec.GPUCount != nil {
+	if spec.LogLevel != "" || len(spec.Environment) > 0 || spec.Template != nil || spec.ResourceRequirements != nil {
 		return &types.StatusError{Code: types.ErrorInvalidArgument, Message: "template creates only allow policy, providers, command, and tty in spec"}
 	}
 	return nil
@@ -407,34 +430,10 @@ func sandboxSpecFromWorkloadTemplate(template *types.SandboxWorkloadTemplate) ty
 	spec.Environment = copyStringMap(workload.Environment)
 	spec.Template = &types.SandboxTemplate{
 		Image:        workload.Image,
-		Resources:    sandboxTemplateResources(workload.Resources),
 		DriverConfig: copyAnyMap(template.Spec.DriverConfig),
 	}
-	if workload.Resources != nil && workload.Resources.GPU != nil {
-		spec.GPU = true
-		if workload.Resources.GPU.Count != nil {
-			count := *workload.Resources.GPU.Count
-			spec.GPUCount = &count
-		}
-	}
+	spec.ResourceRequirements = copyResourceRequirements(workload.Resources)
 	return spec
-}
-
-func sandboxTemplateResources(resources *types.SandboxResources) map[string]any {
-	if resources == nil {
-		return nil
-	}
-	limits := make(map[string]any)
-	if resources.CPU != "" {
-		limits["cpu"] = resources.CPU
-	}
-	if resources.Memory != "" {
-		limits["memory"] = resources.Memory
-	}
-	if len(limits) == 0 {
-		return nil
-	}
-	return map[string]any{"limits": limits}
 }
 
 // Get retrieves a sandbox by name.

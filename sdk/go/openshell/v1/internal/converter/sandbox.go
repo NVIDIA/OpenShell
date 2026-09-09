@@ -81,16 +81,30 @@ func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 	}
 
 	if rr := spec.GetResourceRequirements(); rr != nil {
-		if gpu := rr.GetGpu(); gpu != nil {
-			result.GPU = true
-			if gpu.Count != nil {
-				result.GPUCount = gpu.Count
-			}
-		}
+		result.ResourceRequirements = resourceRequirementsFromProto(rr)
 	}
 	result.Command = CopyStringSlice(spec.GetCommand())
 	result.TTY = spec.GetTty()
 
+	return result
+}
+
+// resourceRequirementsFromProto converts a proto ResourceRequirements to an
+// SDK ResourceRequirements.
+func resourceRequirementsFromProto(rr *pb.ResourceRequirements) *types.ResourceRequirements {
+	if rr == nil {
+		return nil
+	}
+	result := &types.ResourceRequirements{}
+	if gpu := rr.GetGpu(); gpu != nil {
+		result.GPU = &types.GPUResourceRequirements{Count: CopyUint32Ptr(gpu.Count)}
+	}
+	if cpu := rr.GetCpu(); cpu != nil {
+		result.CPU = &types.CPUResourceRequirements{Limit: cpu.GetLimit()}
+	}
+	if mem := rr.GetMemory(); mem != nil {
+		result.Memory = &types.MemoryResourceRequirements{Limit: mem.GetLimit()}
+	}
 	return result
 }
 
@@ -231,17 +245,32 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 		result.Template = tmpl
 	}
 
-	if spec.GPU || spec.GPUCount != nil {
-		result.ResourceRequirements = &pb.ResourceRequirements{
-			Gpu: &pb.GpuResourceRequirements{
-				Count: spec.GPUCount,
-			},
-		}
+	if spec.ResourceRequirements != nil {
+		result.ResourceRequirements = resourceRequirementsToProto(spec.ResourceRequirements)
 	}
 
 	result.Command = CopyStringSlice(spec.Command)
 	result.Tty = spec.TTY
 
+	return result
+}
+
+// resourceRequirementsToProto converts an SDK ResourceRequirements to a
+// proto ResourceRequirements.
+func resourceRequirementsToProto(rr *types.ResourceRequirements) *pb.ResourceRequirements {
+	if rr == nil {
+		return nil
+	}
+	result := &pb.ResourceRequirements{}
+	if rr.GPU != nil {
+		result.Gpu = &pb.GpuResourceRequirements{Count: CopyUint32Ptr(rr.GPU.Count)}
+	}
+	if rr.CPU != nil {
+		result.Cpu = &pb.CpuResourceRequirements{Limit: rr.CPU.Limit}
+	}
+	if rr.Memory != nil {
+		result.Memory = &pb.MemoryResourceRequirements{Limit: rr.Memory.Limit}
+	}
 	return result
 }
 
@@ -322,19 +351,7 @@ func SandboxWorkloadConfigFromProto(workload *pb.SandboxWorkloadConfig) *types.S
 	return &types.SandboxWorkloadConfig{
 		Image:       workload.GetImage(),
 		Environment: CopyStringMap(workload.GetEnvironment()),
-		Resources:   SandboxResourcesFromProto(workload.GetResources()),
-	}
-}
-
-// SandboxResourcesFromProto converts portable resource requirements.
-func SandboxResourcesFromProto(resources *pb.SandboxResources) *types.SandboxResources {
-	if resources == nil {
-		return nil
-	}
-	return &types.SandboxResources{
-		CPU:    resources.GetCpu(),
-		Memory: resources.GetMemory(),
-		GPU:    sandboxResourceGpuFromProto(resources),
+		Resources:   resourceRequirementsFromProto(workload.GetResources()),
 	}
 }
 
@@ -404,34 +421,8 @@ func SandboxWorkloadConfigToProto(workload *types.SandboxWorkloadConfig) *pb.San
 	return &pb.SandboxWorkloadConfig{
 		Image:       workload.Image,
 		Environment: CopyStringMap(workload.Environment),
-		Resources:   SandboxResourcesToProto(workload.Resources),
+		Resources:   resourceRequirementsToProto(workload.Resources),
 	}
-}
-
-// SandboxResourcesToProto converts portable resource requirements.
-func SandboxResourcesToProto(resources *types.SandboxResources) *pb.SandboxResources {
-	if resources == nil {
-		return nil
-	}
-	return &pb.SandboxResources{
-		Cpu:    resources.CPU,
-		Memory: resources.Memory,
-		Gpu:    sandboxResourceGpuToProto(resources),
-	}
-}
-
-func sandboxResourceGpuToProto(resources *types.SandboxResources) *pb.GpuResourceRequirements {
-	if resources == nil || resources.GPU == nil {
-		return nil
-	}
-	return &pb.GpuResourceRequirements{Count: CopyUint32Ptr(resources.GPU.Count)}
-}
-
-func sandboxResourceGpuFromProto(resources *pb.SandboxResources) *types.SandboxGPURequirements {
-	if resources == nil || resources.GetGpu() == nil {
-		return nil
-	}
-	return &types.SandboxGPURequirements{Count: CopyUint32Ptr(resources.GetGpu().Count)}
 }
 
 // SandboxServiceLevelToProto converts template service-level hints.

@@ -138,10 +138,10 @@ func TestSandboxTemplateCreate(t *testing.T) {
 			Workload: &SandboxWorkloadConfig{
 				Image:       "nvcr.io/nvidia/openshell:latest",
 				Environment: map[string]string{"NVIDIA_VISIBLE_DEVICES": "all"},
-				Resources: &SandboxResources{
-					CPU:    "2",
-					Memory: "8Gi",
-					GPU:    &SandboxGPURequirements{Count: &gpuCount},
+				Resources: &ResourceRequirements{
+					CPU:    &CPUResourceRequirements{Limit: "2"},
+					Memory: &MemoryResourceRequirements{Limit: "8Gi"},
+					GPU:    &GPUResourceRequirements{Count: &gpuCount},
 				},
 			},
 			DriverConfig: map[string]any{
@@ -166,8 +166,10 @@ func TestSandboxTemplateCreate(t *testing.T) {
 	require.NotNil(t, mock.createRequest)
 	assert.Equal(t, "default", mock.createRequest.Workspace)
 	assert.Equal(t, "gpu-kata", mock.createRequest.Template.Metadata.Name)
-	assert.Equal(t, "2", mock.createRequest.Template.Spec.Workload.Resources.Cpu)
-	assert.Equal(t, "8Gi", mock.createRequest.Template.Spec.Workload.Resources.Memory)
+	require.NotNil(t, mock.createRequest.Template.Spec.Workload.Resources.Cpu)
+	assert.Equal(t, "2", mock.createRequest.Template.Spec.Workload.Resources.Cpu.Limit)
+	require.NotNil(t, mock.createRequest.Template.Spec.Workload.Resources.Memory)
+	assert.Equal(t, "8Gi", mock.createRequest.Template.Spec.Workload.Resources.Memory.Limit)
 	require.NotNil(t, mock.createRequest.Template.Spec.Workload.Resources.Gpu)
 	require.NotNil(t, mock.createRequest.Template.Spec.Workload.Resources.Gpu.Count)
 	assert.Equal(t, uint32(1), *mock.createRequest.Template.Spec.Workload.Resources.Gpu.Count)

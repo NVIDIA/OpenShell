@@ -18,12 +18,6 @@ type SandboxWorkloadTemplateSpec = types.SandboxWorkloadTemplateSpec
 // SandboxWorkloadConfig defines the portable workload for a reusable template.
 type SandboxWorkloadConfig = types.SandboxWorkloadConfig
 
-// SandboxResources defines portable sandbox resource requirements.
-type SandboxResources = types.SandboxResources
-
-// SandboxGPURequirements defines template GPU requirements.
-type SandboxGPURequirements = types.SandboxGPURequirements
-
 // SandboxServiceLevel describes desired operational characteristics.
 type SandboxServiceLevel = types.SandboxServiceLevel
 
