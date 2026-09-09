@@ -25,7 +25,7 @@ Environment:
   CONTENT_GUARD_SMOKE_HOST  Non-loopback host address reachable from both the
                             gateway and sandbox containers.
   CONTENT_GUARD_SMOKE_DRIVER
-                            Optional compute driver name, such as docker or podman.
+                            Compute driver: docker (default) or podman.
 EOF
 }
 
@@ -105,7 +105,14 @@ detect_service_host() {
 }
 
 SERVICE_HOST="$(detect_service_host)"
-COMPUTE_DRIVER="${CONTENT_GUARD_SMOKE_DRIVER:-}"
+COMPUTE_DRIVER="${CONTENT_GUARD_SMOKE_DRIVER:-docker}"
+case "$COMPUTE_DRIVER" in
+  docker | podman) ;;
+  *)
+    echo "CONTENT_GUARD_SMOKE_DRIVER must be docker or podman" >&2
+    exit 1
+    ;;
+esac
 if [[ "$SERVICE_HOST" == "localhost" || "$SERVICE_HOST" == "::1" || "$SERVICE_HOST" == 127.* || "$SERVICE_HOST" == *:* ]]; then
   echo "CONTENT_GUARD_SMOKE_HOST must be a non-loopback IPv4 address: $SERVICE_HOST" >&2
   exit 1
@@ -121,6 +128,7 @@ MIDDLEWARE_LOG="$LOG_DIR/middleware.log"
 UPSTREAM_LOG="$LOG_DIR/upstream.log"
 SANDBOX_LOG="$LOG_DIR/sandbox.log"
 RUN_ID="content-guard-smoke-$$-$RANDOM"
+SUPERVISOR_IMAGE="localhost/openshell-content-guard/supervisor:$RUN_ID"
 # Sandbox names are capped at 19 characters. Use a short prefix with
 # the PID for uniqueness; keep the full RUN_ID for gateway identity.
 SANDBOX_NAME="cg-$$-$RANDOM"
@@ -228,8 +236,8 @@ allow_insecure_transport = true
 max_payload_bytes = 262144
 timeout = "500ms"
 
-[openshell.drivers.docker]
-supervisor_bin = "$ROOT/target/debug/openshell-sandbox"
+[openshell.drivers.$COMPUTE_DRIVER]
+supervisor_image = "$SUPERVISOR_IMAGE"
 EOF
 }
 
@@ -533,13 +541,21 @@ require_command curl
 require_command jq
 require_command openssl
 require_command uv
+require_command mise
 ROOT_TARGET_DIR="$(cargo_target_dir "$ROOT/Cargo.toml")"
 EXAMPLE_TARGET_DIR="$(cargo_target_dir "$EXAMPLE_DIR/Cargo.toml")"
 GATEWAY_BIN="$ROOT_TARGET_DIR/debug/openshell-gateway"
 CLI_BIN="$ROOT_TARGET_DIR/debug/openshell"
 MIDDLEWARE_BIN="$EXAMPLE_TARGET_DIR/debug/supervisor-middleware-content-guard"
 run_setup_step "building gateway" cargo build --quiet -p openshell-gateway --bin openshell-gateway
-run_setup_step "building sandbox supervisor" cargo build --quiet -p openshell-sandbox --bin openshell-sandbox
+# Always rebuild from this checkout and load into the selected runtime. Native
+# macOS binaries cannot run in Linux sandboxes; Podman also needs an image.
+# A unique tag prevents the driver from selecting an older published runtime.
+run_setup_step "building Linux sandbox supervisor image" \
+  env -u CI -u DOCKER_PLATFORM -u DOCKER_PUSH -u DOCKER_OUTPUT \
+  CONTAINER_ENGINE="$COMPUTE_DRIVER" PREBUILT_AUTO_STAGE=1 \
+  IMAGE_REGISTRY=localhost/openshell-content-guard IMAGE_TAG="$RUN_ID" \
+  mise run docker:build:supervisor
 run_setup_step "building content guard" cargo build --quiet --manifest-path "$EXAMPLE_DIR/Cargo.toml"
 run_setup_step "building CLI" cargo build --quiet -p openshell-cli --bin openshell
 generate_gateway_jwt_bundle

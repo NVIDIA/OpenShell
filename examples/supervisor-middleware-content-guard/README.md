@@ -15,7 +15,7 @@ This configured-literal guard applies the same case-sensitive terms to UTF-8 HTT
 
 ## Prerequisites
 
-Install `cargo`, `curl`, `jq`, `openssl`, and `uv` with Python 3 on the host before running the smoke script.
+Install `cargo`, `curl`, `jq`, `openssl`, `mise`, and `uv` with Python 3 on the host before running the smoke script. Start Docker or Podman. The supervisor image build uses the repository's Linux cross-compilation toolchain, including `cargo-zigbuild` and Zig on macOS. Install the repository's mise tools before running it.
 
 ## Run the smoke example
 
@@ -39,7 +39,15 @@ The script creates the sandbox and prints the guarded and unguarded request comm
 CONTENT_GUARD_SMOKE_HOST=192.168.1.10 ./examples/supervisor-middleware-content-guard/smoke.sh --test-suite
 ```
 
-The gateway auto-detects its compute driver. Set `CONTENT_GUARD_SMOKE_DRIVER=docker` or `CONTENT_GUARD_SMOKE_DRIVER=podman` if more than one local runtime is installed and auto-detection selects the wrong one.
+The script defaults to Docker. Set `CONTENT_GUARD_SMOKE_DRIVER=podman` to build and run with Podman instead.
+
+On Linux and macOS, the script runs `mise run docker:build:supervisor` with the selected container engine to build a Linux supervisor from the current checkout. It configures that driver's `supervisor_image` with a unique local tag, so the response checks exercise the local runtime changes. macOS host binaries are never used inside the sandbox. The local image remains available after the smoke run.
+
+Cargo's configured target directory applies to the host binaries and the Linux supervisor build. For example:
+
+```shell
+CARGO_TARGET_DIR=/tmp/content-guard-target ./examples/supervisor-middleware-content-guard/smoke.sh --test-suite
+```
 
 ## Run manually
 

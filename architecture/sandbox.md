@@ -199,7 +199,12 @@ can change. Whole-body stages delay commitment and share one non-resetting,
 supervisor-wide accumulation deadline. Body stages receive a final body result
 and then one trailer exchange; trailer mutations can only change or remove
 existing, non-protected names. Intentional blocks return the canonical 403
-before commitment and abort delivery without injected bytes after commitment.
+before commitment and abort delivery without injected bytes after commitment. Streaming input units flush after bounded coalescing even within a
+content-length body or transfer chunk. Coalescing cancels only input acquisition;
+deadline transitions and downstream writes finish outside those timeouts.
+The response runtime caps aggregate retained body data across stages and pending
+output at 8 MiB. A transformation that exceeds the budget follows its stage's
+failure policy, preserving its input when failing open.
 
 The supervisor installs policy and middleware registry changes as one runtime
 generation and preserves the last-known-good generation if preparation fails.

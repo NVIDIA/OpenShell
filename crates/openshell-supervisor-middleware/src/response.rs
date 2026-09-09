@@ -32,6 +32,9 @@ use super::{
 
 const STREAM_CHANNEL_CAPACITY: usize = 4;
 pub const MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES: usize = 64 * 1024;
+/// Maximum logical body bytes retained across a session's stage buffers and
+/// pending output. Temporary exchange copies have the per-binding payload cap.
+pub const MAX_HTTP_RESPONSE_RETAINED_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct HttpResponsePreflightInput {
@@ -179,6 +182,7 @@ pub struct HttpResponseSession {
     invocations: Vec<HttpResponseInvocation>,
     session_admission: Option<MiddlewareSessionPermit>,
     body_transformed: bool,
+    retained_body_bytes: usize,
     defer_output_until_finish: bool,
     deferred_output: Vec<Vec<u8>>,
     connection_nominated_headers: Vec<String>,
@@ -242,6 +246,7 @@ impl HttpResponseSession {
             }
         }
         self.defer_output_until_finish = false;
+        self.release_body_bytes(&released);
         Ok(released)
     }
 
@@ -285,8 +290,16 @@ impl HttpResponseSession {
                 diagnostics: HttpResponseDiagnostics::default(),
             })?;
         let deadline = Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT;
+        // Between pushes, the first active whole-body barrier owns all input
+        // not returned to the relay (at most the 4 MiB binding cap). Later
+        // barriers cannot receive bytes until it finishes or disables itself;
+        // finish consumes the session and expiry disables all such barriers.
+        // Replacement admission reserves an additional upstream unit below.
+        self.retained_body_bytes += data.len();
+        debug_assert!(self.retained_body_bytes <= MAX_HTTP_RESPONSE_RETAINED_BODY_BYTES);
         let output = self.process_units_from(0, vec![data], deadline).await?;
         if !self.defer_output_until_finish {
+            self.release_body_bytes(&output);
             return Ok(output);
         }
         if self.requires_whole_body() {
@@ -297,6 +310,7 @@ impl HttpResponseSession {
         self.defer_output_until_finish = false;
         let mut released = std::mem::take(&mut self.deferred_output);
         released.extend(output);
+        self.release_body_bytes(&released);
         Ok(released)
     }
 
@@ -367,6 +381,10 @@ impl HttpResponseSession {
 
     pub async fn end(mut self, reason: MiddlewareSessionEndReason) {
         self.end_all(reason).await;
+    }
+
+    fn release_body_bytes(&mut self, units: &[Vec<u8>]) {
+        self.retained_body_bytes -= units.iter().map(Vec::len).sum::<usize>();
     }
 
     async fn process_units_from(
@@ -526,6 +544,31 @@ impl HttpResponseSession {
             }
         };
         let input_size = original.len();
+        let replacement_size = match &decision.action {
+            BodyAction::Transform(replacement)
+            | BodyAction::SkipRemaining(CurrentBodyAction::Transform(replacement)) => {
+                Some(replacement.len())
+            }
+            _ => None,
+        };
+        if let Some(replacement_size) = replacement_size {
+            let retained = self.retained_body_bytes - input_size + replacement_size;
+            // Reserve room for one more normalized upstream unit. Whole-body
+            // barriers bound the input retained between calls to push_body.
+            if retained
+                > MAX_HTTP_RESPONSE_RETAINED_BODY_BYTES - MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES
+            {
+                return self
+                    .handle_stage_failure(
+                        index,
+                        "response_body_aggregate_over_capacity",
+                        Some(sequence),
+                        original,
+                    )
+                    .await;
+            }
+            self.retained_body_bytes = retained;
+        }
         let stage = &mut self.stages[index];
         collect_diagnostics(
             stage,
@@ -797,11 +840,11 @@ impl ChainRunner {
         entries: &[ChainEntry],
         input: HttpResponsePreflightInput,
     ) -> miette::Result<HttpResponsePreflightOutcome> {
-        validate_preflight_input(&input)?;
         let described = self.describe_http_response_chain(entries).await?;
         if described.is_empty() {
             return Ok(empty_preflight_outcome(input.headers));
         }
+        validate_preflight_input(&input)?;
         let session_admission = match self.try_reserve_middleware_session() {
             MiddlewareSessionAdmission::Admitted(admission) => admission,
             MiddlewareSessionAdmission::AtCapacity => {
@@ -852,16 +895,16 @@ impl ChainRunner {
             };
             let timeout = entry.timeout;
             let opened = tokio::time::timeout(timeout, async {
-                let mut responses = service
-                    .service
-                    .open_http_response_pre_return(receiver)
-                    .await?;
                 sender
                     .send(HttpResponseEvent {
                         event: Some(http_response_event::Event::Preflight(preflight)),
                     })
                     .await
                     .map_err(|_| tonic::Status::unavailable("middleware request stream closed"))?;
+                let mut responses = service
+                    .service
+                    .open_http_response_pre_return(receiver)
+                    .await?;
                 let response = responses.next().await.ok_or_else(|| {
                     tonic::Status::unavailable("middleware result stream closed")
                 })??;
@@ -1163,6 +1206,7 @@ impl ChainRunner {
                 invocations: Vec::new(),
                 session_admission: Some(session_admission),
                 body_transformed: false,
+                retained_body_bytes: 0,
                 defer_output_until_finish,
                 deferred_output: Vec::new(),
                 connection_nominated_headers: input.connection_nominated_headers,
@@ -1811,6 +1855,9 @@ mod tests {
         Configured,
         HangBody,
         LargeStream,
+        Expansion,
+        DeleteBody,
+        SkipBody,
         Skip,
         InvalidSkipReason,
         TrailerMutation,
@@ -1883,6 +1930,13 @@ mod tests {
             request: tonic::Request<tonic::Streaming<HttpResponseEvent>>,
         ) -> Result<tonic::Response<Self::EvaluateStream>, tonic::Status> {
             let mut requests = request.into_inner();
+            // Exercise servers that inspect the initial request before sending
+            // response headers, rather than returning a stream immediately.
+            let first = requests.next().await.expect("initial request");
+            assert!(matches!(&first, Ok(HttpResponseEvent {
+                event: Some(http_response_event::Event::Preflight(_))
+            })));
+            let mut requests = futures::stream::iter([first]).chain(requests);
             let (sender, receiver) = mpsc::channel(4);
             tokio::spawn(async move {
                 while let Some(Ok(event)) = requests.next().await {
@@ -1932,7 +1986,10 @@ mod tests {
                     operation: openshell_core::proto::SupervisorMiddlewareOperation::HttpResponse
                         as i32,
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreReturn as i32,
-                    max_payload_bytes: if matches!(self.script, Script::LargeStream) {
+                    max_payload_bytes: if matches!(
+                        self.script,
+                        Script::LargeStream | Script::Expansion
+                    ) {
                         128 * 1024
                     } else {
                         4096
@@ -2033,6 +2090,9 @@ mod tests {
                                     | Script::InvalidSequence
                                     | Script::HangBody
                                     | Script::LargeStream
+                                    | Script::Expansion
+                                    | Script::DeleteBody
+                                    | Script::SkipBody
                                     | Script::TrailerMutation
                                     | Script::InvalidTrailerMutation => {
                                         (HttpResponseBodyMode::StreamBytes, Vec::new())
@@ -2072,6 +2132,9 @@ mod tests {
                                 break;
                             };
                             let replacement = match selected_script {
+                                Script::Expansion => vec![b'x'; 128 * 1024],
+                                Script::DeleteBody => Vec::new(),
+                                Script::SkipBody => b"replacement".to_vec(),
                                 Script::Stream
                                 | Script::InvalidSequence
                                 | Script::LargeStream
@@ -2084,6 +2147,24 @@ mod tests {
                                 | Script::Skip
                                 | Script::InvalidSkipReason => break,
                             };
+                            let transform = HttpResponseBodyTransform {
+                                replacement: Some(http_response_body_transform::Replacement::Data(
+                                    replacement,
+                                )),
+                            };
+                            let action = if matches!(selected_script, Script::SkipBody) {
+                                http_response_body_result::Action::SkipRemaining(
+                                    openshell_core::proto::HttpResponseBodySkipRemaining {
+                                        current: Some(
+                                            http_response_body_skip_remaining::Current::Transform(
+                                                transform,
+                                            ),
+                                        ),
+                                    },
+                                )
+                            } else {
+                                http_response_body_result::Action::Transform(transform)
+                            };
                             HttpResponseEventResult {
                                 result: Some(http_response_event_result::Result::BodyResult(
                                     HttpResponseBodyResult {
@@ -2095,15 +2176,7 @@ mod tests {
                                         } else {
                                             body.sequence
                                         },
-                                        action: Some(http_response_body_result::Action::Transform(
-                                            HttpResponseBodyTransform {
-                                                replacement: Some(
-                                                    http_response_body_transform::Replacement::Data(
-                                                        replacement,
-                                                    ),
-                                                ),
-                                            },
-                                        )),
+                                        action: Some(action),
                                         ..Default::default()
                                     },
                                 )),
@@ -2231,6 +2304,270 @@ mod tests {
         described.max_payload_bytes = 0;
         let modes = permitted_body_modes(&input(200), &described, None);
         assert!(!modes.contains(&(HttpResponseBodyMode::StreamBytes as i32)));
+    }
+
+    struct ReadPreflightBeforeOpening {
+        failure: Option<bool>,
+    }
+
+    #[tonic::async_trait]
+    impl InProcessMiddleware for ReadPreflightBeforeOpening {
+        async fn describe(&self) -> MiddlewareManifest {
+            let mut manifest = response_manifest("test/response");
+            manifest.bindings[0].timeout = "10ms".into();
+            manifest
+        }
+
+        async fn validate_config(&self, _: &str, _: &prost_types::Struct) -> miette::Result<()> {
+            Ok(())
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _: HttpRequestView<'_>,
+        ) -> miette::Result<HttpRequestResult> {
+            unreachable!()
+        }
+
+        async fn open_http_response_pre_return(
+            &self,
+            mut requests: mpsc::Receiver<HttpResponseEvent>,
+        ) -> Result<super::super::HttpResponseResultStream, tonic::Status> {
+            let first = requests.recv().await.expect("initial preflight");
+            assert!(matches!(
+                first.event,
+                Some(http_response_event::Event::Preflight(_))
+            ));
+            if let Some(hang) = self.failure {
+                if hang {
+                    futures::future::pending::<()>().await;
+                }
+                return Err(tonic::Status::unavailable("startup failed"));
+            }
+            let response = HttpResponseEventResult {
+                result: Some(http_response_event_result::Result::PreflightResult(
+                    HttpResponsePreflightResult {
+                        action: Some(http_response_preflight_result::Action::Inspect(
+                            HttpResponsePreflightInspect {
+                                body_mode: HttpResponseBodyMode::HeadersOnly as i32,
+                                header_mutations: Vec::new(),
+                            },
+                        )),
+                        ..Default::default()
+                    },
+                )),
+            };
+            Ok(Box::pin(futures::stream::iter([Ok(response)])))
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_can_be_read_before_open_returns() {
+        let runner = ChainRunner::new(Arc::new(ReadPreflightBeforeOpening { failure: None }));
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            runner.preflight_http_response(&[entry(OnError::FailClosed)], input(200)),
+        )
+        .await
+        .expect("bounded startup")
+        .expect("preflight");
+        assert!(outcome.allowed, "{}", outcome.reason);
+    }
+
+    #[tokio::test]
+    async fn preflight_opening_failure_obeys_policy_and_releases_admission() {
+        for hang in [false, true] {
+            for on_error in [OnError::FailOpen, OnError::FailClosed] {
+                let runner = ChainRunner::new(Arc::new(ReadPreflightBeforeOpening {
+                    failure: Some(hang),
+                }));
+                let permits = runner.registry.session_admission.available_permits();
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    runner.preflight_http_response(&[entry(on_error)], input(200)),
+                )
+                .await
+                .expect("bounded opening failure")
+                .unwrap();
+                assert_eq!(outcome.allowed, on_error == OnError::FailOpen);
+                assert!(outcome.session.is_none());
+                assert_eq!(
+                    runner.registry.session_admission.available_permits(),
+                    permits
+                );
+                assert!(outcome.invocations[0].failed);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_whole_body_barriers_preserve_accounting_on_overflow_and_expiry() {
+        for expire in [false, true] {
+            let runner = ChainRunner::new(Arc::new(ResponseService {
+                script: Script::Configured,
+            }));
+            let mut entries = vec![
+                configured_entry("first", 0, "whole"),
+                configured_entry("second", 1, "whole"),
+                configured_entry("stream", 2, "stream"),
+            ];
+            for entry in &mut entries {
+                entry.on_error = OnError::FailOpen;
+            }
+            let mut outcome = runner
+                .preflight_http_response(&entries, input(200))
+                .await
+                .unwrap();
+            let mut session = outcome.session.take().unwrap();
+            for _ in 0..2 {
+                assert!(
+                    session
+                        .push_body(vec![b'a'; 2048])
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(session.retained_body_bytes <= 4096);
+                assert_eq!(
+                    session
+                        .stages
+                        .iter()
+                        .filter(|stage| !stage.whole_body.is_empty())
+                        .count(),
+                    1
+                );
+            }
+            let output = if expire {
+                session.start_whole_body_deadline(Duration::ZERO);
+                session.expire_whole_body_deadline().await.unwrap()
+            } else {
+                session.push_body(vec![b'a'; 2048]).await.unwrap()
+            };
+            assert_eq!(
+                output.concat(),
+                vec![b'A'; if expire { 4096 } else { 6144 }]
+            );
+            assert_eq!(session.retained_body_bytes, 0);
+            assert_eq!(
+                session.push_body(b"next".to_vec()).await.unwrap().concat(),
+                b"NEXT"
+            );
+            assert_eq!(session.retained_body_bytes, 0);
+            assert!(
+                session
+                    .finish(Vec::new())
+                    .await
+                    .unwrap()
+                    .body_units
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deleted_and_skip_remaining_units_release_body_accounting() {
+        for script in [Script::DeleteBody, Script::SkipBody] {
+            let runner = ChainRunner::new(Arc::new(ResponseService { script }));
+            let mut outcome = runner
+                .preflight_http_response(&[entry(OnError::FailClosed)], input(200))
+                .await
+                .unwrap();
+            let mut session = outcome.session.take().unwrap();
+            for index in 0..3 {
+                let output = session.push_body(b"original".to_vec()).await.unwrap();
+                let expected = match script {
+                    Script::DeleteBody => Vec::new(),
+                    Script::SkipBody if index == 0 => b"replacement".to_vec(),
+                    Script::SkipBody => b"original".to_vec(),
+                    _ => unreachable!(),
+                };
+                assert_eq!(output.concat(), expected);
+                assert_eq!(session.retained_body_bytes, 0);
+            }
+            assert!(
+                session
+                    .finish(Vec::new())
+                    .await
+                    .unwrap()
+                    .body_units
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn expanding_stages_obey_aggregate_budget_and_failure_policy() {
+        for on_error in [OnError::FailClosed, OnError::FailOpen] {
+            let runner = ChainRunner::new(Arc::new(ResponseService {
+                script: Script::Expansion,
+            }));
+            let permits = runner.registry.session_admission.available_permits();
+            let entries = (0..9)
+                .map(|order| {
+                    let mut entry = entry(on_error);
+                    entry.name = format!("expand-{order}");
+                    entry.order = order;
+                    entry
+                })
+                .collect::<Vec<_>>();
+            let mut outcome = runner
+                .preflight_http_response(&entries, input(200))
+                .await
+                .unwrap();
+            let mut session = outcome.session.take().unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(5), session.push_body(vec![1]))
+                .await
+                .expect("bounded expansion");
+            match result {
+                Ok(output) => {
+                    assert_eq!(on_error, OnError::FailOpen);
+                    assert!(
+                        output.iter().map(Vec::len).sum::<usize>()
+                            < MAX_HTTP_RESPONSE_RETAINED_BODY_BYTES
+                    );
+                    assert!(output.iter().flatten().all(|byte| *byte == b'x'));
+                    assert_eq!(session.retained_body_bytes, 0);
+                    assert!(
+                        session
+                            .invocations
+                            .iter()
+                            .any(|invocation| invocation.outcome
+                                == HttpResponseInvocationOutcome::FailOpen)
+                    );
+                    // Holding returned output applies backpressure: subsequent
+                    // stage work starts only when the relay calls again.
+                    drop(output);
+                    for _ in 0..3 {
+                        let output = session.push_body(vec![1]).await.unwrap();
+                        assert!(
+                            output.iter().map(Vec::len).sum::<usize>()
+                                < MAX_HTTP_RESPONSE_RETAINED_BODY_BYTES
+                        );
+                        assert_eq!(session.retained_body_bytes, 0);
+                    }
+                    let finish = session.finish(Vec::new()).await.unwrap();
+                    assert!(
+                        finish.body_units.iter().map(Vec::len).sum::<usize>()
+                            < MAX_HTTP_RESPONSE_RETAINED_BODY_BYTES
+                    );
+                }
+                Err(failure) => {
+                    assert_eq!(on_error, OnError::FailClosed);
+                    assert!(
+                        failure
+                            .reason
+                            .contains("response_body_aggregate_over_capacity")
+                    );
+                    session
+                        .end(MiddlewareSessionEndReason::MiddlewareFailure)
+                        .await;
+                }
+            }
+            assert_eq!(
+                runner.registry.session_admission.available_permits(),
+                permits
+            );
+        }
     }
 
     #[tokio::test]
@@ -2651,8 +2988,9 @@ mod tests {
         assert!(outcome.session.is_none());
 
         let _ = shutdown_tx.send(());
-        server_task
+        tokio::time::timeout(Duration::from_secs(2), server_task)
             .await
+            .expect("bounded server shutdown")
             .expect("join response middleware server")
             .expect("serve response middleware");
     }

@@ -3378,7 +3378,21 @@ where
         guard.ensure_current()?;
     }
     let header_bytes = &buffered[..header_end];
-    let parsed = match parse_response_head_for_middleware(header_bytes) {
+    // Ordinary responses retain the HTTP parser's byte-preserving behavior.
+    // Response-specific normalization and limits apply only to selected hooks.
+    if middleware.chain.is_empty() {
+        return Ok(None);
+    }
+    let parsed = match middleware
+        .runner
+        .describe_http_response_chain(middleware.chain)
+        .await
+    {
+        Ok(described) if described.is_empty() => return Ok(None),
+        Ok(_) => parse_response_head_for_middleware(header_bytes),
+        Err(error) => Err(error),
+    };
+    let parsed = match parsed {
         Ok(parsed) => parsed,
         Err(error) => {
             debug!(error = %error, "HTTP response head normalization failed");
@@ -4412,9 +4426,10 @@ where
                 let length = usize::try_from(remaining)
                     .unwrap_or(unit_limit)
                     .min(unit_limit);
-                let unit = read_exact_response_with_deadline(
+                let unit = read_response_payload_with_deadline(
                     reader,
                     length,
+                    !pending.is_empty(),
                     session,
                     client,
                     &mut framing,
@@ -4423,6 +4438,7 @@ where
                 if let Some(guard) = generation_guard {
                     guard.ensure_current()?;
                 }
+                let partial = unit.len() < length;
                 remaining -= unit.len() as u64;
                 buffer_normalized_response_bytes(
                     session,
@@ -4433,6 +4449,15 @@ where
                     unit_limit,
                 )
                 .await?;
+                if partial {
+                    flush_normalized_response_bytes(
+                        session,
+                        client,
+                        std::mem::take(&mut pending),
+                        &mut framing,
+                    )
+                    .await?;
+                }
             }
             flush_normalized_response_bytes(session, client, pending, &mut framing).await?;
             Ok(Vec::new())
@@ -4464,9 +4489,10 @@ where
                 let mut remaining = chunk_size;
                 while remaining > 0 {
                     let length = remaining.min(unit_limit);
-                    let unit = read_exact_response_with_deadline(
+                    let unit = read_response_payload_with_deadline(
                         reader,
                         length,
+                        !pending.is_empty(),
                         session,
                         client,
                         &mut framing,
@@ -4475,6 +4501,7 @@ where
                     if let Some(guard) = generation_guard {
                         guard.ensure_current()?;
                     }
+                    let partial = unit.len() < length;
                     remaining -= unit.len();
                     buffer_normalized_response_bytes(
                         session,
@@ -4485,19 +4512,37 @@ where
                         unit_limit,
                     )
                     .await?;
+                    if partial {
+                        flush_normalized_response_bytes(
+                            session,
+                            client,
+                            std::mem::take(&mut pending),
+                            &mut framing,
+                        )
+                        .await?;
+                    }
                 }
-                if read_exact_response_with_deadline(reader, 2, session, client, &mut framing)
-                    .await?
-                    .as_slice()
-                    != b"\r\n"
+                let terminator = if let Ok(result) =
+                    tokio::time::timeout(RESPONSE_UNIT_COALESCE_TIMEOUT, reader.read_exact_vec(2))
+                        .await
                 {
+                    result?
+                } else {
+                    flush_normalized_response_bytes(
+                        session,
+                        client,
+                        std::mem::take(&mut pending),
+                        &mut framing,
+                    )
+                    .await?;
+                    read_exact_response_with_deadline(reader, 2, session, client, &mut framing)
+                        .await?
+                };
+                if terminator != b"\r\n" {
                     return Err(miette!("HTTP response chunk is missing its terminator"));
                 }
-                size_line = if let Ok(line) = tokio::time::timeout(
-                    RESPONSE_UNIT_COALESCE_TIMEOUT,
-                    read_response_line_with_deadline(reader, session, client, &mut framing),
-                )
-                .await
+                size_line = if let Ok(line) =
+                    tokio::time::timeout(RESPONSE_UNIT_COALESCE_TIMEOUT, reader.read_line()).await
                 {
                     line?
                 } else {
@@ -4513,28 +4558,45 @@ where
             }
         }
         BodyLength::None if server_wants_close || event_stream => loop {
-            let read =
-                read_response_with_deadline(reader, unit_limit, session, client, &mut framing);
-            let next = if pending.is_empty() && event_stream {
-                read.await?
-            } else if pending.is_empty() {
-                match tokio::time::timeout(RELAY_EOF_IDLE_TIMEOUT, read).await {
-                    Ok(result) => result?,
-                    Err(_) => None,
+            // Cancel only input acquisition, never expiry or client writes.
+            let wait = if pending.is_empty() {
+                if event_stream {
+                    None
+                } else {
+                    Some(RELAY_EOF_IDLE_TIMEOUT)
                 }
-            } else if let Ok(result) =
-                tokio::time::timeout(RESPONSE_UNIT_COALESCE_TIMEOUT, read).await
-            {
-                result?
             } else {
-                flush_normalized_response_bytes(
-                    session,
-                    client,
-                    std::mem::take(&mut pending),
-                    &mut framing,
-                )
-                .await?;
-                continue;
+                Some(RESPONSE_UNIT_COALESCE_TIMEOUT)
+            };
+            let read_deadline = wait.map(|wait| tokio::time::Instant::now() + wait);
+            let whole_deadline = session.whole_body_deadline();
+            let deadline = match (read_deadline, whole_deadline) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            let next = if let Some(deadline) = deadline {
+                if let Ok(result) =
+                    tokio::time::timeout_at(deadline, reader.read_some(unit_limit)).await
+                {
+                    result?
+                } else {
+                    if whole_deadline.is_some_and(|d| d <= tokio::time::Instant::now()) {
+                        expire_whole_body_deadline(session, client, &mut framing).await?;
+                    } else if pending.is_empty() {
+                        return Ok(Vec::new());
+                    } else {
+                        flush_normalized_response_bytes(
+                            session,
+                            client,
+                            std::mem::take(&mut pending),
+                            &mut framing,
+                        )
+                        .await?;
+                    }
+                    continue;
+                }
+            } else {
+                reader.read_some(unit_limit).await?
             };
             let Some(unit) = next else {
                 flush_normalized_response_bytes(session, client, pending, &mut framing).await?;
@@ -4611,25 +4673,52 @@ async fn expire_whole_body_deadline<C: AsyncWrite + Unpin>(
     deliver_response_units(client, output, framing, session.requires_whole_body()).await
 }
 
-async fn read_response_with_deadline<R, C>(
+// Unit size is a maximum. Coalesce available payload without waiting for
+// the rest of a transfer chunk, and finish expiry outside read timeouts.
+async fn read_response_payload_with_deadline<R, C>(
     reader: &mut BufferedResponseReader<'_, R>,
     limit: usize,
+    has_pending: bool,
     session: &mut openshell_supervisor_middleware::HttpResponseSession,
     client: &mut C,
     framing: &mut ResponseOutputState<'_>,
-) -> Result<Option<Vec<u8>>>
+) -> Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
     C: AsyncWrite + Unpin,
 {
+    let mut payload = Vec::new();
+    let mut coalesce_deadline =
+        has_pending.then(|| tokio::time::Instant::now() + RESPONSE_UNIT_COALESCE_TIMEOUT);
     loop {
-        let Some(deadline) = session.whole_body_deadline() else {
-            return reader.read_some(limit).await;
+        let whole_deadline = session.whole_body_deadline();
+        let deadline = match (coalesce_deadline, whole_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         };
-        match tokio::time::timeout_at(deadline, reader.read_some(limit)).await {
-            Ok(result) => return result,
-            Err(_) => expire_whole_body_deadline(session, client, framing).await?,
+        let read = reader.read_some(limit - payload.len());
+        let result = if let Some(deadline) = deadline {
+            if let Ok(result) = tokio::time::timeout_at(deadline, read).await {
+                result
+            } else {
+                if whole_deadline.is_some_and(|d| d <= tokio::time::Instant::now()) {
+                    expire_whole_body_deadline(session, client, framing).await?;
+                }
+                if coalesce_deadline.is_some_and(|d| d <= tokio::time::Instant::now()) {
+                    return Ok(payload);
+                }
+                continue;
+            }
+        } else {
+            read.await
+        };
+        let data = result?.ok_or_else(|| miette!("HTTP response body ended unexpectedly"))?;
+        payload.extend_from_slice(&data);
+        if payload.len() == limit {
+            return Ok(payload);
         }
+        coalesce_deadline
+            .get_or_insert_with(|| tokio::time::Instant::now() + RESPONSE_UNIT_COALESCE_TIMEOUT);
     }
 }
 
@@ -5253,12 +5342,14 @@ mod tests {
         BlockWholeBody,
         BlockStream,
         SlowWholeBody,
+        SlowStream,
         InvalidBodySequence,
         InvalidWholeBodySequence,
     }
 
     struct ResponseRelayService {
         script: ResponseRelayScript,
+        request_only: bool,
     }
 
     #[tonic::async_trait]
@@ -5268,8 +5359,16 @@ mod tests {
                 name: "test/response-relay".into(),
                 service_version: "test".into(),
                 bindings: vec![MiddlewareBinding {
-                    operation: SupervisorMiddlewareOperation::HttpResponse as i32,
-                    phase: SupervisorMiddlewarePhase::PreReturn as i32,
+                    operation: if self.request_only {
+                        SupervisorMiddlewareOperation::HttpRequest
+                    } else {
+                        SupervisorMiddlewareOperation::HttpResponse
+                    } as i32,
+                    phase: if self.request_only {
+                        SupervisorMiddlewarePhase::PreCredentials
+                    } else {
+                        SupervisorMiddlewarePhase::PreReturn
+                    } as i32,
                     max_payload_bytes: 4096,
                     timeout: String::new(),
                 }],
@@ -5302,7 +5401,11 @@ mod tests {
             openshell_supervisor_middleware::HttpResponseResultStream,
             tonic::Status,
         > {
-            let script = self.script;
+            assert!(
+                !self.request_only,
+                "request-only service received a response"
+            );
+            let mut script = self.script;
             let (sender, receiver) = mpsc::channel(4);
             tokio::spawn(async move {
                 while let Some(event) = requests.recv().await {
@@ -5310,7 +5413,14 @@ mod tests {
                         break;
                     };
                     let result = match event {
-                        http_response_event::Event::Preflight(_) => {
+                        http_response_event::Event::Preflight(preflight) => {
+                            if preflight
+                                .config
+                                .as_ref()
+                                .is_some_and(|config| config.fields.contains_key("whole_body"))
+                            {
+                                script = ResponseRelayScript::WholeBody;
+                            }
                             if matches!(script, ResponseRelayScript::BlockPreflight) {
                                 HttpResponseEventResult {
                                     result: Some(
@@ -5345,6 +5455,7 @@ mod tests {
                                         (HttpResponseBodyMode::WholeBodyBytes, Vec::new())
                                     }
                                     ResponseRelayScript::Stream
+                                    | ResponseRelayScript::SlowStream
                                     | ResponseRelayScript::BlockStream
                                     | ResponseRelayScript::InvalidBodySequence => {
                                         (HttpResponseBodyMode::StreamBytes, Vec::new())
@@ -5384,6 +5495,7 @@ mod tests {
                                     [b"whole:".as_slice(), &data].concat()
                                 }
                                 ResponseRelayScript::Stream
+                                | ResponseRelayScript::SlowStream
                                 | ResponseRelayScript::BlockStream
                                 | ResponseRelayScript::InvalidBodySequence => {
                                     data.to_ascii_uppercase()
@@ -5391,7 +5503,11 @@ mod tests {
                                 ResponseRelayScript::HeadersOnly
                                 | ResponseRelayScript::BlockPreflight => break,
                             };
-                            if matches!(script, ResponseRelayScript::SlowWholeBody) {
+                            if matches!(
+                                script,
+                                ResponseRelayScript::SlowWholeBody
+                                    | ResponseRelayScript::SlowStream
+                            ) {
                                 tokio::time::sleep(std::time::Duration::from_millis(75)).await;
                             }
                             HttpResponseEventResult {
@@ -7326,6 +7442,132 @@ mod tests {
         assert!(!is_bodiless_response("POST", 201));
     }
 
+    #[tokio::test]
+    async fn response_middleware_unbound_chains_preserve_ordinary_headers() {
+        let mut many_headers = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n".to_vec();
+        for _ in 0..129 {
+            many_headers.extend_from_slice(b"Set-Cookie: a=b\r\n");
+        }
+        many_headers.extend_from_slice(b"\r\n");
+        let opaque_headers =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nX-Opaque: \xff\xfe\r\n\r\nabc".to_vec();
+        let (_, chain) = response_middleware_fixture(ResponseRelayScript::HeadersOnly);
+        let request_only_runner =
+            openshell_supervisor_middleware::ChainRunner::new(Arc::new(ResponseRelayService {
+                script: ResponseRelayScript::HeadersOnly,
+                request_only: true,
+            }));
+        let empty_runner = openshell_supervisor_middleware::ChainRunner::default();
+        for response in [many_headers, opaque_headers] {
+            assert!(response.len() < MAX_HEADER_BYTES);
+            for context in [
+                None,
+                Some(response_middleware_context(&empty_runner, &[], "GET")),
+                Some(response_middleware_context(
+                    &request_only_runner,
+                    &chain,
+                    "GET",
+                )),
+            ] {
+                let mut upstream = response.as_slice();
+                let mut delivered = Vec::new();
+                let outcome = relay_response(
+                    "GET",
+                    &mut upstream,
+                    &mut delivered,
+                    RelayResponseOptions::default(),
+                    context,
+                )
+                .await
+                .unwrap();
+                assert!(matches!(outcome, RelayOutcome::Reusable));
+                assert_eq!(delivered, response);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_middleware_selected_hook_enforces_header_limits() {
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n".to_vec();
+        for _ in 0..129 {
+            response.extend_from_slice(b"Set-Cookie: a=b\r\n");
+        }
+        response.extend_from_slice(b"\r\n");
+        let (runner, chain) = response_middleware_fixture(ResponseRelayScript::HeadersOnly);
+        let mut upstream = response.as_slice();
+        let mut delivered = Vec::new();
+        let outcome = relay_response(
+            "GET",
+            &mut upstream,
+            &mut delivered,
+            RelayResponseOptions::default(),
+            Some(response_middleware_context(&runner, &chain, "GET")),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, RelayOutcome::Consumed));
+        assert!(delivered.starts_with(b"HTTP/1.1 502 "));
+    }
+
+    #[tokio::test]
+    async fn response_middleware_flushes_partial_framed_payload_promptly() {
+        for chunked in [false, true] {
+            let (runner, chain) = response_middleware_fixture(ResponseRelayScript::Stream);
+            let (mut upstream_read, mut upstream_write) = tokio::io::duplex(8192);
+            // Small capacity forces the relay to complete partial downstream writes.
+            let (mut client_read, mut client_write) = tokio::io::duplex(7);
+            let head = if chunked {
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/event-stream\r\n\r\n1000\r\nabc".as_slice()
+            } else {
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nContent-Type: text/event-stream\r\n\r\nabc".as_slice()
+            };
+            upstream_write.write_all(head).await.unwrap();
+            let task = tokio::spawn(async move {
+                relay_response(
+                    "GET",
+                    &mut upstream_read,
+                    &mut client_write,
+                    RelayResponseOptions::default(),
+                    Some(response_middleware_context(&runner, &chain, "GET")),
+                )
+                .await
+            });
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    head.push(client_read.read_u8().await.unwrap());
+                }
+                let mut first = [0; 8];
+                client_read.read_exact(&mut first).await.unwrap();
+                assert_eq!(&first, b"3\r\nABC\r\n");
+                // Complete the same framed payload only after its first transformed
+                // bytes have reached the consumer.
+                upstream_write.write_all(&vec![b'd'; 4093]).await.unwrap();
+                if chunked {
+                    for fragment in [b"\r".as_slice(), b"\n0\r", b"\n\r", b"\n"] {
+                        upstream_write.write_all(fragment).await.unwrap();
+                        tokio::task::yield_now().await;
+                    }
+                }
+                drop(upstream_write);
+                let mut rest = Vec::new();
+                client_read.read_to_end(&mut rest).await.unwrap();
+                assert!(rest.ends_with(b"0\r\n\r\n"));
+                let body = collect_chunked_body(&mut tokio::io::empty(), &rest, None, None)
+                    .await
+                    .unwrap();
+                assert_eq!(body, vec![b'D'; 4093]);
+            })
+            .await;
+            if result.is_err() {
+                task.abort();
+            }
+            let relay = task.await;
+            assert!(result.is_ok(), "partial payload stalled, chunked={chunked}");
+            assert!(relay.unwrap().is_ok());
+        }
+    }
+
     fn response_middleware_fixture(
         script: ResponseRelayScript,
     ) -> (
@@ -7348,6 +7590,7 @@ mod tests {
         let runner =
             openshell_supervisor_middleware::ChainRunner::new(Arc::new(ResponseRelayService {
                 script,
+                request_only: false,
             }));
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
             name: "response".into(),
@@ -7668,11 +7911,115 @@ mod tests {
 
         assert!(matches!(outcome.unwrap(), RelayOutcome::Reusable));
         let delivered = String::from_utf8(delivered).unwrap();
-        assert!(
-            delivered.ends_with("5\r\nhello\r\n0\r\n\r\n"),
-            "{delivered}"
-        );
+        let (_, body) = delivered.split_once("\r\n\r\n").unwrap();
+        let decoded = collect_chunked_body(&mut tokio::io::empty(), body.as_bytes(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(decoded, b"hello");
         assert!(!delivered.contains("whole:hello"), "{delivered}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn response_middleware_expiry_preserves_bytes_through_slow_stream_and_client() {
+        for chunked in [true, false] {
+            let (runner, mut chain) = response_middleware_fixture_with_error(
+                ResponseRelayScript::SlowStream,
+                openshell_supervisor_middleware::OnError::FailOpen,
+            );
+            let mut whole_body = chain[0].clone();
+            whole_body.name = "whole-body".into();
+            whole_body
+                .config
+                .fields
+                .insert("whole_body".into(), prost_types::Value::default());
+            chain[0].order = 1;
+            chain.insert(0, whole_body);
+            let (mut upstream_read, mut upstream_write) = tokio::io::duplex(8192);
+            // Force write_all to make partial progress before each wait.
+            let (mut client_read, mut client_write) = tokio::io::duplex(7);
+            let producer = async move {
+                let head = if chunked {
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n800\r\n".as_slice()
+                } else {
+                    b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".as_slice()
+                };
+                upstream_write.write_all(head).await.unwrap();
+                upstream_write.write_all(&vec![b'a'; 2048]).await.unwrap();
+                if chunked {
+                    upstream_write.write_all(b"\r\n").await.unwrap();
+                }
+                // The first coalesced unit belongs to the whole-body stage. A new
+                // partial unit starts coalescing just before its deadline.
+                tokio::time::sleep(std::time::Duration::from_millis(9)).await;
+                upstream_write
+                    .write_all(if chunked { b"1\r\nb\r\n" } else { b"b" })
+                    .await
+                    .unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if chunked {
+                    upstream_write.write_all(b"0\r\n\r\n").await.unwrap();
+                }
+                upstream_write.shutdown().await.unwrap();
+            };
+            let relay = async {
+                let mut context = response_middleware_context(&runner, &chain, "GET");
+                context.whole_body_timeout = std::time::Duration::from_millis(10);
+                let outcome = relay_response(
+                    "GET",
+                    &mut upstream_read,
+                    &mut client_write,
+                    RelayResponseOptions::default(),
+                    Some(context),
+                )
+                .await;
+                drop(client_write);
+                outcome
+            };
+            let consumer = async move {
+                let mut delivered = Vec::new();
+                let mut bytes = [0; 7];
+                loop {
+                    let count = client_read.read(&mut bytes).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    delivered.extend_from_slice(&bytes[..count]);
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                delivered
+            };
+            let ((), outcome, delivered) = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                Box::pin(async { tokio::join!(producer, relay, consumer) }),
+            )
+            .await
+            .expect("response relay stalled");
+            assert!(outcome.is_ok(), "{outcome:?}");
+            assert!(delivered.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            let head_end = delivered
+                .windows(4)
+                .position(|bytes| bytes == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let mut wire = &delivered[head_end..];
+            let mut body = Vec::new();
+            loop {
+                let end = wire.windows(2).position(|bytes| bytes == b"\r\n").unwrap();
+                let size =
+                    usize::from_str_radix(std::str::from_utf8(&wire[..end]).unwrap(), 16).unwrap();
+                wire = &wire[end + 2..];
+                if size == 0 {
+                    assert_eq!(wire, b"\r\n");
+                    break;
+                }
+                body.extend_from_slice(&wire[..size]);
+                assert_eq!(&wire[size..size + 2], b"\r\n");
+                wire = &wire[size + 2..];
+            }
+            let mut expected = vec![b'A'; 2048];
+            expected.push(b'B');
+            assert_eq!(body, expected, "chunked={chunked}");
+        }
     }
 
     #[tokio::test]

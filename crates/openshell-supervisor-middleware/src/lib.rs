@@ -11,7 +11,8 @@ mod websocket;
 pub use response::{
     HttpResponseDiagnostics, HttpResponseFinish, HttpResponseInvocation,
     HttpResponseInvocationOutcome, HttpResponseMiddlewareFailure, HttpResponsePreflightInput,
-    HttpResponsePreflightOutcome, HttpResponseSession, MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES,
+    HttpResponsePreflightOutcome, HttpResponseSession, MAX_HTTP_RESPONSE_RETAINED_BODY_BYTES,
+    MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES,
 };
 
 pub use websocket::{
