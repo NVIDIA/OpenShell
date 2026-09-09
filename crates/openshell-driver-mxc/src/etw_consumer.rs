@@ -152,6 +152,9 @@ const OPCODE_STOP: u8 = 2;
 /// buffers and decodes at leisure. TraceLogging events carry their schema in the
 /// extended-data items, so those are deep-copied too (not just `UserData`).
 struct RawEtwEvent {
+    /// Monotonic instant when the ETW callback observed this record. Attribution
+    /// uses capture time, not delayed decode time, across PID generations.
+    captured_at: Instant,
     header: EVENT_HEADER,
     user_data: Vec<u8>,
     /// Extended-data item headers (their `DataPtr` is re-pointed at `ext_bufs`
@@ -165,10 +168,11 @@ struct RawEtwEvent {
     queued_bytes: usize,
 }
 
-// SAFETY: every field is either a `Vec` or a POD Windows struct whose only
-// address-like field (`EVENT_HEADER_EXTENDED_DATA_ITEM::DataPtr`, a `u64`) is
-// re-pointed at our owned buffers on the consumer thread before use. No borrowed
-// kernel pointers survive the callback, so this is sound to move across threads.
+// SAFETY: every field is `Send`: `Instant`, `Vec`, or a POD Windows struct whose
+// only address-like field (`EVENT_HEADER_EXTENDED_DATA_ITEM::DataPtr`, a `u64`)
+// is re-pointed at our owned buffers on the consumer thread before use. No
+// borrowed kernel pointers survive the callback, so this is sound to move
+// across threads.
 unsafe impl Send for RawEtwEvent {}
 
 /// A decoded ETW event, independent of OCSF and the driver registry.
@@ -177,6 +181,9 @@ unsafe impl Send for RawEtwEvent {}
 /// [`DecodedEtwEvent::summary`] for sanitized diagnostic output.
 #[derive(Clone)]
 pub(crate) struct DecodedEtwEvent {
+    /// Monotonic instant copied from the ETW callback. This prevents consumer
+    /// backlog from making an old record appear to belong to a reused PID.
+    pub captured_at: Instant,
     /// Provider that emitted the event.
     pub provider: GUID,
     /// TraceLogging event id.
@@ -736,6 +743,7 @@ unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD)
     if event.EventHeader.ProviderId != SANDBOXING_PROVIDER_GUID {
         return;
     }
+    let captured_at = Instant::now();
 
     // Hot path: reserve bounded queue memory, copy raw bytes, then use a
     // non-blocking send. No TDH decode or logging runs here. Overload is counted
@@ -750,7 +758,7 @@ unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD)
         record_queue_drop(&context.health);
         return;
     }
-    let raw = unsafe { copy_raw(event_record, queued_bytes) };
+    let raw = unsafe { copy_raw(event_record, queued_bytes, captured_at) };
     try_enqueue_raw(context, raw);
 }
 
@@ -833,7 +841,11 @@ fn try_enqueue_raw(context: &CallbackContext, raw: RawEtwEvent) -> bool {
 
 /// Deep-copy a kernel `EVENT_RECORD` into an owned, `Send` [`RawEtwEvent`].
 /// Runs in the ETW callback, so it does the minimum: byte copies, no decode.
-unsafe fn copy_raw(event_record: *const EVENT_RECORD, queued_bytes: usize) -> RawEtwEvent {
+unsafe fn copy_raw(
+    event_record: *const EVENT_RECORD,
+    queued_bytes: usize,
+    captured_at: Instant,
+) -> RawEtwEvent {
     let ev = unsafe { &*event_record };
     let header = ev.EventHeader;
 
@@ -862,6 +874,7 @@ unsafe fn copy_raw(event_record: *const EVENT_RECORD, queued_bytes: usize) -> Ra
     }
 
     RawEtwEvent {
+        captured_at,
         header,
         user_data,
         ext_items,
@@ -899,7 +912,7 @@ fn decode_raw(raw: &mut RawEtwEvent) -> Option<DecodedEtwEvent> {
         raw.ext_items.as_mut_ptr()
     };
 
-    decode_event(std::ptr::addr_of_mut!(rec))
+    decode_event(std::ptr::addr_of_mut!(rec), raw.captured_at)
 }
 
 // ---------------------------------------------------------------------------
@@ -908,7 +921,7 @@ fn decode_raw(raw: &mut RawEtwEvent) -> Option<DecodedEtwEvent> {
 
 /// Decode a raw event record into a neutral [`DecodedEtwEvent`] via TDH.
 /// Returns `None` only when TDH decoding fails entirely.
-fn decode_event(event_record: *mut EVENT_RECORD) -> Option<DecodedEtwEvent> {
+fn decode_event(event_record: *mut EVENT_RECORD, captured_at: Instant) -> Option<DecodedEtwEvent> {
     let mut buf_size: u32 = 0;
     let status = unsafe { TdhGetEventInformation(event_record, None, None, &mut buf_size) };
     if status != ERROR_INSUFFICIENT_BUFFER {
@@ -934,6 +947,7 @@ fn decode_event(event_record: *mut EVENT_RECORD) -> Option<DecodedEtwEvent> {
     let props = decode_properties(&buffer, info, event_record);
 
     Some(DecodedEtwEvent {
+        captured_at,
         provider: header.ProviderId,
         event_id: header.EventDescriptor.Id,
         level: header.EventDescriptor.Level,
@@ -1163,14 +1177,15 @@ const PENDING_MAX: usize = 4096;
 /// unattributable (e.g. an unrelated Sandboxing-provider consumer on the box).
 const PENDING_TTL: Duration = Duration::from_secs(5);
 
-/// Grace window for trusting a PID match when *replaying* a buffered event.
+/// Grace window for trusting a PID match for an event captured just before the
+/// driver's initial registration.
 /// The driver seeds `by_pid` within milliseconds of spawning `wxc-exec`, so a
 /// legitimate seed event's registration lands at (or just after) the moment the
-/// event was buffered. A recycled PID, by contrast, requires the prior
+/// event was captured. A recycled PID, by contrast, requires the prior
 /// `wxc-exec` to exit and a new one to spawn — far longer than this window — so
-/// a registration that is newer than the buffered event by more than this grace
+/// a registration that is newer than the captured event by more than this grace
 /// is treated as a *different* (recycled) owner and the PID match is refused.
-const REPLAY_PID_GRACE: Duration = Duration::from_secs(2);
+const PRE_REGISTRATION_PID_GRACE: Duration = Duration::from_secs(2);
 
 /// Keep already-established strong correlations briefly after `wxc-exec` exits
 /// so ETW records that were in flight can still be attributed. The consumer's
@@ -1179,16 +1194,16 @@ const REPLAY_PID_GRACE: Duration = Duration::from_secs(2);
 const RETIRED_CORRELATION_TTL: Duration = PENDING_TTL;
 
 /// A `wxc-exec` PID registration: which sandbox owns the PID and *when* it was
-/// registered. The timestamp lets the replay path (see [`AttributionIndex::
-/// resolve_replay`]) reject a PID that was recycled to a different sandbox after
-/// a still-buffered event was captured.
+/// registered. The timestamp lets every resolution path reject a record that
+/// was captured under an older generation of a recycled PID.
 struct PidReg {
     sid: String,
     at: Instant,
-    /// Whether an event buffered just before this registration may use the PID.
+    /// Whether an event captured just before this registration may use the PID.
     /// A recently retired or reassigned PID makes that race ambiguous, so only
-    /// its strong identity/activity/CV correlators remain eligible for replay.
-    replay_before_registration: bool,
+    /// its strong identity/activity/CV correlators remain eligible for
+    /// resolution.
+    allow_pre_registration_capture: bool,
 }
 
 #[derive(Default)]
@@ -1233,14 +1248,15 @@ impl AttributionIndex {
             .by_pid
             .get(&wxc_pid)
             .map(|registration| registration.sid.clone());
-        let replay_before_registration =
+        let allow_pre_registration_capture =
             previous.is_none() && !self.retired_pids.contains_key(&wxc_pid);
 
         // PID-reuse guard: if this PID still maps to a *different* sandbox, the
         // prior sandbox was never `forget()`-ten (e.g. a crash skipped `delete`)
         // and Windows has recycled the number. Rebind to the new owner, expire
         // the prior owner's strong correlations on the normal late-event horizon,
-        // and refuse PID-only replay across the ambiguous generation boundary.
+        // and refuse pre-registration PID matches across the ambiguous
+        // generation boundary.
         if let Some(prev_sid) = previous.as_deref() {
             if prev_sid != sandbox_id {
                 tracing::warn!(
@@ -1261,7 +1277,7 @@ impl AttributionIndex {
             PidReg {
                 sid: sandbox_id.to_string(),
                 at: now,
-                replay_before_registration,
+                allow_pre_registration_capture,
             },
         );
         self.retired_sandboxes.remove(sandbox_id);
@@ -1367,49 +1383,12 @@ impl AttributionIndex {
 
     /// Resolve an event to a `sandbox_id` via any known key, then cross-link the
     /// other keys it carries so later keyless events attribute correctly.
+    ///
+    /// Strong per-sandbox correlators take precedence over PID. A PID match is
+    /// trusted only when the event was captured during the current registration,
+    /// or during the bounded seed race immediately before the first unambiguous
+    /// registration. This rule applies before and after pending-buffer replay.
     fn resolve(&mut self, ev: &DecodedEtwEvent) -> Option<String> {
-        self.purge_expired_retirements(Instant::now());
-        let identity = ev.identity();
-        let cv = ev.cv_base();
-        let activity = guid_key(&ev.activity_id);
-
-        let sid = self
-            .by_pid
-            .get(&ev.process_id)
-            .map(|registration| registration.sid.clone())
-            .or_else(|| {
-                identity
-                    .as_ref()
-                    .and_then(|i| self.by_identity.get(i).cloned())
-            })
-            .or_else(|| {
-                activity
-                    .as_ref()
-                    .and_then(|a| self.by_activity.get(a).cloned())
-            })
-            .or_else(|| cv.as_ref().and_then(|c| self.by_cv.get(c).cloned()))?;
-
-        self.cross_link(&sid, identity, cv, activity);
-        Some(sid)
-    }
-
-    /// Resolve a *buffered* (replayed) event. Unlike [`Self::resolve`], this is
-    /// hardened against PID recycling that can occur during the buffer window
-    /// ([`PENDING_TTL`]):
-    ///
-    /// - Command lines and persistent per-PID hints are never authority keys on
-    ///   either the live or replay path.
-    /// - A `by_pid` match is only trusted if the PID's registration is not newer
-    ///   than the buffered event by more than [`REPLAY_PID_GRACE`]. If the PID
-    ///   was recycled to a *different* sandbox after this event was captured, the
-    ///   registration timestamp will be well beyond the grace window and the PID
-    ///   match is refused (the event stays buffered and ages out rather than
-    ///   being misattributed to the new owner).
-    ///
-    /// Strong, per-sandbox-unique correlators (`identity`, `activity`, CV) are
-    /// always trusted — they are cross-linked from the driver-owned PID anchor
-    /// and are not reused across sandboxes.
-    fn resolve_replay(&mut self, ev: &DecodedEtwEvent, buffered_at: Instant) -> Option<String> {
         self.purge_expired_retirements(Instant::now());
         let identity = ev.identity();
         let cv = ev.cv_base();
@@ -1426,12 +1405,11 @@ impl AttributionIndex {
             .or_else(|| cv.as_ref().and_then(|c| self.by_cv.get(c).cloned()))
             .or_else(|| {
                 self.by_pid.get(&ev.process_id).and_then(|r| {
-                    // Refuse a PID that was (re)registered well after this event
-                    // was buffered — that registration belongs to a recycled PID
-                    // owned by a different sandbox, not this event's emitter. A
-                    // recent retirement/reassignment is ambiguous even within
-                    // the ordinary registration grace window.
-                    if r.replay_before_registration && r.at <= buffered_at + REPLAY_PID_GRACE {
+                    let captured_during_registration = ev.captured_at >= r.at;
+                    let captured_during_seed_race = r.allow_pre_registration_capture
+                        && r.at.saturating_duration_since(ev.captured_at)
+                            <= PRE_REGISTRATION_PID_GRACE;
+                    if captured_during_registration || captured_during_seed_race {
                         Some(r.sid.clone())
                     } else {
                         None
@@ -1503,7 +1481,7 @@ impl AttributionIndex {
                 tracing::debug!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (aged out) {}", p.ev.summary());
                 continue;
             }
-            match self.resolve_replay(&p.ev, p.at) {
+            match self.resolve(&p.ev) {
                 Some(sid) => {
                     let name = self.name_of(&sid);
                     ready.push((sid, name, p.ev));
@@ -1940,6 +1918,7 @@ mod tests {
 
     fn empty_raw_event(queued_bytes: usize) -> RawEtwEvent {
         RawEtwEvent {
+            captured_at: Instant::now(),
             header: EVENT_HEADER::default(),
             user_data: Vec::new(),
             ext_items: Vec::new(),
@@ -2019,6 +1998,7 @@ mod tests {
 
     fn mk_event(pid: u32, name: &str) -> DecodedEtwEvent {
         DecodedEtwEvent {
+            captured_at: Instant::now(),
             provider: GUID::from_u128(0),
             event_id: 1,
             level: 4,
@@ -2222,65 +2202,62 @@ mod tests {
         );
     }
 
-    // CodeRabbit (replay PID recycle): a buffered event whose only key is a PID
-    // must NOT be replayed onto a sandbox that registered that PID *after* the
-    // event was captured — that registration is a recycled PID owned by someone
-    // else. Refusing (event ages out) beats misattributing to the new owner.
+    // A record whose only key is a PID must not bind to a registration that
+    // appeared well after capture. Refusing it beats misattributing it.
     #[test]
-    fn replayed_pid_match_refused_after_recycle() {
+    fn pid_match_refused_when_capture_predates_registration_beyond_grace() {
         let mut idx = AttributionIndex::new();
-        // Stale event for a now-dead sandbox, buffered a while ago.
-        let ev = mk_event(1000, "CreateProcessInSandbox");
-        let buffered_at = Instant::now() - Duration::from_secs(3);
+        let mut ev = mk_event(1000, "CreateProcessInSandbox");
+        ev.captured_at = Instant::now() - Duration::from_secs(3);
 
-        // PID 1000 is recycled and registered to a brand-new sandbox *now*.
         idx.register_launch("sbx-new", "new", 1000);
 
         assert!(
-            idx.resolve_replay(&ev, buffered_at).is_none(),
-            "stale PID-only event must not bind to the recycled PID's new owner"
+            idx.resolve(&ev).is_none(),
+            "stale PID-only record must not bind to a newer registration"
         );
     }
 
     #[test]
-    fn quickly_recycled_pid_is_not_used_for_pre_registration_replay() {
+    fn queued_record_captured_before_pid_reuse_is_not_misattributed() {
         let mut idx = AttributionIndex::new();
         idx.register_launch("sbx-old", "old", 1000);
+        // The callback copies this record while the old PID generation is live,
+        // but consumer backlog delays decode/resolution until after reuse.
+        let queued_old = mk_event(1000, "CreateProcessInSandbox");
         idx.retire_launch("sbx-old", 1000);
-
-        let buffered_at = Instant::now();
-        let ambiguous = mk_event(1000, "CreateProcessInSandbox");
         idx.register_launch("sbx-new", "new", 1000);
 
         assert!(
-            idx.resolve_replay(&ambiguous, buffered_at).is_none(),
-            "a retirement boundary makes pre-registration PID replay ambiguous"
+            idx.resolve(&queued_old).is_none(),
+            "a record captured under the old PID generation must not bind to the new owner"
         );
+
+        let fresh = mk_event(1000, "CreateProcessInSandbox");
         assert_eq!(
-            idx.resolve(&ambiguous).as_deref(),
+            idx.resolve(&fresh).as_deref(),
             Some("sbx-new"),
-            "the new live PID registration remains authoritative"
+            "a record captured during the new registration remains authoritative"
         );
     }
 
-    // The legitimate #2 seed race is preserved: an event buffered essentially
-    // when the driver seeds attribution still replays via its PID.
+    // The legitimate seed race is preserved: an event captured immediately
+    // before the driver seeds attribution still resolves via its PID.
     #[test]
-    fn replayed_pid_match_accepted_within_grace() {
+    fn pre_registration_pid_match_is_accepted_within_grace() {
         let mut idx = AttributionIndex::new();
         let ev = mk_event(1000, "CreateProcessInSandbox");
-        let buffered_at = Instant::now();
         idx.register_launch("sbx-1", "s1", 1000);
         assert_eq!(
-            idx.resolve_replay(&ev, buffered_at).as_deref(),
+            idx.resolve(&ev).as_deref(),
             Some("sbx-1"),
-            "a seed event buffered at registration time must still replay"
+            "a seed event captured at registration time must still resolve"
         );
     }
 
-    // Command text is not an authority key on the replay path either.
+    // Command text is not an authority key for pre-registration records either.
     #[test]
-    fn command_line_is_not_used_for_replay() {
+    fn command_line_is_not_used_for_pre_registration_resolution() {
         let mut idx = AttributionIndex::new();
         idx.register_launch("sbx-1", "s1", 11);
 
@@ -2289,6 +2266,6 @@ mod tests {
             .props
             .push(("commandLine".into(), "\"agent --unique\"".into()));
 
-        assert!(idx.resolve_replay(&only_cmd, Instant::now()).is_none());
+        assert!(idx.resolve(&only_cmd).is_none());
     }
 }

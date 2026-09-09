@@ -384,4 +384,8 @@ diagnostics.
 MXC ETW attribution never treats command text as ownership evidence. It uses the
 driver-owned `wxc-exec` PID only while that child is alive, then retains only
 established identity, activity, and correlation-vector links for a five-second
-late-event window.
+late-event window. The ETW callback timestamps each record before queueing it.
+PID resolution accepts a record only when its capture time belongs to the
+current registration generation, apart from the bounded initial-registration
+race, so consumer backlog cannot carry an old record across a PID-reuse
+boundary.
