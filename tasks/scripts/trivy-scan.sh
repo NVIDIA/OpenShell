@@ -27,6 +27,15 @@ SKIP_DOCKERFILES=(
   --skip-files 'deploy/docker/Dockerfile.*-macos'
 )
 
+# Explicit OpenShell variants, including dev/E2E regression coverage.
+# spire-stack belongs to the external SPIRE chart and is intentionally absent.
+HELM_PROFILES=(
+  cert-manager credential-driver-kubernetes-secrets credential-driver-vault
+  gateway gateway-tls high-availability openshift-route-cert-manager spire
+  tls-disabled workspace-managed workspace-operator
+  corporate-proxy-e2e keycloak sidecar sidecar-kata skaffold
+)
+
 # Reject ignore entries broader than one concrete basename.
 validate_ignore_file() {
   [ -f "${IGNORE_FILE}" ] || {
@@ -61,7 +70,23 @@ validate_ignore_file() {
   fi
 }
 
-# Run one scan and normalize its SARIF metadata and repository path.
+# Convert a report whose targets already use repository-relative paths.
+convert_sarif() {
+  local report=$1 output=$2 category=$3
+  trivy convert --quiet \
+    --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 0 \
+    --format sarif --output "${output}" "${report}"
+  # `convert` can set ROOTPATH to the input JSON file. Our targets are relative
+  # to the checkout, not to the report file or the original scan directory.
+  jq --arg automation_id "trivy/${category}/" '
+    .runs[] |= (.automationDetails.id = $automation_id)
+    | del(.runs[].originalUriBaseIds)
+    | (.. | objects | select(has("artifactLocation")) | .artifactLocation)
+      |= del(.uriBaseId)
+    ' "${output}" >"${output}.tmp"
+  mv "${output}.tmp" "${output}"
+}
+
 scan() {
   local subcommand=$1 slug=$2 prefix=$3
   shift 3
@@ -69,34 +94,43 @@ scan() {
   echo "==> ${slug}"
   trivy "${subcommand}" --skip-version-check --quiet \
     --ignorefile "${IGNORE_FILE}" \
+    --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 0 \
     --format json --output "${REPORT_DIR}/${slug}.json" "$@"
-  trivy convert --quiet \
-    --format sarif --output "${REPORT_DIR}/${slug}.sarif" \
-    "${REPORT_DIR}/${slug}.json"
-
-  jq --arg p "${prefix}" --arg automation_id "trivy/${slug}/" '
-    .runs[] |= (.automationDetails.id = $automation_id)
-    | if $p == "" then
-        .
-      else
-        (.. | objects | select(has("artifactLocation")) | .artifactLocation.uri)
-          |= $p + (. | sub("^[^:]*\\.tgz:"; ""))
-      end
-    ' "${REPORT_DIR}/${slug}.sarif" >"${REPORT_DIR}/${slug}.sarif.tmp"
-  mv "${REPORT_DIR}/${slug}.sarif.tmp" "${REPORT_DIR}/${slug}.sarif"
+  if [ -n "${prefix}" ]; then
+    jq --arg prefix "${prefix}" --arg profile "${slug}" '
+      .TrivyProfile = $profile
+      | (.Results[]?.Target) |= $prefix + sub("^[^:]*\\.tgz:"; "")
+    ' "${REPORT_DIR}/${slug}.json" >"${REPORT_DIR}/${slug}.json.tmp"
+    mv "${REPORT_DIR}/${slug}.json.tmp" "${REPORT_DIR}/${slug}.json"
+  fi
 }
 
-# Scan deploy/ defaults and conditional Helm fixtures.
+# Scan static deployment files once, then charts with their applicable values.
 scan_config() {
-  scan config config-defaults deploy/ "${PREFLIGHT_OFF[@]}" \
-    "${SKIP_DOCKERFILES[@]}" deploy
+  scan config config-static deploy/ "${SKIP_DOCKERFILES[@]}" \
+    --skip-dirs deploy/helm deploy
+  scan config config-defaults deploy/helm/ "${PREFLIGHT_OFF[@]}" deploy/helm
 
   local values fixture
-  for values in deploy/helm/openshell/ci/values-*.yaml; do
-    fixture="$(basename "${values}" .yaml | sed 's/^values-//')"
-    scan config "config-fixture-${fixture}" deploy/ "${PREFLIGHT_OFF[@]}" \
-      "${SKIP_DOCKERFILES[@]}" --helm-values "${values}" deploy
+  for fixture in "${HELM_PROFILES[@]}"; do
+    values="deploy/helm/openshell/ci/values-${fixture}.yaml"
+    if [ ! -f "${values}" ]; then
+      # A newly added profile has no baseline report yet. A missing candidate
+      # fixture is an error: intentional removal must also update HELM_PROFILES.
+      [ "${SOURCE_ROOT}" != "${REPO_ROOT}" ] && continue
+      echo "Error: Helm profile not found: ${values}" >&2
+      return 2
+    fi
+    scan config "config-fixture-${fixture}" deploy/helm/openshell/ \
+      "${PREFLIGHT_OFF[@]}" --helm-values "${values}" deploy/helm/openshell
   done
+}
+
+# A readable label plus the full reference hash avoids registry/tag collisions.
+artifact_slug() {
+  local digest
+  digest="$(printf '%s' "$1" | sha256sum)"
+  printf '%s-%s' "$(printf '%s' "${1##*/}" | tr -cs 'A-Za-z0-9._-' '-' | cut -c1-80)" "${digest%% *}"
 }
 
 # Trivy needs a local chart archive rather than an OCI reference.
@@ -126,7 +160,7 @@ scan_packaged_chart() {
   trap 'rm -rf "${dir}"' RETURN
 
   helm pull "${repo}" --version "${ref##*:}" --destination "${dir}"
-  scan config "config-packaged-${chart_name}" "${chart_dir}" \
+  scan config "config-packaged-$(artifact_slug "${ref}")" "${chart_dir}" \
     "${PREFLIGHT_OFF[@]}" "$(find "${dir}" -name '*.tgz' -print -quit)"
 }
 
@@ -137,7 +171,7 @@ scan_images() {
   local image platform slug
   for image in "$@"; do
     for platform in ${PLATFORMS}; do
-      slug="image-$(printf '%s' "${image#*/}-${platform}" | tr -cs 'A-Za-z0-9._-' '-')"
+      slug="image-$(artifact_slug "${image}")-${platform//\//-}"
       scan image "${slug}" "" --platform "${platform}" --scanners vuln \
         "${extra[@]}" "${image}"
     done
@@ -152,7 +186,17 @@ gate() {
     exit 2
   fi
 
-  for report in "${REPORT_DIR}"/*.json; do
+  local reports=()
+  if [ -f "${REPORT_DIR}/config-defaults.json" ]; then
+    consolidate_config
+    reports+=("${REPORT_DIR}/consolidated/config.json")
+  fi
+  for report in "${REPORT_DIR}"/image-*.json "${REPORT_DIR}"/config-packaged-*.json; do
+    [ -f "${report}" ] && reports+=("${report}")
+  done
+  [ "${#reports[@]}" -gt 0 ] || { echo "Error: no complete scan reports" >&2; return 2; }
+
+  for report in "${reports[@]}"; do
     set +e
     trivy convert --quiet --exit-code 10 --severity "${SEVERITY}" \
       --format table "${report}"
@@ -173,7 +217,7 @@ gate() {
     {
       echo "### Trivy (gate: \`${SEVERITY}\`)"
       echo '```'
-      for report in "${REPORT_DIR}"/*.json; do
+      for report in "${reports[@]}"; do
         trivy convert --quiet --severity "${SEVERITY}" --format table "${report}"
       done
       echo '```'
@@ -183,21 +227,56 @@ gate() {
   [ "${findings}" -eq 0 ] || return 10
 }
 
-collect_config_findings() {
-  local report_dir=$1
+consolidate_config() {
+  local report
+  local reports=("${REPORT_DIR}/config-static.json" "${REPORT_DIR}/config-defaults.json")
+  for report in "${REPORT_DIR}"/config-fixture-*.json; do
+    [ -f "${report}" ] && reports+=("${report}")
+  done
+  mkdir -p "${REPORT_DIR}/consolidated"
+  jq -s -f "${REPO_ROOT}/tasks/scripts/trivy-config-report.jq" \
+    "${reports[@]}" >"${REPORT_DIR}/consolidated/config.json"
+}
 
-  if [ -z "$(find "${report_dir}" -maxdepth 1 -name '*.json' -print -quit)" ]; then
-    echo "Error: no reports in ${report_dir}" >&2
+# Keep detailed reports for the differential gate, but publish one deduplicated
+# configuration analysis. Images and packaged charts retain separate identities.
+prepare_sarif() {
+  local staging report slug batch=0 count=0
+  staging="${REPORT_DIR}/code-scanning"
+  if [ -e "${staging}" ]; then
+    echo "Error: ${staging} already exists; use a fresh report directory" >&2
     return 2
   fi
+  mkdir -p "${staging}/uploads/0"
+  consolidate_config
+  convert_sarif "${REPORT_DIR}/consolidated/config.json" "${staging}/uploads/0/config.sarif" config
+  count=1
+  for report in "${REPORT_DIR}"/image-*.json "${REPORT_DIR}"/config-packaged-*.json; do
+    [ -f "${report}" ] || continue
+    # upload-sarif combines a directory into one file; GitHub accepts at most
+    # 20 runs per file. Every report produced here contains exactly one run.
+    if [ "${count}" -eq 20 ]; then
+      batch=$((batch + 1))
+      count=0
+      mkdir -p "${staging}/uploads/${batch}"
+    fi
+    slug="$(basename "${report}" .json)"
+    convert_sarif "${report}" "${staging}/uploads/${batch}/${slug}.sarif" "${slug}"
+    count=$((count + 1))
+  done
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    printf 'batches=%s\n' "$(jq -cn --argjson last "${batch}" '[range(0; $last + 1) | tostring]')" \
+      >>"${GITHUB_OUTPUT}"
+  fi
+}
 
+collect_config_findings() {
   # Preserve report/profile identity while counting repeated findings.
-  local report profile
-  {
-    for report in "${report_dir}"/*.json; do
-      profile="$(basename "${report}" .json)"
-      jq --arg profile "${profile}" --arg severities "${SEVERITY}" '
-        if .SchemaVersion != 2
+  # With no reports, the unmatched glob makes jq fail on the missing input.
+  jq -n --arg severities "${SEVERITY}" '
+    [inputs
+      | (input_filename | split("/")[-1] | rtrimstr(".json")) as $profile
+      | if .SchemaVersion != 2
           or ((.ArtifactName | type) != "string")
           or ((.ArtifactType | type) != "string")
           or (.Results != null and ((.Results | type) != "array"))
@@ -234,12 +313,11 @@ collect_config_findings() {
             | map(.[0] + { count: length }))
           }
         end
-      ' "${report}"
-    done
-  } | jq -s '{
-    profiles: map(.profile),
-    findings: (map(.findings) | add // [])
-  }'
+    ] | {
+      profiles: map(.profile),
+      findings: (map(.findings) | add // [])
+    }
+  ' "$1"/*.json
 }
 
 # Compare semantic identities and occurrence counts, excluding line numbers.
@@ -290,7 +368,7 @@ gate_config_diff() (
 
   echo "::error::Trivy reported ${finding_count} new configuration finding(s) at ${SEVERITY}."
   jq -r '.[]
-    | "::error::[\(.severity)] \(.id) in \(.profile) (deploy/\(.target)): \(.title)"
+    | "::error::[\(.severity)] \(.id) in \(.profile) (\(.target)): \(.title)"
       + " (\(.new_count) new, \(.baseline_count) in baseline)"' \
     "${new_findings}"
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
@@ -299,7 +377,7 @@ gate_config_diff() (
       echo
       jq -r '.[]
         | "- **\(.severity)** `\(.id)` in `\(.profile)`"
-          + " (`deploy/\(.target)`): \(.title)"
+          + " (`\(.target)`): \(.title)"
           + " (\(.new_count) new, \(.baseline_count) in baseline)"' \
         "${new_findings}"
     } >>"${GITHUB_STEP_SUMMARY}"
@@ -341,6 +419,10 @@ case "${1:-}" in
     require_trivy
     gate
     ;;
+  prepare-sarif)
+    require_trivy
+    prepare_sarif
+    ;;
   gate-config-diff)
     shift
     [ $# -eq 2 ] || {
@@ -358,6 +440,7 @@ Usage:
   trivy-scan.sh config [--chart-ref <oci-ref>]...
   trivy-scan.sh images <image-ref> [<image-ref>...]
   trivy-scan.sh gate
+  trivy-scan.sh prepare-sarif
   trivy-scan.sh gate-config-diff <baseline-reports> <candidate-reports>
   trivy-scan.sh validate-ignore
 USAGE

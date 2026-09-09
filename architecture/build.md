@@ -444,46 +444,29 @@ implemented yet.
 Two entry points share `tasks/scripts/trivy-scan.sh`: a standalone analysis
 workflow and a pull-request change gate. Nix supplies Trivy, Helm and `yq`.
 
-### Standalone Scan
+The standalone workflow scans deployment configuration and supplied OCI
+references independently of release publication. Detailed JSON reports feed the
+differential gate; the summary and published SARIF consolidate configuration
+findings across profiles while preserving resource identity and affected profiles.
+Images and packaged charts retain separate identities based on their full
+references. Publication batches respect GitHub's limit of 20 SARIF runs.
 
-`.github/workflows/trivy-scan.yml` runs only from `workflow_dispatch` or
-`workflow_call` and takes OCI references as inputs, so it knows nothing about
-how an artifact was assembled or published. Neither release workflow calls it
-and no publication job depends on it; the intended consumer is a later
-analysis-orchestration workflow.
-
-A single job, `OpenShell / Trivy (informational)`, always scans the deployment
-configuration in its own checkout and adds OCI images and packaged charts when
-the caller supplies references. Trivy defaults to the runner's platform, so each
-platform of a multi-arch tag is scanned separately, and packaged charts need
-`helm pull` because Trivy has no OCI artifact target. Findings only warn, while
-a scanner that cannot run fails the job; `fail-on-findings` makes them fatal.
-
-The whole report directory uploads to Code Scanning in one operation, so each
-report carries a unique `automationDetails.id`, and SARIF URIs — which Trivy
-emits relative to the scanned target — are rewritten to repository-relative
-paths. Exceptions live in `.trivyignore.yaml`, passed with `--ignorefile`, and
-must use `**/<concrete-basename>` paths, the only shape both scan targets
-report; `validate-ignore` checks that structurally with `yq` and `jq`.
-
-### Pull-Request Change Gate
-
-`.github/workflows/trivy-changes.yml` runs on `pull_request` and `merge_group`;
-`workflow_dispatch` takes explicit base and head SHAs. It scans the baseline and
-candidate trees with the candidate's scanner and fails only on newly introduced
-`HIGH` or `CRITICAL` misconfigurations, behind a stable
-`OpenShell / Trivy Changes` status that succeeds when nothing relevant changed,
-so the check can be required unconditionally. It builds no image, so image CVEs
-need the standalone scan. Three invariants:
+The PR/merge-group gate scans base and candidate with the same scanner and rejects
+new `HIGH` or `CRITICAL` configuration findings. Its stable
+`OpenShell / Trivy Changes` status succeeds when nothing relevant changed.
+Image CVEs need the standalone scan. The reporting and gate invariants are:
 
 - A structurally invalid Trivy report is an error, not an empty finding set.
+- Scanner failures prevent publication of incomplete analyses; findings alone
+  do not prevent publishing complete reports.
 - Findings compare per profile against the same baseline profile, by semantic
   identity and count rather than line number; a profile absent from the baseline
   falls back to that identity's maximum across all profiles.
 - The candidate's ignore file is validated, but the baseline's policy applies to
   both scans, so an exemption takes effect only after merge.
 
-See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
+See [CI.md](../CI.md#artifact-scanning) for profiles, report paths, severity
+settings, exceptions, and the contributor and maintainer workflows.
 
 ## Docs Site
 

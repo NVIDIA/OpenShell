@@ -88,12 +88,28 @@ always scans deployment configuration and optionally scans supplied OCI image
 and chart references. It is not wired into a release workflow; a future analysis
 orchestrator can call it directly.
 
-The single job scans `deploy/`, every Helm CI values fixture, requested packaged
-charts, and both Linux architectures of each requested image. Findings are
-informational by default, but scanner failures still fail the job and
-`fail-on-findings` enables enforcement. Reports retain every severity; the gate
-uses `HIGH,CRITICAL` by default. Each SARIF report has a unique automation ID so
-the report directory can be uploaded in one operation.
+The scan job checks static deployment files (including Dockerfiles) once, both
+local charts with default values, the OpenShell `HELM_PROFILES` selected in
+`tasks/scripts/trivy-scan.sh`, requested packaged charts, and both Linux
+architectures of each requested image. The profile list includes development
+and E2E overlays for regression coverage, but excludes `values-spire-stack.yaml`,
+which belongs to the external SPIRE chart. A new OpenShell values fixture needs
+an explicit entry in this list to receive Trivy coverage.
+
+Findings are informational by default, but scanner failures still fail the job
+and `fail-on-findings` enables enforcement. Reports retain every severity; the
+gate uses `HIGH,CRITICAL` by default.
+
+All detailed JSON reports are retained in one artifact. The workflow summary and
+Code Scanning configuration report deduplicate the same rule, target, resource,
+and message across profiles, listing the affected profiles in each finding.
+Images and packaged charts retain separate analyses, keyed by full reference
+and platform so different registries or versions cannot overwrite each other.
+SARIF is generated only for publication. The upload job publishes
+only this consolidated configuration SARIF and the artifact analyses, in batches
+of at most 20 runs to respect GitHub's per-file limit. It also publishes complete
+reports when `fail-on-findings` makes the scan job fail; incomplete scans are
+retained as artifacts but are not published to Code Scanning.
 
 `.trivyignore.yaml` is reserved for false positives. Every entry must use at
 least one `**/<concrete-basename>` path; `yq` and `jq` validate this structure
@@ -105,7 +121,11 @@ Run the scanner locally with:
 nix develop --command tasks/scripts/trivy-scan.sh config
 nix develop --command tasks/scripts/trivy-scan.sh images ghcr.io/nvidia/openshell/gateway:dev
 nix develop --command tasks/scripts/trivy-scan.sh gate
+nix develop --command tasks/scripts/trivy-scan.sh prepare-sarif
 ```
+
+Use a fresh `TRIVY_REPORT_DIR` for each scan session. `prepare-sarif` creates
+`code-scanning/uploads/<batch>/`; only these directories are intended for upload.
 
 ### Pull-request change gate
 
@@ -115,9 +135,11 @@ changes deployment configuration or scanner inputs. It fails only for new
 
 The candidate ignore file is validated, but the baseline policy applies to both
 scans so a change cannot exempt its own finding. Existing profiles are compared
-independently; a new profile reuses the maximum known occurrence count. Invalid
-Trivy reports fail closed. Image package and operating-system CVEs remain the
-responsibility of the standalone scan.
+independently using the detailed reports, before any presentation deduplication;
+a new profile reuses the maximum known occurrence count. A selected fixture
+missing from the candidate fails the scan; a new fixture absent from the base
+has no baseline profile. Invalid Trivy reports fail closed. Image package and
+operating-system CVEs remain the responsibility of the standalone scan.
 
 ## Commit signing
 

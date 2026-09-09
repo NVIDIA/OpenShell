@@ -62,6 +62,8 @@ jobs:
             flake.lock
             tasks/scripts/trivy-scan.sh
             tasks/scripts/trivy-scan-test.sh
+            tasks/scripts/trivy-config-report.jq
+            .github/workflows/trivy-scan.yml
             .github/workflows/trivy-changes.yml
 
   scan:

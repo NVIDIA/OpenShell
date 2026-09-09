@@ -80,10 +80,12 @@ jobs:
     name: OpenShell / Trivy (informational)
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    outputs:
+      sarif-batches: ${{ steps.sarif.outputs.batches }}
+      artifact-id: ${{ steps.reports.outputs.artifact-id }}
     permissions:
       contents: read
       packages: read
-      security-events: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -99,6 +101,9 @@ jobs:
         uses: ./.github/actions/setup-nix
         with:
           cachix-auth-token: ${{ github.event_name != 'pull_request' && secrets.CACHIX_AUTH_TOKEN || '' }}
+
+      - name: Test scan reporting
+        run: tasks/scripts/trivy-scan-test.sh
 
       - name: Scan configuration
         id: config
@@ -128,7 +133,8 @@ jobs:
             tasks/scripts/trivy-scan.sh images "${refs[@]}"
           fi
 
-      - name: Upload SARIF to Code Scanning
+      - name: Prepare consolidated SARIF uploads
+        id: sarif
         if: >-
           ${{
             !cancelled()
@@ -136,11 +142,10 @@ jobs:
             && steps.images.conclusion == 'success'
             && inputs.upload-sarif
           }}
-        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
-        with:
-          sarif_file: reports/trivy
+        run: tasks/scripts/trivy-scan.sh prepare-sarif
 
       - name: Upload reports
+        id: reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -174,3 +179,41 @@ jobs:
               ;;
             *) echo "::error::Trivy could not evaluate the reports (exit $status)."; exit "$status" ;;
           esac
+
+  upload-sarif:
+    name: Publish Trivy SARIF (${{ matrix.batch }})
+    needs: scan
+    # Findings may fail the scan job after reports are prepared. Publish those
+    # complete results too, but never publish an incomplete/failed scan.
+    if: >-
+      ${{
+        !cancelled()
+        && inputs.upload-sarif
+        && needs.scan.outputs.sarif-batches != ''
+        && needs.scan.outputs.artifact-id != ''
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        batch: ${{ fromJSON(needs.scan.outputs.sarif-batches) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.scan.outputs.artifact-id }}
+          merge-multiple: true
+          path: reports/trivy
+
+      # One configuration run, plus one run per image/platform or packaged
+      # chart. Each batch holds at most GitHub's limit of 20 SARIF runs.
+      - uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          sarif_file: reports/trivy/code-scanning/uploads/${{ matrix.batch }}
