@@ -76,7 +76,6 @@ run = [
   "cargo test --workspace --exclude openshell-server",
   "cargo test -p openshell-server --features test-support",
   "cargo test --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml",
-  "cargo test --manifest-path examples/supervisor-middleware-protocol/Cargo.toml",
 ]
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-precommit native"
 hide = true

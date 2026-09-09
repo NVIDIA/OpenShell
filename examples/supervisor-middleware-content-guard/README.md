@@ -8,7 +8,7 @@ SPDX-License-Identifier: Apache-2.0
 > [!WARNING]
 > Supervisor middleware is a research preview. Its policy and service contracts may change without compatibility guarantees. Use it only to prototype and evaluate middleware integrations.
 
-This configured-literal guard applies the same case-sensitive terms to UTF-8 HTTP request bodies, complete HTTP response bodies, and client WebSocket text messages. It is not a general PII detector. See [the protocol example](../supervisor-middleware-protocol/) for demonstrations of response modes and framing.
+This configured-literal guard applies the same case-sensitive terms to UTF-8 HTTP request bodies, complete HTTP response bodies, and client WebSocket text messages. It is not a general PII detector.
 
 > [!WARNING]
 > This intentionally simple implementation demonstrates the supervisor middleware service contract. It is not a complete or reliable content guard and must not be used as a security control. It handles only UTF-8 HTTP request and response bodies and WebSocket text messages with case-sensitive literal terms, merges overlapping literal match ranges before redaction, and does not address encodings, transformations, normalization, binary WebSocket messages, upstream-to-client messages, or adversarial inputs that a production content guard must handle.

@@ -166,8 +166,7 @@ operator-owned registration names identify implementations.
 The configured-literal content-guard example shares matching semantics across
 request bodies, complete response bodies, and client WebSocket text messages.
 It requires whole-body response inspection and returns a middleware failure
-when that mode is unavailable. The separate protocol example demonstrates each
-V1 hook, response framing modes, unit-local transforms, and trailer mutation.
+when that mode is unavailable.
 
 Built-ins run in-process against a borrowed view of the chain's current HTTP
 request state. Operator services retain the bounded protobuf/gRPC contract, and

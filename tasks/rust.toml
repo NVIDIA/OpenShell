@@ -16,7 +16,6 @@ run = [
   "cargo clippy --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings",
   "cargo check --manifest-path examples/governance-interceptor/Cargo.toml --all-targets",
   "cargo check --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets",
-  "cargo check --manifest-path examples/supervisor-middleware-protocol/Cargo.toml --all-targets",
 ]
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 lint native"
 hide = true
@@ -28,7 +27,6 @@ run = [
   "cargo fmt --manifest-path e2e/rust/Cargo.toml --all",
   "cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all",
   "cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all",
-  "cargo fmt --manifest-path examples/supervisor-middleware-protocol/Cargo.toml --all",
 ]
 hide = true
 
@@ -39,7 +37,6 @@ run = [
   "cargo fmt --manifest-path e2e/rust/Cargo.toml --all -- --check",
   "cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all -- --check",
   "cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all -- --check",
-  "cargo fmt --manifest-path examples/supervisor-middleware-protocol/Cargo.toml --all -- --check",
 ]
 hide = true
 
