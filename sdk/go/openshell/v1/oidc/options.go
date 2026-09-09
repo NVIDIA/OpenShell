@@ -33,6 +33,7 @@ type loginConfig struct {
 	scopesSet      bool
 	callbackPort   int
 	timeout        time.Duration
+	timeoutSet     bool
 	keyboardFlow   bool
 	inMemory       bool
 	displayFunc    func(verificationURL, userCode string)
@@ -48,12 +49,14 @@ type loginConfig struct {
 // applyDefaults fills in default values for fields that were not set
 // by any option function.
 func (c *loginConfig) applyDefaults() {
-	if len(c.scopes) == 0 {
+	// Check set-ness, not the zero value, so an explicitly-set empty scope
+	// list or zero timeout is honored instead of being replaced by defaults.
+	if !c.scopesSet {
 		// Deep copy to avoid callers mutating the package-level slice.
 		c.scopes = make([]string, len(defaultScopes))
 		copy(c.scopes, defaultScopes)
 	}
-	if c.timeout == 0 {
+	if !c.timeoutSet {
 		c.timeout = defaultTimeout
 	}
 }
@@ -125,6 +128,7 @@ func WithCallbackPort(port int) LoginOption {
 func WithTimeout(d time.Duration) LoginOption {
 	return func(c *loginConfig) {
 		c.timeout = d
+		c.timeoutSet = true
 	}
 }
 

@@ -308,6 +308,40 @@ func TestClientCredentialsAuthLateFlightReusesCachedToken(t *testing.T) {
 	assert.Equal(t, "cached-token", accessToken)
 }
 
+// A zero timeout means "no deadline". The exchange context must not be born
+// expired, so the token exchange should still succeed.
+func TestClientCredentialsAuthZeroTimeoutHasNoDeadline(t *testing.T) {
+	resetDiscoveryCache()
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/.well-known/openid-configuration" {
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"issuer":                 server.URL,
+				"authorization_endpoint": server.URL + "/authorize",
+				"token_endpoint":         server.URL + "/token",
+			})
+			return
+		}
+		_, _ = w.Write([]byte(tokenResponseJSON("token", "", 3600)))
+	}))
+	t.Cleanup(server.Close)
+
+	auth, err := NewClientCredentialsAuth(
+		WithIssuer(server.URL),
+		WithClientID("client"),
+		WithClientSecret("secret"),
+		WithTimeout(0), // explicitly no timeout
+	)
+	require.NoError(t, err)
+
+	// The explicit zero timeout must be preserved (not replaced by the default).
+	require.Zero(t, auth.(*clientCredentialsAuth).cfg.timeout)
+
+	metadata, err := auth.GetRequestMetadata(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer token", metadata["authorization"])
+}
+
 func TestClientCredentialsAuthCancellationDoesNotPoisonSharedExchange(t *testing.T) {
 	resetDiscoveryCache()
 	var server *httptest.Server
