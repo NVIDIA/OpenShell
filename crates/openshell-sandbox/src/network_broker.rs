@@ -187,6 +187,7 @@ fn register_dns_socket(
 
 #[derive(Clone)]
 struct NotificationQueues {
+    protected_control_port: Option<u16>,
     accept_registrar: crate::accept_interrupt::AcceptRegistrar,
     identity_resolver: ProcfsIdentityResolver,
     pending: mpsc::Sender<PendingTcpOpen>,
@@ -207,8 +208,11 @@ pub struct NetworkBroker {
 }
 
 impl NetworkBroker {
-    pub(crate) fn start(listener: NotificationListener) -> io::Result<Self> {
-        Self::start_with_dns_address(listener, DNS_RELAY_ADDRESS)
+    pub(crate) fn start(
+        listener: NotificationListener,
+        protected_control_port: Option<u16>,
+    ) -> io::Result<Self> {
+        Self::start_with_dns_address(listener, DNS_RELAY_ADDRESS, protected_control_port)
     }
 
     #[cfg(any(test, feature = "perf-harness"))]
@@ -216,19 +220,27 @@ impl NetworkBroker {
         Self::start_with_dns_address(
             listener,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            None,
         )
     }
 
     fn start_with_dns_address(
         listener: NotificationListener,
         dns_address: SocketAddr,
+        protected_control_port: Option<u16>,
     ) -> io::Result<Self> {
-        Self::start_with_decision_timeout(listener, dns_address, NETWORK_DECISION_TIMEOUT)
+        Self::start_with_decision_timeout(
+            listener,
+            dns_address,
+            protected_control_port,
+            NETWORK_DECISION_TIMEOUT,
+        )
     }
 
     fn start_with_decision_timeout(
         listener: NotificationListener,
         dns_address: SocketAddr,
+        protected_control_port: Option<u16>,
         decision_timeout: Duration,
     ) -> io::Result<Self> {
         let listener = Arc::new(listener);
@@ -244,6 +256,7 @@ impl NetworkBroker {
         let dns_relay = start_dns_relay(dns_address, pending_dns_tx)?;
         let dns_address = dns_relay.address;
         let queues = NotificationQueues {
+            protected_control_port,
             accept_registrar: accept_monitor.registrar(),
             identity_resolver: ProcfsIdentityResolver::for_pid_namespace(),
             pending: pending_tx,
@@ -616,6 +629,19 @@ fn create_socket(
     Ok(())
 }
 
+fn reject_protected_control_destination(
+    destination: SocketAddr,
+    protected_port: Option<u16>,
+) -> io::Result<()> {
+    // Reserve the listener's port across loopback aliases, IPv4-mapped IPv6,
+    // and wildcard Pod listeners. A workload must never reach its control
+    // endpoint, including through a supervisor-authorized external relay.
+    if protected_port == Some(destination.port()) {
+        return Err(io::Error::from_raw_os_error(libc::EACCES));
+    }
+    Ok(())
+}
+
 fn connect_socket(
     registry: Arc<Mutex<SocketRegistry>>,
     listener: Arc<NotificationListener>,
@@ -628,6 +654,7 @@ fn connect_socket(
         active_opens,
         identity_resolver,
         decision_timeout,
+        protected_control_port,
         ..
     } = queues;
     let notification_started = Instant::now();
@@ -661,6 +688,7 @@ fn connect_socket(
     }
     let destination =
         read_socket_addr(notification.tid, notification.args[1], notification.args[2])?;
+    reject_protected_control_destination(destination, protected_control_port)?;
     let (kind, socket_identity, nonblocking) = {
         let registry = lock(&registry);
         let entry = registry.resolve(notification.tid, fd)?;
@@ -1771,6 +1799,7 @@ mod tests {
         let broker = NetworkBroker::start_with_decision_timeout(
             listener,
             "127.0.0.1:0".parse().unwrap(),
+            None,
             Duration::from_millis(50),
         )
         .unwrap();
@@ -1873,6 +1902,58 @@ mod tests {
             query.complete(Ok(Vec::new())).unwrap();
             child.join().unwrap().unwrap();
         }
+    }
+
+    #[test]
+    fn protected_control_port_rejects_loopback_aliases_and_pod_addresses() {
+        for address in [
+            "127.0.0.1:7443",
+            "127.0.0.2:7443",
+            "[::1]:7443",
+            "[::ffff:127.0.0.1]:7443",
+            "10.42.0.8:7443",
+        ] {
+            assert_eq!(
+                reject_protected_control_destination(address.parse().unwrap(), Some(7443))
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EACCES)
+            );
+        }
+        assert!(
+            reject_protected_control_destination("127.0.0.1:8080".parse().unwrap(), Some(7443))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn workload_cannot_fill_control_listener_with_loopback_connections() {
+        let control = TcpListener::bind("127.0.0.1:0").unwrap();
+        control.set_nonblocking(true).unwrap();
+        let address = control.local_addr().unwrap();
+        let (launcher, listener) =
+            openshell_isolation_interface::linux::workload_launcher::start().unwrap();
+        let _broker = NetworkBroker::start_with_dns_address(
+            listener,
+            "127.0.0.1:0".parse().unwrap(),
+            Some(address.port()),
+        )
+        .unwrap();
+        launcher
+            .execute(move || -> io::Result<()> {
+                for _ in 0..160 {
+                    let error =
+                        TcpStream::connect(address).expect_err("control port must be unreachable");
+                    assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+                }
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            control.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]

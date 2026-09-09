@@ -434,17 +434,6 @@ pub fn enforce(prepared: PreparedRuleset) -> Result<()> {
     Ok(())
 }
 
-/// Legacy single-phase apply. Kept for non-Linux platforms and tests.
-/// On Linux, callers should use [`prepare`] + [`enforce`] for correct
-/// privilege ordering.
-#[allow(dead_code)] // Retained for backward compat; live callers use prepare+enforce.
-pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
-    if let Some(prepared) = prepare(policy, workdir)? {
-        enforce(prepared)?;
-    }
-    Ok(())
-}
-
 /// Tailor a rule's access mask to the inode referenced by its already-open FD.
 ///
 /// Landlock directory-only rights such as `ReadDir` are invalid for regular
