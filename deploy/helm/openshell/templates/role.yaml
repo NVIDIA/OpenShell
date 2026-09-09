@@ -1,5 +1,5 @@
 {{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" -}}
-{{- if eq $workspaceMode "shared" }}
+{{- if and (eq $workspaceMode "shared") (include "openshell.workspaceResourcesEnabled" .) }}
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 apiVersion: rbac.authorization.k8s.io/v1
@@ -33,7 +33,7 @@ rules:
       - watch
   # Per-sandbox identity: TokenReview authenticates the projected token from
   # the configured sandbox service account, then the gateway resolves the
-  # returned pod name and UID to the pod's `openshell.io/sandbox-id`
+  # returned pod name and UID to the pod's `openshell.ai/sandbox-id`
   # annotation. patch is intentionally NOT granted — the annotation is set
   # once at pod create and must remain immutable for the lifetime of the
   # sandbox.

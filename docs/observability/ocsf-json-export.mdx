@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "OCSF JSON Export"
 sidebar-title: "OCSF JSON Export"
-description: "How to enable full OCSF JSON logging for SIEM integration, compliance, and structured analysis."
+description: "How to enable full OCSF JSON logging for SIEM integration, compliance, and structured analysis. Includes schema version downgrade for AWS Security Lake, Splunk, and CrowdStrike compatibility."
 keywords: "Generative AI, Cybersecurity, OCSF, JSON, SIEM, Compliance, Observability"
 ---
 
@@ -168,14 +168,66 @@ The shorthand log renders this as:
 OCSF API:INFERENCE [INFO] Success claude-haiku-4-5-20251001 via https://api.anthropic.com/v1 701ms [POST /v1/messages]
 ```
 
+## SIEM Schema Version Compatibility
+
+OpenShell emits OCSF v1.8.0 events internally, but many SIEMs only support older schema versions. The `ocsf_schema_version` setting tells the JSONL layer to downgrade events before writing, stripping fields and profiles that don't exist in the target version.
+
+Set the target version globally:
+
+```shell
+openshell settings set --global --key ocsf_schema_version --value "1.1"
+```
+
+Or per-sandbox:
+
+```shell
+openshell settings set my-sandbox --key ocsf_schema_version --value "1.3"
+```
+
+The setting takes effect on the next poll cycle, by default every 10 seconds. No sandbox restart is required.
+
+Supported target versions are `1.1` and `1.3`. When set, the JSONL layer applies the following transformations:
+
+- Strips fields added after the target version: `ai_model`, `container`, `observation_point_id`
+- Removes unknown profile names from `metadata.profiles`: `ai_operation`, `container`
+- Rewrites `metadata.version` to match the target version
+
+The shorthand log output is unaffected. The internal event model stays at v1.8.0; only the serialized JSONL is transformed.
+
+When unset or empty, no downgrade is applied and events are written at the current schema version.
+
+| SIEM | Required OCSF Version | `ocsf_schema_version` Value |
+|---|---|---|
+| AWS Security Lake | v1.1.0 | `1.1` |
+| Splunk CIM Add-On | v1.1-v1.3 | `1.1` or `1.3` |
+| CrowdStrike FDR | v1.5.0 | Not yet supported |
+| Datadog Cloud SIEM | v1.5.0 (selectable) | Not yet supported |
+
+<Warning>
+Downgrading is lossy. The `ai_model` field and `ai_operation` profile are stripped for v1.1 and v1.3 targets, so AI model attribution is not present in downgraded events. If your audit workflow requires knowing which model handled a request, use the full schema version (leave `ocsf_schema_version` unset). OpenShell supports OCSF v1.8.0 natively; upgrade your SIEM's OCSF schema if you need AI attribution alongside backward-compatible ingestion.
+</Warning>
+
+Downgraded events include a `downgraded_from` marker in the `unmapped` object so auditors can distinguish "no model was involved" from "model attribution was stripped":
+
+```json
+{
+  "unmapped": {
+    "downgraded_from": "1.8.0"
+  }
+}
+```
+
+The core OCSF event structure (class UIDs, activity IDs, network and HTTP fields) is identical across v1.1 through v1.8. The stripped fields are all profile-gated additions.
+
 ## Integration with External Tools
 
 The JSONL file can be shipped to any tool that accepts OCSF-formatted data:
 
 | Tool | Integration Path |
 |---|---|
-| Splunk | Use the [Splunk OCSF Add-on](https://splunkbase.splunk.com/app/6943) to ingest OCSF JSONL files. |
-| Amazon Security Lake | OCSF is the native schema for Security Lake. |
+| Splunk | Use the [Splunk OCSF Add-on](https://splunkbase.splunk.com/app/6943) to ingest OCSF JSONL files. Set `ocsf_schema_version` to `1.3` for CIM Add-On compatibility. |
+| Amazon Security Lake | OCSF is the native schema for Security Lake. Set `ocsf_schema_version` to `1.1` for v1.1.0 compatibility. |
+| CrowdStrike FDR | Ship JSONL files to Falcon Data Replicator. v1.5 downgrade target is not yet supported. |
 | Elastic | Use Filebeat to ship JSONL files with the OCSF field mappings. |
 | Custom pipelines | Parse the JSONL file with `jq`, Python, or any JSON-capable tool. |
 
@@ -188,7 +240,7 @@ cat /var/log/openshell-ocsf.2026-04-01.log | \
 
 ## Relationship to Shorthand Logs
 
-The shorthand format in `openshell.YYYY-MM-DD.log` and the JSON format in `openshell-ocsf.YYYY-MM-DD.log` are derived from the same OCSF events. The shorthand is a human-readable projection; the JSON is the complete record. Both are generated at the same time from the same event data.
+The shorthand format in `openshell.YYYY-MM-DD.log` and the JSON format in `openshell-ocsf.YYYY-MM-DD.log` are derived from the same OCSF events. The shorthand is a human-readable projection; the JSON is the full structured record when no schema downgrade is configured. When `ocsf_schema_version` is set, the JSON export is a lossy projection of the internal event model. Both formats are generated at the same time from the same event data.
 
 The shorthand log is always active. The JSON export is opt-in through `ocsf_json_enabled`.
 

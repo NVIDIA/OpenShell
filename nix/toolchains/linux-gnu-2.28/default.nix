@@ -31,7 +31,10 @@ let
       pkgs.overrideCC pkgs.stdenv (
         pkgs.wrapCCWith {
           cc = pkgs.gccNGPackages.gcc-unwrapped.overrideAttrs (old: {
-            configureFlags = old.configureFlags ++ [ "--disable-fixincludes" ];
+            configureFlags = old.configureFlags ++ [
+              "--disable-fixincludes"
+              "--with-native-system-header-dir=/include"
+            ];
           });
           bintools = pkgs.wrapBintoolsWith {
             bintools = pkgs.binutils-unwrapped;

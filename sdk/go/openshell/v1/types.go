@@ -20,6 +20,7 @@ const (
 	SandboxStopping     = types.SandboxStopping
 	SandboxStopped      = types.SandboxStopped
 	SandboxStarting     = types.SandboxStarting
+	SandboxCompleted    = types.SandboxCompleted
 )
 
 // EventType classifies watch events.

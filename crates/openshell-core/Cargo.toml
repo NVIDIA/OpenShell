@@ -27,6 +27,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 ipnet = "2"
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 base64 = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 reqwest = { workspace = true, features = ["blocking", "rustls-tls-native-roots"], optional = true }
@@ -53,6 +55,7 @@ protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+rcgen = { workspace = true }
 
 [lints]
 workspace = true

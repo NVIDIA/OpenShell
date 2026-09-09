@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+set -euo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  resolve-gator-review-threads LEDGER.json FINDING_ID [FINDING_ID ...]
+EOF
+}
+
+[[ "$#" -ge 2 && -r "$1" ]] || {
+    usage
+    exit 2
+}
+
+ledger="$1"
+shift
+
+jq -e '
+    .schema_version == 4 and
+    (.threads | type == "array")
+' "$ledger" >/dev/null || {
+    echo "invalid gator review feedback ledger" >&2
+    exit 2
+}
+
+mutation='mutation ResolveGatorReviewThread($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) {
+    thread {
+      id
+      isResolved
+    }
+  }
+}'
+
+finding_ids=("$@")
+thread_ids=()
+resolution_states=()
+declare -A seen_finding_ids=()
+
+# Validate the complete request before performing the first GitHub write so a
+# malformed or ambiguous later ID cannot leave a partially resolved batch.
+for finding_id in "${finding_ids[@]}"; do
+    [[ "$finding_id" =~ ^(GATOR-[0-9A-Fa-f]{8}-[0-9]{2}|gator-inline-[0-9]+)$ ]] || {
+        echo "invalid gator finding ID: $finding_id" >&2
+        exit 2
+    }
+    [[ -z "${seen_finding_ids[$finding_id]:-}" ]] || {
+        echo "duplicate gator finding ID: $finding_id" >&2
+        exit 2
+    }
+    seen_finding_ids["$finding_id"]=1
+
+    matching_threads="$(jq -c --arg finding_id "$finding_id" '
+        [
+            .threads[]
+            | select(.finding_id == $finding_id)
+        ]
+    ' "$ledger")"
+    match_count="$(jq 'length' <<< "$matching_threads")"
+    [[ "$match_count" -eq 1 ]] || {
+        echo "expected exactly one Gator thread for $finding_id; found $match_count" >&2
+        exit 1
+    }
+
+    first_body="$(jq -r '.[0].comments[0].body // empty' <<< "$matching_threads")"
+    [[ "$first_body" == '> **gator-agent**'* ]] || {
+        echo "refusing to resolve non-Gator thread for $finding_id" >&2
+        exit 1
+    }
+
+    thread_id="$(jq -r '.[0].thread_id // empty' <<< "$matching_threads")"
+    [[ -n "$thread_id" ]] || {
+        echo "Gator thread ID missing for $finding_id" >&2
+        exit 1
+    }
+
+    thread_ids+=("$thread_id")
+    resolution_states+=("$(jq -r '.[0].is_resolved' <<< "$matching_threads")")
+done
+
+for ((i = 0; i < ${#finding_ids[@]}; i++)); do
+    finding_id="${finding_ids[$i]}"
+    thread_id="${thread_ids[$i]}"
+    if [[ "${resolution_states[$i]}" == "true" ]]; then
+        echo "Gator review thread already resolved: $finding_id"
+        continue
+    fi
+
+    response="$(gh api graphql \
+        -f query="$mutation" \
+        -f threadId="$thread_id")"
+    jq -e --arg thread_id "$thread_id" '
+        .data.resolveReviewThread.thread
+        | .id == $thread_id and .isResolved == true
+    ' <<< "$response" >/dev/null || {
+        echo "GitHub did not confirm resolution for $finding_id ($thread_id)" >&2
+        exit 1
+    }
+
+    echo "Resolved Gator review thread: $finding_id"
+done

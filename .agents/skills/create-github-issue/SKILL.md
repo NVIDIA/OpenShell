@@ -1,6 +1,8 @@
 ---
 name: create-github-issue
 description: Create GitHub issues using the gh CLI. Use when the user wants to create a new issue, report a bug, request a feature, or create a task in GitHub. Trigger keywords - create issue, new issue, file bug, report bug, feature request, github issue.
+metadata:
+  internal: true
 ---
 
 # Create GitHub Issue

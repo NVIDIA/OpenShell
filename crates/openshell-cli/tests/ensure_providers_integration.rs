@@ -81,10 +81,24 @@ impl TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn begin_rootfs_tar_staging(
+        &self,
+        _request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,
+    ) -> Result<Response<openshell_core::proto::BeginRootfsTarStagingResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn report_main_process_exit(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
     ) -> Result<Response<openshell_core::proto::ReportMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn finalize_main_process_exit(
+        &self,
+        _request: tonic::Request<openshell_core::proto::FinalizeMainProcessExitRequest>,
+    ) -> Result<Response<openshell_core::proto::FinalizeMainProcessExitResponse>, Status> {
         Err(Status::unimplemented("not used by this test server"))
     }
 
@@ -146,6 +160,8 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<ListSandboxesResponse>, Status> {
         Ok(Response::new(ListSandboxesResponse::default()))
     }
+
+    unimplemented_sandbox_template_rpcs!();
 
     async fn list_sandbox_providers(
         &self,
@@ -307,14 +323,30 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
     ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
+        let profiles = openshell_providers::builtin_profiles()
+            .iter()
+            .map(openshell_providers::ProviderTypeProfile::to_proto)
+            .collect();
+        Ok(Response::new(
+            openshell_core::proto::ListProviderProfilesResponse { profiles },
+        ))
     }
 
     async fn get_provider_profile(
         &self,
-        _request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
+        request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
     ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
+        let id = request.into_inner().id;
+        let profile = openshell_providers::builtin_profiles()
+            .iter()
+            .find(|profile| profile.id == id)
+            .ok_or_else(|| Status::not_found("provider profile not found"))?
+            .to_proto();
+        Ok(Response::new(
+            openshell_core::proto::ProviderProfileResponse {
+                profile: Some(profile),
+            },
+        ))
     }
 
     async fn import_provider_profiles(
@@ -843,7 +875,7 @@ async fn explicit_provider_name_errors_for_unrecognised_name() {
         "error should mention the name: {msg}"
     );
     assert!(
-        msg.contains("not a recognized provider type"),
+        msg.contains("no provider profile"),
         "error should explain why it failed: {msg}"
     );
 }

@@ -1,0 +1,61 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: workspace namespace resources
+templates:
+  - templates/serviceaccount.yaml
+  - templates/role.yaml
+  - templates/rolebinding.yaml
+  - templates/networkpolicy.yaml
+release:
+  name: tenant-a
+  namespace: app-a
+
+tests:
+  - it: creates the workspace role in the release namespace
+    template: templates/role.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.namespace
+          value: app-a
+
+  - it: binds the shared gateway service account
+    template: templates/rolebinding.yaml
+    set:
+      gateway.serviceAccount.name: shared-gateway
+      gateway.serviceAccount.namespace: openshell-system
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: app-a
+      - equal:
+          path: subjects[0].name
+          value: shared-gateway
+      - equal:
+          path: subjects[0].namespace
+          value: openshell-system
+
+  - it: selects gateway pods in the gateway namespace
+    template: templates/networkpolicy.yaml
+    set:
+      gateway.serviceAccount.namespace: openshell-system
+      gateway.networkPolicy.podSelector:
+        app.kubernetes.io/name: openshell
+        app.kubernetes.io/instance: central
+    asserts:
+      - equal:
+          path: spec.ingress[0].from[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"]
+          value: openshell-system
+      - equal:
+          path: spec.ingress[0].from[0].podSelector.matchLabels["app.kubernetes.io/instance"]
+          value: central
+
+  - it: supports a pre-existing sandbox service account
+    template: templates/serviceaccount.yaml
+    set:
+      sandboxServiceAccount.create: false
+    asserts:
+      - hasDocuments:
+          count: 0

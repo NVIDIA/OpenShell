@@ -1,0 +1,98 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Dependency Review
+
+on:
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+    inputs:
+      base_sha:
+        description: Base commit SHA to compare
+        required: true
+        type: string
+      head_sha:
+        description: Head commit SHA to compare
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Dependency Review (informational)
+    runs-on: ubuntu-latest
+    env:
+      BASE_REF: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || inputs.base_sha }}
+      HEAD_REF: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || inputs.head_sha }}
+    steps:
+      - name: Check Dependency Graph availability
+        id: preflight
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const shaPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+            const baseRef = process.env.BASE_REF;
+            const headRef = process.env.HEAD_REF;
+
+            if (!shaPattern.test(baseRef) || !shaPattern.test(headRef)) {
+              core.setFailed("Dependency Review requires base and head commit SHAs.");
+              return;
+            }
+
+            try {
+              await github.request(
+                "GET /repos/{owner}/{repo}/dependency-graph/compare/{basehead}",
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  basehead: `${baseRef}...${headRef}`,
+                  headers: {
+                    "X-GitHub-Api-Version": "2022-11-28",
+                  },
+                },
+              );
+              core.setOutput("available", "true");
+            } catch (error) {
+              const status = error.status;
+              if (status === 403 || status === 404) {
+                core.setOutput("available", "false");
+                core.warning(
+                  `GitHub Dependency Graph is unavailable (HTTP ${status}); Dependency Review is skipped.`,
+                );
+                await core.summary
+                  .addHeading("Dependency Review", 3)
+                  .addRaw(`GitHub Dependency Graph is unavailable (HTTP ${status}).`, true)
+                  .addRaw(
+                    "The informational review will start automatically once the repository feature is available.",
+                    true,
+                  )
+                  .write();
+                return;
+              }
+
+              const statusSuffix = status ? ` with HTTP ${status}` : "";
+              core.setFailed(
+                `Dependency Graph preflight failed${statusSuffix}: ${error.message}`,
+              );
+            }
+
+      - name: Review dependency changes
+        if: steps.preflight.outputs.available == 'true'
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          base-ref: ${{ env.BASE_REF }}
+          head-ref: ${{ env.HEAD_REF }}
+          fail-on-severity: high
+          fail-on-scopes: runtime, development, unknown
+          warn-only: true
+          comment-summary-in-pr: never
+          license-check: false
+          show-openssf-scorecard: false

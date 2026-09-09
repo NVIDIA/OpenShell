@@ -11,6 +11,9 @@ use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::setting_value;
 use openshell_core::settings::{self, SettingValueKind};
+use openshell_providers::{
+    DiscoveredProvider, ProviderTypeProfile, RealDiscoveryContext, discover_from_profile,
+};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
@@ -350,9 +353,9 @@ pub enum ProviderKeyField {
     Name,
     /// Focused credential row for known types (index via `cred_cursor`).
     Credential,
-    /// Custom env var name (generic / no-known-env-vars types only).
+    /// Custom env var name (legacy no-known-env-vars types only).
     EnvVarName,
-    /// Custom env var value (generic / no-known-env-vars types only).
+    /// Custom env var value (legacy no-known-env-vars types only).
     GenericValue,
     /// Browsing/deleting existing config entries (Up/Down/Ctrl+D).
     ConfigList,
@@ -385,14 +388,16 @@ pub struct CreateProviderForm {
     pub config_key_input: String,
     /// Config value being entered.
     pub config_value_input: String,
-    /// For generic / types with no known env vars: custom env var name.
+    /// For legacy types with no known env vars: custom env var name.
     pub generic_env_name: String,
-    /// For generic / types with no known env vars: custom value.
+    /// For legacy types with no known env vars: custom value.
     pub generic_value: String,
     /// Which field is focused in the key entry form.
     pub key_field: ProviderKeyField,
-    /// True when the provider type has no known env vars (generic, outlook).
+    /// True when the selected profile has no accepted stored credential keys.
     pub is_generic: bool,
+    /// True when the selected profile permits creation without stored credentials.
+    pub allows_empty_credentials: bool,
     /// Status message (errors, validation).
     pub status: Option<String>,
     /// Warning shown at top of `EnterKey` modal (e.g. autodetect failure).
@@ -403,6 +408,12 @@ pub struct CreateProviderForm {
     pub create_result: Option<Result<String, String>>,
     /// Credentials to send (filled by autodetect or built from form fields on submit).
     pub discovered_credentials: Option<HashMap<String, String>>,
+}
+
+fn apply_discovered_provider(form: &mut CreateProviderForm, discovered: DiscoveredProvider) {
+    form.discovered_credentials = Some(discovered.credentials);
+    form.config = discovered.config.into_iter().collect();
+    form.config_cursor = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -590,7 +601,7 @@ pub struct App {
     pub pending_workspace_refresh: bool,
 
     // Provider list
-    pub providers_v2_enabled: bool,
+    pub provider_profiles: Vec<openshell_core::proto::ProviderProfile>,
     pub provider_entries: Vec<ProviderListEntry>,
     pub provider_names: Vec<String>,
     pub provider_types: Vec<String>,
@@ -711,6 +722,13 @@ pub struct App {
     pub draft_viewport_height: usize,
     /// When true, the detail popup is shown for the selected draft chunk.
     pub draft_detail_open: bool,
+    /// Scroll offset, in rendered rows, of the draft detail popup body.
+    pub draft_detail_scroll: usize,
+    /// Total rows of detail-popup content (set by the draw pass).
+    pub draft_detail_rows: usize,
+    /// Visible rows in the detail-popup body, excluding the pinned hint row
+    /// (set by the draw pass).
+    pub draft_detail_body_height: usize,
 
     /// Per-sandbox count of pending draft recommendations (parallel to `sandbox_names`).
     pub sandbox_draft_counts: Vec<usize>,
@@ -963,7 +981,7 @@ impl App {
             all_workspaces: false,
             workspace_names: Vec::new(),
             pending_workspace_refresh: false,
-            providers_v2_enabled: false,
+            provider_profiles: Vec::new(),
             provider_entries: Vec::new(),
             provider_names: Vec::new(),
             provider_types: Vec::new(),
@@ -1032,6 +1050,9 @@ impl App {
             draft_scroll: 0,
             draft_viewport_height: 0,
             draft_detail_open: false,
+            draft_detail_scroll: 0,
+            draft_detail_rows: 0,
+            draft_detail_body_height: 0,
             sandbox_draft_counts: Vec::new(),
             pending_draft_approve: false,
             pending_draft_reject: false,
@@ -1386,6 +1407,9 @@ impl App {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
             }
+            KeyCode::Char('w') => {
+                self.cycle_workspace();
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.provider_count > 0 && self.provider_selected < self.provider_count - 1 {
                     self.provider_selected += 1;
@@ -1400,7 +1424,7 @@ impl App {
                     self.overflow_focus_up();
                 }
             }
-            KeyCode::Char('c') if !self.providers_v2_enabled => {
+            KeyCode::Char('c') => {
                 if self.all_workspaces {
                     self.status_text =
                         "Switch to a specific workspace to create providers.".to_string();
@@ -1413,10 +1437,10 @@ impl App {
                 self.pending_provider_get = true;
             }
             // Open update form for the selected provider.
-            KeyCode::Char('u') if self.provider_count > 0 && !self.providers_v2_enabled => {
+            KeyCode::Char('u') if self.provider_count > 0 => {
                 self.open_update_provider_form();
             }
-            KeyCode::Char('d') if self.provider_count > 0 && !self.providers_v2_enabled => {
+            KeyCode::Char('d') if self.provider_count > 0 => {
                 self.confirm_provider_delete = true;
             }
             KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right => {
@@ -1648,6 +1672,7 @@ impl App {
             KeyCode::Esc => {
                 self.cancel_log_stream();
                 self.draft_detail_open = false;
+                self.draft_detail_scroll = 0;
                 self.sandbox_policy_tab = SandboxPolicyTab::Policy;
                 self.screen = Screen::Dashboard;
                 self.focus = Focus::Sandboxes;
@@ -1856,6 +1881,25 @@ impl App {
         }
     }
 
+    /// Largest useful scroll offset for the draft detail popup.
+    fn draft_detail_max_scroll(&self) -> usize {
+        self.draft_detail_rows
+            .saturating_sub(self.draft_detail_body_height)
+    }
+
+    /// One screenful of the draft detail popup body.
+    fn draft_detail_page(&self) -> isize {
+        isize::try_from(self.draft_detail_body_height.max(1)).unwrap_or(1)
+    }
+
+    /// Move the draft detail popup by `delta` rows, clamped to the content.
+    fn scroll_draft_detail(&mut self, delta: isize) {
+        let max = isize::try_from(self.draft_detail_max_scroll()).unwrap_or(isize::MAX);
+        let current = isize::try_from(self.draft_detail_scroll).unwrap_or(0);
+        let next = current.saturating_add(delta).clamp(0, max);
+        self.draft_detail_scroll = usize::try_from(next).unwrap_or(0);
+    }
+
     fn handle_draft_key(&mut self, key: KeyEvent) {
         // Approve-all confirmation modal intercepts all keys when open.
         if self.approve_all_confirm_open {
@@ -1880,6 +1924,7 @@ impl App {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => {
                     self.draft_detail_open = false;
+                    self.draft_detail_scroll = 0;
                 }
                 // Allow approve/reject toggle from within the popup.
                 KeyCode::Char('a') => {
@@ -1893,6 +1938,7 @@ impl App {
                             if st == "pending" || st == "rejected" {
                                 self.pending_draft_approve = true;
                                 self.draft_detail_open = false;
+                                self.draft_detail_scroll = 0;
                             }
                         }
                     }
@@ -1908,9 +1954,26 @@ impl App {
                             if st == "pending" || st == "approved" {
                                 self.pending_draft_reject = true;
                                 self.draft_detail_open = false;
+                                self.draft_detail_scroll = 0;
                             }
                         }
                     }
+                }
+                // Scroll the detail body; long rejection guidance and rationales
+                // can exceed the fixed popup height.
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_draft_detail(1),
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_draft_detail(-1),
+                KeyCode::PageDown => {
+                    let page = self.draft_detail_page();
+                    self.scroll_draft_detail(page);
+                }
+                KeyCode::PageUp => {
+                    let page = self.draft_detail_page();
+                    self.scroll_draft_detail(-page);
+                }
+                KeyCode::Home | KeyCode::Char('g') => self.draft_detail_scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.draft_detail_scroll = self.draft_detail_max_scroll();
                 }
                 _ => {}
             }
@@ -1937,6 +2000,7 @@ impl App {
             }
             KeyCode::Enter if !self.draft_chunks.is_empty() => {
                 self.draft_detail_open = true;
+                self.draft_detail_scroll = 0;
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if total == 0 {
@@ -2333,13 +2397,43 @@ impl App {
     // ------------------------------------------------------------------
 
     fn open_create_provider_form(&mut self) {
-        let known = openshell_providers::ProviderRegistry::new().known_types();
-        let types: Vec<String> = known.into_iter().map(String::from).collect();
+        let types = self.available_provider_profile_types();
 
         self.create_provider_form = Some(CreateProviderForm {
             types,
+            status: self.provider_profiles.is_empty().then(|| {
+                "Provider profiles unavailable. Wait for refresh, then retry.".to_string()
+            }),
             ..CreateProviderForm::default()
         });
+    }
+
+    fn available_provider_profile_types(&self) -> Vec<String> {
+        let mut types = self
+            .provider_profiles
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect::<Vec<_>>();
+        types.sort();
+        types.dedup();
+        types
+    }
+
+    pub(crate) fn sync_create_provider_types(&mut self) {
+        let types = self.available_provider_profile_types();
+        let Some(form) = self.create_provider_form.as_mut() else {
+            return;
+        };
+        if form.phase != CreateProviderPhase::SelectType {
+            return;
+        }
+
+        form.types = types;
+        form.type_cursor = form.type_cursor.min(form.types.len().saturating_sub(1));
+        form.status = form
+            .types
+            .is_empty()
+            .then(|| "Provider profiles unavailable. Wait for refresh, then retry.".to_string());
     }
 
     fn handle_create_provider_key(&mut self, key: KeyEvent) {
@@ -2359,27 +2453,53 @@ impl App {
                     form.type_cursor = form.type_cursor.saturating_sub(1);
                 }
                 KeyCode::Enter => {
-                    let selected = form.types[form.type_cursor].clone();
-                    let registry = openshell_providers::ProviderRegistry::new();
-                    let env_vars = registry.credential_env_vars(&selected);
-                    form.is_generic = env_vars.is_empty();
-
-                    // Populate credential rows from all known env vars.
-                    form.credentials = env_vars
+                    let Some(selected) = form.types.get(form.type_cursor).cloned() else {
+                        form.status = Some(
+                            "Provider profiles unavailable. Wait for refresh, then retry."
+                                .to_string(),
+                        );
+                        return;
+                    };
+                    let Some(profile) = self
+                        .provider_profiles
                         .iter()
-                        .map(|s| (s.to_string(), String::new()))
+                        .find(|profile| profile.id == selected)
+                        .cloned()
+                    else {
+                        form.status = Some(format!("Provider profile '{selected}' is unavailable"));
+                        return;
+                    };
+                    let profile = ProviderTypeProfile::from_proto(&profile);
+                    let mut credential_keys = Vec::new();
+                    for key in profile
+                        .credentials
+                        .iter()
+                        .flat_map(|credential| credential.accepted_stored_keys())
+                    {
+                        if !credential_keys.iter().any(|existing| existing == key) {
+                            credential_keys.push(key.to_string());
+                        }
+                    }
+                    form.is_generic = credential_keys.is_empty();
+                    form.allows_empty_credentials = profile.allows_empty_provider_credentials();
+
+                    // Populate credential rows from all accepted storage keys,
+                    // including logical names for broker-only credentials.
+                    form.credentials = credential_keys
+                        .into_iter()
+                        .map(|key| (key, String::new()))
                         .collect();
                     form.cred_cursor = 0;
 
                     // Auto-generate a unique name.
                     form.name = unique_provider_name(&selected, &self.provider_names);
 
-                    if form.is_generic {
-                        // No known env vars — skip straight to manual entry.
-                        form.phase = CreateProviderPhase::EnterKey;
-                        form.key_field = ProviderKeyField::Name;
-                        form.status = None;
-                        form.warning = None;
+                    if form.credentials.is_empty() {
+                        // Credential-less profiles can be created directly.
+                        form.discovered_credentials = Some(HashMap::new());
+                        form.phase = CreateProviderPhase::Creating;
+                        form.anim_start = Some(Instant::now());
+                        self.pending_provider_create = true;
                     } else {
                         form.phase = CreateProviderPhase::ChooseMethod;
                         form.method_cursor = 0;
@@ -2400,10 +2520,18 @@ impl App {
                 KeyCode::Enter => {
                     let ptype = form.types[form.type_cursor].clone();
                     if form.method_cursor == 0 {
-                        // Autodetect — synchronous since we only check env vars now.
-                        let registry = openshell_providers::ProviderRegistry::new();
-                        if let Ok(Some(discovered)) = registry.discover_existing(&ptype) {
-                            form.discovered_credentials = Some(discovered.credentials);
+                        let discovered = self
+                            .provider_profiles
+                            .iter()
+                            .find(|profile| profile.id == ptype)
+                            .map(ProviderTypeProfile::from_proto)
+                            .and_then(|profile| {
+                                discover_from_profile(&profile, &RealDiscoveryContext)
+                                    .ok()
+                                    .flatten()
+                            });
+                        if let Some(discovered) = discovered {
+                            apply_discovered_provider(form, discovered);
                             if form.name.is_empty() {
                                 form.name = unique_provider_name(&ptype, &self.provider_names);
                             }
@@ -2415,7 +2543,12 @@ impl App {
                             form.phase = CreateProviderPhase::EnterKey;
                             form.key_field = ProviderKeyField::Name;
                             form.warning = Some(
-                                "No credentials found in environment. Enter manually.".to_string(),
+                                if form.allows_empty_credentials {
+                                    "No credentials found in environment. Enter credentials or submit without them."
+                                } else {
+                                    "No credentials found in environment. Enter manually."
+                                }
+                                .to_string(),
                             );
                             form.status = None;
                         }
@@ -2739,7 +2872,7 @@ impl App {
                                         creds.insert(name.clone(), value.clone());
                                     }
                                 }
-                                if creds.is_empty() {
+                                if creds.is_empty() && !form.allows_empty_credentials {
                                     form.status =
                                         Some("At least one credential is required.".to_string());
                                     return;
@@ -2843,13 +2976,19 @@ impl App {
             })
             .unwrap_or_default();
 
-        // If we don't know the credential key, derive from registry.
+        // If we don't know the credential key, derive it from the profile.
         let key = if cred_key.is_empty() {
-            let registry = openshell_providers::ProviderRegistry::new();
-            registry
-                .credential_env_vars(&ptype)
-                .first()
-                .map_or(String::new(), ToString::to_string)
+            self.provider_entries
+                .get(self.provider_selected)
+                .and_then(|entry| entry.profile.as_ref())
+                .map(ProviderTypeProfile::from_proto)
+                .and_then(|profile| {
+                    profile
+                        .credential_env_vars()
+                        .first()
+                        .map(ToString::to_string)
+                })
+                .unwrap_or_default()
         } else {
             cred_key
         };
@@ -3286,7 +3425,7 @@ impl App {
         );
 
         let raw_profile_yaml = profile.and_then(|profile| {
-            let dto = openshell_providers::ProviderTypeProfile::from_proto(profile);
+            let dto = ProviderTypeProfile::from_proto(profile);
             openshell_providers::profile_to_yaml(&dto).ok()
         });
 
@@ -3385,7 +3524,7 @@ impl App {
         self.global_policy_active = false;
         self.global_policy_version = 0;
         // Reset provider state too.
-        self.providers_v2_enabled = false;
+        self.provider_profiles.clear();
         self.provider_entries.clear();
         self.provider_names.clear();
         self.provider_types.clear();
@@ -3451,22 +3590,115 @@ mod tests {
         )
     }
 
+    fn provider_profile(
+        id: &str,
+        credentials: Vec<openshell_core::proto::ProviderProfileCredential>,
+    ) -> openshell_core::proto::ProviderProfile {
+        openshell_core::proto::ProviderProfile {
+            id: id.to_string(),
+            credentials,
+            ..Default::default()
+        }
+    }
+
+    fn credential(
+        name: &str,
+        env_vars: &[&str],
+        required: bool,
+        runtime_resolvable: bool,
+    ) -> openshell_core::proto::ProviderProfileCredential {
+        openshell_core::proto::ProviderProfileCredential {
+            name: name.to_string(),
+            env_vars: env_vars.iter().map(ToString::to_string).collect(),
+            required,
+            token_grant: runtime_resolvable.then(Default::default),
+            ..Default::default()
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
     #[tokio::test]
-    async fn global_settings_do_not_override_provider_api_capability() {
+    async fn create_provider_enter_with_empty_profile_catalog_is_recoverable() {
         let mut app = test_app();
-        app.providers_v2_enabled = true;
-        let mut values = HashMap::new();
-        values.insert(
-            settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-            openshell_core::proto::SettingValue {
-                value: Some(setting_value::Value::BoolValue(false)),
-            },
+        app.open_create_provider_form();
+
+        app.handle_create_provider_key(key(KeyCode::Enter));
+
+        let form = app
+            .create_provider_form
+            .as_ref()
+            .expect("form remains open");
+        assert_eq!(form.phase, CreateProviderPhase::SelectType);
+        assert!(
+            form.status
+                .as_deref()
+                .is_some_and(|status| status.contains("profiles unavailable"))
         );
+        assert!(!app.pending_provider_create);
 
-        app.apply_global_settings(values, 7);
+        app.provider_profiles = vec![provider_profile("recovered", Vec::new())];
+        app.sync_create_provider_types();
+        let form = app
+            .create_provider_form
+            .as_ref()
+            .expect("form remains open");
+        assert_eq!(form.types, vec!["recovered"]);
+        assert!(form.status.is_none());
+    }
 
-        assert!(app.providers_v2_enabled);
-        assert_eq!(app.global_settings_revision, 7);
+    #[tokio::test]
+    async fn create_provider_accepts_empty_credentials_when_profile_allows_them() {
+        for profile in [
+            provider_profile("policy-only", Vec::new()),
+            provider_profile(
+                "optional-static",
+                vec![credential("api_key", &["API_KEY"], false, false)],
+            ),
+            provider_profile(
+                "runtime-token",
+                vec![credential("access_token", &["ACCESS_TOKEN"], true, true)],
+            ),
+        ] {
+            let mut app = test_app();
+            app.provider_profiles = vec![profile];
+            app.open_create_provider_form();
+            app.handle_create_provider_key(key(KeyCode::Enter));
+
+            let form = app.create_provider_form.as_mut().expect("form");
+            if form.phase != CreateProviderPhase::Creating {
+                form.phase = CreateProviderPhase::EnterKey;
+                form.key_field = ProviderKeyField::Submit;
+                app.handle_create_provider_key(key(KeyCode::Enter));
+            }
+
+            let form = app.create_provider_form.as_ref().expect("form");
+            assert_eq!(form.phase, CreateProviderPhase::Creating);
+            assert_eq!(form.discovered_credentials, Some(HashMap::new()));
+            assert!(app.pending_provider_create);
+        }
+    }
+
+    #[tokio::test]
+    async fn create_provider_uses_logical_key_for_broker_only_credential() {
+        let mut app = test_app();
+        app.provider_profiles = vec![provider_profile(
+            "token-exchange",
+            vec![credential("subject_token", &[], true, false)],
+        )];
+        app.open_create_provider_form();
+
+        app.handle_create_provider_key(key(KeyCode::Enter));
+
+        let form = app.create_provider_form.as_ref().expect("form");
+        assert_eq!(form.phase, CreateProviderPhase::ChooseMethod);
+        assert_eq!(
+            form.credentials,
+            vec![("subject_token".to_string(), String::new())]
+        );
+        assert!(!form.allows_empty_credentials);
     }
 
     #[tokio::test]
@@ -3594,6 +3826,32 @@ mod tests {
         };
 
         assert_eq!(gateway.source_label(), "unknown");
+    }
+
+    #[tokio::test]
+    async fn providers_workspace_shortcut_cycles_scope_and_resets_selections() {
+        let mut app = test_app();
+        app.screen = Screen::Dashboard;
+        app.focus = Focus::Providers;
+        app.workspace_names = vec!["default".to_string(), "team-b".to_string()];
+        app.provider_selected = 3;
+        app.sandbox_selected = 4;
+
+        app.handle_key(key(KeyCode::Char('w')));
+
+        assert_eq!(app.current_workspace, "team-b");
+        assert!(!app.all_workspaces);
+        assert_eq!(app.provider_selected, 0);
+        assert_eq!(app.sandbox_selected, 0);
+        assert!(app.pending_workspace_refresh);
+
+        app.handle_key(key(KeyCode::Char('w')));
+        assert!(app.all_workspaces);
+        assert_eq!(app.workspace_display(), "all");
+
+        app.handle_key(key(KeyCode::Char('w')));
+        assert!(!app.all_workspaces);
+        assert_eq!(app.current_workspace, "default");
     }
 
     // -- selected_sandbox_workspace ----------------------------------------
@@ -3880,5 +4138,35 @@ mod tests {
             "submit guard must not trigger after successful flush"
         );
         assert_eq!(config.get("FOO"), Some(&"bar".to_string()));
+    }
+
+    #[test]
+    fn autodetected_provider_configuration_is_preserved_in_create_form() {
+        let mut form = CreateProviderForm::default();
+        apply_discovered_provider(
+            &mut form,
+            DiscoveredProvider {
+                credentials: HashMap::from([("VERTEX_AI_TOKEN".to_string(), "token".to_string())]),
+                config: HashMap::from([
+                    ("VERTEX_AI_PROJECT_ID".to_string(), "project-a".to_string()),
+                    ("VERTEX_AI_REGION".to_string(), "us-central1".to_string()),
+                ]),
+            },
+        );
+
+        assert_eq!(
+            form.discovered_credentials
+                .as_ref()
+                .and_then(|credentials| credentials.get("VERTEX_AI_TOKEN")),
+            Some(&"token".to_string())
+        );
+        assert_eq!(
+            form.config.get("VERTEX_AI_PROJECT_ID"),
+            Some(&"project-a".to_string())
+        );
+        assert_eq!(
+            form.config.get("VERTEX_AI_REGION"),
+            Some(&"us-central1".to_string())
+        );
     }
 }

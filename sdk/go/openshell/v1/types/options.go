@@ -34,4 +34,8 @@ type WaitOptions struct {
 type ExecOptions struct {
 	Env     map[string]string
 	WorkDir string
+	// NoLoginShell skips sourcing shell login/profile startup files before the
+	// command. The zero value (false) preserves login-shell behavior. Set it
+	// for automation and managed checks that need predictable startup behavior.
+	NoLoginShell bool
 }

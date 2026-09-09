@@ -1,6 +1,8 @@
 ---
 name: create-spike
 description: Investigate a plain-language problem description by deeply exploring the codebase, then create a structured GitHub issue with technical findings. Prequel to build-from-issue — maps vague ideas to concrete, buildable issues. Trigger keywords - spike, investigate, explore, research issue, technical investigation, create spike, new spike, feasibility, codebase exploration.
+metadata:
+  internal: true
 ---
 
 # Create Spike

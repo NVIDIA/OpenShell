@@ -1,6 +1,8 @@
 ---
 name: watch-github-actions
 description: Watch and monitor GitHub Actions workflow runs using the gh CLI. Use when the user wants to check workflow status, watch a running workflow, view CI/CD jobs, or monitor build progress. Trigger keywords - watch pipeline, pipeline status, CI status, check build, monitor CI, view pipeline, pipeline progress, workflow status, actions status.
+metadata:
+  internal: true
 ---
 
 # Watch GitHub Actions

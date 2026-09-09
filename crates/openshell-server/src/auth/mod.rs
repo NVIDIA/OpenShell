@@ -10,12 +10,12 @@
 
 pub mod authenticator;
 pub mod authz;
+pub mod compute_driver;
 pub mod descriptor_authz;
 pub mod extension_mint_limit;
 pub mod guard;
 mod http;
 pub mod identity;
-pub mod k8s_sa;
 pub mod method_authz;
 pub mod oidc;
 pub mod principal;

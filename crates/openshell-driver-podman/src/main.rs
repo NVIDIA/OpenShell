@@ -7,8 +7,6 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::prelude::*;
 
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
@@ -16,7 +14,6 @@ use openshell_driver_podman::config::{
     DEFAULT_NETWORK_NAME, DEFAULT_PODMAN_STOP_TIMEOUT_SECS, DEFAULT_SANDBOX_PIDS_LIMIT,
     ImagePullPolicy,
 };
-use openshell_driver_podman::otel_tracing::compute_driver_rpc_layer;
 use openshell_driver_podman::{ComputeDriverService, PodmanComputeConfig, PodmanComputeDriver};
 
 #[derive(Parser)]
@@ -39,6 +36,9 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
+    gateway_name: Option<String>,
 
     /// Path to the Podman API Unix socket.
     #[arg(long, env = "OPENSHELL_PODMAN_SOCKET")]
@@ -174,22 +174,15 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let (tracer_provider, setup_error) =
-        openshell_driver_podman::otel_tracing::provider_for(args.otlp_endpoint.as_deref());
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)))
-        .with(tracing_subscriber::fmt::layer())
-        .with(
-            tracer_provider
-                .as_ref()
-                .map(openshell_driver_podman::otel_tracing::layer),
-        )
-        .init();
-    if let Some(error) = setup_error {
-        tracing::error!(%error, "OTLP exporting could not be started");
-    } else if let Some(endpoint) = &args.otlp_endpoint {
-        info!(endpoint, "OTLP exporting enabled");
-    }
+    let _tracing = openshell_otel::install_driver_tracing(
+        openshell_driver_podman::otel_tracing::TRACING,
+        openshell_otel::DriverTracingConfig {
+            endpoint: args.otlp_endpoint.as_deref(),
+            gateway_name: args.gateway_name.as_deref(),
+            service_version: VERSION,
+            log_level: &args.log_level,
+        },
+    );
 
     let driver = PodmanComputeDriver::new(PodmanComputeConfig {
         socket_path: args.podman_socket,
@@ -226,14 +219,14 @@ async fn main() -> Result<()> {
     .into_diagnostic()?;
 
     let service = ComputeDriverServer::new(ComputeDriverService::new(driver));
-    let result = if let Some(socket_path) = args.bind_socket {
+    if let Some(socket_path) = args.bind_socket {
         let listener = openshell_core::external_driver_socket::bind_private(&socket_path)
             .map_err(|err| miette::miette!("{err}"))?;
         let _cleanup =
             openshell_core::external_driver_socket::SocketCleanup::new(socket_path.clone());
         info!(socket = %socket_path.display(), "Starting Podman compute driver");
         tonic::transport::Server::builder()
-            .layer(compute_driver_rpc_layer())
+            .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
             .serve_with_incoming_shutdown(
                 openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
@@ -244,18 +237,12 @@ async fn main() -> Result<()> {
     } else {
         info!(address = %args.bind_address, "Starting Podman compute driver");
         tonic::transport::Server::builder()
-            .layer(compute_driver_rpc_layer())
+            .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
             .serve_with_shutdown(args.bind_address, shutdown_signal())
             .await
             .into_diagnostic()
-    };
-    if let Some(provider) = &tracer_provider
-        && let Err(error) = provider.shutdown()
-    {
-        tracing::warn!(%error, "OTLP tracer provider shutdown failed");
     }
-    result
 }
 
 async fn select_shutdown_signal(
@@ -306,17 +293,20 @@ mod tests {
     }
 
     #[test]
-    fn accepts_gateway_otlp_endpoint() {
+    fn accepts_gateway_otlp_configuration() {
         let args = Args::try_parse_from([
             "openshell-driver-podman",
             "--otlp-endpoint",
             "http://collector.internal:4317",
+            "--gateway-name",
+            "production-us-west",
         ])
-        .expect("OTLP endpoint should be accepted");
+        .expect("OTLP configuration should be accepted");
 
         assert_eq!(
             args.otlp_endpoint.as_deref(),
             Some("http://collector.internal:4317")
         );
+        assert_eq!(args.gateway_name.as_deref(), Some("production-us-west"));
     }
 }

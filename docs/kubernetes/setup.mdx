@@ -99,6 +99,36 @@ helm upgrade --install openshell \
 
 The chart automatically generates PKI secrets on first install using pre-install Helm hooks. No manual secret creation is required.
 
+### Split gateway and workspace releases
+
+For a platform-managed namespace, install the gateway without namespace-scoped
+sandbox resources, then install the workspace chart in the sandbox namespace:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set workspaceResources.enabled=false \
+  --set server.sandboxNamespace=app-a
+
+helm upgrade --install openshell-workspace \
+  oci://ghcr.io/nvidia/openshell/openshell-workspace \
+  --version <version> \
+  --namespace app-a \
+  --set gateway.serviceAccount.name=openshell \
+  --set gateway.serviceAccount.namespace=openshell
+```
+
+The workspace chart does not create the namespace or deploy a gateway. It owns
+only the sandbox ServiceAccount, Role, RoleBinding, and NetworkPolicy in its
+release namespace. For one pre-provisioned namespace, keep
+`server.drivers.kubernetes.workspaceMode=shared` and set
+`server.sandboxNamespace=app-a`. To map multiple workspaces to separately
+provisioned namespaces, use `workspaceMode=operator`, configure exactly one of
+`operatorNamespaceLabel` or `operatorNamespaceFile`, and install the workspace
+chart in every allowlisted namespace.
+
 ## Wait for the gateway to be ready
 
 ```shell
@@ -163,6 +193,7 @@ The most commonly changed values are:
 | `workload.kind` | Gateway workload controller. Use `statefulset` for SQLite or `deployment` with `server.externalDbSecret`. |
 | `workload.allowMultiReplicaStatefulSet` | Allow `replicaCount > 1` with `workload.kind=statefulset`. Prefer Deployment for external database-backed multi-replica gateways. |
 | `server.sandboxNamespace` | Namespace where sandbox pods are created. Defaults to the Helm release namespace when left empty. |
+| `workspaceResources.enabled` | Create namespace-scoped sandbox prerequisites from the gateway chart. Disable when installing the workspace chart separately. |
 | `server.externalDbSecret` | Secret containing a PostgreSQL connection URI in the `uri` key. Use when the database is managed outside the chart. |
 | `server.telemetryEnabled` | Enable anonymous OpenShell telemetry from the gateway and its sandbox supervisors. Set to `false` to opt out. |
 | `server.sandboxImage` | Default sandbox image used when a sandbox does not specify one. |

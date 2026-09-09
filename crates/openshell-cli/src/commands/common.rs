@@ -3,6 +3,7 @@
 
 //! Shared helpers, types, and parsing utilities used across CLI command groups.
 
+use crate::color::Colorize;
 use chrono::DateTime;
 use dialoguer::{Confirm, theme::ColorfulTheme};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -17,7 +18,6 @@ use openshell_core::proto::{
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_providers::builtin_profiles;
-use owo_colors::OwoColorize;
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::process::Command;
@@ -65,6 +65,7 @@ pub fn phase_name(phase: i32) -> &'static str {
         Ok(SandboxPhase::Stopping) => "Stopping",
         Ok(SandboxPhase::Stopped) => "Stopped",
         Ok(SandboxPhase::Starting) => "Starting",
+        Ok(SandboxPhase::Completed) => "Completed",
         Ok(SandboxPhase::Unknown) | Err(_) => "Unknown",
     }
 }
@@ -742,7 +743,9 @@ pub fn parse_duration_to_ms(s: &str) -> Result<i64> {
             ));
         }
     };
-    Ok(num * multiplier)
+    num.checked_mul(multiplier).ok_or_else(|| {
+        miette::miette!("duration out of range: {s} (must fit in milliseconds as a 64-bit integer)")
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,6 +1073,24 @@ mod tests {
 
         let err = parse_duration_to_ms("\u{20ac}").expect_err("missing number should error");
         assert!(err.to_string().contains("invalid duration"));
+    }
+
+    #[test]
+    fn parse_duration_to_ms_rejects_out_of_range_values_without_overflowing() {
+        let err = parse_duration_to_ms("9223372036854775807h").expect_err("overflow should error");
+        assert!(err.to_string().contains("duration out of range"));
+
+        let err = parse_duration_to_ms("-9223372036854775808h").expect_err("overflow should error");
+        assert!(err.to_string().contains("duration out of range"));
+    }
+
+    #[test]
+    fn parse_duration_to_ms_accepts_the_largest_representable_duration() {
+        let max_hours = i64::MAX / 3_600_000;
+        assert_eq!(
+            parse_duration_to_ms(&format!("{max_hours}h")).expect("parse"),
+            max_hours * 3_600_000
+        );
     }
 
     #[test]

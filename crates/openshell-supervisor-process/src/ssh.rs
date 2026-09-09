@@ -12,9 +12,12 @@ use crate::process::{
     drop_privileges_with_identity, is_supervisor_only_env_var, session_user_and_home,
 };
 use crate::sandbox;
+#[cfg(unix)]
+use libc;
 use miette::{IntoDiagnostic, Result};
 use nix::pty::{Winsize, openpty};
 use nix::unistd::setsid;
+use openshell_core::VERSION;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::policy::SandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
@@ -24,6 +27,7 @@ use openshell_ocsf::{
 use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, ChannelOpenHandle, Handle, Session};
 use russh::{ChannelId, ChannelOpenFailure, Sig};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -33,6 +37,8 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use tokio::net::UnixListener;
 use tracing::warn;
+
+const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
 
 /// Perform SSH server initialization: generate a host key, build the config,
 /// and bind the Unix socket listener. Extracted so that startup errors can be
@@ -52,7 +58,9 @@ fn ssh_server_init(
     let mut rng = rand::rng();
     let host_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).into_diagnostic()?;
 
+    // TODO: while building the SSH config, refactor the server_id to be "SSH-2.0-OpenShell_<version>" from `openshell_core::VERSION`
     let mut config = russh::server::Config {
+        server_id: russh::SshId::Standard(Cow::Owned(format!("SSH-2.0-OpenShell_{VERSION}"))),
         auth_rejection_time: Duration::from_secs(1),
         ..Default::default()
     };
@@ -143,44 +151,186 @@ pub async fn run_ssh_server(
         }
     };
 
-    loop {
-        let (stream, _peer) = listener.accept().await.into_diagnostic()?;
-        let config = config.clone();
-        let policy = policy.clone();
-        let workspace = workspace.clone();
-        let proxy_url = proxy_url.clone();
-        let ca_paths = ca_paths.clone();
-        let provider_credentials = provider_credentials.clone();
-        let user_environment = user_environment.clone();
-        let main_session = Arc::clone(&main_session);
+    let mut consecutive_resource_errors: u32 = 0;
+    let mut consecutive_unknown_errors: u32 = 0;
 
-        tokio::spawn(async move {
-            if let Err(err) = handle_connection(
-                stream,
-                config,
-                policy,
-                workspace,
-                netns_fd,
-                proxy_url,
-                ca_paths,
-                provider_credentials,
-                user_environment,
-                resolved_identity,
-                enforcement_mode,
-                main_session,
-            )
-            .await
-            {
-                ocsf_emit!(
-                    SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Fail)
-                        .severity(SeverityId::Low)
-                        .status(StatusId::Failure)
-                        .message(format!("SSH connection failed: {err}"))
-                        .build()
-                );
+    loop {
+        match listener.accept().await {
+            Ok((stream, _peer)) => {
+                consecutive_resource_errors = 0;
+                consecutive_unknown_errors = 0;
+                let config = config.clone();
+                let policy = policy.clone();
+                let workspace = workspace.clone();
+                let proxy_url = proxy_url.clone();
+                let ca_paths = ca_paths.clone();
+                let provider_credentials = provider_credentials.clone();
+                let user_environment = user_environment.clone();
+                let main_session = Arc::clone(&main_session);
+
+                tokio::spawn(async move {
+                    if let Err(err) = handle_connection(
+                        stream,
+                        config,
+                        policy,
+                        workspace,
+                        netns_fd,
+                        proxy_url,
+                        ca_paths,
+                        provider_credentials,
+                        user_environment,
+                        resolved_identity,
+                        enforcement_mode,
+                        main_session,
+                    )
+                    .await
+                    {
+                        ocsf_emit!(
+                            SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(SeverityId::Low)
+                                .status(StatusId::Failure)
+                                .message(format!("SSH connection failed: {err}"))
+                                .build()
+                        );
+                    }
+                });
             }
-        });
+            Err(err) => {
+                match classify_ssh_accept_error(
+                    &err,
+                    &mut consecutive_resource_errors,
+                    &mut consecutive_unknown_errors,
+                ) {
+                    SshAcceptAction::Terminal => {
+                        ocsf_emit!(
+                            SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(SeverityId::High)
+                                .status(StatusId::Failure)
+                                .message(format!(
+                                    "SSH accept loop exiting on terminal error: {err}"
+                                ))
+                                .build()
+                        );
+                        break;
+                    }
+                    SshAcceptAction::Retry { backoff, severity } => {
+                        ocsf_emit!(
+                            SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(severity)
+                                .status(StatusId::Failure)
+                                .message(format!(
+                                    "SSH accept error (retrying in {}ms): {err}",
+                                    backoff.as_millis(),
+                                ))
+                                .build()
+                        );
+                        tokio::time::sleep(backoff).await;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+const MAX_CONSECUTIVE_UNKNOWN_SSH_ACCEPT_ERRORS: u32 = 10;
+
+#[derive(Debug, PartialEq)]
+enum SshAcceptAction {
+    Terminal,
+    Retry {
+        backoff: Duration,
+        severity: SeverityId,
+    },
+}
+
+fn classify_ssh_accept_error(
+    err: &std::io::Error,
+    consecutive_resource_errors: &mut u32,
+    consecutive_unknown_errors: &mut u32,
+) -> SshAcceptAction {
+    #[cfg(unix)]
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK)
+    ) {
+        return SshAcceptAction::Terminal;
+    }
+
+    #[cfg(unix)]
+    if matches!(
+        err.raw_os_error(),
+        Some(
+            libc::EMFILE
+                | libc::ENFILE
+                | libc::ENOBUFS
+                | libc::ENOMEM
+                | libc::ECONNABORTED
+                | libc::ECONNRESET
+                | libc::EINTR
+                | libc::ENETDOWN
+                | libc::EPROTO
+                | libc::ENOPROTOOPT
+                | libc::EHOSTDOWN
+                | libc::EHOSTUNREACH
+                | libc::EOPNOTSUPP
+                | libc::ENETUNREACH
+                | libc::ENOSR
+                | libc::ESOCKTNOSUPPORT
+                | libc::EPROTONOSUPPORT
+                | libc::ETIMEDOUT
+        )
+    ) {
+        *consecutive_unknown_errors = 0;
+
+        #[cfg(unix)]
+        let is_resource_pressure = matches!(
+            err.raw_os_error(),
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM | libc::ENOSR)
+        );
+        #[cfg(not(unix))]
+        let is_resource_pressure = false;
+
+        if is_resource_pressure {
+            *consecutive_resource_errors = consecutive_resource_errors.saturating_add(1);
+            let backoff_ms = 100u64
+                .saturating_mul(1u64 << (*consecutive_resource_errors).min(7).saturating_sub(1))
+                .min(5_000);
+            return SshAcceptAction::Retry {
+                backoff: Duration::from_millis(backoff_ms),
+                severity: SeverityId::Medium,
+            };
+        }
+
+        *consecutive_resource_errors = 0;
+        return SshAcceptAction::Retry {
+            backoff: Duration::from_millis(100),
+            severity: SeverityId::Low,
+        };
+    }
+
+    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    if matches!(err.raw_os_error(), Some(libc::ENONET)) {
+        *consecutive_unknown_errors = 0;
+        *consecutive_resource_errors = 0;
+        return SshAcceptAction::Retry {
+            backoff: Duration::from_millis(100),
+            severity: SeverityId::Low,
+        };
+    }
+
+    *consecutive_unknown_errors = consecutive_unknown_errors.saturating_add(1);
+    if *consecutive_unknown_errors >= MAX_CONSECUTIVE_UNKNOWN_SSH_ACCEPT_ERRORS {
+        return SshAcceptAction::Terminal;
+    }
+    SshAcceptAction::Retry {
+        backoff: Duration::from_millis(100),
+        severity: SeverityId::Low,
     }
 }
 
@@ -237,11 +387,15 @@ async fn handle_connection(
 /// sender.  This allows `window_change_request` to resize the correct PTY when
 /// multiple channels are open simultaneously (e.g. parallel shells, shell +
 /// sftp, etc.).
+// Several independent per-channel boolean flags (login-shell opt-out and the
+// main-attachment state bits) legitimately live side by side here.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 struct ChannelState {
     input_sender: Option<InputSender>,
     pty_master: Option<std::fs::File>,
     pty_request: Option<PtyRequest>,
+    no_login_shell: bool,
     main_input_owner: Option<u64>,
     main_attached: bool,
     main_read_only: bool,
@@ -316,6 +470,10 @@ struct SshHandler {
 impl Drop for SshHandler {
     fn drop(&mut self) {
         for state in self.channels.values_mut() {
+            if state.main_attached {
+                self.main_session.end_terminal_attachment();
+                state.main_attached = false;
+            }
             if let Some(owner) = state.main_input_owner.take() {
                 self.main_session.release_input(owner);
             }
@@ -393,6 +551,9 @@ impl russh::server::Handler for SshHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         if let Some(state) = self.channels.remove(&channel) {
+            if state.main_attached {
+                self.main_session.end_terminal_attachment();
+            }
             if let Some(owner) = state.main_input_owner {
                 self.main_session.release_input(owner);
             }
@@ -413,6 +574,12 @@ impl russh::server::Handler for SshHandler {
         reply: ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self.main_session.finished() {
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        }
         // Validate port range before truncating u32 -> u16.  The SSH protocol
         // uses u32 for ports, but valid TCP ports are 0-65535.  Without this
         // check, port 65537 truncates to port 1 (privileged).
@@ -548,6 +715,10 @@ impl russh::server::Handler for SshHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self.main_session.finished() {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
         session.channel_success(channel)?;
         // Only allocate a PTY when the client explicitly requested one via
         // pty_request.  VS Code Remote-SSH sends shell_request *without* a
@@ -565,6 +736,10 @@ impl russh::server::Handler for SshHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self.main_session.finished() {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
         session.channel_success(channel)?;
         let command = String::from_utf8_lossy(data).trim().to_string();
         if command.is_empty() {
@@ -581,9 +756,20 @@ impl russh::server::Handler for SshHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         if name == "openshell-main" {
-            let state = self.channels.get_mut(&channel).ok_or_else(|| {
-                anyhow::anyhow!("subsystem_request on unknown channel {channel:?}")
-            })?;
+            if !self.channels.contains_key(&channel) {
+                return Err(anyhow::anyhow!(
+                    "subsystem_request on unknown channel {channel:?}"
+                ));
+            }
+            if self.main_session.begin_terminal_attachment().is_err() {
+                session.channel_failure(channel)?;
+                return Ok(());
+            }
+            let state = self
+                .channels
+                .get_mut(&channel)
+                .expect("main channel existence checked above");
+            state.main_attached = true;
             if let Some(pty) = state.pty_request.take() {
                 self.main_session.resize(
                     pty.col_width,
@@ -606,10 +792,10 @@ impl russh::server::Handler for SshHandler {
                     }
                 }
             };
-            state.main_attached = true;
             state.main_detach_prefix_pending = false;
             state.input_sender = input;
             let mut output = self.main_session.subscribe();
+            let terminal_delivery = Arc::clone(&self.main_session);
             let handle = session.handle();
             session.channel_success(channel)?;
             if let Some(error) = input_warning {
@@ -625,11 +811,13 @@ impl russh::server::Handler for SshHandler {
                 loop {
                     match output.recv().await {
                         Ok(event) => {
-                            let exited = matches!(event, MainOutput::Exit(_));
-                            send_main_output(&handle, channel, event).await;
-                            if exited {
+                            if let MainOutput::Exit(code) = event {
+                                terminal_delivery.wait_for_terminal_reported().await;
+                                let _ = send_main_output(&handle, channel, MainOutput::Exit(code))
+                                    .await;
                                 break;
                             }
+                            let _ = send_main_output(&handle, channel, event).await;
                         }
                         Err(error) => {
                             let _ = handle
@@ -652,7 +840,7 @@ impl russh::server::Handler for SshHandler {
             if let Some(state) = self.channels.get_mut(&channel) {
                 state.main_output_task = Some(output_task.abort_handle());
             }
-        } else if name == "sftp" {
+        } else if name == "sftp" && !self.main_session.finished() {
             session.channel_success(channel)?;
             // sftp-server speaks the SFTP binary protocol over stdin/stdout,
             // which is exactly what spawn_pipe_exec wires up.  This enables
@@ -662,6 +850,7 @@ impl russh::server::Handler for SshHandler {
                 &self.policy,
                 &self.workspace,
                 Some("/usr/lib/openssh/sftp-server".to_string()),
+                false,
                 session.handle(),
                 channel,
                 self.netns_fd,
@@ -699,8 +888,17 @@ impl russh::server::Handler for SshHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         // Accept the env request so the client knows we handled it, but we
-        // don't actually propagate the variables — the sandbox environment is
-        // controlled via policy.  We must reply so VSCode doesn't stall.
+        // don't actually propagate arbitrary variables — the sandbox
+        // environment is controlled via policy. We must reply so VSCode
+        // doesn't stall. Two exceptions carry supervisor signals the SSH
+        // protocol has no native field for:
+        // - OPENSHELL_NO_LOGIN_SHELL: gateway login-shell opt-out.
+        // - OPENSHELL_MAIN_READ_ONLY: read-only main attachment.
+        if variable_name == NO_LOGIN_SHELL_ENV.0
+            && let Some(state) = self.channels.get_mut(&channel)
+        {
+            state.no_login_shell = variable_value == NO_LOGIN_SHELL_ENV.1;
+        }
         if variable_name == "OPENSHELL_MAIN_READ_ONLY"
             && variable_value == "1"
             && let Some(state) = self.channels.get_mut(&channel)
@@ -810,20 +1008,18 @@ impl russh::server::Handler for SshHandler {
     }
 }
 
-async fn send_main_output(handle: &Handle, channel: ChannelId, event: MainOutput) {
+async fn send_main_output(handle: &Handle, channel: ChannelId, event: MainOutput) -> bool {
     match event {
-        MainOutput::Stdout(data) => {
-            let _ = handle.data(channel, data).await;
-        }
-        MainOutput::Stderr(data) => {
-            let _ = handle.extended_data(channel, 1, data).await;
-        }
+        MainOutput::Stdout(data) => handle.data(channel, data).await.is_ok(),
+        MainOutput::Stderr(data) => handle.extended_data(channel, 1, data).await.is_ok(),
         MainOutput::Exit(code) => {
-            let _ = handle.eof(channel).await;
-            let _ = handle
+            let eof_sent = handle.eof(channel).await.is_ok();
+            let status_sent = handle
                 .exit_status_request(channel, code.max(0).unsigned_abs())
-                .await;
-            let _ = handle.close(channel).await;
+                .await
+                .is_ok();
+            let close_sent = handle.close(channel).await.is_ok();
+            eof_sent && status_sent && close_sent
         }
     }
 }
@@ -836,6 +1032,10 @@ impl SshHandler {
         error: Option<&str>,
     ) {
         if let Some(state) = self.channels.get_mut(&channel) {
+            if state.main_attached {
+                self.main_session.end_terminal_attachment();
+                state.main_attached = false;
+            }
             if let Some(owner) = state.main_input_owner.take() {
                 self.main_session.release_input(owner);
             }
@@ -844,7 +1044,6 @@ impl SshHandler {
             if let Some(task) = state.main_output_task.take() {
                 task.abort();
             }
-            state.main_attached = false;
         }
         if let Some(error) = error {
             let _ = handle
@@ -871,6 +1070,7 @@ impl SshHandler {
             .channels
             .get_mut(&channel)
             .ok_or_else(|| anyhow::anyhow!("start_shell on unknown channel {channel:?}"))?;
+        let no_login_shell = state.no_login_shell;
         if let Some(pty) = state.pty_request.take() {
             // PTY was requested — allocate a real PTY (interactive shell or
             // exec that explicitly asked for a terminal).
@@ -878,6 +1078,7 @@ impl SshHandler {
                 &self.policy,
                 &self.workspace,
                 command,
+                no_login_shell,
                 &pty,
                 handle,
                 channel,
@@ -899,6 +1100,7 @@ impl SshHandler {
                 &self.policy,
                 &self.workspace,
                 command,
+                no_login_shell,
                 handle,
                 channel,
                 self.netns_fd,
@@ -1006,7 +1208,7 @@ fn apply_child_env(
         .env(openshell_core::sandbox_env::SANDBOX, "1")
         .env("HOME", session_home)
         .env("USER", session_user)
-        .env("SHELL", "/bin/bash")
+        .env("SHELL", openshell_core::shell::detect_login_shell())
         .env("PATH", &path)
         .env("TERM", term);
 
@@ -1036,11 +1238,43 @@ fn apply_child_env(
     }
 }
 
+const fn login_shell_flag(no_login_shell: bool) -> &'static str {
+    if no_login_shell { "-c" } else { "-lc" }
+}
+
+/// Build the shell command for an SSH session using a shell that exists in the
+/// sandbox image (minimal images such as Alpine ship only `/bin/sh`, not bash).
+///
+/// `no_command_arg` is appended only when no explicit command is given: `-i`
+/// for an interactive PTY session, or `None` for the non-PTY stdin path (a
+/// bare shell already reads piped stdin line-by-line). With an explicit
+/// command the login-shell flag is used per `no_login_shell`.
+fn build_ssh_shell_command(
+    shell: &str,
+    command: Option<String>,
+    no_login_shell: bool,
+    no_command_arg: Option<&str>,
+) -> Command {
+    let mut cmd = Command::new(shell);
+    match command {
+        None => {
+            if let Some(arg) = no_command_arg {
+                cmd.arg(arg);
+            }
+        }
+        Some(command) => {
+            cmd.arg(login_shell_flag(no_login_shell)).arg(command);
+        }
+    }
+    cmd
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_pty_shell(
     policy: &SandboxPolicy,
     workspace: &ResolvedWorkspace,
     command: Option<String>,
+    no_login_shell: bool,
     pty: &PtyRequest,
     handle: Handle,
     channel: ChannelId,
@@ -1069,18 +1303,11 @@ fn spawn_pty_shell(
     let mut reader = master.try_clone()?;
     let mut writer = master.try_clone()?;
 
-    let mut cmd = command.map_or_else(
-        || {
-            let mut c = Command::new("/bin/bash");
-            c.arg("-i");
-            c
-        },
-        |command| {
-            let mut c = Command::new("/bin/bash");
-            c.arg("-lc").arg(command);
-            c
-        },
-    );
+    // Resolve a shell present in the sandbox image; interactive PTY sessions
+    // pass `-i` when no command is given. Runs in the supervisor, so it
+    // inspects the sandbox filesystem.
+    let shell = openshell_core::shell::detect_login_shell();
+    let mut cmd = build_ssh_shell_command(&shell, command, no_login_shell, Some("-i"));
 
     let term = if pty.term.is_empty() {
         "xterm-256color"
@@ -1217,6 +1444,7 @@ fn spawn_pipe_exec(
     policy: &SandboxPolicy,
     workspace: &ResolvedWorkspace,
     command: Option<String>,
+    no_login_shell: bool,
     handle: Handle,
     channel: ChannelId,
     netns_fd: Option<RawFd>,
@@ -1227,25 +1455,15 @@ fn spawn_pipe_exec(
     resolved_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
 ) -> anyhow::Result<mpsc::Sender<Vec<u8>>> {
-    let mut cmd = command.map_or_else(
-        || {
-            // No command — read from stdin.  Do *not* pass `-i`; interactive
-            // mode reads .bashrc, writes prompts to stderr, and can introduce
-            // just enough latency for VS Code Remote-SSH's platform detection
-            // to time out and fall back to "windows".  Plain `bash` with piped
-            // stdin already reads commands line-by-line (script mode), which is
-            // exactly what VS Code's local server expects.
-            Command::new("/bin/bash")
-        },
-        |command| {
-            let mut c = Command::new("/bin/bash");
-            // Use login shell (-l) so that .profile/.bashrc are sourced and
-            // tool-specific env vars (VIRTUAL_ENV, UV_PYTHON_INSTALL_DIR, etc.)
-            // are available without hardcoding them here.
-            c.arg("-lc").arg(command);
-            c
-        },
-    );
+    // Resolve a shell present in the sandbox image; minimal images (e.g. Alpine)
+    // don't ship bash, only `/bin/sh`. Runs in the supervisor, so it inspects
+    // the sandbox filesystem. No command → read from stdin with no `-i`:
+    // interactive mode reads .bashrc, writes prompts to stderr, and can add
+    // just enough latency for VS Code Remote-SSH's platform detection to time
+    // out and fall back to "windows". A plain shell with piped stdin already
+    // reads commands line-by-line (script mode), which is what VS Code expects.
+    let shell = openshell_core::shell::detect_login_shell();
+    let mut cmd = build_ssh_shell_command(&shell, command, no_login_shell, None);
 
     let (session_user, session_home) = session_user_and_home(policy, workspace.home());
     apply_child_env(
@@ -1589,7 +1807,39 @@ fn is_loopback_host(host: &str) -> bool {
 )]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
     use std::process::Stdio;
+
+    /// Regression test: SSH sessions run the shell they are given, never a
+    /// hardcoded bash, so sh-only images (e.g. Alpine) work. Covers both the
+    /// interactive PTY path (`-i` when no command) and the non-PTY path.
+    #[test]
+    fn build_ssh_shell_command_uses_given_shell() {
+        // PTY, no command → given shell + interactive flag.
+        let cmd = build_ssh_shell_command("/bin/sh", None, false, Some("-i"));
+        assert_eq!(cmd.get_program(), OsStr::new("/bin/sh"));
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), vec![OsStr::new("-i")]);
+
+        // Non-PTY, no command → bare shell, no args (reads piped stdin).
+        let cmd = build_ssh_shell_command("/bin/sh", None, false, None);
+        assert_eq!(cmd.get_program(), OsStr::new("/bin/sh"));
+        assert_eq!(cmd.get_args().count(), 0);
+
+        // Explicit command → login-shell flag + command, still on the given shell.
+        let cmd = build_ssh_shell_command("/bin/sh", Some("echo hi".into()), false, Some("-i"));
+        assert_eq!(cmd.get_program(), OsStr::new("/bin/sh"));
+        assert_eq!(
+            cmd.get_args().collect::<Vec<_>>(),
+            vec![OsStr::new("-lc"), OsStr::new("echo hi")]
+        );
+
+        // OPENSHELL_NO_LOGIN_SHELL → plain -c.
+        let cmd = build_ssh_shell_command("/bin/sh", Some("echo hi".into()), true, None);
+        assert_eq!(
+            cmd.get_args().collect::<Vec<_>>(),
+            vec![OsStr::new("-c"), OsStr::new("echo hi")]
+        );
+    }
 
     /// Regression test: the direct-tcpip connect path sets `TCP_NODELAY`.
     #[tokio::test]
@@ -1719,6 +1969,38 @@ mod tests {
             output.status
         );
         assert_eq!(output.stdout, b"hello");
+    }
+
+    /// Command execution selects a login shell by default and a non-login shell
+    /// under `--no-login-shell`, so user startup files are sourced only in the
+    /// default case.
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_flag_controls_profile_sourcing() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(".bash_profile"), "echo LOGIN_MARKER\n").unwrap();
+
+        let run = |flag: &str| -> String {
+            let out = Command::new("bash")
+                .arg(flag)
+                .arg("true")
+                .env("HOME", home.path())
+                .env_remove("BASH_ENV") // isolate: -c still reads BASH_ENV if set
+                .output()
+                .expect("spawn bash");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        assert_eq!(login_shell_flag(true), "-c");
+        assert_eq!(login_shell_flag(false), "-lc");
+        assert!(
+            run("-lc").contains("LOGIN_MARKER"),
+            "login shell must source .bash_profile"
+        );
+        assert!(
+            !run("-c").contains("LOGIN_MARKER"),
+            "non-login shell must not source it"
+        );
     }
 
     /// Verify that the stdin writer delivers all buffered data before exiting
@@ -2375,6 +2657,59 @@ mod tests {
         })
         .await
         .expect("handler drop should release canonical input lease");
+    }
+
+    #[tokio::test]
+    async fn main_attachment_closes_naturally_after_terminal_delivery() {
+        let main_session = MainSession::inert();
+        let client = authenticated_test_client_with_main(Arc::clone(&main_session)).await;
+        let mut channel = client.channel_open_session().await.expect("open session");
+        channel
+            .request_subsystem(true, "openshell-main")
+            .await
+            .expect("attach main subsystem");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match main_session.acquire_input() {
+                    Err(_) => break,
+                    Ok((owner, _)) => main_session.release_input(owner),
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("main subsystem should register its attachment");
+
+        assert!(main_session.finish(7, false).await);
+        main_session.mark_terminal_reported();
+
+        let exit_status = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut exit_status = None;
+            loop {
+                match channel.wait().await {
+                    Some(russh::ChannelMsg::ExitStatus {
+                        exit_status: status,
+                    }) => {
+                        exit_status = Some(status);
+                    }
+                    Some(russh::ChannelMsg::Close) => break exit_status,
+                    None => panic!("main channel ended without a close message"),
+                    Some(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("main channel should deliver its exit status");
+        assert_eq!(exit_status, Some(7));
+        drop(channel);
+        drop(client);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            main_session.wait_for_terminal_attachments(),
+        )
+        .await
+        .expect("peer channel close should release terminal delivery");
     }
 
     #[tokio::test]

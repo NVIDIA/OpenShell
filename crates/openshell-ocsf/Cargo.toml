@@ -3,7 +3,7 @@
 
 [package]
 name = "openshell-ocsf"
-description = "OCSF v1.7.0 event types, formatters, and tracing layers for OpenShell sandbox logging"
+description = "OCSF v1.8.0 event types, formatters, and tracing layers for OpenShell sandbox logging"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

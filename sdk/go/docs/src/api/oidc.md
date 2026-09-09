@@ -69,6 +69,17 @@ Performs a non-interactive OAuth2 client credentials grant. Requires
 combined with `WithClientSecret`). The client secret is never included
 in error messages.
 
+### NewClientCredentialsAuth
+
+```go
+func NewClientCredentialsAuth(opts ...LoginOption) (types.AuthProvider, error)
+```
+
+Returns a lazy renewable auth provider for `v1.Config.Auth` or
+`gateway.WithAuth`. It caches access tokens in memory, renews within 30 seconds
+of expiry, coalesces concurrent exchanges, and fails closed if renewal fails.
+Use `WithClientSecretProvider` when the application rotates secret material.
+
 ## Options
 
 | Option | Description |
@@ -76,7 +87,9 @@ in error messages.
 | `WithIssuer(url)` | OIDC provider issuer URL |
 | `WithClientID(id)` | OAuth2 client ID |
 | `WithClientSecret(secret)` | OAuth2 client secret (for client credentials) |
-| `WithScopes(scopes...)` | Custom scopes (default: openid, profile, email) |
+| `WithClientSecretProvider(provider)` | Resolve the client secret for each exchange |
+| `WithAudience(audience)` | Optional OAuth2 resource-server audience |
+| `WithScopes(scopes...)` | Custom scopes (client credentials has no implicit scopes) |
 | `WithCallbackPort(port)` | Fixed port for localhost callback (default: tries 8000, then 18000) |
 | `WithTimeout(d)` | Auth flow timeout (default: 2 minutes) |
 | `WithKeyboardFlow()` | Use keyboard flow instead of browser |

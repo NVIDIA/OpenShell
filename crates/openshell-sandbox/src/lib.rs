@@ -5,6 +5,16 @@
 //!
 //! This crate provides process sandboxing and monitoring capabilities.
 
+// `defaults-without-telemetry` is an alias for the default feature set minus
+// `telemetry`, not a switch that turns telemetry off. Cargo cannot subtract a
+// default feature, so adding it on top of the defaults would otherwise produce
+// a telemetry-on build that reads as telemetry-free. Fail the build instead.
+#[cfg(all(feature = "telemetry", feature = "defaults-without-telemetry"))]
+compile_error!(
+    "features `telemetry` and `defaults-without-telemetry` are mutually exclusive; \
+     build a telemetry-free supervisor with `--no-default-features --features defaults-without-telemetry`"
+);
+
 mod activity_aggregator;
 mod denial_aggregator;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -16,6 +26,7 @@ mod sidecar_control;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
@@ -62,6 +73,7 @@ use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPol
 use openshell_core::proposals::AgentProposals;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_supervisor_network::opa::OpaEngine;
+use openshell_supervisor_network::proxy::ProxyHandle;
 use openshell_supervisor_process::process::ProcessEnforcementMode;
 pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
 use openshell_supervisor_process::skills;
@@ -101,6 +113,7 @@ pub async fn run_sandbox(
     workdir: Option<String>,
     timeout_secs: u64,
     interactive: bool,
+    await_main_process_attachment: bool,
     sandbox_id: Option<String>,
     sandbox: Option<String>,
     openshell_endpoint: Option<String>,
@@ -111,6 +124,7 @@ pub async fn run_sandbox(
     _health_port: u16,
     inference_routes: Option<String>,
     ocsf_enabled: Arc<AtomicBool>,
+    ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     network_enabled: bool,
     process_enabled: bool,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
@@ -514,7 +528,7 @@ pub async fn run_sandbox(
     // API read the current value so proposals target the correct workspace.
     let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
 
-    let networking = if network_enabled {
+    let mut networking = if network_enabled {
         #[cfg(target_os = "linux")]
         let proxy_bind_ip = netns
             .as_ref()
@@ -731,6 +745,7 @@ pub async fn run_sandbox(
         let poll_endpoint = endpoint.to_string();
         let poll_engine = engine.clone();
         let poll_ocsf_enabled = ocsf_enabled.clone();
+        let poll_ocsf_schema_version = ocsf_schema_version.clone();
         let poll_pid = entrypoint_pid.clone();
         let poll_provider_credentials = provider_credentials.clone();
         let poll_policy_local = networking.as_ref().map(|n| n.policy_local_ctx.clone());
@@ -746,6 +761,7 @@ pub async fn run_sandbox(
             entrypoint_pid: poll_pid,
             interval_secs: poll_interval_secs,
             ocsf_enabled: poll_ocsf_enabled,
+            ocsf_schema_version: poll_ocsf_schema_version,
             provider_credentials: poll_provider_credentials,
             policy_local_ctx: poll_policy_local,
             agent_proposals: agent_proposals.clone(),
@@ -823,6 +839,19 @@ pub async fn run_sandbox(
             .zip(bootstrap.proxy_ca_bundle_path.clone())
     });
 
+    let proxy_exited: Pin<Box<dyn Future<Output = ()> + Send>> = if let Some(rx) = networking
+        .as_mut()
+        .and_then(|n| n.proxy.as_mut())
+        .and_then(ProxyHandle::take_exit_receiver)
+    {
+        Box::pin(async {
+            let _ = rx.await;
+        })
+    } else {
+        Box::pin(std::future::pending())
+    };
+    tokio::pin!(proxy_exited);
+
     let exit_code = if process_enabled {
         let ca_file_paths = networking
             .as_ref()
@@ -836,6 +865,21 @@ pub async fn run_sandbox(
                     None
                 }
             });
+
+        let (ssh_exit_tx, ssh_exit_rx) = if ssh_socket_path.is_some() {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let ssh_exited: Pin<Box<dyn Future<Output = ()> + Send>> = if let Some(rx) = ssh_exit_rx {
+            Box::pin(async {
+                let _ = rx.await;
+            })
+        } else {
+            Box::pin(std::future::pending())
+        };
+        tokio::pin!(ssh_exited);
 
         let entrypoint_started_tx =
             if process_uses_sidecar_control && let Some(writer) = process_control_writer.clone() {
@@ -859,35 +903,54 @@ pub async fn run_sandbox(
             } else {
                 None
             };
-        let sidecar_exit_tx =
-            if process_uses_sidecar_control && let Some(writer) = process_control_writer.clone() {
-                let exit_ack = Arc::clone(&process_exit_ack);
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<
-                    openshell_supervisor_process::run::SidecarExitReport,
-                >(1);
-                tokio::spawn(async move {
-                    while let Some((instance_id, exit_code, ack)) = rx.recv().await {
-                        let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
-                        *exit_ack.lock().await = Some((instance_id.clone(), durable_tx));
-                        let result = match sidecar_control::send_main_process_exited(
-                            &writer,
+        let sidecar_exit_tx = if process_uses_sidecar_control
+            && let Some(writer) = process_control_writer.clone()
+        {
+            let exit_ack = Arc::clone(&process_exit_ack);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<
+                openshell_supervisor_process::run::SidecarExitReport,
+            >(1);
+            tokio::spawn(async move {
+                while let Some(report) = rx.recv().await {
+                    match report {
+                        openshell_supervisor_process::run::SidecarExitReport::Exited {
                             instance_id,
                             exit_code,
-                        )
-                        .await
-                        {
-                            Ok(()) => durable_rx.await.map_err(|_| {
-                                "sidecar durable exit acknowledgement closed".to_string()
-                            }),
-                            Err(error) => Err(error.to_string()),
-                        };
-                        let _ = ack.send(result);
+                            ack,
+                        } => {
+                            let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
+                            *exit_ack.lock().await = Some((instance_id.clone(), durable_tx));
+                            let result = match sidecar_control::send_main_process_exited(
+                                &writer,
+                                instance_id,
+                                exit_code,
+                            )
+                            .await
+                            {
+                                Ok(()) => durable_rx.await.map_err(|_| {
+                                    "sidecar durable exit acknowledgement closed".to_string()
+                                }),
+                                Err(error) => Err(error.to_string()),
+                            };
+                            let _ = ack.send(result);
+                        }
+                        openshell_supervisor_process::run::SidecarExitReport::Finalized {
+                            instance_id,
+                            ack,
+                        } => {
+                            let result =
+                                sidecar_control::send_main_process_finalized(&writer, instance_id)
+                                    .await
+                                    .map_err(|error| error.to_string());
+                            let _ = ack.send(result);
+                        }
                     }
-                });
-                Some(tx)
-            } else {
-                None
-            };
+                }
+            });
+            Some(tx)
+        } else {
+            None
+        };
 
         let process = openshell_supervisor_process::run::run_process(
             program,
@@ -895,10 +958,12 @@ pub async fn run_sandbox(
             workspace,
             timeout_secs,
             interactive,
+            await_main_process_attachment,
             sandbox_id.as_deref(),
             openshell_endpoint.as_deref(),
             ssh_socket_path,
             sidecar_network_enforcement,
+            ssh_exit_tx,
             &process_policy,
             resolved_process_identity,
             process_enforcement_mode,
@@ -935,9 +1000,71 @@ pub async fn run_sandbox(
                         "authoritative network-sidecar control channel closed"
                     ));
                 }
+                () = &mut proxy_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Proxy accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "proxy accept loop exited unexpectedly"
+                    ));
+                }
+                () = &mut ssh_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "SSH accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "SSH accept loop exited unexpectedly"
+                    ));
+                }
             }
         } else {
-            process.await?
+            tokio::select! {
+                result = process => result?,
+                () = &mut proxy_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Proxy accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "proxy accept loop exited unexpectedly"
+                    ));
+                }
+                () = &mut ssh_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "SSH accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "SSH accept loop exited unexpectedly"
+                    ));
+                }
+            }
         }
     } else {
         // Network-only sidecar mode: keep the proxy and its background
@@ -953,15 +1080,62 @@ pub async fn run_sandbox(
                     warn!(?result, "Authoritative sidecar control channel exited; restarting sidecar");
                     1
                 }
+                () = &mut proxy_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Proxy accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "proxy accept loop exited unexpectedly"
+                    ));
+                }
             }
         } else {
-            wait_for_shutdown_signal().await;
-            0
+            tokio::select! {
+                () = wait_for_shutdown_signal() => 0,
+                () = &mut proxy_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Proxy accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "proxy accept loop exited unexpectedly"
+                    ));
+                }
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
-            wait_for_shutdown_signal().await;
-            0
+            tokio::select! {
+                () = wait_for_shutdown_signal() => 0,
+                () = &mut proxy_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Proxy accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "proxy accept loop exited unexpectedly"
+                    ));
+                }
+            }
         }
     };
 
@@ -1173,11 +1347,39 @@ fn spawn_sidecar_entrypoint_handler(
             control_publisher,
         } = handler;
         let mut session_started = false;
+        let mut session_task: Option<tokio::task::JoinHandle<()>> = None;
         let mut trusted_supervisor_pid = None;
         let terminating = Arc::new(AtomicBool::new(false));
         while let Some(started) = entrypoint_rx.recv().await {
-            if let Some(exit_code) = started.exit_code {
+            if started.finalized {
+                if let (Some(endpoint), Some(id)) =
+                    (openshell_endpoint.as_ref(), sandbox_id.as_ref())
+                {
+                    let mut delay = Duration::from_millis(250);
+                    loop {
+                        match openshell_supervisor_process::supervisor_session::finalize_main_process_exit(
+                            endpoint,
+                            id,
+                            &started.instance_id,
+                        )
+                        .await
+                        {
+                            Ok(()) => break,
+                            Err(error) => {
+                                warn!(%error, "sidecar main-process finalization failed; retrying");
+                                tokio::time::sleep(delay).await;
+                                delay = (delay * 2).min(Duration::from_secs(2));
+                            }
+                        }
+                    }
+                }
                 terminating.store(true, Ordering::Release);
+                if let Some(task) = session_task.take() {
+                    task.abort();
+                }
+                break;
+            }
+            if let Some(exit_code) = started.exit_code {
                 if let (Some(endpoint), Some(id)) =
                     (openshell_endpoint.as_ref(), sandbox_id.as_ref())
                 {
@@ -1203,7 +1405,7 @@ fn spawn_sidecar_entrypoint_handler(
                         publisher.publish_main_process_exit_ack(started.instance_id.clone());
                     }
                 }
-                break;
+                continue;
             }
             entrypoint_pid.store(started.pid, Ordering::Release);
             if started.start_session {
@@ -1246,7 +1448,7 @@ fn spawn_sidecar_entrypoint_handler(
                     );
                     continue;
                 };
-                openshell_supervisor_process::supervisor_session::spawn(
+                session_task = Some(openshell_supervisor_process::supervisor_session::spawn(
                     endpoint.clone(),
                     id.clone(),
                     trusted_ssh_socket_path.clone(),
@@ -1254,7 +1456,7 @@ fn spawn_sidecar_entrypoint_handler(
                     Some(supervisor_pid),
                     Arc::clone(&terminating),
                     started.instance_id.clone(),
-                );
+                ));
                 session_started = true;
                 info!("sidecar supervisor session task spawned");
             }
@@ -3140,6 +3342,7 @@ struct PolicyPollLoopContext {
     entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
     ocsf_enabled: Arc<AtomicBool>,
+    ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     provider_credentials: ProviderCredentialState,
     policy_local_ctx: Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>,
     agent_proposals: AgentProposals,
@@ -3157,7 +3360,7 @@ type MiddlewareConnector = Arc<
     dyn Fn(
             Vec<openshell_core::proto::SupervisorMiddlewareService>,
             MiddlewareAuthentication,
-        ) -> std::pin::Pin<
+        ) -> Pin<
             Box<
                 dyn std::future::Future<
                         Output = Result<openshell_supervisor_middleware::MiddlewareRegistry>,
@@ -3582,6 +3785,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             match initial_poll_disposition(&ctx.loaded_policy_origin, &result) {
                 InitialPollDisposition::Acknowledge(candidate) => {
                     apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
                     apply_agent_proposals_enabled(
                         &ctx.agent_proposals,
                         agent_proposals_enabled_from_settings(&result.settings),
@@ -3609,6 +3813,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 InitialPollDisposition::Reconcile => pending_result = Some(result),
                 InitialPollDisposition::TrackOnly => {
                     apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
                     apply_agent_proposals_enabled(
                         &ctx.agent_proposals,
                         agent_proposals_enabled_from_settings(&result.settings),
@@ -4097,6 +4302,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
 
         // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
         apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+        apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
 
         // Apply the agent-proposals feature toggle. On a false→true transition
         // we lazily install the skill so a sandbox that started with the flag
@@ -4147,6 +4353,37 @@ fn extract_bool_setting(
         .and_then(|sv| sv.value.as_ref())
         .and_then(|v| match v {
             setting_value::Value::BoolValue(b) => Some(*b),
+            _ => None,
+        })
+}
+
+fn apply_ocsf_schema_version_setting(
+    version: &std::sync::Mutex<String>,
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+) {
+    let new_version = extract_string_setting(settings, "ocsf_schema_version").unwrap_or_default();
+    if let Ok(mut current) = version.lock()
+        && *current != new_version
+    {
+        info!(
+            ocsf_schema_version = %new_version,
+            "OCSF schema version target changed"
+        );
+        *current = new_version;
+    }
+}
+
+fn extract_string_setting(
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+    key: &str,
+) -> Option<String> {
+    use openshell_core::proto::setting_value;
+    settings
+        .get(key)
+        .and_then(|es| es.value.as_ref())
+        .and_then(|sv| sv.value.as_ref())
+        .and_then(|v| match v {
+            setting_value::Value::StringValue(s) => Some(s.clone()),
             _ => None,
         })
 }
@@ -4846,6 +5083,7 @@ network_policies:
             entrypoint_pid: Arc::new(AtomicU32::new(0)),
             interval_secs: 0,
             ocsf_enabled: Arc::new(AtomicBool::new(false)),
+            ocsf_schema_version: Arc::new(std::sync::Mutex::new(String::new())),
             provider_credentials: ProviderCredentialState::from_child_env_snapshot(
                 0,
                 std::collections::HashMap::new(),

@@ -45,10 +45,29 @@ await client.sandbox.delete(sandbox.name)
 ```
 
 `connect()` constructs a lazy client; call `health()` when startup must verify
-gateway reachability. Authentication material is static for the client's
-lifetime, so create a new client after refreshing an OIDC or edge token. The
-root client has no explicit close method because Connect does not retain a
-dedicated session. Close operation-scoped streams and forward handles instead.
+gateway reachability. Static `oidcToken` and `edgeToken` values remain fixed for
+the client's lifetime. For long-running service automation, use the renewable
+client-credentials provider:
+
+```ts
+import { clientCredentials, OpenShellClient } from '@nvidia/openshell-sdk'
+
+const client = await OpenShellClient.connect({
+  gateway,
+  oidcTokenProvider: clientCredentials({
+    issuer: 'https://idp.example.com/realms/openshell',
+    clientId: 'openshell-service',
+    clientSecret: () => process.env.OPENSHELL_OIDC_CLIENT_SECRET!,
+    scopes: ['sandbox:read', 'sandbox:write'],
+    audience: 'openshell-gateway',
+  }),
+})
+```
+
+The provider discovers and validates the issuer, keeps credentials and tokens
+in memory, and renews before expiry. The root client has no explicit close
+method because Connect does not retain a dedicated session. Close
+operation-scoped streams and forward handles instead.
 
 Express the create-time safety boundary with `policy`. Sandbox-scoped `setPolicy`
 cannot introduce static policy fields later, so set filesystem, landlock,
@@ -133,11 +152,54 @@ await client.sandbox.setSetting(name, 'feature.enabled', { value: { case: 'boolV
 
 Sandbox-scoped `setPolicy` may only change `networkPolicies`; static fields (`filesystem`, `landlock`, `process`) must match the create-time policy. Sandbox-scoped setting deletes are rejected by the gateway, so only upsert (`setSetting`) is exposed here.
 
+## Sandbox templates
+
+Sandbox workload templates are reusable, workspace-scoped runtime shapes. They
+own image, environment, resource, and driver-specific settings; sandbox creation
+from a template can still attach labels, providers, and create-time policy.
+
+```ts
+import { OpenShellClient, type SandboxWorkloadTemplate } from '@nvidia/openshell-sdk'
+
+const client = await OpenShellClient.connect({ gateway, oidcToken })
+
+const template: SandboxWorkloadTemplate = await client.sandboxTemplates.create(
+  {
+    metadata: { name: 'python', labels: { team: 'runtime' } },
+    spec: {
+      workload: {
+        image: 'ghcr.io/nvidia/openshell-community/sandboxes/python:latest',
+        environment: { FEATURE_FLAG: 'on' },
+        resources: { cpu: '1', memory: '512Mi' },
+      },
+      driverConfig: { kubernetes: { pod: { runtime_class_name: 'kata-containers' } } },
+    },
+  },
+  { workspace: 'default' },
+)
+
+const sandbox = await client.sandbox.createFromTemplate({
+  templateName: template.metadata!.name,
+  workspace: 'default',
+  providers: ['github'],
+  policy: { version: 1, networkPolicies: {} },
+})
+
+await client.sandboxTemplates.get('python', { workspace: 'default' })
+await client.sandboxTemplates.list({ workspace: 'default', limit: 100 })
+await client.sandboxTemplates.delete('python', { workspace: 'default' })
+```
+
+Use `allWorkspaces: true` on `list()` for a platform-admin view. The SDK clears
+the workspace field in that request because the gateway treats `workspace` and
+`allWorkspaces` as mutually exclusive.
+
 ## Surface and roadmap
 
 The SDK's goal is agent parity: anything the OpenShell gateway can do should be reachable from typed code, not only the CLI. The API is organized as scoped sub-clients over one shared connection, mirroring the CLI's verbs.
 
 - `client.sandbox` (`SandboxClient`) is available today: sandbox lifecycle, exec, forward, SSH, sandbox-scoped providers, config, and policy.
+- `client.sandboxTemplates` (`SandboxTemplateClient`) is available today: reusable sandbox workload template CRUD.
 - `client.gateway` (`GatewayClient`) is planned: gateway-scoped config and settings, health, and cluster status.
 - `client.providers` (`ProviderClient`) is planned: gateway-scoped provider CRUD and profiles.
 

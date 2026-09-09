@@ -22,12 +22,11 @@ description: |
 
        Support for system-installed Docker is coming in snapd 2.76.
 
-    2. Connect the required interfaces and start the gateway:
+    2. Connect the required interfaces:
 
          sudo snap connect openshell:docker docker:docker-daemon
          sudo snap connect openshell:log-observe
          sudo snap connect openshell:system-observe
-         sudo snap start openshell.gateway
 
     3. Verify the gateway and register it locally:
 

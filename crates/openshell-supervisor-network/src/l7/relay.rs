@@ -559,11 +559,13 @@ where
             }
         };
         let Some(config) = select_l7_config_for_path(configs, &route_target) else {
+            let reason = "no L7 endpoint path matched request";
+            emit_l7_request_log(ctx, &req.action, &route_target, "deny", "l7", reason, None);
             crate::l7::rest::RestProvider::default()
                 .deny_with_redacted_target(
                     &req,
                     &ctx.policy_name,
-                    "no L7 endpoint path matched request",
+                    reason,
                     client,
                     None,
                     Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
@@ -724,12 +726,12 @@ where
             l7_protocol_log_summary(graphql_info.as_ref(), jsonrpc_info.as_ref());
         emit_l7_request_log(
             ctx,
-            &request_info,
+            &request_info.action,
             &redacted_target,
             decision_str,
             engine_type,
             &reason,
-            &protocol_summary,
+            protocol_summary.as_deref(),
         );
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
@@ -853,7 +855,7 @@ where
                 Ok(None) => {
                     if let Some(session) = middleware_session.take() {
                         session
-                            .end(openshell_core::proto::WebSocketSessionEndReason::Cancellation)
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                             .await;
                     }
                     return Ok(());
@@ -873,14 +875,14 @@ where
                 RelayOutcome::Reusable => {
                     if let Some(session) = middleware_session.take() {
                         session
-                            .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)
                             .await;
                     }
                 }
                 RelayOutcome::Consumed => {
                     if let Some(session) = middleware_session.take() {
                         session
-                            .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)
                             .await;
                     }
                     return Ok(());
@@ -935,13 +937,35 @@ fn select_l7_config_for_path<'a>(
 
 fn emit_l7_request_log(
     ctx: &L7EvalContext,
-    request_info: &L7RequestInfo,
+    action: &str,
     redacted_target: &str,
     decision_str: &str,
     engine_type: &str,
     reason: &str,
-    protocol_summary: &str,
+    protocol_summary: Option<&str>,
 ) {
+    let event = build_l7_request_event(
+        ctx,
+        action,
+        redacted_target,
+        decision_str,
+        engine_type,
+        reason,
+        protocol_summary,
+    );
+    ocsf_emit!(event);
+    emit_activity(ctx, decision_str == "deny", "l7_policy");
+}
+
+fn build_l7_request_event(
+    ctx: &L7EvalContext,
+    action: &str,
+    redacted_target: &str,
+    decision_str: &str,
+    engine_type: &str,
+    reason: &str,
+    protocol_summary: Option<&str>,
+) -> openshell_ocsf::OcsfEvent {
     let (action_id, disposition_id, severity) = match decision_str {
         "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
         "allow" | "audit" => (
@@ -955,43 +979,44 @@ fn emit_l7_request_log(
             SeverityId::Informational,
         ),
     };
-    let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    let protocol_suffix =
+        protocol_summary.map_or_else(String::new, |summary| format!(" {summary}"));
+    let message = format!(
+        "L7_REQUEST {decision_str} {action} {}:{}{}{protocol_suffix} reason={reason}",
+        ctx.host, ctx.port, redacted_target,
+    );
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Other)
         .action(action_id)
         .disposition(disposition_id)
         .severity(severity)
         .http_request(HttpRequest::new(
-            &request_info.action,
+            action,
             OcsfUrl::new("http", &ctx.host, redacted_target, ctx.port),
         ))
         .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
         .firewall_rule(&ctx.policy_name, engine_type)
-        .message(format!(
-            "L7_REQUEST {decision_str} {} {}:{}{}{} reason={}",
-            request_info.action, ctx.host, ctx.port, redacted_target, protocol_summary, reason,
-        ))
-        .build();
-    ocsf_emit!(event);
-    emit_activity(ctx, decision_str == "deny", "l7_policy");
+        .message(message)
+        .build()
 }
 
 fn l7_protocol_log_summary(
     graphql_info: Option<&crate::l7::graphql::GraphqlRequestInfo>,
     jsonrpc_info: Option<&crate::l7::jsonrpc::JsonRpcRequestInfo>,
-) -> String {
+) -> Option<String> {
     if let Some(info) = graphql_info {
-        return format!(" {}", crate::l7::graphql::log_summary(info));
+        return Some(crate::l7::graphql::log_summary(info));
     }
 
     if let Some(info) = jsonrpc_info {
-        return format!(
-            " rule_methods={} tools={}",
+        return Some(format!(
+            "rule_methods={} tools={}",
             rule_method_names_for_log(info),
             tool_names_for_log(info)
-        );
+        ));
     }
 
-    String::new()
+    None
 }
 
 fn emit_activity(ctx: &L7EvalContext, denied: bool, deny_group: &'static str) {
@@ -1192,7 +1217,7 @@ where
         emit_policy_reload(guard, host, port, &options.policy_name);
         if let Some(session) = options.middleware_session.take() {
             session
-                .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+                .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
                 .await;
         }
         send_websocket_close(client, upstream, 1012).await;
@@ -1569,7 +1594,7 @@ where
                 Ok(None) => {
                     if let Some(session) = middleware_session.take() {
                         session
-                            .end(openshell_core::proto::WebSocketSessionEndReason::Cancellation)
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                             .await;
                     }
                     return Ok(());
@@ -1589,14 +1614,14 @@ where
                 RelayOutcome::Reusable => {
                     if let Some(session) = middleware_session.take() {
                         session
-                            .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)
                             .await;
                     }
                 }
                 RelayOutcome::Consumed => {
                     if let Some(session) = middleware_session.take() {
                         session
-                            .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)
                             .await;
                     }
                     debug!(
@@ -1695,7 +1720,7 @@ pub(crate) async fn finalize_websocket_pre_upgrade(
                 emit_policy_reload(guard, host, port, policy_name);
                 if let Some(session) = session.take() {
                     session
-                        .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+                        .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
                         .await;
                 }
                 Err(error)
@@ -1706,9 +1731,9 @@ pub(crate) async fn finalize_websocket_pre_upgrade(
         Err(error) => {
             let reason = if guard.is_stale() {
                 emit_policy_reload(guard, host, port, policy_name);
-                openshell_core::proto::WebSocketSessionEndReason::PolicyReload
+                openshell_core::proto::MiddlewareSessionEndReason::PolicyReload
             } else {
-                openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected
+                openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure
             };
             if let Some(session) = session.take() {
                 session.end(reason).await;
@@ -7332,6 +7357,7 @@ network_policies:
             graphql_max_body_bytes: 0,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             mcp_strict_tool_names: true,
+            mcp_versions: Vec::new(),
             allow_encoded_slash,
             websocket_credential_rewrite: false,
             request_body_credential_rewrite: false,
@@ -7358,6 +7384,95 @@ network_policies:
             secret_resolver: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn unmatched_route_path_builds_denied_http_activity_event() {
+        let ctx = L7EvalContext {
+            host: "gateway.example.test".into(),
+            port: 443,
+            policy_name: "route_api".into(),
+            ..Default::default()
+        };
+
+        let event = build_l7_request_event(
+            &ctx,
+            "GET",
+            "/other",
+            "deny",
+            "l7",
+            "no L7 endpoint path matched request",
+            None,
+        );
+
+        assert_eq!(event.class_uid(), 4002);
+        assert_eq!(event.base().severity, SeverityId::Medium);
+        assert_eq!(
+            event.format_shorthand(),
+            "HTTP:GET [MED] DENIED GET http://gateway.example.test:443/other [policy:route_api engine:l7] [reason:L7_REQUEST deny GET gateway.example.test:443/other reason=no L7 endpoint path matched request]"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_selected_unmatched_path_emits_denied_policy_activity() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, ENCODED_SLASH_SCOPING_POLICY).unwrap();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let configs = encoded_slash_scoping_configs();
+        let (activity_tx, mut activity_rx) = tokio::sync::mpsc::channel(1);
+        let ctx = L7EvalContext {
+            activity_tx: Some(activity_tx),
+            ..encoded_slash_scoping_ctx()
+        };
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /other HTTP/1.1\r\nHost: gateway.example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut response = [0u8; 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("denial should reach client")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&response[..n]).contains("403 Forbidden"));
+
+        let mut upstream_bytes = [0u8; 16];
+        assert!(matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                upstream.read(&mut upstream_bytes)
+            )
+            .await,
+            Err(_) | Ok(Ok(0))
+        ));
+        let activity = tokio::time::timeout(std::time::Duration::from_secs(1), activity_rx.recv())
+            .await
+            .expect("policy activity should be emitted")
+            .expect("activity channel should remain open");
+        assert!(activity.denied);
+        assert_eq!(activity.deny_group, "l7_policy");
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
     }
 
     /// Canonicalization runs before the matching config is known, so
@@ -7687,6 +7802,7 @@ network_policies:
             graphql_max_body_bytes: 0,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             mcp_strict_tool_names: true,
+            mcp_versions: Vec::new(),
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
@@ -7889,6 +8005,7 @@ network_policies:
             graphql_max_body_bytes: 0,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             mcp_strict_tool_names: true,
+            mcp_versions: Vec::new(),
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
@@ -8015,6 +8132,7 @@ network_policies:
             graphql_max_body_bytes: 0,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             mcp_strict_tool_names: true,
+            mcp_versions: Vec::new(),
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,

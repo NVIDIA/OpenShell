@@ -8,6 +8,7 @@ pub mod theme;
 mod ui;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -35,6 +36,7 @@ use event::{Event, EventHandler};
 /// Duration to show the splash screen before auto-dismissing.
 const SPLASH_DURATION: Duration = Duration::from_secs(3);
 const PROVIDER_PROFILE_SCOPE_WORKSPACE: &str = "workspace";
+const PROVIDER_PROFILE_PAGE_SIZE: u32 = 100;
 
 type ProviderProfileCache = HashMap<(String, String), openshell_core::proto::ProviderProfile>;
 
@@ -78,7 +80,6 @@ pub async fn run(
 
     let mut events = EventHandler::new(Duration::from_secs(2));
 
-    fetch_providers_v2_setting(&mut app).await;
     refresh_gateway_list(&mut app);
     refresh_data(&mut app).await;
 
@@ -500,10 +501,6 @@ async fn handle_gateway_switch(app: &mut App) {
             app.gateway_name = name;
             app.endpoint = endpoint;
             app.reset_sandbox_state();
-            // Re-fetch the providers_v2 capability for the new gateway
-            // before refreshing data, so provider CRUD controls reflect
-            // the correct mode.
-            fetch_providers_v2_setting(app).await;
             refresh_data(app).await;
         }
         Err(e) => {
@@ -1407,6 +1404,8 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             workspace: workspace.clone(),
+            await_main_process_attachment: false,
+            workload_template_name: String::new(),
         };
 
         let sandbox_name =
@@ -2017,30 +2016,6 @@ fn format_draft_approve_all_result(
 // Data refresh
 // ---------------------------------------------------------------------------
 
-async fn fetch_providers_v2_setting(app: &mut App) {
-    let req = openshell_core::proto::GetGatewayConfigRequest {};
-    match tokio::time::timeout(Duration::from_secs(5), app.client.get_gateway_config(req)).await {
-        Ok(Ok(resp)) => {
-            let response = resp.into_inner();
-            let enabled = response
-                .settings
-                .get(openshell_core::settings::PROVIDERS_V2_ENABLED_KEY)
-                .and_then(|s| match &s.value {
-                    Some(openshell_core::proto::setting_value::Value::BoolValue(v)) => Some(*v),
-                    _ => None,
-                })
-                .unwrap_or(false);
-            app.providers_v2_enabled = enabled;
-        }
-        Ok(Err(e)) => {
-            app.status_text = format!("failed to fetch gateway config: {}", e.message());
-        }
-        Err(_) => {
-            app.status_text = "gateway config fetch timed out".to_string();
-        }
-    }
-}
-
 async fn refresh_data(app: &mut App) {
     refresh_health(app).await;
     refresh_global_settings(app).await;
@@ -2140,36 +2115,52 @@ async fn refresh_providers(app: &mut App) {
         };
     let providers = response.providers;
 
-    let profiles: ProviderProfileCache = if app.providers_v2_enabled {
-        let workspaces: std::collections::HashSet<String> = providers
-            .iter()
-            .map(|provider| provider_profile_query_workspace(provider).to_string())
-            // Legacy provider records can decode without an object workspace. Do not
-            // turn that missing context into a platform-scoped profile request.
-            .filter(|workspace| !workspace.is_empty())
-            .collect();
-        let mut all_profiles = HashMap::new();
-        for ws in &workspaces {
-            let req = openshell_core::proto::ListProviderProfilesRequest {
-                limit: 100,
-                offset: 0,
-                workspace: ws.clone(),
-            };
-            if let Ok(Ok(resp)) = tokio::time::timeout(
-                Duration::from_secs(5),
-                app.client.list_provider_profiles(req),
-            )
-            .await
-            {
-                for profile in resp.into_inner().profiles {
-                    cache_provider_profile(&mut all_profiles, ws, profile);
+    let mut workspaces: std::collections::HashSet<String> = providers
+        .iter()
+        .map(|provider| provider_profile_query_workspace(provider).to_string())
+        // Legacy provider records can decode without an object workspace. Do not
+        // turn that missing context into a platform-scoped profile request.
+        .filter(|workspace| !workspace.is_empty())
+        .collect();
+    if !app.all_workspaces {
+        workspaces.insert(app.current_workspace.clone());
+    }
+    let mut profiles = HashMap::new();
+    app.provider_profiles.clear();
+    for ws in &workspaces {
+        let client = app.client.clone();
+        let workspace = ws.clone();
+        if let Some(listed) = collect_provider_profile_pages(move |offset| {
+            let mut client = client.clone();
+            let workspace = workspace.clone();
+            async move {
+                let req = openshell_core::proto::ListProviderProfilesRequest {
+                    limit: PROVIDER_PROFILE_PAGE_SIZE,
+                    offset,
+                    workspace,
+                };
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client.list_provider_profiles(req),
+                )
+                .await
+                {
+                    Ok(Ok(response)) => Some(response.into_inner().profiles),
+                    _ => None,
                 }
             }
+        })
+        .await
+        {
+            if !app.all_workspaces && ws == &app.current_workspace {
+                app.provider_profiles.clone_from(&listed);
+            }
+            for profile in listed {
+                cache_provider_profile(&mut profiles, ws, profile);
+            }
         }
-        all_profiles
-    } else {
-        HashMap::new()
-    };
+    }
+    app.sync_create_provider_types();
 
     app.provider_count = providers.len();
     app.provider_entries = providers
@@ -2201,6 +2192,26 @@ async fn refresh_providers(app: &mut App) {
         .collect();
     if app.provider_selected >= app.provider_count && app.provider_count > 0 {
         app.provider_selected = app.provider_count - 1;
+    }
+}
+
+async fn collect_provider_profile_pages<F, Fut>(
+    mut fetch_page: F,
+) -> Option<Vec<openshell_core::proto::ProviderProfile>>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = Option<Vec<openshell_core::proto::ProviderProfile>>>,
+{
+    let mut profiles = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = fetch_page(offset).await?;
+        let page_len = page.len();
+        profiles.extend(page);
+        if page_len < PROVIDER_PROFILE_PAGE_SIZE as usize {
+            return Some(profiles);
+        }
+        offset = offset.saturating_add(PROVIDER_PROFILE_PAGE_SIZE);
     }
 }
 
@@ -2705,6 +2716,7 @@ fn phase_label(phase: i32) -> String {
         x if x == SandboxPhase::Stopping as i32 => "Stopping",
         x if x == SandboxPhase::Stopped as i32 => "Stopped",
         x if x == SandboxPhase::Starting as i32 => "Starting",
+        x if x == SandboxPhase::Completed as i32 => "Completed",
         _ => "Unknown",
     }
     .to_string()
@@ -2766,6 +2778,7 @@ mod phase_label_tests {
         assert_eq!(phase_label(SandboxPhase::Stopping as i32), "Stopping");
         assert_eq!(phase_label(SandboxPhase::Stopped as i32), "Stopped");
         assert_eq!(phase_label(SandboxPhase::Starting as i32), "Starting");
+        assert_eq!(phase_label(SandboxPhase::Completed as i32), "Completed");
     }
 }
 
@@ -2858,5 +2871,50 @@ mod provider_profile_workspace_tests {
                 "{label} did not survive cache insertion and lookup"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_profile_pagination_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn profile_fetch_continues_until_page_two_is_collected() {
+        let requested_offsets = Arc::new(Mutex::new(Vec::new()));
+        let offsets = Arc::clone(&requested_offsets);
+
+        let profiles = collect_provider_profile_pages(move |offset| {
+            let offsets = Arc::clone(&offsets);
+            async move {
+                offsets.lock().unwrap().push(offset);
+                match offset {
+                    0 => Some(
+                        (0..PROVIDER_PROFILE_PAGE_SIZE)
+                            .map(|index| openshell_core::proto::ProviderProfile {
+                                id: format!("profile-{index}"),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    ),
+                    PROVIDER_PROFILE_PAGE_SIZE => {
+                        Some(vec![openshell_core::proto::ProviderProfile {
+                            id: "page-two-profile".to_string(),
+                            ..Default::default()
+                        }])
+                    }
+                    _ => panic!("unexpected profile page offset {offset}"),
+                }
+            }
+        })
+        .await
+        .expect("all pages should load");
+
+        assert_eq!(
+            *requested_offsets.lock().unwrap(),
+            vec![0, PROVIDER_PROFILE_PAGE_SIZE]
+        );
+        assert_eq!(profiles.len(), PROVIDER_PROFILE_PAGE_SIZE as usize + 1);
+        assert_eq!(profiles.last().unwrap().id, "page-two-profile");
     }
 }

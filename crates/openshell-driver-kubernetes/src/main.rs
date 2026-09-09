@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
@@ -36,6 +35,12 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_LOG_LEVEL", default_value = "info")]
     log_level: String,
+
+    #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
+    otlp_endpoint: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
+    gateway_name: Option<String>,
 
     #[arg(long, env = "OPENSHELL_WORKSPACE_MODE", default_value = "shared")]
     workspace_mode: WorkspaceMode,
@@ -210,11 +215,15 @@ async fn shutdown_signal() {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
-        )
-        .init();
+    let _tracing = openshell_otel::install_driver_tracing(
+        openshell_driver_kubernetes::otel_tracing::TRACING,
+        openshell_otel::DriverTracingConfig {
+            endpoint: args.otlp_endpoint.as_deref(),
+            gateway_name: args.gateway_name.as_deref(),
+            service_version: VERSION,
+            log_level: &args.log_level,
+        },
+    );
 
     let managed_ssh_gateway_pod_selector = args
         .managed_ssh_gateway_pod_selector
@@ -303,6 +312,7 @@ async fn main() -> Result<()> {
             openshell_core::external_driver_socket::SocketCleanup::new(socket_path.clone());
         info!(socket = %socket_path.display(), "Starting Kubernetes compute driver");
         tonic::transport::Server::builder()
+            .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
             .serve_with_incoming_shutdown(
                 openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
@@ -313,9 +323,33 @@ async fn main() -> Result<()> {
     } else {
         info!(address = %args.bind_address, "Starting Kubernetes compute driver");
         tonic::transport::Server::builder()
+            .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
             .serve_with_shutdown(args.bind_address, shutdown)
             .await
             .into_diagnostic()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_gateway_otlp_configuration() {
+        let args = Args::try_parse_from([
+            "openshell-driver-kubernetes",
+            "--otlp-endpoint",
+            "http://collector.example:4317",
+            "--gateway-name",
+            "kubernetes-dev",
+        ])
+        .expect("OTLP endpoint should parse");
+
+        assert_eq!(
+            args.otlp_endpoint.as_deref(),
+            Some("http://collector.example:4317")
+        );
+        assert_eq!(args.gateway_name.as_deref(), Some("kubernetes-dev"));
     }
 }

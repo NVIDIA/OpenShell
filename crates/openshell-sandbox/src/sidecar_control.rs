@@ -38,6 +38,7 @@ pub struct EntrypointStarted {
     pub start_session: bool,
     pub instance_id: String,
     pub exit_code: Option<i32>,
+    pub finalized: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -176,6 +177,7 @@ enum WireClientMessage {
     BootstrapRequest { supervisor_pid: u32 },
     EntrypointStarted { pid: u32, instance_id: String },
     MainProcessExited { instance_id: String, exit_code: i32 },
+    MainProcessFinalized { instance_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,6 +254,10 @@ impl TryFrom<WireServerMessage> for BootstrapData {
         let policy_proto = openshell_core::proto::SandboxPolicy::decode(policy_proto.as_slice())
             .into_diagnostic()
             .wrap_err("failed to decode sidecar bootstrap policy")?;
+        let policy_proto = canonicalize_sidecar_policy(
+            policy_proto,
+            "sidecar bootstrap policy failed validation",
+        )?;
 
         Ok(Self {
             policy_proto,
@@ -288,6 +294,10 @@ impl TryFrom<WireServerMessage> for ControlUpdate {
                     openshell_core::proto::SandboxPolicy::decode(policy_proto.as_slice())
                         .into_diagnostic()
                         .wrap_err("failed to decode sidecar policy update")?;
+                let policy_proto = canonicalize_sidecar_policy(
+                    policy_proto,
+                    "sidecar policy update failed validation",
+                )?;
                 Ok(Self::Policy {
                     policy_proto: Box::new(policy_proto),
                     policy_hash,
@@ -466,12 +476,14 @@ async fn handle_connection(
                     start_session: false,
                     instance_id: String::new(),
                     exit_code: None,
+                    finalized: false,
                 })
                 .await
                 .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
         }
         WireClientMessage::EntrypointStarted { .. }
-        | WireClientMessage::MainProcessExited { .. } => {
+        | WireClientMessage::MainProcessExited { .. }
+        | WireClientMessage::MainProcessFinalized { .. } => {
             return Err(miette::miette!(
                 "sidecar control client sent entrypoint event before bootstrap"
             ));
@@ -509,6 +521,7 @@ async fn handle_connection(
                                 start_session: true,
                                 instance_id,
                                 exit_code: None,
+                                finalized: false,
                             })
                             .await
                             .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
@@ -523,6 +536,19 @@ async fn handle_connection(
                                 start_session: false,
                                 instance_id,
                                 exit_code: Some(exit_code),
+                                finalized: false,
+                            })
+                            .await
+                            .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
+                    }
+                    WireClientMessage::MainProcessFinalized { instance_id } => {
+                        entrypoint_tx
+                            .send(EntrypointStarted {
+                                pid: 0,
+                                start_session: false,
+                                instance_id,
+                                exit_code: None,
+                                finalized: true,
                             })
                             .await
                             .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
@@ -640,6 +666,15 @@ pub async fn send_main_process_exited(
     write_json_line(&mut *writer, &message).await
 }
 
+pub async fn send_main_process_finalized(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    instance_id: String,
+) -> Result<()> {
+    let message = WireClientMessage::MainProcessFinalized { instance_id };
+    let mut writer = writer.lock().await;
+    write_json_line(&mut *writer, &message).await
+}
+
 async fn write_json_line<W, T>(writer: &mut W, value: &T) -> Result<()>
 where
     W: AsyncWrite + Unpin + Send,
@@ -665,16 +700,123 @@ fn decode_server_message(line: &str) -> Result<WireServerMessage> {
         .wrap_err("failed to decode sidecar server message")
 }
 
+fn canonicalize_sidecar_policy(
+    policy: openshell_core::proto::SandboxPolicy,
+    error_message: &'static str,
+) -> Result<openshell_core::proto::SandboxPolicy> {
+    // Bootstrap and update messages must expose the same canonical typed
+    // policy to every process-supervisor consumer. Keep validation details
+    // out of this channel error because they can contain authored values.
+    openshell_policy::validate_and_canonicalize_sandbox_policy(policy)
+        .map_err(|_| miette::miette!(error_message))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::SandboxPolicy;
+    use openshell_core::proto::{McpOptions, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy};
+
+    fn defaultable_mcp_policy(mcp: Option<McpOptions>) -> SandboxPolicy {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "mcp".to_string(),
+            NetworkPolicyRule {
+                name: "mcp".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "mcp.example.com".to_string(),
+                    port: 443,
+                    protocol: "mcp".to_string(),
+                    mcp,
+                    rules: vec![openshell_core::proto::L7Rule {
+                        allow: Some(openshell_core::proto::L7Allow {
+                            method: "tools/list".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        policy
+    }
+
+    fn mcp_versions(policy: &SandboxPolicy) -> &[String] {
+        policy.network_policies["mcp"].endpoints[0]
+            .mcp
+            .as_ref()
+            .expect("canonical MCP options")
+            .versions
+            .as_slice()
+    }
+
+    fn bootstrap_message(policy: &SandboxPolicy) -> WireServerMessage {
+        WireServerMessage::BootstrapResponse {
+            policy_proto: policy.encode_to_vec(),
+            provider_env_revision: 0,
+            provider_env_generation: 0,
+            provider_child_env: HashMap::new(),
+            agent_proposals_enabled: false,
+            proxy_ca_cert_path: None,
+            proxy_ca_bundle_path: None,
+        }
+    }
+
+    fn policy_update_message(policy: &SandboxPolicy) -> WireServerMessage {
+        WireServerMessage::PolicyUpdated {
+            policy_proto: policy.encode_to_vec(),
+            policy_hash: "hash".to_string(),
+            config_revision: 1,
+        }
+    }
 
     fn current_peer() -> ExpectedPeer {
         ExpectedPeer {
             uid: nix::unistd::Uid::current().as_raw(),
             gid: nix::unistd::Gid::current().as_raw(),
         }
+    }
+
+    #[test]
+    fn policy_messages_canonicalize_defaultable_mcp_versions() {
+        for raw in [
+            defaultable_mcp_policy(None),
+            defaultable_mcp_policy(Some(McpOptions::default())),
+        ] {
+            let bootstrap = BootstrapData::try_from(bootstrap_message(&raw))
+                .expect("defaultable MCP policy must pass bootstrap ingress");
+            assert_eq!(mcp_versions(&bootstrap.policy_proto), ["2025-11-25"]);
+
+            let update = ControlUpdate::try_from(policy_update_message(&raw))
+                .expect("defaultable MCP policy must pass update ingress");
+            let ControlUpdate::Policy { policy_proto, .. } = update else {
+                panic!("expected policy update");
+            };
+            assert_eq!(mcp_versions(&policy_proto), ["2025-11-25"]);
+        }
+    }
+
+    #[test]
+    fn policy_messages_reject_invalid_mcp_versions_without_echoing_values() {
+        let invalid = defaultable_mcp_policy(Some(McpOptions {
+            versions: vec!["latest".to_string()],
+            ..Default::default()
+        }));
+
+        let bootstrap_error = BootstrapData::try_from(bootstrap_message(&invalid))
+            .expect_err("invalid MCP policy must not pass bootstrap ingress")
+            .to_string();
+        assert_eq!(
+            bootstrap_error,
+            "sidecar bootstrap policy failed validation"
+        );
+        assert!(!bootstrap_error.contains("latest"));
+
+        let update_error = ControlUpdate::try_from(policy_update_message(&invalid))
+            .expect_err("invalid MCP policy must not pass update ingress")
+            .to_string();
+        assert_eq!(update_error, "sidecar policy update failed validation");
+        assert!(!update_error.contains("latest"));
     }
 
     #[tokio::test]
@@ -893,6 +1035,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(terminal.exit_code, Some(0));
+        assert!(!terminal.finalized);
 
         assert!(
             tokio::time::timeout(Duration::from_millis(20), connection.updates.recv())
@@ -909,6 +1052,16 @@ mod tests {
             ack,
             ControlUpdate::MainProcessExitAck { instance_id } if instance_id == "instance-1"
         ));
+
+        send_main_process_finalized(&connection.writer, "instance-1".to_string())
+            .await
+            .unwrap();
+        let delivered = tokio::time::timeout(Duration::from_secs(1), entrypoint_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(delivered.exit_code.is_none());
+        assert!(delivered.finalized);
     }
 
     #[tokio::test]

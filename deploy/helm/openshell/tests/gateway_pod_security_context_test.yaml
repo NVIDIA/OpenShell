@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: gateway pod securityContext
+templates:
+  - templates/gateway-config.yaml
+  - templates/statefulset.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: renders the pod securityContext from podSecurityContext by default
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.fsGroup
+          value: 1000
+
+  - it: renders an explicitly set podSecurityContext
+    template: templates/statefulset.yaml
+    set:
+      podSecurityContext:
+        fsGroup: 2000
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.fsGroup
+          value: 2000
+
+  - it: omits the pod securityContext block when podSecurityContext is null
+    template: templates/statefulset.yaml
+    set:
+      podSecurityContext: null
+    asserts:
+      - notExists:
+          path: spec.template.spec.securityContext

@@ -4,6 +4,7 @@
 pub mod config;
 pub mod driver;
 pub mod grpc;
+pub mod otel_tracing;
 
 pub use config::{
     AppArmorProfile, DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
@@ -13,4 +14,4 @@ pub use config::{
 };
 pub use driver::{KubernetesComputeDriver, KubernetesDriverError};
 pub use grpc::ComputeDriverService;
-pub use openshell_core::OperatorNamespaceAllowlist;
+pub use openshell_core::DynamicStringAllowlist as OperatorNamespaceAllowlist;

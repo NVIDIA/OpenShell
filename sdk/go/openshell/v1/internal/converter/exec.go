@@ -45,6 +45,7 @@ func ExecRequestToProto(sandboxID string, command []string, opts *types.ExecOpti
 	if opts != nil {
 		req.Workdir = opts.WorkDir
 		req.Environment = CopyStringMap(opts.Env)
+		req.NoLoginShell = opts.NoLoginShell
 	}
 	return req
 }

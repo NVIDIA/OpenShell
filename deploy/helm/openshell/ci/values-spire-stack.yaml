@@ -15,7 +15,7 @@ spire-server:
       clusterSPIFFEIDs:
         openshell-sandboxes:
           enabled: true
-          spiffeIDTemplate: 'spiffe://{{ .TrustDomain }}/openshell/sandbox/{{ index .PodMeta.Annotations "openshell.io/sandbox-id" }}'
+          spiffeIDTemplate: 'spiffe://{{ .TrustDomain }}/openshell/sandbox/{{ index .PodMeta.Annotations "openshell.ai/sandbox-id" }}'
           namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: openshell

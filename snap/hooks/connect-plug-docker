@@ -1,0 +1,12 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The gateway daemon can start when this plug is still disconnected. Restart it
+# after Docker access becomes available so driver auto-detection runs with the
+# socket exposed by docker:docker-daemon. This hook does not make normal gateway
+# startup conditional on Docker; it runs only after an operator connects Docker.
+
+set -eu
+
+snapctl restart "${SNAP_INSTANCE_NAME}.gateway"

@@ -386,10 +386,10 @@ mod tests {
     #[test]
     fn gateway_listener_specs_reuse_primary_when_wildcard_covers_driver_address() {
         let primary: SocketAddr = "0.0.0.0:8080".parse().unwrap();
-        let docker: SocketAddr = "172.18.0.1:8080".parse().unwrap();
+        let callback: SocketAddr = "172.18.0.1:8080".parse().unwrap();
         let requirements = [
-            docker_listener_requirement(docker),
-            docker_listener_requirement(docker),
+            exact_listener_requirement(callback),
+            exact_listener_requirement(callback),
         ];
 
         assert_eq!(
@@ -401,15 +401,15 @@ mod tests {
     #[test]
     fn gateway_listener_scope_for_reused_primary_remains_primary() {
         let primary: SocketAddr = "0.0.0.0:8080".parse().unwrap();
-        let docker: SocketAddr = "172.18.0.1:8080".parse().unwrap();
+        let callback: SocketAddr = "172.18.0.1:8080".parse().unwrap();
         let loopback: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let [spec] = gateway_listener_specs(primary, &[docker_listener_requirement(docker)])
+        let [spec] = gateway_listener_specs(primary, &[exact_listener_requirement(callback)])
             .unwrap()
             .try_into()
             .unwrap();
 
         assert_eq!(
-            spec.scope_for_local_addr(docker),
+            spec.scope_for_local_addr(callback),
             GatewayListenerScope::Primary,
         );
         assert_eq!(
@@ -421,10 +421,10 @@ mod tests {
     #[test]
     fn gateway_listener_specs_preserve_driver_callback_scope() {
         let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let docker: SocketAddr = "172.18.0.1:8080".parse().unwrap();
+        let callback: SocketAddr = "172.18.0.1:8080".parse().unwrap();
         let requirements = [
-            docker_listener_requirement(docker),
-            docker_listener_requirement(docker),
+            exact_listener_requirement(callback),
+            exact_listener_requirement(callback),
         ];
 
         assert_eq!(
@@ -437,11 +437,11 @@ mod tests {
                     provenance: None,
                 },
                 GatewayListenerSpec {
-                    address: docker,
+                    address: callback,
                     scope: GatewayListenerScope::ComputeDriverCallback,
                     covered_addresses: Vec::new(),
                     provenance: Some(GatewayListenerProvenance {
-                        driver_name: "docker".to_string(),
+                        driver_name: "alpha".to_string(),
                         reason: "managed bridge".to_string(),
                     }),
                 },
@@ -473,7 +473,7 @@ mod tests {
             "172.18.0.1:0",
             "172.18.0.1:9090",
         ] {
-            let requirement = docker_listener_requirement(address.parse().unwrap());
+            let requirement = exact_listener_requirement(address.parse().unwrap());
             assert!(
                 gateway_listener_specs(primary, &[requirement]).is_err(),
                 "{address} should be rejected"
@@ -482,41 +482,41 @@ mod tests {
     }
 
     #[test]
-    fn gateway_listener_specs_use_exact_podman_network_gateway() {
+    fn gateway_listener_specs_use_exact_network_gateway() {
         let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let podman_gateway: SocketAddr = "10.89.1.1:8080".parse().unwrap();
+        let network_gateway: SocketAddr = "10.89.1.1:8080".parse().unwrap();
 
         assert_eq!(
-            gateway_listener_specs(primary, &[podman_listener_requirement(podman_gateway)])
+            gateway_listener_specs(primary, &[network_listener_requirement(network_gateway)])
                 .unwrap(),
             vec![
                 primary_listener_spec(primary),
-                callback_listener_spec(podman_gateway, "podman", "Podman managed bridge",),
+                callback_listener_spec(network_gateway, "beta", "managed bridge",),
             ]
         );
     }
 
     #[test]
-    fn gateway_listener_specs_reuse_primary_when_it_covers_podman_exact() {
+    fn gateway_listener_specs_reuse_primary_when_it_covers_exact_requirement() {
         let primary: SocketAddr = "0.0.0.0:8080".parse().unwrap();
-        let podman_gateway: SocketAddr = "10.89.1.1:8080".parse().unwrap();
+        let network_gateway: SocketAddr = "10.89.1.1:8080".parse().unwrap();
 
         assert_eq!(
-            gateway_listener_specs(primary, &[podman_listener_requirement(podman_gateway)],)
+            gateway_listener_specs(primary, &[network_listener_requirement(network_gateway)],)
                 .unwrap(),
             vec![primary_listener_spec(primary)]
         );
     }
 
     #[test]
-    fn gateway_listener_specs_resolve_podman_default_route_source() {
+    fn gateway_listener_specs_resolve_default_route_source() {
         let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let default_route_ip = "192.168.20.20".parse().unwrap();
 
         assert_eq!(
             gateway_listener_specs_with_default_route_ip(
                 primary,
-                &[podman_default_route_listener_requirement()],
+                &[default_route_listener_requirement()],
                 Some(default_route_ip),
             )
             .unwrap(),
@@ -524,8 +524,8 @@ mod tests {
                 primary_listener_spec(primary),
                 callback_listener_spec(
                     "192.168.20.20:8080".parse().unwrap(),
-                    "podman",
-                    "rootless pasta upstream interface",
+                    "beta",
+                    "default route interface",
                 ),
             ]
         );
@@ -537,7 +537,7 @@ mod tests {
 
         let err = gateway_listener_specs_with_default_route_ip(
             primary,
-            &[podman_default_route_listener_requirement()],
+            &[default_route_listener_requirement()],
             Some("203.0.113.20".parse().unwrap()),
         )
         .unwrap_err();
@@ -552,7 +552,7 @@ mod tests {
         assert_eq!(
             gateway_listener_specs_with_default_route_ip(
                 primary,
-                &[podman_default_route_listener_requirement()],
+                &[default_route_listener_requirement()],
                 Some(default_route_ip),
             )
             .unwrap(),
@@ -561,28 +561,24 @@ mod tests {
     }
 
     #[test]
-    fn gateway_listener_specs_resolve_podman_loopback_separately() {
+    fn gateway_listener_specs_resolve_loopback_separately() {
         let primary: SocketAddr = "192.168.20.20:8080".parse().unwrap();
 
         assert_eq!(
-            gateway_listener_specs(primary, &[podman_loopback_listener_requirement()]).unwrap(),
+            gateway_listener_specs(primary, &[loopback_listener_requirement()]).unwrap(),
             vec![
                 primary_listener_spec(primary),
-                callback_listener_spec(
-                    "127.0.0.1:8080".parse().unwrap(),
-                    "podman",
-                    "Podman machine host forwarder",
-                ),
+                callback_listener_spec("127.0.0.1:8080".parse().unwrap(), "beta", "host forwarder",),
             ]
         );
     }
 
     #[test]
-    fn gateway_listener_specs_reuse_wildcard_primary_for_podman_loopback() {
+    fn gateway_listener_specs_reuse_wildcard_primary_for_loopback() {
         let primary = "0.0.0.0:8080".parse().unwrap();
 
         assert_eq!(
-            gateway_listener_specs(primary, &[podman_loopback_listener_requirement()]).unwrap(),
+            gateway_listener_specs(primary, &[loopback_listener_requirement()]).unwrap(),
             vec![primary_listener_spec(primary)]
         );
     }
@@ -592,7 +588,7 @@ mod tests {
         let primary = "127.0.0.1:8080".parse().unwrap();
 
         assert_eq!(
-            gateway_listener_specs(primary, &[podman_loopback_listener_requirement()]).unwrap(),
+            gateway_listener_specs(primary, &[loopback_listener_requirement()]).unwrap(),
             vec![primary_listener_spec(primary)]
         );
     }
@@ -602,7 +598,7 @@ mod tests {
         for primary in ["[::1]:8080", "[::]:8080"] {
             let primary = primary.parse().unwrap();
             let specs =
-                gateway_listener_specs(primary, &[podman_loopback_listener_requirement()]).unwrap();
+                gateway_listener_specs(primary, &[loopback_listener_requirement()]).unwrap();
 
             assert_eq!(specs.len(), 2);
             assert_eq!(specs[1].address, SocketAddr::from(([127, 0, 0, 1], 8080)));
@@ -613,7 +609,7 @@ mod tests {
     fn gateway_listener_specs_validate_selector_independently_of_driver_name() {
         let primary: SocketAddr = "192.168.20.20:8080".parse().unwrap();
         let requirement = GatewayListenerRequirement::LoopbackInterface {
-            driver_name: "docker".to_string(),
+            driver_name: "alpha".to_string(),
             reason: "wrong selector".to_string(),
         };
 
@@ -634,7 +630,7 @@ mod tests {
         let result: openshell_core::Result<()> = async {
             let _listeners = bind_gateway_listeners(
                 primary_address,
-                &[docker_listener_requirement(occupied_address)],
+                &[exact_listener_requirement(occupied_address)],
             )
             .await?;
             continuation_reached.store(true, Ordering::SeqCst);
@@ -663,7 +659,7 @@ mod tests {
         drop(probe);
 
         let primary = format!("[::]:{port}").parse().unwrap();
-        let listeners = bind_gateway_listeners(primary, &[podman_loopback_listener_requirement()])
+        let listeners = bind_gateway_listeners(primary, &[loopback_listener_requirement()])
             .await
             .expect("IPv6 wildcard and IPv4 callback listeners should both bind");
 
@@ -675,33 +671,33 @@ mod tests {
         );
     }
 
-    fn docker_listener_requirement(address: SocketAddr) -> GatewayListenerRequirement {
+    fn exact_listener_requirement(address: SocketAddr) -> GatewayListenerRequirement {
         GatewayListenerRequirement::Exact {
             address,
-            driver_name: "docker".to_string(),
+            driver_name: "alpha".to_string(),
             reason: "managed bridge".to_string(),
         }
     }
 
-    fn podman_listener_requirement(address: SocketAddr) -> GatewayListenerRequirement {
+    fn network_listener_requirement(address: SocketAddr) -> GatewayListenerRequirement {
         GatewayListenerRequirement::Exact {
             address,
-            driver_name: "podman".to_string(),
-            reason: "Podman managed bridge".to_string(),
+            driver_name: "beta".to_string(),
+            reason: "managed bridge".to_string(),
         }
     }
 
-    fn podman_default_route_listener_requirement() -> GatewayListenerRequirement {
+    fn default_route_listener_requirement() -> GatewayListenerRequirement {
         GatewayListenerRequirement::DefaultRouteInterface {
-            driver_name: "podman".to_string(),
-            reason: "rootless pasta upstream interface".to_string(),
+            driver_name: "beta".to_string(),
+            reason: "default route interface".to_string(),
         }
     }
 
-    fn podman_loopback_listener_requirement() -> GatewayListenerRequirement {
+    fn loopback_listener_requirement() -> GatewayListenerRequirement {
         GatewayListenerRequirement::LoopbackInterface {
-            driver_name: "podman".to_string(),
-            reason: "Podman machine host forwarder".to_string(),
+            driver_name: "beta".to_string(),
+            reason: "host forwarder".to_string(),
         }
     }
 

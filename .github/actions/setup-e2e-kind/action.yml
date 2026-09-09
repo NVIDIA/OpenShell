@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Setup E2E kind
+description: Create a kind cluster and preload OpenShell images for E2E tests
+
+inputs:
+  cluster-name:
+    description: kind cluster name
+    required: true
+  image-tag:
+    description: OpenShell image tag to load
+    required: true
+  images:
+    description: Space-separated OpenShell image components to load
+    required: false
+    default: gateway supervisor
+  registry:
+    description: Container registry and namespace
+    required: false
+    default: ghcr.io/nvidia/openshell
+  registry-username:
+    description: Registry username
+    required: true
+  registry-password:
+    description: Registry password
+    required: true
+  mise-version:
+    description: mise release to install
+    required: false
+    default: v2026.4.25
+
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/setup-mise
+      with:
+        version: ${{ inputs.mise-version }}
+
+    - name: Log in to GHCR
+      shell: bash
+      env:
+        REGISTRY: ${{ inputs.registry }}
+        REGISTRY_USERNAME: ${{ inputs.registry-username }}
+        REGISTRY_PASSWORD: ${{ inputs.registry-password }}
+      run: echo "$REGISTRY_PASSWORD" | docker login "${REGISTRY%%/*}" -u "$REGISTRY_USERNAME" --password-stdin
+
+    - name: Create kind cluster
+      uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+      with:
+        cluster_name: ${{ inputs.cluster-name }}
+        wait: 120s
+
+    - name: Export kind kubeconfig to mise path
+      shell: bash
+      env:
+        CLUSTER_NAME: ${{ inputs.cluster-name }}
+      run: |
+        set -euo pipefail
+        kind get kubeconfig --name "$CLUSTER_NAME" > "$GITHUB_WORKSPACE/kubeconfig"
+        chmod 600 "$GITHUB_WORKSPACE/kubeconfig"
+
+    - name: Load OpenShell images into kind
+      shell: bash
+      env:
+        CLUSTER_NAME: ${{ inputs.cluster-name }}
+        IMAGE_COMPONENTS: ${{ inputs.images }}
+        IMAGE_TAG: ${{ inputs.image-tag }}
+        REGISTRY: ${{ inputs.registry }}
+      run: |
+        set -euo pipefail
+        for component in $IMAGE_COMPONENTS; do
+          case "$component" in
+            gateway | supervisor) ;;
+            *) echo "ERROR: unsupported OpenShell image component: $component" >&2; exit 1 ;;
+          esac
+          image="${REGISTRY}/${component}:${IMAGE_TAG}"
+          archive="${RUNNER_TEMP:-/tmp}/openshell-${component}-linux-amd64.tar"
+          docker pull --platform linux/amd64 "$image"
+          docker image save --platform linux/amd64 --output "$archive" "$image"
+          kind load image-archive "$archive" --name "$CLUSTER_NAME"
+        done

@@ -413,7 +413,21 @@ impl OpaEngine {
         entrypoint_pid: u32,
         require_binary_identity: bool,
     ) -> Result<Self> {
-        let ambiguities = openshell_policy::find_endpoint_ambiguities(proto);
+        // Protobuf cannot distinguish an omitted repeated MCP version field
+        // from an empty one. Canonicalize before any runtime consumer reads
+        // the policy so both representations select the pinned default.
+        let proto = openshell_policy::validate_and_canonicalize_sandbox_policy(proto.clone())
+            .map_err(|error| {
+                let errors = error
+                    .violations()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                miette::miette!("policy validation failed:\n{errors}")
+            })?;
+
+        let ambiguities = openshell_policy::find_endpoint_ambiguities(&proto);
         if !ambiguities.is_empty() {
             return Err(miette::miette!(
                 "network endpoint ambiguity validation failed:\n{}",
@@ -426,16 +440,7 @@ impl OpaEngine {
         }
 
         emit_binary_identity_mode(require_binary_identity, "proto");
-        if let Err(violations) = openshell_policy::validate_sandbox_policy(proto) {
-            let errors = violations
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Err(miette::miette!("policy validation failed:\n{errors}"));
-        }
-
-        let data_json_str = proto_to_opa_data_json(proto, entrypoint_pid);
+        let data_json_str = proto_to_opa_data_json(&proto, entrypoint_pid);
 
         // Parse back to Value for preprocessing, then re-serialize
         let mut data: serde_json::Value = serde_json::from_str(&data_json_str)
@@ -1502,6 +1507,28 @@ fn normalize_l7_config_aliases(data: &mut serde_json::Value) -> Vec<String> {
             for stanza in L7ConfigStanza::ALL {
                 normalize_l7_config_alias(&mut errors, ep_obj, &loc, stanza);
             }
+
+            // The nested MCP stanza is optional, but the runtime projection is
+            // not. Materialize the pinned default at this YAML boundary so a
+            // missing alias cannot later look like corrupted runtime state.
+            if ep_obj
+                .get("protocol")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|protocol| protocol.eq_ignore_ascii_case("mcp"))
+                && !ep_obj.contains_key("mcp_versions")
+            {
+                match openshell_policy::l7_config_alias_runtime_fields(
+                    L7ConfigStanza::Mcp,
+                    serde_json::json!({}),
+                ) {
+                    Ok(fields) => {
+                        for (field, value) in fields {
+                            ep_obj.insert(field.to_string(), value);
+                        }
+                    }
+                    Err(error) => errors.push(format!("{loc}.mcp: {error}")),
+                }
+            }
         }
     }
 
@@ -1526,6 +1553,15 @@ fn normalize_l7_config_alias(
         Ok(fields) => {
             ep.remove(key);
             for (field, value) in fields {
+                if stanza == L7ConfigStanza::Mcp
+                    && field == "mcp_versions"
+                    && ep.contains_key(field)
+                {
+                    errors.push(format!(
+                        "{loc}: mcp.versions and mcp_versions cannot both be set"
+                    ));
+                    continue;
+                }
                 ep.entry(field.to_string()).or_insert(value);
             }
         }
@@ -1624,19 +1660,6 @@ fn normalize_l7_rule_aliases(
     }
 }
 
-/// Resolve a policy binary path through the container's root filesystem.
-///
-/// On Linux, `/proc/<pid>/root/` provides access to the container's mount
-/// namespace. If the policy path is a symlink inside the container
-/// (e.g., `/usr/bin/python3` → `/usr/bin/python3.11`), returns the
-/// canonical target path. Returns `None` if:
-/// - Not on Linux
-/// - `entrypoint_pid` is 0 (container not yet started)
-/// - Path contains glob characters
-/// - Path is not a symlink
-/// - Resolution fails (binary doesn't exist in container)
-/// - Resolved path equals the original
-///
 /// Normalize a path by resolving `.` and `..` components without touching
 /// the filesystem. Only works correctly for absolute paths.
 #[cfg(any(target_os = "linux", test))]
@@ -1654,10 +1677,72 @@ fn normalize_path(path: &Path) -> PathBuf {
     result
 }
 
+// Only the Linux resolver constructs the non-`Literal` variants; on other
+// platforms the stub returns `Literal`, so the rest look dead there.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum BinaryResolution {
+    /// Symlink resolved to a different canonical target — add it to policy.
+    Resolved(String),
+    /// Nothing to add: glob, pid 0, not a symlink, or already canonical.
+    Literal,
+    /// Candidate absent under an accessible process root — expected, quiet.
+    Absent,
+    /// The process root `/proc/<pid>/root` itself is unreachable (pid gone or
+    /// denied) — actionable, and `CAP_SYS_PTRACE` guidance is relevant.
+    Inaccessible(std::io::ErrorKind),
+    /// The process root is reachable but the candidate path itself failed for a
+    /// non-NotFound reason (a parent component is permission-denied, or the path
+    /// forms a symlink loop) — actionable, but a target-path problem rather than
+    /// a process-root one, so `CAP_SYS_PTRACE` guidance does not apply.
+    CandidateInaccessible(std::io::ErrorKind),
+    /// A component mid symlink-chain failed to resolve.
+    ChainBroken(std::io::ErrorKind),
+}
+
+impl BinaryResolution {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    const fn classify_first_probe_error(kind: std::io::ErrorKind) -> Self {
+        // Callers reach this only after confirming the process root is
+        // reachable, so a non-NotFound failure here is specific to the
+        // candidate path, not the process root.
+        match kind {
+            std::io::ErrorKind::NotFound => Self::Absent,
+            _ => Self::CandidateInaccessible(kind),
+        }
+    }
+}
+
+/// Resolve a policy binary path through the container's root filesystem.
+///
+/// On Linux, `/proc/<pid>/root/` provides access to the container's mount
+/// namespace. If the policy path is a symlink inside the container
+/// (e.g., `/usr/bin/python3` → `/usr/bin/python3.11`), the canonical target is
+/// returned as [`BinaryResolution::Resolved`]. The outcome is classified as:
+/// - [`BinaryResolution::Literal`] — not on Linux, `entrypoint_pid` is 0
+///   (container not yet started), the path contains glob characters, it is not
+///   a symlink, or the resolved path equals the original.
+/// - [`BinaryResolution::Absent`] — the candidate does not exist under an
+///   otherwise reachable process root (expected; the caller logs it quietly).
+/// - [`BinaryResolution::Inaccessible`] — `/proc/<pid>/root` itself is
+///   unreachable (pid gone or access denied).
+/// - [`BinaryResolution::CandidateInaccessible`] — the process root is
+///   reachable but the candidate path failed for a non-NotFound reason.
+/// - [`BinaryResolution::ChainBroken`] — a component mid symlink-chain failed,
+///   or the chain forms a cycle / exceeds the kernel symlink limit.
 #[cfg(target_os = "linux")]
-fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> Option<String> {
+fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> BinaryResolution {
     if policy_path.contains('*') || entrypoint_pid == 0 {
-        return None;
+        return BinaryResolution::Literal;
+    }
+
+    // Confirm the process root itself is reachable before probing candidates.
+    // A leaf `ENOENT` (absent candidate) and an unreachable process root
+    // (pid gone -> `ENOENT`, or denied -> `EACCES`) are indistinguishable at
+    // the leaf path, so check the root first. Any failure here is an access
+    // problem, not an absent candidate, and must stay actionable.
+    if let Err(e) = std::fs::metadata(format!("/proc/{entrypoint_pid}/root")) {
+        return BinaryResolution::Inaccessible(e.kind());
     }
 
     // Walk the symlink chain inside the container filesystem using
@@ -1666,6 +1751,11 @@ fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> Option
     // strips the prefix we need. read_link only reads the target of
     // the specified symlink, keeping us in the container's namespace.
     let mut resolved = PathBuf::from(policy_path);
+
+    // Set once the walk reaches a real (non-symlink) target or a terminal
+    // dead end. If the iteration cap is hit while every component is still a
+    // symlink, this stays false and the chain is treated as broken.
+    let mut reached_target = false;
 
     // Linux SYMLOOP_MAX is 40; stop before infinite loops
     for _ in 0..40 {
@@ -1678,76 +1768,93 @@ fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> Option
         let meta = match std::fs::symlink_metadata(&container_path) {
             Ok(m) => m,
             Err(e) => {
-                // Only warn on the first iteration (the original policy path).
-                // On subsequent iterations, the intermediate target may
-                // legitimately not exist (broken symlink chain).
+                // First iteration is the original policy path: an absent
+                // candidate (NotFound) is expected, any other error means the
+                // process root itself is unreachable. Later iterations are
+                // chain components, so a failure there is a broken symlink
+                // chain. Classify without logging; the caller emits the log at
+                // the appropriate level.
                 if resolved.as_os_str() == policy_path {
-                    tracing::warn!(
-                        "Cannot access container filesystem for symlink resolution: \
-                         path={policy_path} container_path={container_path} pid={entrypoint_pid} \
-                         error={e}. Binary paths in policy will be matched literally. \
-                         If this binary is a symlink (e.g., /usr/bin/python3 -> python3.11), \
-                         use the canonical path instead, or run with CAP_SYS_PTRACE."
-                    );
-                } else {
-                    tracing::warn!(
-                        "Symlink chain broken during resolution: \
-                         original={policy_path} current={} pid={entrypoint_pid} error={e}. \
-                         Binary will be matched by original path only.",
-                        resolved.display()
-                    );
+                    // The up-front root check and this probe are separate
+                    // syscalls; if the process exited in between, the whole
+                    // `/proc/<pid>` tree is gone and the leaf probe also
+                    // reports NotFound. Re-check the root so a vanished process
+                    // stays classified as Inaccessible (actionable) rather than
+                    // being masked as an absent candidate (quiet).
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        && let Err(root_error) =
+                            std::fs::metadata(format!("/proc/{entrypoint_pid}/root"))
+                    {
+                        return BinaryResolution::Inaccessible(root_error.kind());
+                    }
+                    return BinaryResolution::classify_first_probe_error(e.kind());
                 }
-                return None;
+                return BinaryResolution::ChainBroken(e.kind());
             }
         };
 
         if !meta.file_type().is_symlink() {
             // Reached a non-symlink — this is the final resolved target
+            reached_target = true;
             break;
         }
 
         let target = match std::fs::read_link(&container_path) {
             Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(
-                    "Symlink detected but read_link failed: \
-                     path={policy_path} current={} pid={entrypoint_pid} error={e}. \
-                     Binary will be matched by original path only.",
-                    resolved.display()
-                );
-                return None;
-            }
+            // A symlink whose target can't be read is a broken chain; the
+            // caller logs it.
+            Err(e) => return BinaryResolution::ChainBroken(e.kind()),
         };
 
         if target.is_absolute() {
             resolved = target;
-        } else {
+        } else if let Some(parent) = resolved.parent() {
             // Relative symlink: resolve against the containing directory
             // e.g., /usr/bin/python3 -> python3.11 becomes /usr/bin/python3.11
-            if let Some(parent) = resolved.parent() {
-                resolved = normalize_path(&parent.join(&target));
-            } else {
-                break;
+            resolved = normalize_path(&parent.join(&target));
+        } else {
+            // No parent to resolve a relative target against — terminal.
+            reached_target = true;
+            break;
+        }
+    }
+
+    if !reached_target {
+        // The cap was exhausted while following symlinks. Linux SYMLOOP_MAX is
+        // 40, so a chain of exactly 40 symlinks ending at a real file is still
+        // valid — after the 40th hop `resolved` may already point at that file.
+        // Inspect it once more without following another link: a non-symlink is
+        // the valid final target (fall through to the Literal/Resolved logic
+        // below), while another symlink (or an error) is a genuine cycle
+        // (a -> b -> a) or a chain deeper than the kernel allows. read_link
+        // resolves one hop at a time, so the kernel never surfaces ELOOP; treat
+        // those as a broken chain so the caller logs it and matches literally.
+        let container_path = format!("/proc/{entrypoint_pid}/root{}", resolved.display());
+
+        match std::fs::symlink_metadata(&container_path) {
+            Ok(meta) if !meta.file_type().is_symlink() => {}
+            Ok(_) => {
+                return BinaryResolution::ChainBroken(
+                    std::io::Error::from_raw_os_error(libc::ELOOP).kind(),
+                );
             }
+            Err(e) => return BinaryResolution::ChainBroken(e.kind()),
         }
     }
 
     let resolved_str = resolved.to_string_lossy().into_owned();
 
     if resolved_str == policy_path {
-        None
+        BinaryResolution::Literal
     } else {
-        tracing::info!(
-            "Resolved policy binary symlink via container filesystem: \
-             original={policy_path} resolved={resolved_str} pid={entrypoint_pid}"
-        );
-        Some(resolved_str)
+        // The caller logs the resolution at info level.
+        BinaryResolution::Resolved(resolved_str)
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn resolve_binary_in_container(_policy_path: &str, _entrypoint_pid: u32) -> Option<String> {
-    None
+fn resolve_binary_in_container(_policy_path: &str, _entrypoint_pid: u32) -> BinaryResolution {
+    BinaryResolution::Literal
 }
 
 fn l7_matchers_to_json(
@@ -1860,29 +1967,48 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                             .iter()
                             .map(|r| {
                                 let a = r.allow.as_ref();
-                                let mut allow = serde_json::json!({
-                                    "method": a.map_or("", |a| &a.method),
-                                    "path": a.map_or("", |a| &a.path),
-                                    "command": a.map_or("", |a| &a.command),
-                                    "operation_type": a.map_or("", |a| &a.operation_type),
-                                    "operation_name": a.map_or("", |a| &a.operation_name),
-                                });
-                                if let Some(a) = a
-                                    && !a.fields.is_empty()
-                                {
-                                    allow["fields"] = a.fields.clone().into();
+                                let mut allow = serde_json::Map::new();
+                                if let Some(a) = a {
+                                    // Proto3 represents absent scalar selectors as empty
+                                    // strings. Omit them so protobuf and YAML rules expose
+                                    // the same selector families to runtime validation.
+                                    if !a.method.is_empty() {
+                                        allow.insert("method".to_string(), a.method.clone().into());
+                                    }
+                                    if !a.path.is_empty() {
+                                        allow.insert("path".to_string(), a.path.clone().into());
+                                    }
+                                    if !a.command.is_empty() {
+                                        allow
+                                            .insert("command".to_string(), a.command.clone().into());
+                                    }
+                                    if !a.operation_type.is_empty() {
+                                        allow.insert(
+                                            "operation_type".to_string(),
+                                            a.operation_type.clone().into(),
+                                        );
+                                    }
+                                    if !a.operation_name.is_empty() {
+                                        allow.insert(
+                                            "operation_name".to_string(),
+                                            a.operation_name.clone().into(),
+                                        );
+                                    }
+                                    if !a.fields.is_empty() {
+                                        allow.insert("fields".to_string(), a.fields.clone().into());
+                                    }
                                 }
                                 let query = a.map_or_else(serde_json::Map::new, |allow| {
                                     l7_matchers_to_json(&allow.query)
                                 });
                                 if !query.is_empty() {
-                                    allow["query"] = query.into();
+                                    allow.insert("query".to_string(), query.into());
                                 }
                                 let params = a.map_or_else(serde_json::Map::new, |allow| {
                                     l7_matchers_to_json(&allow.params)
                                 });
                                 if !params.is_empty() {
-                                    allow["params"] = params.into();
+                                    allow.insert("params".to_string(), params.into());
                                 }
                                 serde_json::json!({ "allow": allow })
                             })
@@ -1988,6 +2114,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                         ep["json_rpc_max_body_bytes"] = e.json_rpc_max_body_bytes.into();
                     }
                     if let Some(mcp) = &e.mcp {
+                        if e.protocol.eq_ignore_ascii_case("mcp") {
+                            ep["mcp_versions"] = mcp.versions.clone().into();
+                        }
                         if let Some(strict_tool_names) = mcp.strict_tool_names {
                             ep["mcp_strict_tool_names"] = strict_tool_names.into();
                         }
@@ -2015,8 +2144,46 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                         entry
                     };
                     let mut entries = vec![binary_entry(&b.path)];
-                    if let Some(resolved) = resolve_binary_in_container(&b.path, entrypoint_pid) {
-                        entries.push(binary_entry(&resolved));
+                    match resolve_binary_in_container(&b.path, entrypoint_pid) {
+                        BinaryResolution::Resolved(resolved) => {
+                            tracing::info!(
+                                "Resolved policy binary symlink: original={} resolved={resolved} pid={entrypoint_pid}",
+                                b.path
+                            );
+                            entries.push(binary_entry(&resolved));
+                        }
+                        BinaryResolution::Absent => {
+                            tracing::debug!(
+                                "Policy binary candidate not present in container: path={} pid={entrypoint_pid}. Matched literally.",
+                                b.path
+                            );
+                        }
+                        BinaryResolution::Inaccessible(kind) => {
+                            tracing::warn!(
+                                "Cannot access container filesystem for symlink resolution: path={} pid={entrypoint_pid} \
+                                error_kind={kind:?}. Binary paths in policy will be matched literally. \
+                                If this binary is a symlink (e.g., /usr/bin/python3 -> python3.11), \
+                                use the canonical path instead, or run with CAP_SYS_PTRACE.",
+                                b.path
+                            );
+                        }
+                        BinaryResolution::CandidateInaccessible(kind) => {
+                            tracing::warn!(
+                                "Cannot access policy binary candidate path: path={} pid={entrypoint_pid} \
+                                error_kind={kind:?}. Binary path will be matched literally. \
+                                A parent component is permission-denied or the path forms a symlink loop; \
+                                the process root itself is reachable.",
+                                b.path
+                            );
+                        }
+                        BinaryResolution::ChainBroken(kind) => {
+                            tracing::warn!(
+                                "Symlink chain broken during resolution: path={} pid={entrypoint_pid} error_kind={kind:?}. \
+                                Matched by original path only.",
+                                b.path
+                            );
+                        }
+                        BinaryResolution::Literal => {},
                     }
                     entries
                 })
@@ -2083,8 +2250,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
 mod tests {
     use super::*;
 
+    use openshell_core::mcp::DEFAULT_MCP_PROTOCOL_VERSION;
     use openshell_core::proto::{
-        FilesystemPolicy as ProtoFs, L7Allow, L7QueryMatcher, L7Rule, NetworkBinary,
+        FilesystemPolicy as ProtoFs, L7Allow, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
         NetworkEndpoint, NetworkMiddlewareConfig, NetworkPolicyRule, ProcessPolicy as ProtoProc,
         SandboxPolicy as ProtoSandboxPolicy,
     };
@@ -2152,6 +2320,112 @@ mod tests {
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         }
+    }
+
+    fn defaultable_mcp_proto(mcp: Option<McpOptions>) -> ProtoSandboxPolicy {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "mcp".to_string(),
+            NetworkPolicyRule {
+                name: "mcp".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "mcp.example.com".to_string(),
+                    port: 443,
+                    protocol: "mcp".to_string(),
+                    mcp,
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: "tools/list".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        policy
+    }
+
+    fn projected_allow(
+        protocol: &str,
+        allow: L7Allow,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            network_policies: std::collections::HashMap::from([(
+                "selector_projection".to_string(),
+                NetworkPolicyRule {
+                    name: "selector_projection".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        protocol: protocol.to_string(),
+                        rules: vec![L7Rule { allow: Some(allow) }],
+                        ..Default::default()
+                    }],
+                    binaries: vec![],
+                },
+            )]),
+            ..Default::default()
+        };
+        let projected: serde_json::Value = serde_json::from_str(&proto_to_opa_data_json(&proto, 0))
+            .expect("protobuf policy projection must produce JSON");
+        projected["network_policies"]["selector_projection"]["endpoints"][0]["rules"][0]["allow"]
+            .as_object()
+            .expect("projected allow rule must be an object")
+            .clone()
+    }
+
+    #[test]
+    fn proto_projection_omits_absent_allow_selectors() {
+        let allow = projected_allow(
+            "websocket",
+            L7Allow {
+                operation_type: "subscription".to_string(),
+                operation_name: "NewMessages".to_string(),
+                fields: vec!["messageAdded".to_string()],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            allow,
+            serde_json::json!({
+                "operation_type": "subscription",
+                "operation_name": "NewMessages",
+                "fields": ["messageAdded"],
+            })
+            .as_object()
+            .expect("expected object")
+            .clone()
+        );
+    }
+
+    #[test]
+    fn proto_projection_preserves_nonempty_allow_selectors() {
+        let allow = projected_allow(
+            "rest",
+            L7Allow {
+                method: "POST".to_string(),
+                path: "/repos/**".to_string(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            allow,
+            serde_json::json!({
+                "method": "POST",
+                "path": "/repos/**",
+            })
+            .as_object()
+            .expect("expected object")
+            .clone()
+        );
     }
 
     const POLICY_DNS_SNAPSHOT_DATA: &str = r#"
@@ -3789,6 +4063,10 @@ network_policies:
                     path: "/mcp".to_string(),
                     protocol: "mcp".to_string(),
                     enforcement: "enforce".to_string(),
+                    mcp: Some(McpOptions {
+                        versions: vec![DEFAULT_MCP_PROTOCOL_VERSION.as_str().to_string()],
+                        ..Default::default()
+                    }),
                     rules: vec![L7Rule {
                         allow: Some(L7Allow {
                             method: "tools/call".to_string(),
@@ -4715,6 +4993,7 @@ network_policies:
         protocol: mcp
         enforcement: enforce
         mcp:
+          versions: ["2025-11-25", "2025-03-26"]
           strict_tool_names: false
         rules:
           - allow:
@@ -4738,6 +5017,151 @@ network_policies:
         let l7 = crate::l7::parse_l7_config(&config).expect("parse l7 config");
         assert_eq!(l7.protocol, crate::l7::L7Protocol::Mcp);
         assert!(!l7.mcp_strict_tool_names);
+        assert_eq!(
+            l7.mcp_versions,
+            vec![
+                openshell_core::mcp::McpProtocolVersion::V2025_03_26,
+                openshell_core::mcp::McpProtocolVersion::V2025_11_25,
+            ]
+        );
+    }
+
+    #[test]
+    fn yaml_load_accepts_mixed_case_mcp_protocol_with_default_versions() {
+        let data = r#"
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: MCP
+        rules:
+          - allow:
+              method: tools/list
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from yaml");
+        let input = NetworkInput {
+            host: "mcp.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let config = engine
+            .query_endpoint_config(&input)
+            .expect("query endpoint config")
+            .expect("expected MCP endpoint config");
+        let l7 = crate::l7::parse_l7_config(&config).expect("parse L7 endpoint config");
+
+        assert_eq!(l7.mcp_versions, vec![DEFAULT_MCP_PROTOCOL_VERSION]);
+    }
+
+    #[test]
+    fn yaml_load_rejects_invalid_flat_mcp_versions_before_activation() {
+        for (case, versions) in [
+            ("empty", "[]"),
+            ("non-string", "[1]"),
+            ("unsupported", "[\"2026-01-01\"]"),
+            ("duplicate", "[\"2025-11-25\", \"2025-11-25\"]"),
+            ("non-canonical", "[\"2025-11-25\", \"2025-03-26\"]"),
+        ] {
+            let data = format!(
+                r#"
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: mcp
+        mcp_versions: {versions}
+        rules:
+          - allow:
+              method: tools/list
+    binaries:
+      - {{ path: /usr/bin/curl }}
+"#
+            );
+
+            let Err(error) = OpaEngine::from_strings(TEST_POLICY, &data) else {
+                panic!("invalid MCP runtime metadata must reject activation: {case}");
+            };
+            assert!(
+                error.to_string().contains("mcp.versions"),
+                "{case}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_load_rejects_nested_and_flat_mcp_version_collision() {
+        let data = r#"
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: mcp
+        mcp_versions: ["2025-03-26"]
+        mcp:
+          versions: ["2025-11-25"]
+        rules:
+          - allow:
+              method: tools/list
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+
+        let Err(error) = OpaEngine::from_strings(TEST_POLICY, data) else {
+            panic!("ambiguous MCP revision sources must reject activation");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("mcp.versions and mcp_versions cannot both be set"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn yaml_load_rejects_mcp_versions_on_non_mcp_protocols() {
+        for mcp_fields in [
+            "mcp:\n          versions: [\"2025-11-25\"]",
+            "mcp_versions: [\"2025-11-25\"]",
+        ] {
+            let data = format!(
+                r#"
+network_policies:
+  json_rpc:
+    name: json_rpc
+    endpoints:
+      - host: rpc.example.com
+        port: 443
+        protocol: json-rpc
+        {mcp_fields}
+        rules:
+          - allow:
+              method: ping
+    binaries:
+      - {{ path: /usr/bin/curl }}
+"#
+            );
+
+            let Err(error) = OpaEngine::from_strings(TEST_POLICY, &data) else {
+                panic!("MCP revision policy must not apply to generic JSON-RPC");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("mcp.versions is only valid for protocol mcp"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -5155,6 +5579,90 @@ network_policies:
         assert!(message.contains("wildcard"));
         assert!(message.contains("exact"));
         assert!(message.contains("tls"));
+    }
+
+    #[test]
+    fn proto_load_accepts_defaultable_mcp_versions_with_mixed_case_protocol() {
+        let mut implicit_defaults = defaultable_mcp_proto(None);
+        implicit_defaults
+            .network_policies
+            .get_mut("mcp")
+            .expect("defaultable MCP fixture contains the MCP policy")
+            .endpoints[0]
+            .protocol = "Mcp".to_string();
+        let explicit_defaults = defaultable_mcp_proto(Some(McpOptions::default()));
+
+        for policy in [implicit_defaults, explicit_defaults] {
+            let engine = OpaEngine::from_proto(&policy)
+                .expect("supervisor ingress must materialize the pinned MCP revision");
+            let input = NetworkInput {
+                host: "mcp.example.com".into(),
+                port: 443,
+                binary_path: PathBuf::from("/usr/bin/curl"),
+                binary_sha256: "unused".into(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            let config = engine
+                .query_endpoint_config(&input)
+                .expect("query endpoint config")
+                .expect("expected MCP endpoint config");
+            let l7 = crate::l7::parse_l7_config(&config).expect("parse L7 endpoint config");
+            assert_eq!(
+                l7.mcp_versions,
+                vec![DEFAULT_MCP_PROTOCOL_VERSION],
+                "protobuf ingress must preserve the materialized default through OPA"
+            );
+        }
+    }
+
+    #[test]
+    fn proto_load_projects_canonical_mcp_versions_to_l7_config() {
+        let policy = defaultable_mcp_proto(Some(McpOptions {
+            versions: vec!["2025-11-25".to_string(), "2025-03-26".to_string()],
+            ..Default::default()
+        }));
+        let engine = OpaEngine::from_proto(&policy).expect("valid MCP policy");
+        let input = NetworkInput {
+            host: "mcp.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let config = engine
+            .query_endpoint_config(&input)
+            .expect("query endpoint config")
+            .expect("expected MCP endpoint config");
+        let l7 = crate::l7::parse_l7_config(&config).expect("parse L7 endpoint config");
+
+        assert_eq!(
+            l7.mcp_versions,
+            vec![
+                openshell_core::mcp::McpProtocolVersion::V2025_03_26,
+                openshell_core::mcp::McpProtocolVersion::V2025_11_25,
+            ],
+            "protobuf ingress must preserve the canonical allowlist through OPA"
+        );
+    }
+
+    #[test]
+    fn proto_load_rejects_unsupported_mcp_versions() {
+        let policy = defaultable_mcp_proto(Some(McpOptions {
+            versions: vec!["latest".to_string()],
+            ..Default::default()
+        }));
+
+        let Err(error) = OpaEngine::from_proto(&policy) else {
+            panic!("canonicalization must not repair an unsupported MCP revision");
+        };
+        let error = error.to_string();
+        assert!(error.contains("policy validation failed"), "{error}");
+        assert!(
+            error.contains("unsupported protocol version 'latest'"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -7189,22 +7697,36 @@ process:
     #[test]
     fn resolve_binary_skips_glob_paths() {
         // Glob patterns should never be resolved — they're matched differently
-        assert!(resolve_binary_in_container("/usr/bin/*", 1).is_none());
-        assert!(resolve_binary_in_container("/usr/local/bin/**", 1).is_none());
+        assert_eq!(
+            resolve_binary_in_container("/usr/bin/*", 1),
+            BinaryResolution::Literal
+        );
+        assert_eq!(
+            resolve_binary_in_container("/usr/local/bin/**", 1),
+            BinaryResolution::Literal
+        );
     }
 
     #[test]
     fn resolve_binary_skips_pid_zero() {
         // pid=0 means the container hasn't started yet
-        assert!(resolve_binary_in_container("/usr/bin/python3", 0).is_none());
+        assert_eq!(
+            resolve_binary_in_container("/usr/bin/python3", 0),
+            BinaryResolution::Literal
+        );
     }
 
     #[test]
-    fn resolve_binary_returns_none_for_nonexistent_path() {
-        // A path that doesn't exist in any container should gracefully return None
+    fn resolve_binary_does_not_resolve_nonexistent_path() {
+        // A path that doesn't exist should never yield a Resolved target. The
+        // exact non-Resolved variant depends on platform/privilege (Absent when
+        // the process root is readable, Inaccessible when it is not, Literal on
+        // the non-Linux stub), so assert only that nothing is resolved.
+        let result =
+            resolve_binary_in_container("/nonexistent/binary/path/that/will/never/exist", 1);
         assert!(
-            resolve_binary_in_container("/nonexistent/binary/path/that/will/never/exist", 1)
-                .is_none()
+            !matches!(result, BinaryResolution::Resolved(_)),
+            "nonexistent path must not resolve, got: {result:?}"
         );
     }
 
@@ -7409,6 +7931,243 @@ network_policies:
         assert!(
             decision.allowed,
             "reload_from_proto_with_pid(0) should preserve behavior"
+        );
+    }
+
+    #[test]
+    fn classify_not_found_is_absent() {
+        // A missing candidate under an accessible root is expected, not an error.
+        assert_eq!(
+            BinaryResolution::classify_first_probe_error(std::io::ErrorKind::NotFound),
+            BinaryResolution::Absent
+        );
+    }
+
+    #[test]
+    fn classify_permission_denied_is_candidate_inaccessible() {
+        // A non-NotFound failure at the candidate probe (root already confirmed
+        // reachable) is a target-path problem, not a process-root one, so it
+        // must not emit the CAP_SYS_PTRACE process-root guidance.
+        assert_eq!(
+            BinaryResolution::classify_first_probe_error(std::io::ErrorKind::PermissionDenied),
+            BinaryResolution::CandidateInaccessible(std::io::ErrorKind::PermissionDenied)
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn absent_candidate_resolves_to_absent() {
+        // Regression for #2883: a candidate path that does not exist under an
+        // accessible /proc/<pid>/root must classify as Absent (quiet), not as a
+        // container-filesystem-access failure.
+        if !procfs_root_accessible() {
+            eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
+            return;
+        }
+
+        // Use a path guaranteed absent: a real temp dir with an uncreated
+        // child. A hard-coded path like /app/.venv/bin/python could exist in a
+        // valid environment and make the resolver return Resolved/Literal.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-python");
+        let pid = std::process::id(); // our own live, accessible root
+        assert_eq!(
+            resolve_binary_in_container(missing.to_str().unwrap(), pid),
+            BinaryResolution::Absent
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unreachable_process_root_is_inaccessible() {
+        // A pid whose /proc/<pid>/root does not exist (process gone) must be
+        // reported as an access failure, not silently treated as an absent
+        // candidate — even though both surface as ENOENT at the leaf path.
+        // u32::MAX is far above /proc/sys/kernel/pid_max, so it never exists.
+        let dead_pid = u32::MAX;
+        assert!(
+            matches!(
+                resolve_binary_in_container("/usr/bin/python3", dead_pid),
+                BinaryResolution::Inaccessible(_)
+            ),
+            "an unreachable process root must classify as Inaccessible"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn symlink_cycle_exhausts_limit_as_chain_broken() {
+        // A symlink cycle (a -> b -> a) never resolves to a real target. The
+        // manual read_link walk resolves one hop at a time, so the kernel never
+        // raises ELOOP; exhausting the iteration cap must classify as
+        // ChainBroken, not silently pass as Resolved/Literal.
+        use std::os::unix::fs::symlink;
+
+        if !procfs_root_accessible() {
+            eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        symlink(&b, &a).unwrap(); // a -> b
+        symlink(&a, &b).unwrap(); // b -> a
+        let pid = std::process::id();
+        assert!(
+            matches!(
+                resolve_binary_in_container(a.to_str().unwrap(), pid),
+                BinaryResolution::ChainBroken(_)
+            ),
+            "a symlink cycle must classify as ChainBroken"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn symlink_chain_at_limit_resolves_to_target() {
+        // Linux SYMLOOP_MAX is 40: a chain of exactly 40 symlinks ending at a
+        // real file resolves successfully in the kernel. The manual walk must
+        // follow all 40 hops and accept the final target rather than exhausting
+        // the cap and reporting ChainBroken (off-by-one regression).
+        use std::os::unix::fs::symlink;
+
+        if !procfs_root_accessible() {
+            eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real");
+        std::fs::write(&target, b"").unwrap();
+
+        // link0 -> link1 -> ... -> link39 -> real (40 symlinks, absolute
+        // targets so the resolver takes the is_absolute() branch).
+        let link = |i: usize| dir.path().join(format!("link{i}"));
+        symlink(&target, link(39)).unwrap();
+        for i in (0..39).rev() {
+            symlink(link(i + 1), link(i)).unwrap();
+        }
+
+        let pid = std::process::id();
+        let result = resolve_binary_in_container(link(0).to_str().unwrap(), pid);
+        assert!(
+            matches!(result, BinaryResolution::Resolved(_)),
+            "a 40-link chain ending at a real file must resolve, got {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn symlink_chain_over_limit_is_chain_broken() {
+        // A chain of 41 symlinks exceeds SYMLOOP_MAX: the walk must give up and
+        // classify as ChainBroken, proving the 40-hop budget stays enforced.
+        use std::os::unix::fs::symlink;
+
+        if !procfs_root_accessible() {
+            eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real");
+        std::fs::write(&target, b"").unwrap();
+
+        // link0 -> ... -> link40 -> real (41 symlinks).
+        let link = |i: usize| dir.path().join(format!("link{i}"));
+        symlink(&target, link(40)).unwrap();
+        for i in (0..40).rev() {
+            symlink(link(i + 1), link(i)).unwrap();
+        }
+
+        let pid = std::process::id();
+        let result = resolve_binary_in_container(link(0).to_str().unwrap(), pid);
+        assert!(
+            matches!(result, BinaryResolution::ChainBroken(_)),
+            "a 41-link chain must classify as ChainBroken, got {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn absent_candidates_emit_no_warnings() {
+        // Regression for #2883: several expected-but-absent compatibility
+        // candidates under an accessible process root must not produce a burst
+        // of WARN-level noise. Logging now lives at the caller, so drive the
+        // real caller (proto_to_opa_data_json) and count WARN events.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+
+        #[derive(Clone)]
+        struct WarnCounter(Arc<AtomicUsize>);
+        impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for WarnCounter {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        if !procfs_root_accessible() {
+            eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
+            return;
+        }
+
+        let warns = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(WarnCounter(Arc::clone(&warns)));
+
+        // Candidates that do not exist under our accessible /proc/<pid>/root.
+        // Historically each absent candidate emitted its own WARN. Use uncreated
+        // children of a real temp dir so the paths are guaranteed absent (not
+        // merely conventional): a hard-coded path could exist on a runner and
+        // stop exercising the Absent branch, or be inaccessible and emit a
+        // legitimate warning that fails this test.
+        let dir = tempfile::tempdir().unwrap();
+        let candidates = [
+            dir.path().join("app-python"),
+            dir.path().join("sandbox-python"),
+            dir.path().join("opt-python"),
+        ];
+        let mut network_policies = std::collections::HashMap::new();
+        network_policies.insert(
+            "pypi".to_string(),
+            NetworkPolicyRule {
+                name: "pypi".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "pypi.org".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: candidates
+                    .iter()
+                    .map(|p| NetworkBinary {
+                        path: p.to_str().unwrap().to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            },
+        );
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: None,
+            landlock: None,
+            process: None,
+            network_policies,
+            network_middlewares: std::collections::HashMap::default(),
+        };
+
+        let pid = std::process::id(); // accessible root, leaf paths absent
+        tracing::subscriber::with_default(subscriber, || {
+            let _ = proto_to_opa_data_json(&proto, pid);
+        });
+
+        assert_eq!(
+            warns.load(Ordering::SeqCst),
+            0,
+            "absent compatibility candidates must not emit warnings"
         );
     }
 
@@ -7639,7 +8398,7 @@ network_policies:
         old_sessions
             .pop()
             .expect("old-generation session")
-            .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
             .await;
         let admitted = current_runner
             .preflight_websocket(
@@ -7886,7 +8645,10 @@ network_policies:
         let pid = std::process::id();
         let link_path = link.to_string_lossy().to_string();
         // Actually attempt the same resolution our production code uses
-        resolve_binary_in_container(&link_path, pid).is_some()
+        matches!(
+            resolve_binary_in_container(&link_path, pid),
+            BinaryResolution::Resolved(_)
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -7915,11 +8677,9 @@ network_policies:
         let link_path = link.to_string_lossy().to_string();
         let result = resolve_binary_in_container(&link_path, our_pid);
 
-        assert!(
-            result.is_some(),
-            "Should resolve symlink via /proc/<pid>/root/"
-        );
-        let resolved = result.unwrap();
+        let BinaryResolution::Resolved(resolved) = result else {
+            panic!("Should resolve symlink via /proc/<pid>/root/, got: {result:?}");
+        };
         assert!(
             resolved.ends_with("python3.11"),
             "Resolved path should point to target: {resolved}"
@@ -7945,9 +8705,10 @@ network_policies:
         let path = tmp.path().to_string_lossy().to_string();
         let result = resolve_binary_in_container(&path, our_pid);
 
-        assert!(
-            result.is_none(),
-            "Non-symlink file should return None, got: {result:?}"
+        assert_eq!(
+            result,
+            BinaryResolution::Literal,
+            "Non-symlink file should not expand, got: {result:?}"
         );
     }
 
@@ -7975,8 +8736,9 @@ network_policies:
         let link_path = top_link.to_string_lossy().to_string();
         let result = resolve_binary_in_container(&link_path, our_pid);
 
-        assert!(result.is_some(), "Should resolve multi-level symlink chain");
-        let resolved = result.unwrap();
+        let BinaryResolution::Resolved(resolved) = result else {
+            panic!("Should resolve multi-level symlink chain, got: {result:?}");
+        };
         assert!(
             resolved.ends_with("cpython3.11"),
             "Should resolve to final target: {resolved}"

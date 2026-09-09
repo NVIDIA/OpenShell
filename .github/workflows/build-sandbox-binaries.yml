@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build Sandbox Binaries
+
+on:
+  workflow_call:
+    inputs:
+      cargo-version:
+        required: true
+        type: string
+      image-tag:
+        required: false
+        type: string
+        default: ""
+      checkout-ref:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      CACHIX_AUTH_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-musl
+            runner: linux-amd64-cpu8
+            dev_shell: .#devShells.x86_64-linux.musl
+          - triple: aarch64-unknown-linux-musl
+            runner: linux-arm64-cpu8
+            dev_shell: .#devShells.aarch64-linux.musl
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      package: openshell-sandbox
+      binary: openshell-sandbox
+      triple: ${{ matrix.triple }}
+      runner: ${{ matrix.runner }}
+      dev-shell: ${{ matrix.dev_shell }}
+      cargo-version: ${{ inputs.cargo-version }}
+      image-tag: ${{ inputs.image-tag }}
+      checkout-ref: ${{ inputs.checkout-ref }}
+    secrets: inherit

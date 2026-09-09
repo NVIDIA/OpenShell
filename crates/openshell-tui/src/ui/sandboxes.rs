@@ -40,7 +40,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
             let draft_count = app.sandbox_draft_counts.get(i).copied().unwrap_or(0);
 
             let phase_style = match phase {
-                "Ready" => t.status_ok,
+                "Ready" | "Completed" => t.status_ok,
                 "Provisioning" | "Stopping" | "Starting" => t.status_warn,
                 "Error" => t.status_err,
                 _ => t.muted,

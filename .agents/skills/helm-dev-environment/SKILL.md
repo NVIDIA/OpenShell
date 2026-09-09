@@ -1,6 +1,8 @@
 ---
 name: helm-dev-environment
 description: Start up, tear down, and configure the local Kubernetes development environment for OpenShell. Uses k3d (Docker-backed k3s) + Skaffold + Helm. Covers cluster lifecycle, optional add-ons (Keycloak OIDC, Envoy Gateway), HA testing, and port mappings. Trigger keywords - local k8s, local cluster, k3d, skaffold, helm dev, start cluster, stop cluster, tear down cluster, delete cluster, create cluster, helm:k3s, helm:skaffold, local dev environment, dev cluster, k8s dev, envoy gateway local, keycloak local, high availability, HA.
+metadata:
+  internal: true
 ---
 
 # Helm Dev Environment
@@ -26,10 +28,14 @@ mise run helm:k3s:create
 ```
 
 Creates a k3d cluster and merges its kubeconfig into the worktree-local `kubeconfig` file.
+When the named cluster already exists, the task starts any stopped containers and refreshes
+same-named kubeconfig entries so a recreated load balancer's current API port takes effect.
 Also applies the upstream agent-sandbox CRDs/controller (pinned via `AGENT_SANDBOX_VERSION`
 in `tasks/scripts/helm-k3s-local.sh`, fetched from `github.com/kubernetes-sigs/agent-sandbox`
-releases) and preloads the default community sandbox image into k3d so the first sandbox
-create does not wait on a large registry pull. Traefik is disabled at cluster creation time.
+releases), enables its OTLP tracing on v0.5 and later, installs an OTLP trace
+collector and UI in the `observability` namespace,
+and preloads the default community sandbox image into k3d so the first sandbox create
+does not wait on a large registry pull. Traefik is disabled at cluster creation time.
 
 **Multi-worktree support:** the cluster name is derived from the last component of the
 current git branch (e.g. branch `kube-support/local-dev/tmutch` → cluster
@@ -47,6 +53,9 @@ Override with env vars before running `helm:k3s:create`:
 - `HELM_K3S_LB_HOST_PORT` (default: `8080`)
 - `HELM_K3S_PRELOAD_SANDBOX_IMAGE` (default:
   `ghcr.io/nvidia/openshell-community/sandboxes/base:latest`; set to an empty value to skip)
+- `HELM_K3S_COLLECTOR_IMAGE` (default:
+  `mcr.microsoft.com/dotnet/aspire-dashboard:latest`)
+- `HELM_K3S_COLLECTOR_HEALTH_TIMEOUT` (default: `120` seconds)
 
 ### 2. Deploy OpenShell
 
@@ -79,9 +88,43 @@ must be at least `1000` and distinct from the workload UID. The
 sidecar-mTLS profile reuses `ci/values-sidecar.yaml` and restores
 `server.disableTls=false` inline for Skaffold. The `pkiInitJob` hook (a pre-install
 Job that runs `openshell-gateway generate-certs`) generates mTLS secrets on first
-install. Envoy Gateway opt-in; see the Optional Add-ons section below.
+install. The default Skaffold values export gateway and Kubernetes-driver traces to
+the collector service installed by `helm:k3s:create`. Envoy Gateway opt-in; see the
+Optional Add-ons section below.
 
-The gateway Service uses ClusterIP. Access is via Envoy Gateway (port `8080`) or `kubectl port-forward`.
+The gateway Service uses ClusterIP. Access is via Envoy Gateway (port `8080`) or
+the unified local forwarding task:
+
+```bash
+mise run helm:k3s:forward
+```
+
+The task forwards OTLP/gRPC to `http://127.0.0.1:4317` and the trace UI to
+`http://127.0.0.1:18888`. When Skaffold has deployed a Kubernetes gateway, it
+also forwards the gateway to `http://127.0.0.1:8090`; otherwise it continues
+with the collector ports only. A successful plaintext `helm:skaffold:run` or
+`helm:skaffold:run:sidecar` registers the gateway under the worktree-specific
+k3d cluster name and selects it as the active gateway. Keep the forwarding
+task running while using those endpoints.
+
+### Viewing local traces
+
+The gateway exports OTLP/gRPC to
+`http://openshell-collector.observability.svc.cluster.local:4317` through the
+default Skaffold values. Forward OTLP/gRPC and the trace UI to the host:
+
+```bash
+mise run helm:k3s:forward
+```
+
+Open `http://127.0.0.1:18888` and exercise the gateway to inspect gateway and
+Kubernetes compute-driver spans under their distinct service names, along with
+Agent Sandbox controller reconciliation spans linked through the Sandbox
+trace-context annotation. The same command exposes OTLP/gRPC on
+`http://127.0.0.1:4317` and, when deployed, the Kubernetes gateway on
+`http://127.0.0.1:8090`. The local `gateway:docker`, `gateway:podman`, and
+`gateway:vm` tasks detect the collector listener at startup and enable trace
+export only while it is reachable.
 
 **HA test deploy** (two gateway replicas + external PostgreSQL Secret): uncomment
 `#- ci/values-high-availability.yaml` in `deploy/helm/openshell/skaffold.yaml`,
@@ -99,19 +142,20 @@ plaintext by default. To test sidecar topology with TLS enabled, use
 | Skaffold dev (default) | `true` | `http://` |
 | TLS enabled | `false` (or omitted) | `https://` |
 
-### Connecting via port-forward
+### Connecting through the forwarding task
 
-Port `8080` is already bound by the k3d load balancer when Envoy Gateway is active, so
-the port-forward uses local port `8090` to avoid a collision:
+Port `8080` is already bound by the k3d load balancer when Envoy Gateway is
+active, so the forwarding task uses local port `8090` for the gateway. In a
+second terminal, confirm that the gateway is registered and active:
 
 ```bash
-KUBECONFIG=kubeconfig kubectl port-forward -n openshell svc/openshell 8090:8080
+openshell gateway list
 ```
 
 **Plaintext (default Skaffold deploy):**
 
 ```bash
-openshell sandbox list --gateway-endpoint http://localhost:8090
+openshell sandbox list
 ```
 
 **With mTLS enabled** — extract the client cert the PKI hook wrote to the cluster,
@@ -217,7 +261,9 @@ annotations to `spiffe://openshell.local/openshell/sandbox/<sandbox-id>`.
 OpenShell mounts the SPIFFE CSI Workload API socket at
 `/spiffe-workload-api/spire-agent.sock` into sandbox pods for provider token
 grants. Supervisor-to-gateway authentication remains on the Kubernetes
-ServiceAccount bootstrap and gateway-minted sandbox JWT path.
+ServiceAccount bootstrap and gateway-minted sandbox JWT path; the selected
+Kubernetes compute driver validates the projected token before the gateway
+mints its JWT.
 
 ---
 

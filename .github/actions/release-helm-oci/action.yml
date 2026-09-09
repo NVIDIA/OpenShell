@@ -4,7 +4,7 @@
 name: Release Helm OCI
 description: >
   Patch chart version/appVersion, refuse duplicate OCI versions on public
-  releases, package the chart, and push to GHCR OCI.
+  releases, package the gateway and workspace charts, and push them to GHCR OCI.
 
 inputs:
   chart-version:
@@ -51,11 +51,16 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        CHART_DIR="${RUNNER_TEMP}/chart-build"
-        cp -a deploy/helm/openshell/. "${CHART_DIR}"
-        sed -i "s/^version:.*/version: ${CHART_VERSION}/" "${CHART_DIR}/Chart.yaml"
-        sed -i "s/^appVersion:.*/appVersion: \"${APP_VERSION}\"/" "${CHART_DIR}/Chart.yaml"
-        echo "chart_dir=${CHART_DIR}" >> "$GITHUB_OUTPUT"
+        GATEWAY_CHART_DIR="${RUNNER_TEMP}/gateway-chart-build"
+        WORKSPACE_CHART_DIR="${RUNNER_TEMP}/workspace-chart-build"
+        cp -a deploy/helm/openshell/. "${GATEWAY_CHART_DIR}"
+        cp -a deploy/helm/openshell-workspace/. "${WORKSPACE_CHART_DIR}"
+        for chart_dir in "${GATEWAY_CHART_DIR}" "${WORKSPACE_CHART_DIR}"; do
+          sed -i "s/^version:.*/version: ${CHART_VERSION}/" "${chart_dir}/Chart.yaml"
+          sed -i "s/^appVersion:.*/appVersion: \"${APP_VERSION}\"/" "${chart_dir}/Chart.yaml"
+        done
+        echo "gateway_chart_dir=${GATEWAY_CHART_DIR}" >> "$GITHUB_OUTPUT"
+        echo "workspace_chart_dir=${WORKSPACE_CHART_DIR}" >> "$GITHUB_OUTPUT"
         echo "chart_version=${CHART_VERSION}" >> "$GITHUB_OUTPUT"
 
     - name: Refuse duplicate chart version
@@ -65,38 +70,52 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        OCI_CHART="oci://ghcr.io/nvidia/openshell/helm-chart"
-        if helm show chart "${OCI_CHART}" --version "${CHART_VERSION}" >/dev/null 2>&1; then
-          echo "::error::Chart ${CHART_VERSION} is already published. Use a new tag or delete the existing package first."
-          exit 1
-        fi
+        for chart in helm-chart openshell-workspace; do
+          OCI_CHART="oci://ghcr.io/nvidia/openshell/${chart}"
+          if helm show chart "${OCI_CHART}" --version "${CHART_VERSION}" >/dev/null 2>&1; then
+            echo "::error::Chart ${chart}:${CHART_VERSION} is already published. Use a new tag or delete the existing package first."
+            exit 1
+          fi
+        done
 
     - name: Package Helm chart
       env:
-        CHART_DIR: ${{ steps.prep.outputs.chart_dir }}
+        GATEWAY_CHART_DIR: ${{ steps.prep.outputs.gateway_chart_dir }}
+        WORKSPACE_CHART_DIR: ${{ steps.prep.outputs.workspace_chart_dir }}
       shell: bash
       run: |
         set -euo pipefail
-        helm package "${CHART_DIR}" --destination /tmp
-        ls /tmp/helm-chart-*.tgz
+        mkdir -p /tmp/helm-charts
+        helm package "${GATEWAY_CHART_DIR}" --destination /tmp/helm-charts
+        helm package "${WORKSPACE_CHART_DIR}" --destination /tmp/helm-charts
+        ls /tmp/helm-charts/*.tgz
 
     - name: Push Helm chart to GHCR OCI
       shell: bash
       run: |
         set -euo pipefail
-        helm push /tmp/helm-chart-*.tgz oci://ghcr.io/nvidia/openshell
+        for archive in /tmp/helm-charts/*.tgz; do
+          helm push "${archive}" oci://ghcr.io/nvidia/openshell
+        done
 
     - name: Push SHA-pinned chart
       if: inputs.pin-sha != ''
       env:
         PIN_SHA: ${{ inputs.pin-sha }}
-        CHART_DIR: ${{ steps.prep.outputs.chart_dir }}
+        GATEWAY_CHART_DIR: ${{ steps.prep.outputs.gateway_chart_dir }}
+        WORKSPACE_CHART_DIR: ${{ steps.prep.outputs.workspace_chart_dir }}
       shell: bash
       run: |
         set -euo pipefail
-        SHA_CHART_DIR="${RUNNER_TEMP}/chart-build-sha"
-        cp -a "${CHART_DIR}/." "${SHA_CHART_DIR}"
-        sed -i "s/^version:.*/version: 0.0.0-dev.${PIN_SHA}/" "${SHA_CHART_DIR}/Chart.yaml"
-        sed -i "s/^appVersion:.*/appVersion: \"${PIN_SHA}\"/" "${SHA_CHART_DIR}/Chart.yaml"
-        helm package "${SHA_CHART_DIR}" --destination /tmp/sha-pin
-        helm push /tmp/sha-pin/helm-chart-*.tgz oci://ghcr.io/nvidia/openshell
+        mkdir -p /tmp/sha-pin
+        for source_dir in "${GATEWAY_CHART_DIR}" "${WORKSPACE_CHART_DIR}"; do
+          chart_name="$(basename "${source_dir}")"
+          sha_chart_dir="${RUNNER_TEMP}/${chart_name}-sha"
+          cp -a "${source_dir}/." "${sha_chart_dir}"
+          sed -i "s/^version:.*/version: 0.0.0-dev.${PIN_SHA}/" "${sha_chart_dir}/Chart.yaml"
+          sed -i "s/^appVersion:.*/appVersion: \"${PIN_SHA}\"/" "${sha_chart_dir}/Chart.yaml"
+          helm package "${sha_chart_dir}" --destination /tmp/sha-pin
+        done
+        for archive in /tmp/sha-pin/*.tgz; do
+          helm push "${archive}" oci://ghcr.io/nvidia/openshell
+        done

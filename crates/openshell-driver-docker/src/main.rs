@@ -6,11 +6,10 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
+use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
-use openshell_core::{Config, VERSION};
-use openshell_driver_docker::{DockerComputeConfig, DockerComputeDriver};
+use openshell_driver_docker::{ComputeDriverService, DockerComputeConfig, DockerComputeDriver};
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(name = "openshell-driver-docker", version = VERSION)]
@@ -33,21 +32,30 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_LOG_LEVEL", default_value = "info")]
     log_level: String,
+
+    #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
+    otlp_endpoint: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
+    gateway_name: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
-        )
-        .init();
+    let _tracing = openshell_otel::install_driver_tracing(
+        openshell_driver_docker::otel_tracing::TRACING,
+        openshell_otel::DriverTracingConfig {
+            endpoint: args.otlp_endpoint.as_deref(),
+            gateway_name: args.gateway_name.as_deref(),
+            service_version: VERSION,
+            log_level: &args.log_level,
+        },
+    );
 
     let config_source = std::fs::read_to_string(&args.config).into_diagnostic()?;
     let docker_config: DockerComputeConfig = toml::from_str(&config_source).into_diagnostic()?;
-    let gateway_config = Config::new(None).with_bind_address(args.gateway_bind);
-    let driver = DockerComputeDriver::new(&gateway_config, &docker_config)
+    let driver = DockerComputeDriver::new(args.gateway_bind, &args.log_level, &docker_config)
         .await
         .into_diagnostic()?;
 
@@ -57,7 +65,8 @@ async fn main() -> Result<()> {
         openshell_core::external_driver_socket::SocketCleanup::new(args.bind_socket.clone());
     info!(socket = %args.bind_socket.display(), "Starting Docker compute driver");
     tonic::transport::Server::builder()
-        .add_service(ComputeDriverServer::new(driver))
+        .layer(openshell_otel::compute_driver_rpc_layer())
+        .add_service(ComputeDriverServer::new(ComputeDriverService::new(driver)))
         .serve_with_incoming_shutdown(
             openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
             shutdown_signal(),

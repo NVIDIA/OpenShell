@@ -1,14 +1,18 @@
 # Windows MSVC Build Design
 
 This page records the design decisions for the native Windows MSVC build lane.
-It is intentionally build-only. It does not make Windows a Docker, Kubernetes,
-Podman, or VM runtime host.
+It provides the native build lane and validates the in-process MXC compute
+driver. It does not make Windows a Docker, Kubernetes, Podman, or VM runtime host.
 
 ## Goals
 
 - Compile the OpenShell gateway and CLI for `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`.
 - Keep the Linux and macOS build paths unchanged.
 - Preserve gateway configuration parsing for all existing compute driver names.
+- Build and test the in-process MXC driver on supported Windows hosts.
+- Use the ordinary in-process compute-driver composition path; MXC receives the
+  canonical sandbox policy through `DriverSandboxSpec` and advertises that it
+  reports runtime readiness.
 - Return clear unsupported errors when a Windows gateway is configured to use Docker, Kubernetes, Podman, or VM.
 - Keep dedicated `windows:*` validation tasks while allowing the repository-wide
   `pre-commit` task to delegate compiler-bearing Rust checks to the native
@@ -18,13 +22,14 @@ Podman, or VM runtime host.
 
 - Do not support Docker Desktop, WSL, Hyper-V, Podman machine, Podman Desktop, Kubernetes, or VM-backed sandbox execution on Windows.
 - Do not ship Windows standalone binaries for Docker, Kubernetes, Podman, or VM drivers.
-- Do not implement named-pipe driver IPC, Windows services, MSI packaging, Credential Manager integration, DPAPI integration, or MXC policy translation in this build lane.
+- Do not implement named-pipe driver IPC, Windows services, MSI packaging, Credential Manager integration, or DPAPI integration in this lane.
 
 ## Unsupported Driver Strategy
 
-The gateway uses platform-specific configuration contracts on Windows. These
-contracts preserve config-file parsing and reject unsupported driver selection
-with a clear error without depending on the runtime driver crates.
+The gateway composition crate installs platform-specific registration stubs on
+Windows. These registrations preserve config-file selection and reject
+unsupported drivers with a clear error without depending on their runtime
+crates.
 
 The Windows lane does not build, release, package, or smoke-test standalone
 driver binaries for Docker, Kubernetes, Podman, or VM. Those binaries are Linux
@@ -38,10 +43,11 @@ on Windows.
 
 | Driver | Windows build behavior | Runtime behavior |
 |---|---|---|
-| Docker | Driver crate excluded; server config contract retained. | Gateway construction returns unsupported. |
-| Kubernetes | Driver crate excluded; server config contract retained. | Gateway construction returns unsupported. |
-| Podman | Driver crate excluded; server config contract retained. | Gateway construction returns unsupported. |
-| VM | Driver crate excluded from workspace validation. | Gateway construction returns unsupported. |
+| Docker | Driver crate excluded; gateway registration stub retained. | Gateway construction returns unsupported. |
+| Kubernetes | Driver crate excluded; gateway registration stub retained. | Gateway construction returns unsupported. |
+| Podman | Driver crate excluded; gateway registration stub retained. | Gateway construction returns unsupported. |
+| VM | Driver crate excluded; gateway registration stub retained. | Gateway construction returns unsupported. |
+| MXC | Driver links into the native gateway and runs in Windows validation. | `process_container` is default-deny; grant-only `isolation_session` requires explicit configuration. |
 
 This keeps Windows behavior explicit without carrying runtime dependencies or
 creating misleading Windows driver artifacts.
@@ -62,9 +68,9 @@ Windows validation is exposed through `tasks/windows.toml`:
 | `windows:check:arm64` | Check the ARM64 MSVC gateway/CLI build graph. |
 | `windows:build:x64` | Build release x64 `openshell-gateway.exe` and `openshell.exe`. |
 | `windows:build:arm64` | Build release ARM64 `openshell-gateway.exe` and `openshell.exe`. |
-| `windows:test:x64` | Run native x64 workspace tests, excluding unsupported Windows packages as top-level test targets. |
+| `windows:test:x64` | Run native x64 workspace tests, including MXC mapper and lifecycle tests, while excluding unsupported Windows packages as top-level test targets. |
 | `windows:test:arm64` | Run native ARM64 workspace tests with the same package exclusions. |
-| `windows:test:unsupported:x64` | Run focused server/runtime tests for unsupported driver contracts. |
+| `windows:test:unsupported:x64` | Run focused gateway-composition tests for unsupported driver contracts. |
 | `windows:test:unsupported:arm64` | Run the same focused contracts natively on ARM64. |
 | `windows:ci` | Run check, build, test, unsupported-contract tests, and artifact reporting. |
 
@@ -159,5 +165,5 @@ A successful Windows build report should include:
 - Focused unsupported-driver contract test status.
 - Artifact size and SHA256 for each Windows binary.
 
-Warnings from Linux-only dead code are acceptable in this build-only phase when
+Warnings from Linux-only dead code are acceptable in the native Windows lane when
 they come from code paths intentionally disabled on Windows.

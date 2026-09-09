@@ -18,7 +18,6 @@ use openshell_e2e::harness::output::strip_ansi;
 
 const OPERATOR_LABEL: &str = "openshell.ai/e2e-operator-workspace=true";
 const SA_NAME: &str = "openshell-sandbox";
-const DURABLE_MAIN_SCRIPT: &str = r#"echo "$1"; exec sleep infinity"#;
 
 fn kube_context() -> String {
     std::env::var("OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE")
@@ -163,7 +162,7 @@ async fn operator_sandbox_in_labeled_namespace() {
     // Poll until the gateway's namespace watcher discovers the labeled namespace
     // and sandbox creation succeeds (up to 30s).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
+    let sandbox_out = loop {
         let (ok, out) = run_cli(&[
             "sandbox",
             "create",
@@ -171,23 +170,23 @@ async fn operator_sandbox_in_labeled_namespace() {
             &ns,
             "--name",
             "op-sb",
-            "--detach",
             "--",
-            "sh",
-            "-c",
-            DURABLE_MAIN_SCRIPT,
-            "_",
+            "echo",
             "operator-ok",
         ])
         .await;
         if ok {
-            break;
+            break out;
         }
         if tokio::time::Instant::now() >= deadline {
             panic!("sandbox create did not succeed within 30s: {out}");
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
-    }
+    };
+    assert!(
+        sandbox_out.contains("operator-ok"),
+        "sandbox output missing expected string: {sandbox_out}"
+    );
 
     // Verify the sandbox CR lives in the pre-provisioned namespace.
     let (ok, out) = kubectl(&["get", "sandbox.agents.x-k8s.io", "-n", &ns, "-o", "name"]).await;
@@ -255,10 +254,7 @@ async fn operator_rejects_unlabeled_namespace() {
         "--name",
         "should-fail",
         "--",
-        "sh",
-        "-c",
-        DURABLE_MAIN_SCRIPT,
-        "_",
+        "echo",
         "nope",
     ])
     .await;
@@ -294,10 +290,7 @@ async fn operator_rejects_nonexistent_namespace() {
         "--name",
         "should-fail",
         "--",
-        "sh",
-        "-c",
-        DURABLE_MAIN_SCRIPT,
-        "_",
+        "echo",
         "nope",
     ])
     .await;
@@ -334,10 +327,7 @@ async fn operator_workspace_delete_preserves_namespace() {
             "--name",
             "opdel-sb",
             "--",
-            "sh",
-            "-c",
-            DURABLE_MAIN_SCRIPT,
-            "_",
+            "echo",
             "opdel-ok",
         ])
         .await;
@@ -399,10 +389,7 @@ async fn operator_label_removal_blocks_sandbox_creation() {
             "--name",
             "lbl-sb1",
             "--",
-            "sh",
-            "-c",
-            DURABLE_MAIN_SCRIPT,
-            "_",
+            "echo",
             "lbl-ok",
         ])
         .await;
@@ -439,10 +426,7 @@ async fn operator_label_removal_blocks_sandbox_creation() {
             "--name",
             "lbl-sb2",
             "--",
-            "sh",
-            "-c",
-            DURABLE_MAIN_SCRIPT,
-            "_",
+            "echo",
             "should-fail",
         ])
         .await;

@@ -65,6 +65,21 @@ port_is_in_use() {
   (echo >/dev/tcp/127.0.0.1/"${port}") >/dev/null 2>&1
 }
 
+append_local_otlp_config_if_available() {
+  local config_path=$1
+  if ! port_is_in_use 4317; then
+    echo "OTLP collector not detected on 127.0.0.1:4317; trace export disabled."
+    return
+  fi
+
+  cat >>"${config_path}" <<'EOF'
+
+[openshell.gateway.otlp]
+endpoint = "http://127.0.0.1:4317"
+EOF
+  echo "OTLP trace export enabled for http://127.0.0.1:4317."
+}
+
 register_gateway_metadata() {
   local name=$1
   local endpoint=$2
@@ -146,7 +161,7 @@ fi
 
 echo "Building openshell-gateway..."
 cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-  -p openshell-server --bin openshell-gateway
+  -p openshell-gateway --bin openshell-gateway
 
 TLS_DIR="${STATE_DIR}/tls"
 echo "Generating local gateway credentials..."
@@ -199,6 +214,7 @@ cat >"${CONFIG_PATH}" <<EOF
 version = 1
 
 [openshell.gateway]
+name = "${GATEWAY_NAME}"
 compute_drivers = ["docker"]
 disable_tls = true
 
@@ -210,7 +226,6 @@ signing_key_path = "${TLS_DIR}/jwt/signing.pem"
 public_key_path = "${TLS_DIR}/jwt/public.pem"
 kid_path = "${TLS_DIR}/jwt/kid"
 gateway_id = "${GATEWAY_NAME}"
-ttl_secs = 3600
 
 [openshell.drivers.docker]
 default_image = "${SANDBOX_IMAGE}"
@@ -219,6 +234,8 @@ sandbox_namespace = "${SANDBOX_NAMESPACE}"
 grpc_endpoint = "${GRPC_ENDPOINT}"
 supervisor_bin = "${SUPERVISOR_BIN}"
 EOF
+
+append_local_otlp_config_if_available "${CONFIG_PATH}"
 
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"

@@ -221,7 +221,6 @@ enum EndpointMode {
     TlsSkip,
     L4OptIn,
     RestBody { rewrite: bool },
-    WebSocket,
 }
 
 #[derive(Clone, Copy)]
@@ -245,9 +244,6 @@ fn write_policy(
         EndpointMode::RestBody { rewrite } => format!(
             "        protocol: rest\n        access: full\n        request_body_credential_rewrite: {rewrite}\n"
         ),
-        EndpointMode::WebSocket => {
-            "        protocol: websocket\n        access: read-write\n".to_string()
-        }
     };
     let credential_binding = match credential_source {
         CredentialSource::ProviderProfile => String::new(),
@@ -285,6 +281,27 @@ network_policies:
     );
     file.write_all(policy.as_bytes())
         .map_err(|error| format!("write policy: {error}"))?;
+    file.flush()
+        .map_err(|error| format!("flush policy: {error}"))?;
+    Ok(file)
+}
+
+fn write_base_policy() -> Result<NamedTempFile, String> {
+    let mut file = NamedTempFile::new().map_err(|error| format!("create policy: {error}"))?;
+    file.write_all(
+        br#"version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
+  read_write: [/sandbox, /tmp, /dev/null]
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#,
+    )
+    .map_err(|error| format!("write policy: {error}"))?;
     file.flush()
         .map_err(|error| format!("flush policy: {error}"))?;
     Ok(file)
@@ -840,40 +857,41 @@ async fn run_body_sandbox(
     Ok(output)
 }
 
+async fn run_profile_body_sandbox(port: u16) -> Result<String, String> {
+    let policy = write_base_policy()?;
+    let policy_path = policy
+        .path()
+        .to_str()
+        .ok_or_else(|| "body policy path is not UTF-8".to_string())?;
+    let script = body_client_script(port);
+    let mut sandbox = SandboxGuard::create(&[
+        "--policy",
+        policy_path,
+        "--provider",
+        PROVIDER_NAME,
+        "--",
+        "python3",
+        "-c",
+        &script,
+    ])
+    .await?;
+    let output = sandbox.create_output.clone();
+    sandbox.cleanup().await;
+    Ok(output)
+}
+
 async fn assert_rest_body_backstop(server: &HttpProbeServer) -> Result<(), String> {
-    let denied = run_body_sandbox(
-        server.port,
-        EndpointMode::RestBody { rewrite: false },
-        CredentialSource::ProviderProfile,
-    )
-    .await?;
+    let denied = run_profile_body_sandbox(server.port).await?;
     assert!(denied.contains("BODY_DENIED"));
-
-    let rewritten = run_body_sandbox(
-        server.port,
-        EndpointMode::RestBody { rewrite: true },
-        CredentialSource::ProviderProfile,
-    )
-    .await?;
-    assert!(rewritten.contains("BODY_REWRITTEN"));
-    assert!(!rewritten.contains(TEST_SECRET));
-    assert!(!rewritten.contains(PLACEHOLDER_PREFIX));
-
-    let observations = server.wait_for_observations(2).await;
-    assert_eq!(observations.len(), 2, "observations: {observations:?}");
+    let observations = server.wait_for_observations(1).await;
+    assert_eq!(observations.len(), 1, "observations: {observations:?}");
     assert!(!observations[0].saw_placeholder);
     assert!(!observations[0].saw_secret);
-    assert!(!observations[1].saw_placeholder);
-    assert!(observations[1].saw_secret);
     Ok(())
 }
 
 async fn assert_websocket_binary_denied(server: &BinaryWebSocketProbeServer) -> Result<(), String> {
-    let policy = write_policy(
-        server.port,
-        EndpointMode::WebSocket,
-        CredentialSource::ProviderProfile,
-    )?;
+    let policy = write_base_policy()?;
     let policy_path = policy
         .path()
         .to_str()
@@ -914,7 +932,6 @@ async fn credentialed_endpoint_gates_work_end_to_end() {
         .expect("install credentialed provider");
 
     let result = async {
-        assert_gateway_admission(server.port, CredentialSource::ProviderProfile).await?;
         assert_rest_body_backstop(&server).await?;
         assert_websocket_binary_denied(&websocket_server).await
     }
@@ -935,10 +952,21 @@ async fn credentialed_endpoint_gates_work_end_to_end() {
         )
         .await?;
         assert!(denied.contains("BODY_DENIED"));
+        let rewritten = run_body_sandbox(
+            server.port,
+            EndpointMode::RestBody { rewrite: true },
+            CredentialSource::PolicyBinding,
+        )
+        .await?;
+        assert!(rewritten.contains("BODY_REWRITTEN"));
+        assert!(!rewritten.contains(TEST_SECRET));
+        assert!(!rewritten.contains(PLACEHOLDER_PREFIX));
         let observations = server.wait_for_observations(3).await;
         assert_eq!(observations.len(), 3, "observations: {observations:?}");
+        assert!(!observations[1].saw_placeholder);
+        assert!(!observations[1].saw_secret);
         assert!(!observations[2].saw_placeholder);
-        assert!(!observations[2].saw_secret);
+        assert!(observations[2].saw_secret);
         assert_endpointless_provider_env_live_update(server.port).await?;
         Ok::<(), String>(())
     }

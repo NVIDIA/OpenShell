@@ -3,24 +3,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Supervisor image build.
-#
-# The final image carries the static `openshell-sandbox` binary used by Docker
-# extraction, Podman image volumes, and the Kubernetes init container copy-self
-# path. It also includes nftables so the Kubernetes supervisor sidecar can
-# install pod-namespace egress enforcement rules.
-#
-# The Rust binary is built natively before this image build runs and staged at:
+# The static sandbox binary is staged at:
 #   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-sandbox
 #
-# Use tasks/scripts/docker-build-image.sh supervisor (or `mise run build:docker:supervisor`)
-# to stage the binary and build the image in one step. CI builds the binary
-# per-architecture via the `rust-native-build.yml` workflow and uploads it as an
-# artifact, which is downloaded into the same staging directory before the image
-# build job runs.
-#
-# The binary is static under either supported libc variant (`SUPERVISOR_LIBC`:
-# musl by default, or glibc-static), so this Alpine base runs it unchanged.
+# Alpine supplies nftables and iptables for pod-namespace egress enforcement.
 
 FROM alpine:3.22 AS supervisor
 
@@ -28,10 +14,8 @@ ARG TARGETARCH
 
 RUN apk add --no-cache nftables iptables iptables-legacy
 
-# --chmod=0555 restores execute bits after the actions/upload-artifact +
-# download-artifact roundtrip strips them. Ownership stays root (0:0) for
-# Podman image-volume mounts, while world-execute lets the Kubernetes
-# network sidecar run this binary as the dedicated non-root proxy UID.
+# Keep the binary root-owned for Podman image-volume mounts and executable by
+# the Kubernetes network sidecar's non-root proxy UID.
 COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /openshell-sandbox
 
 ENTRYPOINT ["/openshell-sandbox"]

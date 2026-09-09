@@ -145,6 +145,7 @@ impl PolicyDecisionOperation {
 pub enum SandboxTemplateSource {
     Default,
     Image,
+    WorkloadTemplate,
     Undefined,
 }
 
@@ -154,52 +155,41 @@ impl SandboxTemplateSource {
         match self {
             Self::Default => "default",
             Self::Image => "image",
+            Self::WorkloadTemplate => "workload_template",
             Self::Undefined => "undefined",
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TelemetryComputeDriver {
-    Docker,
-    Kubernetes,
-    Podman,
-    Vm,
-    Unknown,
-}
+pub struct TelemetryComputeDriver(&'static str);
 
 impl TelemetryComputeDriver {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Docker => "docker",
-            Self::Kubernetes => "kubernetes",
-            Self::Podman => "podman",
-            Self::Vm => "vm",
-            Self::Unknown => "unknown",
-        }
+        self.0
     }
 
+    /// Classify an unregistered compute driver without exposing its configured
+    /// name.
     #[must_use]
-    pub fn from_raw(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "docker" => Self::Docker,
-            "k8s" | "kubernetes" => Self::Kubernetes,
-            "podman" => Self::Podman,
-            "vm" => Self::Vm,
-            _ => Self::Unknown,
-        }
+    pub const fn custom() -> Self {
+        Self("custom")
     }
 
+    /// Define a bounded, anonymous category at a binary composition boundary.
+    ///
+    /// The category must be a static operational label. Never construct it
+    /// from user input, configuration, resource names, or other runtime data.
     #[must_use]
-    pub const fn from_driver_kind(driver_kind: Option<crate::ComputeDriverKind>) -> Self {
-        match driver_kind {
-            Some(crate::ComputeDriverKind::Docker) => Self::Docker,
-            Some(crate::ComputeDriverKind::Kubernetes) => Self::Kubernetes,
-            Some(crate::ComputeDriverKind::Podman) => Self::Podman,
-            Some(crate::ComputeDriverKind::Vm) => Self::Vm,
-            None => Self::Unknown,
-        }
+    pub const fn anonymous_category(category: &'static str) -> Self {
+        Self(category)
+    }
+}
+
+impl Default for TelemetryComputeDriver {
+    fn default() -> Self {
+        Self::custom()
     }
 }
 
@@ -684,27 +674,11 @@ mod tests {
     }
 
     #[test]
-    fn compute_driver_values_are_sanitized() {
+    fn compute_driver_values_are_bounded_by_the_composition_boundary() {
+        assert_eq!(TelemetryComputeDriver::custom().as_str(), "custom");
         assert_eq!(
-            TelemetryComputeDriver::from_raw("docker").as_str(),
-            "docker"
-        );
-        assert_eq!(
-            TelemetryComputeDriver::from_raw("k8s").as_str(),
-            "kubernetes"
-        );
-        assert_eq!(
-            TelemetryComputeDriver::from_raw("KUBERNETES").as_str(),
-            "kubernetes"
-        );
-        assert_eq!(TelemetryComputeDriver::from_raw("vm").as_str(), "vm");
-        assert_eq!(
-            TelemetryComputeDriver::from_raw("podman").as_str(),
-            "podman"
-        );
-        assert_eq!(
-            TelemetryComputeDriver::from_raw("private-driver").as_str(),
-            "unknown"
+            TelemetryComputeDriver::anonymous_category("first_party").as_str(),
+            "first_party"
         );
     }
 
@@ -793,7 +767,7 @@ mod disabled_tests {
             1,
             false,
             SandboxTemplateSource::Default,
-            TelemetryComputeDriver::Docker,
+            TelemetryComputeDriver::custom(),
         );
         emit_policy_decision(
             PolicyDecisionOperation::Approve,

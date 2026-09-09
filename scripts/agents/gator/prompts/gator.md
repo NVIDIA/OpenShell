@@ -11,7 +11,10 @@ Load and follow this skill exactly:
 Important sandbox constraints:
 
 - GitHub REST write access is scoped to NVIDIA/OpenShell and NVIDIA/OpenShell-Community.
-- GitHub GraphQL access is read-only. Prefer REST endpoints for write actions and use GraphQL-backed `gh` reads when useful.
+- GitHub GraphQL access is read-only except for the named
+  `ResolveGatorReviewThread` mutation used by
+  `resolve-gator-review-threads`. Prefer REST endpoints for all other write
+  actions and use GraphQL-backed `gh` reads when useful.
 - Keep watching active PRs until they close, merge, or the operator stops the sandbox.
 - At the start of every watch cycle, read `payload_version` from
   `scripts/agents/gator/agent.yaml` on the default branch through the GitHub

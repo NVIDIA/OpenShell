@@ -19,9 +19,9 @@ use std::time::Duration;
 
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
-    GatewayMessage, RelayFrame, RelayInit, RelayOpen, RelayOpenResult,
-    ReportMainProcessExitRequest, SupervisorHeartbeat, SupervisorHello, SupervisorMessage,
-    TcpRelayTarget, gateway_message, relay_open, supervisor_message,
+    FinalizeMainProcessExitRequest, GatewayMessage, RelayFrame, RelayInit, RelayOpen,
+    RelayOpenResult, ReportMainProcessExitRequest, SupervisorHeartbeat, SupervisorHello,
+    SupervisorMessage, TcpRelayTarget, gateway_message, relay_open, supervisor_message,
 };
 use openshell_ocsf::{
     ActivityId, ConnectionInfo, Endpoint, NetworkActivityBuilder, OcsfEvent, SandboxContext,
@@ -283,7 +283,7 @@ pub fn spawn(
     terminating: Arc<AtomicBool>,
     instance_id: String,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_session_loop(
+    let config = SessionConfig {
         endpoint,
         sandbox_id,
         ssh_socket_path,
@@ -291,10 +291,11 @@ pub fn spawn(
         expected_ssh_peer_pid,
         terminating,
         instance_id,
-    ))
+    };
+    tokio::spawn(run_session_loop(config))
 }
 
-async fn run_session_loop(
+struct SessionConfig {
     endpoint: String,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
@@ -302,34 +303,29 @@ async fn run_session_loop(
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     instance_id: String,
-) {
+}
+
+async fn run_session_loop(config: SessionConfig) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
 
     loop {
         attempt += 1;
 
-        match run_single_session(
-            &endpoint,
-            &sandbox_id,
-            &ssh_socket_path,
-            netns_fd,
-            expected_ssh_peer_pid,
-            Arc::clone(&terminating),
-            &instance_id,
-        )
-        .await
-        {
+        match run_single_session(&config).await {
             Ok(()) => {
-                let event =
-                    session_closed_event(openshell_ocsf::ctx::ctx(), &endpoint, &sandbox_id);
+                let event = session_closed_event(
+                    openshell_ocsf::ctx::ctx(),
+                    &config.endpoint,
+                    &config.sandbox_id,
+                );
                 ocsf_emit!(event);
                 break;
             }
             Err(e) => {
                 let event = session_failed_event(
                     openshell_ocsf::ctx::ctx(),
-                    &endpoint,
+                    &config.endpoint,
                     attempt,
                     &e.to_string(),
                 );
@@ -342,19 +338,13 @@ async fn run_session_loop(
 }
 
 async fn run_single_session(
-    endpoint: &str,
-    sandbox_id: &str,
-    ssh_socket_path: &std::path::Path,
-    netns_fd: Option<i32>,
-    expected_ssh_peer_pid: Option<u32>,
-    terminating: Arc<AtomicBool>,
-    instance_id: &str,
+    config: &SessionConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
     // every relay rides the same TCP+TLS+HTTP/2 connection — no new TLS
     // handshake per relay.
-    let channel = grpc_client::connect_channel_pub(endpoint)
+    let channel = grpc_client::connect_channel_pub(&config.endpoint)
         .await
         .map_err(|e| format!("connect failed: {e}"))?;
     let mut client = OpenShellClient::new(channel.clone());
@@ -366,8 +356,8 @@ async fn run_single_session(
     // Send hello as the first message.
     tx.send(SupervisorMessage {
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
-            sandbox_id: sandbox_id.to_string(),
-            instance_id: instance_id.to_string(),
+            sandbox_id: config.sandbox_id.clone(),
+            instance_id: config.instance_id.clone(),
         })),
     })
     .await
@@ -397,12 +387,11 @@ async fn run_single_session(
     let heartbeat_secs = accepted.heartbeat_interval_secs.max(5);
     let event = session_established_event(
         openshell_ocsf::ctx::ctx(),
-        endpoint,
+        &config.endpoint,
         &accepted.session_id,
         heartbeat_secs,
     );
     ocsf_emit!(event);
-
     // Main loop: receive gateway messages + send heartbeats.
     let mut heartbeat_interval =
         tokio::time::interval(Duration::from_secs(u64::from(heartbeat_secs)));
@@ -414,19 +403,19 @@ async fn run_single_session(
                 let msg = match map_session_stream_message(
                     msg,
                     "gateway closed stream",
-                    &terminating,
+                    &config.terminating,
                 )? {
                     SessionStreamMessage::Message(msg) => msg,
                     SessionStreamMessage::ExpectedShutdownClose => return Ok(()),
                 };
                 let context = GatewayMessageContext {
-                    sandbox_id,
-                    ssh_socket_path,
-                    netns_fd,
-                    expected_ssh_peer_pid,
+                    sandbox_id: &config.sandbox_id,
+                    ssh_socket_path: &config.ssh_socket_path,
+                    netns_fd: config.netns_fd,
+                    expected_ssh_peer_pid: config.expected_ssh_peer_pid,
                     channel: &channel,
                     tx: &tx,
-                    terminating: &terminating,
+                    terminating: &config.terminating,
                 };
                 handle_gateway_message(
                     &msg,
@@ -463,6 +452,25 @@ pub async fn report_main_process_exit(
             sandbox_id: sandbox_id.to_string(),
             instance_id: instance_id.to_string(),
             exit_code,
+        })
+        .await?;
+    Ok(())
+}
+
+/// Confirm terminal delivery and permit ephemeral cleanup.
+pub async fn finalize_main_process_exit(
+    endpoint: &str,
+    sandbox_id: &str,
+    instance_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let channel = grpc_client::connect_channel_pub(endpoint)
+        .await
+        .map_err(|error| format!("connect failed: {error}"))?;
+    let mut client = OpenShellClient::new(channel);
+    client
+        .finalize_main_process_exit(FinalizeMainProcessExitRequest {
+            sandbox_id: sandbox_id.to_string(),
+            instance_id: instance_id.to_string(),
         })
         .await?;
     Ok(())

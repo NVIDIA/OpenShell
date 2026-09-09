@@ -5,7 +5,7 @@
 
 ["build:gateway"]
 description = "Build the standalone openshell-gateway binary"
-run = "cargo build -p openshell-server --bin openshell-gateway"
+run = "cargo build -p openshell-gateway --bin openshell-gateway"
 hide = true
 
 ["gateway"]

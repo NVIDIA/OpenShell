@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    DraftChunkRecord, ObjectRecord, PersistenceError, PersistenceResult, PolicyRecord,
-    WriteCondition, WriteResult, current_time_ms, map_db_error, map_migrate_error,
+    DraftChunkRecord, ObjectCursor, ObjectRecord, PersistenceError, PersistenceResult,
+    PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error, map_migrate_error,
 };
 use crate::policy_store::{
     AtomicPolicyRevisionWrite, draft_chunk_payload_from_record, draft_chunk_record_from_parts,
@@ -14,11 +14,11 @@ use openshell_core::SetResourceVersion;
 use openshell_core::proto::Sandbox;
 use prost::Message;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{Connection, PgPool, Row};
+use sqlx::{Connection, PgPool, Postgres, QueryBuilder, Row};
 
 static POSTGRES_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
 
-use super::{DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
+use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
 
 #[derive(Debug, Clone)]
 pub struct PostgresStore {
@@ -337,6 +337,73 @@ RETURNING resource_version, created_at_ms, updated_at_ms
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_if_workspace_count_below(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+        max_count: u64,
+    ) -> PersistenceResult<Option<WriteResult>> {
+        let now_ms = current_time_ms();
+        let labels_jsonb: Option<serde_json::Value> = labels
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| PersistenceError::Encode(format!("invalid labels JSON: {e}")))?;
+        let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+            .bind(object_type)
+            .bind(workspace)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM objects WHERE object_type = $1 AND workspace = $2",
+        )
+        .bind(object_type)
+        .bind(workspace)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        let count = u64::try_from(row.0).unwrap_or(0);
+        if count >= max_count {
+            tx.commit().await.map_err(|e| map_db_error(&e))?;
+            return Ok(None);
+        }
+
+        let row = sqlx::query(
+            r"
+INSERT INTO objects (object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version)
+VALUES ($1, $2, $3, $4, $5, $6, $6, COALESCE($7, '{}'::jsonb), 1)
+RETURNING resource_version, created_at_ms, updated_at_ms
+",
+        )
+        .bind(object_type)
+        .bind(id)
+        .bind(name)
+        .bind(workspace)
+        .bind(payload)
+        .bind(now_ms)
+        .bind(labels_jsonb)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+
+        let resource_version_i64: i64 = row.try_get("resource_version").unwrap_or(1);
+        Ok(Some(WriteResult {
+            resource_version: resource_version_i64.max(1).cast_unsigned(),
+            created_at_ms: row.get("created_at_ms"),
+            updated_at_ms: row.get("updated_at_ms"),
+        }))
+    }
+
     pub async fn get(
         &self,
         object_type: &str,
@@ -389,6 +456,28 @@ WHERE object_type = $1 AND workspace = $2 AND name = $3
             .await
             .map_err(|e| map_db_error(&e))?;
         Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete_many(&self, object_type: &str, ids: &[String]) -> PersistenceResult<u64> {
+        let mut deleted = 0_u64;
+        for ids in ids.chunks(DELETE_MANY_BATCH_SIZE) {
+            let mut query =
+                QueryBuilder::<Postgres>::new("DELETE FROM objects WHERE object_type = ");
+            query.push_bind(object_type).push(" AND id IN (");
+            let mut separated = query.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated(")");
+
+            deleted += query
+                .build()
+                .execute(&self.pool)
+                .await
+                .map_err(|e| map_db_error(&e))?
+                .rows_affected();
+        }
+        Ok(deleted)
     }
 
     pub async fn count_in_workspace(
@@ -498,6 +587,33 @@ LIMIT $2 OFFSET $3
         .await
         .map_err(|e| map_db_error(&e))?;
 
+        Ok(rows.into_iter().map(row_to_object_record).collect())
+    }
+    pub async fn list_after(
+        &self,
+        object_type: &str,
+        workspace: &str,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        let rows = if let Some(cursor) = after {
+            sqlx::query("SELECT object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version FROM objects WHERE object_type = $1 AND workspace = $2 AND (created_at_ms, name, id) > ($3, $4, $5) ORDER BY created_at_ms, name, id LIMIT $6").bind(object_type).bind(workspace).bind(cursor.created_at_ms).bind(&cursor.name).bind(&cursor.id).bind(i64::from(limit)).fetch_all(&self.pool).await
+        } else {
+            sqlx::query("SELECT object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version FROM objects WHERE object_type = $1 AND workspace = $2 ORDER BY created_at_ms, name, id LIMIT $3").bind(object_type).bind(workspace).bind(i64::from(limit)).fetch_all(&self.pool).await
+        }.map_err(|e| map_db_error(&e))?;
+        Ok(rows.into_iter().map(row_to_object_record).collect())
+    }
+    pub async fn list_by_type_after(
+        &self,
+        object_type: &str,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        let rows = if let Some(cursor) = after {
+            sqlx::query("SELECT object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version FROM objects WHERE object_type = $1 AND (created_at_ms, name, workspace, id) > ($2, $3, $4, $5) ORDER BY created_at_ms, name, workspace, id LIMIT $6").bind(object_type).bind(cursor.created_at_ms).bind(&cursor.name).bind(&cursor.workspace).bind(&cursor.id).bind(i64::from(limit)).fetch_all(&self.pool).await
+        } else {
+            sqlx::query("SELECT object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version FROM objects WHERE object_type = $1 ORDER BY created_at_ms, name, workspace, id LIMIT $2").bind(object_type).bind(i64::from(limit)).fetch_all(&self.pool).await
+        }.map_err(|e| map_db_error(&e))?;
         Ok(rows.into_iter().map(row_to_object_record).collect())
     }
 

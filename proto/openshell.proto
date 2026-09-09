@@ -6,6 +6,7 @@ syntax = "proto3";
 package openshell.v1;
 
 import "datamodel.proto";
+import "google/protobuf/duration.proto";
 import "google/protobuf/struct.proto";
 import "options.proto";
 import "sandbox.proto";
@@ -51,6 +52,23 @@ service OpenShell {
     };
   }
 
+  // Allocate a gateway-owned staging slot for a local rootfs tar archive.
+  //
+  // The gateway creates a request-scoped directory inside the compute driver's
+  // staging root and returns an opaque single-use token plus the absolute path
+  // the client must write the archive to. The token is then passed as
+  // `template.driver_config.<driver>.rootfs_tar_staging_token` on
+  // CreateSandbox; callers never name a filesystem path themselves. Only a
+  // client sharing the gateway's filesystem can complete the upload.
+  rpc BeginRootfsTarStaging(BeginRootfsTarStagingRequest)
+      returns (BeginRootfsTarStagingResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
   // Fetch a sandbox by name.
   rpc GetSandbox(GetSandboxRequest) returns (SandboxResponse) {
     option (openshell.options.v1.authorization) = {
@@ -66,6 +84,46 @@ service OpenShell {
       auth_mode: "bearer"
       scope: "sandbox:read"
       workspace_role: "user"
+    };
+  }
+
+  // Create a reusable sandbox workload template.
+  rpc CreateSandboxTemplate(CreateSandboxTemplateRequest)
+      returns (SandboxTemplateResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "admin"
+    };
+  }
+
+  // Fetch a reusable sandbox workload template by name.
+  rpc GetSandboxTemplate(GetSandboxTemplateRequest)
+      returns (SandboxTemplateResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
+  // List reusable sandbox workload templates.
+  rpc ListSandboxTemplates(ListSandboxTemplatesRequest)
+      returns (ListSandboxTemplatesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
+
+  // Delete a reusable sandbox workload template by name.
+  rpc DeleteSandboxTemplate(DeleteSandboxTemplateRequest)
+      returns (DeleteSandboxTemplateResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "admin"
     };
   }
 
@@ -364,9 +422,8 @@ service OpenShell {
     };
   }
 
-  // Get gateway-global settings (read-only feature flags; any authenticated
-  // user may read these so the CLI and TUI can discover capabilities like
-  // providers_v2_enabled without requiring Platform Admin).
+  // Get gateway-global settings (read-only runtime configuration; any
+  // authenticated user may read these without requiring Platform Admin).
   //
   // Scope-only (no role): scopes are granted by the IdP at token issuance,
   // orthogonal to workspace membership. Deployments that enable scope
@@ -466,6 +523,14 @@ service OpenShell {
 
   // Persist the canonical main process result before the supervisor exits.
   rpc ReportMainProcessExit(ReportMainProcessExitRequest) returns (ReportMainProcessExitResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
+  // Confirm that foreground terminal delivery completed naturally.
+  rpc FinalizeMainProcessExit(FinalizeMainProcessExitRequest)
+      returns (FinalizeMainProcessExitResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "sandbox"
     };
@@ -789,6 +854,33 @@ message ComputeDriverCapabilities {
   // Driver-reported implementation version from the startup capability snapshot.
   string driver_version = 2;
 
+  // Static portable resource request forms reported by the driver.
+  ResourceCapabilities resource_capabilities = 3;
+}
+
+// Static portable resource request forms reported by a compute driver.
+// An omitted domain means the driver does not report that domain.
+message ResourceCapabilities {
+  CpuResourceCapabilities cpu = 1;
+  MemoryResourceCapabilities memory = 2;
+  GpuResourceCapabilities gpu = 3;
+}
+
+message CpuResourceCapabilities {
+  // The driver accepts and enforces a portable CPU limit.
+  bool limit_supported = 1;
+}
+
+message MemoryResourceCapabilities {
+  // The driver accepts and enforces a portable memory limit.
+  bool limit_supported = 1;
+}
+
+message GpuResourceCapabilities {
+  // The driver accepts a GPU request with no explicit count.
+  bool default_selection_supported = 1;
+  // The driver accepts an explicit `gpu.count` request.
+  bool count_selection_supported = 2;
 }
 
 // Public sandbox resource exposed by the OpenShell API.
@@ -806,6 +898,8 @@ message Sandbox {
   SandboxSpec spec = 2;
   // Latest user-facing observed status derived by the gateway.
   SandboxStatus status = 3;
+  // Read-only provenance for sandboxes created from a reusable workload template.
+  SandboxWorkloadTemplateProvenance created_from_workload_template = 20;
 
   reserved 4, 5;
   reserved "phase", "current_policy_version";
@@ -854,7 +948,12 @@ message GpuResourceRequirements {
   optional uint32 count = 1;
 }
 
-// Public sandbox template mapped onto compute-driver template inputs.
+// Historical inline compute template mapped onto compute-driver template inputs.
+//
+// Despite its name, this is not a reusable named sandbox template resource. It
+// is an inline part of `SandboxSpec` kept for v1 compatibility. A future
+// breaking API cleanup may rename this message to free `SandboxTemplate` for
+// the reusable template resource now represented by `SandboxWorkloadTemplate`.
 message SandboxTemplate {
   // Fully-qualified OCI image reference used to boot the sandbox.
   string image = 1;
@@ -885,6 +984,62 @@ message SandboxTemplate {
   google.protobuf.Struct driver_config = 11;
 }
 
+// Reusable named sandbox workload template resource.
+//
+// This is the actual workspace-scoped template resource used to create
+// sandboxes by reference. It uses the longer name in v1 to avoid colliding with
+// the historical inline `SandboxTemplate` message. A future breaking API
+// cleanup may rename this resource to `SandboxTemplate`.
+message SandboxWorkloadTemplate {
+  // Kubernetes-style metadata (id, name, labels, timestamps, resource version).
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  // Desired reusable workload shape and template-owned driver config.
+  SandboxWorkloadTemplateSpec spec = 2;
+}
+
+message SandboxWorkloadTemplateSpec {
+  // Portable workload shape.
+  SandboxWorkloadConfig workload = 1;
+  // Driver-keyed opaque config envelope supplied by the template owner.
+  google.protobuf.Struct driver_config = 2;
+  // Desired service level associated with this template.
+  SandboxServiceLevel desired_service_level = 3;
+}
+
+message SandboxWorkloadConfig {
+  // Fully-qualified OCI image reference used to boot the sandbox.
+  string image = 1;
+  // Environment variables injected into the sandbox runtime.
+  map<string, string> environment = 2;
+  // Portable resource requirements for sandboxes created from this workload.
+  SandboxResources resources = 3;
+}
+
+message SandboxResources {
+  // Portable CPU quantity, for example "500m" or "2".
+  string cpu = 1;
+  // Portable memory quantity, for example "512Mi" or "2Gi".
+  string memory = 2;
+  // GPU requirements for the sandbox workload. Presence indicates a GPU
+  // request. When count is omitted, the request uses the selected driver's
+  // default GPU assignment behavior.
+  GpuResourceRequirements gpu = 3;
+}
+
+message SandboxServiceLevel {
+  SandboxStartup startup = 1;
+}
+
+message SandboxStartup {
+  google.protobuf.Duration ready_within = 1;
+  uint32 max_burst = 2;
+}
+
+message SandboxWorkloadTemplateProvenance {
+  string name = 1;
+  string resource_version = 2;
+}
+
 // User-facing sandbox status derived by the gateway from compute-driver observations.
 //
 // Public status does not embed driver-only flags such as `deleting`.
@@ -907,7 +1062,8 @@ message SandboxStatus {
   // The gateway uses this to reject stale exit reports after a restart.
   string main_process_instance_id = 8;
   // Normalized main process result. Signal exits use 128 + signal number.
-  // Presence indicates that the main process exited and the sandbox is in Error.
+  // Presence indicates that the canonical main process exited. Exit code 0
+  // produces Completed; nonzero and signal-normalized exits produce Error.
   optional int32 exit_code = 9;
 }
 
@@ -939,6 +1095,8 @@ enum SandboxPhase {
   SANDBOX_PHASE_STOPPING = 6;
   SANDBOX_PHASE_STOPPED = 7;
   SANDBOX_PHASE_STARTING = 8;
+  // The canonical main process exited successfully and its result is final.
+  SANDBOX_PHASE_COMPLETED = 9;
 }
 
 // Public platform event exposed on the sandbox watch stream.
@@ -968,6 +1126,80 @@ message CreateSandboxRequest {
   map<string, string> annotations = 4;
   // Workspace for the sandbox. Empty defaults to "default".
   string workspace = 5;
+  // One-shot launch hint indicating that the creating client will attach to
+  // the canonical main process. The supervisor keeps the terminal transport
+  // alive until that attachment connects and closes naturally.
+  bool await_main_process_attachment = 6;
+  // Workspace-scoped SandboxWorkloadTemplate name to resolve at creation time.
+  string workload_template_name = 7;
+}
+
+message CreateSandboxTemplateRequest {
+  SandboxWorkloadTemplate template = 1;
+  // Workspace for the template. Empty defaults to "default".
+  string workspace = 2;
+}
+
+message GetSandboxTemplateRequest {
+  string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
+}
+
+message ListSandboxTemplatesRequest {
+  uint32 limit = 1;
+  uint32 offset = 2;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 3;
+  // List across all workspaces. Mutually exclusive with workspace.
+  bool all_workspaces = 4;
+  // Optional label selector in key=value comma-separated form.
+  string label_selector = 5;
+}
+
+message DeleteSandboxTemplateRequest {
+  string name = 1;
+  // Workspace scope. Empty defaults to "default".
+  string workspace = 2;
+}
+
+message SandboxTemplateResponse {
+  SandboxWorkloadTemplate template = 1;
+}
+
+message ListSandboxTemplatesResponse {
+  repeated SandboxWorkloadTemplate templates = 1;
+}
+
+message DeleteSandboxTemplateResponse {
+  bool deleted = 1;
+}
+
+// Request a gateway-owned staging slot for a local rootfs tar archive.
+message BeginRootfsTarStagingRequest {
+  // Workspace that will own the sandbox created from this archive. Empty
+  // defaults to "default", matching CreateSandboxRequest.workspace.
+  string workspace = 1;
+  // Base file name of the local archive. The gateway uses it only to name the
+  // staged file; path separators and traversal components are rejected.
+  string file_name = 2;
+  // Size of the local archive in bytes, checked against the driver limit
+  // before the gateway allocates a slot.
+  uint64 size_bytes = 3;
+}
+
+// Gateway-issued staging slot.
+message BeginRootfsTarStagingResponse {
+  // Opaque single-use token. Pass it as
+  // `template.driver_config.<driver>.rootfs_tar_staging_token` on
+  // CreateSandbox. The first CreateSandbox presenting it consumes it.
+  string staging_token = 1;
+  // Absolute path on the gateway host the client must write the archive to.
+  string upload_path = 2;
+  // Maximum accepted archive size in bytes, enforced again by the driver.
+  uint64 max_bytes = 3;
+  // Wall-clock deadline after which the gateway reclaims the slot.
+  int64 expires_at_ms = 4;
 }
 
 // Get sandbox request.
@@ -1247,6 +1479,13 @@ message ExecSandboxRequest {
 
   // Initial terminal rows (used when tty=true, 0 = use default).
   uint32 rows = 9;
+
+  // Skip sourcing shell login/profile startup files before running the command.
+  // When false (the default), the command runs through a login shell
+  // (`bash -lc`) so user startup files (.bash_profile/.profile, and .bashrc if
+  // sourced by them) are applied. When true, the command runs without those
+  // files (`bash -c`), for automation that needs predictable startup behavior.
+  bool no_login_shell = 10;
 }
 
 // One stdout chunk from a sandbox exec.
@@ -1355,7 +1594,8 @@ message WatchSandboxRequest {
   // Replay the last N platform events (best-effort) before following.
   uint32 event_tail = 6;
 
-  // Stop streaming once the sandbox reaches a terminal phase (READY or ERROR).
+  // Stop streaming once the sandbox reaches READY or a terminal result phase
+  // (COMPLETED, STOPPED, or ERROR).
   bool stop_on_terminal = 7;
 
   // Only include log lines with timestamp >= this value (milliseconds since epoch).
@@ -1620,9 +1860,23 @@ message ProviderCredentialRefreshStatus {
   ProviderCredentialRefreshStrategy strategy = 4;
   string status = 5;
   int64 expires_at_ms = 6;
+  // Next automatic refresh time in Unix epoch milliseconds. A value of
+  // 9223372036854775807 (int64 max) means no automatic retry is scheduled;
+  // consumers should render it as unset and use recovery_action to determine
+  // the required recovery workflow.
   int64 next_refresh_at_ms = 7;
   int64 last_refresh_at_ms = 8;
   string last_error = 9;
+  ProviderCredentialRefreshRecoveryAction recovery_action = 10;
+  // Stable gateway-owned failure identifier, for example
+  // "oauth_invalid_grant". This is not provider-controlled prose and
+  // incorporates any recognized top-level OAuth error classification.
+  string failure_code = 11;
+  // A bounded, recognized provider subtype that refines failure_code; clients
+  // do not need a separate provider_error field. Unknown provider-controlled
+  // values are not persisted or returned.
+  string provider_error_subtype = 12;
+  int64 last_error_at_ms = 13;
 }
 
 // Provider profile local discovery declaration.
@@ -1643,6 +1897,7 @@ message StoredProviderCredentialRefreshState {
   // are not automatically migrated before OpenShell 0.1.0.
   repeated string secret_material_keys = 7;
   int64 expires_at_ms = 8;
+  // int64 max parks the refresh until an explicit rotation or reconfiguration.
   int64 next_refresh_at_ms = 9;
   int64 last_refresh_at_ms = 10;
   string status = 11;
@@ -1671,6 +1926,12 @@ message StoredProviderCredentialRefreshState {
   // Cleanup is retried by the refresh worker so a gateway crash or temporary
   // credential-backend outage does not lose the deletion reference.
   repeated StoredRefreshMaterialDeletion pending_secret_deletions = 20;
+  // Structured recovery details for the most recent refresh failure. These
+  // fields contain only gateway-owned codes and recognized bounded values.
+  ProviderCredentialRefreshRecoveryAction recovery_action = 21;
+  string failure_code = 22;
+  string provider_error_subtype = 23;
+  int64 last_error_at_ms = 24;
 }
 
 message StoredRefreshMaterialDeletion {
@@ -2065,6 +2326,8 @@ message ListSandboxPoliciesRequest {
 
 // List sandbox policies response.
 message ListSandboxPoliciesResponse {
+  // Invalid historical payloads remain visible as failed projections so one
+  // legacy row cannot hide the rest of the policy history.
   repeated SandboxPolicyRevision revisions = 1;
 }
 
@@ -2087,11 +2350,16 @@ message ReportPolicyStatusResponse {}
 message SandboxPolicyRevision {
   // Policy version (monotonically increasing per sandbox).
   uint32 version = 1;
-  // SHA-256 hash of the serialized policy payload.
+  // SHA-256 hash of the canonical serialized policy payload. Empty in a
+  // ListSandboxPolicies projection when the stored payload is invalid under
+  // the current schema and therefore has no trusted canonical identity.
   string policy_hash = 2;
-  // Load status of this revision.
+  // Load status of this revision. ListSandboxPolicies reports FAILED when a
+  // stored historical payload is invalid under the current schema, regardless
+  // of its persisted sandbox load status.
   PolicyStatus status = 3;
-  // Error message if status is FAILED.
+  // Sandbox load error, or the schema-validation diagnostic for an invalid
+  // historical row returned by ListSandboxPolicies.
   string load_error = 4;
   // Milliseconds since epoch when this revision was created.
   int64 created_at_ms = 5;
@@ -2111,6 +2379,8 @@ enum PolicyStatus {
   // Sandbox successfully applied this policy version.
   POLICY_STATUS_LOADED = 2;
   // Sandbox attempted to apply but failed; LKG policy remains active.
+  // ListSandboxPolicies also uses FAILED for historical payloads that are
+  // invalid under the current schema; load_error contains the diagnostic.
   POLICY_STATUS_FAILED = 3;
   // A newer version was persisted before the sandbox loaded this one.
   POLICY_STATUS_SUPERSEDED = 4;
@@ -2218,6 +2488,15 @@ message ReportMainProcessExitRequest {
 }
 
 message ReportMainProcessExitResponse {}
+
+// Terminal-delivery completion reported after all expected foreground SSH
+// attachments close. A successful response permits ephemeral cleanup.
+message FinalizeMainProcessExitRequest {
+  string sandbox_id = 1;
+  string instance_id = 2;
+}
+
+message FinalizeMainProcessExitResponse {}
 
 // Gateway requests the supervisor to open a relay channel.
 //
@@ -2785,6 +3064,18 @@ enum WorkspaceRole {
   WORKSPACE_ROLE_UNSPECIFIED = 0;
   WORKSPACE_ROLE_USER = 1;
   WORKSPACE_ROLE_ADMIN = 2;
+}
+
+// Stable recovery action for the most recent provider credential refresh
+// failure. Kept after the pre-existing enums so adding it does not renumber
+// their generated descriptors. Clients should use this field instead of
+// parsing last_error.
+enum ProviderCredentialRefreshRecoveryAction {
+  PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_UNSPECIFIED = 0;
+  PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_RETRY = 1;
+  PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_REAUTHORIZE = 2;
+  PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_FIX_CONFIGURATION = 3;
+  PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_INVESTIGATE = 4;
 }
 
 // Workspace membership record.

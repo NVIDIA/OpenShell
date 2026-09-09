@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# demo.yaml — June 15 MXC filesystem-policy proof.
+#
+# Minimal filesystem policy granting the workload folder read-write. The granted
+# path must cover the per-sandbox command executable, working directory, and any
+# files that command reads or writes. ProcessContainer denies all ungranted paths.
+#
+# NOTE: the canonical OpenShell policy YAML key is `filesystem_policy`
+# (parsed by the `openshell-policy` crate into SandboxPolicy.filesystem), NOT
+# `filesystem`. The MXC driver's policy bridge then re-emits this under the
+# `filesystem_policy` key the embedded mapper expects.
+version: 1
+
+filesystem_policy:
+  include_workdir: false
+  read_only: []
+  read_write:
+    - "C:/work/openshell-mxc-demo"   # = OPENSHELL_MXC_SHARE_DIR (host-visible share)
+
+# No landlock, process, or network policy is present. MXC rejects every network
+# policy at create time until an enforcing egress path is available; it never
+# silently drops network rules.

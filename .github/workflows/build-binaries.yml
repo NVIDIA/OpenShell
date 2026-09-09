@@ -1,0 +1,78 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build Binary
+
+on:
+  workflow_call:
+    inputs:
+      package:
+        required: true
+        type: string
+      binary:
+        required: true
+        type: string
+      triple:
+        required: true
+        type: string
+      runner:
+        required: true
+        type: string
+      dev-shell:
+        required: true
+        type: string
+      cargo-version:
+        required: true
+        type: string
+      image-tag:
+        required: false
+        type: string
+        default: ""
+      artifact-name:
+        required: false
+        type: string
+        default: ""
+      extra-cargo-flags:
+        required: false
+        type: string
+        default: ""
+      interpreter:
+        required: false
+        type: string
+        default: ""
+      checkout-ref:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      CACHIX_AUTH_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ inputs.binary }} (${{ inputs.triple }})
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - uses: ./.github/actions/build-rust-binary
+        with:
+          package: ${{ inputs.package }}
+          binary: ${{ inputs.binary }}
+          triple: ${{ inputs.triple }}
+          dev-shell: ${{ inputs['dev-shell'] }}
+          cargo-version: ${{ inputs['cargo-version'] }}
+          image-tag: ${{ inputs['image-tag'] }}
+          artifact-name: ${{ inputs['artifact-name'] }}
+          extra-cargo-flags: ${{ inputs['extra-cargo-flags'] }}
+          interpreter: ${{ inputs.interpreter }}

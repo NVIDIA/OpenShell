@@ -21,6 +21,7 @@ pub mod tls;
 pub(crate) mod token_grant_injection;
 pub(crate) mod websocket;
 
+use openshell_core::mcp::McpProtocolVersion;
 pub use openshell_policy::L7Protocol;
 use openshell_policy::{
     L7EndpointFields, validate_explicit_tcp_additional_fields, validate_l7_endpoint_semantics,
@@ -119,6 +120,10 @@ pub struct L7EndpointConfig {
     /// MCP-only strict validation for tools/call params.name. Defaults to true
     /// for MCP endpoints and is ignored by other JSON-RPC-family protocols.
     pub mcp_strict_tool_names: bool,
+    /// Canonical MCP protocol revisions allowed by this endpoint.
+    ///
+    /// Non-MCP endpoints always carry an empty list.
+    pub mcp_versions: Vec<McpProtocolVersion>,
     /// When true, percent-encoded `/` (`%2F`) is preserved in path segments
     /// rather than rejected at the parser. Needed by upstreams like GitLab
     /// that embed `%2F` in namespaced project paths. Defaults to false.
@@ -172,7 +177,8 @@ pub struct L7RequestInfo {
 /// Parse an L7 endpoint config from a regorus Value (returned by Rego query).
 ///
 /// The value is expected to be the raw endpoint object from the Rego data,
-/// containing fields: `protocol`, optionally `tls`, `enforcement`.
+/// containing fields: `protocol`, optionally `tls`, `enforcement`, and the
+/// canonical `mcp_versions` array for MCP endpoints.
 pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let protocol_val = get_object_str(val, "protocol")?;
     let protocol = L7Protocol::parse(&protocol_val)?;
@@ -231,6 +237,11 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         .unwrap_or(jsonrpc::DEFAULT_MAX_BODY_BYTES);
     let mcp_strict_tool_names = protocol == L7Protocol::Mcp
         && get_object_bool(val, "mcp_strict_tool_names").unwrap_or(true);
+    let mcp_versions = if protocol == L7Protocol::Mcp {
+        parse_canonical_mcp_versions(val)?
+    } else {
+        Vec::new()
+    };
 
     let credential_signing = match get_object_str(val, "credential_signing").as_deref() {
         Some("sigv4") => CredentialSigning::SigV4,
@@ -271,6 +282,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         graphql_max_body_bytes,
         json_rpc_max_body_bytes,
         mcp_strict_tool_names,
+        mcp_versions,
         allow_encoded_slash,
         websocket_credential_rewrite,
         request_body_credential_rewrite,
@@ -400,6 +412,27 @@ fn get_object_str(val: &regorus::Value, key: &str) -> Option<String> {
         },
         _ => None,
     }
+}
+
+fn parse_canonical_mcp_versions(val: &regorus::Value) -> Option<Vec<McpProtocolVersion>> {
+    let regorus::Value::Array(values) = get_object_value(val, "mcp_versions")? else {
+        return None;
+    };
+    let versions = values
+        .iter()
+        .map(|value| match value {
+            regorus::Value::String(value) => value.parse::<McpProtocolVersion>().ok(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    // Both policy ingress paths promise a non-empty, strictly ordered list.
+    // Rechecking that runtime contract prevents a dropped or corrupted
+    // projection from silently selecting a different wire profile.
+    if versions.is_empty() || !versions.windows(2).all(|pair| pair[0] < pair[1]) {
+        return None;
+    }
+    Some(versions)
 }
 
 fn endpoint_has_graphql_policy(val: &regorus::Value) -> bool {
@@ -1252,6 +1285,7 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                     "{loc}: JSON-RPC-specific endpoint fields are ignored unless protocol is json-rpc or mcp"
                 ));
             }
+            validate_mcp_versions_field(&mut errors, &loc, ep, l7_protocol);
             let has_mcp_strict_tool_names = ep.get("mcp_strict_tool_names").is_some();
             let has_mcp_allow_all_known_mcp_methods =
                 ep.get("mcp_allow_all_known_mcp_methods").is_some();
@@ -1571,6 +1605,55 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
     (errors, warnings)
 }
 
+fn validate_mcp_versions_field(
+    errors: &mut Vec<String>,
+    loc: &str,
+    endpoint: &serde_json::Value,
+    protocol: Option<L7Protocol>,
+) {
+    let Some(value) = endpoint.get("mcp_versions") else {
+        return;
+    };
+    if protocol != Some(L7Protocol::Mcp) {
+        errors.push(format!(
+            "{loc}: mcp.versions is only valid for protocol mcp"
+        ));
+        return;
+    }
+    let Some(values) = value.as_array() else {
+        errors.push(format!("{loc}: mcp.versions must be an array"));
+        return;
+    };
+    if values.is_empty() {
+        errors.push(format!("{loc}: mcp.versions must not be empty"));
+        return;
+    }
+
+    let mut versions = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(value) = value.as_str() else {
+            errors.push(format!("{loc}: mcp.versions entries must be strings"));
+            return;
+        };
+        let Ok(version) = value.parse::<McpProtocolVersion>() else {
+            errors.push(format!(
+                "{loc}: mcp.versions contains an unsupported protocol version"
+            ));
+            return;
+        };
+        versions.push(version);
+    }
+
+    // Runtime ingress has already normalized the allowlist. Requiring strict
+    // order here catches duplicates and bypasses that could otherwise fail
+    // later by removing L7 inspection from the selected route.
+    if !versions.windows(2).all(|pair| pair[0] < pair[1]) {
+        errors.push(format!(
+            "{loc}: mcp.versions must be unique and in canonical order"
+        ));
+    }
+}
+
 /// Map a supported L7 `access` preset to explicit rules for `protocol`.
 ///
 /// Returns `None` when `access` is not `read-only`, `read-write`, or `full`.
@@ -1884,7 +1967,7 @@ mod tests {
     #[test]
     fn parse_l7_config_mcp_strict_tool_names_defaults_true() {
         let val = regorus::Value::from_json_str(
-            r#"{"protocol": "mcp", "host": "mcp.example.com", "port": 443}"#,
+            r#"{"protocol": "mcp", "host": "mcp.example.com", "port": 443, "mcp_versions": ["2025-11-25"]}"#,
         )
         .unwrap();
         let config = parse_l7_config(&val).unwrap();
@@ -1894,11 +1977,51 @@ mod tests {
     #[test]
     fn parse_l7_config_mcp_strict_tool_names_can_disable() {
         let val = regorus::Value::from_json_str(
-            r#"{"protocol": "mcp", "host": "mcp.example.com", "port": 443, "mcp_strict_tool_names": false}"#,
+            r#"{"protocol": "mcp", "host": "mcp.example.com", "port": 443, "mcp_strict_tool_names": false, "mcp_versions": ["2025-11-25"]}"#,
         )
         .unwrap();
         let config = parse_l7_config(&val).unwrap();
         assert!(!config.mcp_strict_tool_names);
+    }
+
+    #[test]
+    fn parse_l7_config_requires_canonical_mcp_versions() {
+        let explicit = regorus::Value::from_json_str(
+            r#"{"protocol": "mcp", "mcp_versions": ["2025-03-26", "2025-11-25"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_l7_config(&explicit).unwrap().mcp_versions,
+            vec![
+                McpProtocolVersion::V2025_03_26,
+                McpProtocolVersion::V2025_11_25
+            ]
+        );
+
+        for invalid in [
+            r#"{"protocol": "mcp"}"#,
+            r#"{"protocol": "mcp", "mcp_versions": []}"#,
+            r#"{"protocol": "mcp", "mcp_versions": ["2026-01-01"]}"#,
+            r#"{"protocol": "mcp", "mcp_versions": [1]}"#,
+            r#"{"protocol": "mcp", "mcp_versions": ["2025-11-25", "2025-11-25"]}"#,
+            r#"{"protocol": "mcp", "mcp_versions": ["2025-11-25", "2025-03-26"]}"#,
+        ] {
+            let value = regorus::Value::from_json_str(invalid).unwrap();
+            assert!(
+                parse_l7_config(&value).is_none(),
+                "non-canonical MCP runtime config must be rejected: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_l7_config_keeps_mcp_versions_off_other_protocols() {
+        let value = regorus::Value::from_json_str(
+            r#"{"protocol": "json-rpc", "mcp_versions": ["2025-11-25"]}"#,
+        )
+        .unwrap();
+
+        assert!(parse_l7_config(&value).unwrap().mcp_versions.is_empty());
     }
 
     #[test]

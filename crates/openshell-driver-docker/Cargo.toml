@@ -19,6 +19,7 @@ openshell-core = { path = "../openshell-core", default-features = false, feature
 openshell-otel = { path = "../openshell-otel" }
 
 opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
@@ -35,6 +36,8 @@ url = { workspace = true }
 clap = { workspace = true }
 miette = { workspace = true }
 toml = { workspace = true }
+tower-http = { workspace = true }
+http = { workspace = true }
 
 [dev-dependencies]
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
