@@ -197,7 +197,7 @@ pub fn short_id(id: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
-struct ContainerSpec {
+pub struct ContainerSpec {
     name: String,
     image: String,
     labels: BTreeMap<String, String>,
@@ -212,18 +212,19 @@ struct ContainerSpec {
     entrypoint: Vec<String>,
     command: Vec<String>,
     user: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    groups: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unsetenv: Vec<String>,
     cap_drop: Vec<String>,
     cap_add: Vec<String>,
     no_new_privileges: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
     seccomp_profile_path: String,
-    /// Podman's container create API accepts `AppArmor` through the dedicated
-    /// `apparmor_profile` `SpecGenerator` field. This is not Docker's
-    /// `security_opt` representation.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    apparmor_profile: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    sysctl: BTreeMap<String, String>,
     image_pull_policy: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    healthconfig: Option<HealthConfig>,
+    healthconfig: HealthConfig,
     resource_limits: ResourceLimits,
     /// Env-type secrets: map of `ENV_VAR_NAME → secret_name`.
     /// Podman's libpod `SpecGenerator` uses `secret_env` (a flat map) for
@@ -340,15 +341,8 @@ struct SecretMount {
 struct ResourceLimits {
     cpu: CpuLimits,
     memory: MemoryLimits,
-    // Podman's libpod API consumes the OCI LinuxResources shape. A Docker-style
-    // scalar PidsLimit is silently ignored and leaves the runtime default.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pids: Option<PidsLimits>,
-}
-
-#[derive(Serialize)]
-struct PidsLimits {
-    limit: i64,
+    #[serde(rename = "PidsLimit", skip_serializing_if = "Option::is_none")]
+    pids_limit: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -486,7 +480,7 @@ fn build_env(
     config: &PodmanComputeConfig,
     image: &str,
     oci_user: &str,
-) -> BTreeMap<String, String> {
+) -> Result<BTreeMap<String, String>, ComputeDriverError> {
     let spec = sandbox.spec.as_ref();
     let template = spec.and_then(|s| s.template.as_ref());
 
@@ -511,10 +505,11 @@ fn build_env(
             user_env.insert(k.clone(), v.clone());
         }
     }
-    env.extend(user_env.clone());
-    if !user_env.is_empty()
-        && let Ok(json) = serde_json::to_string(&user_env)
-    {
+    // User environment belongs exclusively to mediated workload children. In
+    // particular, never activate loader or policy overrides in the supervisor.
+    if !user_env.is_empty() {
+        let json = serde_json::to_string(&user_env)
+            .map_err(|error| ComputeDriverError::Precondition(error.to_string()))?;
         env.insert(openshell_core::sandbox_env::USER_ENVIRONMENT.into(), json);
     }
 
@@ -539,11 +534,11 @@ fn build_env(
     );
     env.insert(
         openshell_core::sandbox_env::SSH_SOCKET_PATH.into(),
-        config.ssh_socket_path.clone(),
+        config.sandbox_ssh_socket_path.clone(),
     );
     env.insert("OPENSHELL_CONTAINER_IMAGE".into(), image.to_string());
     let main_process = openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(spec)
-        .expect("main process config serialization cannot fail");
+        .map_err(|error| ComputeDriverError::Precondition(error.to_string()))?;
     env.insert(
         openshell_core::sandbox_env::MAIN_PROCESS_SPEC.into(),
         main_process,
@@ -615,7 +610,7 @@ fn build_env(
         );
     }
 
-    env
+    Ok(env)
 }
 
 /// Merge labels from the sandbox template with required managed labels.
@@ -665,10 +660,12 @@ fn build_resource_limits(sandbox: &DriverSandbox, config: &PodmanComputeConfig) 
             period: DEFAULT_CPU_PERIOD,
         },
         memory: MemoryLimits { limit: mem_bytes },
-        pids: config
-            .sandbox_pids_limit
-            .map(|limit| PidsLimits { limit: limit.get() }),
+        pids_limit: podman_pids_limit(config.sandbox_pids_limit),
     }
+}
+
+fn podman_pids_limit(value: i64) -> Option<i64> {
+    if value > 0 { Some(value) } else { None }
 }
 
 pub fn podman_driver_volume_mount_sources(
@@ -880,6 +877,7 @@ fn validate_podman_driver_mounts(
             }
         };
         driver_mounts::validate_container_mount_target(target)?;
+        driver_mounts::validate_mount_control_path(target, "/.openshell")?;
         let normalized_target = driver_mounts::normalize_mount_target(target);
         if !targets.insert(normalized_target.clone()) {
             return Err(format!(
@@ -951,14 +949,6 @@ fn validate_tmpfs_options(options: &[String]) -> Result<Vec<String>, String> {
         .collect()
 }
 
-fn podman_apparmor_profile(profile: Option<&openshell_core::AppArmorProfile>) -> Option<String> {
-    match profile {
-        None | Some(openshell_core::AppArmorProfile::RuntimeDefault) => None,
-        Some(openshell_core::AppArmorProfile::Unconfined) => Some("unconfined".to_string()),
-        Some(openshell_core::AppArmorProfile::Localhost(profile)) => Some(profile.clone()),
-    }
-}
-
 /// Build the Podman container creation JSON spec.
 #[cfg(test)]
 #[must_use]
@@ -1025,6 +1015,7 @@ pub fn build_container_spec_with_token_and_gpu_devices(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn build_container_spec_for_image(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
@@ -1036,10 +1027,36 @@ pub fn build_container_spec_for_image(
     supervisor_bin_path: Option<&Path>,
     tls_secret_names: Option<&[String; 3]>,
 ) -> Result<Value, ComputeDriverError> {
+    serde_json::to_value(build_base_spec(
+        sandbox,
+        config,
+        token_secret_name,
+        gpu_device_ids,
+        requested_image,
+        image_id,
+        oci_user,
+        supervisor_bin_path,
+        tls_secret_names,
+    )?)
+    .map_err(|error| ComputeDriverError::Message(format!("encode Podman spec: {error}")))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_base_spec(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+    token_secret_name: Option<&str>,
+    gpu_device_ids: Option<&[String]>,
+    requested_image: &str,
+    image_id: &str,
+    oci_user: &str,
+    supervisor_bin_path: Option<&Path>,
+    tls_secret_names: Option<&[String; 3]>,
+) -> Result<ContainerSpec, ComputeDriverError> {
     let name = container_name(&sandbox.workspace, &sandbox.name, &sandbox.id);
     let vol = volume_name(&sandbox.id);
 
-    let env = build_env(sandbox, config, requested_image, oci_user);
+    let env = build_env(sandbox, config, requested_image, oci_user)?;
     let labels = build_labels(sandbox);
     let resource_limits = build_resource_limits(sandbox, config);
     let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
@@ -1117,99 +1134,31 @@ pub fn build_container_spec_for_image(
         // corporate proxy flags follow it; the workload command comes from
         // the reserved environment variable.
         command,
-        // Force the supervisor to run as root (UID 0). Sandbox images may
-        // set a non-root USER directive (e.g. `USER sandbox`), but the
-        // supervisor needs root to create network namespaces, set up the
-        // proxy, and configure Landlock/seccomp. This matches the K8s
-        // driver's runAsUser: 0.
-        user: "0:0".into(),
-        // Podman's default container capability set is already restricted:
-        //   CHOWN DAC_OVERRIDE FOWNER FSETID KILL SETGID SETUID SETPCAP
-        //   NET_BIND_SERVICE SYS_CHROOT SETFCAP
-        // We add what the supervisor needs and drop what it doesn't.
-        cap_drop: vec![
-            // Not needed: standard file permission bits are sufficient; dropping
-            // prevents the supervisor from bypassing DAC checks it shouldn't need.
-            "DAC_OVERRIDE".into(),
-            // Not needed: the supervisor does not create setuid/setgid executables.
-            "FSETID".into(),
-            // Not needed: the supervisor does not bind privileged ports (<1024).
-            "NET_BIND_SERVICE".into(),
-            // Not in Podman's default set but explicitly denied in case the image
-            // or runtime adds it; raw sockets are not required.
-            "NET_RAW".into(),
-            // Not needed: the supervisor does not manipulate file capabilities.
-            "SETFCAP".into(),
-            // Not needed: the supervisor does not call chroot().
-            "SYS_CHROOT".into(),
-        ],
-        cap_add: vec![
-            // seccomp filter installation, namespace creation, Landlock setup.
-            "SYS_ADMIN".into(),
-            // Network namespace veth setup, IP/route configuration.
-            "NET_ADMIN".into(),
-            // Reading /proc/<pid>/exe and ancestor walk for process identity in policy.
-            "SYS_PTRACE".into(),
-            // Reading /dev/kmsg for bypass-detection diagnostics.
-            "SYSLOG".into(),
-            // Reading /proc/<pid>/fd/ across UIDs for process identity resolution.
-            // In rootless Podman the supervisor runs as UID 0 inside a user namespace
-            // while sandbox processes run as the sandbox user. The kernel's
-            // proc_fd_permission() calls generic_permission() which denies cross-UID
-            // access to the dr-x------ fd directory unless this cap is present.
-            // Without it the proxy cannot determine which binary made each outbound
-            // connection and all traffic is denied.
-            "DAC_READ_SEARCH".into(),
-            // Child setup clears the capability bounding set before exec, which
-            // requires CAP_SETPCAP in the supervisor until drop_privileges().
-            "SETPCAP".into(),
-            // Forwarding shutdown signals to the canonical workload process
-            // group after it drops to the sandbox UID requires CAP_KILL.
-            "KILL".into(),
-        ],
-        // SETUID, SETGID, SETPCAP, CHOWN, and FOWNER are intentionally kept from
-        // Podman's default set and not dropped:
-        //   SETUID/SETGID – drop_privileges(): setuid()/setgid()/initgroups() to the
-        //                   sandbox user. In rootless Podman cap_drop:ALL removes them
-        //                   from the bounding set even though uid=0 owns the user
-        //                   namespace — so we keep them by not dropping them explicitly.
-        //   SETPCAP       – drop_privileges(): clears the child capability
-        //                   bounding set before the sandbox user execs.
-        //   CHOWN         – prepare_filesystem(): chown(path, uid, gid) on newly
-        //                   created read_write directories so the sandbox user can
-        //                   write to them.
-        //   FOWNER        – chown on files where the supervisor is not the owner
-        //                   (e.g. pre-existing directories owned by another user).
-        //
-        // Disable the container-level seccomp profile. The sandbox supervisor The sandbox supervisor
-        // installs its own policy-aware BPF seccomp filter at runtime via
-        // seccompiler (two-phase: clone3 blocker + main filter). The runtime
-        // filter is more restrictive than Podman's default — it blocks 20+
-        // dangerous syscalls and conditionally restricts socket domains based
-        // on network policy. The filter self-seals by blocking further
-        // seccomp(SET_MODE_FILTER) calls after installation.
-        //
-        // A container-level profile would interfere by blocking the landlock
-        // and seccomp syscalls the supervisor needs during setup, before it
-        // locks itself down.
+        // The paired builder supplies the immutable non-root identity.
+        user: String::new(),
+        groups: Vec::new(),
+        unsetenv: Vec::new(),
+        cap_drop: vec!["ALL".into()],
+        cap_add: Vec::new(),
         no_new_privileges: true,
-        seccomp_profile_path: "unconfined".into(),
-        apparmor_profile: podman_apparmor_profile(config.app_armor_profile.as_ref()),
+        // Omission selects the runtime default, never an unconfined profile.
+        seccomp_profile_path: String::new(),
+        sysctl: BTreeMap::new(),
         image_pull_policy: "never".to_string(),
-        healthconfig: config.health_check_interval_secs.map(|interval_secs| HealthConfig {
+        healthconfig: HealthConfig {
             test: vec![
                 "CMD-SHELL".into(),
                 format!(
                     "test -e /var/run/openshell-ssh-ready || test -S {} || ss -tlnp | grep -q :{}",
-                    config.ssh_socket_path,
+                    config.sandbox_ssh_socket_path,
                     openshell_core::config::DEFAULT_SSH_PORT
                 ),
             ],
-            interval: interval_secs.get() * 1_000_000_000,
+            interval: config.health_check_interval_secs * 1_000_000_000,
             timeout: 2_000_000_000,
             retries: 10,
             start_period: 5_000_000_000,
-        }),
+        },
         resource_limits,
         secret_env: BTreeMap::new(),
         secrets: {
@@ -1409,7 +1358,185 @@ pub fn build_container_spec_for_image(
         },
     };
 
-    Ok(serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail"))
+    Ok(container_spec)
+}
+
+/// Driver-owned inputs for the two independent runtime containers.
+pub struct IsolationSpecInput<'a> {
+    pub sandbox: &'a DriverSandbox,
+    pub config: &'a PodmanComputeConfig,
+    pub token_secret: Option<&'a str>,
+    pub gpu_devices: Option<&'a [String]>,
+    pub requested_image: &'a str,
+    pub image_id: &'a str,
+    pub image_user: &'a str,
+    pub image_env: &'a [String],
+    pub supervisor_bin: Option<&'a Path>,
+    pub tls_secrets: Option<&'a [String; 3]>,
+    pub identity: &'a openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
+}
+
+pub struct IsolationSpecs {
+    pub workload: ContainerSpec,
+    pub supervisor: ContainerSpec,
+}
+
+impl ContainerSpec {
+    pub(crate) fn join_user_namespace(&mut self, container_id: &str) {
+        self.userns = Some(UserNS {
+            nsmode: "container".to_string(),
+            value: Some(container_id.to_string()),
+        });
+        self.idmappings = None;
+    }
+}
+
+pub fn build_isolation_specs(
+    input: IsolationSpecInput<'_>,
+) -> Result<IsolationSpecs, ComputeDriverError> {
+    let base = || {
+        build_base_spec(
+            input.sandbox,
+            input.config,
+            input.token_secret,
+            input.gpu_devices,
+            input.requested_image,
+            input.image_id,
+            input.image_user,
+            input.supervisor_bin,
+            input.tls_secrets,
+        )
+    };
+    let mut workload = base()?;
+    let mut supervisor = base()?;
+    let user = format!("{}:{}", input.identity.uid, input.identity.gid);
+    let channel = crate::isolation::channel_volume_name(&input.sandbox.id);
+
+    workload
+        .labels
+        .insert(crate::isolation::LABEL_ROLE.into(), "sandbox".into());
+    workload.env = BTreeMap::new();
+    workload.unsetenv = input
+        .image_env
+        .iter()
+        .filter_map(|entry| entry.split_once('=').map(|(key, _)| key.to_string()))
+        .collect();
+    workload.command = vec![
+        "--bootstrap".into(),
+        crate::isolation::BOOTSTRAP_PATH.into(),
+    ];
+    workload.user.clone_from(&user);
+    workload.groups = input
+        .identity
+        .supplementary_gids
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    workload.cap_drop = vec!["ALL".into()];
+    workload.cap_add.clear();
+    workload.seccomp_profile_path.clear();
+    workload
+        .sysctl
+        .insert("net.ipv4.ip_unprivileged_port_start".into(), "0".into());
+    workload.netns.nsmode = "none".into();
+    workload.networks.clear();
+    workload.portmappings.clear();
+    workload.hostadd.clear();
+    workload.secret_env.clear();
+    workload.secrets.clear();
+    workload.healthconfig.test = vec!["NONE".into()];
+    workload
+        .mounts
+        .retain(|mount| !trusted_mount(&mount.destination));
+    workload.volumes.push(NamedVolume {
+        name: channel.clone(),
+        dest: crate::isolation::CHANNEL_ROOT.into(),
+        options: vec!["rw".into(), "nocopy".into(), "z".into()],
+    });
+
+    supervisor.name = crate::isolation::supervisor_name(&input.sandbox.id);
+    supervisor
+        .labels
+        .insert(crate::isolation::LABEL_ROLE.into(), "supervisor".into());
+    supervisor.image.clone_from(&input.config.supervisor_image);
+    supervisor.entrypoint = vec!["/openshell-supervisor".into()];
+    supervisor.command.extend([
+        "--topology-backend-name=podman".into(),
+        format!(
+            "--topology-payload-file={}",
+            crate::isolation::TOPOLOGY_PATH
+        ),
+        "--health-socket-path=/run/openshell/supervisor-health.sock".into(),
+    ]);
+    supervisor.env.insert(
+        openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND.into(),
+        "podman".into(),
+    );
+    supervisor.user = user;
+    supervisor.groups = input
+        .identity
+        .supplementary_gids
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    supervisor.cap_drop = vec!["ALL".into()];
+    supervisor.cap_add.clear();
+    supervisor.seccomp_profile_path.clear();
+    supervisor.devices = None;
+    supervisor.image_volumes.clear();
+    supervisor.volumes = vec![NamedVolume {
+        name: channel,
+        dest: crate::isolation::CHANNEL_ROOT.into(),
+        options: vec!["ro".into(), "nocopy".into(), "z".into()],
+    }];
+    supervisor.mounts.retain(|mount| {
+        trusted_mount(&mount.destination)
+            && mount.destination != openshell_core::container_paths::NETNS_MOUNT_ROOT
+    });
+    for destination in ["/run", "/var/log", "/tmp"] {
+        supervisor.mounts.push(Mount {
+            kind: "tmpfs".into(),
+            source: "tmpfs".into(),
+            destination: destination.into(),
+            options: vec![
+                "rw".into(),
+                "nosuid".into(),
+                "nodev".into(),
+                format!("uid={}", input.identity.uid),
+                format!("gid={}", input.identity.gid),
+                "mode=0700".into(),
+                "size=64m".into(),
+            ],
+        });
+    }
+    for secret in &mut supervisor.secrets {
+        secret.uid = input.identity.uid;
+        secret.gid = input.identity.gid;
+    }
+    supervisor.healthconfig.test = vec![
+        "CMD".into(),
+        "/openshell-supervisor".into(),
+        "health".into(),
+        "--socket".into(),
+        "/run/openshell/supervisor-health.sock".into(),
+    ];
+    supervisor.healthconfig.interval =
+        input.config.health_check_interval_secs.max(1) * 1_000_000_000;
+    Ok(IsolationSpecs {
+        workload,
+        supervisor,
+    })
+}
+
+fn trusted_mount(destination: &str) -> bool {
+    matches!(
+        destination,
+        TLS_CA_MOUNT_PATH
+            | TLS_CERT_MOUNT_PATH
+            | TLS_KEY_MOUNT_PATH
+            | PROXY_CA_MOUNT_PATH
+            | PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR
+    ) || destination == openshell_core::container_paths::NETNS_MOUNT_ROOT
 }
 
 fn provider_spiffe_workload_api_socket_env_value(config: &PodmanComputeConfig) -> Option<String> {
@@ -1516,6 +1643,70 @@ mod tests {
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
+    #[test]
+    fn isolated_pair_keeps_privileges_network_and_secrets_out_of_workload() {
+        let sandbox = DriverSandbox {
+            id: "pair".into(),
+            name: "agent".into(),
+            ..Default::default()
+        };
+        let config = PodmanComputeConfig::default();
+        let identity = openshell_isolation_interface::contract::ResolvedWorkloadIdentity::new(
+            1000,
+            1001,
+            vec![2000],
+            "image".into(),
+            "sha256:image".into(),
+        )
+        .unwrap();
+        let env = vec![
+            "LD_PRELOAD=/hostile.so".into(),
+            "HTTP_PROXY=http://bypass".into(),
+        ];
+        let specs = build_isolation_specs(IsolationSpecInput {
+            sandbox: &sandbox,
+            config: &config,
+            token_secret: Some("jwt"),
+            gpu_devices: None,
+            requested_image: "image:latest",
+            image_id: "sha256:image",
+            image_user: "1000:1001",
+            image_env: &env,
+            supervisor_bin: None,
+            tls_secrets: None,
+            identity: &identity,
+        })
+        .unwrap();
+        for spec in [&specs.workload, &specs.supervisor] {
+            assert_eq!(spec.user, "1000:1001");
+            assert_eq!(spec.groups, vec!["2000"]);
+            assert_eq!(spec.cap_drop, vec!["ALL"]);
+            assert!(spec.cap_add.is_empty());
+            assert!(spec.seccomp_profile_path.is_empty());
+            assert!(spec.no_new_privileges);
+        }
+        assert_eq!(specs.workload.netns.nsmode, "none");
+        assert!(specs.workload.networks.is_empty());
+        assert!(specs.workload.portmappings.is_empty());
+        assert!(specs.workload.env.is_empty());
+        assert_eq!(specs.workload.unsetenv, vec!["LD_PRELOAD", "HTTP_PROXY"]);
+        assert!(specs.workload.secrets.is_empty());
+        assert!(
+            specs
+                .workload
+                .mounts
+                .iter()
+                .all(|mount| !trusted_mount(&mount.destination))
+        );
+        assert_eq!(specs.supervisor.secrets.len(), 1);
+        assert_eq!(specs.supervisor.secrets[0].source, "jwt");
+        assert_eq!(specs.supervisor.secrets[0].uid, 1000);
+        assert_eq!(specs.supervisor.volumes.len(), 1);
+        assert!(specs.supervisor.volumes[0].options.contains(&"ro".into()));
+        assert!(specs.supervisor.volumes[0].options.contains(&"z".into()));
+        assert_eq!(specs.supervisor.entrypoint, vec!["/openshell-supervisor"]);
+    }
+
     fn json_struct(value: Value) -> prost_types::Struct {
         let Value::Object(object) = value else {
             panic!("expected JSON object");
@@ -1564,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_applies_resource_limits() {
+    fn container_spec_applies_cpu_and_memory_limits() {
         use openshell_core::proto::compute::v1::{
             DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
         };
@@ -1581,8 +1772,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let mut config = test_config();
-        config.sandbox_pids_limit = std::num::NonZeroI64::new(2048);
+        let config = test_config();
         let spec = build_container_spec(&sandbox, &config);
 
         assert_eq!(
@@ -1594,8 +1784,8 @@ mod tests {
             Some(2 * 1024 * 1024 * 1024)
         );
         assert_eq!(
-            spec["resource_limits"]["pids"]["limit"].as_i64(),
-            Some(2048)
+            spec["resource_limits"]["PidsLimit"].as_i64(),
+            Some(crate::config::DEFAULT_SANDBOX_PIDS_LIMIT)
         );
     }
 
@@ -1603,44 +1793,10 @@ mod tests {
     fn container_spec_can_inherit_runtime_pids_limit() {
         let sandbox = test_sandbox("test-id", "test-name");
         let mut config = test_config();
-        config.sandbox_pids_limit = None;
+        config.sandbox_pids_limit = 0;
         let spec = build_container_spec(&sandbox, &config);
 
-        assert!(spec["resource_limits"].get("pids").is_none());
-    }
-
-    #[test]
-    fn container_spec_uses_podman_apparmor_profile_field() {
-        let sandbox = test_sandbox("test-id", "test-name");
-
-        for (profile, expected) in [
-            (openshell_core::AppArmorProfile::Unconfined, "unconfined"),
-            (
-                openshell_core::AppArmorProfile::Localhost("openshell-supervisor".to_string()),
-                "openshell-supervisor",
-            ),
-        ] {
-            let mut config = test_config();
-            config.app_armor_profile = Some(profile);
-            let spec = build_container_spec(&sandbox, &config);
-
-            assert_eq!(spec["apparmor_profile"].as_str(), Some(expected));
-            assert!(spec.get("security_opt").is_none());
-        }
-    }
-
-    #[test]
-    fn container_spec_omits_podman_apparmor_profile_for_runtime_default() {
-        let sandbox = test_sandbox("test-id", "test-name");
-
-        for profile in [None, Some(openshell_core::AppArmorProfile::RuntimeDefault)] {
-            let mut config = test_config();
-            config.app_armor_profile = profile;
-            let spec = build_container_spec(&sandbox, &config);
-
-            assert!(spec.get("apparmor_profile").is_none());
-            assert!(spec.get("security_opt").is_none());
-        }
+        assert!(spec["resource_limits"].get("PidsLimit").is_none());
     }
 
     #[test]
@@ -1681,7 +1837,8 @@ mod tests {
             container["env"]["OPENSHELL_CONTAINER_IMAGE"].as_str(),
             Some("registry.example/app:latest")
         );
-        assert_eq!(container["user"].as_str(), Some("0:0"));
+        // Only the paired builder materializes the immutable non-root user.
+        assert_eq!(container["user"].as_str(), Some(""));
         assert_eq!(container["image_pull_policy"].as_str(), Some("never"));
         assert_eq!(container["dns_search"], serde_json::json!([]));
         assert_eq!(container["dns_option"], serde_json::json!([]));
@@ -1921,66 +2078,25 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_includes_required_capabilities() {
+    fn container_spec_defaults_drop_capabilities_and_keep_runtime_seccomp() {
         let sandbox = test_sandbox("test-id", "test-name");
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
-
-        let added: Vec<&str> = spec["cap_add"]
-            .as_array()
-            .expect("cap_add should be an array")
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        assert!(added.contains(&"SYS_ADMIN"), "missing SYS_ADMIN");
-        assert!(added.contains(&"NET_ADMIN"), "missing NET_ADMIN");
-        assert!(added.contains(&"SYS_PTRACE"), "missing SYS_PTRACE");
-        assert!(added.contains(&"SYSLOG"), "missing SYSLOG");
-        assert!(
-            added.contains(&"DAC_READ_SEARCH"),
-            "missing DAC_READ_SEARCH"
-        );
-        assert!(added.contains(&"SETPCAP"), "missing SETPCAP");
-        assert!(added.contains(&"KILL"), "missing KILL");
-
-        // SETUID and SETGID are NOT in cap_add — they remain available from the
-        // default bounding set because we no longer use cap_drop:ALL. Verify they
-        // are also not explicitly dropped. Similarly SETPCAP, CHOWN and FOWNER
-        // must not be dropped because child setup clears the bounding set and
-        // prepare_filesystem() calls chown() on newly created read_write
-        // directories before the supervisor drops privileges.
-        let dropped: Vec<&str> = spec["cap_drop"]
-            .as_array()
-            .expect("cap_drop should be an array")
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        assert!(!dropped.contains(&"SETUID"), "SETUID must not be dropped");
-        assert!(!dropped.contains(&"SETGID"), "SETGID must not be dropped");
-        assert!(
-            dropped.contains(&"NET_BIND_SERVICE"),
-            "NET_BIND_SERVICE must stay dropped; policy DNS binds an unprivileged port"
-        );
-        assert!(
-            !dropped.contains(&"CHOWN"),
-            "CHOWN must not be dropped (needed for prepare_filesystem chown)"
-        );
-        assert!(
-            !dropped.contains(&"FOWNER"),
-            "FOWNER must not be dropped (needed for chown on non-owned files)"
-        );
-        assert!(
-            !dropped.contains(&"SETPCAP"),
-            "SETPCAP must not be dropped (needed for child bounding-set clear)"
-        );
-        assert!(
-            !dropped.contains(&"KILL"),
-            "KILL must not be dropped (needed to signal the sandbox workload on shutdown)"
-        );
-        assert!(
-            !dropped.contains(&"ALL"),
-            "must not use cap_drop:ALL in rootless Podman"
-        );
+        let spec = build_base_spec(
+            &sandbox,
+            &config,
+            None,
+            None,
+            "image",
+            "sha256:image",
+            "",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(spec.cap_drop, vec!["ALL"]);
+        assert!(spec.cap_add.is_empty());
+        assert!(spec.seccomp_profile_path.is_empty());
+        assert!(spec.no_new_privileges);
     }
 
     #[test]
@@ -2016,8 +2132,7 @@ mod tests {
     #[test]
     fn container_spec_healthcheck_accepts_supervisor_socket() {
         let sandbox = test_sandbox("test-id", "test-name");
-        let mut config = test_config();
-        config.health_check_interval_secs = std::num::NonZeroU64::new(10);
+        let config = test_config();
         let spec = build_container_spec(&sandbox, &config);
 
         let healthcheck = spec["healthconfig"]["test"]
@@ -2034,17 +2149,10 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_omits_healthcheck_when_disabled() {
-        let sandbox = test_sandbox("test-id", "test-name");
-        let spec = build_container_spec(&sandbox, &test_config());
-        assert!(spec.get("healthconfig").is_none());
-    }
-
-    #[test]
     fn container_spec_healthcheck_interval_from_config() {
         let sandbox = test_sandbox("test-id", "test-name");
         let mut config = test_config();
-        config.health_check_interval_secs = std::num::NonZeroU64::new(30);
+        config.health_check_interval_secs = 30;
         let spec = build_container_spec(&sandbox, &config);
 
         let interval = spec["healthconfig"]["Interval"]
@@ -2470,7 +2578,7 @@ mod tests {
             default_image: "test-image:latest".to_string(),
             grpc_endpoint: "http://localhost:50051".to_string(),
             host_gateway_ip: String::new(),
-            ssh_socket_path: "/run/openshell/test-ssh.sock".to_string(),
+            sandbox_ssh_socket_path: "/run/openshell/test-ssh.sock".to_string(),
             ..PodmanComputeConfig::default()
         }
     }
@@ -2928,6 +3036,27 @@ mod tests {
         let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
 
         assert!(err.to_string().contains("reserved OpenShell path"));
+    }
+
+    #[test]
+    fn user_mounts_cannot_replace_private_channel_hierarchy() {
+        for target in [
+            "/.openshell",
+            "/.openshell/channel",
+            "/.openshell/channel/sandbox",
+            "/.openshell/supervisor",
+        ] {
+            let mount = PodmanDriverMountConfig::Volume {
+                source: "user-owned".into(),
+                target: target.into(),
+                read_only: false,
+                subpath: None,
+            };
+            assert!(
+                validate_podman_driver_mounts(&[mount], false).is_err(),
+                "{target}"
+            );
+        }
     }
 
     #[test]
