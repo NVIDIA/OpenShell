@@ -1155,23 +1155,15 @@ impl BoundaryClient {
         {
             return Ok(session.clone());
         }
-        for attempt in 0..=40 {
-            match self.open_mediation_session().await {
-                Ok(session) => {
-                    *state = Some(session.clone());
-                    return Ok(session);
-                }
-                Err(BackendError::Denied(message))
-                    if message.contains("already active") && attempt < 40 =>
-                {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(BackendError::Unavailable(
-            "boundary mediation retry budget exhausted".to_string(),
-        ))
+        // The boundary owns exclusive-lease retirement and bounds replacement
+        // waiting. Never multiply that deadline with message-matching retries.
+        let session = tokio::time::timeout(REQUEST_TIMEOUT, self.open_mediation_session())
+            .await
+            .map_err(|_| {
+                BackendError::Unavailable("boundary mediation attach timed out".to_string())
+            })??;
+        *state = Some(session.clone());
+        Ok(session)
     }
 
     async fn open_mediation_session(&self) -> Result<Arc<ClientMediationSession>, BackendError> {
@@ -1585,6 +1577,11 @@ mod tests {
                                 kind: crate::boundary_protocol::BoundaryErrorKind::Denied,
                                 message: "control authentication failed".to_string(),
                             }
+                        } else if matches!(envelope.request, Request::OpenMediation) {
+                            Response::Error {
+                                kind: crate::boundary_protocol::BoundaryErrorKind::Denied,
+                                message: "a mediation session is already active".to_string(),
+                            }
                         } else if matches!(envelope.request, Request::Wait { .. }) {
                             Response::Exited {
                                 status: ExitStatusWire::Exited(23),
@@ -1635,6 +1632,48 @@ mod tests {
                     frame[..4].try_into().expect("frame header"),
                 ))
                 .expect("frame length")
+    }
+
+    #[tokio::test]
+    async fn mediation_denial_is_not_retried_or_cached_as_a_session() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let service = TestGrpcBoundary {
+            wait_for_half_close: false,
+            expected_token: "a".repeat(32),
+            requests: requests.clone(),
+        };
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tonic::transport::Server::builder()
+                .add_service(IsolationBoundaryServer::new(service))
+                .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(stream)]))
+                .await
+                .unwrap();
+        });
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let client = BoundaryClient::new(tls_topology(
+            address,
+            test_certificate().client_tls,
+            &"a".repeat(32),
+        ));
+        *client.grpc_channel.lock().await = Some(channel);
+        // A caller may try again later, but each call makes exactly one
+        // bounded attach attempt and preserves the server's typed denial.
+        for expected_requests in 1..=2 {
+            assert!(matches!(
+                client.mediation_session().await,
+                Err(BackendError::Denied(_))
+            ));
+            assert_eq!(requests.load(Ordering::Acquire), expected_requests);
+            assert!(client.mediation.lock().await.is_none());
+        }
+        server.abort();
     }
 
     #[tokio::test]
