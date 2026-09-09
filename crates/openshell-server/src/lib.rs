@@ -1463,7 +1463,7 @@ async fn build_compute_runtime(
         && !driver.is_local_singleplayer(registry)
     {
         warn!(
-            "Gateway configured with non-expiring sandbox JWTs (gateway_jwt.ttl_secs is omitted or zero); set gateway_jwt.ttl_secs > 0 for shared deployments"
+            "Gateway configured with non-expiring sandbox JWTs (gateway_jwt.ttl_secs is omitted); set gateway_jwt.ttl_secs > 0 for shared deployments"
         );
     }
 
@@ -1746,7 +1746,7 @@ mod tests {
     }
 
     fn extension_test_issuer() -> Arc<crate::auth::sandbox_jwt::SandboxJwtIssuer> {
-        extension_test_issuer_with_ttl(Some(Duration::from_secs(900)))
+        extension_test_issuer_with_ttl(Some(Duration::from_mins(15)))
     }
 
     fn extension_test_issuer_with_ttl(
@@ -1767,16 +1767,16 @@ mod tests {
     #[test]
     fn non_expiring_sandbox_tokens_use_finite_extension_ttl() {
         let issuer = extension_test_issuer_with_ttl(None);
-        assert_eq!(extension_token_ttl(&issuer), Duration::from_secs(15 * 60));
+        assert_eq!(extension_token_ttl(&issuer), Duration::from_mins(15));
     }
 
     #[test]
     fn extension_token_ttl_is_capped_at_one_hour() {
-        let issuer = extension_test_issuer_with_ttl(Some(Duration::from_secs(24 * 60 * 60)));
-        assert_eq!(extension_token_ttl(&issuer), Duration::from_secs(60 * 60));
+        let issuer = extension_test_issuer_with_ttl(Some(Duration::from_hours(24)));
+        assert_eq!(extension_token_ttl(&issuer), Duration::from_hours(1));
 
-        let short = extension_test_issuer_with_ttl(Some(Duration::from_secs(5 * 60)));
-        assert_eq!(extension_token_ttl(&short), Duration::from_secs(5 * 60));
+        let short = extension_test_issuer_with_ttl(Some(Duration::from_mins(5)));
+        assert_eq!(extension_token_ttl(&short), Duration::from_mins(5));
     }
 
     #[test]

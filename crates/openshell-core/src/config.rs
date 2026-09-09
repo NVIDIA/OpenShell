@@ -1160,7 +1160,7 @@ mod tests {
         }))
         .expect("gateway JWT config should deserialize with positive ttl");
 
-        assert_eq!(cfg.sandbox_token_ttl(), Some(Duration::from_secs(3600)));
+        assert_eq!(cfg.sandbox_token_ttl(), Some(Duration::from_hours(1)));
         let serialized = serde_json::to_value(&cfg).expect("gateway JWT config serializes");
         assert_eq!(serialized["ttl_secs"], 3600);
     }
