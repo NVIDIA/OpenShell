@@ -54,6 +54,16 @@ health, metrics, or tunnel routes. The plaintext service router also rejects
 browser requests whose Fetch Metadata, Origin, or Referer headers indicate a
 cross-origin or sibling-subdomain request.
 
+Public workspace-scoped RPCs carry a typed `WorkspaceSelector`. A request must
+select one non-empty workspace explicitly; `default` is an ordinary explicit
+name, not an omitted-value fallback. Sandbox, sandbox template, provider, and
+service list RPCs also accept an all-workspaces marker after Platform Admin
+authorization. Single-workspace handlers reject that marker. Platform-global
+policy operations require the selector to be absent, while workspace policy
+operations require it. The gateway authorizes the selected scope before
+performing resource lookup so malformed, unsupported, and unauthorized scopes
+have consistent behavior across resource types.
+
 Docker and Podman report the local address through which their sandboxes can
 reach the gateway. When the primary listener covers that address, the gateway
 reuses it; sandbox JWT authentication and its RPC allowlist remain the callback

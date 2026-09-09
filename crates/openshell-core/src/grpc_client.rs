@@ -28,6 +28,7 @@ use crate::proto::{
     NetworkActivitySummary, PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
     ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest,
     SubmitPolicyAnalysisResponse, UpdateConfigRequest, open_shell_client::OpenShellClient,
+    workspace_selector,
 };
 use crate::sandbox_env;
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -752,7 +753,7 @@ async fn sync_policy_with_client(
         .update_config(UpdateConfigRequest {
             name: sandbox.to_string(),
             policy: Some(policy.clone()),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(workspace_selector(workspace)),
             ..Default::default()
         })
         .await
@@ -1180,7 +1181,7 @@ impl CachedOpenShellClient {
             .get_draft_policy(GetDraftPolicyRequest {
                 name: sandbox_name.to_string(),
                 status_filter: status_filter.to_string(),
-                workspace: self.workspace(),
+                workspace_scope: Some(workspace_selector(self.workspace())),
             })
             .await
             .into_diagnostic()?;

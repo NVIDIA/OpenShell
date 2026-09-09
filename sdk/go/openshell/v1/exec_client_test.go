@@ -40,6 +40,9 @@ func (r *stubSandboxResolver) Create(context.Context, string, string, *SandboxSp
 func (r *stubSandboxResolver) List(context.Context, string, ...ListOptions) ([]*Sandbox, error) {
 	panic("not implemented")
 }
+func (r *stubSandboxResolver) ListAll(context.Context, ...ListOptions) ([]*Sandbox, error) {
+	panic("not implemented")
+}
 func (r *stubSandboxResolver) Delete(context.Context, string, string) error {
 	panic("not implemented")
 }

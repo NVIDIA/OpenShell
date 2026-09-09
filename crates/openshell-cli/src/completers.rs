@@ -39,8 +39,9 @@ pub fn complete_sandbox_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
                 limit: 200,
                 offset: 0,
                 label_selector: String::new(),
-                workspace: workspace_from_args(),
-                all_workspaces: false,
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace_from_args(),
+                )),
             })
             .await
             .ok()?;
@@ -64,8 +65,9 @@ pub fn complete_provider_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
             .list_providers(ListProvidersRequest {
                 limit: 200,
                 offset: 0,
-                workspace: workspace_from_args(),
-                all_workspaces: false,
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace_from_args(),
+                )),
             })
             .await
             .ok()?;

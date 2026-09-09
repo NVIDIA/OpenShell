@@ -37,6 +37,16 @@ _ClientCallDetailsBase = namedtuple(
 _OAUTH_MAX_RESPONSE_BYTES = 1 << 20
 
 
+def _workspace_scope(workspace: str) -> datamodel_pb2.WorkspaceSelector:
+    if not workspace:
+        raise ValueError("workspace must be non-empty")
+    return datamodel_pb2.WorkspaceSelector(workspace=workspace)
+
+
+def _all_workspaces_scope() -> datamodel_pb2.WorkspaceSelector:
+    return datamodel_pb2.WorkspaceSelector(all_workspaces=datamodel_pb2.AllWorkspaces())
+
+
 class _ClientCallDetails(_ClientCallDetailsBase, grpc.ClientCallDetails):
     pass
 
@@ -722,7 +732,7 @@ class SandboxClient:
                 spec=request_spec,
                 name=name or "",
                 labels=dict(labels) if labels else {},
-                workspace=workspace,
+                workspace_scope=_workspace_scope(workspace),
             ),
             timeout=self._timeout,
         )
@@ -748,7 +758,7 @@ class SandboxClient:
                 spec=request_spec,
                 name=name or "",
                 labels=dict(labels) if labels else {},
-                workspace=workspace,
+                workspace_scope=_workspace_scope(workspace),
                 workload_template_name=template_name,
             ),
             timeout=self._timeout,
@@ -795,7 +805,9 @@ class SandboxClient:
 
     def get(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.GetSandbox(
-            openshell_pb2.GetSandboxRequest(name=sandbox_name, workspace=workspace),
+            openshell_pb2.GetSandboxRequest(
+                name=sandbox_name, workspace_scope=_workspace_scope(workspace)
+            ),
             timeout=self._timeout,
         )
         return _sandbox_ref(response.sandbox)
@@ -812,7 +824,7 @@ class SandboxClient:
         label_selector: str | None = None,
     ) -> builtins.list[SandboxRef]:
         request = openshell_pb2.ListSandboxesRequest(
-            workspace=workspace,
+            workspace_scope=_workspace_scope(workspace),
             limit=limit,
             offset=offset,
             label_selector=label_selector or "",
@@ -828,7 +840,7 @@ class SandboxClient:
         label_selector: str | None = None,
     ) -> builtins.list[SandboxRef]:
         request = openshell_pb2.ListSandboxesRequest(
-            all_workspaces=True,
+            workspace_scope=_all_workspaces_scope(),
             limit=limit,
             offset=offset,
             label_selector=label_selector or "",
@@ -872,21 +884,27 @@ class SandboxClient:
 
     def delete(self, sandbox_name: str, *, workspace: str) -> bool:
         response = self._stub.DeleteSandbox(
-            openshell_pb2.DeleteSandboxRequest(name=sandbox_name, workspace=workspace),
+            openshell_pb2.DeleteSandboxRequest(
+                name=sandbox_name, workspace_scope=_workspace_scope(workspace)
+            ),
             timeout=self._timeout,
         )
         return bool(response.deleted)
 
     def stop(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.StopSandbox(
-            openshell_pb2.StopSandboxRequest(name=sandbox_name, workspace=workspace),
+            openshell_pb2.StopSandboxRequest(
+                name=sandbox_name, workspace_scope=_workspace_scope(workspace)
+            ),
             timeout=self._timeout,
         )
         return _sandbox_ref(response.sandbox)
 
     def start(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.StartSandbox(
-            openshell_pb2.StartSandboxRequest(name=sandbox_name, workspace=workspace),
+            openshell_pb2.StartSandboxRequest(
+                name=sandbox_name, workspace_scope=_workspace_scope(workspace)
+            ),
             timeout=self._timeout,
         )
         return _sandbox_ref(response.sandbox)
@@ -1138,7 +1156,7 @@ class SandboxTemplateClient:
 
         response = self._stub.CreateSandboxTemplate(
             openshell_pb2.CreateSandboxTemplateRequest(
-                workspace=workspace,
+                workspace_scope=_workspace_scope(workspace),
                 template=template,
             ),
             timeout=self._timeout,
@@ -1152,7 +1170,9 @@ class SandboxTemplateClient:
         workspace: str,
     ) -> openshell_pb2.SandboxWorkloadTemplate:
         response = self._stub.GetSandboxTemplate(
-            openshell_pb2.GetSandboxTemplateRequest(name=name, workspace=workspace),
+            openshell_pb2.GetSandboxTemplateRequest(
+                name=name, workspace_scope=_workspace_scope(workspace)
+            ),
             timeout=self._timeout,
         )
         return response.template
@@ -1167,7 +1187,7 @@ class SandboxTemplateClient:
     ) -> builtins.list[openshell_pb2.SandboxWorkloadTemplate]:
         response = self._stub.ListSandboxTemplates(
             openshell_pb2.ListSandboxTemplatesRequest(
-                workspace=workspace,
+                workspace_scope=_workspace_scope(workspace),
                 limit=limit,
                 offset=offset,
                 label_selector=label_selector,
@@ -1185,7 +1205,7 @@ class SandboxTemplateClient:
     ) -> builtins.list[openshell_pb2.SandboxWorkloadTemplate]:
         response = self._stub.ListSandboxTemplates(
             openshell_pb2.ListSandboxTemplatesRequest(
-                all_workspaces=True,
+                workspace_scope=_all_workspaces_scope(),
                 limit=limit,
                 offset=offset,
                 label_selector=label_selector,
@@ -1196,7 +1216,9 @@ class SandboxTemplateClient:
 
     def delete(self, name: str, *, workspace: str) -> bool:
         response = self._stub.DeleteSandboxTemplate(
-            openshell_pb2.DeleteSandboxTemplateRequest(name=name, workspace=workspace),
+            openshell_pb2.DeleteSandboxTemplateRequest(
+                name=name, workspace_scope=_workspace_scope(workspace)
+            ),
             timeout=self._timeout,
         )
         return bool(response.deleted)

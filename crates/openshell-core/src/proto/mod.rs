@@ -73,3 +73,19 @@ pub use middleware::v1::*;
 pub use openshell::*;
 pub use sandbox::v1::*;
 pub use test::ObjectForTest;
+
+/// Build a selector for one explicitly named workspace.
+pub fn workspace_selector(workspace: impl Into<String>) -> WorkspaceSelector {
+    WorkspaceSelector {
+        selection: Some(workspace_selector::Selection::Workspace(workspace.into())),
+    }
+}
+
+/// Build a selector for every workspace supported by a cross-workspace request.
+pub fn all_workspaces_selector() -> WorkspaceSelector {
+    WorkspaceSelector {
+        selection: Some(workspace_selector::Selection::AllWorkspaces(
+            AllWorkspaces {},
+        )),
+    }
+}

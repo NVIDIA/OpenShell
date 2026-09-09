@@ -43,6 +43,19 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate as TlsCertificate, Identity, Server, ServerTlsConfig};
 use tonic::{Response, Status};
 
+fn selected_workspace(
+    scope: &Option<openshell_core::proto::datamodel::v1::WorkspaceSelector>,
+) -> Option<&str> {
+    match scope.as_ref()?.selection.as_ref()? {
+        openshell_core::proto::datamodel::v1::workspace_selector::Selection::Workspace(
+            workspace,
+        ) => Some(workspace),
+        openshell_core::proto::datamodel::v1::workspace_selector::Selection::AllWorkspaces(_) => {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct SandboxState {
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
@@ -214,7 +227,9 @@ impl OpenShell for TestOpenShell {
                 .unwrap_or_default(),
             resource_version: 1,
             annotations: HashMap::new(),
-            workspace: request.workspace.clone(),
+            workspace: selected_workspace(&request.workspace_scope)
+                .unwrap_or("default")
+                .to_string(),
             deletion_timestamp_ms: 0,
         });
         self.state
@@ -246,7 +261,9 @@ impl OpenShell for TestOpenShell {
                     labels: HashMap::new(),
                     resource_version: 1,
                     annotations: HashMap::new(),
-                    workspace: request.workspace,
+                    workspace: selected_workspace(&request.workspace_scope)
+                        .unwrap_or("default")
+                        .to_string(),
                     deletion_timestamp_ms: 0,
                 }),
                 spec: None,
@@ -1759,7 +1776,10 @@ async fn sandbox_template_create_sends_workload_template_resource() {
     let request = requests
         .first()
         .expect("template create request should be recorded");
-    assert_eq!(request.workspace, "default");
+    assert_eq!(
+        selected_workspace(&request.workspace_scope),
+        Some("default")
+    );
     let template = request.template.as_ref().expect("template should be sent");
     let metadata = template.metadata.as_ref().expect("metadata should be sent");
     assert_eq!(metadata.name, "gpu-kata");
@@ -1831,15 +1851,20 @@ async fn sandbox_template_list_and_delete_send_workspace_requests() {
     assert_eq!(list_request.limit, 25);
     assert_eq!(list_request.offset, 5);
     assert_eq!(list_request.label_selector, "team=runtime");
-    assert_eq!(list_request.workspace, "default");
-    assert!(!list_request.all_workspaces);
+    assert_eq!(
+        selected_workspace(&list_request.workspace_scope),
+        Some("default")
+    );
 
     let delete_requests = template_delete_requests(&server).await;
     let delete_request = delete_requests
         .first()
         .expect("template delete request should be recorded");
     assert_eq!(delete_request.name, "gpu-kata");
-    assert_eq!(delete_request.workspace, "default");
+    assert_eq!(
+        selected_workspace(&delete_request.workspace_scope),
+        Some("default")
+    );
 }
 
 #[tokio::test]

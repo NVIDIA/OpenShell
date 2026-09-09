@@ -17,5 +17,6 @@ type ServiceInterface interface {
 	Expose(ctx context.Context, workspace, sandboxName, serviceName string, targetPort uint32, domain bool) (*ServiceEndpoint, error)
 	Get(ctx context.Context, workspace, sandboxName, serviceName string) (*ServiceEndpoint, error)
 	List(ctx context.Context, workspace, sandboxName string, opts ...ListOptions) ([]*ServiceEndpoint, error)
+	ListAll(ctx context.Context, opts ...ListOptions) ([]*ServiceEndpoint, error)
 	Delete(ctx context.Context, workspace, sandboxName, serviceName string) error
 }

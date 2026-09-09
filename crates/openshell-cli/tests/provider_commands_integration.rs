@@ -2920,7 +2920,7 @@ async fn provider_create_supports_nvidia_type_with_nvidia_api_key() {
     let response = client
         .get_provider(GetProviderRequest {
             name: "my-nvidia".to_string(),
-            workspace: String::new(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
         })
         .await
         .expect("get provider should succeed")

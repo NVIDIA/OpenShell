@@ -108,7 +108,7 @@ func TestSandboxTemplate_ListAllWorkspaces(t *testing.T) {
 	_, _ = tc.Create(ctx, "default", testSandboxWorkloadTemplate("default-template"))
 	_, _ = tc.Create(ctx, "team-a", testSandboxWorkloadTemplate("team-template"))
 
-	listed, err := tc.List(ctx, "default", types.ListOptions{AllWorkspaces: true})
+	listed, err := tc.ListAll(ctx)
 	require.NoError(t, err)
 	assert.Len(t, listed, 2)
 }

@@ -16,7 +16,7 @@ import * as net from 'node:net';
 import type { MessageInitShape } from '@bufbuild/protobuf';
 import { type CallOptions, type Client, createClient, type Transport } from '@connectrpc/connect';
 import { errorCode, fromConnect, SdkError } from './errors.js';
-import type { Provider } from './gen/datamodel_pb.js';
+import type { Provider, WorkspaceSelectorSchema } from './gen/datamodel_pb.js';
 import type { Sandbox, SandboxWorkloadTemplate, UpdateConfigResponse } from './gen/openshell_pb.js';
 import {
   type ExecSandboxInputSchema,
@@ -86,7 +86,7 @@ export interface Health {
 
 export interface SandboxSpec {
   name?: string;
-  /** Workspace scope. Omit or use an empty string for the gateway default workspace. */
+  /** Workspace name. Omit for `default`; empty strings are invalid. */
   workspace?: string;
   image?: string;
   labels?: Record<string, string>;
@@ -115,7 +115,7 @@ export interface SandboxSpec {
 
 export interface SandboxFromTemplateSpec {
   name?: string;
-  /** Workspace scope. Omit or use an empty string for the gateway default workspace. */
+  /** Workspace name. Omit for `default`; empty strings are invalid. */
   workspace?: string;
   templateName: string;
   labels?: Record<string, string>;
@@ -149,36 +149,37 @@ export interface SandboxWorkloadTemplateProvenance {
   resourceVersion: string;
 }
 
-export interface ListOptions {
+interface PaginationOptions {
   limit?: number;
   offset?: number;
   labelSelector?: string;
-  /** Workspace scope. Omit or use an empty string for the gateway default workspace. */
-  workspace?: string;
-  /** List across all workspaces. Requires platform admin permission. */
-  allWorkspaces?: boolean;
 }
 
+/** Mutually exclusive named/default or all-workspaces list scope. */
+export type WorkspaceListScope =
+  | { workspace?: string; allWorkspaces?: false | undefined }
+  | { workspace?: never; allWorkspaces: true };
+
+export type ListOptions = PaginationOptions & WorkspaceListScope;
+
 export interface SandboxWorkspaceOptions {
-  /** Workspace scope. Omit or use an empty string for the gateway default workspace. */
+  /** Workspace name. Omit for `default`; empty strings are invalid. */
   workspace?: string;
 }
 
 export type SandboxCallOptions = CallOptions & SandboxWorkspaceOptions;
 
 export interface SandboxTemplateWorkspaceOptions {
-  /** Workspace scope. Omit or use an empty string for the gateway default workspace. */
+  /** Workspace name. Omit for `default`; empty strings are invalid. */
   workspace?: string;
 }
 
-export interface SandboxTemplateListOptions extends SandboxTemplateWorkspaceOptions {
+export type SandboxTemplateListOptions = WorkspaceListScope & {
   limit?: number;
   offset?: number;
   /** Optional label selector in key=value comma-separated form. */
   labelSelector?: string;
-  /** List templates across all workspaces. Requires platform admin permission. */
-  allWorkspaces?: boolean;
-}
+};
 
 export interface ExecOptions extends SandboxWorkspaceOptions {
   workdir?: string;
@@ -491,8 +492,18 @@ function versionPin(value: string | undefined): bigint {
 
 const FORWARD_CHUNK = 64 * 1024;
 
-function workspaceOption(options?: SandboxWorkspaceOptions | null): string {
-  return options?.workspace ?? '';
+function workspaceName(options?: SandboxWorkspaceOptions | null): string {
+  const workspace = options?.workspace ?? 'default';
+  if (workspace.trim() === '') throw new SdkError('invalid_config', 'workspace must be non-empty');
+  return workspace;
+}
+
+function workspaceScope(options?: SandboxWorkspaceOptions | null): MessageInitShape<typeof WorkspaceSelectorSchema> {
+  return { selection: { case: 'workspace', value: workspaceName(options) } };
+}
+
+function listWorkspaceScope(options?: WorkspaceListScope | null): MessageInitShape<typeof WorkspaceSelectorSchema> {
+  return options?.allWorkspaces ? { selection: { case: 'allWorkspaces', value: {} } } : workspaceScope(options);
 }
 
 function requestCallOptions(options?: SandboxCallOptions | null): CallOptions | undefined {
@@ -653,7 +664,7 @@ export class SandboxTemplateClient {
     try {
       const resp = await this.grpc.createSandboxTemplate({
         template,
-        workspace: options?.workspace ?? '',
+        workspaceScope: workspaceScope(options),
       });
       return sandboxTemplate(resp.template);
     } catch (e) {
@@ -666,7 +677,7 @@ export class SandboxTemplateClient {
     try {
       const resp = await this.grpc.getSandboxTemplate({
         name,
-        workspace: options?.workspace ?? '',
+        workspaceScope: workspaceScope(options),
       });
       return sandboxTemplate(resp.template);
     } catch (e) {
@@ -676,13 +687,11 @@ export class SandboxTemplateClient {
 
   async list(options?: SandboxTemplateListOptions | null): Promise<SandboxWorkloadTemplate[]> {
     try {
-      const allWorkspaces = options?.allWorkspaces ?? false;
       const resp = await this.grpc.listSandboxTemplates({
         limit: options?.limit ?? 0,
         offset: options?.offset ?? 0,
-        workspace: allWorkspaces ? '' : (options?.workspace ?? ''),
-        allWorkspaces,
         labelSelector: options?.labelSelector ?? '',
+        workspaceScope: listWorkspaceScope(options),
       });
       return resp.templates;
     } catch (e) {
@@ -695,7 +704,7 @@ export class SandboxTemplateClient {
     try {
       const resp = await this.grpc.deleteSandboxTemplate({
         name,
-        workspace: options?.workspace ?? '',
+        workspaceScope: workspaceScope(options),
       });
       return resp.deleted;
     } catch (e) {
@@ -758,7 +767,7 @@ export class SandboxClient {
       const resp = await this.grpc.createSandbox({
         name: spec.name ?? '',
         labels: spec.labels ?? {},
-        workspace: spec.workspace ?? '',
+        workspaceScope: workspaceScope(spec),
         spec: specInit,
       });
       return sandboxRef(resp.sandbox);
@@ -773,7 +782,7 @@ export class SandboxClient {
       const resp = await this.grpc.createSandbox({
         name: spec.name ?? '',
         labels: spec.labels ?? {},
-        workspace: spec.workspace ?? '',
+        workspaceScope: workspaceScope(spec),
         spec: {
           providers: spec.providers ?? [],
           command: spec.command ?? [],
@@ -791,7 +800,7 @@ export class SandboxClient {
   async get(name: string, options?: SandboxCallOptions | null): Promise<SandboxRef> {
     try {
       const resp = await this.grpc.getSandbox(
-        { name, workspace: workspaceOption(options) },
+        { name, workspaceScope: workspaceScope(options) },
         requestCallOptions(options),
       );
       return sandboxRef(resp.sandbox);
@@ -802,13 +811,11 @@ export class SandboxClient {
 
   async list(options?: ListOptions | null): Promise<SandboxRef[]> {
     try {
-      const allWorkspaces = options?.allWorkspaces ?? false;
       const resp = await this.grpc.listSandboxes({
         limit: options?.limit ?? 0,
         offset: options?.offset ?? 0,
         labelSelector: options?.labelSelector ?? '',
-        workspace: allWorkspaces ? '' : (options?.workspace ?? ''),
-        allWorkspaces,
+        workspaceScope: listWorkspaceScope(options),
       });
       return resp.sandboxes.map((s) => sandboxRef(s));
     } catch (e) {
@@ -818,7 +825,7 @@ export class SandboxClient {
 
   async delete(name: string, options?: SandboxWorkspaceOptions | null): Promise<boolean> {
     try {
-      const resp = await this.grpc.deleteSandbox({ name, workspace: workspaceOption(options) });
+      const resp = await this.grpc.deleteSandbox({ name, workspaceScope: workspaceScope(options) });
       return resp.deleted;
     } catch (e) {
       throw fromConnect(e);
@@ -1307,7 +1314,7 @@ export class SandboxClient {
         sandboxName: name,
         providerName: provider,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
-        workspace: workspaceOption(options),
+        workspaceScope: workspaceScope(options),
       });
       return { sandbox: sandboxRef(resp.sandbox), changed: resp.attached };
     } catch (e) {
@@ -1325,7 +1332,7 @@ export class SandboxClient {
         sandboxName: name,
         providerName: provider,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
-        workspace: workspaceOption(options),
+        workspaceScope: workspaceScope(options),
       });
       return { sandbox: sandboxRef(resp.sandbox), changed: resp.detached };
     } catch (e) {
@@ -1335,7 +1342,10 @@ export class SandboxClient {
 
   async listProviders(name: string, options?: SandboxWorkspaceOptions | null): Promise<ProviderRef[]> {
     try {
-      const resp = await this.grpc.listSandboxProviders({ sandboxName: name, workspace: workspaceOption(options) });
+      const resp = await this.grpc.listSandboxProviders({
+        sandboxName: name,
+        workspaceScope: workspaceScope(options),
+      });
       return resp.providers.map((p) => providerRef(p));
     } catch (e) {
       throw fromConnect(e);
@@ -1367,7 +1377,7 @@ export class SandboxClient {
         policy,
         global: false,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
-        workspace: workspaceOption(options),
+        workspaceScope: workspaceScope(options),
       });
       const result = updateConfigResult(resp);
       if (options?.wait)
@@ -1392,7 +1402,7 @@ export class SandboxClient {
         settingKey: key,
         settingValue: value,
         global: false,
-        workspace: workspaceOption(options),
+        workspaceScope: workspaceScope(options),
       });
       return updateConfigResult(resp);
     } catch (e) {

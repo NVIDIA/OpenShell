@@ -1117,6 +1117,8 @@ message PlatformEvent {
 
 // Create sandbox request.
 message CreateSandboxRequest {
+  reserved 5;
+  reserved "workspace";
   SandboxSpec spec = 1;
   // Optional user-supplied sandbox name. When empty the server generates one.
   string name = 2;
@@ -1124,43 +1126,49 @@ message CreateSandboxRequest {
   map<string, string> labels = 3;
   // Optional annotations for the sandbox (non-selector metadata).
   map<string, string> annotations = 4;
-  // Workspace for the sandbox. Empty defaults to "default".
-  string workspace = 5;
   // One-shot launch hint indicating that the creating client will attach to
   // the canonical main process. The supervisor keeps the terminal transport
   // alive until that attachment connects and closes naturally.
   bool await_main_process_attachment = 6;
   // Workspace-scoped SandboxWorkloadTemplate name to resolve at creation time.
   string workload_template_name = 7;
+  // Explicit workspace for the sandbox. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 8;
 }
 
 message CreateSandboxTemplateRequest {
+  reserved 2;
+  reserved "workspace";
   SandboxWorkloadTemplate template = 1;
-  // Workspace for the template. Empty defaults to "default".
-  string workspace = 2;
+  // Explicit workspace for the template. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
 }
 
 message GetSandboxTemplateRequest {
+  reserved 2;
+  reserved "workspace";
   string name = 1;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 2;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
 }
 
 message ListSandboxTemplatesRequest {
+  reserved 3, 4;
+  reserved "workspace", "all_workspaces";
   uint32 limit = 1;
   uint32 offset = 2;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 3;
-  // List across all workspaces. Mutually exclusive with workspace.
-  bool all_workspaces = 4;
   // Optional label selector in key=value comma-separated form.
   string label_selector = 5;
+  // Explicit named or all-workspaces scope.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 6;
 }
 
 message DeleteSandboxTemplateRequest {
+  reserved 2;
+  reserved "workspace";
   string name = 1;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 2;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
 }
 
 message SandboxTemplateResponse {
@@ -1177,15 +1185,17 @@ message DeleteSandboxTemplateResponse {
 
 // Request a gateway-owned staging slot for a local rootfs tar archive.
 message BeginRootfsTarStagingRequest {
-  // Workspace that will own the sandbox created from this archive. Empty
-  // defaults to "default", matching CreateSandboxRequest.workspace.
-  string workspace = 1;
+  reserved 1;
+  reserved "workspace";
   // Base file name of the local archive. The gateway uses it only to name the
   // staged file; path separators and traversal components are rejected.
   string file_name = 2;
   // Size of the local archive in bytes, checked against the driver limit
   // before the gateway allocates a slot.
   uint64 size_bytes = 3;
+  // Explicit workspace that will own the sandbox created from this archive.
+  // The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
 }
 
 // Gateway-issued staging slot.
@@ -1204,34 +1214,40 @@ message BeginRootfsTarStagingResponse {
 
 // Get sandbox request.
 message GetSandboxRequest {
+  reserved 2;
+  reserved "workspace";
   // Sandbox name (canonical lookup key).
   string name = 1;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 2;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
 }
 
 // List sandboxes request.
 message ListSandboxesRequest {
+  reserved 4, 5;
+  reserved "workspace", "all_workspaces";
   uint32 limit = 1;
   uint32 offset = 2;
   // Optional label selector for filtering (format: "key1=value1,key2=value2").
   string label_selector = 3;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 4;
-  // List across all workspaces. Mutually exclusive with workspace.
-  bool all_workspaces = 5;
+  // Explicit named or all-workspaces scope.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 6;
 }
 
 // List providers attached to a sandbox request.
 message ListSandboxProvidersRequest {
+  reserved 2;
+  reserved "workspace";
   // Sandbox name (canonical lookup key).
   string sandbox_name = 1;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 2;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
 }
 
 // Attach provider to sandbox request.
 message AttachSandboxProviderRequest {
+  reserved 4;
+  reserved "workspace";
   // Sandbox name (canonical lookup key).
   string sandbox_name = 1;
   // Provider name to attach.
@@ -1241,12 +1257,14 @@ message AttachSandboxProviderRequest {
   // If non-zero, the server validates that the sandbox's current resource_version
   // matches this value before applying the mutation, returning ABORTED on mismatch.
   uint64 expected_resource_version = 3;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 4;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
 }
 
 // Detach provider from sandbox request.
 message DetachSandboxProviderRequest {
+  reserved 4;
+  reserved "workspace";
   // Sandbox name (canonical lookup key).
   string sandbox_name = 1;
   // Provider name to detach.
@@ -1256,32 +1274,38 @@ message DetachSandboxProviderRequest {
   // If non-zero, the server validates that the sandbox's current resource_version
   // matches this value before applying the mutation, returning ABORTED on mismatch.
   uint64 expected_resource_version = 3;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 4;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
 }
 
 // Delete sandbox request.
 message DeleteSandboxRequest {
+  reserved 2;
+  reserved "workspace";
   // Sandbox name (canonical lookup key).
   string name = 1;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 2;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
 }
 
 // Stop sandbox request.
 message StopSandboxRequest {
+  reserved 2;
+  reserved "workspace";
   // Sandbox name (canonical lookup key).
   string name = 1;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 2;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
 }
 
 // Start sandbox request.
 message StartSandboxRequest {
+  reserved 2;
+  reserved "workspace";
   // Sandbox name (canonical lookup key).
   string name = 1;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 2;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
 }
 
 // Sandbox response.
@@ -1360,6 +1384,8 @@ message CreateSshSessionResponse {
 
 // Request to expose an HTTP service running inside a sandbox.
 message ExposeServiceRequest {
+  reserved 5;
+  reserved "workspace";
   // Sandbox name.
   string sandbox = 1;
   // Service name within the sandbox.
@@ -1368,32 +1394,34 @@ message ExposeServiceRequest {
   uint32 target_port = 3;
   // Whether to print/use the browser-facing service URL.
   bool domain = 4;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 5;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 6;
 }
 
 // Request to fetch an exposed sandbox service endpoint.
 message GetServiceRequest {
+  reserved 3;
+  reserved "workspace";
   // Sandbox name.
   string sandbox = 1;
   // Service name within the sandbox. Empty selects the unnamed endpoint.
   string service = 2;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 3;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
 }
 
 // Request to list exposed sandbox service endpoints.
 message ListServicesRequest {
+  reserved 4, 5;
+  reserved "workspace", "all_workspaces";
   // Optional sandbox name. Empty lists endpoints for all sandboxes.
   string sandbox = 1;
   // Page size. Zero uses the server default.
   uint32 limit = 2;
   // Page offset.
   uint32 offset = 3;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 4;
-  // List across all workspaces. Mutually exclusive with workspace.
-  bool all_workspaces = 5;
+  // Explicit named or all-workspaces scope.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 6;
 }
 
 // Response containing exposed sandbox service endpoints.
@@ -1403,12 +1431,14 @@ message ListServicesResponse {
 
 // Request to delete an exposed sandbox service endpoint.
 message DeleteServiceRequest {
+  reserved 3;
+  reserved "workspace";
   // Sandbox name.
   string sandbox = 1;
   // Service name within the sandbox. Empty selects the unnamed endpoint.
   string service = 2;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 3;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
 }
 
 // Response for deleting an exposed sandbox service endpoint.
@@ -1645,43 +1675,51 @@ message SandboxStreamWarning {
 
 // Create provider request.
 message CreateProviderRequest {
+  reserved 2;
+  reserved "workspace";
   openshell.datamodel.v1.Provider provider = 1;
-  // Workspace for the provider. Empty defaults to "default".
-  string workspace = 2;
+  // Explicit workspace for the provider. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
 }
 
 // Get provider request.
 message GetProviderRequest {
+  reserved 2;
+  reserved "workspace";
   string name = 1;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 2;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
 }
 
 // List providers request.
 message ListProvidersRequest {
+  reserved 3, 4;
+  reserved "workspace", "all_workspaces";
   uint32 limit = 1;
   uint32 offset = 2;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 3;
-  // List across all workspaces. Mutually exclusive with workspace.
-  bool all_workspaces = 4;
+  // Explicit named or all-workspaces scope.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
 }
 
 // Update provider request.
 message UpdateProviderRequest {
+  reserved 3;
+  reserved "workspace";
   openshell.datamodel.v1.Provider provider = 1;
   // Optional per-credential expiry timestamps to merge into the provider.
   // A zero value removes the expiry for that credential.
   map<string, int64> credential_expires_at_ms = 2;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 3;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
 }
 
 // Delete provider request.
 message DeleteProviderRequest {
+  reserved 2;
+  reserved "workspace";
   string name = 1;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 2;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
 }
 
 // Provider response.
@@ -1942,10 +1980,12 @@ message StoredRefreshMaterialDeletion {
 }
 
 message GetProviderRefreshStatusRequest {
+  reserved 3;
+  reserved "workspace";
   string provider = 1;
   string credential_key = 2;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 3;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
 }
 
 message GetProviderRefreshStatusResponse {
@@ -1953,6 +1993,8 @@ message GetProviderRefreshStatusResponse {
 }
 
 message ConfigureProviderRefreshRequest {
+  reserved 7;
+  reserved "workspace";
   string provider = 1;
   string credential_key = 2;
   ProviderCredentialRefreshStrategy strategy = 3;
@@ -1962,8 +2004,8 @@ message ConfigureProviderRefreshRequest {
   // the authoritative provider profile and refresh strategy.
   repeated string secret_material_keys = 5;
   optional int64 expires_at_ms = 6;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 7;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 8;
 }
 
 message ConfigureProviderRefreshResponse {
@@ -1971,10 +2013,12 @@ message ConfigureProviderRefreshResponse {
 }
 
 message RotateProviderCredentialRequest {
+  reserved 3;
+  reserved "workspace";
   string provider = 1;
   string credential_key = 2;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 3;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
 }
 
 message RotateProviderCredentialResponse {
@@ -1982,10 +2026,12 @@ message RotateProviderCredentialResponse {
 }
 
 message DeleteProviderRefreshRequest {
+  reserved 3;
+  reserved "workspace";
   string provider = 1;
   string credential_key = 2;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 3;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
 }
 
 message DeleteProviderRefreshResponse {
@@ -2195,6 +2241,8 @@ message ExchangeProviderSubjectTokenResponse {
 
 // Update sandbox policy request.
 message UpdateConfigRequest {
+  reserved 10;
+  reserved "workspace";
   // Sandbox name (canonical lookup key). Required for sandbox-scoped updates.
   // Not required when `global=true`.
   string name = 1;
@@ -2231,8 +2279,9 @@ message UpdateConfigRequest {
   // sandbox metadata as a convenience projection. For setting-only updates, it
   // only merges them into sandbox metadata.
   map<string, string> annotations = 9;
-  // Workspace scope. Empty defaults to "default". Ignored for global-scoped updates.
-  string workspace = 10;
+  // Explicit workspace scope for sandbox-scoped updates. Omit only when
+  // `global` is true; the all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 11;
 }
 
 message PolicyMergeOperation {
@@ -2294,14 +2343,17 @@ message UpdateConfigResponse {
 
 // Get sandbox policy status request.
 message GetSandboxPolicyStatusRequest {
+  reserved 4;
+  reserved "workspace";
   // Sandbox name (canonical lookup key). Ignored when global is true.
   string name = 1;
   // The specific policy version to query. 0 means latest.
   uint32 version = 2;
   // Query global policy revisions instead of a sandbox-scoped one.
   bool global = 3;
-  // Workspace scope. Empty defaults to "default". Ignored when global is true.
-  string workspace = 4;
+  // Explicit workspace scope for sandbox-scoped queries. Omit only when
+  // `global` is true; the all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
 }
 
 // Get sandbox policy status response.
@@ -2314,14 +2366,17 @@ message GetSandboxPolicyStatusResponse {
 
 // List sandbox policies request.
 message ListSandboxPoliciesRequest {
+  reserved 5;
+  reserved "workspace";
   // Sandbox name (canonical lookup key). Ignored when global is true.
   string name = 1;
   uint32 limit = 2;
   uint32 offset = 3;
   // List global policy revisions instead of sandbox-scoped ones.
   bool global = 4;
-  // Workspace scope. Empty defaults to "default". Ignored when global is true.
-  string workspace = 5;
+  // Explicit workspace scope for sandbox-scoped queries. Omit only when
+  // `global` is true; the all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 6;
 }
 
 // List sandbox policies response.
@@ -2392,6 +2447,8 @@ enum PolicyStatus {
 
 // Get sandbox logs request (one-shot fetch).
 message GetSandboxLogsRequest {
+  reserved 6;
+  reserved "workspace";
   // Sandbox id.
   string sandbox_id = 1;
   // Maximum number of log lines to return. 0 means use default (2000).
@@ -2402,8 +2459,8 @@ message GetSandboxLogsRequest {
   repeated string sources = 4;
   // Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
   string min_level = 5;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 6;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 7;
 }
 
 // Batch of log lines pushed from sandbox to server.
@@ -2756,12 +2813,14 @@ message SubmitPolicyAnalysisResponse {
 
 // Get draft policy for a sandbox.
 message GetDraftPolicyRequest {
+  reserved 3;
+  reserved "workspace";
   // Sandbox name.
   string name = 1;
   // Optional status filter: "pending", "approved", "rejected", or "" for all.
   string status_filter = 2;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 3;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
 }
 
 message GetDraftPolicyResponse {
@@ -2777,15 +2836,17 @@ message GetDraftPolicyResponse {
 
 // Approve a single draft chunk.
 message ApproveDraftChunkRequest {
+  reserved 3;
+  reserved "workspace";
   // Sandbox name.
   string name = 1;
   // Chunk ID to approve.
   string chunk_id = 2;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 3;
   // Token returned with the reviewed PolicyChunk. Approval fails with
   // FAILED_PRECONDITION if live decision inputs no longer match it.
   string review_token = 4;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
 }
 
 message ApproveDraftChunkResponse {
@@ -2797,14 +2858,16 @@ message ApproveDraftChunkResponse {
 
 // Reject a single draft chunk.
 message RejectDraftChunkRequest {
+  reserved 4;
+  reserved "workspace";
   // Sandbox name.
   string name = 1;
   // Chunk ID to reject.
   string chunk_id = 2;
   // Optional reason for rejection (fed to LLM context in future analysis).
   string reason = 3;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 4;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
 }
 
 message RejectDraftChunkResponse {}
@@ -2816,15 +2879,17 @@ message DraftChunkApproval {
 }
 
 message ApproveAllDraftChunksRequest {
+  reserved 3;
+  reserved "workspace";
   // Sandbox name.
   string name = 1;
   // Include chunks with security_notes (default false: skips them).
   bool include_security_flagged = 2;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 3;
   // Exact reviewed chunks and tokens. The server validates them against one
   // live snapshot, stages compatible operations in order, and writes once.
   repeated DraftChunkApproval approvals = 4;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
 }
 
 message ApproveAllDraftChunksResponse {
@@ -2841,26 +2906,30 @@ message ApproveAllDraftChunksResponse {
 
 // Edit a pending chunk in-place.
 message EditDraftChunkRequest {
+  reserved 4;
+  reserved "workspace";
   // Sandbox name.
   string name = 1;
   // Chunk ID to edit.
   string chunk_id = 2;
   // The modified rule (replaces existing proposed_rule).
   openshell.sandbox.v1.NetworkPolicyRule proposed_rule = 3;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 4;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
 }
 
 message EditDraftChunkResponse {}
 
 // Reverse an approval (remove merged rule from active policy).
 message UndoDraftChunkRequest {
+  reserved 3;
+  reserved "workspace";
   // Sandbox name.
   string name = 1;
   // Chunk ID to undo.
   string chunk_id = 2;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 3;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 4;
 }
 
 message UndoDraftChunkResponse {
@@ -2872,10 +2941,12 @@ message UndoDraftChunkResponse {
 
 // Clear all pending draft chunks for a sandbox.
 message ClearDraftChunksRequest {
+  reserved 2;
+  reserved "workspace";
   // Sandbox name.
   string name = 1;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 2;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
 }
 
 message ClearDraftChunksResponse {
@@ -2885,10 +2956,12 @@ message ClearDraftChunksResponse {
 
 // Get decision history for a sandbox's draft policy.
 message GetDraftHistoryRequest {
+  reserved 2;
+  reserved "workspace";
   // Sandbox name.
   string name = 1;
-  // Workspace scope. Empty defaults to "default".
-  string workspace = 2;
+  // Explicit workspace scope. The all-workspaces selection is invalid.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
 }
 
 message DraftHistoryEntry {

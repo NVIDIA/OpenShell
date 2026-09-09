@@ -43,6 +43,7 @@ export type {
   SshSession,
   UpdateConfigResult,
   WaitOptions,
+  WorkspaceListScope,
 } from './client.js';
 export { errorCode, OpenShellClient, SandboxClient, SandboxTemplateClient } from './client.js';
 export type { SdkErrorCode } from './errors.js';

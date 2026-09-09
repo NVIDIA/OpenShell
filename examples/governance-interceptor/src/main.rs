@@ -1233,8 +1233,7 @@ async fn propagate_policy_to_running_sandboxes(
                 limit,
                 offset,
                 label_selector: String::new(),
-                workspace: String::new(),
-                all_workspaces: true,
+                workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
             })
             .await
             .map_err(|status| format!("list sandboxes failed: {status}"))?
@@ -1257,6 +1256,7 @@ async fn propagate_policy_to_running_sandboxes(
                     policy: Some(policy_state.policy_proto.clone()),
                     annotations: policy_update_annotations(policy_state, &correlation_id),
                     expected_resource_version: resource_version,
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                     ..Default::default()
                 })
                 .await;

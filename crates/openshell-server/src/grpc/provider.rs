@@ -2350,7 +2350,10 @@ use std::sync::{Arc, LazyLock, RwLock};
 use tonic::{Request, Response};
 
 use crate::auth::principal::Principal;
-use crate::auth::workspace_authz::{MinWorkspaceRole, authorize_workspace, require_platform_admin};
+use crate::auth::workspace_authz::{
+    AuthorizedWorkspaceScope, MinWorkspaceRole, authorize_list_workspace_selector,
+    authorize_workspace, authorize_workspace_selector, require_platform_admin,
+};
 use openshell_core::oauth::{
     self, TokenExchangeParams, effective_client_assertion_type, effective_token_type,
 };
@@ -2468,11 +2471,11 @@ pub(super) async fn handle_create_provider(
 ) -> Result<Response<ProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &req.workspace,
+        req.workspace_scope.as_ref(),
         MinWorkspaceRole::Admin,
     )
     .await?;
@@ -2542,11 +2545,11 @@ pub(super) async fn handle_get_provider(
 ) -> Result<Response<ProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &req.workspace,
+        req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
@@ -2566,15 +2569,17 @@ pub(super) async fn handle_list_providers(
 ) -> Result<Response<ListProvidersResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    if request.all_workspaces && !request.workspace.is_empty() {
-        return Err(Status::invalid_argument(
-            "all_workspaces and workspace are mutually exclusive",
-        ));
-    }
     let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
 
-    let providers = if request.all_workspaces {
-        require_platform_admin(&state.admin_role, &principal)?;
+    let scope = authorize_list_workspace_selector(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        request.workspace_scope.as_ref(),
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let providers = if matches!(scope, AuthorizedWorkspaceScope::AllWorkspaces) {
         let all: Vec<Provider> = state
             .store
             .list_all_messages(limit, request.offset)
@@ -2582,14 +2587,9 @@ pub(super) async fn handle_list_providers(
             .map_err(|e| Status::internal(format!("list providers failed: {e}")))?;
         all.into_iter().map(redact_provider_credentials).collect()
     } else {
-        let authz = authorize_workspace(
-            &state.store,
-            &state.admin_role,
-            &principal,
-            &request.workspace,
-            MinWorkspaceRole::User,
-        )
-        .await?;
+        let AuthorizedWorkspaceScope::Workspace(authz) = scope else {
+            unreachable!("all-workspaces scope handled above")
+        };
         let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
             .await?
             .name;
@@ -3697,11 +3697,11 @@ pub(super) async fn handle_update_provider(
 ) -> Result<Response<ProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &req.workspace,
+        req.workspace_scope.as_ref(),
         MinWorkspaceRole::Admin,
     )
     .await?;
@@ -4228,11 +4228,11 @@ pub(super) async fn handle_get_provider_refresh_status(
 ) -> Result<Response<GetProviderRefreshStatusResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &request.workspace,
+        request.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
@@ -4281,11 +4281,11 @@ pub(super) async fn handle_configure_provider_refresh(
 ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &request.workspace,
+        request.workspace_scope.as_ref(),
         MinWorkspaceRole::Admin,
     )
     .await?;
@@ -4678,11 +4678,11 @@ pub(super) async fn handle_rotate_provider_credential(
 ) -> Result<Response<RotateProviderCredentialResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &request.workspace,
+        request.workspace_scope.as_ref(),
         MinWorkspaceRole::Admin,
     )
     .await?;
@@ -4748,11 +4748,11 @@ pub(super) async fn handle_delete_provider_refresh(
 ) -> Result<Response<DeleteProviderRefreshResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &request.workspace,
+        request.workspace_scope.as_ref(),
         MinWorkspaceRole::Admin,
     )
     .await?;
@@ -4826,11 +4826,11 @@ pub(super) async fn handle_delete_provider(
 ) -> Result<Response<DeleteProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &req.workspace,
+        req.workspace_scope.as_ref(),
         MinWorkspaceRole::Admin,
     )
     .await?;
@@ -6569,7 +6569,9 @@ mod tests {
                 sandbox_name: "sandbox-custom".to_string(),
                 provider_name: "custom-provider".to_string(),
                 expected_resource_version: 0,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -6664,7 +6666,9 @@ mod tests {
                 // credential storage by omitting this advisory list.
                 secret_material_keys: Vec::new(),
                 expires_at_ms: Some(expires_at_ms),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -6679,7 +6683,9 @@ mod tests {
             authed_request(GetProviderRefreshStatusRequest {
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -6746,7 +6752,9 @@ mod tests {
                 ]),
                 secret_material_keys: vec!["client_secret".to_string()],
                 expires_at_ms: Some(expires_at_ms),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -6771,7 +6779,9 @@ mod tests {
             authed_request(DeleteProviderRefreshRequest {
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -6785,7 +6795,9 @@ mod tests {
             authed_request(GetProviderRefreshStatusRequest {
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -6837,7 +6849,9 @@ mod tests {
             ]),
             secret_material_keys: vec!["client_secret".to_string()],
             expires_at_ms: None,
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
         };
         handle_configure_provider_refresh(&state, authed_request(request("original-secret")))
             .await
@@ -6957,7 +6971,9 @@ mod tests {
             ]),
             secret_material_keys: vec!["client_secret".to_string()],
             expires_at_ms: None,
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
         };
         let (first_store_hit, release_first_store) = first_state.credentials.gate_next_store();
 
@@ -7082,7 +7098,9 @@ mod tests {
                 material: HashMap::new(),
                 secret_material_keys: Vec::new(),
                 expires_at_ms: Some(expires_at_ms),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -7157,7 +7175,9 @@ mod tests {
             authed_request(DeleteProviderRefreshRequest {
                 provider: "provider-a".to_string(),
                 credential_key: "REFRESH_TOKEN".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -7226,7 +7246,9 @@ mod tests {
                 ]),
                 secret_material_keys: vec!["private_key".to_string()],
                 expires_at_ms: None,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -7292,7 +7314,9 @@ mod tests {
                 ]),
                 secret_material_keys: vec!["client_secret".to_string()],
                 expires_at_ms: Some(refresh_expires_at_ms),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -7332,7 +7356,9 @@ mod tests {
             authed_request(DeleteProviderRefreshRequest {
                 provider: "msgraph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -7395,7 +7421,9 @@ mod tests {
                 )]),
                 secret_material_keys: Vec::new(),
                 expires_at_ms: Some(refresh_expires_at_ms),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -7438,7 +7466,9 @@ mod tests {
             authed_request(DeleteProviderRefreshRequest {
                 provider: "aws-delete".to_string(),
                 credential_key: "AWS_ACCESS_KEY_ID".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -7616,7 +7646,9 @@ mod tests {
                 ]),
                 secret_material_keys: vec!["client_secret".to_string()],
                 expires_at_ms: None,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -7696,7 +7728,9 @@ mod tests {
                 ]),
                 secret_material_keys: vec!["client_secret".to_string()],
                 expires_at_ms: None,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -7715,7 +7749,9 @@ mod tests {
                 ]),
                 secret_material_keys: vec!["client_secret".to_string()],
                 expires_at_ms: None,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -7778,7 +7814,9 @@ mod tests {
                 ]),
                 secret_material_keys: vec!["client_secret".to_string()],
                 expires_at_ms: None,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -7795,7 +7833,9 @@ mod tests {
                 material: HashMap::from([("tenant_id".to_string(), "tenant".to_string())]),
                 secret_material_keys: vec!["client_secret".to_string()],
                 expires_at_ms: None,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -7849,7 +7889,9 @@ mod tests {
                     material: HashMap::new(),
                     secret_material_keys: Vec::new(),
                     expires_at_ms: None,
-                    workspace: "default".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
                 }),
             )
             .await
@@ -7972,7 +8014,9 @@ mod tests {
                 &task_state,
                 authed_request(CreateProviderRequest {
                     provider: Some(provider),
-                    workspace: "default".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
                 }),
             )
             .await
@@ -8406,7 +8450,9 @@ mod tests {
                     "openai",
                     "OPENAI_API_KEY",
                 )),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -8423,7 +8469,9 @@ mod tests {
             &state,
             authed_request(CreateProviderRequest {
                 provider: Some(provider_with_values("legacy-gitlab", "gitlab")),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -8452,7 +8500,9 @@ mod tests {
                     profile_workspace: "default".to_string(),
                     ..Default::default()
                 }),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -8494,7 +8544,9 @@ mod tests {
                     profile_workspace: "default".to_string(),
                     ..Default::default()
                 }),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -8550,7 +8602,9 @@ mod tests {
                     "GITHUB_TOKEN",
                     "test-token",
                 )),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -8596,7 +8650,9 @@ mod tests {
                     "OPENAI_API_KEY",
                     "sk-test",
                 )),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -8711,7 +8767,9 @@ mod tests {
                     "subject_token",
                     "test-token",
                 )),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -8747,7 +8805,9 @@ mod tests {
                     "OPENAI_API_KEY",
                 )),
                 credential_expires_at_ms: HashMap::new(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -9709,7 +9769,9 @@ mod tests {
             ]),
             secret_material_keys: vec!["client_secret".to_string()],
             expires_at_ms: None,
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
         };
         handle_configure_provider_refresh(&state, authed_request(configure()))
             .await
@@ -9774,7 +9836,9 @@ mod tests {
                         ..Default::default()
                     }),
                     credential_expires_at_ms: HashMap::new(),
-                    workspace: "default".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
                 }),
             )
             .await
@@ -11588,7 +11652,9 @@ mod tests {
                     "OPENAI_API_KEY",
                     "sk-test",
                 )),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -11612,7 +11678,9 @@ mod tests {
             authed_request(UpdateProviderRequest {
                 provider: Some(update),
                 credential_expires_at_ms: HashMap::new(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -11634,7 +11702,9 @@ mod tests {
                     "OPENAI_API_KEY",
                     "sk-test",
                 )),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -11657,7 +11727,9 @@ mod tests {
             authed_request(UpdateProviderRequest {
                 provider: Some(update),
                 credential_expires_at_ms: HashMap::new(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -11679,7 +11751,9 @@ mod tests {
             &state,
             authed_request(CreateProviderRequest {
                 provider: Some(provider.clone()),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -11708,7 +11782,9 @@ mod tests {
             authed_request(UpdateProviderRequest {
                 provider: Some(updated_provider.clone()),
                 credential_expires_at_ms: HashMap::new(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -11745,7 +11821,9 @@ mod tests {
             &state,
             authed_request(CreateProviderRequest {
                 provider: Some(provider.clone()),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -11774,7 +11852,9 @@ mod tests {
             authed_request(UpdateProviderRequest {
                 provider: Some(stale_provider),
                 credential_expires_at_ms: HashMap::new(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -11823,7 +11903,9 @@ mod tests {
                     "OPENAI_API_KEY",
                     "sk-first",
                 )),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -11847,7 +11929,9 @@ mod tests {
             authed_request(UpdateProviderRequest {
                 provider: Some(stale_provider),
                 credential_expires_at_ms: HashMap::new(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -11887,7 +11971,9 @@ mod tests {
             &state,
             authed_request(CreateProviderRequest {
                 provider: Some(provider.clone()),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -11919,7 +12005,9 @@ mod tests {
                     authed_request(UpdateProviderRequest {
                         provider: Some(updated),
                         credential_expires_at_ms: HashMap::new(),
-                        workspace: "default".to_string(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector(
+                            "default".to_string(),
+                        )),
                     }),
                 )
                 .await
@@ -12013,7 +12101,9 @@ mod tests {
                 )]),
                 secret_material_keys: Vec::new(),
                 expires_at_ms: None,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -12075,7 +12165,9 @@ mod tests {
                 ]),
                 secret_material_keys: Vec::new(),
                 expires_at_ms: None,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -12149,7 +12241,9 @@ mod tests {
                 ]),
                 secret_material_keys: Vec::new(),
                 expires_at_ms: None,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -12205,7 +12299,9 @@ mod tests {
                 ]),
                 secret_material_keys: vec!["aws_session_token".to_string()],
                 expires_at_ms: None,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -12255,7 +12351,9 @@ mod tests {
                 )]),
                 secret_material_keys: Vec::new(),
                 expires_at_ms: None,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -12333,7 +12431,9 @@ mod tests {
                 )]),
                 secret_material_keys: Vec::new(),
                 expires_at_ms: None,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -12357,7 +12457,9 @@ mod tests {
                             ..Default::default()
                         }),
                         credential_expires_at_ms: HashMap::new(),
-                        workspace: "default".to_string(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector(
+                            "default".to_string(),
+                        )),
                     }),
                 )
                 .await
@@ -12423,7 +12525,9 @@ mod tests {
                 )]),
                 secret_material_keys: Vec::new(),
                 expires_at_ms: None,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -12475,7 +12579,9 @@ mod tests {
                 )]),
                 secret_material_keys: Vec::new(),
                 expires_at_ms: None,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -12653,7 +12759,9 @@ mod tests {
                 )]),
                 secret_material_keys: Vec::new(),
                 expires_at_ms: None,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -12728,7 +12836,9 @@ mod tests {
                 )]),
                 secret_material_keys: Vec::new(),
                 expires_at_ms: None,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             })
         };
 
@@ -12931,12 +13041,14 @@ mod tests {
                         labels: HashMap::new(),
                         resource_version: 0,
                         annotations: HashMap::new(),
-                        workspace: String::new(),
+                        workspace: "default".to_string(),
                         deletion_timestamp_ms: 0,
                     });
                     p
                 }),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -12961,12 +13073,14 @@ mod tests {
                         labels: HashMap::new(),
                         resource_version: 0,
                         annotations: HashMap::new(),
-                        workspace: String::new(),
+                        workspace: "default".to_string(),
                         deletion_timestamp_ms: 0,
                     });
                     p
                 }),
-                workspace: "beta".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "beta".to_string(),
+                )),
             }),
         )
         .await
@@ -12986,7 +13100,9 @@ mod tests {
             &state,
             authed_request(GetProviderRequest {
                 name: "shared-name".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -12998,7 +13114,9 @@ mod tests {
             &state,
             authed_request(GetProviderRequest {
                 name: "shared-name".to_string(),
-                workspace: "beta".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "beta".to_string(),
+                )),
             }),
         )
         .await
@@ -13012,8 +13130,9 @@ mod tests {
             authed_request(ListProvidersRequest {
                 limit: 100,
                 offset: 0,
-                workspace: "default".to_string(),
-                all_workspaces: false,
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -13027,8 +13146,9 @@ mod tests {
             authed_request(ListProvidersRequest {
                 limit: 100,
                 offset: 0,
-                workspace: "beta".to_string(),
-                all_workspaces: false,
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "beta".to_string(),
+                )),
             }),
         )
         .await
@@ -13042,7 +13162,9 @@ mod tests {
             &state,
             authed_request(DeleteProviderRequest {
                 name: "shared-name".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -13055,8 +13177,9 @@ mod tests {
             authed_request(ListProvidersRequest {
                 limit: 100,
                 offset: 0,
-                workspace: "default".to_string(),
-                all_workspaces: false,
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -13068,7 +13191,9 @@ mod tests {
             &state,
             authed_request(GetProviderRequest {
                 name: "shared-name".to_string(),
-                workspace: "beta".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "beta".to_string(),
+                )),
             }),
         )
         .await
@@ -13090,12 +13215,14 @@ mod tests {
                         labels: HashMap::new(),
                         resource_version: 0,
                         annotations: HashMap::new(),
-                        workspace: String::new(),
+                        workspace: "default".to_string(),
                         deletion_timestamp_ms: 0,
                     });
                     p
                 }),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -13106,28 +13233,13 @@ mod tests {
             authed_request(ListProvidersRequest {
                 limit: 100,
                 offset: 0,
-                workspace: String::new(),
-                all_workspaces: true,
+                workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
             }),
         )
         .await
         .unwrap()
         .into_inner();
         assert_eq!(listed.providers.len(), 2);
-
-        // all_workspaces with non-empty workspace is rejected.
-        let err = handle_list_providers(
-            &state,
-            authed_request(ListProvidersRequest {
-                limit: 100,
-                offset: 0,
-                workspace: "default".to_string(),
-                all_workspaces: true,
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.code(), Code::InvalidArgument);
     }
 
     #[tokio::test]
@@ -13939,7 +14051,7 @@ mod tests {
         let err = handle_create_provider(
             &state,
             non_member_request(CreateProviderRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
         )
@@ -13954,7 +14066,7 @@ mod tests {
         let err = handle_get_provider(
             &state,
             non_member_request(GetProviderRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
         )
@@ -13969,7 +14081,7 @@ mod tests {
         let err = handle_list_providers(
             &state,
             non_member_request(ListProvidersRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
         )
@@ -13984,7 +14096,7 @@ mod tests {
         let err = handle_update_provider(
             &state,
             non_member_request(UpdateProviderRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
         )
@@ -13999,7 +14111,7 @@ mod tests {
         let err = handle_get_provider_refresh_status(
             &state,
             non_member_request(GetProviderRefreshStatusRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
         )
@@ -14014,7 +14126,7 @@ mod tests {
         let err = handle_configure_provider_refresh(
             &state,
             non_member_request(ConfigureProviderRefreshRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
         )
@@ -14029,7 +14141,7 @@ mod tests {
         let err = handle_rotate_provider_credential(
             &state,
             non_member_request(RotateProviderCredentialRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
         )
@@ -14044,7 +14156,7 @@ mod tests {
         let err = handle_delete_provider_refresh(
             &state,
             non_member_request(DeleteProviderRefreshRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
         )
@@ -14059,7 +14171,7 @@ mod tests {
         let err = handle_delete_provider(
             &state,
             non_member_request(DeleteProviderRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
         )
