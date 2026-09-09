@@ -274,7 +274,7 @@ impl NetworkBroker {
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "DNS broker queue closed"))
     }
 
-    #[cfg(any(test, feature = "perf-harness"))]
+    #[cfg(test)]
     pub(crate) fn dns_address(&self) -> SocketAddr {
         self.dns_address
     }
