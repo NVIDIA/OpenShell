@@ -7,7 +7,7 @@ package openshell.isolation.v1;
 
 // IsolationBoundary multiplexes the protected sandbox-to-supervisor protocol
 // over one authenticated gRPC connection. Each Exchange call is an independent
-// HTTP/2 stream; Mediate is the persistent DNS and UDP data plane.
+// HTTP/2 stream; Mediate is the persistent DNS exchange channel.
 service IsolationBoundary {
   rpc Exchange(stream BoundaryChunk) returns (stream BoundaryChunk);
   rpc Mediate(stream BoundaryChunk) returns (stream BoundaryChunk);
