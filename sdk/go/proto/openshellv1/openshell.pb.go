@@ -10982,6 +10982,7 @@ type SupervisorHello struct {
 	// Supervisor instance ID (e.g. boot id or process epoch).
 	InstanceId string `protobuf:"bytes,2,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
 	// Exact internal stream protocol revision implemented by this supervisor.
+	// Zero identifies a supervisor built before the handshake existed.
 	ProtocolRevision uint32 `protobuf:"varint,3,opt,name=protocol_revision,json=protocolRevision,proto3" json:"protocol_revision,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
