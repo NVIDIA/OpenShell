@@ -172,7 +172,10 @@ struct RawEtwEvent {
 unsafe impl Send for RawEtwEvent {}
 
 /// A decoded ETW event, independent of OCSF and the driver registry.
-#[derive(Debug, Clone)]
+///
+/// Do not derive `Debug`: properties can contain raw command-line secrets. Use
+/// [`DecodedEtwEvent::summary`] for sanitized diagnostic output.
+#[derive(Clone)]
 pub(crate) struct DecodedEtwEvent {
     /// Provider that emitted the event.
     pub provider: GUID,
@@ -225,12 +228,25 @@ impl DecodedEtwEvent {
     }
 
     /// Compact `name { k=v, k=v }` rendering for debug logging.
+    ///
+    /// Sensitive property values are redacted here so every logging path,
+    /// including pending-buffer eviction, is safe by construction.
     pub fn summary(&self) -> String {
         let name = self.event_name.as_deref().unwrap_or("<unnamed>");
         if self.props.is_empty() {
             format!("{name} (id={})", self.event_id)
         } else {
-            let joined: Vec<String> = self.props.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            let joined: Vec<String> = self
+                .props
+                .iter()
+                .map(|(key, value)| {
+                    if key.eq_ignore_ascii_case("commandLine") {
+                        format!("{key}=[REDACTED]")
+                    } else {
+                        format!("{key}={value}")
+                    }
+                })
+                .collect();
             format!("{name} (id={}) {{ {} }}", self.event_id, joined.join(", "))
         }
     }
@@ -2040,6 +2056,25 @@ mod tests {
             process_event.base.message.as_deref(),
             Some("MXC sandbox launched process: tool (cwd: C:\\work\\openshell)")
         );
+    }
+
+    #[test]
+    fn decoded_event_summary_redacts_command_line() {
+        const SECRET: &str = "secret-value";
+        let mut ev = mk_event(4242, "CreateProcessInSandbox");
+        ev.props.extend([
+            ("commandLine".into(), format!(r#""tool --token {SECRET}""#)),
+            ("currentDirectory".into(), r#""C:\work\openshell""#.into()),
+        ]);
+
+        let summary = ev.summary();
+
+        assert!(
+            !summary.contains(SECRET),
+            "debug summary leaked an argument"
+        );
+        assert!(summary.contains("commandLine=[REDACTED]"));
+        assert!(summary.contains(r#"currentDirectory="C:\work\openshell""#));
     }
 
     // Shailendra #2: the create/config burst can reach the consumer before the
