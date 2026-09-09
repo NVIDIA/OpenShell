@@ -134,6 +134,20 @@ where
         let mut visitor = LogVisitor::default();
         event.record(&mut visitor);
 
+        if meta.target() == OCSF_TARGET
+            && let Some(ocsf) = openshell_ocsf::clone_current_event()
+        {
+            // The structured bridge carries no tracing fields. Route by the
+            // affected sandbox, not by the gateway that produced the event.
+            visitor.sandbox_id = ocsf
+                .base()
+                .container
+                .as_ref()
+                .and_then(|container| container.uid.clone())
+                .filter(|id| !id.is_empty());
+            visitor.message = Some(ocsf.format_shorthand());
+        }
+
         let Some(sandbox_id) = visitor.sandbox_id else {
             return;
         };
@@ -195,6 +209,44 @@ fn display_level(target: &str, level: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_ocsf_reaches_sandbox_tail_and_live_stream() {
+        use tracing_subscriber::prelude::*;
+        let bus = TracingLogBus::new();
+        let mut receiver = bus.subscribe("sb-audit");
+        let event = openshell_ocsf::ConfigStateChangeBuilder::new(&crate::gateway_ocsf::context(
+            "sb-audit", "audit",
+        ))
+        .message("policy approved")
+        .build();
+        let expected = event.format_shorthand();
+        let subscriber = tracing_subscriber::registry().with(bus.layer());
+        tracing::subscriber::with_default(subscriber, || {
+            openshell_ocsf::ocsf_emit!(event);
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(&crate::gateway_ocsf::context(
+                    "", ""
+                ),)
+                .message("gateway-wide event")
+                .build()
+            );
+        });
+        let live = receiver
+            .try_recv()
+            .expect("sandbox audit event must reach live stream");
+        let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) = live.payload
+        else {
+            panic!("expected log payload");
+        };
+        assert_eq!(log.sandbox_id, "sb-audit");
+        assert_eq!(log.source, "gateway");
+        assert_eq!(log.level, "OCSF");
+        assert_eq!(log.message, expected);
+        assert_eq!(bus.tail("sb-audit", 10).len(), 1);
+        assert!(bus.tail("", 10).is_empty());
+        assert!(receiver.try_recv().is_err());
+    }
 
     fn make_log_event(sandbox_id: &str, message: &str) -> SandboxLogLine {
         SandboxLogLine {

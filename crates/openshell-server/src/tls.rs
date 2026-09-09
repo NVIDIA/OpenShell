@@ -14,9 +14,7 @@ use arc_swap::ArcSwap;
 use notify::event::EventKind;
 use notify::{Event, RecursiveMode, Watcher};
 use openshell_core::{Error, Result};
-use openshell_ocsf::{
-    ConfigStateChangeBuilder, EventContext, OCSF_TARGET, SeverityId, StateId, StatusId,
-};
+use openshell_ocsf::{ConfigStateChangeBuilder, EventContext, SeverityId, StateId, StatusId};
 use rustls::ServerConfig;
 use rustls::crypto::aws_lc_rs::sign;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -117,11 +115,7 @@ impl TlsAcceptor {
             .state(StateId::Enabled, "reloaded")
             .message("TLS certificate config reloaded successfully")
             .build();
-        info!(
-            target: OCSF_TARGET,
-            sandbox_id = "",
-            message = %event.format_shorthand()
-        );
+        openshell_ocsf::ocsf_emit!(event);
 
         Ok(())
     }
@@ -247,11 +241,7 @@ impl TlsAcceptor {
                                         "TLS certificate reload failed: {e}"
                                     ))
                                     .build();
-                                info!(
-                                    target: OCSF_TARGET,
-                                    sandbox_id = "",
-                                    message = %event.format_shorthand()
-                                );
+                                openshell_ocsf::ocsf_emit!(event);
                                 warn!(error = %e, "TLS certificate reload failed, keeping existing config");
                             }
                             break;
@@ -474,15 +464,7 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 
 /// Build an OCSF context for gateway-level (non-sandbox) events.
 fn tls_ocsf_ctx() -> EventContext {
-    EventContext {
-        sandbox_id: String::new(),
-        sandbox_name: String::new(),
-        container_image: "openshell/gateway".to_string(),
-        hostname: "openshell-gateway".to_string(),
-        product_version: openshell_core::VERSION.to_string(),
-        proxy_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        proxy_port: 0,
-    }
+    crate::gateway_ocsf::context("", "")
 }
 
 #[cfg(test)]

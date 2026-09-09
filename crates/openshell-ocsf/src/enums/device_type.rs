@@ -15,6 +15,8 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 pub enum DeviceTypeId {
     /// 0 — Unknown
     Unknown = 0,
+    /// 1 — Server
+    Server = 1,
     /// 99 — Other
     Other = 99,
 }
@@ -30,6 +32,7 @@ impl std::fmt::Display for DeviceTypeId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Unknown => "Unknown",
+            Self::Server => "Server",
             Self::Other => "Other",
         })
     }
@@ -43,6 +46,7 @@ mod tests {
     fn device_type_display_uses_schema_labels() {
         for (device_type, expected) in [
             (DeviceTypeId::Unknown, "Unknown"),
+            (DeviceTypeId::Server, "Server"),
             (DeviceTypeId::Other, "Other"),
         ] {
             assert_eq!(device_type.to_string(), expected);
@@ -52,7 +56,11 @@ mod tests {
 
     #[test]
     fn device_type_json_roundtrip() {
-        for (device_type, expected) in [(DeviceTypeId::Unknown, 0), (DeviceTypeId::Other, 99)] {
+        for (device_type, expected) in [
+            (DeviceTypeId::Unknown, 0),
+            (DeviceTypeId::Server, 1),
+            (DeviceTypeId::Other, 99),
+        ] {
             let json = serde_json::to_value(device_type).unwrap();
             assert_eq!(json, serde_json::json!(expected));
             let decoded: DeviceTypeId = serde_json::from_value(json).unwrap();

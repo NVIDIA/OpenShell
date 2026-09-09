@@ -9,19 +9,18 @@ use axum::{
 };
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
 use hyper_util::rt::TokioIo;
+use openshell_core::ObjectId;
 use openshell_core::config::ServiceRoutingConfig;
 use openshell_core::proto::{Sandbox, SandboxPhase, ServiceEndpoint, TcpRelayTarget, relay_open};
-use openshell_core::{ObjectId, VERSION};
 use openshell_ocsf::{
     ActionId, ActivityId, ConfigStateChangeBuilder, DispositionId, Endpoint, EventContext,
     HttpActivityBuilder, HttpRequest, HttpResponse as OcsfHttpResponse, NetworkActivityBuilder,
-    OCSF_TARGET, OcsfEvent, SeverityId, StateId, StatusId, Url as OcsfUrl,
+    OcsfEvent, SeverityId, StateId, StatusId, Url as OcsfUrl,
 };
-use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::ServerState;
 use crate::persistence::{ObjectType, Store};
@@ -582,12 +581,12 @@ fn is_gateway_auth_cookie(name: &str) -> bool {
 
 pub fn emit_service_endpoint_config_event(endpoint: &ServiceEndpoint, url: &str, created: bool) {
     let event = build_service_endpoint_config_event(endpoint, url, created);
-    emit_gateway_ocsf_event(&endpoint.sandbox_id, event);
+    openshell_ocsf::ocsf_emit!(event);
 }
 
 pub fn emit_service_endpoint_delete_event(endpoint: &ServiceEndpoint) {
     let event = build_service_endpoint_delete_event(endpoint);
-    emit_gateway_ocsf_event(&endpoint.sandbox_id, event);
+    openshell_ocsf::ocsf_emit!(event);
 }
 
 pub fn emit_cross_origin_service_http_rejection(state: &ServerState, req: &Request<Body>) {
@@ -623,13 +622,12 @@ fn emit_service_http_failure(
         endpoint,
         err,
     );
-    let sandbox_id = endpoint.map_or("", |endpoint| endpoint.sandbox_id.as_str());
-    emit_gateway_ocsf_event(sandbox_id, event);
+    openshell_ocsf::ocsf_emit!(event);
 }
 
 fn emit_service_relay_failure(endpoint: &ServiceEndpoint, target_port: u16, reason: &str) {
     let event = build_service_relay_failure_event(endpoint, target_port, reason);
-    emit_gateway_ocsf_event(&endpoint.sandbox_id, event);
+    openshell_ocsf::ocsf_emit!(event);
 }
 
 fn build_service_endpoint_config_event(
@@ -751,25 +749,8 @@ fn build_service_relay_failure_event(
     .build()
 }
 
-fn emit_gateway_ocsf_event(sandbox_id: &str, event: OcsfEvent) {
-    let message = event.format_shorthand();
-    info!(
-        target: OCSF_TARGET,
-        sandbox_id = %sandbox_id,
-        message = %message
-    );
-}
-
 fn gateway_ocsf_ctx(sandbox_id: &str, sandbox_name: &str) -> EventContext {
-    EventContext {
-        sandbox_id: sandbox_id.to_string(),
-        sandbox_name: sandbox_name.to_string(),
-        container_image: "openshell/gateway".to_string(),
-        hostname: "openshell-gateway".to_string(),
-        product_version: VERSION.to_string(),
-        proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        proxy_port: 0,
-    }
+    crate::gateway_ocsf::context(sandbox_id, sandbox_name)
 }
 
 fn endpoint_name(endpoint: &ServiceEndpoint) -> String {
@@ -1233,5 +1214,49 @@ mod tests {
             not_found.is_err(),
             "should not find endpoint in wrong workspace"
         );
+    }
+
+    /// Captures structured OCSF events during tracing dispatch.
+    #[derive(Clone, Default)]
+    struct ProbeLayer {
+        seen: Arc<std::sync::Mutex<Vec<Option<OcsfEvent>>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ProbeLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() == openshell_ocsf::OCSF_TARGET {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(openshell_ocsf::clone_current_event());
+            }
+        }
+    }
+
+    #[test]
+    fn gateway_ocsf_events_expose_the_structured_event_to_layers() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let probe = ProbeLayer::default();
+        let subscriber = tracing_subscriber::registry().with(probe.clone());
+
+        let endpoint = endpoint();
+        let expected = build_service_endpoint_config_event(&endpoint, "https://example.test", true);
+        let expected_shorthand = expected.format_shorthand();
+
+        tracing::subscriber::with_default(subscriber, || {
+            emit_service_endpoint_config_event(&endpoint, "https://example.test", true);
+        });
+
+        let seen = probe.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "expected exactly one OCSF tracing event");
+        let event = seen[0]
+            .as_ref()
+            .expect("structured OCSF event should be reachable from the layer");
+        assert_eq!(event.format_shorthand(), expected_shorthand);
     }
 }

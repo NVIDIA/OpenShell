@@ -183,6 +183,8 @@ pub struct GatewayFileSection {
     pub gateway_jwt: Option<GatewayJwtConfig>,
     #[serde(default)]
     pub otlp: Option<OtlpConfig>,
+    #[serde(default)]
+    pub ocsf_log: Option<OcsfLogConfig>,
 
     // ── Disallowed-in-file fields ────────────────────────────────────────
     //
@@ -191,6 +193,63 @@ pub struct GatewayFileSection {
     // rejected in [`load`].
     #[serde(default)]
     pub database_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OcsfLogRotation {
+    Never,
+    #[default]
+    Daily,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "RawOcsfLogConfig")]
+pub struct OcsfLogConfig {
+    pub path: PathBuf,
+    pub rotation: OcsfLogRotation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_files: Option<std::num::NonZeroUsize>,
+    pub queue_capacity: std::num::NonZeroUsize,
+    pub queue_max_bytes: std::num::NonZeroUsize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOcsfLogConfig {
+    path: PathBuf,
+    #[serde(default)]
+    rotation: OcsfLogRotation,
+    max_files: Option<std::num::NonZeroUsize>,
+    queue_capacity: Option<std::num::NonZeroUsize>,
+    queue_max_bytes: Option<std::num::NonZeroUsize>,
+}
+
+impl TryFrom<RawOcsfLogConfig> for OcsfLogConfig {
+    type Error = &'static str;
+
+    fn try_from(raw: RawOcsfLogConfig) -> Result<Self, Self::Error> {
+        if raw.path.as_os_str().is_empty() {
+            return Err("ocsf_log.path must not be empty");
+        }
+        if raw.rotation == OcsfLogRotation::Never && raw.max_files.is_some() {
+            return Err("ocsf_log.max_files requires daily rotation");
+        }
+        Ok(Self {
+            path: raw.path,
+            rotation: raw.rotation,
+            max_files: (raw.rotation == OcsfLogRotation::Daily).then(|| {
+                raw.max_files
+                    .unwrap_or(std::num::NonZeroUsize::new(7).unwrap())
+            }),
+            queue_capacity: raw
+                .queue_capacity
+                .unwrap_or(std::num::NonZeroUsize::new(10_000).unwrap()),
+            queue_max_bytes: raw
+                .queue_max_bytes
+                .unwrap_or(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap()),
+        })
+    }
 }
 
 /// `[openshell.gateway.otlp]` section.
@@ -602,6 +661,43 @@ service_name = "openshell-gateway-dev"
             "http://otel-collector.observability.svc:4317"
         );
         assert_eq!(otlp.service_name.as_deref(), Some("openshell-gateway-dev"));
+    }
+
+    #[test]
+    fn gateway_accepts_a_single_ocsf_log_destination() {
+        let tmp = write_tmp("[openshell.gateway.ocsf_log]\npath = 'events.jsonl'\n");
+        let config = load(tmp.path())
+            .unwrap()
+            .openshell
+            .gateway
+            .ocsf_log
+            .unwrap();
+        assert_eq!(config.rotation, OcsfLogRotation::Daily);
+        assert_eq!(config.max_files.unwrap().get(), 7);
+        assert_eq!(config.queue_capacity.get(), 10_000);
+        assert_eq!(config.queue_max_bytes.get(), 16 * 1024 * 1024);
+        assert!(ConfigFile::default().openshell.gateway.ocsf_log.is_none());
+    }
+
+    #[test]
+    fn ocsf_log_rejects_invalid_and_unshipped_options() {
+        for settings in [
+            "",
+            "path = ''",
+            "path = 'log'\nqueue_capacity = 0",
+            "path = 'log'\nqueue_max_bytes = 0",
+            "path = 'log'\nmax_files = 0",
+            "path = 'log'\nrotation = 'hourly'",
+            "path = 'log'\nkind = 'jsonl'",
+            "path = 'log'\nrotation = 'never'\nmax_files = 7",
+        ] {
+            let tmp = write_tmp(&format!("[openshell.gateway.ocsf_log]\n{settings}\n"));
+            assert!(load(tmp.path()).is_err(), "accepted {settings}");
+        }
+        let tmp = write_tmp("[openshell.gateway.ocsf_log]\npath = 'log'\nrotation = 'never'\n");
+        let config = load(tmp.path()).unwrap();
+        let encoded = toml::to_string(&config).unwrap();
+        assert!(toml::from_str::<ConfigFile>(&encoded).is_ok());
     }
 
     #[test]

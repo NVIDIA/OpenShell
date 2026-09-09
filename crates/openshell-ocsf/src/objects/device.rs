@@ -55,6 +55,28 @@ impl Device {
             }),
         }
     }
+
+    /// Create the device for a gateway replica.
+    #[must_use]
+    pub fn gateway(hostname: &str, name: &str) -> Self {
+        Self {
+            hostname: hostname.to_string(),
+            type_id: DeviceTypeId::Server,
+            type_label: DeviceTypeId::Server.to_string(),
+            name: Some(name.to_string()),
+            // Keep the replica identity opaque rather than encoding multiple fields in the UID.
+            uid: Some(hostname.to_string()),
+            os: Some(OsInfo {
+                name: match std::env::consts::OS {
+                    "linux" => "Linux",
+                    "windows" => "Windows",
+                    "macos" => "macOS",
+                    other => other,
+                }
+                .to_string(),
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -84,5 +106,24 @@ mod tests {
         let decoded: Device = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(decoded, device);
         assert_eq!(serde_json::to_value(&decoded).unwrap(), json);
+    }
+
+    #[test]
+    fn gateway_device_does_not_inherit_the_sandbox_type() {
+        let json = serde_json::to_value(Device::gateway("gateway-0", "production")).unwrap();
+
+        assert_eq!(json["type_id"], 1);
+        assert_eq!(json["type"], "Server");
+    }
+
+    #[test]
+    fn gateway_replicas_have_distinct_device_uids() {
+        let first = Device::gateway("openshell-gateway-0", "production");
+        let second = Device::gateway("openshell-gateway-1", "production");
+
+        assert_ne!(
+            first.uid, second.uid,
+            "gateway replicas must have distinct OCSF device UIDs"
+        );
     }
 }

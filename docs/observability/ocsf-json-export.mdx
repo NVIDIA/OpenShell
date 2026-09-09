@@ -7,9 +7,19 @@ description: "How to enable full OCSF JSON logging for SIEM integration, complia
 keywords: "Generative AI, Cybersecurity, OCSF, JSON, SIEM, Compliance, Observability"
 ---
 
-The [shorthand log format](/observability/logging) is optimized for humans and agents reading logs in real time. For machine consumption, compliance archival, or SIEM integration, you can enable full OCSF JSON export. This writes every OCSF event as a complete JSON record in JSONL format, one JSON object per line.
+The [shorthand log format](/observability/logging) is optimized for humans and agents reading logs in real time. For machine consumption or SIEM integration, enable OCSF JSON output: one native JSON object per line. Collection is best-effort, not a guarantee of complete audit history.
 
-## Enable JSON Export
+## Gateway Output
+
+Configure `[openshell.gateway.ocsf_log]` in `gateway.toml` to collect gateway-origin OCSF events into one JSONL file. This includes gateway-wide events such as TLS certificate reloads, even when no sandbox log stream applies. Collection preserves native OCSF fields and event IDs and does not depend on `RUST_LOG`.
+
+The gateway writes OCSF events to a local JSONL file. Give each replica its own path and configure the shipper to follow renamed rotation segments. See [OCSF JSONL configuration](/reference/gateway-config#ocsf-jsonl-output) for queue bounds, retention, loss metrics, and best-effort delivery limits.
+
+This output is separate from the sandbox-local file described below. Enabling one does not enable the other.
+
+Without JSONL enabled, gateway OCSF events still appear as shorthand in console output, subject to the diagnostic log filter. Events associated with a sandbox also appear in its gateway log stream; gateway-wide events have no sandbox association.
+
+## Enable Sandbox JSON Export
 
 Use the `ocsf_json_enabled` setting to toggle JSON export. The setting can be applied globally, for all sandboxes, or per-sandbox.
 
@@ -38,6 +48,10 @@ openshell settings set --global --key ocsf_json_enabled --value false
 When enabled, OCSF JSON records are written to `/var/log/openshell-ocsf.YYYY-MM-DD.log` inside the sandbox. The file rotates daily and retains the 3 most recent files, matching the main log file rotation.
 
 ## JSON Record Structure
+
+Gateway-produced records use the `OpenShell Gateway` product identity; supervisor records use `OpenShell Sandbox Supervisor`. The producing device and the affected sandbox are separate identities, so a gateway event can still identify an affected sandbox through its container fields.
+
+For gateway-produced records, `device.os.name` identifies the OS running the gateway process: Linux, Windows, or macOS. Linux supervisor records continue to report Linux, regardless of the gateway's OS. A native macOS gateway therefore reports macOS while its Linux sandboxes report Linux; a gateway running inside a Linux container reports Linux, even on a Mac host.
 
 `metadata.uid` uniquely identifies an event and stays unchanged when that record is serialized again. Use `container.uid` to associate the event with its sandbox, not `metadata.uid`. Records without a sandbox association omit the container; unknown images are omitted rather than represented by an empty image name.
 
