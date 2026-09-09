@@ -8,14 +8,14 @@ SPDX-License-Identifier: Apache-2.0
 > [!WARNING]
 > Supervisor middleware is a research preview. Its policy and service contracts may change without compatibility guarantees. Use it only to prototype and evaluate middleware integrations.
 
-This example implements request, response, and client WebSocket bindings in one operator-run supervisor middleware service. The response binding demonstrates header-only inspection, whole-body and streaming transforms, trailer mutation, and block delivery.
+This configured-literal guard applies the same case-sensitive terms to UTF-8 HTTP request bodies, complete HTTP response bodies, and client WebSocket text messages. It is not a general PII detector. See [the protocol example](../supervisor-middleware-protocol/) for demonstrations of response modes and framing.
 
 > [!WARNING]
-> This intentionally simple implementation demonstrates the supervisor middleware service contract. It is not a complete or reliable content guard and must not be used as a security control. It handles only UTF-8 HTTP request bodies and WebSocket text messages with case-sensitive literal terms, merges overlapping literal match ranges before redaction, and does not address encodings, transformations, normalization, binary WebSocket messages, upstream-to-client messages, or adversarial inputs that a production content guard must handle.
+> This intentionally simple implementation demonstrates the supervisor middleware service contract. It is not a complete or reliable content guard and must not be used as a security control. It handles only UTF-8 HTTP request and response bodies and WebSocket text messages with case-sensitive literal terms, merges overlapping literal match ranges before redaction, and does not address encodings, transformations, normalization, binary WebSocket messages, upstream-to-client messages, or adversarial inputs that a production content guard must handle.
 
 ## Prerequisites
 
-Install `cargo`, `curl`, `jq`, `openssl`, and Python 3 on the host before running the smoke script.
+Install `cargo`, `curl`, `jq`, `openssl`, and `uv` with Python 3 on the host before running the smoke script.
 
 ## Run the smoke example
 
@@ -89,31 +89,31 @@ The echoed JSON body contains `[FILTERED]` instead of the configured term.
 
 ## HTTP response behavior
 
-Start the included raw HTTP upstream in another terminal:
+The smoke launcher starts the local fixture. To start it manually:
 
 ```shell
-python3 examples/supervisor-middleware-content-guard/upstream.py
+uv run --no-project python examples/supervisor-middleware-content-guard/upstream.py
 ```
 
-From the sandbox, exercise the response protocol:
+The policy permits `GET /clean` and `GET /sensitive` on
+`http://host.openshell.internal:18081`. The first returns ordinary public text.
+The second contains both configured terms. Redact mode returns
+`contains [FILTERED] and [FILTERED]`. Deny mode returns typed `BlockDelivery`
+with reason code `content_match`, which produces the canonical 403 response
+before delivery. The smoke suite recreates the sandbox in deny mode and checks
+both clean and matching responses through the external gRPC service.
 
-```shell
-curl -i http://host.openshell.internal:18081/headers-only
-curl -i http://host.openshell.internal:18081/whole-body
-curl -i --raw http://host.openshell.internal:18081/stream
-curl -i --raw http://host.openshell.internal:18081/stream-close
-curl -i http://host.openshell.internal:18081/block
-```
+Every selected response requires `WHOLE_BODY_BYTES`. If that mode is unavailable,
+the service returns a middleware failure and the policy's `on_error` decides
+whether delivery fails open or closed. This includes encoded, partial,
+no-transform, bodyless, and known oversized responses. Unknown-length bodies can
+also exceed the runtime limit during collection. Invalid UTF-8 fails the same way.
+The example policy uses `fail_closed`.
 
-| Path | Mode | Result |
-| --- | --- | --- |
-| `/headers-only` | `HEADERS_ONLY` | Adds `x-example-response-mode` without changing content-length framing. |
-| `/whole-body` | `WHOLE_BODY_BYTES` | Prefixes the normalized body with `[whole]`. |
-| `/stream` | `STREAM_BYTES` | Uppercases normalized units and changes the existing `x-example-body-bytes` trailer to `11`. |
-| `/stream-close` | `STREAM_BYTES` | Uppercases a close-delimited `text/event-stream` response. |
-| `/block` | `WHOLE_BODY_BYTES` | Returns OpenShell's canonical 403 response with reason code `content_match`. |
-
-The upstream deliberately uses content-length, chunked, and close-delimited responses. OpenShell normalizes transport framing only for body-processing modes and validates trailer changes against the names supplied by the upstream.
+Clean bodies pass unchanged. Matching spans are merged and replaced in the
+complete body, so transport chunk boundaries do not affect matching. Trailers
+are accepted without mutation. The guard does not decode compressed bodies,
+normalize Unicode, scan response headers, retain stream units, or spool bodies.
 
 ## WebSocket behavior
 

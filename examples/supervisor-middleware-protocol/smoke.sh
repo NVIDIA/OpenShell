@@ -5,7 +5,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-EXAMPLE_DIR="$ROOT/examples/supervisor-middleware-content-guard"
+EXAMPLE_DIR="$ROOT/examples/supervisor-middleware-protocol"
 RUN_TEST_SUITE=0
 PRINT_CONFIG=0
 
@@ -13,18 +13,18 @@ usage() {
   cat <<EOF
 usage: $0 [--test-suite|--test|--print-config]
 
-Without flags, starts a local gateway and content-guard service, creates an
+Without flags, starts a local gateway and protocol service, creates an
 example sandbox, and keeps the stack running for interactive use.
 
 Options:
-  --test-suite, --test  Run guarded and unguarded request checks, then stop.
+  --test-suite, --test  Run request, response, and WebSocket checks, then stop.
   --print-config        Print the generated middleware gateway config, then stop.
   -h, --help            Show this help.
 
 Environment:
-  CONTENT_GUARD_SMOKE_HOST  Non-loopback host address reachable from both the
+  PROTOCOL_SMOKE_HOST  Non-loopback host address reachable from both the
                             gateway and sandbox containers.
-  CONTENT_GUARD_SMOKE_DRIVER
+  PROTOCOL_SMOKE_DRIVER
                             Optional compute driver name, such as docker or podman.
 EOF
 }
@@ -54,8 +54,8 @@ done
 detect_service_host() {
   local interface address
 
-  if [[ -n "${CONTENT_GUARD_SMOKE_HOST:-}" ]]; then
-    printf '%s\n' "$CONTENT_GUARD_SMOKE_HOST"
+  if [[ -n "${PROTOCOL_SMOKE_HOST:-}" ]]; then
+    printf '%s\n' "$PROTOCOL_SMOKE_HOST"
     return
   fi
 
@@ -100,14 +100,14 @@ detect_service_host() {
   fi
 
   echo "could not detect a non-loopback host address" >&2
-  echo "set CONTENT_GUARD_SMOKE_HOST to an address reachable from sandbox containers" >&2
+  echo "set PROTOCOL_SMOKE_HOST to an address reachable from sandbox containers" >&2
   exit 1
 }
 
 SERVICE_HOST="$(detect_service_host)"
-COMPUTE_DRIVER="${CONTENT_GUARD_SMOKE_DRIVER:-}"
+COMPUTE_DRIVER="${PROTOCOL_SMOKE_DRIVER:-}"
 if [[ "$SERVICE_HOST" == "localhost" || "$SERVICE_HOST" == "::1" || "$SERVICE_HOST" == 127.* || "$SERVICE_HOST" == *:* ]]; then
-  echo "CONTENT_GUARD_SMOKE_HOST must be a non-loopback IPv4 address: $SERVICE_HOST" >&2
+  echo "PROTOCOL_SMOKE_HOST must be a non-loopback IPv4 address: $SERVICE_HOST" >&2
   exit 1
 fi
 
@@ -120,7 +120,7 @@ GATEWAY_LOG="$LOG_DIR/gateway.log"
 MIDDLEWARE_LOG="$LOG_DIR/middleware.log"
 UPSTREAM_LOG="$LOG_DIR/upstream.log"
 SANDBOX_LOG="$LOG_DIR/sandbox.log"
-RUN_ID="content-guard-smoke-$$-$RANDOM"
+RUN_ID="protocol-smoke-$$-$RANDOM"
 # Sandbox names are capped at 19 characters. Use a short prefix with
 # the PID for uniqueness; keep the full RUN_ID for gateway identity.
 SANDBOX_NAME="cg-$$-$RANDOM"
@@ -196,7 +196,7 @@ choose_port_block() {
     fi
   done
 
-  echo "failed to find free local ports for content guard launcher" >&2
+  echo "failed to find free local ports for protocol demo launcher" >&2
   exit 1
 }
 
@@ -222,7 +222,7 @@ gateway_id = "$RUN_ID"
 ttl_secs = 0
 
 [[openshell.supervisor.middleware]]
-name = "content-guard-example"
+name = "protocol-example"
 grpc_endpoint = "http://$SERVICE_HOST:$MIDDLEWARE_PORT"
 allow_insecure_transport = true
 max_payload_bytes = 262144
@@ -318,7 +318,7 @@ cargo_target_dir() {
 }
 
 start_middleware() {
-  printf 'INFO starting content guard service at %s:%s\n' "$SERVICE_HOST" "$MIDDLEWARE_PORT"
+  printf 'INFO starting protocol demo service at %s:%s\n' "$SERVICE_HOST" "$MIDDLEWARE_PORT"
   "$MIDDLEWARE_BIN" \
     --bind "0.0.0.0:$MIDDLEWARE_PORT" >"$MIDDLEWARE_LOG" 2>&1 &
   MIDDLEWARE_PID=$!
@@ -336,19 +336,19 @@ middleware_port_is_ready() {
 wait_for_middleware() {
   for _ in {1..60}; do
     if ! kill -0 "$MIDDLEWARE_PID" 2>/dev/null; then
-      fail "content guard service starts"
+      fail "protocol demo service starts"
     fi
     if middleware_port_is_ready; then
-      printf 'INFO content guard service is ready\n'
+      printf 'INFO protocol demo service is ready\n'
       return
     fi
     sleep 1
   done
-  fail "content guard service is reachable at $SERVICE_HOST:$MIDDLEWARE_PORT"
+  fail "protocol demo service is reachable at $SERVICE_HOST:$MIDDLEWARE_PORT"
 }
 
 start_upstream() {
-  printf 'INFO starting content guard upstream at %s:18081\n' "$SERVICE_HOST"
+  printf 'INFO starting response framing upstream at %s:18081\n' "$SERVICE_HOST"
   uv run --no-project python "$EXAMPLE_DIR/upstream.py" >"$UPSTREAM_LOG" 2>&1 &
   UPSTREAM_PID=$!
 }
@@ -356,15 +356,15 @@ start_upstream() {
 wait_for_upstream() {
   for _ in {1..30}; do
     if ! kill -0 "$UPSTREAM_PID" 2>/dev/null; then
-      fail "content guard upstream starts"
+      fail "response framing upstream starts"
     fi
-    if curl -fsS --max-time 1 "http://127.0.0.1:18081/clean" >/dev/null 2>&1; then
-      printf 'INFO content guard upstream is ready\n'
+    if curl -fsS --max-time 1 "http://127.0.0.1:18081/headers-only" >/dev/null 2>&1; then
+      printf 'INFO response framing upstream is ready\n'
       return
     fi
     sleep 1
   done
-  fail "content guard upstream is reachable"
+  fail "response framing upstream is reachable"
 }
 
 start_gateway() {
@@ -380,7 +380,7 @@ start_gateway() {
     --port "$GATEWAY_PORT" \
     --health-port "$HEALTH_PORT" \
     --metrics-port 0 \
-    --log-level "${CONTENT_GUARD_SMOKE_LOG_LEVEL:-info}" \
+    --log-level "${PROTOCOL_SMOKE_LOG_LEVEL:-info}" \
     --disable-tls \
     --db-url "sqlite://$SMOKE_TMP_DIR/gateway.db" >"$GATEWAY_LOG" 2>&1 &
   GATEWAY_PID=$!
@@ -389,18 +389,18 @@ start_gateway() {
 wait_for_gateway() {
   for _ in {1..60}; do
     if ! kill -0 "$MIDDLEWARE_PID" 2>/dev/null; then
-      fail "content guard service starts"
+      fail "protocol demo service starts"
     fi
     if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
-      fail "gateway starts with content guard"
+      fail "gateway starts with protocol demo"
     fi
     if curl -fsS "http://127.0.0.1:$HEALTH_PORT/healthz" >/dev/null 2>&1; then
-      printf 'INFO gateway starts with content guard\n'
+      printf 'INFO gateway starts with protocol demo\n'
       return
     fi
     sleep 1
   done
-  fail "gateway starts with content guard"
+  fail "gateway starts with protocol demo"
 }
 
 create_sandbox() {
@@ -412,16 +412,8 @@ create_sandbox() {
   )
   SANDBOX_CREATED=1
   run_setup_step \
-    "creating content guard sandbox" \
+    "creating protocol demo sandbox" \
     "${CLI[@]}" sandbox create --name "$SANDBOX_NAME" --policy "$EXAMPLE_DIR/policy.yaml" --no-tty --detach -- sleep infinity
-}
-
-request() {
-  local host="$1"
-  "${CLI[@]}" sandbox exec --name "$SANDBOX_NAME" --no-tty -- \
-    curl -sS --max-time 20 "https://$host/anything" \
-    --header 'content-type: application/json' \
-    --data '{"note":"prototype-secret"}'
 }
 
 response_request() {
@@ -431,71 +423,56 @@ response_request() {
 }
 
 run_suite() {
-  local guarded_output="$LOG_DIR/guarded.out"
-  local unguarded_output="$LOG_DIR/unguarded.out"
   local response_output="$LOG_DIR/response.out"
+  if ! "${CLI[@]}" sandbox exec --name "$SANDBOX_NAME" --no-tty -- \
+    curl -fsS --max-time 20 http://host.openshell.internal:18081/request --data 'request body' >"$response_output" 2>>"$SETUP_LOG" ||
+    [[ "$(cat "$response_output")" != "REQUEST BODY" ]]; then
+    fail "request body replacement"
+  fi
+  printf 'PASS request body replacement\n'
+  if ! "${CLI[@]}" sandbox exec --name "$SANDBOX_NAME" --no-tty -- \
+    python3 -c "$(cat "$EXAMPLE_DIR/websocket-client.py")" >"$response_output" 2>>"$SETUP_LOG" ||
+    [[ "$(cat "$response_output")" != "HELLO PROTOCOL" ]]; then
+    fail "WebSocket message replacement"
+  fi
+  printf 'PASS WebSocket message replacement\n'
 
-  printf 'INFO sending guarded request to httpbin.org\n'
-  if ! request httpbin.org >"$guarded_output" 2>>"$SETUP_LOG"; then
-    fail "guarded request completes"
+  printf 'INFO exercising HTTP response middleware modes\n'
+  if ! response_request headers-only >"$response_output" 2>>"$SETUP_LOG" ||
+    ! grep -Fiq 'x-example-response-mode: headers-only' "$response_output" ||
+    ! grep -Fiq 'content-length: 12' "$response_output" ||
+    ! grep -Fq 'headers-only' "$response_output"; then
+    fail "headers-only response middleware"
   fi
-
-  printf 'INFO checking response pass-through and redaction\n'
-  if ! response_request clean >"$response_output" 2>>"$SETUP_LOG" ||
-    ! grep -Fq 'ordinary public text' "$response_output"; then
-    fail "clean response passes unchanged"
+  if ! response_request whole-body >"$response_output" 2>>"$SETUP_LOG" ||
+    ! grep -Fq '[whole] whole body' "$response_output"; then
+    fail "whole-body response middleware"
   fi
-  if ! response_request sensitive >"$response_output" 2>>"$SETUP_LOG" ||
-    ! grep -Fq 'contains [FILTERED] and [FILTERED]' "$response_output" ||
-    grep -Fq 'prototype-secret' "$response_output"; then
-    fail "configured response terms are redacted"
+  if ! response_request stream >"$response_output" 2>>"$SETUP_LOG" ||
+    ! grep -Fq 'STREAM BODY' "$response_output" ||
+    ! grep -Fiq 'x-example-body-bytes: 11' "$response_output"; then
+    fail "stream response middleware with trailer mutation"
   fi
-  printf 'PASS response pass-through and redaction\n'
-  if grep -Fq '[FILTERED]' "$guarded_output" && ! grep -Fq 'prototype-secret' "$guarded_output"; then
-    printf 'PASS guarded request is filtered\n'
-  else
-    cat "$guarded_output" >>"$SETUP_LOG"
-    fail "guarded request is filtered"
+  if ! response_request stream-close >"$response_output" 2>>"$SETUP_LOG" ||
+    ! grep -Fq 'DATA: STREAM CLOSE' "$response_output"; then
+    fail "close-delimited SSE response middleware"
   fi
-
-  printf 'INFO sending unguarded request to httpbingo.org\n'
-  if ! request httpbingo.org >"$unguarded_output" 2>>"$SETUP_LOG"; then
-    fail "unguarded request completes"
-  fi
-  if grep -Fq 'prototype-secret' "$unguarded_output" && ! grep -Fq '[FILTERED]' "$unguarded_output"; then
-    printf 'PASS unguarded request is unchanged\n'
-  else
-    cat "$unguarded_output" >>"$SETUP_LOG"
-    fail "unguarded request is unchanged"
-  fi
-
-  # Recreate with the same terms in deny mode, through the external service.
-  "${CLI[@]}" sandbox delete "$SANDBOX_NAME" >>"$SETUP_LOG" 2>&1
-  SANDBOX_CREATED=0
-  sed '/replacement:/d; s/mode: redact/mode: deny/' "$EXAMPLE_DIR/policy.yaml" >"$SMOKE_TMP_DIR/deny.yaml"
-  SANDBOX_CREATED=1
-  run_setup_step "creating deny sandbox" "${CLI[@]}" sandbox create --name "$SANDBOX_NAME" --policy "$SMOKE_TMP_DIR/deny.yaml" --no-tty --detach -- sleep infinity
-  if ! response_request sensitive >"$response_output" 2>>"$SETUP_LOG" ||
+  if ! response_request block >"$response_output" 2>>"$SETUP_LOG" ||
     ! grep -Fq 'HTTP/1.1 403 Forbidden' "$response_output" ||
-    ! grep -Fq 'content_match' "$response_output" ||
-    grep -Fq 'prototype-secret' "$response_output"; then
-    fail "configured response term blocks delivery"
+    ! grep -Fq 'middleware_denied' "$response_output" ||
+    ! grep -Fq 'content_match' "$response_output"; then
+    fail "response middleware block"
   fi
-  if ! response_request clean >"$response_output" 2>>"$SETUP_LOG" ||
-    ! grep -Fq 'ordinary public text' "$response_output"; then
-    fail "deny mode passes clean responses"
-  fi
-  printf 'PASS response denial\n'
-
+  printf 'PASS HTTP response middleware modes\n'
   "${CLI[@]}" sandbox delete "$SANDBOX_NAME" >>"$SETUP_LOG" 2>&1
   SANDBOX_CREATED=0
-  echo "ALL PASS content guard smoke"
+  echo "ALL PASS protocol demo smoke"
 }
 
 print_ready() {
   cat <<EOF
 
-READY supervisor middleware content guard
+READY supervisor middleware protocol demo
 
 Gateway endpoint:   $GATEWAY_ENDPOINT
 Middleware endpoint: http://$SERVICE_HOST:$MIDDLEWARE_PORT
@@ -505,11 +482,11 @@ Setup log:          $SETUP_LOG
 Gateway log:        $GATEWAY_LOG
 Middleware log:     $MIDDLEWARE_LOG
 
-Guarded request, selected by the httpbin.org middleware endpoint selector:
-  ${CLI[*]} sandbox exec --name $SANDBOX_NAME --no-tty -- curl -sS https://httpbin.org/anything --header 'content-type: application/json' --data '{"note":"prototype-secret"}'
+Request replacement:
+  ${CLI[*]} sandbox exec --name $SANDBOX_NAME --no-tty -- curl -sS http://host.openshell.internal:18081/request --data 'request body'
 
-Unguarded request, allowed by policy but outside the middleware selector:
-  ${CLI[*]} sandbox exec --name $SANDBOX_NAME --no-tty -- curl -sS https://httpbingo.org/anything --header 'content-type: application/json' --data '{"note":"prototype-secret"}'
+Response transformation:
+  ${CLI[*]} sandbox exec --name $SANDBOX_NAME --no-tty -- curl -i http://host.openshell.internal:18081/whole-body
 
 Press Ctrl-C to delete the sandbox and stop the gateway and middleware.
 EOF
@@ -521,7 +498,7 @@ wait_until_stopped() {
       fail "gateway process exited"
     fi
     if ! kill -0 "$MIDDLEWARE_PID" 2>/dev/null; then
-      fail "content guard process exited"
+      fail "protocol demo process exited"
     fi
     sleep 1
   done
@@ -537,10 +514,10 @@ ROOT_TARGET_DIR="$(cargo_target_dir "$ROOT/Cargo.toml")"
 EXAMPLE_TARGET_DIR="$(cargo_target_dir "$EXAMPLE_DIR/Cargo.toml")"
 GATEWAY_BIN="$ROOT_TARGET_DIR/debug/openshell-gateway"
 CLI_BIN="$ROOT_TARGET_DIR/debug/openshell"
-MIDDLEWARE_BIN="$EXAMPLE_TARGET_DIR/debug/supervisor-middleware-content-guard"
+MIDDLEWARE_BIN="$EXAMPLE_TARGET_DIR/debug/supervisor-middleware-protocol"
 run_setup_step "building gateway" cargo build --quiet -p openshell-gateway --bin openshell-gateway
 run_setup_step "building sandbox supervisor" cargo build --quiet -p openshell-sandbox --bin openshell-sandbox
-run_setup_step "building content guard" cargo build --quiet --manifest-path "$EXAMPLE_DIR/Cargo.toml"
+run_setup_step "building protocol demo" cargo build --quiet --manifest-path "$EXAMPLE_DIR/Cargo.toml"
 run_setup_step "building CLI" cargo build --quiet -p openshell-cli --bin openshell
 generate_gateway_jwt_bundle
 start_upstream

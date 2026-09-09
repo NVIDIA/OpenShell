@@ -220,10 +220,23 @@ Middleware activity is emitted through OpenShell's OCSF logging:
 
 See [Logging](/observability/logging) for log access and [OCSF JSON Export](/observability/ocsf-json-export) for structured export.
 
+## Runnable examples
+
+The [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard)
+matches configured literal terms in UTF-8 request bodies, complete response
+bodies, and client WebSocket text messages. It supports redaction and denial.
+Responses require whole-body inspection; unavailable inspection or invalid
+UTF-8 invokes the configured `on_error` policy. It is not a general PII detector.
+
+The [protocol example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-protocol)
+demonstrates all V1 hooks in one service, including header-only response changes,
+whole-body and unit-local streaming transformations, trailers, and typed blocks.
+Each example includes a policy, local fixture, and smoke launcher.
+
 ## Current Limitations
 
 - Middleware applies only through operation bindings advertised by each implementation. For protocols that have no supported middleware operation at all, such as HTTP/2 prior knowledge or non-HTTP TCP, the existing uninspectable-traffic gate denies a host match containing `fail_closed` and relays an all-`fail_open` match with a detection finding.
-- The typed operation and phase pairs are `HTTP_REQUEST/PRE_CREDENTIALS` and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`.
+- The typed operation and phase pairs are `HTTP_REQUEST/PRE_CREDENTIALS`, `HTTP_RESPONSE/PRE_RETURN`, and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`.
 - A host match does not imply every advertised operation: an HTTP-only attachment can inspect the upgrade GET, then post-upgrade traffic passes with `binding_not_selected` coverage.
 - The V1 WebSocket binding inspects complete client text messages only. Binary messages pass with `unsupported_message_type` coverage for active stages; control frames and upstream-to-client messages remain outside the middleware operation.
 - Selection uses destination host include and exclude patterns.

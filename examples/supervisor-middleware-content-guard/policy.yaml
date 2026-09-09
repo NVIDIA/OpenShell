@@ -45,8 +45,8 @@ network_policies:
               path: /anything
     binaries:
       - path: /usr/bin/curl
-  response-framing-demo:
-    name: Response framing demo
+  guard-responses:
+    name: Guard responses
     endpoints:
       - host: host.openshell.internal
         port: 18081
@@ -54,18 +54,9 @@ network_policies:
         rules:
           - allow:
               method: GET
-              path: /headers-only
+              path: /clean
           - allow:
               method: GET
-              path: /whole-body
-          - allow:
-              method: GET
-              path: /stream
-          - allow:
-              method: GET
-              path: /stream-close
-          - allow:
-              method: GET
-              path: /block
+              path: /sensitive
     binaries:
       - path: /usr/bin/curl
