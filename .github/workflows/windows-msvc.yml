@@ -18,6 +18,8 @@ concurrency:
 
 env:
   CARGO_INCREMENTAL: "0"
+  # Log cache write failures without dumping compiler arguments or environments.
+  SCCACHE_LOG: "debug/Error executing cache write"
 
 jobs:
   pr_metadata:
@@ -54,6 +56,8 @@ jobs:
             rust_target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     env:
+      # rust-cache hashes every installed toolchain, including unused runner defaults.
+      RUSTUP_HOME: ${{ runner.temp }}/openshell-rustup
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
       SCCACHE_GHA_ENABLED: "true"
       SCCACHE_GHA_VERSION: windows-msvc-${{ matrix.arch }}
@@ -111,6 +115,7 @@ jobs:
             rust_target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     env:
+      RUSTUP_HOME: ${{ runner.temp }}/openshell-rustup
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
       SCCACHE_GHA_ENABLED: "true"
       SCCACHE_GHA_VERSION: windows-msvc-${{ matrix.arch }}
@@ -165,6 +170,7 @@ jobs:
             rust_target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     env:
+      RUSTUP_HOME: ${{ runner.temp }}/openshell-rustup
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
       SCCACHE_GHA_ENABLED: "true"
       SCCACHE_GHA_VERSION: windows-msvc-${{ matrix.arch }}
