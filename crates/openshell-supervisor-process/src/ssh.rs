@@ -1492,13 +1492,8 @@ fn spawn_pipe_exec(
     // reads commands line-by-line (script mode), which is what VS Code expects.
     let shell = openshell_core::shell::detect_login_shell();
     let repair_standard_sbin = child_env::standard_sbin_path_repair_enabled(policy);
-    let mut cmd = build_ssh_shell_command(
-        &shell,
-        command,
-        no_login_shell,
-        None,
-        repair_standard_sbin,
-    );
+    let mut cmd =
+        build_ssh_shell_command(&shell, command, no_login_shell, None, repair_standard_sbin);
 
     let (session_user, session_home) = session_user_and_home(policy, workspace.home());
     apply_child_env(
@@ -1862,13 +1857,8 @@ mod tests {
         assert_eq!(cmd.get_args().count(), 0);
 
         // Explicit command → login-shell flag + command, still on the given shell.
-        let cmd = build_ssh_shell_command(
-            "/bin/sh",
-            Some("echo hi".into()),
-            false,
-            Some("-i"),
-            false,
-        );
+        let cmd =
+            build_ssh_shell_command("/bin/sh", Some("echo hi".into()), false, Some("-i"), false);
         assert_eq!(cmd.get_program(), OsStr::new("/bin/sh"));
         assert_eq!(
             cmd.get_args().collect::<Vec<_>>(),
