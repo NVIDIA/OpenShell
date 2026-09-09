@@ -1213,7 +1213,9 @@ class SandboxTemplateClient:
         annotations: Mapping[str, str] | None = None,
         environment: Mapping[str, str] | None = None,
         cpu: str | None = None,
+        cpu_request: str | None = None,
         memory: str | None = None,
+        memory_request: str | None = None,
         gpu_count: int | None = None,
         gpu: bool = False,
         driver_config: Mapping[str, Any] | None = None,
@@ -1228,13 +1230,18 @@ class SandboxTemplateClient:
                 annotations=annotations,
                 environment=environment,
                 cpu=cpu,
+                cpu_request=cpu_request,
                 memory=memory,
+                memory_request=memory_request,
                 gpu_count=gpu_count,
                 gpu=gpu,
                 driver_config=driver_config,
             )
         elif (
-            any(value is not None for value in (name, image, cpu, memory, gpu_count))
+            any(
+                value is not None
+                for value in (name, image, cpu, cpu_request, memory, memory_request, gpu_count)
+            )
             or any(
                 bool(value)
                 for value in (labels, annotations, environment, driver_config)
@@ -1713,7 +1720,9 @@ def _sandbox_workload_template(
     annotations: Mapping[str, str] | None = None,
     environment: Mapping[str, str] | None = None,
     cpu: str | None = None,
+    cpu_request: str | None = None,
     memory: str | None = None,
+    memory_request: str | None = None,
     gpu_count: int | None = None,
     gpu: bool = False,
     driver_config: Mapping[str, Any] | None = None,
@@ -1736,9 +1745,13 @@ def _sandbox_workload_template(
     if environment:
         template.spec.workload.environment.update(dict(environment))
     if cpu is not None:
-        template.spec.workload.resources.cpu = cpu
+        template.spec.workload.resources.cpu.limit = cpu
+    if cpu_request is not None:
+        template.spec.workload.resources.cpu.request = cpu_request
     if memory is not None:
-        template.spec.workload.resources.memory = memory
+        template.spec.workload.resources.memory.limit = memory
+    if memory_request is not None:
+        template.spec.workload.resources.memory.request = memory_request
     if gpu or gpu_count is not None:
         template.spec.workload.resources.gpu.SetInParent()
     if gpu_count is not None:
