@@ -541,14 +541,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::grpc::{OpenShellService, test_support::test_server_state};
-    use openshell_core::proto::{
-        GatewayMessage, ObjectMeta, SandboxSpec, SupervisorHello, SupervisorMessage,
-        gateway_message, open_shell_client::OpenShellClient, open_shell_server::OpenShellServer,
-        supervisor_message,
-    };
-    use tokio::sync::mpsc;
-    use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+    use crate::grpc::test_support::{connect_supervisor_stream, test_server_state};
+    use openshell_core::proto::{GatewayMessage, ObjectMeta, SandboxSpec, gateway_message};
 
     fn key(sandbox_id: &str, component: ConfigComponentKind) -> DeliveryKey {
         DeliveryKey {
@@ -727,35 +721,15 @@ mod tests {
             .await
             .unwrap();
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(
-            tonic::transport::Server::builder()
-                .add_service(OpenShellServer::new(OpenShellService::new(Arc::clone(
-                    &state,
-                ))))
-                .serve_with_incoming(TcpListenerStream::new(listener)),
-        );
-        let mut client = OpenShellClient::connect(format!("http://{address}"))
-            .await
-            .unwrap();
-        let (tx, rx) = mpsc::channel(4);
-        tx.send(SupervisorMessage {
-            payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
-                sandbox_id: "sandbox".into(),
-                instance_id: "instance".into(),
-                protocol_revision: openshell_core::proto::SUPERVISOR_PROTOCOL_REVISION,
-            })),
-        })
+        let mut harness = connect_supervisor_stream(
+            &state,
+            "sandbox",
+            openshell_core::proto::SUPERVISOR_PROTOCOL_REVISION,
+        )
         .await
         .unwrap();
-        let mut stream = client
-            .connect_supervisor(ReceiverStream::new(rx))
-            .await
-            .unwrap()
-            .into_inner();
 
-        let first = tokio::time::timeout(Duration::from_secs(5), stream.message())
+        let first = tokio::time::timeout(Duration::from_secs(5), harness.inbound.message())
             .await
             .unwrap()
             .unwrap()
@@ -766,7 +740,7 @@ mod tests {
         ));
 
         publish_sandbox_components(&state, "sandbox", ConfigComponents::SANDBOX_CONFIG);
-        let update = tokio::time::timeout(Duration::from_secs(5), stream.message())
+        let update = tokio::time::timeout(Duration::from_secs(5), harness.inbound.message())
             .await
             .unwrap()
             .unwrap()
@@ -777,9 +751,6 @@ mod tests {
                 payload: Some(gateway_message::Payload::ConfigUpdate(_))
             }
         ));
-
-        drop(tx);
-        server.abort();
     }
 
     #[test]

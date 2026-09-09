@@ -15,12 +15,12 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use openshell_core::proto::SUPERVISOR_PROTOCOL_REVISION;
 use openshell_core::proto::{
     ConfigUpdate, GatewayMessage, RelayFrame, RelayInit, RelayOpen, ReportMainProcessExitRequest,
     ReportMainProcessExitResponse, Sandbox, SandboxPhase, SessionAccepted, SshRelayTarget,
     SupervisorMessage, config_update, gateway_message, relay_open, supervisor_message,
 };
+use openshell_core::proto::{LEGACY_SUPERVISOR_PROTOCOL_REVISION, SUPERVISOR_PROTOCOL_REVISION};
 use openshell_core::transport_errors::is_expected_transport_close_status;
 
 use crate::ServerState;
@@ -810,7 +810,7 @@ pub async fn handle_connect_supervisor(
     if sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
     }
-    validate_protocol_revision(hello.protocol_revision)?;
+    validate_protocol_revision(&sandbox_id, hello.protocol_revision)?;
     if let Some(principal) = principal.as_ref() {
         crate::auth::guard::ensure_sandbox_principal_scope(principal, &sandbox_id)?;
     }
@@ -960,13 +960,20 @@ pub async fn handle_connect_supervisor(
     Ok(Response::new(stream))
 }
 
-fn validate_protocol_revision(supervisor_revision: u32) -> Result<(), Status> {
-    if supervisor_revision == SUPERVISOR_PROTOCOL_REVISION {
-        Ok(())
-    } else {
-        Err(Status::failed_precondition(format!(
-            "supervisor protocol revision mismatch: gateway requires {SUPERVISOR_PROTOCOL_REVISION}, supervisor offered {supervisor_revision}"
-        )))
+fn validate_protocol_revision(sandbox_id: &str, supervisor_revision: u32) -> Result<(), Status> {
+    match supervisor_revision {
+        SUPERVISOR_PROTOCOL_REVISION => Ok(()),
+        LEGACY_SUPERVISOR_PROTOCOL_REVISION => {
+            counter!("openshell_supervisor_protocol_legacy_sessions_total").increment(1);
+            warn!(
+                sandbox_id = %sandbox_id,
+                "supervisor session: supervisor predates the protocol handshake; recreate the sandbox before the next gateway upgrade"
+            );
+            Ok(())
+        }
+        other => Err(Status::failed_precondition(format!(
+            "supervisor protocol revision mismatch: gateway requires {SUPERVISOR_PROTOCOL_REVISION}, supervisor offered {other}"
+        ))),
     }
 }
 
@@ -1246,9 +1253,77 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_protocol_revision_must_match_exactly() {
-        assert!(validate_protocol_revision(SUPERVISOR_PROTOCOL_REVISION).is_ok());
-        let error = validate_protocol_revision(SUPERVISOR_PROTOCOL_REVISION + 1).unwrap_err();
+    fn supervisor_protocol_revision_accepts_current_and_legacy_peers() {
+        assert!(validate_protocol_revision("sb-1", SUPERVISOR_PROTOCOL_REVISION).is_ok());
+        assert!(validate_protocol_revision("sb-1", LEGACY_SUPERVISOR_PROTOCOL_REVISION).is_ok());
+    }
+
+    async fn state_with_sandbox(sandbox_id: &str) -> Arc<ServerState> {
+        let state = crate::grpc::test_support::test_server_state().await;
+        state
+            .store
+            .put_message(&sandbox_record(sandbox_id, sandbox_id))
+            .await
+            .unwrap();
+        state
+    }
+
+    async fn first_gateway_message(
+        harness: &mut crate::grpc::test_support::SupervisorStreamHarness,
+    ) -> GatewayMessage {
+        tokio::time::timeout(Duration::from_secs(5), harness.inbound.message())
+            .await
+            .expect("gateway response before timeout")
+            .expect("stream open")
+            .expect("gateway message")
+    }
+
+    #[tokio::test]
+    async fn legacy_supervisor_without_protocol_revision_is_accepted() {
+        let state = state_with_sandbox("sb-legacy").await;
+        let mut harness = crate::grpc::test_support::connect_supervisor_stream(
+            &state,
+            "sb-legacy",
+            LEGACY_SUPERVISOR_PROTOCOL_REVISION,
+        )
+        .await
+        .expect("legacy supervisor must connect");
+
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
+            first_gateway_message(&mut harness).await.payload
+        else {
+            panic!("expected SessionAccepted");
+        };
+        assert_eq!(accepted.protocol_revision, SUPERVISOR_PROTOCOL_REVISION);
+        assert!(
+            state
+                .supervisor_sessions
+                .is_current_session("sb-legacy", &accepted.session_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_supervisor_protocol_revision_is_rejected() {
+        let state = state_with_sandbox("sb-future").await;
+        let Err(status) = crate::grpc::test_support::connect_supervisor_stream(
+            &state,
+            "sb-future",
+            SUPERVISOR_PROTOCOL_REVISION + 1,
+        )
+        .await
+        else {
+            panic!("mismatched revision must be rejected");
+        };
+
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("revision mismatch"));
+        assert!(state.supervisor_sessions.connected_sandbox_ids().is_empty());
+    }
+
+    #[test]
+    fn supervisor_protocol_revision_rejects_unknown_peers() {
+        let error =
+            validate_protocol_revision("sb-1", SUPERVISOR_PROTOCOL_REVISION + 1).unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(error.message().contains("revision mismatch"));
     }

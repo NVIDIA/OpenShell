@@ -476,7 +476,9 @@ quickly.
 ## Supervisor Configuration Delivery
 
 The gateway and supervisor must implement the same internal supervisor protocol
-revision. The gateway includes a configuration bootstrap when it accepts a
+revision. Peers built before the handshake existed report revision zero and are
+accepted for one release with a warning and a counter, because sandboxes keep
+their supervisor binary until they are recreated. The gateway includes a configuration bootstrap when it accepts a
 `ConnectSupervisor` session and can send complete component replacements on the
 same stream after policy, settings, or provider state changes.
 Bootstrap construction does not gate the session while polling remains

@@ -2517,6 +2517,7 @@ message SupervisorHello {
   // Supervisor instance ID (e.g. boot id or process epoch).
   string instance_id = 2;
   // Exact internal stream protocol revision implemented by this supervisor.
+  // Zero identifies a supervisor built before the handshake existed.
   uint32 protocol_revision = 3;
 }
 

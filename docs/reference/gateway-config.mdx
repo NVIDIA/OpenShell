@@ -108,6 +108,8 @@ disable_tls = false
 default_image           = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 # Defaults to the gateway version. Custom builds must match the gateway's
 # internal supervisor protocol revision; mismatched peers reject the session.
+# Supervisors from releases before the handshake existed still connect, with
+# a gateway warning, until the next release.
 # supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
 client_tls_secret_name  = "openshell-client-tls"
 service_account_name    = "openshell-sandbox"
