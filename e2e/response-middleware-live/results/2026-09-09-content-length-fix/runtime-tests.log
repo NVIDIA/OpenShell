@@ -1,0 +1,137 @@
+   Compiling openshell-core v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-core)
+   Compiling openshell-supervisor-middleware-builtins v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-supervisor-middleware-builtins)
+   Compiling openshell-supervisor-middleware v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-supervisor-middleware)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.60s
+     Running unittests src/lib.rs (target/debug/deps/openshell_supervisor_middleware-1dc8f308418208e3)
+
+running 121 tests
+test headers::tests::protected_header_remove_is_rejected_even_when_not_visible ... ok
+test headers::tests::existing_header_write_obeys_collision_action ... ok
+test headers::tests::empty_response_trailers_accept_pass_through ... ok
+test headers::tests::connection_nominated_header_is_protected ... ok
+test headers::tests::existing_credential_placeholder_header_value_is_preserved ... ok
+test headers::tests::credential_placeholder_header_values_are_rejected ... ok
+test headers::tests::protected_header_write_is_rejected ... ok
+test headers::tests::remove_drops_every_case_insensitive_value ... ok
+test headers::tests::request_write_accepts_end_to_end_header_without_namespace ... ok
+test headers::tests::response_authority_allows_end_to_end_writes_and_integrity_removal ... ok
+test headers::tests::response_authority_rejects_framing_and_integrity_writes ... ok
+test headers::tests::response_authority_keeps_visible_body_metadata_read_only ... ok
+test headers::tests::response_trailer_pass_through_preserves_fields_and_order ... ok
+test headers::tests::response_trailer_mutations_modify_remove_and_preserve_order ... ok
+test headers::tests::response_trailer_write_cannot_introduce_an_absent_name ... ok
+test headers::tests::response_trailer_removal_of_an_absent_name_is_a_noop ... ok
+test headers::tests::unsafe_header_value_is_rejected ... ok
+test headers::tests::response_authority_protects_credential_headers_from_writes_and_removals ... ok
+test response::tests::stream_mode_requires_only_one_byte_of_payload_capacity ... ok
+test response::tests::headers_only_preflight_applies_end_to_end_mutation ... ok
+test response::tests::preflight_can_be_read_before_open_returns ... ok
+test headers::tests::response_trailer_protected_fields_cannot_be_mutated ... ok
+test response::tests::response_trailers_are_mutated_by_body_stage ... ok
+test response::tests::stream_mode_transforms_lockstep_units_and_preserves_trailers ... ok
+test response::tests::deleted_and_skip_remaining_units_release_body_accounting ... ok
+test response::tests::whole_body_mode_releases_replacement_only_at_finish ... ok
+test response::tests::mixed_profile_chain_respects_policy_order_and_whole_body_barrier ... ok
+test response::tests::skip_reason_code_is_retained_and_oversized_reason_obeys_on_error ... ok
+test response::tests::invalid_trailer_mutations_are_atomic_and_keep_failure_diagnostics ... ok
+test response::tests::invalid_sequence_obeys_fail_open_and_fail_closed ... ok
+test response::tests::body_inspection_restrictions_obey_fail_open_and_fail_closed ... ok
+test response::tests::stream_unit_limit_never_exceeds_platform_cap ... ok
+test tests::advertised_audience_mismatch_fails_registration ... ok
+test response::tests::multiple_whole_body_barriers_preserve_accounting_on_overflow_and_expiry ... ok
+test response::tests::whole_body_overflow_obeys_fail_open_and_fail_closed ... ok
+test tests::applies_fixed_regex_replacements ... ok
+test tests::connection_nominated_write_and_remove_are_rejected_after_filtering ... ok
+test tests::builtin_regex_redacts_after_fail_open_message_capacity_gap ... ok
+test tests::deny_decision_short_circuits_chain ... ok
+test tests::describe_chain_sorts_by_order_then_name ... ok
+test tests::describe_chain_accepts_maximum_selected_stages ... ok
+test tests::empty_websocket_chain_skips_describe_and_preflight ... ok
+test tests::descriptors_are_resolved_from_any_middleware_service ... ok
+test tests::credential_placeholder_header_mutation_follows_on_error ... ok
+test tests::external_manifest_rejects_operator_limit_above_capability ... ok
+test tests::deny_decision_ignores_oversized_replacement_under_fail_open ... ok
+test tests::builtin_regex_redacts_ordered_websocket_text_messages ... ok
+test tests::deny_decision_ignores_unsafe_mutations_under_fail_open ... ok
+test tests::external_header_mutation_failure_uses_platform_reason ... ok
+test tests::explicit_websocket_preflight_denial_is_authoritative_for_both_error_modes ... ok
+test tests::external_diagnostics_are_normalized_before_reaching_logs ... ok
+test tests::describe_chain_rejects_selected_stages_over_capacity ... ok
+test tests::external_registration_name_is_stable_and_cannot_shadow_builtins ... ok
+test tests::external_registration_rejects_payload_limit_above_platform_maximum ... ok
+test tests::external_registration_rejects_unsupported_grpc_endpoint_scheme ... ok
+test tests::external_websocket_binding_requires_operator_payload_limit ... ok
+test tests::fail_closed_denies_unavailable_middleware ... ok
+test tests::fail_open_allows_unavailable_middleware ... ok
+test tests::http_only_attachments_are_reported_but_do_not_select_websocket_stages ... ok
+test tests::http_only_attachment_allows_33_requested_subprotocols ... ok
+test tests::grpc_envelope_headroom_matches_bounded_components ... ok
+test tests::external_websocket_binding_rejects_operator_limit_above_capability ... ok
+test tests::finding_overflow_is_an_invalid_response_governed_by_on_error ... ok
+test tests::describe_chain_marks_resolved_and_unresolved_entries ... ok
+test tests::external_registration_accepts_http_and_https_grpc_endpoints ... ok
+test tests::in_process_stages_share_one_borrowed_request_envelope ... ok
+test tests::in_process_websocket_endpoint_redacts_openai_event ... ok
+test tests::manifest_accepts_http_response_pre_return_binding_when_dispatch_is_available ... ok
+test tests::manifest_accepts_forward_websocket_binding_and_reserves_return_phase ... ok
+test tests::in_process_request_middleware_writes_end_to_end_header_without_namespace ... ok
+test tests::invalid_reason_code_is_a_middleware_failure ... ok
+test tests::manifest_binding_timeout_enforces_bounds ... ok
+test tests::manifest_rejects_duplicate_operation_phase_pairs ... ok
+test tests::malformed_response_headers_fail_open_continues ... ok
+test tests::metadata_and_findings_are_namespaced_per_config ... ok
+test tests::injected_services_cannot_duplicate_middleware_names ... ok
+test tests::manifest_rejects_payload_limit_above_platform_maximum ... ok
+test tests::mixed_builtin_and_external_chain_uses_operator_limit ... ok
+test tests::mixed_websocket_preflight_denial_ends_every_opened_stage ... ok
+test tests::injected_service_names_drive_registration_checks ... ok
+test tests::malformed_response_headers_fail_closed_denies ... ok
+test tests::later_middleware_observes_prior_header_mutations ... ok
+test response::tests::response_body_timeout_obeys_fail_open_and_fail_closed ... ok
+test response::tests::preflight_opening_failure_obeys_policy_and_releases_admission ... ok
+test tests::maximum_chain_retains_findings_from_every_stage ... ok
+test tests::mixed_websocket_session_keeps_message_admission_while_one_stage_is_active ... ok
+test tests::binding_timeout_override_controls_evaluation_and_on_error ... ok
+test tests::oversized_replacement_body_honors_on_error ... ok
+test tests::oversized_request_body_honors_on_error ... ok
+test tests::per_stage_validator_allows_compliant_transformations ... ok
+test tests::per_stage_validation_denies_before_the_next_stage_runs ... ok
+test tests::registration_timeout_enforces_bounds ... ok
+test tests::registration_timeout_uses_default_and_operator_override ... ok
+test tests::per_stage_validator_error_becomes_structured_denial ... ok
+test tests::replacement_body_allocation_moves_through_next_stage_and_outcome ... ok
+test tests::repeated_request_headers_reach_middleware_in_wire_order ... ok
+test tests::undersized_stage_fails_open_while_later_stage_runs ... ok
+test tests::websocket_queue_exhaustion_remains_a_protocol_failure ... ok
+test tests::transformed_body_feeds_next_stage ... ok
+test tests::unspecified_decision_uses_fail_closed ... ok
+test tests::transformed_body_still_over_later_stage_capacity_honors_on_error ... ok
+test tests::external_registry_attaches_same_service_under_multiple_names ... ok
+test tests::websocket_admission_wait_queue_is_bounded ... ok
+test tests::unsupported_binary_messages_advance_sequence_without_applying_on_error ... ok
+test tests::operator_timeout_controls_binding_without_manifest_override ... ok
+test tests::in_process_evaluation_remains_interruptible_by_stage_timeout ... ok
+test websocket::tests::disabling_stage_sends_middleware_failure_once ... ok
+test websocket::tests::protobuf_rejects_invalid_utf8_text_payload ... ok
+test websocket::tests::replacement_presence_preserves_empty_text_and_rejects_type_changes ... ok
+test websocket::tests::session_end_refines_only_protocol_errors ... ok
+test tests::websocket_session_budget_survives_registry_replacement ... ok
+test tests::websocket_session_capacity_exhaustion_honors_mixed_on_error ... ok
+test tests::websocket_session_budget_caps_idle_inspecting_sessions_and_releases_on_end ... ok
+test tests::operator_timeout_caps_longer_binding_timeout_for_validation_and_evaluation ... ok
+test response::tests::remote_service_executes_through_http_response_pre_return_rpc ... ok
+test response::tests::expanding_stages_obey_aggregate_budget_and_failure_policy ... ok
+test tests::fail_open_disables_broken_websocket_stage_for_later_messages ... ok
+test tests::websocket_preflight_skip_removes_stage_without_message_calls ... ok
+test tests::openai_websocket_event_is_introspected_and_redacted ... ok
+test tests::remote_transport_accepts_maximum_bounded_request_and_response_envelopes ... ok
+test tests::in_process_validation_remains_interruptible_by_binding_timeout ... ok
+
+test result: ok. 121 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+
+   Doc-tests openshell_supervisor_middleware
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

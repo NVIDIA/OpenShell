@@ -1,0 +1,29 @@
+   Compiling openshell-core v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-core)
+   Compiling openshell-supervisor-middleware v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-supervisor-middleware)
+   Compiling openshell-router v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-router)
+   Compiling openshell-policy v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-policy)
+   Compiling openshell-supervisor-middleware-builtins v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-supervisor-middleware-builtins)
+   Compiling openshell-supervisor-network v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-supervisor-network)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.72s
+     Running unittests src/lib.rs (target/debug/deps/openshell_supervisor_network-87915103312047d6)
+
+running 1 test
+test l7::rest::tests::response_middleware_preflight_keeps_read_only_content_length ... FAILED
+
+failures:
+
+---- l7::rest::tests::response_middleware_preflight_keeps_read_only_content_length stdout ----
+
+thread 'l7::rest::tests::response_middleware_preflight_keeps_read_only_content_length' (1899071) panicked at crates/openshell-supervisor-network/src/l7/rest.rs:7702:9:
+assertion `left == right` failed
+  left: [HttpHeader { name: "content-encoding", value: "gzip" }, HttpHeader { name: "content-range", value: "bytes 0-4/10" }]
+ right: [HttpHeader { name: "content-length", value: "5" }, HttpHeader { name: "content-encoding", value: "gzip" }, HttpHeader { name: "content-range", value: "bytes 0-4/10" }]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    l7::rest::tests::response_middleware_preflight_keeps_read_only_content_length
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1306 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p openshell-supervisor-network --lib`

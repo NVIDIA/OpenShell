@@ -8,7 +8,9 @@ The fixture is not wired into CI. It uses a dedicated local gateway, fixed ports
 
 [The 2026-09-09 snapshot](results/2026-09-09/README.md) contains the report, charts, raw timing samples, and every final case's request configuration, response, and middleware events. It tested commit `555ff32896a225020b670902a601707624bbadc5`: 85 of 86 live cases passed, as did 65 selected runtime/relay regression tests.
 
-The failing case, `preflight-content-length-contract`, checks that middleware receives the upstream Content-Length. The protocol promises that metadata, but the tested relay omitted it. This branch preserves the reproducer; it does not fix the runtime.
+The original failing case, `preflight-content-length-contract`, checks that middleware receives the upstream Content-Length. The recorded revision omitted it. The current relay exposes it as read-only metadata and emits downstream framing separately; the case remains a regression check. The original results snapshot is unchanged.
+
+[The fix validation snapshot](results/2026-09-09-content-length-fix/README.md) records 86/86 passing live cases and 14/14 passing chain-event checks after rebuilding the supervisor with the fix.
 
 ## Setup
 

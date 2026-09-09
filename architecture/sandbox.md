@@ -194,7 +194,10 @@ The same selected chain can inspect the matching final HTTP response before it
 returns to the workload. Response stages select header-only, whole-body, or
 streaming mode independently. The relay preserves upstream framing for a
 header-only chain and owns normalized downstream framing only when body bytes
-can change. Whole-body stages delay commitment and share one non-resetting,
+can change. Preflight exposes the upstream Content-Length as read-only metadata;
+the relay emits the final framing separately so transformations cannot retain
+a stale length or duplicate the header. Whole-body stages delay commitment and
+share one non-resetting,
 120-second accumulation deadline per response, defined in the response relay.
 Body stages receive a final body result and then one trailer exchange;
 trailer mutations can only change or remove

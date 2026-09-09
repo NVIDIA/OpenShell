@@ -1,0 +1,86 @@
+PASS baseline {"status": true, "curl_code": true, "body": true}
+PASS single-1-pass {"status": true, "curl_code": true, "body": true}
+PASS single-1-skip {"status": true, "curl_code": true, "body": true}
+PASS single-1-header {"status": true, "curl_code": true, "body": true, "header": true}
+PASS single-1-preflight-block {"status": true, "curl_code": true, "canonical_error": true}
+PASS single-2-pass {"status": true, "curl_code": true, "body": true}
+PASS single-2-skip {"status": true, "curl_code": true, "body": true}
+PASS single-2-header {"status": true, "curl_code": true, "body": true, "header": true}
+PASS single-2-preflight-block {"status": true, "curl_code": true, "canonical_error": true}
+PASS single-3-pass {"status": true, "curl_code": true, "body": true}
+PASS single-3-skip {"status": true, "curl_code": true, "body": true}
+PASS single-3-header {"status": true, "curl_code": true, "body": true, "header": true}
+PASS single-3-preflight-block {"status": true, "curl_code": true, "canonical_error": true}
+PASS single-2-transform {"status": true, "curl_code": true, "body": true, "absent_header": true}
+PASS single-2-delete {"status": true, "curl_code": true, "body": true}
+PASS single-2-body-block {"status": true, "curl_code": true, "canonical_error": true}
+PASS single-2-skip-remaining {"status": true, "curl_code": true, "body": true}
+PASS single-2-invalid_sequence-fail_open {"status": true, "curl_code": true, "body": true}
+PASS single-2-invalid_sequence-fail_closed {"status": true, "curl_code": true, "canonical_error": true}
+PASS single-2-timeout-fail_open {"status": true, "curl_code": true, "body": true}
+PASS single-2-timeout-fail_closed {"status": true, "curl_code": true, "canonical_error": true}
+PASS single-2-abort-fail_open {"status": true, "curl_code": true, "body": true}
+PASS single-2-abort-fail_closed {"status": true, "curl_code": true, "canonical_error": true}
+PASS single-3-transform {"status": true, "curl_code": true, "body": true, "absent_header": true}
+PASS single-3-delete {"status": true, "curl_code": true, "body": true}
+PASS single-3-body-block {"status": true, "curl_code": true, "body": true}
+PASS single-3-skip-remaining {"status": true, "curl_code": true, "body": true}
+PASS single-3-invalid_sequence-fail_open {"status": true, "curl_code": true, "body": true}
+PASS single-3-invalid_sequence-fail_closed {"status": true, "curl_code": true, "body": true}
+PASS single-3-timeout-fail_open {"status": true, "curl_code": true, "body": true}
+PASS single-3-timeout-fail_closed {"status": true, "curl_code": true, "body": true}
+PASS single-3-abort-fail_open {"status": true, "curl_code": true, "body": true}
+PASS single-3-abort-fail_closed {"status": true, "curl_code": true, "body": true}
+PASS preflight-timeout-fail_open {"status": true, "curl_code": true, "body": true}
+PASS preflight-abort-fail_open {"status": true, "curl_code": true, "body": true}
+PASS preflight-invalid-mode-fail_open {"status": true, "curl_code": true, "body": true}
+PASS protected-header-fail_open {"status": true, "curl_code": true, "body": true}
+PASS preflight-timeout-fail_closed {"status": true, "curl_code": true, "canonical_error": true}
+PASS preflight-abort-fail_closed {"status": true, "curl_code": true, "canonical_error": true}
+PASS preflight-invalid-mode-fail_closed {"status": true, "curl_code": true, "canonical_error": true}
+PASS protected-header-fail_closed {"status": true, "curl_code": true, "canonical_error": true}
+PASS pair-1-1 {"status": true, "curl_code": true, "body": true, "header": true}
+PASS pair-1-2 {"status": true, "curl_code": true, "body": true, "header": true}
+PASS pair-1-3 {"status": true, "curl_code": true, "body": true, "header": true}
+PASS pair-2-1 {"status": true, "curl_code": true, "body": true, "header": true}
+PASS pair-2-2 {"status": true, "curl_code": true, "body": true, "header": true}
+PASS pair-2-3 {"status": true, "curl_code": true, "body": true, "header": true}
+PASS pair-3-1 {"status": true, "curl_code": true, "body": true, "header": true}
+PASS pair-3-2 {"status": true, "curl_code": true, "body": true, "header": true}
+PASS pair-3-3 {"status": true, "curl_code": true, "body": true, "header": true}
+PASS triple-2-2-2 {"status": true, "curl_code": true, "body": true}
+PASS triple-3-3-3 {"status": true, "curl_code": true, "body": true}
+PASS triple-1-2-3 {"status": true, "curl_code": true, "body": true}
+PASS triple-3-2-3 {"status": true, "curl_code": true, "body": true}
+PASS triple-2-3-2 {"status": true, "curl_code": true, "body": true}
+PASS skip-stage-continues-chain {"status": true, "curl_code": true, "body": true}
+PASS skip-transform-continues-chain {"status": true, "curl_code": true, "body": true}
+PASS fail-open-continues-chain {"status": true, "curl_code": true, "body": true}
+PASS block-overrides-fail-open {"status": true, "curl_code": true, "canonical_error": true}
+PASS stream-then-whole-block {"status": true, "curl_code": true, "canonical_error": true}
+PASS whole-then-stream-block {"status": true, "curl_code": true, "canonical_error": true}
+PASS late-stream-block {"status": true, "curl_code": true, "body": true}
+PASS stream-split-token {"status": true, "curl_code": true, "body": true}
+PASS whole-split-token {"status": true, "curl_code": true, "body": true}
+PASS empty-2 {"status": true, "curl_code": true, "body": true}
+PASS trailers-2 {"status": true, "curl_code": true, "body": true, "header": true}
+PASS empty-3 {"status": true, "curl_code": true, "body": true}
+PASS trailers-3 {"status": true, "curl_code": true, "body": true, "header": true}
+PASS headers-only-bodyless {"status": true, "curl_code": true, "body": true, "modes": true}
+PASS illegal-whole-bodyless {"status": true, "curl_code": true, "canonical_error": true}
+PASS headers-only-range {"status": true, "curl_code": true, "modes": true}
+PASS illegal-whole-range {"status": true, "curl_code": true, "canonical_error": true}
+PASS headers-only-encoded {"status": true, "curl_code": true, "modes": true}
+PASS illegal-whole-encoded {"status": true, "curl_code": true, "canonical_error": true}
+PASS headers-only-no-transform {"status": true, "curl_code": true, "modes": true}
+PASS illegal-whole-no-transform {"status": true, "curl_code": true, "canonical_error": true}
+PASS head {"status": true, "curl_code": true, "modes": true}
+PASS small-limit-stream {"status": true, "curl_code": true, "body": true}
+PASS small-limit-whole-known-closed {"status": true, "curl_code": true, "canonical_error": true}
+PASS small-limit-whole-unknown-closed {"status": true, "curl_code": true, "canonical_error": true}
+PASS small-limit-whole-unknown-open {"status": true, "curl_code": true, "body": true}
+PASS different-limits-and-modes {"status": true, "curl_code": true, "body": true}
+PASS growth-over-next-stage-limit {"status": true, "curl_code": true, "canonical_error": true}
+PASS preflight-content-length-contract {"status": true, "curl_code": true, "body": true, "preflight_header": true}
+PASS stream-over-total-limit {"status": true, "curl_code": true, "body": true}
+PASS stream-pair-over-total-limit {"status": true, "curl_code": true, "body": true}

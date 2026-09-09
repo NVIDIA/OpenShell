@@ -4176,7 +4176,7 @@ fn parse_response_head_for_middleware(header_bytes: &[u8]) -> Result<ParsedRespo
         validate_http_field_name(name)?;
         validate_http_field_value(value.trim())?;
         let name = name.to_ascii_lowercase();
-        if nominated.contains(&name) || is_protected_response_field(&name) {
+        if nominated.contains(&name) || is_hidden_response_field(&name) {
             continue;
         }
         headers.push(HttpHeader {
@@ -4232,10 +4232,13 @@ fn validate_http_field_value(value: &str) -> Result<()> {
 }
 
 fn is_protected_response_field(name: &str) -> bool {
+    name.eq_ignore_ascii_case("content-length") || is_hidden_response_field(name)
+}
+
+fn is_hidden_response_field(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "connection"
-            | "content-length"
             | "keep-alive"
             | "proxy-authenticate"
             | "proxy-authorization"
@@ -4273,6 +4276,11 @@ fn serialize_response_head(
 ) -> Vec<u8> {
     let mut output = format!("{status_line}\r\n");
     for header in headers {
+        // Content-Length is read-only preflight metadata. The relay emits the
+        // final framing below, after any body transformation or mode change.
+        if header.name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
         output.push_str(&header.name);
         output.push_str(": ");
         output.push_str(&header.value);
@@ -7691,6 +7699,71 @@ mod tests {
         let mut delivered = Vec::new();
         client_read.read_to_end(&mut delivered).await.unwrap();
         (outcome, delivered)
+    }
+
+    #[test]
+    fn response_middleware_preflight_keeps_read_only_content_length() {
+        let parsed = parse_response_head_for_middleware(
+            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Encoding: gzip\r\nContent-Range: bytes 0-4/10\r\nConnection: keep-alive, x-internal\r\nKeep-Alive: timeout=5\r\nX-Internal: hidden\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.headers,
+            vec![
+                HttpHeader {
+                    name: "content-length".into(),
+                    value: "5".into()
+                },
+                HttpHeader {
+                    name: "content-encoding".into(),
+                    value: "gzip".into()
+                },
+                HttpHeader {
+                    name: "content-range".into(),
+                    value: "bytes 0-4/10".into()
+                },
+            ]
+        );
+
+        // Connection-nominated fields remain hidden even when otherwise visible.
+        let nominated = parse_response_head_for_middleware(
+            b"HTTP/1.1 200 OK\r\nConnection: Content-Length\r\nContent-Length: 5\r\n\r\n",
+        )
+        .unwrap();
+        assert!(nominated.headers.is_empty());
+    }
+
+    #[test]
+    fn response_middleware_serializes_only_relay_owned_framing() {
+        let headers = vec![
+            HttpHeader {
+                name: "content-length".into(),
+                value: "5".into(),
+            },
+            HttpHeader {
+                name: "Content-Length".into(),
+                value: "5".into(),
+            },
+            HttpHeader {
+                name: "content-type".into(),
+                value: "text/plain".into(),
+            },
+        ];
+        for (framing, expected) in [
+            (
+                ResponseFraming::Preserve(BodyLength::ContentLength(5)),
+                "Content-Length: 5\r\n",
+            ),
+            (ResponseFraming::ContentLength(9), "Content-Length: 9\r\n"),
+            (ResponseFraming::Chunked, "Transfer-Encoding: chunked\r\n"),
+            (ResponseFraming::Preserve(BodyLength::None), ""),
+        ] {
+            let output = serialize_response_head("HTTP/1.1 200 OK", &headers, framing, false, &[]);
+            assert_eq!(
+                String::from_utf8(output).unwrap(),
+                format!("HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n{expected}\r\n")
+            );
+        }
     }
 
     #[tokio::test]

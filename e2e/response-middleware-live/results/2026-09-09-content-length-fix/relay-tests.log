@@ -1,0 +1,71 @@
+   Compiling openshell-core v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-core)
+   Compiling openshell-policy v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-policy)
+   Compiling openshell-router v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-router)
+   Compiling openshell-supervisor-middleware v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-supervisor-middleware)
+   Compiling openshell-supervisor-middleware-builtins v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-supervisor-middleware-builtins)
+   Compiling openshell-supervisor-network v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-supervisor-network)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.03s
+     Running unittests src/lib.rs (target/debug/deps/openshell_supervisor_network-87915103312047d6)
+
+running 34 tests
+test l7::rest::tests::response_middleware_ocsf_events_omit_content_headers_and_free_form_reasons ... ok
+test l7::rest::tests::response_middleware_fail_open_dual_emits_sanitized_findings ... ok
+test l7::relay::tests::response_middleware_context_reuses_exchange_request_id ... ok
+test l7::rest::tests::response_middleware_preflight_keeps_read_only_content_length ... ok
+test l7::rest::tests::response_middleware_serializes_only_relay_owned_framing ... ok
+test l7::rest::tests::response_middleware_client_disconnect_aborts_stream_delivery ... ok
+test l7::rest::tests::response_middleware_fail_closed_after_commit_aborts_without_replacement ... ok
+test l7::rest::tests::response_middleware_head_failure_reports_body_length_without_body ... ok
+test l7::rest::tests::response_middleware_preflight_block_returns_canonical_403 ... ok
+test l7::rest::tests::response_middleware_fail_closed_before_commit_returns_canonical_502 ... ok
+test l7::rest::tests::response_middleware_head_block_reports_length_without_body ... ok
+test l7::rest::tests::response_middleware_preserves_baseline_connection_outcomes ... ok
+test l7::rest::tests::response_middleware_forwards_interim_head_before_final_preflight ... ok
+test l7::rest::tests::response_middleware_handles_bodyless_responses_without_body_events ... ok
+test l7::rest::tests::response_middleware_streams_normalized_chunks_and_preserves_trailers ... ok
+test l7::rest::tests::response_middleware_whole_body_block_returns_403_before_commit ... ok
+test l7::rest::tests::response_middleware_stream_block_aborts_after_commit_without_error_bytes ... ok
+test l7::rest::tests::response_middleware_streams_close_delimited_body_with_owned_framing ... ok
+test l7::rest::tests::response_middleware_whole_body_delays_commit_and_sets_length ... ok
+test l7::rest::tests::response_middleware_unbound_chains_preserve_ordinary_headers ... ok
+test l7::rest::tests::response_middleware_bypasses_protocol_upgrades ... ok
+test l7::rest::tests::response_middleware_headers_only_mutates_head_and_preserves_framing ... ok
+test l7::rest::tests::response_middleware_rejects_malformed_or_protected_upstream_trailers_atomically ... ok
+test l7::rest::tests::response_middleware_selected_hook_enforces_header_limits ... ok
+test l7::rest::tests::response_middleware_rejects_malformed_response_fields_before_commit ... ok
+test l7::rest::tests::response_middleware_headers_only_preserves_chunked_and_close_delimited_bodies ... ok
+test l7::rest::tests::response_middleware_fail_open_preserves_input_before_and_after_commit ... ok
+test l7::rest::tests::response_middleware_never_uses_chunked_framing_for_http_10 ... ok
+test l7::rest::tests::response_middleware_flushes_partial_framed_payload_promptly ... ok
+test l7::rest::tests::response_middleware_expiry_preserves_bytes_through_slow_stream_and_client ... ok
+test proxy::tests::plaintext_forward_relay_applies_response_middleware ... ok
+test l7::rest::tests::response_middleware_whole_body_timeout_obeys_failure_policy ... ok
+test l7::rest::tests::response_middleware_stale_policy_generation_aborts_before_preflight ... ok
+test l7::rest::tests::response_middleware_whole_body_timeout_does_not_reset_for_trickle_input ... ok
+
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 1273 filtered out; finished in 0.06s
+
+     Running tests/accept_fd_exhaustion.rs (target/debug/deps/accept_fd_exhaustion-a2743d6692f17827)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/sigv4_localstack.rs (target/debug/deps/sigv4_localstack-f2d4d7cd500d4ee3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/system_inference.rs (target/debug/deps/system_inference-c30a5c4b68046428)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/websocket_upgrade.rs (target/debug/deps/websocket_upgrade-140fcc4868f868cb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
