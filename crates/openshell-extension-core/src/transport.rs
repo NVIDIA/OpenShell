@@ -292,7 +292,6 @@ mod tests {
 
     #[tokio::test]
     async fn custom_ca_verifies_certificate_and_hostname() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let ca_key = KeyPair::generate().unwrap();
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);

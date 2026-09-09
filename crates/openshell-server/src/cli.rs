@@ -230,10 +230,6 @@ pub async fn run_cli() -> Result<()> {
 
 /// Run the gateway CLI with the compute drivers linked by the binary.
 pub async fn run_cli_with_compute_drivers(compute_drivers: ComputeDriverRegistry) -> Result<()> {
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .map_err(|e| miette::miette!("failed to install rustls crypto provider: {e:?}"))?;
-
     let matches = command().get_matches();
     let cli = Cli::from_arg_matches(&matches).expect("clap validated args");
 

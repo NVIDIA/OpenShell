@@ -3,9 +3,7 @@
 
 mod helpers;
 
-use helpers::{
-    EnvVarGuard, build_ca, build_client_cert, build_server_cert, install_rustls_provider,
-};
+use helpers::{EnvVarGuard, build_ca, build_client_cert, build_server_cert};
 use openshell_bootstrap::{get_gateway_metadata, load_active_gateway};
 use openshell_cli::{
     run,
@@ -651,8 +649,6 @@ fn isolated_gateway_add_env(
 
 #[tokio::test]
 async fn gateway_add_mtls_loopback_uses_explicit_gateway_name() {
-    install_rustls_provider();
-
     let (ca, ca_key) = build_ca();
     let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
     let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
@@ -695,8 +691,6 @@ async fn gateway_add_mtls_loopback_uses_explicit_gateway_name() {
 
 #[tokio::test]
 async fn gateway_add_mtls_loopback_without_name_uses_openshell_default() {
-    install_rustls_provider();
-
     let (ca, ca_key) = build_ca();
     let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
     let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
@@ -738,8 +732,6 @@ async fn gateway_add_mtls_loopback_without_name_uses_openshell_default() {
 
 #[tokio::test]
 async fn gateway_add_mtls_loopback_explicit_name_does_not_fallback_to_openshell_certs() {
-    install_rustls_provider();
-
     let (ca, ca_key) = build_ca();
     let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
     let ca_cert = ca.pem();
@@ -777,7 +769,6 @@ async fn gateway_add_mtls_loopback_explicit_name_does_not_fallback_to_openshell_
 #[tokio::test]
 async fn cli_connects_with_client_cert() {
     let _env = EnvVarGuard::set(&[]);
-    install_rustls_provider();
 
     let (ca, ca_key) = build_ca();
     let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
@@ -803,8 +794,6 @@ async fn cli_connects_with_client_cert() {
 
 #[tokio::test]
 async fn cli_requires_client_cert_for_https() {
-    install_rustls_provider();
-
     let (ca, ca_key) = build_ca();
     let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
     let ca_cert = ca.pem();
@@ -851,7 +840,6 @@ async fn run_server_no_client_auth(
 #[tokio::test]
 async fn cli_connects_with_gateway_insecure() {
     let _env = EnvVarGuard::set(&[]);
-    install_rustls_provider();
 
     let (ca, ca_key) = build_ca();
     let (server_cert, server_key) = build_server_cert(&ca, &ca_key);

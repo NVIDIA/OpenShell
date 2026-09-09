@@ -1610,9 +1610,8 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::{
-        compute::GatewayListenerRequirement,
-        gateway_listener::GatewayListenerSpec,
-        tls_test_utils::{generate_test_certs_with_ca, install_rustls_provider},
+        compute::GatewayListenerRequirement, gateway_listener::GatewayListenerSpec,
+        tls_test_utils::generate_test_certs_with_ca,
     };
 
     static DETECTION_PROBE_ORDER: LazyLock<Mutex<Vec<&'static str>>> =
@@ -1773,8 +1772,6 @@ mod tests {
     }
 
     fn test_tls_acceptor() -> (TempDir, TlsAcceptor) {
-        install_rustls_provider();
-
         let dir = tempdir().expect("failed to create tempdir");
         generate_test_certs_with_ca(dir.path());
 
