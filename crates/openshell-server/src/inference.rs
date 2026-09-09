@@ -940,6 +940,7 @@ async fn verify_provider_endpoint(
     model_id: &str,
     route: &ResolvedProviderRoute,
 ) -> Result<ValidatedEndpoint, Status> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()

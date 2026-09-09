@@ -2392,7 +2392,7 @@ fn run_main() -> Result<()> {
 async fn run_async() -> Result<()> {
     // Install the rustls crypto provider before completion runs — completers may
     // establish TLS connections to the gateway.
-    rustls::crypto::ring::default_provider()
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .map_err(|e| miette::miette!("failed to install rustls crypto provider: {e:?}"))?;
 

@@ -407,6 +407,7 @@ impl JwksCache {
             );
         }
 
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let http = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()

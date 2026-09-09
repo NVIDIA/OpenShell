@@ -1133,7 +1133,7 @@ mod tests {
     /// `ClientConfig` (for an `https://` proxy) requires it; the install is
     /// idempotent, so tests that build TLS configs call this first.
     fn install_crypto_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     }
 
     #[test]
@@ -2013,7 +2013,7 @@ mod tests {
 
         const SERVER_HOSTNAME: &str = "upstream.example.test";
 
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         // Trusted CA; the client config trusts it, and the fake upstream
         // server presents a leaf for SERVER_HOSTNAME signed by it.

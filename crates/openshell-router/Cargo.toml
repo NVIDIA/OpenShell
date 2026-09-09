@@ -14,6 +14,7 @@ repository.workspace = true
 openshell-core = { path = "../openshell-core", default-features = false }
 bytes = { workspace = true }
 reqwest = { workspace = true }
+rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

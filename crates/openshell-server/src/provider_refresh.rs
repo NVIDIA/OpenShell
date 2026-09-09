@@ -1537,6 +1537,7 @@ async fn request_token(
         }
     }
 
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()

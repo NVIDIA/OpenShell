@@ -1104,6 +1104,7 @@ mod tests {
             .await;
 
         let route = test_route(&mock_server.uri(), &["model_discovery"], AuthHeader::Bearer);
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::new();
         let result = proxy_to_backend(
             &client,
@@ -1151,6 +1152,7 @@ mod tests {
     #[tokio::test]
     async fn read_capped_response_body_rejects_over_cap_chunked() {
         let addr = spawn_chunked_upstream(&["aaaa", "bbbb", "cccc"]).await;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let response = reqwest::Client::new()
             .get(format!("http://{addr}/"))
             .send()
@@ -1172,6 +1174,7 @@ mod tests {
     #[tokio::test]
     async fn read_capped_response_body_accepts_body_at_cap() {
         let addr = spawn_chunked_upstream(&["aaaa", "bbbb"]).await;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let response = reqwest::Client::new()
             .get(format!("http://{addr}/"))
             .send()
@@ -1358,6 +1361,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::builder().build().unwrap();
         let validated = verify_backend_endpoint(&client, &route).await.unwrap();
 
@@ -1373,6 +1377,7 @@ mod tests {
             AuthHeader::Bearer,
         );
 
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::builder().build().unwrap();
         let validated = verify_backend_endpoint(&client, &route).await.unwrap();
 
@@ -1402,6 +1407,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::builder().build().unwrap();
         let validated = verify_backend_endpoint(&client, &route).await.unwrap();
 
@@ -1445,6 +1451,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::builder().build().unwrap();
         let validated = verify_backend_endpoint(&client, &route).await.unwrap();
 
@@ -1491,6 +1498,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::new();
         let validated = verify_backend_endpoint(&client, &route)
             .await
@@ -1526,6 +1534,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::new();
         let err = verify_backend_endpoint(&client, &route)
             .await
@@ -1629,6 +1638,7 @@ mod tests {
 
     /// Helper: run `verify_backend_endpoint` and return the expected failure.
     async fn reqwest_verify(route: &ResolvedRoute) -> ValidationFailure {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         verify_backend_endpoint(&reqwest::Client::new(), route)
             .await
             .expect_err("validation should fail")
@@ -1651,6 +1661,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::builder().build().unwrap();
         let result = verify_backend_endpoint(&client, &route).await;
 
@@ -1691,6 +1702,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::builder().build().unwrap();
         let validated = verify_backend_endpoint(&client, &route).await.unwrap();
         assert!(
@@ -1897,6 +1909,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::builder().build().unwrap();
         let body = bytes::Bytes::from(
             serde_json::to_vec(&serde_json::json!({
@@ -1966,6 +1979,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::builder().build().unwrap();
         // Simulate a client (e.g. Claude Code) that always sends "model" in the body.
         let body = bytes::Bytes::from(
@@ -2028,6 +2042,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::builder().build().unwrap();
         let body = bytes::Bytes::from(
             serde_json::to_vec(&serde_json::json!({
@@ -2086,6 +2101,7 @@ mod tests {
             request_path_override: None,
         };
 
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::builder().build().unwrap();
         let body = bytes::Bytes::from(
             serde_json::to_vec(&serde_json::json!({
@@ -2212,6 +2228,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::builder().build().unwrap();
         let body = bytes::Bytes::from(
             serde_json::to_vec(&serde_json::json!({
@@ -2274,6 +2291,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::builder().build().unwrap();
         let body = bytes::Bytes::from(
             serde_json::to_vec(&serde_json::json!({
@@ -2338,6 +2356,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::builder().build().unwrap();
         let body = bytes::Bytes::from(
             serde_json::to_vec(&serde_json::json!({
@@ -2557,6 +2576,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
@@ -2674,6 +2694,7 @@ mod tests {
         }))
         .unwrap();
 
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::new();
         let result = proxy_to_backend(
             &client,
@@ -2701,6 +2722,7 @@ mod tests {
     /// but if it ever did, we must not silently forward.
     #[test]
     fn bedrock_route_rejects_non_bedrock_path() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::new();
         let route = test_route(
             "https://bedrock-bridge.example",

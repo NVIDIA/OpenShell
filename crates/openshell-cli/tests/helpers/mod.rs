@@ -160,12 +160,12 @@ impl Drop for EnvVarGuard {
 
 // ── TLS helpers ──────────────────────────────────────────────────────────────
 
-/// Install the `rustls` ring crypto provider as the process default.
+/// Install the `rustls` AWS-LC crypto provider as the process default.
 ///
 /// Safe to call multiple times — subsequent calls are no-ops.
 #[allow(dead_code)]
 pub fn install_rustls_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 /// Generate a self-signed CA certificate and its key pair.

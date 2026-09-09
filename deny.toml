@@ -53,6 +53,7 @@ registries = []
 
 # -- Bans ----------------------------------------------------------------------
 [bans]
+deny = [{ name = "ring", reason = "Use the AWS-LC crypto backend instead." }]
 multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"

@@ -18,7 +18,7 @@ use openshell_ocsf::{
     ConfigStateChangeBuilder, OCSF_TARGET, SandboxContext, SeverityId, StateId, StatusId,
 };
 use rustls::ServerConfig;
-use rustls::crypto::ring::sign;
+use rustls::crypto::aws_lc_rs::sign;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
