@@ -20,9 +20,10 @@ sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSp
 })
 ```
 
-Set `GPU: true` to request the active driver's default GPU assignment. Set
-`GPUCount` when the sandbox needs a specific GPU count; a non-nil `GPUCount`
-also implies `GPU`.
+Set `ResourceRequirements.GPU` to request a GPU. Leave its `Count` nil to use
+the active driver's default GPU assignment, or set `Count` to request a
+specific number. `ResourceRequirements.CPU` and `.Memory` accept portable
+quantity limits such as `500m` and `2Gi`.
 
 ## Create From Template
 
