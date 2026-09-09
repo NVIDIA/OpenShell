@@ -3730,8 +3730,34 @@ mod tests {
 
     // ---- Numeric UID tests (Phase 2) ----
 
+    // Even a failing setuid(0) probe synchronizes libc credentials across all
+    // threads. Other tests own seccomp-notified launcher threads in this same
+    // process; signaling those while they await their broker can deadlock the
+    // parallel harness. Re-exec just the credential probe, without those threads.
+    fn numeric_uid_probe_runs_in_child(test_name: &str) -> bool {
+        const MARKER: &str = "OPENSHELL_TEST_ISOLATED_NUMERIC_UID_PROBE";
+        if std::env::var(MARKER).as_deref() == Ok(test_name) {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", test_name, "--test-threads=1", "--nocapture"])
+            .env(MARKER, test_name)
+            .output()
+            .expect("run isolated credential probe");
+        assert!(
+            output.status.success(),
+            "isolated credential probe failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
     #[test]
     fn drop_privileges_accepts_numeric_uid() {
+        if !numeric_uid_probe_runs_in_child("process::tests::drop_privileges_accepts_numeric_uid") {
+            return;
+        }
         // When running as non-root, a numeric UID/GID that matches the
         // current process should succeed without any passwd lookup.
         if nix::unistd::geteuid().is_root() {
@@ -3754,6 +3780,11 @@ mod tests {
 
     #[test]
     fn drop_privileges_numeric_uid_skips_initgroups() {
+        if !numeric_uid_probe_runs_in_child(
+            "process::tests::drop_privileges_numeric_uid_skips_initgroups",
+        ) {
+            return;
+        }
         // When running as non-root with a numeric user but group matches,
         // initgroups should not be called (guard: target_uid != geteuid()).
         if nix::unistd::geteuid().is_root() {
