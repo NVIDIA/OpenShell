@@ -18,6 +18,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
 
+# shellcheck source=tasks/scripts/build-env.sh
+source "${ROOT}/tasks/scripts/build-env.sh"
+ensure_build_nofile_limit
+
 usage() {
   cat <<'EOF'
 Usage: mise run gateway [-- --driver DRIVER]
