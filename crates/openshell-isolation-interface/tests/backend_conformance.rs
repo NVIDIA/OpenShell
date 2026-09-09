@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::*;
 use tokio::sync::oneshot;
 
