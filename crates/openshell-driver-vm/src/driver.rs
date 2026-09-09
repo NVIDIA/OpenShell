@@ -785,9 +785,11 @@ impl VmDriver {
             resource_capabilities: Some(ResourceCapabilities {
                 cpu: Some(CpuResourceCapabilities {
                     limit_supported: false,
+                    request_supported: false,
                 }),
                 memory: Some(MemoryResourceCapabilities {
                     limit_supported: false,
+                    request_supported: false,
                 }),
                 gpu: Some(GpuResourceCapabilities {
                     default_selection_supported: self.config.gpu_enabled,
@@ -4100,6 +4102,7 @@ fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Statu
     if let Some(template) = spec.template.as_ref() {
         validate_vm_sandbox_template(template)?;
     }
+    validate_cpu_memory_request(spec)?;
     validate_gpu_request(sandbox, gpu_enabled)?;
 
     Ok(())
@@ -4117,6 +4120,22 @@ fn validate_vm_sandbox_template(template: &SandboxTemplate) -> Result<(), Status
             "vm sandboxes do not support template.platform_config",
         ));
     }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_cpu_memory_request(
+    spec: &openshell_core::proto::compute::v1::DriverSandboxSpec,
+) -> Result<(), Status> {
+    let resources = spec.resource_requirements.as_ref();
+    if resources
+        .is_some_and(|requirements| requirements.cpu.is_some() || requirements.memory.is_some())
+    {
+        return Err(Status::failed_precondition(
+            "vm sandboxes do not support spec.resource_requirements.cpu or spec.resource_requirements.memory yet; configure VM driver vcpus and mem_mib instead",
+        ));
+    }
+
     Ok(())
 }
 
@@ -6851,8 +6870,9 @@ mod tests {
         PROGRESS_COMPLETE_STEP_KEY,
     };
     use openshell_core::proto::compute::v1::{
-        DriverSandboxSpec as SandboxSpec, DriverSandboxTemplate as SandboxTemplate,
-        GpuResourceRequirements, ResourceRequirements,
+        CpuResourceRequirements, DriverSandboxSpec as SandboxSpec,
+        DriverSandboxTemplate as SandboxTemplate, GpuResourceRequirements,
+        MemoryResourceRequirements, ResourceRequirements,
     };
     use prost_types::{Struct, Value, value::Kind};
     use std::fs;
@@ -7560,6 +7580,8 @@ mod tests {
     fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
         ResourceRequirements {
             gpu: Some(GpuResourceRequirements { count }),
+            cpu: None,
+            memory: None,
         }
     }
 
@@ -7931,26 +7953,30 @@ mod tests {
     }
 
     #[test]
-    fn validate_vm_sandbox_accepts_template_resources_as_noop() {
-        use openshell_core::proto::compute::v1::DriverResourceRequirements;
-
+    fn validate_vm_sandbox_rejects_typed_cpu_and_memory_resources() {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
-                template: Some(SandboxTemplate {
-                    resources: Some(DriverResourceRequirements {
-                        cpu_limit: "2".to_string(),
-                        memory_limit: "4Gi".to_string(),
-                        ..Default::default()
+                resource_requirements: Some(ResourceRequirements {
+                    gpu: None,
+                    cpu: Some(CpuResourceRequirements {
+                        limit: Some("2".to_string()),
+                        request: None,
                     }),
-                    ..Default::default()
+                    memory: Some(MemoryResourceRequirements {
+                        limit: Some("4Gi".to_string()),
+                        request: None,
+                    }),
                 }),
                 ..Default::default()
             }),
             ..Default::default()
         };
-        validate_vm_sandbox(&sandbox, false)
-            .expect("template.resources should be accepted and ignored");
+        let err = validate_vm_sandbox(&sandbox, false).expect_err(
+            "typed CPU/memory resources should be rejected until VM sizing is supported",
+        );
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("spec.resource_requirements.cpu"));
     }
 
     #[test]
@@ -10985,8 +11011,12 @@ mod tests {
     fn capabilities_report_static_resource_support() {
         let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
         let resources = driver.capabilities().resource_capabilities.unwrap();
-        assert!(!resources.cpu.unwrap().limit_supported);
-        assert!(!resources.memory.unwrap().limit_supported);
+        let cpu = resources.cpu.unwrap();
+        assert!(!cpu.limit_supported);
+        assert!(!cpu.request_supported);
+        let memory = resources.memory.unwrap();
+        assert!(!memory.limit_supported);
+        assert!(!memory.request_supported);
         let gpu = resources.gpu.unwrap();
         assert!(!gpu.default_selection_supported);
         assert!(!gpu.count_selection_supported);
