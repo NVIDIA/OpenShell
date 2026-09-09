@@ -469,14 +469,20 @@ Proto types come from `openshell-core` which generates them from `OUT_DIR` via `
 
 ```rust
 use openshell_core::proto::openshell_client::OpenShellClient;
-use openshell_core::proto::{ListSandboxesRequest, GetSandboxLogsRequest, ...};
+use openshell_core::proto::{
+    all_workspaces_selector, workspace_selector, GetSandboxLogsRequest,
+    ListSandboxesRequest, ...
+};
 ```
 
 ### Proto field gotchas
 
 - `DeleteSandboxRequest` uses the `name` field (not `id`):
   ```rust
-  let req = openshell_core::proto::DeleteSandboxRequest { name: sandbox_name };
+  let req = openshell_core::proto::DeleteSandboxRequest {
+      name: sandbox_name,
+      workspace_scope: Some(workspace_selector(workspace)),
+  };
   ```
 - `WatchSandboxRequest` has extra fields beyond what you might need — always use `..Default::default()`:
   ```rust
@@ -490,12 +496,24 @@ use openshell_core::proto::{ListSandboxesRequest, GetSandboxLogsRequest, ...};
   };
   ```
 - `SandboxLogLine` proto fields: `sandbox_id`, `timestamp_ms`, `level`, `target`, `message`, `source`, `fields` (HashMap<String, String>).
-- `GetSandboxLogsRequest` fields: `sandbox_id`, `lines` (u32), `since_ms` (i64), `sources` (Vec<String>), `min_level` (String), `workspace` (String).
-- `ListSandboxesRequest` fields: `limit` (i64), `offset` (i64), `label_selector` (String), `workspace` (String), `all_workspaces` (bool).
-- `ListProvidersRequest` fields: `limit` (i64), `offset` (i64), `workspace` (String), `all_workspaces` (bool).
-- `ListWorkspacesRequest` fields: `limit` (i64), `offset` (i64), `label_selector` (String).
-- `UpdateConfigRequest` fields: `name` (String, sandbox name or empty for global), `setting_key`, `setting_value`, `delete_setting` (bool), `global` (bool), `workspace`.
-- Most resource requests include a `workspace` field that scopes the operation to the current workspace.
+- Workspace-scoped request fields use `workspace_scope: Option<WorkspaceSelector>`.
+  Select one workspace with `Some(workspace_selector(name))`. List requests that
+  explicitly support cross-workspace access also accept
+  `Some(all_workspaces_selector())`; do not use that marker on other requests.
+- `GetSandboxLogsRequest` fields: `sandbox_id`, `lines` (u32), `since_ms` (i64),
+  `sources` (Vec<String>), `min_level` (String), `workspace_scope`.
+- `ListSandboxesRequest` fields: `limit` (u32), `offset` (u32),
+  `label_selector` (String), `workspace_scope`.
+- `ListProvidersRequest` fields: `limit` (u32), `offset` (u32),
+  `workspace_scope`.
+- `ListWorkspacesRequest` fields: `limit` (u32), `offset` (u32),
+  `label_selector` (String).
+- `UpdateConfigRequest` fields include `name` (String, sandbox name or empty for
+  global), `setting_key`, `setting_value`, `delete_setting` (bool), `global`
+  (bool), and `workspace_scope`. Sandbox-scoped updates require a named selector;
+  gateway-global updates must leave `workspace_scope` as `None`.
+- Most resource requests require an explicit named `workspace_scope`, including
+  the `default` workspace. An omitted selector is not an implicit default.
 
 ### gRPC timeouts
 

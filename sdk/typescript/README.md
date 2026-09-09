@@ -212,14 +212,24 @@ Curated methods are added deliberately, so some gateway RPCs are not yet wrapped
 `client.raw` is a generated client for every gateway RPC, including surface the curated sub-clients do not wrap yet (gateway config, provider CRUD, policy status, watch, logs, and the full observed `Sandbox`). `client.transport` is the shared connection, so extra clients reuse one socket. Generated request and response types live at `@nvidia/openshell-sdk/raw`.
 
 ```ts
+import { create } from '@bufbuild/protobuf'
 import { OpenShellClient } from '@nvidia/openshell-sdk'
+import { WorkspaceSelectorSchema } from '@nvidia/openshell-sdk/raw'
 import type { GetGatewayConfigResponse } from '@nvidia/openshell-sdk/raw'
 
 const client = await OpenShellClient.connect({ gateway, oidcToken })
 
 // Reach RPCs the curated surface does not wrap yet:
 const cfg: GetGatewayConfigResponse = await client.raw.getGatewayConfig({})
-const status = await client.raw.getSandboxPolicyStatus({ name: 'my-sandbox', version: 0, global: false })
+const defaultWorkspace = create(WorkspaceSelectorSchema, {
+  selection: { case: 'workspace', value: 'default' },
+})
+const status = await client.raw.getSandboxPolicyStatus({
+  name: 'my-sandbox',
+  version: 0,
+  global: false,
+  workspaceScope: defaultWorkspace,
+})
 ```
 
 The raw layer returns the generated wire messages verbatim, preserving proto distinctions (an omitted optional versus an explicitly empty map) that the curated types may smooth over. As curated sub-clients land, prefer them; `raw` stays as the always-available floor.
