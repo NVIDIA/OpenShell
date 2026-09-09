@@ -2877,8 +2877,17 @@ fn pending_sandbox_snapshot_uses_docker_namespace_and_starting_condition() {
     assert_eq!(snapshot.name, "demo");
     assert_eq!(snapshot.namespace, "docker-dev");
     assert!(snapshot.spec.is_none());
-    assert!(pending_sandbox_matches(&snapshot, "sbx-123", ""));
-    assert!(pending_sandbox_matches(&snapshot, "", "demo"));
+    let pending = pending_map(&[&snapshot]);
+    assert_eq!(
+        resolve_pending_id(&pending, "sbx-123", "")
+            .unwrap()
+            .as_deref(),
+        Some("sbx-123")
+    );
+    assert_eq!(
+        resolve_pending_id(&pending, "", "demo").unwrap().as_deref(),
+        Some("sbx-123")
+    );
 
     let status = snapshot.status.expect("status");
     assert!(!status.deleting);
@@ -3350,4 +3359,334 @@ fn docker_oom_kill_stays_terminal_despite_137() {
     };
     apply_docker_exit_classification(&mut sandbox, &state);
     assert_eq!(ready_reason(&sandbox), CONDITION_EXITED);
+}
+
+/// Minimal pending-map entry. Only the identity fields matter for lookup
+/// resolution, so the spec and status are left empty on purpose.
+fn pending_sandbox(id: &str, name: &str, workspace: &str) -> DriverSandbox {
+    DriverSandbox {
+        id: id.to_string(),
+        name: name.to_string(),
+        namespace: String::new(),
+        spec: None,
+        status: None,
+        workspace: workspace.to_string(),
+    }
+}
+
+fn pending_map(sandboxes: &[&DriverSandbox]) -> HashMap<String, PendingSandboxRecord> {
+    sandboxes
+        .iter()
+        .map(|sandbox| {
+            (
+                sandbox.id.clone(),
+                PendingSandboxRecord {
+                    sandbox: (*sandbox).clone(),
+                    task: None,
+                },
+            )
+        })
+        .collect()
+}
+
+async fn driver_with_pending(sandboxes: &[&DriverSandbox]) -> DockerComputeDriver {
+    let driver = test_driver_with_config(runtime_config());
+    for sandbox in sandboxes {
+        driver
+            .reserve_pending_sandbox(sandbox)
+            .await
+            .expect("reserving a distinct sandbox must succeed");
+    }
+    driver
+}
+
+fn pending_ids(pending: &HashMap<String, DriverSandbox>) -> Vec<String> {
+    let mut ids: Vec<String> = pending.keys().cloned().collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn resolve_pending_id_prefers_sandbox_id_over_sandbox_name() {
+    // The id is authoritative. A stale or mismatched name travelling in the
+    // same request must not change which record is resolved.
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let pending = pending_map(&[&alpha]);
+
+    assert_eq!(
+        resolve_pending_id(&pending, "sbx-alpha", "stale-name")
+            .unwrap()
+            .as_deref(),
+        Some("sbx-alpha")
+    );
+}
+
+#[test]
+fn resolve_pending_id_ignores_the_name_when_the_id_is_not_pending() {
+    // Regression for the `id OR name` match. `demo` exists in two workspaces:
+    // the beta copy is still provisioning, the alpha copy is already running.
+    // Deleting the alpha copy sends alpha's id plus the shared name. Matching
+    // on the name alone resolved to the beta record and evicted it, aborting
+    // an unrelated sandbox's provisioning task.
+    let beta = pending_sandbox("sbx-beta", "demo", "beta");
+    let pending = pending_map(&[&beta]);
+
+    assert_eq!(
+        resolve_pending_id(&pending, "sbx-alpha", "demo").unwrap(),
+        None
+    );
+}
+
+#[test]
+fn resolve_pending_id_falls_back_to_the_name_when_no_id_is_supplied() {
+    // Direct driver callers may omit the id; a unique name still resolves.
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let pending = pending_map(&[&alpha]);
+
+    assert_eq!(
+        resolve_pending_id(&pending, "", "demo").unwrap().as_deref(),
+        Some("sbx-alpha")
+    );
+}
+
+#[test]
+fn resolve_pending_id_rejects_an_ambiguous_name_only_lookup() {
+    // Two pending sandboxes share a name across workspaces and the driver
+    // request carries no workspace. Picking either one would make the outcome
+    // depend on `HashMap` iteration order, so refuse instead.
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let beta = pending_sandbox("sbx-beta", "demo", "beta");
+    let pending = pending_map(&[&alpha, &beta]);
+
+    let err = resolve_pending_id(&pending, "", "demo")
+        .expect_err("an ambiguous name-only lookup must be rejected");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+#[test]
+fn resolve_pending_id_returns_none_without_any_identifier() {
+    // `require_sandbox_identifier` rejects this upstream, but the resolver
+    // stays total so an empty request can never match an arbitrary record.
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let pending = pending_map(&[&alpha]);
+
+    assert_eq!(resolve_pending_id(&pending, "", "").unwrap(), None);
+}
+
+#[tokio::test]
+async fn remove_pending_sandbox_by_id_keeps_a_same_named_sandbox_in_another_workspace() {
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let beta = pending_sandbox("sbx-beta", "demo", "beta");
+    let driver = driver_with_pending(&[&alpha, &beta]).await;
+
+    let removed = driver
+        .remove_pending_sandbox("sbx-alpha", "demo")
+        .await
+        .expect("an id-scoped removal must succeed")
+        .expect("the alpha record must be removed");
+
+    assert_eq!(removed.sandbox.id, "sbx-alpha");
+    assert_eq!(
+        pending_ids(&driver.pending_snapshot_map().await),
+        ["sbx-beta"]
+    );
+}
+
+#[tokio::test]
+async fn remove_pending_sandbox_by_a_unique_name_still_removes_the_record() {
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let driver = driver_with_pending(&[&alpha]).await;
+
+    let removed = driver
+        .remove_pending_sandbox("", "demo")
+        .await
+        .expect("a unique name-only removal must succeed")
+        .expect("the alpha record must be removed");
+
+    assert_eq!(removed.sandbox.id, "sbx-alpha");
+    assert!(driver.pending_snapshot_map().await.is_empty());
+}
+
+#[tokio::test]
+async fn remove_pending_sandbox_rejects_an_ambiguous_name_and_keeps_both_records() {
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let beta = pending_sandbox("sbx-beta", "demo", "beta");
+    let driver = driver_with_pending(&[&alpha, &beta]).await;
+
+    let err = driver
+        .remove_pending_sandbox("", "demo")
+        .await
+        .map(|record| record.map(|record| record.sandbox.id))
+        .expect_err("an ambiguous name-only removal must be rejected");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        pending_ids(&driver.pending_snapshot_map().await),
+        ["sbx-alpha", "sbx-beta"]
+    );
+}
+
+#[tokio::test]
+async fn pending_snapshot_by_id_ignores_a_same_named_sandbox_in_another_workspace() {
+    // `GetSandbox` falls through to the pending map when no container exists.
+    // Resolving by name there leaked another workspace's snapshot.
+    let beta = pending_sandbox("sbx-beta", "demo", "beta");
+    let driver = driver_with_pending(&[&beta]).await;
+
+    assert!(
+        driver
+            .pending_snapshot("sbx-alpha", "demo")
+            .await
+            .expect("an id-scoped snapshot lookup must succeed")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn pending_snapshot_rejects_an_ambiguous_name_only_lookup() {
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let beta = pending_sandbox("sbx-beta", "demo", "beta");
+    let driver = driver_with_pending(&[&alpha, &beta]).await;
+
+    let err = driver
+        .pending_snapshot("", "demo")
+        .await
+        .expect_err("an ambiguous name-only snapshot lookup must be rejected");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn reserve_pending_sandbox_allows_the_same_name_in_a_different_workspace() {
+    // Sandbox names are unique per workspace, so this is a legitimate create.
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let beta = pending_sandbox("sbx-beta", "demo", "beta");
+    let driver = driver_with_pending(&[&alpha]).await;
+
+    driver
+        .reserve_pending_sandbox(&beta)
+        .await
+        .expect("a same-named sandbox in another workspace must be allowed");
+
+    assert_eq!(
+        pending_ids(&driver.pending_snapshot_map().await),
+        ["sbx-alpha", "sbx-beta"]
+    );
+}
+
+#[tokio::test]
+async fn reserve_pending_sandbox_rejects_a_duplicate_name_in_the_same_workspace() {
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let duplicate = pending_sandbox("sbx-other", "demo", "alpha");
+    let driver = driver_with_pending(&[&alpha]).await;
+
+    let err = driver
+        .reserve_pending_sandbox(&duplicate)
+        .await
+        .expect_err("a duplicate name within one workspace must be rejected");
+
+    assert_eq!(err.code(), tonic::Code::AlreadyExists);
+    assert_eq!(
+        pending_ids(&driver.pending_snapshot_map().await),
+        ["sbx-alpha"]
+    );
+}
+
+#[tokio::test]
+async fn reserve_pending_sandbox_rejects_a_duplicate_id() {
+    let alpha = pending_sandbox("sbx-alpha", "demo", "alpha");
+    let duplicate = pending_sandbox("sbx-alpha", "other-name", "beta");
+    let driver = driver_with_pending(&[&alpha]).await;
+
+    let err = driver
+        .reserve_pending_sandbox(&duplicate)
+        .await
+        .expect_err("a duplicate sandbox id must be rejected regardless of workspace");
+
+    assert_eq!(err.code(), tonic::Code::AlreadyExists);
+    assert_eq!(
+        pending_ids(&driver.pending_snapshot_map().await),
+        ["sbx-alpha"]
+    );
+}
+
+fn managed_container_labels(
+    namespace: &str,
+    sandbox_id: &str,
+    sandbox_name: &str,
+) -> HashMap<String, String> {
+    HashMap::from([
+        (
+            LABEL_MANAGED_BY.to_string(),
+            LABEL_MANAGED_BY_VALUE.to_string(),
+        ),
+        (LABEL_SANDBOX_NAMESPACE.to_string(), namespace.to_string()),
+        (LABEL_SANDBOX_ID.to_string(), sandbox_id.to_string()),
+        (LABEL_SANDBOX_NAME.to_string(), sandbox_name.to_string()),
+    ])
+}
+
+#[test]
+fn managed_container_identity_matches_on_id_despite_a_stale_name() {
+    // Requiring the name to agree with an authoritative id dropped the match
+    // and made the driver report a live sandbox as absent, stranding the
+    // container and leaking its token file.
+    let labels = managed_container_labels("default", "sbx-alpha", "demo");
+
+    assert!(managed_container_identity_matches(
+        &labels,
+        "default",
+        "sbx-alpha",
+        "stale-name"
+    ));
+}
+
+#[test]
+fn managed_container_identity_rejects_a_name_match_when_the_id_differs() {
+    // The mirror of the pending-map fix: a shared name must not stand in for
+    // an id that explicitly disagrees.
+    let labels = managed_container_labels("default", "sbx-beta", "demo");
+
+    assert!(!managed_container_identity_matches(
+        &labels,
+        "default",
+        "sbx-alpha",
+        "demo"
+    ));
+}
+
+#[test]
+fn managed_container_identity_falls_back_to_the_name_without_an_id() {
+    let labels = managed_container_labels("default", "sbx-alpha", "demo");
+
+    assert!(managed_container_identity_matches(
+        &labels, "default", "", "demo"
+    ));
+    assert!(!managed_container_identity_matches(
+        &labels, "default", "", "other"
+    ));
+}
+
+#[test]
+fn managed_container_identity_matches_nothing_without_an_identifier() {
+    // The label filters degenerate to "every managed container in the
+    // namespace" when neither identifier is supplied, so the predicate must
+    // not wave the container through.
+    let labels = managed_container_labels("default", "sbx-alpha", "demo");
+
+    assert!(!managed_container_identity_matches(
+        &labels, "default", "", ""
+    ));
+}
+
+#[test]
+fn managed_container_identity_requires_the_configured_namespace() {
+    let labels = managed_container_labels("other-namespace", "sbx-alpha", "demo");
+
+    assert!(!managed_container_identity_matches(
+        &labels,
+        "default",
+        "sbx-alpha",
+        "demo"
+    ));
 }
