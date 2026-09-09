@@ -7,6 +7,12 @@ mod driver;
 mod grpc;
 mod propagation;
 
+pub use grpc::RecordGrpcFailure;
+pub use propagation::{
+    EnvTraceContextInterceptor, HeaderMapExtractor, MetadataMapInjector, TraceContextInterceptor,
+};
+pub use grpc::{RecordGrpcFailure, RecordGrpcStatus};
+pub use propagation::{HeaderMapExtractor, MetadataMapInjector, TraceContextInterceptor};
 pub use driver::{
     BoxGrpcStream, ComputeDriverTracing, DriverTracingConfig, DriverTracingHandle,
     IN_PROCESS_COMPUTE_DRIVER_TARGET, InProcessRpcTracer, install_driver_tracing,

@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 openshell-bootstrap = { path = "../openshell-bootstrap" }
 openshell-core = { path = "../openshell-core", default-features = false }
+openshell-otel = { path = "../openshell-otel" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-providers = { path = "../openshell-providers" }
 openshell-sdk = { path = "../openshell-sdk" }
