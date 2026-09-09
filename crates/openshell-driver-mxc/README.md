@@ -66,6 +66,11 @@ gateway's capture. Graceful shutdown stops the session by its owned handle. A
 force-killed gateway can leave a stale session; the audit example removes only
 matching sessions whose encoded owner process is no longer running.
 
+The gateway-local OCSF JSONL sink is available only for the Windows/MXC path
+and is opt-in. Set `OPENSHELL_OCSF_JSON=1` to enable it and optionally set
+`OPENSHELL_OCSF_LOG_DIR` to override its `%PROGRAMDATA%\OpenShell\logs` default.
+Other gateway deployments do not initialize this local file sink.
+
 The ETW callback uses a non-blocking queue capped at 4,096 records and 16 MiB
 of copied event data. Records that exceed either limit are dropped instead of
 blocking the ETW pump or growing gateway memory. The gateway emits an immediate
