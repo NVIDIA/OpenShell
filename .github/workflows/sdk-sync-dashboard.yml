@@ -15,7 +15,6 @@ permissions:
   actions: read
   contents: read
   packages: read
-  issues: write
 
 concurrency:
   group: sdk-proto-sync
@@ -39,7 +38,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:37072ee81cd7b294c714bfa5ecc829b6927b3d70
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -90,8 +89,12 @@ jobs:
     if: always() && needs.load_config.result == 'success' && needs.sdk_sync_check.result == 'success'
     runs-on: linux-amd64-cpu8
     timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      packages: read
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:37072ee81cd7b294c714bfa5ecc829b6927b3d70
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
