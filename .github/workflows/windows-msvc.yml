@@ -69,6 +69,8 @@ jobs:
           experimental: true
       - name: Configure GHA sccache backend
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        env:
+          SCCACHE_ERROR_LOG: ${{ runner.temp }}/openshell-sccache-errors.log
       - name: Isolate Rust toolchains
         # rust-cache hashes every installed toolchain, including unused runner defaults.
         run: '"RUSTUP_HOME=$env:RUNNER_TEMP/openshell-rustup" >> $env:GITHUB_ENV'
@@ -96,7 +98,13 @@ jobs:
         run: mise run --skip-tools windows:test:${{ matrix.arch }}
       - name: sccache stats
         if: always()
-        run: sccache --show-stats
+        run: |
+          sccache --show-stats
+          $cacheErrorLog = Join-Path $env:RUNNER_TEMP 'openshell-sccache-errors.log'
+          if (Test-Path -LiteralPath $cacheErrorLog) {
+            Get-Content -LiteralPath $cacheErrorLog -Tail 20 |
+              ForEach-Object { $_ -replace '(https?://[^\s?]+)\?\S+', '$1?[redacted]' }
+          }
 
   cache-seed:
     name: Seed cache (${{ matrix.arch }})
@@ -129,6 +137,8 @@ jobs:
           experimental: true
       - name: Configure GHA sccache backend
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        env:
+          SCCACHE_ERROR_LOG: ${{ runner.temp }}/openshell-sccache-errors.log
       - name: Isolate Rust toolchains
         run: '"RUSTUP_HOME=$env:RUNNER_TEMP/openshell-rustup" >> $env:GITHUB_ENV'
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -155,7 +165,13 @@ jobs:
         run: mise run --skip-tools windows:test:${{ matrix.arch }}
       - name: sccache stats
         if: always()
-        run: sccache --show-stats
+        run: |
+          sccache --show-stats
+          $cacheErrorLog = Join-Path $env:RUNNER_TEMP 'openshell-sccache-errors.log'
+          if (Test-Path -LiteralPath $cacheErrorLog) {
+            Get-Content -LiteralPath $cacheErrorLog -Tail 20 |
+              ForEach-Object { $_ -replace '(https?://[^\s?]+)\?\S+', '$1?[redacted]' }
+          }
 
   build:
     name: Build binaries (${{ matrix.arch }})
@@ -185,6 +201,8 @@ jobs:
           experimental: true
       - name: Configure GHA sccache backend
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        env:
+          SCCACHE_ERROR_LOG: ${{ runner.temp }}/openshell-sccache-errors.log
       - name: Isolate Rust toolchains
         run: '"RUSTUP_HOME=$env:RUNNER_TEMP/openshell-rustup" >> $env:GITHUB_ENV'
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -204,4 +222,10 @@ jobs:
         run: mise run --skip-tools windows:build:${{ matrix.arch }}
       - name: sccache stats
         if: always()
-        run: sccache --show-stats
+        run: |
+          sccache --show-stats
+          $cacheErrorLog = Join-Path $env:RUNNER_TEMP 'openshell-sccache-errors.log'
+          if (Test-Path -LiteralPath $cacheErrorLog) {
+            Get-Content -LiteralPath $cacheErrorLog -Tail 20 |
+              ForEach-Object { $_ -replace '(https?://[^\s?]+)\?\S+', '$1?[redacted]' }
+          }
