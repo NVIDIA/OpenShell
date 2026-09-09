@@ -824,12 +824,14 @@ fn public_resource_capabilities(
     ResourceCapabilities {
         cpu: resources.cpu.as_ref().map(|cpu| CpuResourceCapabilities {
             limit_supported: cpu.limit_supported,
+            request_supported: cpu.request_supported,
         }),
         memory: resources
             .memory
             .as_ref()
             .map(|memory| MemoryResourceCapabilities {
                 limit_supported: memory.limit_supported,
+                request_supported: memory.request_supported,
             }),
         gpu: resources.gpu.as_ref().map(|gpu| GpuResourceCapabilities {
             default_selection_supported: gpu.default_selection_supported,
@@ -963,9 +965,11 @@ mod tests {
         let driver_capabilities = DriverResourceCapabilities {
             cpu: Some(DriverCpuResourceCapabilities {
                 limit_supported: true,
+                request_supported: true,
             }),
             memory: Some(DriverMemoryResourceCapabilities {
                 limit_supported: false,
+                request_supported: false,
             }),
             gpu: Some(DriverGpuResourceCapabilities {
                 default_selection_supported: true,
@@ -975,7 +979,9 @@ mod tests {
 
         let capabilities = public_resource_capabilities(driver_capabilities);
 
-        assert!(capabilities.cpu.expect("CPU capabilities").limit_supported);
+        let cpu = capabilities.cpu.expect("CPU capabilities");
+        assert!(cpu.limit_supported);
+        assert!(cpu.request_supported);
         assert!(
             !capabilities
                 .memory

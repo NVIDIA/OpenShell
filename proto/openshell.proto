@@ -907,11 +907,15 @@ message ResourceCapabilities {
 message CpuResourceCapabilities {
   // The driver accepts and enforces a portable CPU limit.
   bool limit_supported = 1;
+  // The driver accepts a portable CPU request independent of its limit.
+  bool request_supported = 2;
 }
 
 message MemoryResourceCapabilities {
   // The driver accepts and enforces a portable memory limit.
   bool limit_supported = 1;
+  // The driver accepts a portable memory request independent of its limit.
+  bool request_supported = 2;
 }
 
 message GpuResourceCapabilities {
@@ -980,6 +984,10 @@ message SandboxSpec {
 message ResourceRequirements {
   // GPU requirements for the sandbox. Presence indicates a GPU request.
   GpuResourceRequirements gpu = 1;
+  // CPU requirements for the sandbox workload.
+  CpuResourceRequirements cpu = 2;
+  // Memory requirements for the sandbox workload.
+  MemoryResourceRequirements memory = 3;
 }
 
 // Public GPU resource requirements.
@@ -987,6 +995,22 @@ message GpuResourceRequirements {
   // Optional number of GPUs requested. When omitted, the request is for one
   // GPU using the selected driver's default assignment behavior.
   optional uint32 count = 1;
+}
+
+// Public CPU resource requirements.
+message CpuResourceRequirements {
+  // CPU limit for the sandbox workload (e.g. "500m", "2").
+  optional string limit = 1;
+  // CPU request for the sandbox workload (e.g. "250m", "1").
+  optional string request = 2;
+}
+
+// Public memory resource requirements.
+message MemoryResourceRequirements {
+  // Memory limit for the sandbox workload (e.g. "512Mi", "4Gi").
+  optional string limit = 1;
+  // Memory request for the sandbox workload (e.g. "256Mi", "2Gi").
+  optional string request = 2;
 }
 
 // Historical inline compute template mapped onto compute-driver template inputs.
@@ -1008,7 +1032,8 @@ message SandboxTemplate {
   map<string, string> annotations = 5;
   // Additional environment variables injected by the template.
   map<string, string> environment = 6;
-  // Platform-specific compute resource requirements and limits.
+  // Platform-specific resource passthrough. CPU and memory under
+  // limits/requests are rejected; use ResourceRequirements.cpu/memory instead.
   google.protobuf.Struct resources = 7;
   reserved 9;
   reserved "volume_claim_templates";
@@ -1053,18 +1078,7 @@ message SandboxWorkloadConfig {
   // Environment variables injected into the sandbox runtime.
   map<string, string> environment = 2;
   // Portable resource requirements for sandboxes created from this workload.
-  SandboxResources resources = 3;
-}
-
-message SandboxResources {
-  // Portable CPU quantity, for example "500m" or "2".
-  string cpu = 1;
-  // Portable memory quantity, for example "512Mi" or "2Gi".
-  string memory = 2;
-  // GPU requirements for the sandbox workload. Presence indicates a GPU
-  // request. When count is omitted, the request uses the selected driver's
-  // default GPU assignment behavior.
-  GpuResourceRequirements gpu = 3;
+  ResourceRequirements resources = 3;
 }
 
 message SandboxServiceLevel {
