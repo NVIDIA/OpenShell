@@ -3,14 +3,14 @@
 
 //! Runtime-owned policy DNS listeners for combined Linux supervisors.
 
-use super::resolver::MAX_DNS_MESSAGE_BYTES;
-use super::store::{ResolvedEndpointStore, StoreConfig, SyntheticPools};
-use super::{PolicyDnsService, SocketTrustedResolver, wire};
 use crate::opa::OpaEngine;
+use crate::policy_dns::resolver::MAX_DNS_MESSAGE_BYTES;
+use crate::policy_dns::store::{ResolvedEndpointStore, StoreConfig, SyntheticPools};
+use crate::policy_dns::{PolicyDnsService, SocketTrustedResolver, wire};
 use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::net::set_tcp_nodelay_best_effort;
-use openshell_isolation_interface::contract::{DnsMediationSource, DnsTransport};
+use openshell_isolation_interface::contract::{DnsMediationSource, DnsTransport, MediatedDnsQuery};
 use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -23,6 +23,22 @@ const IPV4_EPOCH_WINDOWS: u64 = 1 << (IPV4_POOL_PREFIX - 15);
 const MAX_MAPPINGS: usize = 1024;
 const MAX_CONCURRENT_UDP_QUERIES: usize = 64;
 const MEDIATION_ACCEPT_WINDOW: usize = 32;
+const MEDIATION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+const MEDIATION_MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn accept_mediated_dns(source: Arc<dyn DnsMediationSource>) -> MediatedDnsQuery {
+    let mut delay = MEDIATION_RETRY_DELAY;
+    loop {
+        match source.accept().await {
+            Ok(query) => return query,
+            Err(error) => {
+                tracing::warn!(%error, "mediated DNS accept failed; retrying");
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2).min(MEDIATION_MAX_RETRY_DELAY);
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct PolicyDnsRuntimeConfig {
@@ -93,14 +109,14 @@ impl PolicyDnsRuntime {
             let mut accepts = FuturesUnordered::new();
             for _ in 0..MEDIATION_ACCEPT_WINDOW {
                 let source = source.clone();
-                accepts.push(async move { source.accept().await }.boxed());
+                accepts.push(accept_mediated_dns(source).boxed());
             }
             loop {
-                let Some(Ok(query)) = accepts.next().await else {
+                let Some(query) = accepts.next().await else {
                     return;
                 };
                 let source = source.clone();
-                accepts.push(async move { source.accept().await }.boxed());
+                accepts.push(accept_mediated_dns(source).boxed());
                 let service = service.clone();
                 tokio::spawn(async move {
                     let timing = query.timing.clone();
@@ -306,6 +322,45 @@ fn trusted_resolver_from_resolv_conf() -> Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn mediated_dns_accept_retries_errors_with_backoff() {
+        use openshell_isolation_interface::contract::{
+            BackendError, MediationTiming, ResolveError,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct RecoveringSource(AtomicUsize);
+
+        #[async_trait::async_trait]
+        impl DnsMediationSource for RecoveringSource {
+            async fn accept(&self) -> std::result::Result<MediatedDnsQuery, BackendError> {
+                if self.0.fetch_add(1, Ordering::AcqRel) < 2 {
+                    return Err(BackendError::Unavailable("injected disconnect".into()));
+                }
+                let (response, _) = tokio::sync::oneshot::channel();
+                Ok(MediatedDnsQuery {
+                    request: b"recovered query".to_vec(),
+                    transport: DnsTransport::Udp,
+                    binary_identity: Err(ResolveError::Failed("unknown sender".into())),
+                    timing: MediationTiming::default(),
+                    response,
+                })
+            }
+        }
+
+        let source = Arc::new(RecoveringSource(AtomicUsize::new(0)));
+        let start = tokio::time::Instant::now();
+        let query = accept_mediated_dns(source.clone()).await;
+        assert_eq!(query.request, b"recovered query");
+        assert_eq!(source.0.load(Ordering::Acquire), 3);
+        assert!(start.elapsed() >= MEDIATION_RETRY_DELAY * 3);
+        // The same source remains usable when the accept window replenishes.
+        assert_eq!(
+            accept_mediated_dns(source).await.request,
+            b"recovered query"
+        );
+    }
 
     #[test]
     fn production_pool_is_disjoint_from_workload_veth() {
