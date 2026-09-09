@@ -85,6 +85,9 @@ filesystem policy. It requires Landlock ABI v3, including pathname truncation
 protection. Rules cover individually opened root children except `/.openshell`;
 the sandbox opens entries relative to a pinned root descriptor without following
 symlinks. An image-provided alias cannot grant access to the protected subtree.
+The reserved `/.openshell` root must itself be a real directory if present;
+a symlink or non-directory aborts preparation so private child mounts cannot
+redirect into an allowed subtree.
 
 ## Network and Inference
 

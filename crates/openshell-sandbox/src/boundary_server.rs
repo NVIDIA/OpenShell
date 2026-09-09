@@ -49,7 +49,7 @@ mod linux {
     use tokio_stream::wrappers::ReceiverStream;
 
     use openshell_isolation_interface::boundary_protocol::{
-        AgentSpecWire, BinaryIdentityWire, BoundaryConfig,
+        AgentSpecWire, BinaryIdentityWire, BoundaryConfig, BoundaryErrorKind,
         BoundaryListener as BoundaryListenerConfig, DnsQueryResultWire, ExecSpecWire,
         ExitStatusWire, MediationTimingWire, OutputWindowWire, ProcessKindWire,
         ProcessSnapshotWire, Request, RequestEnvelope, Response, ResponseEnvelope, STREAM_EXIT,
@@ -603,7 +603,10 @@ mod linux {
             {
                 Some(MediationLease(runtime.clone()))
             } else {
-                response = guest_error("denied", "a mediation session is already active");
+                response = guest_error(
+                    BoundaryErrorKind::Denied,
+                    "a mediation session is already active",
+                );
                 None
             }
         } else {
@@ -761,7 +764,7 @@ mod linux {
         if !runtime.authenticate(&request) {
             let response = ResponseEnvelope {
                 request_id: request.request_id,
-                response: guest_error("denied", "control authentication failed"),
+                response: guest_error(BoundaryErrorKind::Denied, "control authentication failed"),
             };
             return write_frame(&mut stream, &response)
                 .map_err(|error| format!("write control frame: {error}"));
@@ -769,7 +772,10 @@ mod linux {
         if request.validate_payload_digest().is_err() {
             let response = ResponseEnvelope {
                 request_id: request.request_id,
-                response: guest_error("denied", "control request payload digest mismatch"),
+                response: guest_error(
+                    BoundaryErrorKind::Denied,
+                    "control request payload digest mismatch",
+                ),
             };
             return write_frame(&mut stream, &response)
                 .map_err(|error| format!("write control frame: {error}"));
@@ -842,7 +848,7 @@ mod linux {
                             &mut stream,
                             &ResponseEnvelope {
                                 request_id: request.request_id,
-                                response: guest_error("failed", error),
+                                response: guest_error(BoundaryErrorKind::Process, error),
                             },
                         )
                         .map_err(|error| format!("write port-forward error response: {error}"))?;
@@ -993,13 +999,13 @@ mod linux {
     ) -> Result<(), Response> {
         if requests.contains(request_id) {
             return Err(guest_error(
-                "denied",
+                BoundaryErrorKind::Denied,
                 "exec request has expired; it cannot be executed again",
             ));
         }
         if requests.len() >= MAX_REPLAY_LEDGER_ENTRIES {
             return Err(guest_error(
-                "unavailable",
+                BoundaryErrorKind::Unavailable,
                 "boundary generation exec request limit reached",
             ));
         }
@@ -1120,7 +1126,7 @@ mod linux {
             .is_err()
         {
             return Err(guest_error(
-                "denied",
+                BoundaryErrorKind::Denied,
                 "process already has a control attachment",
             ));
         }
@@ -1186,10 +1192,13 @@ mod linux {
 
         fn dispatch(&self, envelope: RequestEnvelope) -> Response {
             if !self.authenticate(&envelope) {
-                return guest_error("denied", "control authentication failed");
+                return guest_error(BoundaryErrorKind::Denied, "control authentication failed");
             }
             if envelope.validate_payload_digest().is_err() {
-                return guest_error("denied", "control request payload digest mismatch");
+                return guest_error(
+                    BoundaryErrorKind::Denied,
+                    "control request payload digest mismatch",
+                );
             }
             let replayable = envelope.request.is_replayable_mutation();
             let mut replay_ledger = replayable.then(|| lock(&self.replay_ledger));
@@ -1201,7 +1210,7 @@ mod linux {
                     record.response.clone()
                 } else {
                     guest_error(
-                        "denied",
+                        BoundaryErrorKind::Denied,
                         "control request ID was reused with a different payload",
                     )
                 };
@@ -1217,7 +1226,7 @@ mod linux {
                         self.attach(*policy)
                     } else {
                         guest_error(
-                            "denied",
+                            BoundaryErrorKind::Denied,
                             "topology resource claims do not match the boundary configuration",
                         )
                     }
@@ -1255,15 +1264,16 @@ mod linux {
                     rows,
                 } => self.resize_process(&process_id, cols, rows),
                 Request::OpenMediation => self.network_accept_context().map_or_else(
-                    |error| guest_error("unavailable", error),
+                    |error| guest_error(BoundaryErrorKind::Unavailable, error),
                     |_| Response::MediationReady,
                 ),
                 Request::Exec { .. }
                 | Request::AttachProcess { .. }
                 | Request::PortForward { .. }
-                | Request::AcceptNetwork => {
-                    guest_error("invalid", "streaming request used on control path")
-                }
+                | Request::AcceptNetwork => guest_error(
+                    BoundaryErrorKind::Invalid,
+                    "streaming request used on control path",
+                ),
             };
             if let Some(ledger) = replay_ledger.as_mut() {
                 ledger.insert(
@@ -1300,7 +1310,10 @@ mod linux {
             let executor = {
                 let state = lock(&self.state);
                 let RuntimeState::Running(process) = &*state else {
-                    return Err(guest_error("invalid", "agent process has not been started"));
+                    return Err(guest_error(
+                        BoundaryErrorKind::Invalid,
+                        "agent process has not been started",
+                    ));
                 };
                 process.boundary_exec()
             };
@@ -1311,13 +1324,13 @@ mod linux {
             {
                 if handle.payload_digest != payload_digest {
                     return Err(guest_error(
-                        "denied",
+                        BoundaryErrorKind::Denied,
                         "exec request ID was reused with a different payload",
                     ));
                 }
                 if handle.attached.load(Ordering::Acquire) {
                     return Err(guest_error(
-                        "unavailable",
+                        BoundaryErrorKind::Unavailable,
                         "prior exec attachment is still being released",
                     ));
                 }
@@ -1338,7 +1351,7 @@ mod linux {
                     handles.remove(&process_id);
                 } else {
                     return Err(guest_error(
-                        "unavailable",
+                        BoundaryErrorKind::Unavailable,
                         "retained exec process limit reached",
                     ));
                 }
@@ -1350,7 +1363,7 @@ mod linux {
             let session = self
                 .process_runtime
                 .block_on(executor.exec(spec.into()))
-                .map_err(|error| guest_error("failed", error.to_string()))?;
+                .map_err(|error| guest_error(BoundaryErrorKind::Process, error.to_string()))?;
             let process_id = format!(
                 "{}:exec:{}",
                 self.config.generation,
@@ -1365,7 +1378,7 @@ mod linux {
             } = session;
             let Some(stdin) = stdin else {
                 return Err(guest_error(
-                    "failed",
+                    BoundaryErrorKind::Process,
                     "exec process stdin pipe is unavailable",
                 ));
             };
@@ -1423,11 +1436,11 @@ mod linux {
                 .get(process_id)
                 .map(|handle| handle.process.clone());
             let Some(process) = process else {
-                return guest_error("invalid", "unknown exec process ID");
+                return guest_error(BoundaryErrorKind::Invalid, "unknown exec process ID");
             };
             match self.process_runtime.block_on(process.signal(signal.into())) {
                 Ok(()) => Response::Signaled,
-                Err(error) => guest_error("failed", error.to_string()),
+                Err(error) => guest_error(BoundaryErrorKind::Process, error.to_string()),
             }
         }
 
@@ -1435,7 +1448,10 @@ mod linux {
             if let Ok(process) = self.running_process(process_id) {
                 let session = process.main_session();
                 if !session.terminal() {
-                    return guest_error("invalid", "agent process has no terminal");
+                    return guest_error(
+                        BoundaryErrorKind::Invalid,
+                        "agent process has no terminal",
+                    );
                 }
                 self.process_runtime.block_on(session.resize(
                     u32::from(cols),
@@ -1449,11 +1465,11 @@ mod linux {
                 .get(process_id)
                 .and_then(|handle| handle.terminal.clone());
             let Some(terminal) = terminal else {
-                return guest_error("invalid", "exec process has no terminal");
+                return guest_error(BoundaryErrorKind::Invalid, "exec process has no terminal");
             };
             match self.process_runtime.block_on(terminal.resize(cols, rows)) {
                 Ok(()) => Response::Resized,
-                Err(error) => guest_error("failed", error.to_string()),
+                Err(error) => guest_error(BoundaryErrorKind::Process, error.to_string()),
             }
         }
 
@@ -1498,7 +1514,7 @@ mod linux {
             let handles = lock(&self.exec_handles);
             let handle = handles
                 .get(process_id)
-                .ok_or_else(|| guest_error("invalid", "unknown process ID"))?;
+                .ok_or_else(|| guest_error(BoundaryErrorKind::Invalid, "unknown process ID"))?;
             Ok((acquire_exec_attachment(handle)?, handle.terminal.is_some()))
         }
 
@@ -1519,7 +1535,7 @@ mod linux {
                 RuntimeState::AwaitingAttach => {
                     let prepared = match PreparedBoundary::establish(self.network_broker.clone()) {
                         Ok(prepared) => prepared,
-                        Err(error) => return guest_error("failed", error),
+                        Err(error) => return guest_error(BoundaryErrorKind::Process, error),
                     };
                     *lock(&self.attached_policy) = Some(policy);
                     *state = RuntimeState::Bound(prepared);
@@ -1537,7 +1553,10 @@ mod linux {
                     snapshot: self.session_snapshot(),
                 }
             } else {
-                guest_error("denied", "attach policy does not match the bound boundary")
+                guest_error(
+                    BoundaryErrorKind::Denied,
+                    "attach policy does not match the bound boundary",
+                )
             }
         }
 
@@ -1595,11 +1614,11 @@ mod linux {
             match &*state {
                 RuntimeState::Bound(prepared) => {
                     if let Err(error) = prepared.confirm(&self.process_runtime) {
-                        return guest_error("failed", error);
+                        return guest_error(BoundaryErrorKind::Process, error);
                     }
                     let evidence = match self.measure_confirmation_evidence() {
                         Ok(evidence) => evidence,
-                        Err(error) => return guest_error("failed", error),
+                        Err(error) => return guest_error(BoundaryErrorKind::Process, error),
                     };
                     *state = RuntimeState::Ready(prepared.clone());
                     Response::Confirmed {
@@ -1608,15 +1627,16 @@ mod linux {
                 }
                 RuntimeState::Ready(_) | RuntimeState::Running(_) => {
                     self.measure_confirmation_evidence().map_or_else(
-                        |error| guest_error("failed", error),
+                        |error| guest_error(BoundaryErrorKind::Process, error),
                         |evidence| Response::Confirmed {
                             evidence: Box::new(evidence),
                         },
                     )
                 }
-                RuntimeState::AwaitingAttach => {
-                    guest_error("invalid", "boundary must be attached before confirm")
-                }
+                RuntimeState::AwaitingAttach => guest_error(
+                    BoundaryErrorKind::Invalid,
+                    "boundary must be attached before confirm",
+                ),
             }
         }
 
@@ -1688,7 +1708,7 @@ mod linux {
         ) -> Response {
             let spec = match resolve_agent_spec(spec) {
                 Ok(spec) => spec,
-                Err(error) => return guest_error("failed", error),
+                Err(error) => return guest_error(BoundaryErrorKind::Process, error),
             };
             let mut state = lock(&self.state);
             let requested = StartedAgent {
@@ -1711,17 +1731,20 @@ mod linux {
                     }
                 } else {
                     guest_error(
-                        "denied",
+                        BoundaryErrorKind::Denied,
                         "start_agent inputs do not match the running boundary",
                     )
                 };
             }
             let RuntimeState::Ready(prepared) = &*state else {
-                return guest_error("invalid", "boundary must be confirmed before start_agent");
+                return guest_error(
+                    BoundaryErrorKind::Invalid,
+                    "boundary must be confirmed before start_agent",
+                );
             };
             let ca_file_paths = match install_ca_material(ca_cert, ca_bundle) {
                 Ok(paths) => paths,
-                Err(error) => return guest_error("failed", error),
+                Err(error) => return guest_error(BoundaryErrorKind::Process, error),
             };
             let mut policy = policy.into();
             let driver_identity = DriverIdentity::Resolved {
@@ -1729,7 +1752,7 @@ mod linux {
                 gid: self.config.workload_identity.gid,
             };
             if let Err(error) = resolve_process_identity(&mut policy, &driver_identity) {
-                return guest_error("failed", error.to_string());
+                return guest_error(BoundaryErrorKind::Process, error.to_string());
             }
             let launch = ManagedProcessLaunch {
                 process_id: format!("{}:main:0", self.config.generation),
@@ -1746,7 +1769,7 @@ mod linux {
                 prepared.clone(),
             ) {
                 Ok(process) => Arc::new(process),
-                Err(error) => return guest_error("failed", error),
+                Err(error) => return guest_error(BoundaryErrorKind::Process, error),
             };
             let process_id = process.process_id();
             *lock(&self.started_agent) = Some(requested);
@@ -1767,15 +1790,19 @@ mod linux {
                 let state = lock(&self.state);
                 let RuntimeState::Running(process) = &*state else {
                     return guest_error(
-                        "invalid",
+                        BoundaryErrorKind::Invalid,
                         "agent process must be running before provider environment updates",
                     );
                 };
                 process.clone()
             };
-            let revision = process
+            let revision = match process
                 .provider_credentials
-                .compare_and_install_child_env_snapshot(expected_revision, revision, provider_env);
+                .compare_and_install_child_env_snapshot(expected_revision, revision, provider_env)
+            {
+                Ok(revision) => revision,
+                Err(error) => return guest_error(BoundaryErrorKind::Process, error.to_string()),
+            };
             Response::ProviderEnvironmentUpdated { revision }
         }
 
@@ -1786,7 +1813,7 @@ mod linux {
             };
             match process.wait() {
                 Ok(status) => Response::Exited { status },
-                Err(error) => guest_error("failed", error),
+                Err(error) => guest_error(BoundaryErrorKind::Process, error),
             }
         }
 
@@ -1797,7 +1824,7 @@ mod linux {
             };
             match process.signal(signal) {
                 Ok(()) => Response::Signaled,
-                Err(error) => guest_error("terminated", error),
+                Err(error) => guest_error(BoundaryErrorKind::Terminated, error),
             }
         }
 
@@ -1809,7 +1836,7 @@ mod linux {
             match process.signal(SignalWire::Kill) {
                 Ok(()) => Response::Terminated,
                 Err(_) if process.has_exited() => Response::Terminated,
-                Err(error) => guest_error("failed", error),
+                Err(error) => guest_error(BoundaryErrorKind::Process, error),
             }
         }
 
@@ -1820,10 +1847,16 @@ mod linux {
         fn running_process(&self, process_id: &str) -> Result<Arc<ManagedProcess>, Response> {
             let state = lock(&self.state);
             let RuntimeState::Running(process) = &*state else {
-                return Err(guest_error("invalid", "agent process has not been started"));
+                return Err(guest_error(
+                    BoundaryErrorKind::Invalid,
+                    "agent process has not been started",
+                ));
             };
             if process.process_id() != process_id {
-                return Err(guest_error("invalid", "unknown process ID"));
+                return Err(guest_error(
+                    BoundaryErrorKind::Invalid,
+                    "unknown process ID",
+                ));
             }
             Ok(process.clone())
         }
@@ -2284,9 +2317,9 @@ mod linux {
         )
     }
 
-    fn guest_error(kind: &str, message: impl Into<String>) -> Response {
+    fn guest_error(kind: BoundaryErrorKind, message: impl Into<String>) -> Response {
         Response::Error {
-            kind: kind.to_string(),
+            kind,
             message: message.into(),
         }
     }
@@ -3400,7 +3433,7 @@ mod linux {
             changed.request_id = update.request_id;
             assert!(matches!(
                 boundary.dispatch(changed),
-                Response::Error { kind, .. } if kind == "denied"
+                Response::Error { kind, .. } if kind == BoundaryErrorKind::Denied
             ));
 
             let (first_attachment, _) = boundary
@@ -3441,7 +3474,7 @@ mod linux {
             changed_policy.version += 1;
             assert!(matches!(
                 boundary.attach(changed_policy.clone()),
-                Response::Error { kind, .. } if kind == "denied"
+                Response::Error { kind, .. } if kind == BoundaryErrorKind::Denied
             ));
             assert!(matches!(
                 boundary.start_agent(
@@ -3453,7 +3486,7 @@ mod linux {
                     0,
                     std::collections::HashMap::new(),
                 ),
-                Response::Error { kind, .. } if kind == "denied"
+                Response::Error { kind, .. } if kind == BoundaryErrorKind::Denied
             ));
 
             let exec_spec = ExecSpecWire {

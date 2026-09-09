@@ -175,6 +175,23 @@ fn capability_free_baseline_entries(root: &Path) -> Result<Vec<(PathBuf, OwnedFd
         Mode::empty(),
     )
     .into_diagnostic()?;
+    // The reserved root itself must not redirect private child mounts into an
+    // allowed subtree. Pin and validate it independently of the public entries.
+    // Absence is allowed for qualification before driver bootstrap is staged.
+    let _private_root = match openat(
+        &root_fd,
+        PRIVATE_ROOT,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => Some(fd),
+        Err(rustix::io::Errno::NOENT) => None,
+        Err(error) => {
+            return Err(miette::miette!(
+                "private sandbox root must be a real directory: {error}"
+            ));
+        }
+    };
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(root).into_diagnostic()? {
         let entry = entry.into_diagnostic()?;
@@ -628,6 +645,20 @@ mod tests {
                 .map(|name| root.path().join(name))
                 .to_vec()
         );
+    }
+
+    #[test]
+    fn capability_free_baseline_rejects_private_root_redirect() {
+        let root = tempfile::tempdir().unwrap();
+        let public = root.path().join("public");
+        let private = root.path().join(".openshell");
+        std::fs::create_dir(&public).unwrap();
+        std::fs::write(public.join("secret"), b"private mount contents").unwrap();
+        std::os::unix::fs::symlink(&public, &private).unwrap();
+        assert!(capability_free_baseline_entries(root.path()).is_err());
+        std::fs::remove_file(&private).unwrap();
+        std::fs::write(&private, b"not a directory").unwrap();
+        assert!(capability_free_baseline_entries(root.path()).is_err());
     }
 
     #[test]
