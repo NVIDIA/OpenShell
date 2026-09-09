@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+grpcio==1.83.1
+grpcio-tools==1.83.1
+protobuf==7.36.1
+PyYAML==6.0.3
+matplotlib==3.11.1

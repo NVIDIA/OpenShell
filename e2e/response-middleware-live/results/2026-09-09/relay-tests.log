@@ -1,0 +1,176 @@
+   Compiling subtle v2.6.1
+   Compiling portable-atomic v1.13.1
+   Compiling typenum v1.20.1
+   Compiling num-traits v0.2.19
+   Compiling tokio v1.52.1
+   Compiling prost-derive v0.14.3
+   Compiling ring v0.17.14
+   Compiling serde_json v1.0.149
+   Compiling axum-core v0.5.6
+   Compiling tempfile v3.27.0
+   Compiling spin v0.9.8
+   Compiling time v0.3.47
+   Compiling ff v0.13.1
+   Compiling aho-corasick v1.1.4
+   Compiling url v2.5.8
+   Compiling getrandom v0.4.2
+   Compiling either v1.15.0
+   Compiling rand v0.8.6
+   Compiling chacha20 v0.10.1
+   Compiling msvc_spectre_libs v0.1.3
+   Compiling regorus v0.9.1
+   Compiling group v0.13.0
+   Compiling bstr v1.12.1
+   Compiling lazy_static v1.5.0
+   Compiling generic-array v0.14.7
+   Compiling hashbrown v0.14.5
+   Compiling bytes-utils v0.1.4
+   Compiling countme v3.0.1
+   Compiling rustc-hash v1.1.0
+   Compiling regex-automata v0.4.14
+   Compiling sharded-slab v0.1.7
+   Compiling text-size v1.1.1
+   Compiling rustls-webpki v0.103.13
+   Compiling yasna v0.5.2
+   Compiling webpki-roots v1.0.7
+   Compiling temp-env v0.3.6
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling sec1 v0.7.3
+   Compiling crypto-bigint v0.5.5
+   Compiling rowan v0.16.1
+   Compiling rcgen v0.13.2
+   Compiling digest v0.10.7
+   Compiling rand v0.10.2
+   Compiling uuid v1.23.1
+   Compiling once_cell v1.21.4
+   Compiling apollo-parser v0.8.5
+   Compiling num-integer v0.1.46
+   Compiling chrono v0.4.44
+   Compiling matchers v0.2.0
+   Compiling globset v0.4.18
+   Compiling regex v1.12.3
+   Compiling hmac v0.12.1
+   Compiling signature v2.2.0
+   Compiling sha2 v0.10.9
+   Compiling curve25519-dalek v4.1.3
+   Compiling sha1 v0.10.6
+   Compiling tokio-util v0.7.18
+   Compiling tokio-stream v0.1.18
+   Compiling aws-smithy-async v1.2.14
+   Compiling tracing-core v0.1.36
+   Compiling rustls v0.23.38
+   Compiling aws-smithy-types v1.5.0
+   Compiling num-iter v0.1.45
+   Compiling ed25519 v2.2.3
+   Compiling hkdf v0.12.4
+   Compiling rfc6979 v0.4.0
+   Compiling num-bigint v0.4.6
+   Compiling num-bigint-dig v0.8.6
+   Compiling ed25519-dalek v2.2.0
+   Compiling tracing v0.1.44
+   Compiling tracing-log v0.2.0
+   Compiling tracing-serde v0.2.0
+   Compiling elliptic-curve v0.13.8
+   Compiling ecdsa v0.16.9
+   Compiling primeorder v0.13.6
+   Compiling h2 v0.4.19
+   Compiling tower v0.5.3
+   Compiling aws-smithy-runtime-api v1.12.3
+   Compiling hickory-proto v0.26.1
+   Compiling prost v0.14.3
+   Compiling rsa v0.9.10
+   Compiling tokio-rustls v0.26.4
+   Compiling p256 v0.13.2
+   Compiling p384 v0.13.1
+   Compiling tungstenite v0.26.2
+   Compiling tracing-subscriber v0.3.23
+   Compiling tower-mcp-types v0.12.0
+   Compiling prost-types v0.14.3
+   Compiling aws-credential-types v1.2.14
+   Compiling aws-smithy-http v0.63.6
+   Compiling axum v0.8.9
+   Compiling tower-http v0.6.8
+   Compiling jsonwebtoken v10.3.0
+   Compiling aws-sigv4 v1.4.2
+   Compiling hyper v1.9.0
+   Compiling prost-build v0.14.3
+   Compiling tonic-prost-build v0.14.6
+   Compiling hyper-util v0.1.20
+   Compiling openshell-core v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-core)
+   Compiling hyper-timeout v0.5.2
+   Compiling hyper-rustls v0.27.9
+   Compiling tokio-tungstenite v0.26.2
+   Compiling reqwest v0.12.28
+   Compiling openshell-ocsf v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-ocsf)
+   Compiling tonic v0.14.6
+   Compiling tonic-prost v0.14.6
+   Compiling openshell-extension-core v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-extension-core)
+   Compiling spiffe v0.15.1
+   Compiling openshell-policy v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-policy)
+   Compiling openshell-supervisor-middleware v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-supervisor-middleware)
+   Compiling openshell-router v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-router)
+   Compiling openshell-supervisor-middleware-builtins v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-supervisor-middleware-builtins)
+   Compiling openshell-supervisor-network v0.0.0 (/home/pmlocek/.codex/worktrees/5fa1/OpenShell/crates/openshell-supervisor-network)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 28.52s
+     Running unittests src/lib.rs (target/debug/deps/openshell_supervisor_network-87915103312047d6)
+
+running 32 tests
+test l7::rest::tests::response_middleware_ocsf_events_omit_content_headers_and_free_form_reasons ... ok
+test l7::rest::tests::response_middleware_fail_open_dual_emits_sanitized_findings ... ok
+test l7::relay::tests::response_middleware_context_reuses_exchange_request_id ... ok
+test l7::rest::tests::response_middleware_bypasses_protocol_upgrades ... ok
+test l7::rest::tests::response_middleware_client_disconnect_aborts_stream_delivery ... ok
+test l7::rest::tests::response_middleware_headers_only_mutates_head_and_preserves_framing ... ok
+test l7::rest::tests::response_middleware_fail_closed_after_commit_aborts_without_replacement ... ok
+test l7::rest::tests::response_middleware_head_block_reports_length_without_body ... ok
+test l7::rest::tests::response_middleware_preflight_block_returns_canonical_403 ... ok
+test l7::rest::tests::response_middleware_fail_closed_before_commit_returns_canonical_502 ... ok
+test l7::rest::tests::response_middleware_forwards_interim_head_before_final_preflight ... ok
+test l7::rest::tests::response_middleware_handles_bodyless_responses_without_body_events ... ok
+test l7::rest::tests::response_middleware_stream_block_aborts_after_commit_without_error_bytes ... ok
+test l7::rest::tests::response_middleware_headers_only_preserves_chunked_and_close_delimited_bodies ... ok
+test l7::rest::tests::response_middleware_never_uses_chunked_framing_for_http_10 ... ok
+test l7::rest::tests::response_middleware_selected_hook_enforces_header_limits ... ok
+test l7::rest::tests::response_middleware_fail_open_preserves_input_before_and_after_commit ... ok
+test l7::rest::tests::response_middleware_streams_close_delimited_body_with_owned_framing ... ok
+test l7::rest::tests::response_middleware_rejects_malformed_response_fields_before_commit ... ok
+test l7::rest::tests::response_middleware_rejects_malformed_or_protected_upstream_trailers_atomically ... ok
+test l7::rest::tests::response_middleware_streams_normalized_chunks_and_preserves_trailers ... ok
+test l7::rest::tests::response_middleware_preserves_baseline_connection_outcomes ... ok
+test l7::rest::tests::response_middleware_whole_body_block_returns_403_before_commit ... ok
+test l7::rest::tests::response_middleware_head_failure_reports_body_length_without_body ... ok
+test l7::rest::tests::response_middleware_unbound_chains_preserve_ordinary_headers ... ok
+test l7::rest::tests::response_middleware_whole_body_delays_commit_and_sets_length ... ok
+test l7::rest::tests::response_middleware_expiry_preserves_bytes_through_slow_stream_and_client ... ok
+test proxy::tests::plaintext_forward_relay_applies_response_middleware ... ok
+test l7::rest::tests::response_middleware_flushes_partial_framed_payload_promptly ... ok
+test l7::rest::tests::response_middleware_stale_policy_generation_aborts_before_preflight ... ok
+test l7::rest::tests::response_middleware_whole_body_timeout_obeys_failure_policy ... ok
+test l7::rest::tests::response_middleware_whole_body_timeout_does_not_reset_for_trickle_input ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 1273 filtered out; finished in 0.06s
+
+     Running tests/accept_fd_exhaustion.rs (target/debug/deps/accept_fd_exhaustion-a2743d6692f17827)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/sigv4_localstack.rs (target/debug/deps/sigv4_localstack-f2d4d7cd500d4ee3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/system_inference.rs (target/debug/deps/system_inference-c30a5c4b68046428)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/websocket_upgrade.rs (target/debug/deps/websocket_upgrade-140fcc4868f868cb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s

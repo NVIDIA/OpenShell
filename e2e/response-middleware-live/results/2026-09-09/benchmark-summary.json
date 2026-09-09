@@ -1,0 +1,504 @@
+[
+  {
+    "name": "stream-whole",
+    "size": 19,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 8.427999999999999,
+    "p95_ms": 10.103,
+    "overhead_ms": 3.472999999999999,
+    "ttfb_median_ms": 8.343,
+    "connections": 105,
+    "round_median_ms": [
+      8.22,
+      8.65,
+      8.163
+    ]
+  },
+  {
+    "name": "stream-whole",
+    "size": 65536,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 8.91,
+    "p95_ms": 10.52,
+    "overhead_ms": 4.122000000000001,
+    "ttfb_median_ms": 8.781,
+    "connections": 105,
+    "round_median_ms": [
+      8.687999999999999,
+      8.822999999999999,
+      9.207
+    ]
+  },
+  {
+    "name": "stream-whole",
+    "size": 262144,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 12.122000000000002,
+    "p95_ms": 14.001,
+    "overhead_ms": 7.154000000000002,
+    "ttfb_median_ms": 11.798,
+    "connections": 105,
+    "round_median_ms": [
+      11.751,
+      12.11,
+      12.351
+    ]
+  },
+  {
+    "name": "headers-1",
+    "size": 19,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 5.184,
+    "p95_ms": 6.646,
+    "overhead_ms": 0.2290000000000001,
+    "ttfb_median_ms": 5.143,
+    "connections": 105,
+    "round_median_ms": [
+      5.19,
+      4.9750000000000005,
+      5.409
+    ]
+  },
+  {
+    "name": "headers-1",
+    "size": 65536,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 5.589,
+    "p95_ms": 6.766,
+    "overhead_ms": 0.801000000000001,
+    "ttfb_median_ms": 5.4590000000000005,
+    "connections": 105,
+    "round_median_ms": [
+      5.539,
+      6.0600000000000005,
+      5.199
+    ]
+  },
+  {
+    "name": "headers-1",
+    "size": 262144,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 5.845999999999999,
+    "p95_ms": 6.909,
+    "overhead_ms": 0.8779999999999992,
+    "ttfb_median_ms": 5.4799999999999995,
+    "connections": 105,
+    "round_median_ms": [
+      5.805000000000001,
+      6.231000000000001,
+      5.718
+    ]
+  },
+  {
+    "name": "headers-whole-stream",
+    "size": 19,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 9.177,
+    "p95_ms": 10.907,
+    "overhead_ms": 4.2219999999999995,
+    "ttfb_median_ms": 9.135000000000002,
+    "connections": 105,
+    "round_median_ms": [
+      8.974,
+      9.499,
+      9.112
+    ]
+  },
+  {
+    "name": "headers-whole-stream",
+    "size": 65536,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 9.1,
+    "p95_ms": 10.803,
+    "overhead_ms": 4.312,
+    "ttfb_median_ms": 8.998000000000001,
+    "connections": 105,
+    "round_median_ms": [
+      8.943,
+      8.821000000000002,
+      9.468
+    ]
+  },
+  {
+    "name": "headers-whole-stream",
+    "size": 262144,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 12.725,
+    "p95_ms": 14.632,
+    "overhead_ms": 7.757,
+    "ttfb_median_ms": 12.411999999999999,
+    "connections": 105,
+    "round_median_ms": [
+      12.306,
+      12.76,
+      12.857999999999999
+    ]
+  },
+  {
+    "name": "stream-2",
+    "size": 19,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 8.415000000000001,
+    "p95_ms": 10.56,
+    "overhead_ms": 3.460000000000001,
+    "ttfb_median_ms": 5.854,
+    "connections": 105,
+    "round_median_ms": [
+      8.036,
+      8.552999999999999,
+      8.685
+    ]
+  },
+  {
+    "name": "stream-2",
+    "size": 65536,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 9.188,
+    "p95_ms": 10.984,
+    "overhead_ms": 4.400000000000001,
+    "ttfb_median_ms": 6.2490000000000006,
+    "connections": 105,
+    "round_median_ms": [
+      8.704,
+      9.421000000000001,
+      9.133000000000001
+    ]
+  },
+  {
+    "name": "stream-2",
+    "size": 262144,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 13.389,
+    "p95_ms": 16.343,
+    "overhead_ms": 8.421,
+    "ttfb_median_ms": 6.531000000000001,
+    "connections": 105,
+    "round_median_ms": [
+      12.029,
+      13.284,
+      14.798
+    ]
+  },
+  {
+    "name": "whole-1",
+    "size": 19,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 5.435,
+    "p95_ms": 7.0600000000000005,
+    "overhead_ms": 0.47999999999999954,
+    "ttfb_median_ms": 5.393,
+    "connections": 105,
+    "round_median_ms": [
+      5.17,
+      5.2620000000000005,
+      6.3
+    ]
+  },
+  {
+    "name": "whole-1",
+    "size": 65536,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 6.2059999999999995,
+    "p95_ms": 7.747999999999999,
+    "overhead_ms": 1.4180000000000001,
+    "ttfb_median_ms": 6.1000000000000005,
+    "connections": 105,
+    "round_median_ms": [
+      6.099,
+      6.124,
+      6.732
+    ]
+  },
+  {
+    "name": "whole-1",
+    "size": 262144,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 7.426,
+    "p95_ms": 9.45,
+    "overhead_ms": 2.458,
+    "ttfb_median_ms": 7.1209999999999996,
+    "connections": 105,
+    "round_median_ms": [
+      6.96,
+      7.534,
+      8.754
+    ]
+  },
+  {
+    "name": "whole-2",
+    "size": 19,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 7.787999999999999,
+    "p95_ms": 9.343,
+    "overhead_ms": 2.8329999999999993,
+    "ttfb_median_ms": 7.662999999999999,
+    "connections": 105,
+    "round_median_ms": [
+      6.808,
+      8.043,
+      8.463999999999999
+    ]
+  },
+  {
+    "name": "whole-2",
+    "size": 65536,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 8.744,
+    "p95_ms": 10.514000000000001,
+    "overhead_ms": 3.9560000000000004,
+    "ttfb_median_ms": 8.595,
+    "connections": 105,
+    "round_median_ms": [
+      7.612,
+      9.181,
+      9.485999999999999
+    ]
+  },
+  {
+    "name": "whole-2",
+    "size": 262144,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 10.437999999999999,
+    "p95_ms": 12.133,
+    "overhead_ms": 5.469999999999999,
+    "ttfb_median_ms": 10.039,
+    "connections": 105,
+    "round_median_ms": [
+      9.751,
+      10.356,
+      11.089
+    ]
+  },
+  {
+    "name": "baseline",
+    "size": 19,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 4.955,
+    "p95_ms": 5.671,
+    "overhead_ms": 0.0,
+    "ttfb_median_ms": 4.867,
+    "connections": 105,
+    "round_median_ms": [
+      4.937,
+      4.963,
+      4.955
+    ]
+  },
+  {
+    "name": "baseline",
+    "size": 65536,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 4.787999999999999,
+    "p95_ms": 5.626,
+    "overhead_ms": 0.0,
+    "ttfb_median_ms": 4.624,
+    "connections": 105,
+    "round_median_ms": [
+      4.988,
+      3.731,
+      5.087000000000001
+    ]
+  },
+  {
+    "name": "baseline",
+    "size": 262144,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 4.968,
+    "p95_ms": 5.902,
+    "overhead_ms": 0.0,
+    "ttfb_median_ms": 4.619,
+    "connections": 105,
+    "round_median_ms": [
+      5.152,
+      4.339,
+      4.891
+    ]
+  },
+  {
+    "name": "stream-1",
+    "size": 19,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 6.930000000000001,
+    "p95_ms": 8.453999999999999,
+    "overhead_ms": 1.9750000000000005,
+    "ttfb_median_ms": 5.622,
+    "connections": 105,
+    "round_median_ms": [
+      6.930000000000001,
+      6.422,
+      7.427
+    ]
+  },
+  {
+    "name": "stream-1",
+    "size": 65536,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 7.252,
+    "p95_ms": 8.595,
+    "overhead_ms": 2.4640000000000004,
+    "ttfb_median_ms": 5.741,
+    "connections": 105,
+    "round_median_ms": [
+      7.0089999999999995,
+      7.559,
+      7.587
+    ]
+  },
+  {
+    "name": "stream-1",
+    "size": 262144,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 9.232000000000001,
+    "p95_ms": 10.841,
+    "overhead_ms": 4.264000000000001,
+    "ttfb_median_ms": 5.6290000000000004,
+    "connections": 105,
+    "round_median_ms": [
+      9.198,
+      9.747,
+      8.796999999999999
+    ]
+  },
+  {
+    "name": "headers-2",
+    "size": 19,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 6.569,
+    "p95_ms": 7.691,
+    "overhead_ms": 1.6139999999999999,
+    "ttfb_median_ms": 6.45,
+    "connections": 105,
+    "round_median_ms": [
+      6.61,
+      5.948,
+      7.074999999999999
+    ]
+  },
+  {
+    "name": "headers-2",
+    "size": 65536,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 6.453,
+    "p95_ms": 7.579,
+    "overhead_ms": 1.665000000000001,
+    "ttfb_median_ms": 6.266,
+    "connections": 105,
+    "round_median_ms": [
+      6.652,
+      5.923,
+      6.662999999999999
+    ]
+  },
+  {
+    "name": "headers-2",
+    "size": 262144,
+    "fresh": false,
+    "n": 105,
+    "median_ms": 6.2700000000000005,
+    "p95_ms": 7.9,
+    "overhead_ms": 1.3020000000000005,
+    "ttfb_median_ms": 5.904999999999999,
+    "connections": 105,
+    "round_median_ms": [
+      6.364,
+      5.956,
+      6.708
+    ]
+  },
+  {
+    "name": "baseline",
+    "size": 19,
+    "fresh": true,
+    "n": 35,
+    "median_ms": 5.607,
+    "p95_ms": 6.2620000000000005,
+    "overhead_ms": 0.0,
+    "ttfb_median_ms": 5.523,
+    "connections": 35,
+    "round_median_ms": [
+      5.607
+    ]
+  },
+  {
+    "name": "headers-1",
+    "size": 19,
+    "fresh": true,
+    "n": 35,
+    "median_ms": 5.242,
+    "p95_ms": 6.2620000000000005,
+    "overhead_ms": -0.3650000000000002,
+    "ttfb_median_ms": 5.189,
+    "connections": 35,
+    "round_median_ms": [
+      5.242
+    ]
+  },
+  {
+    "name": "whole-1",
+    "size": 19,
+    "fresh": true,
+    "n": 35,
+    "median_ms": 6.281,
+    "p95_ms": 7.161,
+    "overhead_ms": 0.6739999999999995,
+    "ttfb_median_ms": 6.23,
+    "connections": 35,
+    "round_median_ms": [
+      6.281
+    ]
+  },
+  {
+    "name": "stream-1",
+    "size": 19,
+    "fresh": true,
+    "n": 35,
+    "median_ms": 6.216,
+    "p95_ms": 7.615,
+    "overhead_ms": 0.609,
+    "ttfb_median_ms": 5.149,
+    "connections": 35,
+    "round_median_ms": [
+      6.216
+    ]
+  },
+  {
+    "name": "stream-2",
+    "size": 19,
+    "fresh": true,
+    "n": 35,
+    "median_ms": 9.065999999999999,
+    "p95_ms": 10.229000000000001,
+    "overhead_ms": 3.4589999999999987,
+    "ttfb_median_ms": 6.325,
+    "connections": 35,
+    "round_median_ms": [
+      9.065999999999999
+    ]
+  }
+]

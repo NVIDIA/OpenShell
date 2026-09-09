@@ -1,0 +1,245 @@
+[
+  {
+    "name": "stream-whole",
+    "size": 19,
+    "n": 105,
+    "median_ms": 3.972,
+    "p95_ms": 5.436,
+    "overhead_ms": 3.183,
+    "connections": 0
+  },
+  {
+    "name": "stream-whole",
+    "size": 65536,
+    "n": 105,
+    "median_ms": 5.061999999999999,
+    "p95_ms": 6.462,
+    "overhead_ms": 4.313,
+    "connections": 0
+  },
+  {
+    "name": "stream-whole",
+    "size": 262144,
+    "n": 105,
+    "median_ms": 7.394,
+    "p95_ms": 8.998000000000001,
+    "overhead_ms": 6.4830000000000005,
+    "connections": 0
+  },
+  {
+    "name": "headers-1",
+    "size": 19,
+    "n": 105,
+    "median_ms": 1.527,
+    "p95_ms": 2.179,
+    "overhead_ms": 0.7379999999999999,
+    "connections": 0
+  },
+  {
+    "name": "headers-1",
+    "size": 65536,
+    "n": 105,
+    "median_ms": 1.6509999999999998,
+    "p95_ms": 2.124,
+    "overhead_ms": 0.9019999999999998,
+    "connections": 0
+  },
+  {
+    "name": "headers-1",
+    "size": 262144,
+    "n": 105,
+    "median_ms": 1.911,
+    "p95_ms": 2.601,
+    "overhead_ms": 1.0,
+    "connections": 0
+  },
+  {
+    "name": "headers-whole-stream",
+    "size": 19,
+    "n": 105,
+    "median_ms": 5.386,
+    "p95_ms": 6.736,
+    "overhead_ms": 4.597,
+    "connections": 0
+  },
+  {
+    "name": "headers-whole-stream",
+    "size": 65536,
+    "n": 105,
+    "median_ms": 6.058,
+    "p95_ms": 7.4079999999999995,
+    "overhead_ms": 5.309,
+    "connections": 0
+  },
+  {
+    "name": "headers-whole-stream",
+    "size": 262144,
+    "n": 105,
+    "median_ms": 7.962999999999999,
+    "p95_ms": 10.123,
+    "overhead_ms": 7.052,
+    "connections": 0
+  },
+  {
+    "name": "stream-2",
+    "size": 19,
+    "n": 105,
+    "median_ms": 5.167,
+    "p95_ms": 6.518999999999999,
+    "overhead_ms": 4.378,
+    "connections": 0
+  },
+  {
+    "name": "stream-2",
+    "size": 65536,
+    "n": 105,
+    "median_ms": 5.2940000000000005,
+    "p95_ms": 6.697,
+    "overhead_ms": 4.545000000000001,
+    "connections": 0
+  },
+  {
+    "name": "stream-2",
+    "size": 262144,
+    "n": 105,
+    "median_ms": 9.802,
+    "p95_ms": 11.625,
+    "overhead_ms": 8.891,
+    "connections": 0
+  },
+  {
+    "name": "whole-1",
+    "size": 19,
+    "n": 105,
+    "median_ms": 2.379,
+    "p95_ms": 3.418,
+    "overhead_ms": 1.5899999999999999,
+    "connections": 0
+  },
+  {
+    "name": "whole-1",
+    "size": 65536,
+    "n": 105,
+    "median_ms": 2.542,
+    "p95_ms": 3.31,
+    "overhead_ms": 1.7929999999999997,
+    "connections": 0
+  },
+  {
+    "name": "whole-1",
+    "size": 262144,
+    "n": 105,
+    "median_ms": 3.798,
+    "p95_ms": 4.656000000000001,
+    "overhead_ms": 2.887,
+    "connections": 0
+  },
+  {
+    "name": "whole-2",
+    "size": 19,
+    "n": 105,
+    "median_ms": 3.9459999999999997,
+    "p95_ms": 5.146999999999999,
+    "overhead_ms": 3.1569999999999996,
+    "connections": 0
+  },
+  {
+    "name": "whole-2",
+    "size": 65536,
+    "n": 105,
+    "median_ms": 4.531000000000001,
+    "p95_ms": 5.617,
+    "overhead_ms": 3.7820000000000005,
+    "connections": 0
+  },
+  {
+    "name": "whole-2",
+    "size": 262144,
+    "n": 105,
+    "median_ms": 6.32,
+    "p95_ms": 7.612,
+    "overhead_ms": 5.409000000000001,
+    "connections": 0
+  },
+  {
+    "name": "baseline",
+    "size": 19,
+    "n": 105,
+    "median_ms": 0.789,
+    "p95_ms": 1.0610000000000002,
+    "overhead_ms": 0.0,
+    "connections": 0
+  },
+  {
+    "name": "baseline",
+    "size": 65536,
+    "n": 105,
+    "median_ms": 0.749,
+    "p95_ms": 1.1509999999999998,
+    "overhead_ms": 0.0,
+    "connections": 0
+  },
+  {
+    "name": "baseline",
+    "size": 262144,
+    "n": 105,
+    "median_ms": 0.911,
+    "p95_ms": 1.3619999999999999,
+    "overhead_ms": 0.0,
+    "connections": 0
+  },
+  {
+    "name": "stream-1",
+    "size": 19,
+    "n": 105,
+    "median_ms": 2.597,
+    "p95_ms": 3.807,
+    "overhead_ms": 1.8079999999999998,
+    "connections": 0
+  },
+  {
+    "name": "stream-1",
+    "size": 65536,
+    "n": 105,
+    "median_ms": 3.098,
+    "p95_ms": 3.985,
+    "overhead_ms": 2.3489999999999998,
+    "connections": 0
+  },
+  {
+    "name": "stream-1",
+    "size": 262144,
+    "n": 105,
+    "median_ms": 4.982,
+    "p95_ms": 6.4910000000000005,
+    "overhead_ms": 4.071,
+    "connections": 0
+  },
+  {
+    "name": "headers-2",
+    "size": 19,
+    "n": 105,
+    "median_ms": 2.442,
+    "p95_ms": 2.953,
+    "overhead_ms": 1.653,
+    "connections": 0
+  },
+  {
+    "name": "headers-2",
+    "size": 65536,
+    "n": 105,
+    "median_ms": 2.422,
+    "p95_ms": 3.3609999999999998,
+    "overhead_ms": 1.673,
+    "connections": 0
+  },
+  {
+    "name": "headers-2",
+    "size": 262144,
+    "n": 105,
+    "median_ms": 2.63,
+    "p95_ms": 3.33,
+    "overhead_ms": 1.7189999999999999,
+    "connections": 0
+  }
+]

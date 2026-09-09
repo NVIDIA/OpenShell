@@ -17,6 +17,8 @@
     ".opencode/**",
     ".github/**",
     "architecture/plans/**",
+    "e2e/response-middleware-live/.venv/**",
+    "e2e/response-middleware-live/output/**",
     "**/node_modules/**",
     "target/**",
     ".pytest_cache/**",

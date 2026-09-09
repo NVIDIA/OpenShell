@@ -1,0 +1,12 @@
+{
+  "commit": "555ff32896a225020b670902a601707624bbadc5",
+  "date": "2026-09-09",
+  "live_cases": 86,
+  "live_passed": 85,
+  "chain_event_checks_passed": 14,
+  "runtime_tests_passed": 33,
+  "relay_tests_passed": 32,
+  "primary_benchmark_samples": 5670,
+  "cleanup": "Dedicated sandbox, gateway, and middleware fixture processes stopped; active runtime credentials removed",
+  "report_design_source": "OpenShell docs: fern/main.css and fern/docs.yml"
+}

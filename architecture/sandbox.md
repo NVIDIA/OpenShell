@@ -206,6 +206,11 @@ The response runtime caps aggregate retained body data across stages and pending
 output at 8 MiB. A transformation that exceeds the budget follows its stage's
 failure policy, preserving its input when failing open.
 
+The standalone [live response middleware fixture](../e2e/response-middleware-live/README.md)
+exercises response actions, body modes, and ordered chains through external gRPC
+services and a Docker sandbox. It also measures latency with and without
+middleware over ordinary HTTP proxy requests and reused CONNECT tunnels.
+
 The supervisor installs policy and middleware registry changes as one runtime
 generation and preserves the last-known-good generation if preparation fails.
 Policy-only updates reuse the connected registry, so an external middleware
