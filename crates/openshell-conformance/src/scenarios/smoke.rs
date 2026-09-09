@@ -9,11 +9,11 @@ use crate::{OpenShellRunner, PlanRun, STATUS_TIMEOUT, Scenario, ScenarioFuture};
 use serde::Deserialize;
 use tokio::time::sleep;
 
-const CREATE_TIMEOUT: Duration = Duration::from_secs(600);
+const CREATE_TIMEOUT: Duration = Duration::from_mins(10);
 const LIST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 const LIST_PAGE_SIZE: u32 = 1_000;
-const EXEC_TIMEOUT: Duration = Duration::from_secs(120);
-const DELETE_TIMEOUT: Duration = Duration::from_secs(120);
+const EXEC_TIMEOUT: Duration = Duration::from_mins(2);
+const DELETE_TIMEOUT: Duration = Duration::from_mins(2);
 const DELETE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Deserialize)]

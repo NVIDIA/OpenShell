@@ -315,11 +315,11 @@ pub struct ComputeDriverInfoSnapshot {
 }
 
 /// Interval between store-vs-backend reconciliation sweeps.
-const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+const RECONCILE_INTERVAL: Duration = Duration::from_mins(1);
 
 /// How long a sandbox can remain provisioning in the store without a
 /// corresponding backend resource before it is considered orphaned.
-const ORPHAN_GRACE_PERIOD: Duration = Duration::from_secs(300);
+const ORPHAN_GRACE_PERIOD: Duration = Duration::from_mins(5);
 
 // Re-export the shared error type under the name used by this module.
 pub use openshell_core::ComputeDriverError as ComputeError;

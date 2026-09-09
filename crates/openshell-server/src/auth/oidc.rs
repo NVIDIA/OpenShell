@@ -1608,7 +1608,7 @@ mod tests {
             // cooldown window, even if the test task is descheduled while the
             // rest of the server suite runs in parallel.
             *cache.last_kid_miss_refresh.write().await =
-                Instant::now().checked_add(Duration::from_secs(60)).unwrap();
+                Instant::now().checked_add(Duration::from_mins(1)).unwrap();
             for _ in 0..4 {
                 let err = cache.validate_token(&unknown_kid_token).await.unwrap_err();
                 assert_eq!(err.code(), tonic::Code::Unauthenticated);

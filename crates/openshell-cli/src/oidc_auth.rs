@@ -29,7 +29,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tracing::debug;
 
-const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
+const AUTH_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// OIDC discovery document (subset of fields we need).
 #[derive(Debug, Deserialize)]

@@ -719,7 +719,7 @@ impl PodmanClient {
             url_encode(policy),
         );
         // Image pulls can be slow — use a generous timeout.
-        let pull_timeout = Duration::from_secs(600);
+        let pull_timeout = Duration::from_mins(10);
         let (status, bytes) = self
             .request(hyper::Method::POST, &path, None, pull_timeout)
             .await?;

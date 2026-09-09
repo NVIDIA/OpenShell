@@ -5409,7 +5409,7 @@ mod tests {
 
         assert_eq!(
             kubernetes_sandbox_stop_timeout(&sandbox),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             "an omitted grace period uses the Kubernetes 30-second default"
         );
 

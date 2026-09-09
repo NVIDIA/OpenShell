@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Extension credentials cross the gateway trust boundary and must remain
 /// short-lived even when legacy sandbox bootstrap credentials do not expire.
-pub const MAX_EXTENSION_TOKEN_TTL: Duration = Duration::from_secs(3_600);
+pub const MAX_EXTENSION_TOKEN_TTL: Duration = Duration::from_hours(1);
 
 /// Explicit `typ` header value carried by every extension bearer token.
 ///
