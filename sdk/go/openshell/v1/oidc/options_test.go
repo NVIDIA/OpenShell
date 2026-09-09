@@ -82,6 +82,26 @@ func TestWithTimeout(t *testing.T) {
 	assert.Equal(t, 5*time.Minute, cfg.timeout)
 }
 
+func TestWithScopes_ExplicitEmptyNotOverridden(t *testing.T) {
+	var cfg loginConfig
+	WithScopes()(&cfg) // caller explicitly requests no scopes
+	cfg.applyDefaults()
+
+	// An explicitly-set empty scope list must be honored, not replaced by defaults.
+	assert.True(t, cfg.scopesSet)
+	assert.Empty(t, cfg.scopes)
+}
+
+func TestWithTimeout_ExplicitZeroNotOverridden(t *testing.T) {
+	var cfg loginConfig
+	WithTimeout(0)(&cfg) // caller explicitly requests no timeout
+	cfg.applyDefaults()
+
+	// An explicitly-set zero timeout must be honored, not replaced by the default.
+	assert.True(t, cfg.timeoutSet)
+	assert.Zero(t, cfg.timeout)
+}
+
 func TestWithKeyboardFlow(t *testing.T) {
 	var cfg loginConfig
 	WithKeyboardFlow()(&cfg)
