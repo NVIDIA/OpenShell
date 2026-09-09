@@ -4321,6 +4321,7 @@ dependencies = [
  "serde",
  "tempfile",
  "tokio",
+ "toml",
  "tonic",
  "tower",
  "tracing",

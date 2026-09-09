@@ -425,6 +425,20 @@ impl VmDriverConfig {
         Ok(())
     }
 
+    pub fn validate_rootfs_tar_config(&self) -> Result<(), String> {
+        if self
+            .rootfs_tar_staging_dir
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err("rootfs_tar_staging_dir must not be empty when set".to_string());
+        }
+        if self.rootfs_tar_max_bytes == Some(0) {
+            return Err("rootfs_tar_max_bytes must be greater than zero when set".to_string());
+        }
+        Ok(())
+    }
+
     pub fn validate_sandbox_identity(&self) -> Result<(), String> {
         let range = openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID;
         if let Some(uid) = self.sandbox_uid
@@ -619,6 +633,7 @@ impl VmDriver {
             .map_err(|err| err.message().to_string())?;
         config.validate_sandbox_identity()?;
         config.validate_runtime_security_config()?;
+        config.validate_rootfs_tar_config()?;
         if config.grpc_endpoint.trim().is_empty() {
             return Err("openshell endpoint is required".to_string());
         }
@@ -2969,7 +2984,7 @@ impl VmDriver {
                 )));
             }
         };
-        let cache_identity = rootfs_tar_cache_identity(&source_digest);
+        let cache_identity = rootfs_tar_cache_identity(&source_digest, &self.config);
         let image_path = image_cache_rootfs_image(&self.config.state_dir, &cache_identity);
         let tar_display = tar_path.display().to_string();
 
@@ -4990,8 +5005,8 @@ fn write_stream_to_file(mut reader: impl Read, dst: &Path, max_bytes: u64) -> Re
 /// seconds-truncated mtime cannot distinguish two writes within the same
 /// second. A fixed-length digest also keeps the cache directory name inside
 /// filesystem component limits regardless of how long the source path was.
-fn rootfs_tar_cache_identity(digest: &str) -> String {
-    prepared_image_cache_identity(&format!("rootfs-tar:sha256:{digest}"))
+fn rootfs_tar_cache_identity(digest: &str, config: &VmDriverConfig) -> String {
+    prepared_image_cache_identity(&format!("rootfs-tar:sha256:{digest}"), config)
 }
 
 fn extract_layer_blob_to_dir(
@@ -9255,6 +9270,23 @@ mod tests {
     }
 
     #[test]
+    fn vm_driver_rejects_invalid_rootfs_tar_limits_before_startup() {
+        let config = VmDriverConfig {
+            rootfs_tar_max_bytes: Some(0),
+            ..Default::default()
+        };
+        let error = config.validate_rootfs_tar_config().unwrap_err();
+        assert!(error.contains("rootfs_tar_max_bytes"));
+
+        let config = VmDriverConfig {
+            rootfs_tar_staging_dir: Some(PathBuf::new()),
+            ..Default::default()
+        };
+        let error = config.validate_rootfs_tar_config().unwrap_err();
+        assert!(error.contains("rootfs_tar_staging_dir"));
+    }
+
+    #[test]
     fn vm_proxy_and_spiffe_config_require_explicit_safe_acknowledgements() {
         let config = VmDriverConfig {
             upstream_proxy: UpstreamProxyConfig {
@@ -10055,22 +10087,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Identity must follow the bytes, not the path. The gateway hands every
-    /// request its own staging directory, so a path-derived key would miss the
-    /// cache on every single create.
+    /// Identity must follow the bytes and configured owner contract, not the
+    /// path. The gateway hands every request its own staging directory, so a
+    /// path-derived key would miss the cache on every single create.
     #[test]
-    fn rootfs_tar_cache_identity_tracks_contents_not_path() {
-        let same_a = rootfs_tar_cache_identity(&compute_bytes_sha256_hex(b"rootfs-bytes"));
-        let same_b = rootfs_tar_cache_identity(&compute_bytes_sha256_hex(b"rootfs-bytes"));
-        let different = rootfs_tar_cache_identity(&compute_bytes_sha256_hex(b"other-bytes"));
+    fn rootfs_tar_cache_identity_tracks_contents_and_owner_contract() {
+        let config = VmDriverConfig::default();
+        let same_a = rootfs_tar_cache_identity(&compute_bytes_sha256_hex(b"rootfs-bytes"), &config);
+        let same_b = rootfs_tar_cache_identity(&compute_bytes_sha256_hex(b"rootfs-bytes"), &config);
+        let different =
+            rootfs_tar_cache_identity(&compute_bytes_sha256_hex(b"other-bytes"), &config);
+        let configured_owner = rootfs_tar_cache_identity(
+            &compute_bytes_sha256_hex(b"rootfs-bytes"),
+            &VmDriverConfig {
+                sandbox_uid: Some(1234),
+                sandbox_gid: Some(5678),
+                ..VmDriverConfig::default()
+            },
+        );
 
         assert_eq!(
             same_a, same_b,
-            "identical contents must share one prepared disk"
+            "identical contents and owner contracts must share one prepared disk"
         );
         assert_ne!(
             same_a, different,
             "different contents must not collide on one prepared disk"
+        );
+        assert_ne!(
+            same_a, configured_owner,
+            "different owner contracts must not share a prepared disk"
         );
     }
 
@@ -10080,7 +10126,7 @@ mod tests {
     #[test]
     fn rootfs_tar_cache_identity_is_bounded_and_separator_safe() {
         let long_path_digest = compute_bytes_sha256_hex(&vec![7_u8; 4096]);
-        let identity = rootfs_tar_cache_identity(&long_path_digest);
+        let identity = rootfs_tar_cache_identity(&long_path_digest, &VmDriverConfig::default());
         let sanitized = sanitize_image_identity(&identity);
 
         assert!(
@@ -10089,8 +10135,14 @@ mod tests {
             sanitized.len()
         );
         assert_ne!(
-            rootfs_tar_cache_identity(&compute_bytes_sha256_hex(b"/tmp/a/b.tar")),
-            rootfs_tar_cache_identity(&compute_bytes_sha256_hex(b"/tmp/a-b.tar")),
+            rootfs_tar_cache_identity(
+                &compute_bytes_sha256_hex(b"/tmp/a/b.tar"),
+                &VmDriverConfig::default(),
+            ),
+            rootfs_tar_cache_identity(
+                &compute_bytes_sha256_hex(b"/tmp/a-b.tar"),
+                &VmDriverConfig::default(),
+            ),
             "separator-colliding inputs must not share an identity"
         );
     }

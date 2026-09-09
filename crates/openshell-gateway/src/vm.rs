@@ -97,6 +97,12 @@ pub struct VmComputeConfig {
     /// Optional GID override for the VM guest sandbox account.
     pub sandbox_gid: Option<u32>,
 
+    /// Directory shared with the gateway for request-scoped rootfs tar staging.
+    pub rootfs_tar_staging_dir: Option<PathBuf>,
+
+    /// Maximum accepted rootfs tar size, in bytes, before and after decompression.
+    pub rootfs_tar_max_bytes: Option<u64>,
+
     /// Host-side CA certificate for the guest's mTLS client bundle.
     pub guest_tls_ca: Option<PathBuf>,
 
@@ -165,6 +171,20 @@ impl VmComputeConfig {
             ));
         }
         validate_vm_sandbox_identity(self)?;
+        if self
+            .rootfs_tar_staging_dir
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(Error::config(
+                "rootfs_tar_staging_dir must not be empty when set",
+            ));
+        }
+        if self.rootfs_tar_max_bytes == Some(0) {
+            return Err(Error::config(
+                "rootfs_tar_max_bytes must be greater than zero when set",
+            ));
+        }
         self.validate_proxy_config()?;
         if let Some(endpoint) = self.provider_spiffe_workload_api_tcp_endpoint.as_deref() {
             openshell_core::driver_utils::validate_guest_spiffe_tcp_endpoint(
@@ -222,6 +242,8 @@ impl Default for VmComputeConfig {
             overlay_disk_mib: Self::default_overlay_disk_mib(),
             sandbox_uid: None,
             sandbox_gid: None,
+            rootfs_tar_staging_dir: None,
+            rootfs_tar_max_bytes: None,
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
@@ -556,6 +578,7 @@ pub async fn spawn(
         .arg("--overlay-disk-mib")
         .arg(vm_config.overlay_disk_mib.to_string());
     append_vm_identity_args(&mut command, vm_config);
+    append_vm_rootfs_tar_args(&mut command, vm_config);
     if let Some(tls) = guest_tls_paths {
         command.arg("--guest-tls-ca").arg(tls.ca);
         command.arg("--guest-tls-cert").arg(tls.cert);
@@ -602,6 +625,18 @@ fn append_vm_identity_args(command: &mut Command, config: &VmComputeConfig) {
     }
     if let Some(gid) = config.sandbox_gid {
         command.arg("--sandbox-gid").arg(gid.to_string());
+    }
+}
+
+#[cfg(unix)]
+fn append_vm_rootfs_tar_args(command: &mut Command, config: &VmComputeConfig) {
+    if let Some(path) = config.rootfs_tar_staging_dir.as_ref() {
+        command.arg("--rootfs-tar-staging-dir").arg(path);
+    }
+    if let Some(max_bytes) = config.rootfs_tar_max_bytes {
+        command
+            .arg("--rootfs-tar-max-bytes")
+            .arg(max_bytes.to_string());
     }
 }
 
@@ -725,7 +760,7 @@ async fn connect_compute_driver(socket_path: &Path) -> Result<Channel> {
 mod tests {
     use super::{
         VmComputeConfig, append_otlp_args, append_vm_identity_args,
-        append_vm_proxy_and_spiffe_args, compute_driver_guest_tls_paths,
+        append_vm_proxy_and_spiffe_args, append_vm_rootfs_tar_args, compute_driver_guest_tls_paths,
         compute_driver_socket_path, current_euid, prepare_compute_driver_socket_path,
         prepare_vm_state_dir, resolve_compute_driver_bin, resolve_driver_search_dirs,
         validate_vm_sandbox_identity,
@@ -863,6 +898,53 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(args, ["--sandbox-uid", "2000", "--sandbox-gid", "3000"]);
+    }
+
+    #[test]
+    fn vm_gateway_toml_forwards_rootfs_tar_settings() {
+        let config: VmComputeConfig = toml::from_str(
+            r#"
+                grpc_endpoint = "http://127.0.0.1:50051"
+                rootfs_tar_staging_dir = "/var/lib/openshell/rootfs-tar-staging"
+                rootfs_tar_max_bytes = 1073741824
+            "#,
+        )
+        .expect("schema-v2 VM rootfs tar settings must deserialize");
+        config
+            .validate_configuration()
+            .expect("rootfs tar settings must pass static validation");
+
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        append_vm_rootfs_tar_args(&mut command, &config);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            [
+                "--rootfs-tar-staging-dir",
+                "/var/lib/openshell/rootfs-tar-staging",
+                "--rootfs-tar-max-bytes",
+                "1073741824",
+            ]
+        );
+    }
+
+    #[test]
+    fn vm_gateway_rejects_zero_rootfs_tar_limit() {
+        let config = VmComputeConfig {
+            grpc_endpoint: "http://127.0.0.1:50051".to_string(),
+            rootfs_tar_max_bytes: Some(0),
+            ..Default::default()
+        };
+
+        let error = config
+            .validate_configuration()
+            .expect_err("a zero rootfs tar limit must fail before driver startup");
+        assert!(error.to_string().contains("rootfs_tar_max_bytes"));
     }
 
     #[test]
