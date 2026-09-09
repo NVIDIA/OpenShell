@@ -3910,6 +3910,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]
