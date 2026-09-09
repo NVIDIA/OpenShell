@@ -184,7 +184,7 @@ trait ReadyBoundary: Send {
 trait RunningBoundary: Send + Sync {
     fn agent(&self) -> Arc<dyn BoundaryProcess>;
     fn exec(&self) -> Arc<dyn BoundaryExec>;
-    fn port_forward(&self) -> Arc<dyn BoundaryPortForward>;
+    fn loopback_connector(&self) -> Arc<dyn BoundaryLoopbackConnector>;
 }
 ```
 
@@ -232,7 +232,7 @@ struct ExecSession {                              // owned; outlives the exec ca
 }
 
 #[async_trait]
-trait BoundaryPortForward: Send + Sync {
+trait BoundaryLoopbackConnector: Send + Sync {
     async fn connect(&self, target: LoopbackTarget) -> Result<BoundaryDuplexStream, BackendError>;
 }
 
@@ -242,7 +242,7 @@ trait BoundaryTerminal: Send + Sync {
 }
 ```
 
-`ExecSpec` carries command, arguments, environment, working directory, and PTY settings. Streams are owned, non-PTY stdout and stderr remain separate, and PTYs support resize. Port forwarding accepts only validated loopback targets. Exit status and signals are explicit and placement-neutral; a local PID is never the process handle. These operations carry the existing agent, SSH, exec, and forwarding paths behind the contract, and all of them are mandatory conformance.
+`ExecSpec` carries command, arguments, environment, working directory, and PTY settings. Streams are owned, non-PTY stdout and stderr remain separate, and PTYs support resize. The loopback connector accepts only validated loopback targets and supplies the protected connection primitive used by both end-user port forwarding and service exposure. Public listeners, authentication, routing, and exposure lifecycle remain above the isolation backend. Exit status and signals are explicit and placement-neutral; a local PID is never the process handle. These operations carry the existing agent, SSH, exec, and forwarding paths behind the contract, and all of them are mandatory conformance.
 
 `BoundaryProcess::wait` returns one stable exit status or `Terminated` error while the backend retains process-exit observation.
 

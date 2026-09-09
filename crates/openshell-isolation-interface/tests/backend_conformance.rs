@@ -174,10 +174,10 @@ impl BoundaryExec for MockExec {
     }
 }
 
-struct MockPortForward;
+struct MockLoopbackConnector;
 
 #[async_trait]
-impl BoundaryPortForward for MockPortForward {
+impl BoundaryLoopbackConnector for MockLoopbackConnector {
     async fn connect(&self, _target: LoopbackTarget) -> Result<BoundaryDuplexStream, BackendError> {
         let (near, far) = tokio::io::duplex(64);
         tokio::spawn(async move {
@@ -205,7 +205,7 @@ struct MockReady<K> {
 struct MockRunning<K> {
     process: Arc<MockProcess>,
     exec: Arc<MockExec>,
-    port_forward: Arc<MockPortForward>,
+    loopback_connector: Arc<MockLoopbackConnector>,
     _k: PhantomData<K>,
 }
 
@@ -229,7 +229,7 @@ impl<K: MockKind> ReadyBoundary for MockReady<K> {
         Ok(Box::new(MockRunning::<K> {
             process: MockProcess::new(),
             exec: Arc::new(MockExec),
-            port_forward: Arc::new(MockPortForward),
+            loopback_connector: Arc::new(MockLoopbackConnector),
             _k: PhantomData,
         }))
     }
@@ -242,8 +242,8 @@ impl<K: MockKind> RunningBoundary for MockRunning<K> {
     fn exec(&self) -> Arc<dyn BoundaryExec> {
         self.exec.clone()
     }
-    fn port_forward(&self) -> Arc<dyn BoundaryPortForward> {
-        self.port_forward.clone()
+    fn loopback_connector(&self) -> Arc<dyn BoundaryLoopbackConnector> {
+        self.loopback_connector.clone()
     }
 }
 
@@ -695,7 +695,10 @@ async fn validated_port_forward_stream_remains_usable() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let target = LoopbackTarget::new("127.0.0.1".parse().unwrap(), 8080).unwrap();
-    let mut stream = MockPortForward.connect(target).await.expect("connect");
+    let mut stream = MockLoopbackConnector
+        .connect(target)
+        .await
+        .expect("connect");
     stream.write_all(b"ping").await.expect("write");
     let mut response = [0_u8; 4];
     stream.read_exact(&mut response).await.expect("read");

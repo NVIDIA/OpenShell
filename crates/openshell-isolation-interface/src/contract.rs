@@ -548,8 +548,8 @@ pub trait RunningBoundary: Send + Sync {
     fn agent(&self) -> Arc<dyn BoundaryProcess>;
     /// The in-boundary exec interface.
     fn exec(&self) -> Arc<dyn BoundaryExec>;
-    /// The loopback port-forward interface.
-    fn port_forward(&self) -> Arc<dyn BoundaryPortForward>;
+    /// The loopback connection interface used by port forwarding and service exposure.
+    fn loopback_connector(&self) -> Arc<dyn BoundaryLoopbackConnector>;
 }
 
 // ============================================================================
@@ -687,9 +687,13 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin> DuplexStream for T {}
 /// An open connection into a boundary loopback target.
 pub type BoundaryDuplexStream = Box<dyn DuplexStream>;
 
-/// Loopback port-forward, consumed by the SSH server and supervisor session.
+/// Protected connector to services listening inside the boundary.
+///
+/// Higher layers use this primitive for both end-user port forwarding and
+/// service exposure. Authentication, public listeners, routing, and exposure
+/// lifecycle remain outside the isolation backend.
 #[async_trait]
-pub trait BoundaryPortForward: Send + Sync {
+pub trait BoundaryLoopbackConnector: Send + Sync {
     /// Connect to `target` inside the boundary.
     async fn connect(&self, target: LoopbackTarget) -> Result<BoundaryDuplexStream, BackendError>;
 }
