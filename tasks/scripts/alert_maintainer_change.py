@@ -7,10 +7,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Print a review comment describing how a pull request changes the approver set.
+"""Print a review comment describing how a pull request changes the approver set
+to make sure that reviewers notice the change.
 
-The calling workflow does the I/O: it extracts MAINTAINERS.md at the base and
-head commits, passes both as files, and posts the output as a comment.
+Prints nothing when the approver set is unchanged, and exits non-zero when the
+updated file yields no maintainers at all.
 
 Runs as bare `python3` on the Actions runner, so it must stay stdlib-only.
 """
@@ -18,6 +19,7 @@ Runs as bare `python3` on the Actions runner, so it must stay stdlib-only.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from pathlib import Path
@@ -29,40 +31,32 @@ MAINTAINER_RE = re.compile(
     r"\[@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)\]\(https://github\.com/"
 )
 
-# The workflow finds its own earlier comment by this prefix, so it must stay
-# identical on both sides.
-COMMENT_MARKER = "<!-- maintainer-approval-delta -->"
-
 
 def parse_maintainers(markdown: str) -> set[str]:
     """Return the lowercased GitHub logins listed in a MAINTAINERS.md table."""
     return {match.group(1).lower() for match in MAINTAINER_RE.finditer(markdown)}
 
 
-def format_delta(before: str, after: str) -> str:
-    """Render a review comment describing how the approver set changes."""
+def format_delta(marker: str, before: str, after: str) -> str:
+    """Render a review comment, or an empty string when nothing changed."""
     old, new = parse_maintainers(before), parse_maintainers(after)
     added, removed = sorted(new - old), sorted(old - new)
-
-    lines = [COMMENT_MARKER, "## Maintainer list change", ""]
     if not added and not removed:
-        lines.append(
-            "This pull request edits `MAINTAINERS.md` but does not change the set "
-            "of logins the approval gate recognises."
-        )
-    else:
-        if added:
-            lines += ["**Gains approval rights:**", ""]
-            lines += [f"- @{login}" for login in added]
-            lines.append("")
-        if removed:
-            lines += ["**Loses approval rights:**", ""]
-            lines += [f"- @{login}" for login in removed]
-            lines.append("")
-        lines.append(
-            "Confirm every change is intended. Anyone listed here can single-handedly "
-            "satisfy `OpenShell / Maintainer Approval`."
-        )
+        return ""
+
+    lines = [marker, "## Maintainer list change", ""]
+    if added:
+        lines += ["**Gains approval rights:**", ""]
+        lines += [f"- @{login}" for login in added]
+        lines.append("")
+    if removed:
+        lines += ["**Loses approval rights:**", ""]
+        lines += [f"- @{login}" for login in removed]
+        lines.append("")
+    lines.append(
+        "Confirm every change is intended. Anyone listed here can single-handedly "
+        "satisfy `OpenShell / Maintainer Approval`."
+    )
 
     if not new:
         lines += [
@@ -84,12 +78,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    print(
-        format_delta(
-            args.before.read_text(encoding="utf-8"),
-            args.after.read_text(encoding="utf-8"),
+    marker = os.environ.get("COMMENT_MARKER")
+    if not marker:
+        print("COMMENT_MARKER is not set", file=sys.stderr)
+        return 1
+
+    after = args.after.read_text(encoding="utf-8")
+    body = format_delta(marker, args.before.read_text(encoding="utf-8"), after)
+    if body:
+        print(body)
+
+    if not parse_maintainers(after):
+        print(
+            "No logins parse from the updated MAINTAINERS.md; the approval gate "
+            "would fail closed on every pull request.",
+            file=sys.stderr,
         )
-    )
+        return 1
     return 0
 
 

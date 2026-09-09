@@ -9,9 +9,6 @@
 
 """Exit non-zero unless a maintainer listed in MAINTAINERS.md has approved.
 
-The calling workflow does the I/O: it checks out MAINTAINERS.md from the
-default branch and lists the pull request's reviews, then passes both as files.
-
 Runs as bare `python3` on the Actions runner, so it must stay stdlib-only.
 """
 
