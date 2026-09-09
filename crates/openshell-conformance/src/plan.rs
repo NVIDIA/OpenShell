@@ -124,9 +124,17 @@ fn validate_command(label: &str, command: &Path, timeout_secs: u64) -> Result<()
 mod tests {
     use super::*;
 
+    fn absolute_test_command(name: &str) -> String {
+        if cfg!(target_os = "windows") {
+            format!("C:/OpenShell/{name}")
+        } else {
+            format!("/usr/local/libexec/{name}")
+        }
+    }
+
     #[test]
     fn parses_a_smoke_and_continuity_plan() {
-        let plan = ConformancePlan::parse(
+        let input = format!(
             r#"
                 version = 1
 
@@ -139,11 +147,12 @@ mod tests {
 
                 [[runs.actions]]
                 name = "gateway-upgrade"
-                command = "/usr/local/libexec/restart-gateway"
+                command = '{}'
                 timeout_secs = 120
             "#,
-        )
-        .expect("valid plan");
+            absolute_test_command("restart-gateway")
+        );
+        let plan = ConformancePlan::parse(&input).expect("valid plan");
 
         assert_eq!(plan.runs.len(), 2);
         assert_eq!(plan.runs[1].actions[0].name, "gateway-upgrade");
@@ -151,19 +160,20 @@ mod tests {
 
     #[test]
     fn parses_plan_diagnostics() {
-        let plan = ConformancePlan::parse(
+        let input = format!(
             r#"
                 version = 1
 
                 [diagnostics]
-                command = "/usr/local/libexec/diagnostics"
+                command = '{}'
                 timeout_secs = 60
 
                 [[runs]]
                 scenario = "smoke"
             "#,
-        )
-        .expect("valid plan with diagnostics");
+            absolute_test_command("diagnostics")
+        );
+        let plan = ConformancePlan::parse(&input).expect("valid plan with diagnostics");
 
         assert_eq!(
             plan.diagnostics

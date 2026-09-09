@@ -224,8 +224,9 @@ mod tests {
             String::from_utf8(buf.lock().unwrap().clone()).unwrap()
         }
 
-        let bare = capture(|| emit_ocsf_event(test_event()));
-        let routed = capture(|| emit_ocsf_event_routed("sb-1", test_event()));
+        let event = test_event();
+        let bare = capture(|| emit_ocsf_event(event.clone()));
+        let routed = capture(|| emit_ocsf_event_routed("sb-1", event));
 
         let bare_json: serde_json::Value = serde_json::from_str(bare.trim()).unwrap();
         let routed_json: serde_json::Value = serde_json::from_str(routed.trim()).unwrap();
