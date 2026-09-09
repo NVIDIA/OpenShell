@@ -118,10 +118,25 @@ notifications cannot race task-memory writes.
 
 DNS uses an exact sandbox-local resolver at `127.0.0.53:53`. The driver sets the
 nameserver and permits an unprivileged bind to port 53. UDP and TCP DNS requests
-are attributed to the calling binary and forwarded through the supervisor; the
-kernel delivers replies from the configured nameserver address, including for
-strict musl and c-ares resolvers. No proxy environment variable, nftables rule,
-or workload network namespace setup is part of enforcement.
+are forwarded through the supervisor, which applies hostname-based DNS policy.
+DNS sender identity is explicitly unavailable: native writes can come from an
+inheriting process or after exec, and neither the connecting binary nor a later
+descriptor-owner snapshot proves who sent an already queued query. Consumers
+must not use this unavailable identity to grant binary-specific access. TCP
+connection authorization still uses decision-time binary identity.
+
+The sandbox retains only bounded DNS socket-admission records, consumes TCP
+records on accept, and reclaims closed UDP records when capacity is reached.
+The kernel delivers replies from the configured nameserver address, including
+for strict musl and c-ares resolvers. No proxy environment variable, nftables
+rule, or workload network namespace setup is part of enforcement. The supervisor
+retries failed DNS accepts with backoff, preserving service across a channel
+reconnect.
+
+External TCP opens wait at most 30 seconds for a supervisor decision, then fail
+with `ETIMEDOUT` and release their worker quota. An approval is tied to the
+original socket identity; replacing the descriptor during policy evaluation
+cannot transfer that approval to another socket.
 
 The outer fence remains mandatory. If notification handling misses a syscall,
 loses the supervisor, exceeds a bound, or encounters an unsupported socket
