@@ -122,7 +122,7 @@ pub async fn run_ssh_server(
     ready_tx: tokio::sync::oneshot::Sender<Result<()>>,
     ca_file_paths: Option<(PathBuf, PathBuf)>,
     shared_socket: bool,
-    port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryPortForward>,
+    port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryLoopbackConnector>,
     boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
     main_session: Option<Arc<MainSession>>,
 ) -> Result<()> {
@@ -293,7 +293,7 @@ fn classify_ssh_accept_error(
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     config: Arc<russh::server::Config>,
-    port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryPortForward>,
+    port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryLoopbackConnector>,
     boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
     main_session: Option<Arc<MainSession>>,
 ) -> Result<()> {
@@ -362,7 +362,7 @@ struct SshHandler {
     /// Loopback port-forward, injected by the orchestrator (RFC 0012). In-pod
     /// this connects from inside the workload netns; a delegated backend
     /// tunnels into its guest. The handler does not know which.
-    port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryPortForward>,
+    port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryLoopbackConnector>,
     boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
     main_session: Option<Arc<MainSession>>,
     channels: HashMap<ChannelId, ChannelState>,
@@ -389,7 +389,7 @@ impl Drop for SshHandler {
 
 impl SshHandler {
     fn new(
-        port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryPortForward>,
+        port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryLoopbackConnector>,
         boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
         main_session: Option<Arc<MainSession>>,
     ) -> Self {
@@ -1196,10 +1196,10 @@ mod tests {
         }
     }
 
-    struct TestPortForward;
+    struct TestLoopbackConnector;
 
     #[async_trait::async_trait]
-    impl openshell_isolation_interface::contract::BoundaryPortForward for TestPortForward {
+    impl openshell_isolation_interface::contract::BoundaryLoopbackConnector for TestLoopbackConnector {
         async fn connect(
             &self,
             target: openshell_isolation_interface::contract::LoopbackTarget,
@@ -1249,7 +1249,7 @@ mod tests {
         server_config.keys.push(host_key);
 
         let handler = SshHandler::new(
-            Arc::new(TestPortForward),
+            Arc::new(TestLoopbackConnector),
             Arc::new(RejectingExec),
             Some(MainSession::inert()),
         );

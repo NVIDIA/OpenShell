@@ -39,8 +39,9 @@ mod linux {
     };
     use openshell_core::provider_credentials::ProviderCredentialState;
     use openshell_isolation_interface::contract::{
-        BoundaryExec, BoundaryPortForward, BoundaryProcess, BoundaryTerminal, CapabilityEvidence,
-        ExecSession, LoopbackTarget, ResolvedWorkloadIdentity, SandboxConfirmEvidence,
+        BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess, BoundaryTerminal,
+        CapabilityEvidence, ExecSession, LoopbackTarget, ResolvedWorkloadIdentity,
+        SandboxConfirmEvidence,
     };
     use openshell_isolation_interface::mediation::{
         self, DnsQueryWire, MediationFrame, MediationFrameKind,
@@ -884,7 +885,7 @@ mod linux {
                 .map_err(|error| format!("write process attachment response: {error}"))?;
                 return runtime.stream_process(stream, attachment);
             }
-            Request::PortForward { host, port } => {
+            Request::LoopbackConnect { host, port } => {
                 let target = match LoopbackTarget::new(host, port)
                     .map_err(|error| format!("validate port-forward target: {error}"))
                     .and_then(|target| {
@@ -1319,7 +1320,7 @@ mod linux {
                 ),
                 Request::Exec { .. }
                 | Request::AttachProcess { .. }
-                | Request::PortForward { .. }
+                | Request::LoopbackConnect { .. }
                 | Request::AcceptNetwork => guest_error(
                     BoundaryErrorKind::Invalid,
                     "streaming request used on control path",
@@ -1527,15 +1528,15 @@ mod linux {
             &self,
             target: LoopbackTarget,
         ) -> Result<openshell_isolation_interface::contract::BoundaryDuplexStream, String> {
-            let port_forward = {
+            let loopback_connector = {
                 let state = lock(&self.state);
                 let RuntimeState::Running(process) = &*state else {
                     return Err("agent process has not been started".to_string());
                 };
-                process.port_forward()
+                process.loopback_connector()
             };
             self.process_runtime
-                .block_on(port_forward.connect(target))
+                .block_on(loopback_connector.connect(target))
                 .map_err(|error| error.to_string())
         }
 
@@ -2121,7 +2122,7 @@ mod linux {
         signaler: AgentSignaler,
         exit: SharedProcessExit,
         boundary_exec: Arc<dyn BoundaryExec>,
-        port_forward: Arc<dyn BoundaryPortForward>,
+        loopback_connector: Arc<dyn BoundaryLoopbackConnector>,
         main_session: Arc<MainSession>,
         attached: Arc<AtomicBool>,
         boundary_runtime: Arc<BoundaryRuntimeState>,
@@ -2195,7 +2196,7 @@ mod linux {
                 .map_err(|error| format!("start process supervisor leaf: {error:?}"))?;
             let signaler = spawned.signaler();
             let boundary_exec = spawned.boundary_exec();
-            let port_forward = spawned.port_forward();
+            let loopback_connector = spawned.loopback_connector();
             let main_session = spawned.main_session();
             let exit = Arc::new((Mutex::new(None), Condvar::new()));
             let reaper_exit = exit.clone();
@@ -2214,7 +2215,7 @@ mod linux {
                 signaler,
                 exit,
                 boundary_exec,
-                port_forward,
+                loopback_connector,
                 main_session,
                 attached: Arc::new(AtomicBool::new(false)),
                 boundary_runtime,
@@ -2266,8 +2267,8 @@ mod linux {
             self.boundary_exec.clone()
         }
 
-        fn port_forward(&self) -> Arc<dyn BoundaryPortForward> {
-            self.port_forward.clone()
+        fn loopback_connector(&self) -> Arc<dyn BoundaryLoopbackConnector> {
+            self.loopback_connector.clone()
         }
 
         fn main_session(&self) -> Arc<MainSession> {

@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Sandbox-local [`BoundaryPortForward`] implementation.
+//! Sandbox-local [`BoundaryLoopbackConnector`] implementation.
 
 use async_trait::async_trait;
 use openshell_isolation_interface::contract::{
-    BackendError, BoundaryDuplexStream, BoundaryPortForward, LoopbackTarget,
+    BackendError, BoundaryDuplexStream, BoundaryLoopbackConnector, LoopbackTarget,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -168,11 +168,11 @@ impl RegisteredProcessGroup {
 }
 
 /// Loopback port-forward owned by the sandbox process.
-pub struct LocalPortForward {
+pub struct LocalLoopbackConnector {
     runtime: Option<Arc<BoundaryRuntimeState>>,
 }
 
-impl LocalPortForward {
+impl LocalLoopbackConnector {
     #[must_use]
     pub fn new(runtime: Option<Arc<BoundaryRuntimeState>>) -> Self {
         Self { runtime }
@@ -180,7 +180,7 @@ impl LocalPortForward {
 }
 
 #[async_trait]
-impl BoundaryPortForward for LocalPortForward {
+impl BoundaryLoopbackConnector for LocalLoopbackConnector {
     async fn connect(&self, target: LoopbackTarget) -> Result<BoundaryDuplexStream, BackendError> {
         if let Some(runtime) = &self.runtime {
             runtime.ensure_active()?;
@@ -205,7 +205,7 @@ mod tests {
     /// Stands in for the SSH server's port-forward path: connect through the
     /// interface, write, and read the echo.
     #[tokio::test]
-    async fn port_forward_connects_and_round_trips() {
+    async fn loopback_connector_connects_and_round_trips() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -215,7 +215,7 @@ mod tests {
             sock.write_all(&buf).await.unwrap();
         });
 
-        let pf = LocalPortForward::new(None);
+        let pf = LocalLoopbackConnector::new(None);
         let target =
             LoopbackTarget::new(Ipv4Addr::LOCALHOST.into(), addr.port()).expect("loopback target");
         let mut conn = pf.connect(target).await.expect("connect through interface");
@@ -228,8 +228,8 @@ mod tests {
     /// Drive the port-forward interface through a generic `&dyn` consumer, proving a
     /// kernel-separated backend (tunneling into a guest) would use the same call.
     #[tokio::test]
-    async fn port_forward_is_driven_via_dyn() {
-        async fn forward_one(pf: &dyn BoundaryPortForward, target: LoopbackTarget) -> bool {
+    async fn loopback_connector_is_driven_via_dyn() {
+        async fn forward_one(pf: &dyn BoundaryLoopbackConnector, target: LoopbackTarget) -> bool {
             pf.connect(target).await.is_ok()
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -237,15 +237,15 @@ mod tests {
         tokio::spawn(async move {
             let _ = listener.accept().await;
         });
-        let pf = LocalPortForward::new(None);
+        let pf = LocalLoopbackConnector::new(None);
         let target = LoopbackTarget::new(Ipv4Addr::LOCALHOST.into(), addr.port()).unwrap();
         assert!(forward_one(&pf, target).await);
     }
 
     #[tokio::test]
-    async fn port_forward_rejects_after_boundary_end() {
+    async fn loopback_connector_rejects_after_boundary_end() {
         let runtime = BoundaryRuntimeState::new();
-        let pf = LocalPortForward::new(Some(runtime.clone()));
+        let pf = LocalLoopbackConnector::new(Some(runtime.clone()));
         runtime.deactivate();
         let target = LoopbackTarget::new(Ipv4Addr::LOCALHOST.into(), 1).unwrap();
         assert!(matches!(
@@ -255,9 +255,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_port_forward_keeps_boundary_active() {
+    async fn failed_loopback_connector_keeps_boundary_active() {
         let runtime = BoundaryRuntimeState::new();
-        let pf = LocalPortForward::new(Some(runtime.clone()));
+        let pf = LocalLoopbackConnector::new(Some(runtime.clone()));
         // Port zero is never a connectable TCP destination. Reserving an ephemeral
         // port and dropping its listener races other parallel tests that may bind it.
         let target = LoopbackTarget::new(Ipv4Addr::LOCALHOST.into(), 0).unwrap();
