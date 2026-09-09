@@ -102,15 +102,6 @@ pub fn apply_supervisor_prelude() -> Result<()> {
     seccomp::apply_supervisor_prelude()
 }
 
-/// Legacy single-phase apply. Kept for backward compatibility.
-/// New callers should use [`prepare`] + [`enforce`] for correct privilege ordering.
-#[allow(dead_code)] // Retained for backward compat; live callers use prepare+enforce.
-pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
-    landlock::apply(policy, workdir)?;
-    seccomp::apply(policy)?;
-    Ok(())
-}
-
 /// Probe Landlock availability and emit OCSF logs from the parent process.
 ///
 /// This must be called **before** `pre_exec` / `fork()` so that the OCSF events

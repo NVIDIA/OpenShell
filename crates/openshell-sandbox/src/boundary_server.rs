@@ -59,6 +59,11 @@ mod linux {
     };
 
     const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(30);
+    const CONTROL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+    const CONTROL_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+    const CONTROL_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+    const MEDIATION_REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(20);
+    const MAX_PENDING_HANDSHAKES: usize = 32;
     const MAX_CONTROL_CONNECTIONS: usize = 128;
     const MAX_REPLAY_LEDGER_ENTRIES: usize = 4096;
     const MAX_RETAINED_EXEC_PROCESSES: usize = 64;
@@ -119,7 +124,11 @@ mod linux {
             .map_err(|error| format!("install sandbox process prelude: {error}"))?;
         let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
             .map_err(|error| format!("start sandbox workload launcher: {error}"))?;
-        let network_broker = NetworkBroker::start(listener)
+        let protected_control_port = match &config.listener {
+            BoundaryListenerConfig::TlsTcp { address, .. } => Some(address.port()),
+            BoundaryListenerConfig::Unix { .. } | BoundaryListenerConfig::Vsock { .. } => None,
+        };
+        let network_broker = NetworkBroker::start(listener, protected_control_port)
             .map_err(|error| format!("start sandbox network broker: {error}"))?;
         let process_runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -349,6 +358,7 @@ mod linux {
         let listener = ControlListener::bind(config)
             .map_err(|error| format!("bind boundary control listener: {error}"))?;
         let active_connections = Arc::new(AtomicUsize::new(0));
+        let pending_handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
         tracing::info!(?config, "Boundary control listener ready");
         loop {
             if BOUNDARY_TERMINATION_REQUESTED.load(Ordering::Acquire) {
@@ -357,41 +367,31 @@ mod linux {
             }
             match listener.accept() {
                 Ok(stream) => {
-                    let Some(slot) = acquire_control_connection_slot(&active_connections) else {
-                        tracing::warn!(
-                            limit = MAX_CONTROL_CONNECTIONS,
-                            "Boundary control connection limit reached"
-                        );
+                    // Unauthenticated sockets use only a bounded async TLS
+                    // task, never an OS thread or an authenticated session slot.
+                    let Ok(pending) = pending_handshakes.clone().try_acquire_owned() else {
                         continue;
                     };
+                    let active_connections = active_connections.clone();
                     let runtime = runtime.clone();
-                    std::thread::spawn(move || {
-                        let _slot = slot;
-                        let stream = match stream.establish(&runtime.process_runtime) {
-                            Ok(stream) => stream,
-                            Err(error) => {
-                                tracing::warn!(%error, "Boundary control transport handshake failed");
-                                return;
+                    runtime.process_runtime.spawn({
+                        let runtime = runtime.clone();
+                        async move {
+                            if let Err(error) = serve_control_connection(
+                                stream,
+                                runtime,
+                                pending,
+                                active_connections,
+                            )
+                            .await
+                            {
+                                tracing::debug!(%error, "Boundary control connection ended");
                             }
-                        };
-                        let result = {
-                            let stream = match stream.into_tokio() {
-                                Ok(stream) => stream,
-                                Err(error) => {
-                                    tracing::warn!(%error, "prepare boundary gRPC session");
-                                    return;
-                                }
-                            };
-                            runtime
-                                .process_runtime
-                                .block_on(serve_grpc(stream, runtime.clone()))
-                        };
-                        if let Err(error) = result {
-                            tracing::warn!(%error, "Boundary control session failed: {error}");
                         }
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -400,12 +400,39 @@ mod linux {
         }
     }
 
+    async fn serve_control_connection(
+        stream: ControlStream,
+        runtime: Arc<BoundaryRuntime>,
+        pending: tokio::sync::OwnedSemaphorePermit,
+        active_connections: Arc<AtomicUsize>,
+    ) -> Result<(), String> {
+        let stream = stream
+            .establish_async(&runtime.process_runtime)
+            .await
+            .map_err(|error| format!("authenticate boundary transport: {error}"))?;
+        drop(pending);
+        let Some(_slot) = acquire_control_connection_slot(&active_connections) else {
+            return Err("authenticated control connection limit reached".to_string());
+        };
+        serve_grpc(stream.into_tokio()?, runtime).await
+    }
+
     async fn serve_grpc(
         stream: openshell_isolation_interface::contract::BoundaryDuplexStream,
         runtime: Arc<BoundaryRuntime>,
     ) -> Result<(), String> {
-        let incoming = tokio_stream::iter([Ok::<_, io::Error>(GrpcServerIo(stream))]);
+        let (connection_alive, connection_closed) = tokio::sync::watch::channel(());
+        let incoming = tokio_stream::StreamExt::chain(
+            tokio_stream::iter([Ok::<_, io::Error>(GrpcServerIo {
+                stream,
+                _connection_alive: connection_alive,
+            })]),
+            tokio_stream::pending(),
+        );
+        let mut shutdown = connection_closed.clone();
         tonic::transport::Server::builder()
+            .http2_keepalive_interval(Some(CONTROL_KEEPALIVE_INTERVAL))
+            .http2_keepalive_timeout(Some(CONTROL_KEEPALIVE_TIMEOUT))
             .max_concurrent_streams(
                 u32::try_from(MAX_CONTROL_CONNECTIONS)
                     .map_err(|error| format!("invalid control connection limit: {error}"))?,
@@ -413,16 +440,26 @@ mod linux {
             .initial_stream_window_size(16 * 1024 * 1024)
             .initial_connection_window_size(16 * 1024 * 1024)
             .add_service(
-                IsolationBoundaryServer::new(GrpcBoundaryService { runtime })
-                    .max_decoding_message_size(64 * 1024)
-                    .max_encoding_message_size(64 * 1024),
+                IsolationBoundaryServer::new(GrpcBoundaryService {
+                    runtime,
+                    connection_closed,
+                })
+                .max_decoding_message_size(64 * 1024)
+                .max_encoding_message_size(64 * 1024),
             )
-            .serve_with_incoming(incoming)
+            .serve_with_incoming_shutdown(incoming, async move {
+                let _ = shutdown.changed().await;
+            })
             .await
             .map_err(|error| format!("serve boundary gRPC connection: {error}"))
     }
 
-    struct GrpcServerIo(openshell_isolation_interface::contract::BoundaryDuplexStream);
+    struct GrpcServerIo {
+        stream: openshell_isolation_interface::contract::BoundaryDuplexStream,
+        // Dropping the actual HTTP/2 transport stops all detached stream
+        // bridges, including on keepalive failure or task cancellation.
+        _connection_alive: tokio::sync::watch::Sender<()>,
+    }
 
     impl tokio::io::AsyncRead for GrpcServerIo {
         fn poll_read(
@@ -430,7 +467,7 @@ mod linux {
             context: &mut Context<'_>,
             buffer: &mut tokio::io::ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.0).poll_read(context, buffer)
+            Pin::new(&mut self.stream).poll_read(context, buffer)
         }
     }
 
@@ -440,18 +477,18 @@ mod linux {
             context: &mut Context<'_>,
             buffer: &[u8],
         ) -> Poll<io::Result<usize>> {
-            Pin::new(&mut self.0).poll_write(context, buffer)
+            Pin::new(&mut self.stream).poll_write(context, buffer)
         }
 
         fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.0).poll_flush(context)
+            Pin::new(&mut self.stream).poll_flush(context)
         }
 
         fn poll_shutdown(
             mut self: Pin<&mut Self>,
             context: &mut Context<'_>,
         ) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.0).poll_shutdown(context)
+            Pin::new(&mut self.stream).poll_shutdown(context)
         }
     }
 
@@ -464,6 +501,7 @@ mod linux {
     #[derive(Clone)]
     struct GrpcBoundaryService {
         runtime: Arc<BoundaryRuntime>,
+        connection_closed: tokio::sync::watch::Receiver<()>,
     }
 
     type GrpcResponseStream = ReceiverStream<Result<BoundaryChunk, tonic::Status>>;
@@ -477,7 +515,8 @@ mod linux {
             &self,
             request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
         ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
-            let (stream, response) = bridge_grpc_server_stream(request.into_inner());
+            let (stream, response) =
+                bridge_grpc_server_stream(request.into_inner(), self.connection_closed.clone());
             let runtime = self.runtime.clone();
             tokio::task::spawn_blocking(move || {
                 let stream = ControlStream::Grpc {
@@ -495,7 +534,8 @@ mod linux {
             &self,
             request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
         ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
-            let (stream, response) = bridge_grpc_server_stream(request.into_inner());
+            let (stream, response) =
+                bridge_grpc_server_stream(request.into_inner(), self.connection_closed.clone());
             let runtime = self.runtime.clone();
             tokio::spawn(async move {
                 if let Err(error) = serve_persistent_mediation(stream, runtime).await {
@@ -508,12 +548,17 @@ mod linux {
 
     fn bridge_grpc_server_stream(
         mut inbound: tonic::Streaming<BoundaryChunk>,
+        connection_closed: tokio::sync::watch::Receiver<()>,
     ) -> (tokio::io::DuplexStream, GrpcResponseStream) {
         let (application, bridge) = tokio::io::duplex(256 * 1024);
         let (mut reader, mut writer) = tokio::io::split(bridge);
         let (outbound, outbound_rx) =
             tokio::sync::mpsc::channel::<Result<BoundaryChunk, tonic::Status>>(64);
+        let mut inbound_closed = connection_closed.clone();
         tokio::spawn(async move {
+            tokio::select! {
+            _ = inbound_closed.changed() => {},
+            () = async {
             loop {
                 match inbound.message().await {
                     Ok(Some(chunk)) => {
@@ -531,8 +576,14 @@ mod linux {
                     }
                 }
             }
+            } => {},
+            }
         });
+        let mut outbound_closed = connection_closed;
         tokio::spawn(async move {
+            tokio::select! {
+            _ = outbound_closed.changed() => {},
+            () = async {
             let mut buffer = vec![0_u8; 16 * 1024];
             loop {
                 let read = match reader.read(&mut buffer).await {
@@ -555,6 +606,8 @@ mod linux {
                     return;
                 }
             }
+            } => {},
+            }
         });
         (application, ReceiverStream::new(outbound_rx))
     }
@@ -574,41 +627,38 @@ mod linux {
         >,
     >;
 
-    struct MediationLease(Arc<BoundaryRuntime>);
-
-    impl Drop for MediationLease {
-        fn drop(&mut self) {
-            self.0.mediation_active.store(false, Ordering::Release);
-        }
-    }
-
     async fn serve_persistent_mediation(
         mut stream: tokio::io::DuplexStream,
         runtime: Arc<BoundaryRuntime>,
     ) -> Result<(), String> {
-        let request: RequestEnvelope =
-            openshell_isolation_interface::boundary_protocol::read_frame_async(&mut stream)
-                .await
-                .map_err(|error| format!("read mediation attach: {error}"))?;
+        let request: RequestEnvelope = tokio::time::timeout(
+            CONTROL_IO_TIMEOUT,
+            openshell_isolation_interface::boundary_protocol::read_frame_async(&mut stream),
+        )
+        .await
+        .map_err(|_| "mediation attach timed out".to_string())?
+        .map_err(|error| format!("read mediation attach: {error}"))?;
         let request_id = request.request_id.clone();
         if !matches!(request.request, Request::OpenMediation) {
             return Err("persistent mediation stream omitted OpenMediation".to_string());
         }
         let mut response = runtime.dispatch(request);
         let lease = if matches!(response, Response::MediationReady) {
-            if runtime
-                .mediation_active
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                Some(MediationLease(runtime.clone()))
-            } else {
-                response = guest_error(
-                    BoundaryErrorKind::Denied,
-                    "a mediation session is already active",
-                );
-                None
-            }
+            tokio::time::timeout(
+                MEDIATION_REPLACEMENT_TIMEOUT,
+                runtime.mediation_active.lock(),
+            )
+            .await
+            .map_or_else(
+                |_| {
+                    response = guest_error(
+                        BoundaryErrorKind::Denied,
+                        "a mediation session is already active",
+                    );
+                    None
+                },
+                Some,
+            )
         } else {
             None
         };
@@ -629,7 +679,7 @@ mod linux {
             return Ok(());
         };
         let broker = runtime.network_accept_context()?;
-        run_boundary_mediation(stream, runtime, broker).await
+        run_boundary_mediation(stream, runtime.clone(), broker).await
     }
 
     async fn run_boundary_mediation(
@@ -967,7 +1017,7 @@ mod linux {
         /// any launch input or start a second workload.
         started_agent: Mutex<Option<StartedAgent>>,
         next_exec_id: AtomicU64,
-        mediation_active: AtomicBool,
+        mediation_active: tokio::sync::Mutex<()>,
         next_mediation_stream_id: AtomicU64,
         exec_handles: Mutex<std::collections::HashMap<String, ExecHandle>>,
         /// Never evicted within a boundary generation. Reclaiming process I/O
@@ -1164,7 +1214,7 @@ mod linux {
                 attached_policy: Mutex::new(None),
                 started_agent: Mutex::new(None),
                 next_exec_id: AtomicU64::new(1),
-                mediation_active: AtomicBool::new(false),
+                mediation_active: tokio::sync::Mutex::new(()),
                 next_mediation_stream_id: AtomicU64::new(1),
                 exec_handles: Mutex::new(std::collections::HashMap::new()),
                 exec_requests: Mutex::new(std::collections::HashSet::new()),
@@ -2480,6 +2530,7 @@ mod linux {
                     server_config,
                 } => {
                     let (stream, _) = listener.accept()?;
+                    reject_workload_unix_peer(&stream)?;
                     Ok(ControlStream::PendingTls {
                         stream: PlainControlStream::Unix(stream),
                         server_config: server_config.clone(),
@@ -2500,6 +2551,74 @@ mod linux {
                 }
             }
         }
+    }
+
+    fn reject_workload_unix_peer(stream: &std::os::unix::net::UnixStream) -> io::Result<()> {
+        let mut credentials = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut length =
+            libc::socklen_t::try_from(size_of::<libc::ucred>()).map_err(io::Error::other)?;
+        // SAFETY: both output pointers reference initialized storage of the
+        // declared length, and stream owns the connected Unix descriptor.
+        if unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut credentials).cast(),
+                &raw mut length,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let peer = u32::try_from(credentials.pid)
+            .map_err(|_| io::Error::from_raw_os_error(libc::EACCES))?;
+        // Linux reports PID zero for a peer outside our PID namespace. Such a
+        // peer still must authenticate with the per-sandbox mTLS certificate.
+        if peer != 0
+            && peer != std::process::id()
+            && is_process_descendant(peer, std::process::id())
+                .map_err(|_| io::Error::from_raw_os_error(libc::EACCES))?
+        {
+            return Err(io::Error::from_raw_os_error(libc::EACCES));
+        }
+        Ok(())
+    }
+
+    fn is_process_descendant(mut process: u32, ancestor: u32) -> io::Result<bool> {
+        // Drivers run the sandbox as workload PID 1, so orphaned descendants
+        // reparent to it and cannot escape this check by double-forking.
+        // Read kernel-owned ancestry, never workload-supplied paths or UIDs.
+        // If a peer exits during inspection, fail closed for that connection.
+        for _ in 0..1024 {
+            if process == ancestor {
+                return Ok(true);
+            }
+            if process == 0 {
+                return Ok(false);
+            }
+            let stat = std::fs::read_to_string(format!("/proc/{process}/stat"))?;
+            let parent = stat
+                .rsplit_once(')')
+                .and_then(|(_, fields)| fields.split_whitespace().nth(1))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "missing peer process parent")
+                })?
+                .parse::<u32>()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if parent == process {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cyclic peer process ancestry",
+                ));
+            }
+            process = parent;
+        }
+        Err(io::Error::from_raw_os_error(libc::EACCES))
     }
 
     fn remove_owned_stale_control_socket(socket_path: &Path) -> io::Result<()> {
@@ -2639,7 +2758,12 @@ mod linux {
     }
 
     impl ControlStream {
+        #[cfg(test)]
         fn establish(self, runtime: &tokio::runtime::Handle) -> io::Result<Self> {
+            runtime.block_on(self.establish_async(runtime))
+        }
+
+        async fn establish_async(self, runtime: &tokio::runtime::Handle) -> io::Result<Self> {
             let Self::PendingTls {
                 stream,
                 server_config,
@@ -2652,14 +2776,14 @@ mod linux {
                 stream.into_tokio()?
             };
             let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
-            let stream = runtime.block_on(async {
-                tokio::time::timeout(CONTROL_IO_TIMEOUT, acceptor.accept(stream))
+            let stream = {
+                tokio::time::timeout(CONTROL_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
                     .await
                     .map_err(|_| {
                         io::Error::new(io::ErrorKind::TimedOut, "boundary TLS handshake timed out")
                     })?
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-            })?;
+            }?;
             Ok(Self::Tls {
                 stream: Box::new(stream),
                 runtime: runtime.clone(),
@@ -2996,12 +3120,279 @@ mod linux {
         }
 
         #[test]
-        fn control_connection_slots_bound_unauthenticated_threads() {
+        fn control_connection_slots_bound_authenticated_sessions() {
             let active = Arc::new(AtomicUsize::new(MAX_CONTROL_CONNECTIONS - 1));
             let slot = acquire_control_connection_slot(&active).expect("last available slot");
             assert!(acquire_control_connection_slot(&active).is_none());
             drop(slot);
             assert_eq!(active.load(Ordering::Acquire), MAX_CONTROL_CONNECTIONS - 1);
+        }
+
+        #[test]
+        fn unix_control_rejects_workload_descendants_before_admission() {
+            const CHILD_SOCKET: &str = "OPENSHELL_TEST_CONTROL_PEER_SOCKET";
+            if let Some(path) = std::env::var_os(CHILD_SOCKET) {
+                let mut stream = std::os::unix::net::UnixStream::connect(path).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                assert_eq!(stream.read(&mut [0_u8; 1]).unwrap(), 0);
+                return;
+            }
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("control.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "boundary_server::linux::tests::unix_control_rejects_workload_descendants_before_admission", "--nocapture"])
+                .env(CHILD_SOCKET, &path).spawn().unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            assert_eq!(
+                reject_workload_unix_peer(&stream)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EACCES)
+            );
+            drop(stream);
+            assert!(child.wait().unwrap().success());
+            assert!(!is_process_descendant(std::process::id(), child.id()).unwrap());
+            // Trusted same-process connections and external ancestors remain
+            // eligible for mTLS; we do not equate same UID with workload trust.
+            let client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            reject_workload_unix_peer(&stream).unwrap();
+            drop(client);
+        }
+
+        fn availability_test_runtime() -> Arc<BoundaryRuntime> {
+            let (broker, launcher) = test_network_broker();
+            Arc::new(BoundaryRuntime::new(
+                BoundaryConfig {
+                    boundary_id: "availability".to_string(),
+                    generation: "generation-1".to_string(),
+                    session_epoch: "session-1".to_string(),
+                    bootstrap_token: "a".repeat(32),
+                    listener: BoundaryListenerConfig::TlsTcp {
+                        address: "127.0.0.1:5500".parse().unwrap(),
+                        tls: placeholder_server_tls(),
+                    },
+                    resource_claims: std::collections::BTreeMap::new(),
+                    resource_claim_files: std::collections::BTreeMap::new(),
+                    workload_identity: test_workload_identity(),
+                    driver_fence: test_driver_fence(),
+                    child_env: std::collections::HashMap::new(),
+                },
+                tokio::runtime::Handle::current(),
+                broker,
+                launcher,
+                test_runtime_qualification(),
+            ))
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn idle_uds_and_tcp_handshakes_do_not_consume_authenticated_slots() {
+            let directory = tempfile::tempdir().unwrap();
+            let (tls, _) = stage_test_tls(directory.path(), "pending");
+            let server_config = Arc::new(load_tls_server_config(&tls).unwrap());
+            let runtime = availability_test_runtime();
+            let active = Arc::new(AtomicUsize::new(0));
+            let pending = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
+            let mut clients: Vec<Box<dyn std::any::Any>> = Vec::new();
+            let mut tasks = tokio::task::JoinSet::new();
+            for index in 0..MAX_PENDING_HANDSHAKES {
+                let stream = if index % 2 == 0 {
+                    let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+                    clients.push(Box::new(client));
+                    PlainControlStream::Unix(server)
+                } else {
+                    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                    clients.push(Box::new(
+                        std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap(),
+                    ));
+                    PlainControlStream::Tcp(listener.accept().unwrap().0)
+                };
+                let permit = pending.clone().try_acquire_owned().unwrap();
+                tasks.spawn(serve_control_connection(
+                    ControlStream::PendingTls {
+                        stream,
+                        server_config: server_config.clone(),
+                    },
+                    runtime.clone(),
+                    permit,
+                    active.clone(),
+                ));
+            }
+            assert!(pending.clone().try_acquire_owned().is_err());
+            assert_eq!(active.load(Ordering::Acquire), 0);
+            tokio::time::timeout(CONTROL_HANDSHAKE_TIMEOUT + Duration::from_secs(2), async {
+                while let Some(result) = tasks.join_next().await {
+                    assert!(result.unwrap().unwrap_err().contains("timed out"));
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(pending.available_permits(), MAX_PENDING_HANDSHAKES);
+            assert_eq!(active.load(Ordering::Acquire), 0);
+            drop(clients);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn grpc_blackhole_expires_connection_and_releases_mediation_lease() {
+            let runtime = availability_test_runtime();
+            let server_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let server_address = server_listener.local_addr().unwrap();
+            let server_runtime = runtime.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = server_listener.accept().await.unwrap();
+                serve_grpc(Box::new(stream), server_runtime).await
+            });
+            let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = proxy_listener.local_addr().unwrap();
+            let (blackhole, stop_forwarding) = tokio::sync::oneshot::channel::<()>();
+            let proxy = tokio::spawn(async move {
+                let (mut downstream, _) = proxy_listener.accept().await.unwrap();
+                let mut upstream = tokio::net::TcpStream::connect(server_address)
+                    .await
+                    .unwrap();
+                tokio::select! {
+                    _ = stop_forwarding => {},
+                    _ = tokio::io::copy_bidirectional(&mut upstream, &mut downstream) => panic!("proxy closed before blackhole"),
+                }
+                // Keep both sockets open without forwarding PING or ACK: this
+                // models a silently dropped Kubernetes TCP path, not FIN/RST.
+                std::future::pending::<()>().await;
+                drop((upstream, downstream));
+            });
+            let channel =
+                tonic::transport::Endpoint::from_shared(format!("http://{proxy_address}"))
+                    .unwrap()
+                    .connect()
+                    .await
+                    .unwrap();
+            let (sender, receiver) = tokio::sync::mpsc::channel(4);
+            let request = RequestEnvelope::new(
+                "availability".to_string(),
+                "a".repeat(32),
+                Request::OpenMediation,
+            )
+            .unwrap();
+            sender
+                .send(BoundaryChunk {
+                    data: encode_frame(&request).unwrap(),
+                })
+                .await
+                .unwrap();
+            let mut response = IsolationBoundaryClient::new(channel)
+                .mediate(ReceiverStream::new(receiver))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(response.message().await.unwrap().is_some());
+            tokio::time::sleep(CONTROL_KEEPALIVE_INTERVAL + Duration::from_secs(1)).await;
+            assert!(
+                !server.is_finished(),
+                "healthy idle session must survive keepalive"
+            );
+            assert!(runtime.mediation_active.try_lock().is_err());
+            blackhole.send(()).unwrap();
+            tokio::time::timeout(
+                CONTROL_KEEPALIVE_INTERVAL + CONTROL_KEEPALIVE_TIMEOUT + Duration::from_secs(3),
+                server,
+            )
+            .await
+            .expect("blackholed HTTP/2 connection must expire")
+            .unwrap()
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while runtime.mediation_active.try_lock().is_err() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("connection teardown must stop all bridges and release lease");
+            let (mut replacement, task) = request_test_mediation(runtime, &"a".repeat(32)).await;
+            let ready: ResponseEnvelope =
+                openshell_isolation_interface::boundary_protocol::read_frame_async(
+                    &mut replacement,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(ready.response, Response::MediationReady));
+            drop(replacement);
+            task.await.unwrap().unwrap();
+            drop(sender);
+            proxy.abort();
+        }
+
+        async fn request_test_mediation(
+            runtime: Arc<BoundaryRuntime>,
+            token: &str,
+        ) -> (
+            tokio::io::DuplexStream,
+            tokio::task::JoinHandle<Result<(), String>>,
+        ) {
+            let (mut client, server) = tokio::io::duplex(4096);
+            let task = tokio::spawn(serve_persistent_mediation(server, runtime));
+            let envelope = RequestEnvelope::new(
+                "availability".to_string(),
+                token.to_string(),
+                Request::OpenMediation,
+            )
+            .unwrap();
+            client
+                .write_all(&encode_frame(&envelope).unwrap())
+                .await
+                .unwrap();
+            (client, task)
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn mediation_replacement_waits_for_lease_and_rejects_bad_authentication() {
+            let runtime = availability_test_runtime();
+            let (mut first, first_task) =
+                request_test_mediation(runtime.clone(), &"a".repeat(32)).await;
+            let ready: ResponseEnvelope =
+                openshell_isolation_interface::boundary_protocol::read_frame_async(&mut first)
+                    .await
+                    .unwrap();
+            assert!(matches!(ready.response, Response::MediationReady));
+            let (mut denied, denied_task) =
+                request_test_mediation(runtime.clone(), &"b".repeat(32)).await;
+            let response: ResponseEnvelope =
+                openshell_isolation_interface::boundary_protocol::read_frame_async(&mut denied)
+                    .await
+                    .unwrap();
+            assert!(matches!(
+                response.response,
+                Response::Error {
+                    kind: BoundaryErrorKind::Denied,
+                    ..
+                }
+            ));
+            denied_task.await.unwrap().unwrap();
+            let (mut replacement, replacement_task) =
+                request_test_mediation(runtime.clone(), &"a".repeat(32)).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), replacement.read_u8())
+                    .await
+                    .is_err(),
+                "a live lease cannot be preempted"
+            );
+            drop(first);
+            first_task.await.unwrap().unwrap();
+            let ready: ResponseEnvelope = tokio::time::timeout(
+                Duration::from_secs(1),
+                openshell_isolation_interface::boundary_protocol::read_frame_async(
+                    &mut replacement,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(matches!(ready.response, Response::MediationReady));
+            assert!(runtime.mediation_active.try_lock().is_err());
+            drop(replacement);
+            replacement_task.await.unwrap().unwrap();
+            assert!(runtime.mediation_active.try_lock().is_ok());
         }
 
         fn test_workload_identity() -> ResolvedWorkloadIdentity {
