@@ -16,7 +16,7 @@ WHAT THIS PROVES / PRODUCES
 
   OCSF classes you will see:
     [6002] Application Lifecycle        - sandbox created
-    [5019] Device Config State Change   - OS policy / hardening / proxy / console
+    [5019] Device Config State Change   - OS policy / hardening / console
     [1007] Process Activity             - in-sandbox process launch (+ executable identity)
     [2004] Detection Finding            - MXC setup activity errors (informational)
 
@@ -46,7 +46,7 @@ WHAT YOU GET BACK
 FILES IN THIS PACKAGE
   openshell-gateway.exe    the gateway (self-contained; needs only VC++ runtime)
   openshell.exe            the CLI
-  mxc-ocsf-audit.toml      gateway/driver config (process_container, etw_audit=true, egress proxy)
+  mxc-ocsf-audit.toml      gateway/driver config (process_container, etw_audit=true)
   ocsf-audit.yaml          sandbox policy (read-write grant to the share dir)
   run-ocsf-audit.ps1       the orchestrator you run
   README-ocsf-audit.txt    this file
@@ -54,9 +54,6 @@ FILES IN THIS PACKAGE
 
 USEFUL OPTIONS
   -SandboxCount <n>   Create n sandboxes (default 2). More sandboxes = more events.
-  -NoProxy            Skip the per-sandbox egress proxy. This omits ONLY the
-                      SandboxProxyConfigured config event; everything else is
-                      still produced. (Default is proxy ON for the full set.)
   -ShareDir <path>    Host folder granted read-write to the workload. The script
                       derives a disposable policy and per-sandbox config for it.
   -WxcExecPath <path> Path to wxc-exec.exe on this box.
@@ -69,9 +66,6 @@ NOTES
     that is unrelated to the OCSF audit path this example exercises.
   - A "supervisor session not connected" / ssh 255 message during sandbox create
     is EXPECTED on MXC and harmless - the agent already ran in-driver.
-  - The proxy path requires the host-side CONNECT proxy and an absolute agent
-    binary (the packaged config uses C:\Windows\System32\cmd.exe); the run script
-    handles this for you.
   - The Sandboxing provider reports the sandbox entry-point process, not the full
     in-sandbox process tree. Deep process-tree auditing would need a second ETW
     source (Microsoft-Windows-Kernel-Process) and is out of scope for this trail.
