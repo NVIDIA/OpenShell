@@ -182,9 +182,24 @@ cleanup() {
     for id in ${sandbox_ids}; do
       local sandbox_id
       sandbox_id="$(podman_cmd inspect --format '{{ index .Config.Labels "openshell.ai/sandbox-id" }}' "${id}" 2>/dev/null || true)"
-      podman_cmd rm -f "${id}" >/dev/null 2>&1 || true
       if [ -n "${sandbox_id}" ] && [ "${sandbox_id}" != "<no value>" ]; then
+        # Only the companion is attached to the test network. Remove it first
+        # (it depends on the workload user namespace), then locate the isolated
+        # network=none workload by this test sandbox's immutable label.
+        podman_cmd rm -f "openshell-supervisor-${sandbox_id}" >/dev/null 2>&1 || true
+        local workload_ids workload_id
+        workload_ids="$(podman_cmd ps -aq --filter "label=openshell.managed=true" \
+          --filter "label=openshell.ai/sandbox-id=${sandbox_id}" \
+          --filter "label=openshell.io/isolation-role=sandbox" 2>/dev/null || true)"
+        for workload_id in ${workload_ids}; do
+          podman_cmd rm -f "${workload_id}" >/dev/null 2>&1 || true
+        done
+        podman_cmd volume rm "openshell-channel-${sandbox_id}" >/dev/null 2>&1 || true
         podman_cmd volume rm -f "openshell-sandbox-${sandbox_id}-workspace" >/dev/null 2>&1 || true
+        local secret_prefix
+        for secret_prefix in openshell-token openshell-proxy-auth openshell-tls-ca openshell-tls-cert openshell-tls-key; do
+          podman_cmd secret rm "${secret_prefix}-${sandbox_id}" >/dev/null 2>&1 || true
+        done
       fi
     done
   fi

@@ -20,12 +20,12 @@ use tokio::net::UnixListener;
 #[derive(Clone)]
 pub struct StubResponse {
     pub status: StatusCode,
-    pub body: String,
+    pub body: Bytes,
     pub delay: Duration,
 }
 
 impl StubResponse {
-    pub fn new(status: StatusCode, body: impl Into<String>) -> Self {
+    pub fn new(status: StatusCode, body: impl Into<Bytes>) -> Self {
         Self {
             status,
             body: body.into(),
@@ -108,7 +108,7 @@ pub fn spawn_podman_stub(
                             Ok::<_, Infallible>(
                                 hyper::Response::builder()
                                     .status(response.status)
-                                    .body(Full::new(Bytes::from(response.body)))
+                                    .body(Full::new(response.body))
                                     .expect("stub response should build"),
                             )
                         }

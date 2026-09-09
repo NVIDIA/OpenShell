@@ -777,7 +777,7 @@ impl PodmanComputeDriver {
             "Creating sandbox container"
         );
 
-        let (image, immutable_image_id, image_user) = async {
+        let (image, immutable_image_id, image_user, image_env) = async {
             let phase_status = openshell_otel::ErrorStatusGuard::current();
             let result = async {
                 // The supervisor binary is shipped in a standalone OCI image and
@@ -837,7 +837,8 @@ impl PodmanComputeDriver {
                         .map_err(ComputeDriverError::from)?;
                 }
 
-                Ok((image.to_string(), inspected_image.id, image_user))
+                let image_env = inspected_image.config.as_ref().map_or_else(Vec::new, |config| config.env.clone());
+                Ok((image.to_string(), inspected_image.id, image_user, image_env))
             }
             .await;
             phase_status.finish(result)
@@ -855,6 +856,22 @@ impl PodmanComputeDriver {
         // failure. The supervisor independently validates the certificate
         // content at startup.
         validate_sandbox_proxy_ca_bundle(&self.config).await?;
+
+        let identity = self
+            .resolve_workload_identity(sandbox, &immutable_image_id, &image_user)
+            .await?;
+        let channel_volume = crate::isolation::channel_volume_name(&sandbox.id);
+        let mut runtime_config = self.config.clone();
+        runtime_config.supervisor_image = self
+            .client
+            .inspect_image(&self.config.supervisor_image)
+            .await?
+            .id;
+        if runtime_config.supervisor_image.is_empty() {
+            return Err(ComputeDriverError::Precondition(
+                "supervisor image inspection returned no immutable image ID".into(),
+            ));
+        }
 
         // Create workspace volume and per-sandbox token secret.
         let (token_secret_name, proxy_auth_secret_name) = async {
@@ -901,6 +918,7 @@ impl PodmanComputeDriver {
         // Clean up the volume and both per-sandbox secrets on any failure past
         // this point.
         let cleanup_created = || async {
+            let _ = self.client.remove_volume(&channel_volume).await;
             let _ = self.client.remove_volume(&vol_name).await;
             if let Some(secret) = token_secret_name.as_deref() {
                 cleanup_sandbox_token_secret(&self.client, secret).await;
@@ -911,7 +929,7 @@ impl PodmanComputeDriver {
         };
 
         // Prepare and create the container.
-        let tls_secret_names = async {
+        async {
             let phase_status = openshell_otel::ErrorStatusGuard::current();
             let result = async {
                 let gpu_devices = match self.resolve_gpu_cdi_devices(
@@ -927,7 +945,7 @@ impl PodmanComputeDriver {
                 };
                 let supervisor_bin_path = if userns_needs_extraction(self.config.userns.as_deref())
                 {
-                    match extract_supervisor_bin(&self.client, &self.config).await {
+                    match extract_supervisor_bin(&self.client, &runtime_config).await {
                         Ok(path) => Some(path),
                         Err(e) => {
                             cleanup_created().await;
@@ -938,9 +956,7 @@ impl PodmanComputeDriver {
                     None
                 };
 
-                let tls_secret_names = if userns_remaps_uids(self.config.userns.as_deref())
-                    && self.config.tls_enabled()
-                {
+                let tls_secret_names = if self.config.tls_enabled() {
                     let names = container::tls_secret_names(&sandbox.id);
                     if let Err(e) = create_tls_secrets(&self.client, &self.config, &names).await {
                         cleanup_created().await;
@@ -958,32 +974,77 @@ impl PodmanComputeDriver {
                     }
                 };
 
-                let spec = match container::build_container_spec_for_image(
+                let specs = container::build_isolation_specs(container::IsolationSpecInput {
                     sandbox,
-                    &self.config,
-                    token_secret_name.as_deref(),
-                    gpu_devices.as_deref(),
-                    &image,
-                    &immutable_image_id,
-                    &image_user,
-                    supervisor_bin_path.as_deref(),
-                    tls_secret_names.as_ref(),
-                ) {
+                    config: &runtime_config,
+                    token_secret: token_secret_name.as_deref(),
+                    gpu_devices: gpu_devices.as_deref(),
+                    requested_image: &image,
+                    image_id: &immutable_image_id,
+                    image_user: &image_user,
+                    image_env: &image_env,
+                    supervisor_bin: supervisor_bin_path.as_deref(),
+                    tls_secrets: tls_secret_names.as_ref(),
+                    identity: &identity,
+                });
+                let mut specs = match specs {
                     Ok(spec) => spec,
                     Err(e) => {
                         cleanup_all().await;
                         return Err(e);
                     }
                 };
-                match self.client.create_container(&spec).await {
-                    Ok(_) => Ok(tls_secret_names),
-                    Err(PodmanApiError::Conflict(_)) => {
-                        cleanup_all().await;
-                        Err(ComputeDriverError::AlreadyExists)
+                let mut created_workload = None;
+                let mut created_supervisor = None;
+                let create_result = async {
+                    self.client.create_volume(&channel_volume).await?;
+                    let workload_id = self.client.create_typed_container(&specs.workload).await?;
+                    created_workload = Some(workload_id.clone());
+                    self.client.verify_isolation_fence(&workload_id).await?;
+                    let child_env = image_env
+                        .iter()
+                        .filter_map(|entry| {
+                            entry
+                                .split_once('=')
+                                .map(|(key, value)| (key.into(), value.into()))
+                        })
+                        .collect();
+                    let archives = crate::isolation::bootstrap_archives(
+                        &sandbox.id,
+                        &workload_id,
+                        &identity,
+                        child_env,
+                    )?;
+                    self.client
+                        .copy_to_container(&workload_id, archives.workload)
+                        .await?;
+                    specs.supervisor.join_user_namespace(&workload_id);
+                    let supervisor_id = self
+                        .client
+                        .create_typed_container(&specs.supervisor)
+                        .await?;
+                    created_supervisor = Some(supervisor_id.clone());
+                    self.client
+                        .copy_to_container(&supervisor_id, archives.supervisor)
+                        .await?;
+                    // Both resources and private files exist before either
+                    // container can run. Only the trusted sandbox starts here;
+                    // authenticated confirmation gates subsequent agent exec.
+                    self.client.start_container(&workload_id).await?;
+                    self.client.start_container(&supervisor_id).await?;
+                    Ok::<(), ComputeDriverError>(())
+                }
+                .await;
+                if create_result.is_err() {
+                    for id in [created_supervisor, created_workload].into_iter().flatten() {
+                        let _ = self.client.remove_container(&id, 0).await;
                     }
+                }
+                match create_result {
+                    Ok(()) => Ok(()),
                     Err(e) => {
                         cleanup_all().await;
-                        Err(ComputeDriverError::from(e))
+                        Err(e)
                     }
                 }
             }
@@ -998,44 +1059,6 @@ impl PodmanComputeDriver {
         ))
         .await?;
 
-        let cleanup_all = || async {
-            cleanup_created().await;
-            if let Some(names) = &tls_secret_names {
-                cleanup_tls_secrets(&self.client, names).await;
-            }
-        };
-
-        // Start container.
-        let start_result = async {
-            let phase_status = openshell_otel::ErrorStatusGuard::current();
-            let result = self
-                .client
-                .start_container(&name)
-                .await
-                .map_err(ComputeDriverError::from);
-            phase_status.finish(result)
-        }
-        .instrument(tracing::info_span!(
-            "podman.start_container",
-            otel.name = "podman.start_container",
-            otel.status_code = tracing::field::Empty,
-            container.name = %name,
-        ))
-        .await;
-        if let Err(e) = start_result {
-            warn!(
-                sandbox_name = %sandbox.name,
-                error = %e,
-                "Failed to start container; cleaning up"
-            );
-            let _ = self
-                .client
-                .remove_container(&name, self.config.stop_timeout_secs)
-                .await;
-            cleanup_all().await;
-            return Err(e);
-        }
-
         info!(
             sandbox_id = %sandbox.id,
             sandbox_name = %sandbox.name,
@@ -1045,7 +1068,65 @@ impl PodmanComputeDriver {
         span_status.finish(Ok(()))
     }
 
-    /// Find the Podman container ID for a sandbox by its sandbox ID using label lookup.
+    /// Resolve image accounts without executing any image-supplied program.
+    async fn resolve_workload_identity(
+        &self,
+        sandbox: &DriverSandbox,
+        image: &str,
+        image_user: &str,
+    ) -> Result<openshell_isolation_interface::contract::ResolvedWorkloadIdentity, ComputeDriverError>
+    {
+        #[derive(serde::Serialize)]
+        struct InspectionSpec<'a> {
+            name: String,
+            image: &'a str,
+        }
+        // Inspect a stopped, unexecuted container pinned to the final image ID.
+        let id = self
+            .client
+            .create_typed_container(&InspectionSpec {
+                name: format!("openshell-identity-{}", uuid::Uuid::new_v4()),
+                image,
+            })
+            .await?;
+        let result =
+            async {
+                // Do not let image-controlled symlinks alias the protected channel
+                // into an agent-readable subtree before Podman mounts it.
+                match self.client.copy_from_container(&id, "/.openshell").await {
+                    Err(PodmanApiError::NotFound(_)) => {}
+                    Ok(_) => return Err(ComputeDriverError::Precondition(
+                        "workload images must not prepopulate the reserved /.openshell hierarchy"
+                            .into(),
+                    )),
+                    Err(error) => return Err(error.into()),
+                }
+                let mut accounts = Vec::new();
+                for path in ["/etc/passwd", "/etc/group"] {
+                    let content = match self.client.copy_from_container(&id, path).await {
+                        Ok(archive) => extract_first_tar_entry(&archive)
+                            .map_err(ComputeDriverError::Precondition)?,
+                        Err(PodmanApiError::NotFound(_)) => Vec::new(),
+                        Err(error) => return Err(error.into()),
+                    };
+                    accounts.push(content);
+                }
+                let [passwd, group] = accounts.as_slice() else {
+                    return Err(ComputeDriverError::Precondition(
+                        "image account inspection was incomplete".into(),
+                    ));
+                };
+                crate::isolation::resolve_identity(sandbox, image, image_user, passwd, group)
+            }
+            .await;
+        let cleanup = self.client.remove_container(&id, 0).await;
+        if let Err(error) = cleanup {
+            warn!(container = %id, %error, "Failed to remove stopped identity inspection container");
+        }
+        result
+    }
+
+    /// Find only the workload, never its supervisor companion.
     async fn find_container_id(
         &self,
         sandbox_id: &str,
@@ -1060,7 +1141,11 @@ impl PodmanComputeDriver {
         let id_filter = format!("{LABEL_SANDBOX_ID}={sandbox_id}");
         let entries = self
             .client
-            .list_containers(&[LABEL_MANAGED_FILTER, &id_filter])
+            .list_containers(&[
+                LABEL_MANAGED_FILTER,
+                &id_filter,
+                crate::isolation::WORKLOAD_FILTER,
+            ])
             .await
             .map_err(ComputeDriverError::from)?;
         Ok(entries.into_iter().next())
@@ -1113,6 +1198,15 @@ impl PodmanComputeDriver {
             .await?
             .ok_or(ComputeDriverError::NotFound)?;
         let container_id = container.id;
+        let supervisor = crate::isolation::supervisor_name(sandbox_id);
+        match self
+            .client
+            .stop_container(&supervisor, self.config.stop_timeout_secs)
+            .await
+        {
+            Ok(()) | Err(PodmanApiError::NotFound(_)) => {}
+            Err(error) => return Err(error.into()),
+        }
         if container.state == "stopping" {
             let result = async {
                 let finished_at = self
@@ -1176,7 +1270,19 @@ impl PodmanComputeDriver {
             .await?
             .ok_or(ComputeDriverError::NotFound)?;
         if container.state == "running" {
-            return span_status.finish(Ok(()));
+            let supervisor = self
+                .client
+                .inspect_container(&crate::isolation::supervisor_name(sandbox_id))
+                .await;
+            if supervisor
+                .as_ref()
+                .is_ok_and(|inspect| inspect.state.running)
+            {
+                return span_status.finish(Ok(()));
+            }
+            self.client.stop_container(&container.id, 0).await?;
+            self.wait_for_container_stopped(sandbox_id, &container.id)
+                .await?;
         }
         let container_id = container.id;
         info!(sandbox_id = %sandbox_id, container = %container_id, "Starting sandbox container");
@@ -1193,11 +1299,29 @@ impl PodmanComputeDriver {
             .map_err(ComputeDriverError::from)?;
         self.lifecycle_event_fences
             .record_previous_exit(sandbox_id, previous.state.finished_at.as_deref());
-        let result = self
-            .client
-            .start_container(&container_id)
-            .await
-            .map_err(ComputeDriverError::from);
+        let result = async {
+            let supervisor = crate::isolation::supervisor_name(sandbox_id);
+            self.client
+                .stop_container(&supervisor, self.config.stop_timeout_secs)
+                .await?;
+            self.wait_for_container_stopped(sandbox_id, &supervisor)
+                .await?;
+            let archive = self
+                .client
+                .copy_from_container(&supervisor, crate::isolation::RESTART_BUNDLE_PATH)
+                .await?;
+            let bundle =
+                extract_first_tar_entry(&archive).map_err(ComputeDriverError::Precondition)?;
+            self.client.copy_to_container(&container_id, bundle).await?;
+            self.client.verify_isolation_fence(&container_id).await?;
+            self.client.start_container(&container_id).await?;
+            if let Err(error) = self.client.start_container(&supervisor).await {
+                let _ = self.client.stop_container(&container_id, 0).await;
+                return Err(error.into());
+            }
+            Ok(())
+        }
+        .await;
         span_status.finish(result)
     }
 
@@ -1217,6 +1341,25 @@ impl PodmanComputeDriver {
             return Err(ComputeDriverError::Precondition(
                 "sandbox id is required".into(),
             ));
+        }
+
+        let supervisor = crate::isolation::supervisor_name(sandbox_id);
+        match self
+            .client
+            .remove_container(&supervisor, self.config.stop_timeout_secs)
+            .await
+        {
+            Ok(()) | Err(PodmanApiError::NotFound(_)) => {}
+            Err(error) => return Err(error.into()),
+        }
+        match self
+            .client
+            .remove_volume(&crate::isolation::channel_volume_name(sandbox_id))
+            .await
+        {
+            Ok(()) | Err(PodmanApiError::NotFound(_)) => {}
+            // The workload still owns the volume until its removal below.
+            Err(error) => debug!(%error, "Channel volume is still attached to workload"),
         }
 
         let Some(container_id) = self.find_container_id(sandbox_id).await? else {
@@ -1252,6 +1395,13 @@ impl PodmanComputeDriver {
         };
 
         // Remove workspace volume.
+        if let Err(error) = self
+            .client
+            .remove_volume(&crate::isolation::channel_volume_name(sandbox_id))
+            .await
+        {
+            warn!(%sandbox_id, %error, "Failed to remove private channel volume");
+        }
         let vol = container::volume_name(sandbox_id);
         if let Err(e) = self.client.remove_volume(&vol).await {
             warn!(
@@ -1278,7 +1428,11 @@ impl PodmanComputeDriver {
         let id_filter = format!("{LABEL_SANDBOX_ID}={sandbox_id}");
         let entries = self
             .client
-            .list_containers(&[LABEL_MANAGED_FILTER, &id_filter])
+            .list_containers(&[
+                LABEL_MANAGED_FILTER,
+                &id_filter,
+                crate::isolation::WORKLOAD_FILTER,
+            ])
             .await
             .map_err(ComputeDriverError::from)?;
         Ok(!entries.is_empty())
@@ -1292,16 +1446,18 @@ impl PodmanComputeDriver {
         let id_filter = format!("{LABEL_SANDBOX_ID}={sandbox_id}");
         let entries = self
             .client
-            .list_containers(&[LABEL_MANAGED_FILTER, &id_filter])
+            .list_containers(&[
+                LABEL_MANAGED_FILTER,
+                &id_filter,
+                crate::isolation::WORKLOAD_FILTER,
+            ])
             .await
             .map_err(ComputeDriverError::from)?;
         let Some(entry) = entries.first() else {
             return Ok(None);
         };
         if entry.state == "running" {
-            Ok(self
-                .client
-                .inspect_container(&entry.id)
+            Ok(watcher::inspect_workload(&self.client, &entry.id)
                 .await
                 .ok()
                 .and_then(|inspect| driver_sandbox_from_inspect(&inspect))
@@ -1318,7 +1474,7 @@ impl PodmanComputeDriver {
     pub async fn list_sandboxes(&self) -> Result<Vec<DriverSandbox>, ComputeDriverError> {
         let entries = self
             .client
-            .list_containers(&[LABEL_MANAGED_FILTER])
+            .list_containers(&[LABEL_MANAGED_FILTER, crate::isolation::WORKLOAD_FILTER])
             .await
             .map_err(ComputeDriverError::from)?;
 
@@ -1326,7 +1482,7 @@ impl PodmanComputeDriver {
         for entry in &entries {
             if entry.state == "running" {
                 // Running containers need inspect for health check status.
-                match self.client.inspect_container(&entry.id).await {
+                match watcher::inspect_workload(&self.client, &entry.id).await {
                     Ok(inspect) => {
                         if let Some(sandbox) = driver_sandbox_from_inspect(&inspect) {
                             sandboxes.push(sandbox);
@@ -1609,6 +1765,7 @@ fn userns_needs_extraction(userns: Option<&str>) -> bool {
 /// Returns `true` when userns remaps all UIDs, making host-owned bind mounts
 /// unreadable from inside the container. `auto` and `no-map` remap every UID;
 /// `keep-id` preserves the host user's UID; `host` uses the host namespace.
+#[cfg(test)]
 fn userns_remaps_uids(userns: Option<&str>) -> bool {
     userns.is_some_and(|mode| {
         let base = mode.split(':').next().unwrap_or(mode);
@@ -1705,6 +1862,7 @@ mod tests {
             "lifecycle-stop",
             vec![
                 StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"running"}]"#),
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // companion stop
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
                 StubResponse::new(
                     StatusCode::OK,
@@ -1720,7 +1878,7 @@ mod tests {
         assert_eq!(
             stop_requests
                 .lock()
-                .expect("request log lock should not be poisoned")[1],
+                .expect("request log lock should not be poisoned")[2],
             format!(
                 "POST {}",
                 api_path("/libpod/containers/ctr-1/stop?timeout=10")
@@ -1729,7 +1887,7 @@ mod tests {
         assert_eq!(
             stop_requests
                 .lock()
-                .expect("request log lock should not be poisoned")[2],
+                .expect("request log lock should not be poisoned")[3],
             format!("GET {}", api_path("/libpod/containers/ctr-1/json"))
         );
 
@@ -1741,8 +1899,7 @@ mod tests {
                     StatusCode::OK,
                     r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"exited","Running":false,"FinishedAt":"2026-08-12T16:39:13Z"},"Config":{}}"#,
                 ),
-                StubResponse::new(StatusCode::NO_CONTENT, ""),
-            ],
+            ].into_iter().chain(restart_responses()).collect(),
         );
         test_driver(start_socket.clone())
             .start_sandbox("sandbox-1")
@@ -1759,7 +1916,10 @@ mod tests {
             start_requests
                 .lock()
                 .expect("request log lock should not be poisoned")[2],
-            format!("POST {}", api_path("/libpod/containers/ctr-1/start"))
+            format!(
+                "POST {}",
+                api_path("/libpod/containers/openshell-supervisor-sandbox-1/stop?timeout=10")
+            )
         );
 
         let _ = fs::remove_file(stop_socket);
@@ -1772,6 +1932,7 @@ mod tests {
             "lifecycle-stop-wait",
             vec![
                 StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"running"}]"#),
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // companion stop
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
                 StubResponse::new(
                     StatusCode::OK,
@@ -1793,12 +1954,12 @@ mod tests {
         let requests = requests
             .lock()
             .expect("request log lock should not be poisoned");
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 5);
         assert_eq!(
-            requests[2],
+            requests[3],
             format!("GET {}", api_path("/libpod/containers/ctr-1/json"))
         );
-        assert_eq!(requests[3], requests[2]);
+        assert_eq!(requests[4], requests[3]);
 
         let _ = fs::remove_file(socket);
     }
@@ -1809,6 +1970,7 @@ mod tests {
             "lifecycle-stop-retry",
             vec![
                 StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"stopping"}]"#),
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // companion stop
                 StubResponse::new(
                     StatusCode::OK,
                     r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"exited","Running":false,"FinishedAt":"2026-08-12T16:39:13Z"},"Config":{}}"#,
@@ -1825,9 +1987,9 @@ mod tests {
         let requests = requests
             .lock()
             .expect("request log lock should not be poisoned");
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert_eq!(
-            requests[1],
+            requests[2],
             format!("GET {}", api_path("/libpod/containers/ctr-1/json"))
         );
 
@@ -1845,6 +2007,7 @@ mod tests {
             "trace-stop",
             vec![
                 StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"running"}]"#),
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // companion stop
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
                 StubResponse::new(
                     StatusCode::OK,
@@ -1893,17 +2056,10 @@ mod tests {
         let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
         let (socket_path, _requests, handle) = spawn_podman_stub(
             "trace-create",
-            vec![
-                StubResponse::new(StatusCode::OK, "{}"),
-                StubResponse::new(StatusCode::OK, "{}"),
-                StubResponse::new(
-                    StatusCode::OK,
-                    r#"{"Id":"sha256:sandbox","Config":{"User":"1234:1235"}}"#,
-                ),
-                StubResponse::new(StatusCode::CREATED, "{}"),
-                StubResponse::new(StatusCode::CREATED, "{}"),
-                StubResponse::new(StatusCode::NO_CONTENT, ""),
-            ],
+            create_setup_responses(false)
+                .into_iter()
+                .chain(create_launch_responses())
+                .collect(),
         );
         let exporter = InMemorySpanExporterBuilder::new().build();
         let provider = SdkTracerProvider::builder()
@@ -1929,7 +2085,6 @@ mod tests {
             "podman.prepare_images",
             "podman.prepare_storage",
             "podman.prepare_container",
-            "podman.start_container",
         ] {
             let child = spans
                 .iter()
@@ -2009,8 +2164,7 @@ mod tests {
                     StatusCode::OK,
                     r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"exited","Running":false,"FinishedAt":"2026-08-12T16:39:13Z"},"Config":{}}"#,
                 ),
-                StubResponse::new(StatusCode::NO_CONTENT, ""),
-            ],
+            ].into_iter().chain(restart_responses()).collect(),
         );
         test_driver(start_socket.clone())
             .start_sandbox("sandbox-1")
@@ -2022,6 +2176,8 @@ mod tests {
         let (delete_socket, _requests, delete_handle) = spawn_podman_stub(
             "trace-delete",
             vec![
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove companion
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove channel if detached
                 StubResponse::new(StatusCode::OK, "[]"),
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
@@ -2892,6 +3048,8 @@ mod tests {
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "delete-not-found",
             vec![
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove companion
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove channel if detached
                 // list_containers returns empty (container already gone)
                 StubResponse::new(StatusCode::OK, "[]"),
                 // remove_volume
@@ -2911,9 +3069,9 @@ mod tests {
             .lock()
             .expect("request log lock should not be poisoned")
             .clone();
-        assert!(requests[0].contains("/libpod/containers/json"));
+        assert!(requests[2].contains("/libpod/containers/json"));
         assert_eq!(
-            requests[1],
+            requests[3],
             format!(
                 "DELETE {}",
                 api_path(&format!("/libpod/volumes/{volume_name}"))
@@ -2961,6 +3119,159 @@ mod tests {
         )
     }
 
+    fn restart_responses() -> Vec<StubResponse> {
+        let mut archive = tar::Builder::new(Vec::new());
+        let bundle = tar::Builder::new(Vec::new()).into_inner().unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bundle.len() as u64);
+        header.set_mode(0o600);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "sandbox-bundle.tar", bundle.as_slice())
+            .unwrap();
+        vec![
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // supervisor stop
+            StubResponse::new(
+                StatusCode::OK,
+                r#"{"Id":"supervisor","Name":"supervisor","State":{"Status":"exited","Running":false},"Config":{}}"#,
+            ),
+            StubResponse::new(StatusCode::OK, archive.into_inner().unwrap()),
+            StubResponse::new(StatusCode::OK, ""), // restore bootstrap
+            fence_response(),
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // workload start
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // supervisor start
+        ]
+    }
+
+    fn fence_response() -> StubResponse {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct HostConfig {
+            network_mode: &'static str,
+            privileged: bool,
+        }
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Networks {
+            networks: std::collections::BTreeMap<String, String>,
+        }
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Fence {
+            host_config: HostConfig,
+            network_settings: Networks,
+        }
+        StubResponse::new(
+            StatusCode::OK,
+            serde_json::to_vec(&Fence {
+                host_config: HostConfig {
+                    network_mode: "none",
+                    privileged: false,
+                },
+                network_settings: Networks {
+                    networks: std::collections::BTreeMap::default(),
+                },
+            })
+            .unwrap(),
+        )
+    }
+
+    fn created_response(id: &'static str) -> StubResponse {
+        #[derive(serde::Serialize)]
+        struct Created {
+            #[serde(rename = "Id")]
+            id: &'static str,
+        }
+        StubResponse::new(
+            StatusCode::CREATED,
+            serde_json::to_vec(&Created { id }).unwrap(),
+        )
+    }
+
+    fn image_response(id: &'static str) -> StubResponse {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Config {
+            user: &'static str,
+        }
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Image {
+            id: &'static str,
+            config: Config,
+        }
+        StubResponse::new(
+            StatusCode::OK,
+            serde_json::to_vec(&Image {
+                id,
+                config: Config { user: "1234:1235" },
+            })
+            .unwrap(),
+        )
+    }
+
+    fn create_setup_responses(proxy_secret: bool) -> Vec<StubResponse> {
+        let mut responses = vec![
+            StubResponse::new(StatusCode::OK, "{}"), // supervisor pull
+            StubResponse::new(StatusCode::OK, "{}"), // workload pull
+            image_response("sha256:sandbox"),
+            created_response("identity-reader"),
+            StubResponse::new(StatusCode::NOT_FOUND, ""), // reserved hierarchy absent
+            StubResponse::new(StatusCode::NOT_FOUND, ""), // optional passwd
+            StubResponse::new(StatusCode::NOT_FOUND, ""), // optional group
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // remove stopped reader
+            image_response("sha256:supervisor"),
+            StubResponse::new(StatusCode::CREATED, "{}"), // workspace volume
+        ];
+        if proxy_secret {
+            responses.push(StubResponse::new(StatusCode::CREATED, "{}"));
+        }
+        responses.push(StubResponse::new(StatusCode::CREATED, "{}")); // channel volume
+        responses
+    }
+
+    fn create_launch_responses() -> Vec<StubResponse> {
+        vec![
+            created_response("workload"),
+            fence_response(),
+            StubResponse::new(StatusCode::OK, ""), // workload archive
+            created_response("supervisor"),
+            StubResponse::new(StatusCode::OK, ""), // supervisor archive
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // workload start
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // supervisor start
+        ]
+    }
+
+    #[tokio::test]
+    async fn reserved_image_control_root_fails_before_workload_or_secrets() {
+        let (path, requests, handle) = spawn_podman_stub(
+            "reserved-control-root",
+            vec![
+                StubResponse::new(StatusCode::OK, "{}"),
+                StubResponse::new(StatusCode::OK, "{}"),
+                image_response("sha256:image"),
+                created_response("identity-reader"),
+                StubResponse::new(StatusCode::OK, "existing reserved path"),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+            ],
+        );
+        let error = test_driver(path.clone())
+            .create_sandbox(&plain_sandbox("id", "name"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("reserved /.openshell"));
+        handle.await.unwrap();
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.contains("/libpod/volumes")
+                    || request.contains("/libpod/secrets"))
+        );
+        let _ = fs::remove_file(path);
+    }
+
     #[tokio::test]
     async fn create_sandbox_removes_proxy_auth_secret_on_container_create_failure() {
         // A credential secret is staged before the container is created, so a
@@ -2969,19 +3280,15 @@ mod tests {
         let auth_file = write_proxy_auth_file("create-fail");
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "create-container-fail",
-            vec![
-                StubResponse::new(StatusCode::OK, "{}"), // pull supervisor image
-                StubResponse::new(StatusCode::OK, "{}"), // pull sandbox image
-                StubResponse::new(
-                    StatusCode::OK,
-                    r#"{"Id":"sha256:sandbox","Config":{"User":"1234:1235"}}"#,
-                ), // inspect sandbox image
-                StubResponse::new(StatusCode::CREATED, "{}"), // create volume
-                StubResponse::new(StatusCode::CREATED, "{}"), // create proxy-auth secret
-                StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"message":"boom"}"#), // create container
-                StubResponse::new(StatusCode::NO_CONTENT, ""), // cleanup: remove volume
-                StubResponse::new(StatusCode::NO_CONTENT, ""), // cleanup: remove proxy-auth secret
-            ],
+            create_setup_responses(true)
+                .into_iter()
+                .chain([
+                    StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "create failed"),
+                    StubResponse::new(StatusCode::NO_CONTENT, ""), // channel
+                    StubResponse::new(StatusCode::NO_CONTENT, ""), // workspace
+                    StubResponse::new(StatusCode::NO_CONTENT, ""), // proxy secret
+                ])
+                .collect(),
         );
         let driver = test_driver_with_config(proxy_auth_config(socket_path.clone(), &auth_file));
 
@@ -3011,21 +3318,18 @@ mod tests {
         let auth_file = write_proxy_auth_file("start-fail");
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "create-start-fail",
-            vec![
-                StubResponse::new(StatusCode::OK, "{}"), // pull supervisor image
-                StubResponse::new(StatusCode::OK, "{}"), // pull sandbox image
-                StubResponse::new(
-                    StatusCode::OK,
-                    r#"{"Id":"sha256:sandbox","Config":{"User":"1234:1235"}}"#,
-                ), // inspect sandbox image
-                StubResponse::new(StatusCode::CREATED, "{}"), // create volume
-                StubResponse::new(StatusCode::CREATED, "{}"), // create proxy-auth secret
-                StubResponse::new(StatusCode::CREATED, "{}"), // create container
-                StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"message":"boom"}"#), // start container
-                StubResponse::new(StatusCode::NO_CONTENT, ""), // cleanup: remove container
-                StubResponse::new(StatusCode::NO_CONTENT, ""), // cleanup: remove volume
-                StubResponse::new(StatusCode::NO_CONTENT, ""), // cleanup: remove proxy-auth secret
-            ],
+            create_setup_responses(true)
+                .into_iter()
+                .chain(create_launch_responses().into_iter().take(6))
+                .chain([
+                    StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "supervisor start failed"),
+                    StubResponse::new(StatusCode::NO_CONTENT, ""), // supervisor
+                    StubResponse::new(StatusCode::NO_CONTENT, ""), // workload
+                    StubResponse::new(StatusCode::NO_CONTENT, ""), // channel
+                    StubResponse::new(StatusCode::NO_CONTENT, ""), // workspace
+                    StubResponse::new(StatusCode::NO_CONTENT, ""), // proxy secret
+                ])
+                .collect(),
         );
         let driver = test_driver_with_config(proxy_auth_config(socket_path.clone(), &auth_file));
 
@@ -3055,7 +3359,9 @@ mod tests {
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "delete-proxy-auth",
             vec![
-                StubResponse::new(StatusCode::OK, "[]"), // list_containers (not found)
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove companion
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove channel if detached
+                StubResponse::new(StatusCode::OK, "[]"),       // list_containers (not found)
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // remove volume
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // remove token secret
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // remove proxy-auth secret
@@ -3098,9 +3404,13 @@ mod tests {
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "delete-label-lookup",
             vec![
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove companion
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove channel if detached
                 // list_containers by label
                 StubResponse::new(StatusCode::OK, list_body),
                 // single timed remove_container operation
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                // channel volume, now detached
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
                 // remove_volume
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
@@ -3119,9 +3429,9 @@ mod tests {
             .lock()
             .expect("request log lock should not be poisoned")
             .clone();
-        assert!(requests[0].contains("/libpod/containers/json"));
+        assert!(requests[2].contains("/libpod/containers/json"));
         assert_eq!(
-            requests[1],
+            requests[3],
             format!(
                 "DELETE {}",
                 api_path(&format!(
@@ -3130,7 +3440,7 @@ mod tests {
             )
         );
         assert_eq!(
-            requests[2],
+            requests[5],
             format!(
                 "DELETE {}",
                 api_path(&format!("/libpod/volumes/{volume_name}"))

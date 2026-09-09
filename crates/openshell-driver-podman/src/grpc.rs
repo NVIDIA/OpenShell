@@ -162,8 +162,7 @@ impl ComputeDriver for ComputeDriverService {
                     .into_inner()
                     .sandbox
                     .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-                self.driver
-                    .create_sandbox(&sandbox)
+                Box::pin(self.driver.create_sandbox(&sandbox))
                     .await
                     .map_err(Status::from)?;
                 Ok(Response::new(CreateSandboxResponse {}))
@@ -680,6 +679,8 @@ mod tests {
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "forward-id",
             vec![
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // companion
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // channel
                 // list_containers returns empty (container already gone)
                 StubResponse::new(StatusCode::OK, "[]"),
                 // remove_volume
@@ -708,9 +709,9 @@ mod tests {
             .lock()
             .expect("request log lock should not be poisoned")
             .clone();
-        assert!(requests[0].contains("/libpod/containers/json"));
+        assert!(requests[2].contains("/libpod/containers/json"));
         assert_eq!(
-            requests[1],
+            requests[3],
             format!(
                 "DELETE {}",
                 api_path(&format!("/libpod/volumes/{volume_name}"))

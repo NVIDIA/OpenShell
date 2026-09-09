@@ -252,10 +252,14 @@ Common findings:
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
 - Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Numeric workload identities `1` through `4294967294` are accepted; root, the invalid identity sentinel, and missing identities are rejected.
 - Supervisor cannot call back: check callback endpoint and gateway logs.
-- A sandbox with explicit `protocol: tcp` endpoints fails before readiness:
-  inspect supervisor logs for policy DNS port-53 binding, synthetic-route, or
-  nftables redirect failures. Rootless Podman must provide these primitives
-  inside the supervisor-owned nested network namespace; setup fails closed.
+- Inspect both Podman containers for the sandbox: the `sandbox` isolation role
+  must have network mode `none`; the `supervisor` role owns gateway callbacks
+  and egress. Both run non-root with all capabilities dropped. Check the private
+  channel volume and shared user-namespace mapping if authentication fails.
+- If a sandbox fails before readiness, inspect its unprivileged enforcement
+  probe and the companion supervisor's private health check. Do not add
+  capabilities, attach a workload network, or disable the runtime seccomp
+  profile. There is no sandbox nftables or nested-network setup to repair.
 - Gateway exits before becoming healthy with a callback-listener discovery
   error: inspect `podman info --debug`, the configured Podman network, and the
   host's IPv4 default route. Rootless pasta uses the private source address

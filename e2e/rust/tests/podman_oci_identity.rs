@@ -22,7 +22,7 @@ const BASE_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:late
 const READY_MARKER: &str = "podman-oci-identity-ready";
 const OCI_UID: &str = "2345";
 const OCI_GID: &str = "2346";
-const OCI_FALLBACK_POLICY: &str = r#"version: 1
+const OCI_FALLBACK_POLICY: &str = r"version: 1
 
 filesystem_policy:
   include_workdir: true
@@ -32,7 +32,7 @@ landlock:
   compatibility: best_effort
 
 network_policies: {}
-"#;
+";
 
 struct ImageGuard {
     engine: ContainerEngine,
@@ -128,7 +128,16 @@ fn run_engine(engine: &ContainerEngine, args: &[&str]) -> Result<String, String>
 }
 
 fn sandbox_container_id(engine: &ContainerEngine, sandbox_name: &str) -> Result<String, String> {
+    container_id_for_role(engine, sandbox_name, "sandbox")
+}
+
+fn container_id_for_role(
+    engine: &ContainerEngine,
+    sandbox_name: &str,
+    role: &str,
+) -> Result<String, String> {
     let name_filter = format!("label=openshell.ai/sandbox-name={sandbox_name}");
+    let role_filter = format!("label=openshell.io/isolation-role={role}");
     let stdout = run_engine(
         engine,
         &[
@@ -138,6 +147,8 @@ fn sandbox_container_id(engine: &ContainerEngine, sandbox_name: &str) -> Result<
             "label=openshell.managed=true",
             "--filter",
             &name_filter,
+            "--filter",
+            &role_filter,
         ],
     )?;
     let ids = stdout
@@ -233,5 +244,54 @@ async fn podman_uses_oci_identity_and_inspected_image_id() {
         "Podman sandbox must launch the immutable image ID inspected before creation"
     );
 
+    assert_isolated_pair(&image, &sandbox, &container_id).await;
     sandbox.cleanup().await;
+}
+
+async fn assert_isolated_pair(image: &ImageGuard, sandbox: &SandboxGuard, container_id: &str) {
+    let supervisor_id = container_id_for_role(&image.engine, &sandbox.name, "supervisor")
+        .expect("find separate supervisor companion");
+    assert_ne!(supervisor_id, container_id);
+    for id in [container_id, &supervisor_id] {
+        let user = run_engine(
+            &image.engine,
+            &["inspect", "--format", "{{.Config.User}}", id],
+        )
+        .unwrap();
+        assert_eq!(user, format!("{OCI_UID}:{OCI_GID}"));
+        let caps = run_engine(
+            &image.engine,
+            &["inspect", "--format", "{{.EffectiveCaps}}", id],
+        )
+        .unwrap();
+        assert_eq!(
+            caps, "[]",
+            "neither container may have effective capabilities"
+        );
+    }
+    let network = run_engine(
+        &image.engine,
+        &[
+            "inspect",
+            "--format",
+            "{{.HostConfig.NetworkMode}}",
+            container_id,
+        ],
+    )
+    .unwrap();
+    assert_eq!(network, "none");
+    let mounts = run_engine(
+        &image.engine,
+        &[
+            "inspect",
+            "--format",
+            "{{range .Mounts}}{{println .Destination}}{{end}}",
+            container_id,
+        ],
+    )
+    .unwrap();
+    assert!(!mounts.contains("/etc/openshell/tls"));
+    assert!(!mounts.contains("/.openshell/supervisor"));
+    let posture = sandbox.exec(&["sh", "-c", "set -eu; awk '/^CapEff:|^CapBnd:|^NoNewPrivs:/ {print}' /proc/self/status; test ! -r /.openshell/channel/sandbox/server.key; test ! -r /.openshell/supervisor/topology.payload"]).await.expect("workload cannot read either control credential set");
+    assert!(posture.contains("0000000000000000"));
 }

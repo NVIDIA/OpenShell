@@ -6,6 +6,7 @@ pub mod config;
 pub(crate) mod container;
 pub mod driver;
 pub mod grpc;
+mod isolation;
 pub mod otel_tracing;
 mod socket_discovery;
 #[cfg(test)]
