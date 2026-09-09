@@ -22,7 +22,7 @@ pub(super) enum McpRequestProtocolVersion {
 /// Failure to select a policy-allowed protocol revision for an MCP HTTP request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum McpProtocolVersionError {
-    /// The HTTP header block could not yield one unambiguous header value.
+    /// The HTTP header block could not yield one unambiguous end-to-end value.
     InvalidHeader,
     /// The header value is not an MCP revision supported by this `OpenShell` build.
     UnsupportedHeaderValue,
@@ -54,8 +54,9 @@ impl McpProtocolVersionError {
 impl std::fmt::Display for McpProtocolVersionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidHeader => formatter
-                .write_str("MCP-Protocol-Version must contain exactly one non-empty header value"),
+            Self::InvalidHeader => formatter.write_str(
+                "MCP-Protocol-Version must contain one non-empty end-to-end header value",
+            ),
             Self::UnsupportedHeaderValue => {
                 formatter.write_str("MCP-Protocol-Version names an unsupported protocol version")
             }
@@ -117,6 +118,14 @@ fn request_protocol_version_header(
         + 4;
     let headers = std::str::from_utf8(&raw_header[..header_end])
         .map_err(|_| McpProtocolVersionError::InvalidHeader)?;
+    // Forwarding removes Connection-nominated fields. A revision field must
+    // survive that cleanup. Use the forwarding parser's canonical field names
+    // so authorization and removal agree, including after middleware rebuilds.
+    let nominated = crate::l7::rest::connection_nominated_header_names(&raw_header[..header_end])
+        .map_err(|_| McpProtocolVersionError::InvalidHeader)?;
+    if nominated.contains(MCP_PROTOCOL_VERSION_HEADER) {
+        return Err(McpProtocolVersionError::InvalidHeader);
+    }
     let mut values = headers.split("\r\n").skip(1).filter_map(|line| {
         let (name, value) = line.split_once(':')?;
         // HTTP field-value optional whitespace is only SP or HTAB. Using
@@ -246,6 +255,27 @@ mod tests {
                 Err(McpProtocolVersionError::InvalidHeader)
             );
         }
+    }
+
+    #[test]
+    fn protocol_version_must_remain_an_end_to_end_field() {
+        for connection_options in [
+            "mcp-protocol-version",
+            "keep-alive, MCP-Protocol-Version",
+            "\tMcp-Protocol-Version\t, close",
+        ] {
+            let headers = request("POST", &format!("Connection: {connection_options}\r\n"));
+            assert_eq!(
+                request_protocol_version_header(&headers.raw_header),
+                Err(McpProtocolVersionError::InvalidHeader),
+                "revision metadata cannot be declared hop-by-hop"
+            );
+        }
+        let headers = request("POST", "Connection: keep-alive, x-request-id\r\n");
+        assert_eq!(
+            request_protocol_version_header(&headers.raw_header),
+            Ok(None)
+        );
     }
 
     #[test]

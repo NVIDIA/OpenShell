@@ -164,7 +164,9 @@ where
     Ok(())
 }
 
-async fn enforce_mcp_protocol_version<W>(
+/// Enforce MCP request-version policy and emit a transport or policy rejection.
+/// Non-MCP adapters share this entry point without changing their behavior.
+pub(crate) async fn enforce_mcp_protocol_version<W>(
     config: &L7EndpointConfig,
     request: &crate::l7::provider::L7Request,
     info: &crate::l7::jsonrpc::JsonRpcRequestInfo,
@@ -227,7 +229,9 @@ where
     }
 }
 
-async fn enforce_final_mcp_protocol_version<W>(
+/// Reinspect the buffered outgoing MCP request after request transformations.
+/// The forwarding adapter must call this before any upstream request write.
+pub(crate) async fn enforce_final_mcp_protocol_version<W>(
     config: &L7EndpointConfig,
     request: &crate::l7::provider::L7Request,
     client: &mut W,
