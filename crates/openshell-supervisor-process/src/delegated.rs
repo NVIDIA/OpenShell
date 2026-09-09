@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use miette::Result;
-use openshell_isolation_interface::contract::{BoundaryExec, BoundaryPortForward, BoundaryProcess};
+use openshell_isolation_interface::contract::{
+    BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess,
+};
 use openshell_ocsf::{ActivityId, AppLifecycleBuilder, SeverityId, StatusId, ocsf_emit};
 
 fn ocsf_ctx() -> &'static openshell_ocsf::SandboxContext {
@@ -82,7 +84,7 @@ pub async fn start_boundary_access(
     shared_ssh_socket: bool,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     boundary_exec: Arc<dyn BoundaryExec>,
-    port_forward: Arc<dyn BoundaryPortForward>,
+    port_forward: Arc<dyn BoundaryLoopbackConnector>,
     agent: Arc<dyn BoundaryProcess>,
 ) -> Result<BoundaryAccess> {
     let instance_id = uuid::Uuid::new_v4().to_string();

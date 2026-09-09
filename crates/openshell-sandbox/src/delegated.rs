@@ -12,7 +12,7 @@ use miette::WrapErr as _;
 use miette::{IntoDiagnostic as _, Result};
 use openshell_core::policy::SandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
-use openshell_isolation_interface::contract::{BoundaryExec, BoundaryPortForward};
+use openshell_isolation_interface::contract::{BoundaryExec, BoundaryLoopbackConnector};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, LaunchTypeId, Process as OcsfProcess,
     ProcessActivityBuilder, SeverityId, StatusId, ocsf_emit,
@@ -65,8 +65,8 @@ pub async fn spawn_workload(
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or_default();
     user_environment.retain(|key, _value| !crate::process::is_proxy_env_var(key));
-    let port_forward: Arc<dyn BoundaryPortForward> = Arc::new(
-        crate::boundary_io::LocalPortForward::new(Some(boundary_runtime.clone())),
+    let loopback_connector: Arc<dyn BoundaryLoopbackConnector> = Arc::new(
+        crate::boundary_io::LocalLoopbackConnector::new(Some(boundary_runtime.clone())),
     );
     let boundary_exec: Arc<dyn BoundaryExec> =
         Arc::new(crate::boundary_exec::LocalBoundaryExec::new(
@@ -129,7 +129,7 @@ pub async fn spawn_workload(
         signal_lock,
         main_session,
         boundary_exec,
-        port_forward,
+        loopback_connector,
         boundary_runtime,
     })
 }
@@ -142,7 +142,7 @@ pub struct SpawnedAgent {
     signal_lock: Arc<std::sync::Mutex<()>>,
     main_session: Arc<crate::main_session::MainSession>,
     boundary_exec: Arc<dyn BoundaryExec>,
-    port_forward: Arc<dyn BoundaryPortForward>,
+    loopback_connector: Arc<dyn BoundaryLoopbackConnector>,
     boundary_runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
 }
 
@@ -162,8 +162,8 @@ impl SpawnedAgent {
     }
 
     #[must_use]
-    pub fn port_forward(&self) -> Arc<dyn BoundaryPortForward> {
-        self.port_forward.clone()
+    pub fn loopback_connector(&self) -> Arc<dyn BoundaryLoopbackConnector> {
+        self.loopback_connector.clone()
     }
 
     /// Retained canonical-process I/O owned by the boundary.

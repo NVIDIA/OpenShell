@@ -800,7 +800,7 @@ pub async fn run_sandbox(
                 .as_ref()
                 .and_then(|runtime| runtime.ca_file_paths.clone()),
             running.exec(),
-            running.port_forward(),
+            running.loopback_connector(),
             agent.clone(),
         )
         .await?;
