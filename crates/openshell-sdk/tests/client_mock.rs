@@ -1143,6 +1143,29 @@ async fn list_sandboxes_follows_continuation_tokens() {
 }
 
 #[tokio::test]
+async fn list_sandboxes_passes_initial_page_token() {
+    let state = Arc::new(MockState {
+        paginate_list: true,
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let mut pager = client.list_sandboxes(ListOptions {
+        page_size: 1,
+        page_token: "page-2".to_string(),
+        ..Default::default()
+    });
+    let page = pager.next_page().await.unwrap().unwrap();
+
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].name, "beta");
+    let requests = state.list_requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].page_token, "page-2");
+}
+
+#[tokio::test]
 async fn delete_sandbox_returns_server_ack() {
     let state = Arc::new(MockState::default());
     let endpoint = start_mock(state.clone()).await;
