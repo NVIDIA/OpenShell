@@ -5082,6 +5082,199 @@ network_policies:
         );
     }
 
+    const PROTOCOL_NAME_CASES: [(&str, &str); 7] = [
+        ("tcp", "TcP"),
+        ("rest", "ReSt"),
+        ("websocket", "WeBsOcKeT"),
+        ("graphql", "GrApHqL"),
+        ("sql", "SqL"),
+        ("json-rpc", "JsOn-RpC"),
+        ("mcp", "McP"),
+    ];
+
+    fn assert_loaded_protocol_name(engine: &OpaEngine, authored: &str, canonical: &str) {
+        // Inspect stored data before typed parsing, which accepts mixed case and
+        // would otherwise hide a missing normalization step in either loader.
+        let data = engine.engine.lock().expect("OPA engine lock").get_data();
+        assert_eq!(
+            data["network_policies"]["protocol_names"]["endpoints"][0]["protocol"],
+            regorus::Value::from(canonical),
+            "stored protocol for {authored}"
+        );
+
+        let input = NetworkInput {
+            host: "protocol.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let config = engine
+            .query_endpoint_config(&input)
+            .expect("endpoint query");
+        if canonical == "tcp" {
+            // TCP remains an L4 endpoint; canonical spelling must not opt it
+            // into request inspection or change its network-level allowance.
+            assert!(config.is_none(), "TCP must not return L7 configuration");
+            assert!(matches!(
+                engine
+                    .evaluate_network_action(&input)
+                    .expect("network query"),
+                NetworkAction::Allow { .. }
+            ));
+        } else {
+            let config = config.expect("L7 endpoint configuration");
+            assert_eq!(
+                config["protocol"],
+                regorus::Value::from(canonical),
+                "published endpoint protocol for {authored}"
+            );
+            crate::l7::parse_l7_config(&config).expect("valid typed L7 configuration");
+        }
+    }
+
+    #[test]
+    fn protocol_names_yaml_load_canonicalizes_all_supported_values() {
+        for (canonical, mixed_case) in PROTOCOL_NAME_CASES {
+            let fields = match canonical {
+                "tcp" => "",
+                "rest" | "websocket" => {
+                    "enforcement: enforce\n        rules: [{allow: {method: GET, path: /status}}]"
+                }
+                "graphql" => {
+                    "enforcement: enforce\n        rules: [{allow: {operation_type: query, fields: [viewer]}}]"
+                }
+                // SQL inspection supports audit mode, not enforce mode.
+                "sql" => "enforcement: audit\n        rules: [{allow: {command: SELECT}}]",
+                "json-rpc" => "enforcement: enforce\n        rules: [{allow: {method: status}}]",
+                "mcp" => "enforcement: enforce\n        rules: [{allow: {method: tools/list}}]",
+                _ => unreachable!("fixture must name a supported protocol"),
+            };
+            for authored in [
+                canonical.to_string(),
+                canonical.to_ascii_uppercase(),
+                mixed_case.into(),
+            ] {
+                let yaml = format!(
+                    r#"
+network_policies:
+  protocol_names:
+    name: protocol_names
+    endpoints:
+      - host: protocol.example.com
+        port: 443
+        protocol: {authored}
+        {fields}
+    binaries:
+      - {{ path: /usr/bin/curl }}
+"#
+                );
+                let engine = OpaEngine::from_strings(TEST_POLICY, &yaml)
+                    .unwrap_or_else(|error| panic!("valid YAML protocol {authored}: {error}"));
+                assert_loaded_protocol_name(&engine, &authored, canonical);
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_names_proto_load_canonicalizes_all_supported_values() {
+        for (canonical, mixed_case) in PROTOCOL_NAME_CASES {
+            let allow = match canonical {
+                "tcp" => None,
+                "rest" | "websocket" => Some(L7Allow {
+                    method: "GET".into(),
+                    path: "/status".into(),
+                    ..Default::default()
+                }),
+                "graphql" => Some(L7Allow {
+                    operation_type: "query".into(),
+                    fields: vec!["viewer".into()],
+                    ..Default::default()
+                }),
+                "sql" => Some(L7Allow {
+                    command: "SELECT".into(),
+                    ..Default::default()
+                }),
+                "json-rpc" | "mcp" => Some(L7Allow {
+                    method: if canonical == "mcp" {
+                        "tools/list"
+                    } else {
+                        "status"
+                    }
+                    .into(),
+                    ..Default::default()
+                }),
+                _ => unreachable!("fixture must name a supported protocol"),
+            };
+            for authored in [
+                canonical.to_string(),
+                canonical.to_ascii_uppercase(),
+                mixed_case.into(),
+            ] {
+                let mut policy = openshell_policy::restrictive_default_policy();
+                policy.network_policies.insert(
+                    "protocol_names".into(),
+                    NetworkPolicyRule {
+                        name: "protocol_names".into(),
+                        endpoints: vec![NetworkEndpoint {
+                            host: "protocol.example.com".into(),
+                            port: 443,
+                            protocol: authored.clone(),
+                            // TCP has no L7 settings; SQL only supports audit.
+                            enforcement: match canonical {
+                                "tcp" => "",
+                                "sql" => "audit",
+                                _ => "enforce",
+                            }
+                            .into(),
+                            rules: allow
+                                .clone()
+                                .map(|allow| L7Rule { allow: Some(allow) })
+                                .into_iter()
+                                .collect(),
+                            ..Default::default()
+                        }],
+                        binaries: vec![NetworkBinary {
+                            path: "/usr/bin/curl".into(),
+                            ..Default::default()
+                        }],
+                    },
+                );
+                let engine = OpaEngine::from_proto(&policy)
+                    .unwrap_or_else(|error| panic!("valid protobuf protocol {authored}: {error}"));
+                assert_loaded_protocol_name(&engine, &authored, canonical);
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_names_normalization_preserves_other_data_and_is_idempotent() {
+        let mut data = serde_json::json!({
+            "network_policies": {
+                "first": {
+                    "endpoints": [
+                        {"protocol": "ReSt", "path": "/KeepCase", "host": "KeepCase.example"},
+                        {"protocol": "FutureProtocol"},
+                        {"protocol": ""},
+                        {"protocol": null},
+                        {"protocol": 42},
+                        {"host": "no-protocol.example"}
+                    ]
+                },
+                "second": {"endpoints": [{"protocol": "JsOn-RpC"}]}
+            }
+        });
+        let mut expected = data.clone();
+        expected["network_policies"]["first"]["endpoints"][0]["protocol"] = "rest".into();
+        expected["network_policies"]["second"]["endpoints"][0]["protocol"] = "json-rpc".into();
+
+        normalize_endpoint_protocols(&mut data);
+        assert_eq!(data, expected, "only recognized protocol names may change");
+        normalize_endpoint_protocols(&mut data);
+        assert_eq!(data, expected, "normalization must be idempotent");
+    }
+
     #[test]
     fn yaml_load_accepts_mixed_case_mcp_protocol_with_default_versions() {
         let data = r#"
