@@ -666,6 +666,18 @@ service OpenShell {
     };
   }
 
+  // Register a supervisor instance and wait for gateway activation.
+  //
+  // The initial trial activates already-bound supervisor instances immediately. Later
+  // warm-pool stages keep this stream pending until a SandboxClaim adopts the
+  // registered instance.
+  rpc RegisterSupervisor(RegisterSupervisorRequest)
+      returns (stream SupervisorActivationMessage) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "supervisor_registration"
+    };
+  }
+
   // Renew the calling sandbox's gateway JWT. Older tokens remain valid
   // until their own expiry; deployments should keep token TTLs short to
   // bound replay exposure. The supervisor calls this from a background
@@ -761,6 +773,28 @@ message IssueSandboxTokenResponse {
   // Absolute expiry of the issued token, milliseconds since the epoch. 0 means
   // the token is non-expiring.
   int64 expires_at_ms = 2;
+}
+
+// RegisterSupervisor request. Empty body; identity is established by the
+// authentication credentials carried in the request headers (a projected
+// Kubernetes ServiceAccount JWT in the K8s driver path).
+message RegisterSupervisorRequest {}
+
+// Activation sent by the gateway once a registered supervisor instance is bound to
+// an OpenShell sandbox identity.
+message SupervisorActivationMessage {
+  // OpenShell sandbox UUID the supervisor should use for ConnectSupervisor.
+  string sandbox_id = 1;
+  // Human-readable sandbox name, if known.
+  string sandbox_name = 2;
+  // Gateway-minted JWT bound to the sandbox UUID.
+  string token = 3 [(openshell.options.v1.secret) = true];
+  // Absolute expiry of the issued token, milliseconds since the epoch. 0 means
+  // the token is non-expiring.
+  int64 token_expires_at_ms = 4;
+  // Reserved for future activation-time metadata. The phase-1 cold path leaves
+  // this empty.
+  map<string, string> startup_metadata = 5;
 }
 
 // RefreshSandboxToken request. The calling principal must already be a

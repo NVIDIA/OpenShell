@@ -63,6 +63,8 @@ where
 }
 
 pub const COMPUTE_DRIVER_RPC_SERVICE: &str = "openshell.compute.v1.ComputeDriver";
+pub const SANDBOX_TEMPLATE_RECONCILER_RPC_SERVICE: &str =
+    "openshell.compute.v1.SandboxTemplateReconciler";
 
 /// Low-cardinality semantic-convention identity for a compute-driver RPC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,17 +76,25 @@ pub struct ComputeDriverRpc {
 
 impl ComputeDriverRpc {
     const fn new(method: &'static str, operation: &'static str) -> Self {
+        Self::new_for_service(COMPUTE_DRIVER_RPC_SERVICE, method, operation)
+    }
+
+    const fn new_for_service(
+        service: &'static str,
+        method: &'static str,
+        operation: &'static str,
+    ) -> Self {
         Self {
-            service: COMPUTE_DRIVER_RPC_SERVICE,
+            service,
             method,
             operation,
         }
     }
 }
 
-/// Typed identities for every RPC in the generated compute-driver service.
+/// Typed identities for every RPC in the generated compute-driver extension services.
 pub mod rpc {
-    use super::ComputeDriverRpc;
+    use super::{ComputeDriverRpc, SANDBOX_TEMPLATE_RECONCILER_RPC_SERVICE};
 
     pub const AUTHENTICATE_SANDBOX: ComputeDriverRpc = ComputeDriverRpc::new(
         "AuthenticateSandbox",
@@ -101,6 +111,11 @@ pub mod rpc {
     pub const VALIDATE_SANDBOX_CREATE: ComputeDriverRpc = ComputeDriverRpc::new(
         "ValidateSandboxCreate",
         "openshell.compute.v1.ComputeDriver/ValidateSandboxCreate",
+    );
+    pub const RECONCILE_SANDBOX_TEMPLATES: ComputeDriverRpc = ComputeDriverRpc::new_for_service(
+        SANDBOX_TEMPLATE_RECONCILER_RPC_SERVICE,
+        "ReconcileSandboxTemplates",
+        "openshell.compute.v1.SandboxTemplateReconciler/ReconcileSandboxTemplates",
     );
     pub const CREATE_SANDBOX: ComputeDriverRpc = ComputeDriverRpc::new(
         "CreateSandbox",
@@ -194,6 +209,7 @@ pub fn compute_driver_rpc_operation(path: &str) -> Option<ComputeDriverRpc> {
         Some("GetCapabilities") => Some(rpc::GET_CAPABILITIES),
         Some("GetGatewayListenerRequirements") => Some(rpc::GET_GATEWAY_LISTENER_REQUIREMENTS),
         Some("ValidateSandboxCreate") => Some(rpc::VALIDATE_SANDBOX_CREATE),
+        Some("ReconcileSandboxTemplates") => Some(rpc::RECONCILE_SANDBOX_TEMPLATES),
         Some("CreateSandbox") => Some(rpc::CREATE_SANDBOX),
         Some("GetSandbox") => Some(rpc::GET_SANDBOX),
         Some("ListSandboxes") => Some(rpc::LIST_SANDBOXES),
@@ -317,6 +333,7 @@ mod tests {
             rpc::GET_CAPABILITIES,
             rpc::GET_GATEWAY_LISTENER_REQUIREMENTS,
             rpc::VALIDATE_SANDBOX_CREATE,
+            rpc::RECONCILE_SANDBOX_TEMPLATES,
             rpc::CREATE_SANDBOX,
             rpc::GET_SANDBOX,
             rpc::LIST_SANDBOXES,

@@ -20,6 +20,12 @@ tests:
       - equal:
           path: metadata.namespace
           value: app-a
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["pods"]
+            verbs: ["get", "list"]
 
   - it: binds the shared gateway service account
     template: templates/rolebinding.yaml

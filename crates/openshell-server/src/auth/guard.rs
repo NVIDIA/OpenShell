@@ -20,6 +20,8 @@ use tracing::info;
 ///   scope at the router level).
 /// - [`Principal::Sandbox`] must reference the same canonical UUID it
 ///   was authenticated with.
+/// - [`Principal::SupervisorBootstrap`] is rejected — bootstrap registration
+///   identity is not a sandbox-scoped credential.
 /// - [`Principal::Anonymous`] is rejected — sandbox-class methods are
 ///   never anonymously callable.
 ///
@@ -44,6 +46,9 @@ pub fn ensure_sandbox_scope(principal: &Principal, claimed_sandbox_id: &str) -> 
                 ))
             }
         }
+        Principal::SupervisorBootstrap(_) => Err(Status::permission_denied(
+            "sandbox-scoped methods require a sandbox principal",
+        )),
         Principal::Anonymous => Err(Status::unauthenticated(
             "sandbox-scoped methods require an authenticated caller",
         )),
@@ -84,7 +89,7 @@ pub fn ensure_sandbox_principal_scope(
             ensure_sandbox_scope(principal, claimed_sandbox_id)?;
             Ok(p.clone())
         }
-        Principal::User(_) => Err(Status::permission_denied(
+        Principal::User(_) | Principal::SupervisorBootstrap(_) => Err(Status::permission_denied(
             "supervisor RPCs require a sandbox principal",
         )),
         Principal::Anonymous => Err(Status::unauthenticated(

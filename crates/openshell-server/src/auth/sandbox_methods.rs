@@ -50,5 +50,8 @@ mod tests {
         assert!(!is_sandbox_callable(
             "/openshell.v1.OpenShell/ApproveDraftChunk"
         ));
+        assert!(!is_sandbox_callable(
+            "/openshell.v1.OpenShell/RegisterSupervisor"
+        ));
     }
 }

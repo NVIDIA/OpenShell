@@ -9,12 +9,15 @@ use std::path::PathBuf;
 use tracing::info;
 
 use openshell_core::VERSION;
-use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_core::proto::compute::v1::{
+    compute_driver_server::ComputeDriverServer,
+    sandbox_template_reconciler_server::SandboxTemplateReconcilerServer,
+};
 use openshell_driver_kubernetes::{
     AppArmorProfile, ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID,
     DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig, KubernetesComputeDriver,
-    KubernetesSidecarConfig, ManagedSshIngressConfig, SupervisorSideloadMethod, SupervisorTopology,
-    WorkspaceMode,
+    KubernetesSidecarConfig, KubernetesWarmPoolingConfig, ManagedSshIngressConfig,
+    SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode,
 };
 
 #[derive(Parser, Debug)]
@@ -173,8 +176,8 @@ struct Args {
     app_armor_profile: Option<AppArmorProfile>,
 
     /// Lifetime (seconds) of the projected `ServiceAccount` token
-    /// kubelet writes into each sandbox pod for the `IssueSandboxToken`
-    /// bootstrap exchange. Kubelet enforces a minimum of 600s; the
+    /// kubelet writes into each sandbox pod for the `RegisterSupervisor`
+    /// bootstrap stream. Kubelet enforces a minimum of 600s; the
     /// gateway clamps values outside `[600, 86400]`. Default 3600.
     #[arg(long, env = "OPENSHELL_K8S_SA_TOKEN_TTL_SECS", default_value_t = 3600)]
     sa_token_ttl_secs: i64,
@@ -239,7 +242,7 @@ async fn main() -> Result<()> {
         .collect::<Result<BTreeMap<_, _>>>()?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let driver = KubernetesComputeDriver::new(
+    let driver = KubernetesComputeDriver::new_with_activation_support(
         KubernetesComputeConfig {
             workspace_mode: args.workspace_mode,
             gateway_id: args.gateway_id,
@@ -294,13 +297,17 @@ async fn main() -> Result<()> {
                 .unwrap_or_default(),
             sandbox_uid: args.sandbox_uid,
             sandbox_gid: args.sandbox_gid,
+            warm_pooling: KubernetesWarmPoolingConfig::default(),
         },
         shutdown_rx,
+        openshell_driver_kubernetes::WarmActivationSupport::Unavailable,
     )
     .await
     .into_diagnostic()?;
 
-    let service = ComputeDriverServer::new(ComputeDriverService::new(driver));
+    let service = ComputeDriverService::new(driver);
+    let compute_driver_service = ComputeDriverServer::new(service.clone());
+    let template_reconciler_service = SandboxTemplateReconcilerServer::new(service);
     let shutdown = async move {
         shutdown_signal().await;
         let _ = shutdown_tx.send(true);
@@ -313,7 +320,8 @@ async fn main() -> Result<()> {
         info!(socket = %socket_path.display(), "Starting Kubernetes compute driver");
         tonic::transport::Server::builder()
             .layer(openshell_otel::compute_driver_rpc_layer())
-            .add_service(service)
+            .add_service(compute_driver_service)
+            .add_service(template_reconciler_service)
             .serve_with_incoming_shutdown(
                 openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
                 shutdown,
@@ -324,7 +332,8 @@ async fn main() -> Result<()> {
         info!(address = %args.bind_address, "Starting Kubernetes compute driver");
         tonic::transport::Server::builder()
             .layer(openshell_otel::compute_driver_rpc_layer())
-            .add_service(service)
+            .add_service(compute_driver_service)
+            .add_service(template_reconciler_service)
             .serve_with_shutdown(args.bind_address, shutdown)
             .await
             .into_diagnostic()

@@ -57,6 +57,16 @@ tests:
           path: metadata.namespace
           value: other-ns
 
+  - it: grants pod lookup and selector fallback in shared mode
+    template: templates/role.yaml
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["pods"]
+            verbs: ["get", "list"]
+
   - it: uses explicit sandboxNamespace for sandbox RoleBinding
     template: templates/rolebinding.yaml
     set:

@@ -27,6 +27,7 @@ openshell-driver-docker = { path = "../openshell-driver-docker", optional = true
 openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes", optional = true }
 openshell-driver-podman = { path = "../openshell-driver-podman", optional = true }
 hyper-util = { workspace = true, optional = true }
+kube = { workspace = true, optional = true }
 nix = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 rustix = { workspace = true, optional = true }
@@ -45,6 +46,7 @@ in-tree-compute-drivers = [
     "dep:openshell-driver-podman",
     "dep:openshell-otel",
     "dep:hyper-util",
+    "dep:kube",
     "dep:nix",
     "dep:serde",
     "dep:rustix",

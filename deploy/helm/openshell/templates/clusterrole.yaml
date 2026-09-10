@@ -9,8 +9,8 @@ metadata:
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 rules:
-  # Validate projected sandbox ServiceAccount tokens during the
-  # IssueSandboxToken bootstrap exchange.
+  # Validate projected sandbox ServiceAccount tokens during supervisor
+  # registration and legacy token bootstrap.
   - apiGroups:
       - authentication.k8s.io
     resources:
@@ -72,6 +72,53 @@ rules:
       - pods
     verbs:
       - get
+      - list
+  {{- end }}
+  {{- if ne $workspaceMode "shared" }}
+  # Claim inventory, activation, and cleanup remain available across managed or
+  # operator-owned workspace namespaces when new warm allocation is disabled.
+  - apiGroups:
+      - extensions.agents.x-k8s.io
+    resources:
+      - sandboxclaims
+    verbs:
+      - get
+      - list
+      - watch
+      - delete
+  {{- if .Values.server.warmPooling.enabled }}
+  # Creating new claims is required only for warm-pool allocation.
+  - apiGroups:
+      - extensions.agents.x-k8s.io
+    resources:
+      - sandboxclaims
+    verbs:
+      - create
+  {{- end }}
+  # Keep generated-resource cleanup available when warm allocation is disabled
+  # so the driver can prune resources created by an earlier configuration.
+  - apiGroups:
+      - extensions.agents.x-k8s.io
+    resources:
+      - sandboxtemplates
+      - sandboxwarmpools
+    verbs:
+      - list
+      - delete
+  {{- if .Values.server.warmPooling.enabled }}
+  # Reconcile and watch generated resources while warm allocation is enabled.
+  - apiGroups:
+      - extensions.agents.x-k8s.io
+    resources:
+      - sandboxtemplates
+      - sandboxwarmpools
+    verbs:
+      - get
+      - watch
+      - create
+      - patch
+      - update
+  {{- end }}
   {{- end }}
   {{- $copiedSecretNames := list }}
   {{- if and (ne $workspaceMode "shared") (not .Values.server.disableTls) }}

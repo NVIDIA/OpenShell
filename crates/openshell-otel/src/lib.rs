@@ -14,8 +14,9 @@ pub use driver::{
 
 pub use grpc::{
     COMPUTE_DRIVER_RPC_SERVICE, ComputeDriverRpc, ComputeDriverRpcSpan, RecordGrpcFailure,
-    RecordGrpcStatus, TracedGrpcStream, compute_driver_rpc_layer, compute_driver_rpc_operation,
-    grpc_status_code_name, record_grpc_status, rpc,
+    RecordGrpcStatus, SANDBOX_TEMPLATE_RECONCILER_RPC_SERVICE, TracedGrpcStream,
+    compute_driver_rpc_layer, compute_driver_rpc_operation, grpc_status_code_name,
+    record_grpc_status, rpc,
 };
 pub use propagation::{
     HeaderMapExtractor, MetadataMapInjector, TraceContextInterceptor, current_trace_context_carrier,

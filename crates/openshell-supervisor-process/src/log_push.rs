@@ -9,7 +9,7 @@
 
 use openshell_core::grpc_client::CachedOpenShellClient;
 use openshell_core::proto::{PushSandboxLogsRequest, SandboxLogLine};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
@@ -20,13 +20,21 @@ use tracing_subscriber::layer::Context;
 /// event is dropped. Logging must never block the sandbox.
 #[derive(Clone)]
 pub struct LogPushLayer {
-    sandbox_id: String,
+    sandbox_id: watch::Receiver<Option<String>>,
     tx: mpsc::Sender<SandboxLogLine>,
     max_level: tracing::Level,
 }
 
 impl LogPushLayer {
     pub fn new(sandbox_id: String, tx: mpsc::Sender<SandboxLogLine>) -> Self {
+        let (_identity_tx, identity_rx) = watch::channel(Some(sandbox_id));
+        Self::with_identity(identity_rx, tx)
+    }
+
+    fn with_identity(
+        sandbox_id: watch::Receiver<Option<String>>,
+        tx: mpsc::Sender<SandboxLogLine>,
+    ) -> Self {
         let max_level = parse_max_level(std::env::var("OPENSHELL_LOG_PUSH_LEVEL").ok().as_deref());
         Self {
             sandbox_id,
@@ -74,7 +82,7 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
         let is_ocsf = meta.target() == openshell_ocsf::OCSF_TARGET;
 
         let log = SandboxLogLine {
-            sandbox_id: self.sandbox_id.clone(),
+            sandbox_id: self.sandbox_id.borrow().clone().unwrap_or_default(),
             timestamp_ms: ts,
             level: if is_ocsf {
                 "OCSF".to_string()
@@ -92,6 +100,35 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
     }
 }
 
+/// Completes a pending log stream once warm-pod registration assigns the
+/// authoritative sandbox identity.
+#[derive(Clone)]
+pub struct LogPushActivation {
+    sandbox_id: watch::Sender<Option<String>>,
+}
+
+impl LogPushActivation {
+    pub fn activate(&self, sandbox_id: String) {
+        self.sandbox_id.send_replace(Some(sandbox_id));
+    }
+}
+
+/// Build a log layer and push task that may start before a warm sandbox has an
+/// identity. The task does not connect to the gateway until activation.
+pub fn spawn_log_push(
+    endpoint: String,
+    sandbox_id: Option<String>,
+) -> (LogPushLayer, LogPushActivation, tokio::task::JoinHandle<()>) {
+    let (identity_tx, identity_rx) = watch::channel(sandbox_id);
+    let (tx, rx) = mpsc::channel::<SandboxLogLine>(1024);
+    let layer = LogPushLayer::with_identity(identity_rx.clone(), tx);
+    let activation = LogPushActivation {
+        sandbox_id: identity_tx,
+    };
+    let handle = tokio::spawn(run_push_loop(endpoint, identity_rx, rx));
+    (layer, activation, handle)
+}
+
 /// Spawn a background task that batches and pushes log lines to the server.
 ///
 /// Returns the sender half of the channel (for the [`LogPushLayer`]) and the
@@ -102,8 +139,8 @@ pub fn spawn_log_push_task(
     sandbox_id: String,
 ) -> (mpsc::Sender<SandboxLogLine>, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<SandboxLogLine>(1024);
-
-    let handle = tokio::spawn(run_push_loop(endpoint, sandbox_id, rx));
+    let (_identity_tx, identity_rx) = watch::channel(Some(sandbox_id));
+    let handle = tokio::spawn(run_push_loop(endpoint, identity_rx, rx));
 
     (tx, handle)
 }
@@ -115,9 +152,18 @@ const INITIAL_BACKOFF: tokio::time::Duration = tokio::time::Duration::from_secs(
 
 async fn run_push_loop(
     endpoint: String,
-    sandbox_id: String,
+    mut sandbox_id_rx: watch::Receiver<Option<String>>,
     mut rx: mpsc::Receiver<SandboxLogLine>,
 ) {
+    let sandbox_id = loop {
+        let current_sandbox_id = sandbox_id_rx.borrow().clone();
+        if let Some(sandbox_id) = current_sandbox_id {
+            break sandbox_id;
+        }
+        if sandbox_id_rx.changed().await.is_err() {
+            return;
+        }
+    };
     let mut batch = Vec::with_capacity(50);
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
@@ -169,7 +215,7 @@ async fn run_push_loop(
 
         // --- Flush any lines buffered during reconnect ---
         if !batch.is_empty() {
-            let lines = std::mem::take(&mut batch);
+            let lines = take_batch_for_sandbox(&mut batch, &sandbox_id);
             if push_tx
                 .send(PushSandboxLogsRequest {
                     sandbox_id: sandbox_id.clone(),
@@ -197,7 +243,7 @@ async fn run_push_loop(
                         // Tracing layer dropped — sandbox is shutting down.
                         // Flush remaining and exit entirely.
                         if !batch.is_empty() {
-                            let lines = std::mem::take(&mut batch);
+                            let lines = take_batch_for_sandbox(&mut batch, &sandbox_id);
                             let _ = push_tx.send(PushSandboxLogsRequest {
                                 sandbox_id: sandbox_id.clone(),
                                 logs: lines,
@@ -207,7 +253,7 @@ async fn run_push_loop(
                     };
                     batch.push(line);
                     if batch.len() >= 50 {
-                        let lines = std::mem::take(&mut batch);
+                        let lines = take_batch_for_sandbox(&mut batch, &sandbox_id);
                         if push_tx.send(PushSandboxLogsRequest {
                             sandbox_id: sandbox_id.clone(),
                             logs: lines,
@@ -218,7 +264,7 @@ async fn run_push_loop(
                 }
                 _ = timer.tick() => {
                     if !batch.is_empty() {
-                        let lines = std::mem::take(&mut batch);
+                        let lines = take_batch_for_sandbox(&mut batch, &sandbox_id);
                         if push_tx.send(PushSandboxLogsRequest {
                             sandbox_id: sandbox_id.clone(),
                             logs: lines,
@@ -246,6 +292,17 @@ async fn run_push_loop(
             backoff = (backoff * 2).min(MAX_BACKOFF);
         }
     }
+}
+
+fn take_batch_for_sandbox(
+    batch: &mut Vec<SandboxLogLine>,
+    sandbox_id: &str,
+) -> Vec<SandboxLogLine> {
+    let mut lines = std::mem::take(batch);
+    for line in &mut lines {
+        line.sandbox_id = sandbox_id.to_string();
+    }
+    lines
 }
 
 /// Drain incoming log lines during a backoff delay so the tracing layer's
@@ -338,7 +395,7 @@ mod tests {
     fn capture(capacity: usize, f: impl FnOnce()) -> Vec<SandboxLogLine> {
         let (tx, mut rx) = mpsc::channel::<SandboxLogLine>(capacity);
         let layer = LogPushLayer {
-            sandbox_id: "sb-test".to_string(),
+            sandbox_id: watch::channel(Some("sb-test".to_string())).1,
             tx,
             max_level: tracing::Level::INFO,
         };
@@ -350,6 +407,39 @@ mod tests {
             out.push(line);
         }
         out
+    }
+
+    #[test]
+    fn pending_layer_switches_to_activated_identity() {
+        let (tx, mut rx) = mpsc::channel::<SandboxLogLine>(4);
+        let (identity_tx, identity_rx) = watch::channel(None);
+        let activation = LogPushActivation {
+            sandbox_id: identity_tx,
+        };
+        let layer = LogPushLayer::with_identity(identity_rx, tx);
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "test_target", "before activation");
+            activation.activate("sb-warm".to_string());
+            tracing::info!(target: "test_target", "after activation");
+        });
+
+        assert_eq!(rx.try_recv().unwrap().sandbox_id, "");
+        assert_eq!(rx.try_recv().unwrap().sandbox_id, "sb-warm");
+    }
+
+    #[test]
+    fn queued_lines_are_rebound_to_authoritative_identity() {
+        let mut batch = vec![SandboxLogLine {
+            sandbox_id: String::new(),
+            ..SandboxLogLine::default()
+        }];
+
+        let lines = take_batch_for_sandbox(&mut batch, "sb-warm");
+
+        assert!(batch.is_empty());
+        assert_eq!(lines[0].sandbox_id, "sb-warm");
     }
 
     #[test]

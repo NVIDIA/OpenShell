@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: Warm-pool RBAC
+templates:
+  - templates/clusterrole.yaml
+  - templates/role.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: keeps shared claim and generated-resource cleanup permissions when warm pooling is disabled
+    set:
+      server.warmPooling.enabled: false
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["extensions.agents.x-k8s.io"]
+          any: true
+        template: templates/clusterrole.yaml
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["extensions.agents.x-k8s.io"]
+            resources: ["sandboxclaims"]
+            verbs: ["get", "list", "watch", "delete"]
+        template: templates/role.yaml
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["extensions.agents.x-k8s.io"]
+            resources: ["sandboxtemplates", "sandboxwarmpools"]
+            verbs: ["list", "delete"]
+        template: templates/role.yaml
+
+  - it: keeps multi-namespace claim and generated-resource cleanup permissions when warm pooling is disabled
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+      server.warmPooling.enabled: false
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["extensions.agents.x-k8s.io"]
+            resources: ["sandboxclaims"]
+            verbs: ["get", "list", "watch", "delete"]
+        template: templates/clusterrole.yaml
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["extensions.agents.x-k8s.io"]
+            resources: ["sandboxtemplates", "sandboxwarmpools"]
+            verbs: ["list", "delete"]
+        template: templates/clusterrole.yaml
+
+  - it: grants shared warm-pool permissions only in the namespaced role
+    set:
+      server.drivers.kubernetes.workspaceMode: shared
+      server.warmPooling.enabled: true
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["extensions.agents.x-k8s.io"]
+          any: true
+        template: templates/clusterrole.yaml
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["extensions.agents.x-k8s.io"]
+            resources: ["sandboxclaims"]
+            verbs: ["get", "list", "watch", "delete"]
+        template: templates/role.yaml
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["extensions.agents.x-k8s.io"]
+            resources: ["sandboxclaims"]
+            verbs: ["create"]
+        template: templates/role.yaml
+
+  - it: grants generated-resource mutation in multi-namespace mode
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+      server.warmPooling.enabled: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["extensions.agents.x-k8s.io"]
+            resources: ["sandboxtemplates", "sandboxwarmpools"]
+            verbs: ["list", "delete"]
+        template: templates/clusterrole.yaml
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["extensions.agents.x-k8s.io"]
+            resources: ["sandboxtemplates", "sandboxwarmpools"]
+            verbs: ["get", "watch", "create", "patch", "update"]
+        template: templates/clusterrole.yaml

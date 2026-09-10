@@ -47,6 +47,7 @@ pub mod secrets;
 pub mod settings;
 pub mod shell;
 pub mod spiffe;
+pub mod supervisor_bootstrap;
 pub mod telemetry;
 pub mod time;
 pub mod transport_errors;

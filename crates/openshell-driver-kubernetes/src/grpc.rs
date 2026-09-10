@@ -10,11 +10,14 @@ use openshell_core::proto::compute::v1::{
     DeleteWorkspaceResponse, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
+    ListSandboxesRequest, ListSandboxesResponse, ReconcileSandboxTemplatesRequest,
+    ReconcileSandboxTemplatesResponse, StartSandboxRequest, StartSandboxResponse,
     StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_server::ComputeDriver,
+    ValidateSandboxCreateResponse, WarmPendingInstance, WatchSandboxesEvent, WatchSandboxesRequest,
+    authenticate_sandbox_response, compute_driver_server::ComputeDriver,
+    sandbox_template_reconciler_server::SandboxTemplateReconciler,
 };
+use openshell_core::supervisor_bootstrap::SupervisorBootstrapBinding;
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
 
@@ -63,8 +66,21 @@ impl ComputeDriver for ComputeDriverService {
                 if credential.is_empty() {
                     return Err(Status::invalid_argument("credential is required"));
                 }
-                let sandbox_id = self.driver.authenticate_sandbox(&credential).await?;
-                Ok(Response::new(AuthenticateSandboxResponse { sandbox_id }))
+                let identity = self.driver.authenticate_sandbox(&credential).await?;
+                let binding = match identity.binding {
+                    SupervisorBootstrapBinding::BoundSandbox { sandbox_id } => {
+                        authenticate_sandbox_response::Binding::SandboxId(sandbox_id)
+                    }
+                    SupervisorBootstrapBinding::WarmPending { activation_guard } => {
+                        authenticate_sandbox_response::Binding::WarmPending(WarmPendingInstance {
+                            instance_id: identity.instance_id,
+                            activation_guard,
+                        })
+                    }
+                };
+                Ok(Response::new(AuthenticateSandboxResponse {
+                    binding: Some(binding),
+                }))
             })
             .await
     }
@@ -160,12 +176,12 @@ impl ComputeDriver for ComputeDriverService {
     ) -> Result<Response<CreateSandboxResponse>, Status> {
         self.rpc_tracer
             .trace(openshell_otel::rpc::CREATE_SANDBOX, async {
+                let request = request.into_inner();
                 let sandbox = request
-                    .into_inner()
                     .sandbox
                     .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
                 self.driver
-                    .create_sandbox(&sandbox)
+                    .create_sandbox(&sandbox, request.sandbox_template.as_ref())
                     .await
                     .map_err(|e| Status::from(openshell_core::ComputeDriverError::from(e)))?;
                 Ok(Response::new(CreateSandboxResponse {}))
@@ -318,6 +334,24 @@ impl ComputeDriver for ComputeDriverService {
                 Ok(Response::new(DeleteWorkspaceResponse {}))
             })
             .await
+    }
+}
+
+#[tonic::async_trait]
+impl SandboxTemplateReconciler for ComputeDriverService {
+    async fn reconcile_sandbox_templates(
+        &self,
+        request: Request<ReconcileSandboxTemplatesRequest>,
+    ) -> Result<Response<ReconcileSandboxTemplatesResponse>, Status> {
+        let (reconciled, pruned) = self
+            .driver
+            .reconcile_sandbox_templates(&request.into_inner().templates)
+            .await
+            .map_err(|e| Status::from(openshell_core::ComputeDriverError::from(e)))?;
+        Ok(Response::new(ReconcileSandboxTemplatesResponse {
+            reconciled,
+            pruned,
+        }))
     }
 }
 
@@ -627,5 +661,16 @@ mod tests {
         assert!(!workspace_delete_requires_namespace_access(
             WorkspaceMode::Shared
         ));
+    }
+
+    #[test]
+    fn ambiguous_driver_errors_map_to_unavailable_status() {
+        let status: Status = ComputeDriverError::from(KubernetesDriverError::Unavailable(
+            "create outcome unknown".to_string(),
+        ))
+        .into();
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), "create outcome unknown");
     }
 }

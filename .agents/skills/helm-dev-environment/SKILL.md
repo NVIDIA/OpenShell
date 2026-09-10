@@ -30,12 +30,18 @@ mise run helm:k3s:create
 Creates a k3d cluster and merges its kubeconfig into the worktree-local `kubeconfig` file.
 When the named cluster already exists, the task starts any stopped containers and refreshes
 same-named kubeconfig entries so a recreated load balancer's current API port takes effect.
-Also applies the upstream agent-sandbox CRDs/controller (pinned via `AGENT_SANDBOX_VERSION`
+Also applies the upstream agent-sandbox CRDs/controller and, for v0.5 and later,
+the `SandboxClaim`, `SandboxTemplate`, and `SandboxWarmPool` extension APIs
+(pinned via `AGENT_SANDBOX_VERSION`
 in `tasks/scripts/helm-k3s-local.sh`, fetched from `github.com/kubernetes-sigs/agent-sandbox`
 releases), enables its OTLP tracing on v0.5 and later, installs an OTLP trace
 collector and UI in the `observability` namespace,
 and preloads the default community sandbox image into k3d so the first sandbox create
 does not wait on a large registry pull. Traefik is disabled at cluster creation time.
+
+For a v0.4.x Agent Sandbox release, deploy OpenShell with
+`server.warmPooling.enabled=false`. Verify a warm-capable installation with
+`kubectl api-resources --api-group=extensions.agents.x-k8s.io`.
 
 **Multi-worktree support:** the cluster name is derived from the last component of the
 current git branch (e.g. branch `kube-support/local-dev/tmutch` → cluster
