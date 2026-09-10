@@ -32,9 +32,8 @@ impl BufferMetrics {
     }
 }
 
-/// Sender half of the telemetry buffer. Implements ring-buffer drop semantics:
-/// when the buffer is full, the send still succeeds but the oldest entry is
-/// lost and the drop counter increments.
+/// Sender half of the telemetry buffer. Sends never block: when the buffer
+/// is full, the new item is dropped and the drop counter increments.
 #[derive(Clone)]
 pub struct TelemetrySender {
     tx: mpsc::Sender<TelemetryItem>,

@@ -28,10 +28,11 @@ use openshell_ocsf::{
     SeverityId, StatusId, ocsf_emit,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::StreamExt;
 use tracing::{debug, info, warn};
 
+use crate::otlp::{RelayLifecycle, RelaySetup, export_message};
 use openshell_core::grpc_client;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::transport_errors::is_expected_transport_close_status;
@@ -275,9 +276,12 @@ fn map_session_stream_message<T>(
 /// The task runs for the lifetime of the sandbox process, reconnecting with
 /// exponential backoff on failures.
 ///
-/// `otel_rx` is an optional channel for receiving OTEL export messages from
-/// the relay forwarder. The session drains this channel and forwards the
-/// messages to the gateway.
+/// `relay` describes the OTLP telemetry relay. The session owns it: the
+/// receiver is bound once the gateway confirms the `otel_export` capability,
+/// buffered telemetry is forwarded over the session stream, and
+/// [`SessionHandle::drain_telemetry`] flushes what is left before the
+/// main-process exit is reported.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     endpoint: String,
     sandbox_id: String,
@@ -286,8 +290,9 @@ pub fn spawn(
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     instance_id: String,
-    otel_rx: Option<mpsc::Receiver<SupervisorMessage>>,
-) -> tokio::task::JoinHandle<()> {
+    relay: Option<RelaySetup>,
+) -> SessionHandle {
+    let (drain_tx, drain_rx) = oneshot::channel();
     let config = SessionConfig {
         endpoint,
         sandbox_id,
@@ -296,9 +301,58 @@ pub fn spawn(
         expected_ssh_peer_pid,
         terminating,
         instance_id,
-        otel_rx,
+        relay,
+        drain_rx: Some(drain_rx),
     };
-    tokio::spawn(run_session_loop(config))
+    SessionHandle {
+        task: tokio::spawn(run_session_loop(config)),
+        drain_tx: Some(drain_tx),
+    }
+}
+
+/// Request sent to the session to stop the OTLP receiver and flush buffered
+/// telemetry. Carries the channel the session acks on when done.
+type DrainRequest = oneshot::Sender<()>;
+
+/// Handle to the running session task.
+pub struct SessionHandle {
+    task: tokio::task::JoinHandle<()>,
+    drain_tx: Option<oneshot::Sender<DrainRequest>>,
+}
+
+impl SessionHandle {
+    /// Ask the session to stop the OTLP receiver and flush buffered telemetry
+    /// to the gateway. Returns when the session acks or `deadline` elapses.
+    /// Safe to call more than once; only the first call sends a request.
+    pub async fn drain_telemetry(&mut self, deadline: Duration) {
+        let Some(request_tx) = self.drain_tx.take() else {
+            return;
+        };
+        let (done_tx, done_rx) = oneshot::channel();
+        if request_tx.send(done_tx).is_err() {
+            debug!("OTEL relay drain skipped: session task is gone");
+            return;
+        }
+        if tokio::time::timeout(deadline, done_rx).await.is_err() {
+            warn!(
+                ?deadline,
+                "OTEL relay final drain did not complete within deadline"
+            );
+        }
+    }
+
+    /// Abort the session task.
+    pub fn abort(&self) {
+        self.task.abort();
+    }
+
+    #[cfg(test)]
+    fn for_test(drain_tx: Option<oneshot::Sender<DrainRequest>>) -> Self {
+        Self {
+            task: tokio::spawn(std::future::pending()),
+            drain_tx,
+        }
+    }
 }
 
 struct SessionConfig {
@@ -309,18 +363,23 @@ struct SessionConfig {
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     instance_id: String,
-    otel_rx: Option<mpsc::Receiver<SupervisorMessage>>,
+    relay: Option<RelaySetup>,
+    drain_rx: Option<oneshot::Receiver<DrainRequest>>,
 }
 
 async fn run_session_loop(mut config: SessionConfig) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
-    let mut otel_rx = config.otel_rx.take();
+    // The relay and the pending drain request live here, outside the
+    // reconnect loop, so a bound receiver and its buffer survive gateway
+    // reconnects instead of being re-created per session.
+    let mut relay = RelayLifecycle::new(config.relay.take());
+    let mut drain_rx = config.drain_rx.take();
 
     loop {
         attempt += 1;
 
-        match run_single_session(&config, &mut otel_rx).await {
+        match run_single_session(&config, &mut relay, &mut drain_rx).await {
             Ok(()) => {
                 let event = session_closed_event(
                     openshell_ocsf::ctx::ctx(),
@@ -347,7 +406,8 @@ async fn run_session_loop(mut config: SessionConfig) {
 
 async fn run_single_session(
     config: &SessionConfig,
-    otel_rx: &mut Option<mpsc::Receiver<SupervisorMessage>>,
+    relay: &mut RelayLifecycle,
+    drain_rx: &mut Option<oneshot::Receiver<DrainRequest>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
@@ -395,13 +455,17 @@ async fn run_single_session(
     };
 
     let otel_confirmed = accepted.capabilities.iter().any(|c| c == "otel_export");
-    if otel_confirmed {
-        info!("gateway confirmed otel_export capability; OTLP drain active");
+    let relay_running = relay.ensure_started(otel_confirmed, config.netns_fd).await;
+    // Forwarding is gated per session on the negotiated capability. A running
+    // receiver stays bound if a later session declines; it just stops
+    // forwarding until a session confirms again.
+    let mut otel_active = relay_running && otel_confirmed;
+    if otel_active {
+        info!("gateway confirmed otel_export capability; OTLP forwarding active");
+    } else if relay_running {
+        debug!("gateway did not confirm otel_export; OTLP forwarding paused for this session");
     } else {
-        debug!(
-            "gateway did not confirm otel_export; \
-             OTLP forwarding disabled for this session"
-        );
+        debug!("gateway did not confirm otel_export; OTLP receiver not started");
     }
 
     let heartbeat_secs = accepted.heartbeat_interval_secs.max(5);
@@ -413,7 +477,8 @@ async fn run_single_session(
     );
     ocsf_emit!(event);
 
-    // Main loop: receive gateway messages + send heartbeats + drain OTEL exports.
+    // Main loop: receive gateway messages, send heartbeats, forward OTEL
+    // exports, and service the final telemetry drain request.
     let mut heartbeat_interval =
         tokio::time::interval(Duration::from_secs(u64::from(heartbeat_secs)));
     heartbeat_interval.tick().await; // skip immediate tick
@@ -453,17 +518,31 @@ async fn run_single_session(
                     return Err("outbound channel closed".into());
                 }
             }
-            otel_msg = async {
-                match otel_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
+            item = relay.next_item(), if otel_active => {
+                match item {
+                    Some(item) => {
+                        if tx.try_send(export_message(&config.sandbox_id, item)).is_err() {
+                            debug!("OTEL relay: session channel full or closed, dropping message");
+                        }
+                    }
+                    None => otel_active = false,
+                }
+            }
+            request = async {
+                match drain_rx.as_mut() {
+                    Some(rx) => rx.await,
                     None => std::future::pending().await,
                 }
-            }, if otel_confirmed => {
-                if let Some(msg) = otel_msg {
-                    if tx.try_send(msg).is_err() {
-                        debug!("OTEL relay: session channel full or closed, dropping message");
-                    }
+            } => {
+                // A completed oneshot must not be polled again.
+                *drain_rx = None;
+                otel_active = false;
+                if let Ok(done_tx) = request {
+                    relay.stop_and_drain(&config.sandbox_id, &tx).await;
+                    let _ = done_tx.send(());
                 }
+                // Keep the session up: heartbeats and relays must continue
+                // until the gateway finalizes the main-process exit.
             }
         }
     }
@@ -1185,5 +1264,67 @@ mod ocsf_event_tests {
         };
         assert!(err.to_string().contains("peer PID mismatch"));
         accept_task.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn drain_telemetry_returns_when_session_is_gone() {
+        let (tx, rx) = oneshot::channel::<DrainRequest>();
+        drop(rx);
+        let mut handle = SessionHandle::for_test(Some(tx));
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            handle.drain_telemetry(Duration::from_secs(30)),
+        )
+        .await
+        .expect("returns immediately when the session task is gone");
+    }
+
+    #[tokio::test]
+    async fn drain_telemetry_returns_on_ack() {
+        let (tx, rx) = oneshot::channel::<DrainRequest>();
+        let mut handle = SessionHandle::for_test(Some(tx));
+        tokio::spawn(async move {
+            let done = rx.await.expect("drain request delivered");
+            let _ = done.send(());
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            handle.drain_telemetry(Duration::from_secs(30)),
+        )
+        .await
+        .expect("returns promptly once the session acks");
+    }
+
+    #[tokio::test]
+    async fn drain_telemetry_returns_after_deadline_without_ack() {
+        let (tx, rx) = oneshot::channel::<DrainRequest>();
+        let mut handle = SessionHandle::for_test(Some(tx));
+        // Holds the ack sender without ever using it.
+        let session = tokio::spawn(async move { rx.await.ok() });
+
+        let deadline = Duration::from_millis(200);
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), handle.drain_telemetry(deadline))
+            .await
+            .expect("drain gives up at the deadline");
+        assert!(started.elapsed() >= deadline);
+
+        let ack = session.await.unwrap();
+        assert!(ack.is_some(), "request reached the session");
+
+        // A second call is a no-op: the request was already sent.
+        tokio::time::timeout(
+            Duration::from_millis(10),
+            handle.drain_telemetry(Duration::from_secs(30)),
+        )
+        .await
+        .expect("second drain call returns immediately");
     }
 }

@@ -15,6 +15,7 @@ pub mod identity;
 pub mod log_push;
 pub mod main_session;
 pub mod managed_children;
+pub mod otlp;
 pub mod process;
 pub mod run;
 pub mod sandbox;

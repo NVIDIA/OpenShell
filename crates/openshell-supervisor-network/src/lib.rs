@@ -11,7 +11,6 @@
 pub mod identity;
 pub mod l7;
 pub mod opa;
-pub mod otlp;
 pub(crate) mod policy_dns;
 pub mod policy_local;
 pub mod procfs;

@@ -1059,6 +1059,9 @@ fn confirm_capabilities(advertised: &[String], state: &Arc<ServerState>) -> Vec<
     confirmed
 }
 
+/// Upper bound on a single relayed OCSF event; larger events are skipped.
+const MAX_OCSF_EVENT_SIZE: usize = 256 * 1024;
+
 /// Handle incoming OTEL export data from the supervisor: forward trace data to
 /// the configured OTLP collector and dispatch OCSF events to the log sink.
 fn handle_otel_export(
@@ -1069,39 +1072,33 @@ fn handle_otel_export(
 ) {
     if let Some(openshell_core::proto::otel_export_data::Signal::TraceData(trace_data)) =
         otel_data.signal
+        && !trace_data.is_empty()
+        && let Some(relay_exporter) = state.otel_relay_exporter.as_ref()
     {
-        if !trace_data.is_empty() {
-            if let Some(relay_exporter) = state.otel_relay_exporter.as_ref() {
-                let exporter = relay_exporter.clone();
-                let sandbox_id = sandbox_id.to_string();
-                tokio::spawn(async move {
-                    match tokio::time::timeout(
-                        Duration::from_secs(10),
-                        exporter.export_raw(trace_data),
-                    )
-                    .await
-                    {
-                        Ok(Err(e)) => {
-                            debug!(
-                                sandbox_id = %sandbox_id,
-                                error = %e,
-                                "OTEL relay: failed to export trace data"
-                            );
-                        }
-                        Err(_) => {
-                            debug!(
-                                sandbox_id = %sandbox_id,
-                                "OTEL relay: export timed out"
-                            );
-                        }
-                        Ok(Ok(())) => {}
-                    }
-                });
+        let exporter = relay_exporter.clone();
+        let sandbox_id = sandbox_id.to_string();
+        tokio::spawn(async move {
+            match tokio::time::timeout(Duration::from_secs(10), exporter.export_raw(trace_data))
+                .await
+            {
+                Ok(Err(e)) => {
+                    debug!(
+                        sandbox_id = %sandbox_id,
+                        error = %e,
+                        "OTEL relay: failed to export trace data"
+                    );
+                }
+                Err(_) => {
+                    debug!(
+                        sandbox_id = %sandbox_id,
+                        "OTEL relay: export timed out"
+                    );
+                }
+                Ok(Ok(())) => {}
             }
-        }
+        });
     }
 
-    const MAX_OCSF_EVENT_SIZE: usize = 256 * 1024;
     for ocsf_event in &otel_data.ocsf_events {
         if ocsf_event.len() > MAX_OCSF_EVENT_SIZE {
             debug!(

@@ -39,6 +39,11 @@ use crate::process::{
     ResolvedWorkspace,
 };
 
+/// Bound on the final OTLP telemetry flush that runs after the entrypoint
+/// exits and before its exit is reported. Covers the receiver's graceful
+/// shutdown grace period plus the buffer flush.
+const OTEL_FINAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+
 pub enum SidecarExitReport {
     Exited {
         instance_id: String,
@@ -90,7 +95,7 @@ pub async fn run_process(
         tokio::sync::mpsc::UnboundedSender<DenialEvent>,
     >,
     #[cfg(target_os = "linux")] bypass_activity_tx: Option<ActivitySender>,
-    otel_rx: Option<tokio::sync::mpsc::Receiver<openshell_core::proto::SupervisorMessage>>,
+    otel_relay: Option<crate::otlp::RelaySetup>,
 ) -> Result<i32> {
     // Platform drivers with a resolved numeric UID/GID retain the legacy
     // account-file update. OCI-image identity leaves those environment values
@@ -368,7 +373,7 @@ pub async fn run_process(
     // Spawn the persistent supervisor session if we have a gateway endpoint
     // and sandbox identity. The session provides relay channels for SSH
     // connect and ExecSandbox through the gateway.
-    let supervisor_session_task = if let (Some(endpoint), Some(id), Some(socket)) =
+    let mut supervisor_session_task = if let (Some(endpoint), Some(id), Some(socket)) =
         (openshell_endpoint, sandbox_id, ssh_socket_path.as_ref())
     {
         let task = crate::supervisor_session::spawn(
@@ -379,7 +384,7 @@ pub async fn run_process(
             None,
             Arc::clone(&supervisor_terminating),
             main_instance_id.clone(),
-            otel_rx,
+            otel_relay,
         );
         info!("supervisor session task spawned");
         Some(task)
@@ -454,6 +459,15 @@ pub async fn run_process(
             .message(format!("Process exited with code {rendered_code}"))
             .build()
     );
+
+    // Flush agent telemetry before the exit is reported: reporting hands the
+    // sandbox to the driver for teardown and the gateway closes the session
+    // once the exit is finalized, so this is the last point where buffered
+    // spans can still reach the gateway. Bounded, so a dead gateway cannot
+    // delay the exit report.
+    if let Some(session) = supervisor_session_task.as_mut() {
+        session.drain_telemetry(OTEL_FINAL_DRAIN_TIMEOUT).await;
+    }
 
     if outcome.should_report_main_process_exit() {
         if let Some(tx) = sidecar_exit_tx.as_ref() {

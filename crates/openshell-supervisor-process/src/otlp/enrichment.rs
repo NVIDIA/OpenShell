@@ -211,11 +211,11 @@ mod tests {
             .collect();
         assert_eq!(sandbox_ids.len(), 1, "should have exactly one sandbox.id");
 
-        let sources: Vec<_> = attrs
+        let sources = attrs
             .iter()
             .filter(|a| a.key == "openshell.telemetry.source")
-            .collect();
-        assert_eq!(sources.len(), 1, "should have exactly one telemetry.source");
+            .count();
+        assert_eq!(sources, 1, "should have exactly one telemetry.source");
 
         if let Some(AnyValue {
             value: Some(any_value::Value::StringValue(v)),

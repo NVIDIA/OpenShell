@@ -25,6 +25,7 @@ mod grpc;
 mod http;
 mod middleware;
 mod multiplex;
+pub(crate) mod otel_relay;
 mod otel_tracing;
 mod persistence;
 pub(crate) mod policy_store;
@@ -37,7 +38,6 @@ mod service_routing;
 mod ssh_sessions;
 pub mod supervisor_session;
 mod telemetry;
-pub(crate) mod otel_relay;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 mod tls;
@@ -666,8 +666,7 @@ pub(crate) async fn run_server(
     state.middleware_registry = middleware_registry;
     state.gateway_interceptors = gateway_interceptors;
     state.provider_profile_sources = provider_profile_sources;
-    state.otel_relay_exporter =
-        otel_relay::try_create_exporter(config_file.as_ref()).await;
+    state.otel_relay_exporter = otel_relay::try_create_exporter(config_file.as_ref()).await;
     state.sandbox_jwt_issuer = sandbox_jwt_issuer.clone();
     state.sandbox_jwt_authenticator = sandbox_jwt_authenticator;
     if let Some(issuer) = sandbox_jwt_issuer {

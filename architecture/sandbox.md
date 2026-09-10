@@ -469,9 +469,14 @@ collector without requiring direct egress from the sandbox.
 Agent process --> OTLP HTTP (127.0.0.1:4318) --> Supervisor receiver
   --> Enrichment (sandbox resource attributes)
   --> Bounded buffer (4096 slots, shared traces + OCSF)
-  --> Forwarder --> Session channel (OtelExportData message)
+  --> Supervisor session (OtelExportData message on the session stream)
   --> Gateway --> Dedicated SpanExporter --> External OTLP collector
 ```
+
+The supervisor session owns the relay (`openshell-supervisor-process::otlp`).
+There is no separate forwarder task: the session drains the buffer directly
+into its outbound stream, so the buffer is the only queue between the
+receiver and the gateway.
 
 ### Receiver Binding
 
@@ -479,6 +484,16 @@ The OTLP HTTP receiver binds to `127.0.0.1:4318` only when the relay is
 active (the gateway has `[openshell.gateway.otlp]` configured and confirms
 the `otel_export` capability). When OTLP is not configured, no port is
 bound and no receiver runs.
+
+The bind is lazy: the session binds the receiver on the first
+`SessionAccepted` that confirms the capability and keeps it bound across
+gateway reconnects. The agent process starts before the session handshake
+completes, so an exporter that flushes in that window sees a refused
+connection rather than a silent drop; OTel SDK exporters retry with
+backoff, so those spans land once the port is up. If a later reconnect
+declines the capability, the receiver stays bound and forwarding pauses
+until a session confirms again. A bind failure is logged and disables the
+relay for the rest of the sandbox lifetime.
 
 The bind address depends on the supervisor topology. In all current
 topologies, the process supervisor runs co-located with the agent workload,
@@ -515,10 +530,22 @@ relay is active, the supervisor sets `OTEL_EXPORTER_OTLP_ENDPOINT` and
 
 ### Non-Interference
 
-The buffer uses `try_send` (non-blocking) on the session channel. When the
-buffer reaches capacity, the oldest entries are dropped and a counter records
-each drop. A queue depth gauge tracks buffer pressure. This ensures telemetry
-cannot block or degrade sandbox control operations.
+Both hops are non-blocking. The receiver uses `try_send` into the bounded
+buffer: when the buffer is full, the newest item is dropped and a counter
+records each drop. The session uses `try_send` into its outbound stream and
+drops the message when that stream is backed up. A queue depth gauge tracks
+buffer pressure. This ensures telemetry cannot block or degrade sandbox
+control operations.
+
+### Shutdown
+
+After the entrypoint exits and before the exit is reported to the gateway,
+the supervisor asks the session to stop the receiver and flush the buffer.
+The receiver stops accepting, disables keep-alive on open connections (idle
+ones close immediately), waits up to 2 seconds for in-flight requests, and
+aborts stragglers. The session then pushes whatever is still buffered onto
+the session stream. The whole flush is bounded at 3 seconds so an
+unreachable gateway cannot delay the exit report.
 
 ### OCSF Event Relay
 
