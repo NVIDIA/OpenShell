@@ -1216,7 +1216,9 @@ mod lifecycle_tests {
     use super::*;
     use futures::StreamExt;
     use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
-    use openshell_core::proto::{FilesystemPolicy, SandboxPolicy};
+    use openshell_core::proto::{
+        FilesystemPolicy, MiddlewareEndpointSelector, NetworkMiddlewareConfig, SandboxPolicy,
+    };
     use std::time::Duration;
 
     fn driver_sandbox(id: &str) -> DriverSandbox {
@@ -1740,5 +1742,34 @@ mod lifecycle_tests {
             .expect_err("unmappable policy must fail CreateSandbox synchronously");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
         assert!(backend.get_sandbox("sb-net").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn governed_egress_rejects_network_middleware_before_lifecycle() {
+        let mut config = MxcComputeConfig::default();
+        config.egress_proxy = true;
+        config.egress_proxy_addr = "127.0.0.1:18080".into();
+        let backend = MxcComputeBackend::new_mocked(config);
+
+        let mut policy = fs_policy(&[]);
+        policy.network_middlewares.insert(
+            "redactor".into(),
+            NetworkMiddlewareConfig {
+                name: "redactor".into(),
+                middleware: "openshell/regex".into(),
+                on_error: "fail_closed".into(),
+                endpoints: Some(MiddlewareEndpointSelector {
+                    include: vec!["api.example.com".into()],
+                    exclude: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        );
+        let sandbox = with_policy(driver_sandbox("sb-middleware"), policy);
+
+        let error = backend.create_sandbox(&sandbox).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("network_middlewares"));
+        assert!(backend.get_sandbox("sb-middleware").await.is_none());
     }
 }

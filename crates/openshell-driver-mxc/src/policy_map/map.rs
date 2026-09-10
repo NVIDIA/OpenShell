@@ -21,7 +21,7 @@ use super::config::{
 use super::loss::{LossItem, add_loss};
 
 /// Options controlling the generated MXC config. Fields not relevant to the
-/// coarse map (e.g. `proxy_redirect`) are reserved for the lossless split.
+/// coarse map (e.g. `proxy_redirect`) are reserved for the governed-egress split.
 #[derive(Clone, Debug)]
 pub struct MxcMappingOptions {
     /// MXC schema version written into `version`.
@@ -40,7 +40,7 @@ pub struct MxcMappingOptions {
     pub timeout_ms: u64,
     /// Emit `OpenShell` wildcard hosts into `allowedHosts` despite lossiness.
     pub allow_wildcards: bool,
-    /// Governed-egress redirect address (used by the lossless split, not the
+    /// Governed-egress redirect address (used by the governed-egress split, not the
     /// coarse map).
     pub proxy_redirect: Option<SocketAddr>,
 }
@@ -68,7 +68,7 @@ pub struct MxcMappingResult {
     pub loss: Vec<LossItem>,
 }
 
-/// Result of the lossless split: the MXC config carries filesystem grants and a
+/// Result of the governed-egress split: the MXC config carries filesystem grants and a
 /// proxy redirect; the full network policy is returned unchanged for the
 /// `OpenShell` CONNECT proxy to enforce.
 #[derive(Clone, Debug)]
@@ -95,7 +95,7 @@ pub fn map_to_mxc(policy: &SandboxPolicy, opts: &MxcMappingOptions) -> MxcMappin
     MxcMappingResult { config, loss }
 }
 
-/// Lossless split: map filesystem + containment to MXC, delegate network to the
+/// Governed-egress split: map filesystem + containment to MXC, delegate network to the
 /// `OpenShell` CONNECT proxy.
 ///
 /// The returned [`SplitPolicyResult::mxc_config`] sets `network.proxy` to
@@ -103,7 +103,8 @@ pub fn map_to_mxc(policy: &SandboxPolicy, opts: &MxcMappingOptions) -> MxcMappin
 /// is blocked at the MXC layer and all outbound connections flow through the
 /// proxy. [`SplitPolicyResult::proxy_policy`] carries the original
 /// `network_policies` verbatim; no binary-scope, port, protocol, or wildcard
-/// loss items are generated for the network side.
+/// loss items are generated for those rules. Network middleware is rejected
+/// until the host proxy can receive the gateway middleware service registry.
 ///
 /// Returns `None` if `opts.proxy_redirect` is not set. Use [`map_to_mxc`]
 /// for the standalone coarse path when no proxy is in the loop.
@@ -168,6 +169,19 @@ fn build_split_mxc_config(
             ),
             "governed egress",
             "The host proxy receives the trimmed policy and enforces network rules.",
+        );
+    }
+    if !policy.network_middlewares.is_empty() {
+        add_loss(
+            items,
+            "network_middlewares",
+            "error",
+            &format!(
+                "{} network middleware config(s) cannot be enforced because the MXC host proxy is not connected to the gateway middleware service registry.",
+                policy.network_middlewares.len()
+            ),
+            "network egress middleware",
+            "The MXC sandbox is rejected before launch instead of bypassing fail-open middleware or failing unrelated allowed traffic.",
         );
     }
 

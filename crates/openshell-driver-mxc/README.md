@@ -21,6 +21,7 @@ readiness; there is no in-sandbox supervisor or `ConnectSupervisor` relay.
 | Filesystem policy (read-write / read-only grants) | ✅ provision-time AppContainer shares | — |
 | Governed egress (CONNECT proxy + OPA + L7) | Available behind `egress_proxy` on `process_container`; the driver starts a per-sandbox host CONNECT proxy, generates HTTPS MITM trust material, and injects the CA bundle into the sandbox process env | Gateway event-bus wiring follow-on |
 | Network policy | Split into MXC `network.proxy` + trimmed OpenShell policy on `process_container`; `isolation_session` still rejects network config | MXC feedback item M1 for persistent sessions |
+| Network middleware | ❌ rejected before launch because the MXC host proxy does not receive the gateway middleware registry | Gateway middleware-registry injection |
 | Process policy (seccomp, uid/gid) | ❌ host-side governance design; OS isolation only | not pursued |
 | Interactive exec/connect/forward | ❌ exec runs in-driver, no client attach | gateway interactive-exec surgery (follow-on) |
 | Bundled agent image | ❌ no OCI image; relies on Windows host install | — |
@@ -120,9 +121,11 @@ or MXC-specific gateway composition variant.
 When `egress_proxy` is enabled, `EmbeddedPolicyMapper` uses `split_policy`
 instead: MXC receives filesystem grants plus a loopback `network.proxy`
 redirect, and the driver starts a host CONNECT proxy from the trimmed
-network-only `SandboxPolicy`. The proxy uses the configured agent command as
-the static sandbox process identity because MXC does not expose Linux-style
-procfs socket ownership. For HTTPS L7 inspection, the host proxy generates a
+network-only `SandboxPolicy`. Policies containing `network_middlewares` are
+rejected synchronously until this host-proxy path can receive the gateway's
+built-in and remote middleware registry. The proxy uses the configured agent
+command as the static sandbox process identity because MXC does not expose
+Linux-style procfs socket ownership. For HTTPS L7 inspection, the host proxy generates a
 per-sandbox CA and injects `NODE_EXTRA_CA_CERTS`, `DENO_CERT`, `SSL_CERT_FILE`,
 `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and `GIT_SSL_CAINFO` into the agent
 process env. It does not add the generated CA directory to MXC read-only grants:

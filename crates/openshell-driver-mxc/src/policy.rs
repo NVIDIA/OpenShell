@@ -189,7 +189,9 @@ impl PolicyMapper for EmbeddedPolicyMapper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::FilesystemPolicy;
+    use openshell_core::proto::{
+        FilesystemPolicy, MiddlewareEndpointSelector, NetworkMiddlewareConfig,
+    };
 
     fn demo_ctx() -> MapCtx {
         MapCtx {
@@ -290,5 +292,36 @@ mod tests {
         assert_eq!(trimmed.version, policy.version);
         assert_eq!(trimmed.network_policies, policy.network_policies);
         assert!(trimmed.filesystem.is_none());
+    }
+
+    #[test]
+    fn embedded_rejects_network_middleware_on_egress_proxy() {
+        let mapper = EmbeddedPolicyMapper;
+        let mut policy = fs_policy(&["C:/work/demo"], &[]);
+        policy.network_middlewares.insert(
+            "redactor".into(),
+            NetworkMiddlewareConfig {
+                name: "redactor".into(),
+                middleware: "openshell/regex".into(),
+                on_error: "fail_closed".into(),
+                endpoints: Some(MiddlewareEndpointSelector {
+                    include: vec!["api.example.com".into()],
+                    exclude: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        );
+        let ctx = MapCtx {
+            sandbox_id: "sb-egress-middleware".into(),
+            egress: Some("127.0.0.1:18080".parse().unwrap()),
+        };
+
+        let error = mapper.map(Some(&policy), &ctx).unwrap_err();
+        let MapError::Unsupported(loss) = error else {
+            panic!("expected unsupported middleware error");
+        };
+        assert_eq!(loss.len(), 1);
+        assert_eq!(loss[0].rule_kind, "network_middlewares");
+        assert!(loss[0].detail.contains("middleware service registry"));
     }
 }

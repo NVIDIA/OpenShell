@@ -86,6 +86,12 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
             config.bind_addr
         ));
     }
+    if !config.policy.network_middlewares.is_empty() {
+        return Err(miette::miette!(
+            "host proxy cannot enforce network_middlewares without a middleware service registry; refusing to start with {} configured middleware(s)",
+            config.policy.network_middlewares.len()
+        ));
+    }
 
     let engine = Arc::new(OpaEngine::from_proto(&config.policy)?);
     let (_workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
@@ -221,7 +227,9 @@ mod tests {
     use std::time::Duration;
 
     use openshell_core::proposals::AgentProposals;
-    use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
+    use openshell_core::proto::{
+        MiddlewareEndpointSelector, NetworkMiddlewareConfig, SandboxPolicy as ProtoSandboxPolicy,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
@@ -260,6 +268,37 @@ mod tests {
         assert!(
             err.to_string().contains("loopback-only"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_middleware_policy_without_registry() {
+        let mut config = test_config(
+            ([127, 0, 0, 1], 0).into(),
+            PathBuf::from("missing-agent.exe"),
+        );
+        config.policy.network_middlewares.insert(
+            "redactor".into(),
+            NetworkMiddlewareConfig {
+                name: "redactor".into(),
+                middleware: "openshell/regex".into(),
+                on_error: "fail_closed".into(),
+                endpoints: Some(MiddlewareEndpointSelector {
+                    include: vec!["api.example.com".into()],
+                    exclude: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        );
+
+        let Err(error) = start_host_proxy(config).await else {
+            panic!("host proxy must reject middleware without a registry");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("cannot enforce network_middlewares"),
+            "unexpected error: {error}"
         );
     }
 
