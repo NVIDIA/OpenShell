@@ -47,6 +47,7 @@ openshell-policy = { path = "../openshell-policy" }
 # base64 and serde_json are already [dependencies] but dev-dependency resolution
 # is independent; explicit entries make them visible to integration tests.
 base64 = { workspace = true }
+rustls = { workspace = true }
 serde_json = { workspace = true }
 # Used by the drift guard test (handled_fields_inventory) to parse YAML into a
 # generic serde_json::Value for key enumeration.

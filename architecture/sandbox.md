@@ -49,6 +49,9 @@ OpenShell uses overlapping controls rather than a single sandbox primitive:
 
 The supervisor may enrich baseline filesystem allowances for runtime-required
 paths, such as proxy support files or GPU device paths when a GPU is present.
+These internal allowances must stay sandbox-scoped and avoid exposing host
+secrets. For example, MXC governed egress grants the generated public CA bundle
+while the ephemeral CA private key remains in the host proxy's memory.
 
 ## Network and Provider Access
 

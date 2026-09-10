@@ -4175,6 +4175,7 @@ dependencies = [
  "openshell-ocsf",
  "openshell-policy",
  "openshell-supervisor-network",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",

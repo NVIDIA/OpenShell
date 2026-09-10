@@ -127,11 +127,14 @@ per-sandbox CA and injects `NODE_EXTRA_CA_CERTS`, `DENO_CERT`, `SSL_CERT_FILE`,
 `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and `GIT_SSL_CAINFO` into the agent
 process env. It does not add the generated CA directory to MXC read-only grants:
 released `wxc-exec` BaseContainer builds require `WRITE_DAC` on every such
-grant and reject the user-owned proxy temp directory. The driver seeds only
-`SYSTEMROOT`, `WINDIR`, `PATH`, `COMSPEC`, and `LOCALAPPDATA` from the gateway
-host before applying sandbox and TLS overrides, so required Windows bootstrap
-values remain available without exposing the gateway's full environment. The
-development export surface remains the
+grant and reject the user-owned proxy temp directory. Instead, the driver adds
+the sandbox-unique directory as an internal read-write share so HTTPS clients
+can read the injected paths. The directory contains only public CA certificates;
+the ephemeral CA private key remains in the host proxy's memory. The driver
+seeds only `SYSTEMROOT`, `WINDIR`, `PATH`, `COMSPEC`, and `LOCALAPPDATA` from the
+gateway host before applying sandbox and TLS overrides, so required Windows
+bootstrap values remain available without exposing the gateway's full
+environment. The development export surface remains the
 [`policy-to-mxc`](examples/policy-to-mxc.rs) example; there is no production
 `openshell policy export-mxc` subcommand yet.
 
@@ -156,7 +159,7 @@ exits 0 rather than failing.
 
 | Task | What it runs | When to use |
 |---|---|---|
-| `windows:test:mxc-real:x64` | `tests/wxc_exec_real.rs` — Tier-2 invoker tests with `--ignored --test-threads=1` | Pre-merge on any Windows host that has `wxc-exec`; dry-run tests always pass; enforcement tests probe-gate themselves |
+| `windows:test:mxc-real:x64` | `tests/wxc_exec_real.rs` — Tier-2 invoker tests with `--ignored --test-threads=1`, including an HTTPS request through the host proxy | Pre-merge on any Windows host that has `wxc-exec`; dry-run tests always pass; enforcement tests probe-gate themselves |
 | `windows:e2e:mxc` | `examples/run-mxc-e2e.ps1` — Tier-3 scenario runner, real binary, probe-gated | Demo box / nightly; needs the gateway + CLI binaries in the script directory |
 | `windows:e2e:mxc:mock` | Same runner with `-Mock` — wiring-only, no real `wxc-exec` needed | Any Windows host (CI, dev machine); validates wiring and the network-reject scenario |
 
