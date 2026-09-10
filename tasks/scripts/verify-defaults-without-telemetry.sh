@@ -32,7 +32,7 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 2
 fi
 
-metadata=$(cargo metadata --locked --no-deps --format-version 1)
+metadata=$(cargo metadata --no-deps --format-version 1)
 
 failed=0
 for crate in "${CRATES[@]}"; do
@@ -71,7 +71,7 @@ done
 # host, and a check that failed for an unrelated reason would make this guard
 # silently vacuous.
 for crate in "${CRATES[@]}"; do
-  output=$(cargo check --locked -p "$crate" --features defaults-without-telemetry 2>&1 || true)
+  output=$(cargo check -p "$crate" --features defaults-without-telemetry 2>&1 || true)
 
   if grep -qF "features \`telemetry\` and \`defaults-without-telemetry\` are mutually exclusive" <<<"$output"; then
     echo "OK: $crate rejects 'telemetry' + 'defaults-without-telemetry'"

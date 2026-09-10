@@ -46,7 +46,9 @@ Run Rust tests only:
 mise run test:rust     # cargo test --workspace
 ```
 
-Run `mise run rust:lockfiles:check` to validate every tracked Cargo lockfile against its adjacent manifest. This check also runs through `lint`, including `mise run pre-commit` and `mise run ci`. It resolves dependency metadata without compiling, but may download uncached dependencies. Cargo diagnostics explain whether a failure requires refreshing a lockfile or resolving another problem, such as registry access. To refresh a stale lockfile, run `cargo metadata --format-version 1 --manifest-path path/to/Cargo.toml > /dev/null` with the adjacent manifest, review and commit the lockfile changes, then rerun `mise run pre-commit`.
+Run `mise run rust:lockfiles:check` to validate every tracked Cargo lockfile against its adjacent manifest. Local Rust lint, check, and test tasks depend on this guard, so it finishes before those Cargo commands start, including through pre-commit and local CI. It resolves dependency metadata without compiling, but may download uncached dependencies. Cargo diagnostics explain whether a failure requires refreshing a lockfile or resolving another problem, such as registry access. To refresh a stale lockfile, run `cargo metadata --format-version 1 --manifest-path path/to/Cargo.toml > /dev/null` with the adjacent manifest, review and commit the lockfile changes, then rerun `mise run pre-commit`.
+
+Each Rust CI job ends with lockfile validation and `git diff --exit-code HEAD -- ':(glob)**/Cargo.lock'`. This rejects tracked lockfile changes made during validation, even when the Cargo commands themselves succeed. The final step also runs after earlier failures. Ordinary build and test commands do not need `--locked`; the metadata guard is the single explicit use for this policy.
 
 ## Python Unit Tests
 

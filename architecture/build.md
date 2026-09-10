@@ -517,9 +517,11 @@ Published docs live in `docs/`, and Fern site configuration lives in `fern/`. Se
 Rust lint tasks and branch checks run Clippy with warnings denied for the
 workspace, E2E crate, and the standalone governance-interceptor and
 supervisor-middleware-content-guard examples, including all Cargo targets.
-The lint task also validates every tracked Cargo lockfile, so pre-commit
-and local CI catch stale resolutions in standalone workspaces. Rust validation
-commands use `--locked` to prevent implicit lockfile updates.
+Local Rust lint, check, and test tasks validate every tracked Cargo lockfile
+before running, including when invoked through pre-commit or local CI.
+Each Rust branch-check job finishes by validating the lockfiles and comparing
+them with the checked-out commit. Any tracked lockfile change fails the job,
+including changes made by Cargo commands that completed successfully.
 
 - Run `mise run pre-commit` before committing.
 - Run `mise run test` after code changes.
