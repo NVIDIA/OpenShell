@@ -31,9 +31,14 @@
 #![cfg(target_os = "windows")]
 
 use base64::Engine as _;
-use openshell_core::proto::{FilesystemPolicy, SandboxPolicy};
+use openshell_core::proto::compute::v1::{DriverSandbox, DriverSandboxSpec, DriverSandboxTemplate};
+use openshell_core::proto::{
+    FilesystemPolicy, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
+};
+use openshell_driver_mxc::{MxcComputeBackend, MxcComputeConfig};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 // ── Path resolution ──────────────────────────────────────────────────────────
 
@@ -415,6 +420,58 @@ fn probe_processcontainer(wxc: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+/// Probe the released binary's live `network.proxy` support separately from
+/// ordinary ProcessContainer support. Some builds accept the proxy JSON during
+/// `--dry-run` but return `ERROR_INVALID_PARAMETER` from the live launcher.
+fn probe_processcontainer_proxy(wxc: &PathBuf) -> Result<(), String> {
+    let (_tempdir, temp_path) = temp_fixture();
+    let proxy_listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|error| format!("failed to reserve proxy probe port: {error}"))?;
+    let proxy_port = proxy_listener
+        .local_addr()
+        .map_err(|error| format!("failed to read proxy probe port: {error}"))?
+        .port();
+    let config = serde_json::json!({
+        "version": "0.6.0-alpha",
+        "containerId": "probe-pc-proxy",
+        "containment": "processcontainer",
+        "process": {
+            "commandLine": "C:\\Windows\\System32\\cmd.exe /c exit 0",
+            "cwd": temp_path,
+            "timeout": 30_000,
+        },
+        "filesystem": {
+            "readwritePaths": [temp_path],
+        },
+        "processContainer": {
+            "leastPrivilege": false,
+        },
+        "network": {
+            "defaultPolicy": "block",
+            "proxy": { "localhost": proxy_port },
+        },
+    });
+
+    let json = serde_json::to_string(&config).unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+    let output = Command::new(wxc)
+        .arg("--config-base64")
+        .arg(&b64)
+        .output()
+        .map_err(|error| format!("wxc-exec proxy probe failed to spawn: {error}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "live network.proxy probe returned exit {}: stdout={} stderr={}",
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    ))
+}
+
 /// Probe the isolation_session backend.
 ///
 /// Attempts a `provision` phase. Returns `Ok(sandbox_id)` when live, or
@@ -607,6 +664,158 @@ fn pc_oneshot_in_policy_write_succeeds() {
     assert!(
         target.exists(),
         "in-policy write: file should exist at {target_str}\nstdout={stdout}\nstderr={stderr}"
+    );
+}
+
+/// Run an HTTPS request through the real driver and ProcessContainer. The
+/// workload explicitly reads the injected bundle before curl uses it, proving
+/// that the driver's internal TLS share is reachable from the AppContainer.
+#[tokio::test]
+#[ignore = "requires real wxc-exec and outbound HTTPS"]
+async fn pc_https_egress_reads_injected_ca_bundle() {
+    let Some(wxc) = wxc_path() else {
+        eprintln!("SKIP: wxc-exec not found");
+        return;
+    };
+
+    if let Err(reason) = probe_processcontainer(&wxc) {
+        eprintln!("SKIP: processcontainer not live: {reason}");
+        return;
+    }
+    if let Err(reason) = probe_processcontainer_proxy(&wxc) {
+        eprintln!("SKIP: processcontainer network.proxy not live: {reason}");
+        return;
+    }
+
+    let system_root = std::env::var("SYSTEMROOT").expect("SYSTEMROOT must be set on Windows");
+    let cmd = PathBuf::from(&system_root).join("System32").join("cmd.exe");
+    let curl = PathBuf::from(system_root).join("System32").join("curl.exe");
+    if !curl.exists() {
+        eprintln!("SKIP: Windows curl.exe not found at {}", curl.display());
+        return;
+    }
+
+    let output_dir = tempfile::tempdir().expect("HTTPS output directory");
+    let output_path = output_dir.path().join("example.html");
+    let certificate_path = output_dir.path().join("peer-certificate.txt");
+    let output_dir_string = output_dir.path().to_string_lossy().into_owned();
+    let output_path_string = output_path.to_string_lossy().into_owned();
+    let certificate_path_string = certificate_path.to_string_lossy().into_owned();
+    let cmd_string = cmd.to_string_lossy().into_owned();
+    let script = format!(
+        "type \"%CURL_CA_BUNDLE%\" 1>NUL && \
+         \"{}\" --fail --silent --show-error --cacert \"%CURL_CA_BUNDLE%\" \
+         https://example.com/ --output \"{output_path_string}\" \
+         --write-out \"%{{certs}}\" 1>\"{certificate_path_string}\"",
+        curl.display()
+    );
+    let command = vec![
+        cmd_string.clone(),
+        "/d".to_string(),
+        "/c".to_string(),
+        script,
+    ];
+    let serde_json::Value::Object(driver_config) = serde_json::json!({
+        "command": command,
+        "cwd": output_dir_string,
+    }) else {
+        unreachable!();
+    };
+
+    let policy = SandboxPolicy {
+        version: 1,
+        filesystem: Some(FilesystemPolicy {
+            include_workdir: false,
+            read_only: Vec::new(),
+            read_write: vec![output_dir_string],
+        }),
+        network_policies: std::collections::HashMap::from([(
+            "https_example".to_string(),
+            NetworkPolicyRule {
+                name: "https-example".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "example.com".to_string(),
+                    ports: vec![443],
+                    protocol: "rest".to_string(),
+                    tls: "terminate".to_string(),
+                    enforcement: "enforce".to_string(),
+                    access: "read-only".to_string(),
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: cmd_string,
+                    ..Default::default()
+                }],
+            },
+        )]),
+        ..Default::default()
+    };
+    let sandbox = DriverSandbox {
+        id: "pc-https-ca".to_string(),
+        name: "pc-https-ca".to_string(),
+        spec: Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(
+                    openshell_core::proto_struct::json_object_to_struct(driver_config)
+                        .expect("driver config"),
+                ),
+                ..Default::default()
+            }),
+            policy: Some(policy),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let config = MxcComputeConfig {
+        wxc_exec_path: wxc.to_string_lossy().into_owned(),
+        egress_proxy: true,
+        egress_proxy_addr: "127.0.0.1:18080".to_string(),
+        ..Default::default()
+    };
+    let backend = MxcComputeBackend::new(config);
+    backend
+        .create_sandbox(&sandbox)
+        .await
+        .expect("real HTTPS sandbox create accepted");
+
+    let mut terminal_condition = None;
+    for _ in 0..600 {
+        if let Some(observed) = backend.get_sandbox("pc-https-ca").await
+            && let Some(condition) = observed
+                .status
+                .and_then(|status| status.conditions.into_iter().find(|c| c.r#type == "Ready"))
+            && matches!(
+                condition.reason.as_str(),
+                "AgentCompleted" | "ExecFailed" | "ProvisionFailed"
+            )
+        {
+            terminal_condition = Some(condition);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let condition = terminal_condition.expect("HTTPS sandbox should reach a terminal condition");
+    assert_eq!(
+        condition.reason, "AgentCompleted",
+        "HTTPS workload failed: {}",
+        condition.message
+    );
+    assert!(output_path.exists(), "curl should write the HTTPS response");
+    assert!(
+        std::fs::metadata(&output_path)
+            .expect("HTTPS response metadata")
+            .len()
+            > 0,
+        "HTTPS response should not be empty"
+    );
+    let peer_certificate =
+        std::fs::read_to_string(certificate_path).expect("curl peer certificate output");
+    assert!(
+        peer_certificate.contains("OpenShell Sandbox CA"),
+        "HTTPS response must use a certificate issued by the host proxy CA"
     );
 }
 

@@ -384,6 +384,25 @@ fn append_tls_env_vars(env: &mut Vec<String>, ca_paths: Option<&(PathBuf, PathBu
     ]);
 }
 
+fn append_tls_readwrite_grant(
+    readwrite_paths: &mut Vec<String>,
+    ca_paths: Option<&(PathBuf, PathBuf)>,
+) {
+    let Some((ca_cert_path, _)) = ca_paths else {
+        return;
+    };
+    let Some(dir) = ca_cert_path.parent() else {
+        return;
+    };
+    let dir = dir.display().to_string();
+    if !readwrite_paths
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&dir))
+    {
+        readwrite_paths.push(dir);
+    }
+}
+
 impl MxcComputeBackend {
     pub fn new(config: MxcComputeConfig) -> Self {
         let invoker = WxcExecInvoker::new(&config.wxc_exec_path, config.debug);
@@ -858,13 +877,17 @@ async fn run_lifecycle(
         ));
     }
 
-    // Do not add the generated TLS directory to readonly_paths. Released
-    // wxc-exec BaseContainer builds require WRITE_DAC on every read-only grant;
-    // the user-owned proxy temp directory otherwise makes sandbox launch fail.
-    // CA paths remain available through the TLS trust environment variables.
+    // Released wxc-exec BaseContainer builds cannot provision the generated
+    // TLS directory as a read-only share because that path fails its WRITE_DAC
+    // setup. Grant the sandbox-unique directory read-write instead so the
+    // AppContainer can actually read the injected trust paths. The directory
+    // contains only public CA certificates; the CA private key remains in the
+    // host proxy's in-memory TLS state.
+    let mut readwrite_paths = mapped.readwrite_paths;
+    append_tls_readwrite_grant(&mut readwrite_paths, host_proxy_ca_paths.as_ref());
     let readonly_paths = mapped.readonly_paths;
     let filesystem = MxcFilesystem {
-        readwrite_paths: mapped.readwrite_paths,
+        readwrite_paths,
         readonly_paths,
         // OpenShell's policy model has no explicit deny field; default-deny is
         // implicit and enforced by processContainer at the OS boundary.
@@ -1341,6 +1364,19 @@ mod lifecycle_tests {
         assert!(env.contains(&format!("REQUESTS_CA_BUNDLE={bundle_path}")));
         assert!(env.contains(&format!("CURL_CA_BUNDLE={bundle_path}")));
         assert!(env.contains(&format!("GIT_SSL_CAINFO={bundle_path}")));
+    }
+
+    #[test]
+    fn tls_readwrite_grant_adds_ca_directory_once() {
+        let tls_dir = std::env::temp_dir().join("openshell-mxc-tls-test");
+        let ca_cert = tls_dir.join("openshell-ca.pem");
+        let bundle = tls_dir.join("ca-bundle.pem");
+        let existing = tls_dir.display().to_string().to_ascii_lowercase();
+        let mut readwrite = vec![existing.clone()];
+
+        append_tls_readwrite_grant(&mut readwrite, Some(&(ca_cert, bundle)));
+
+        assert_eq!(readwrite, vec![existing]);
     }
 
     #[test]
