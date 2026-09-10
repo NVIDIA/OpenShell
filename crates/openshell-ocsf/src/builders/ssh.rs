@@ -3,7 +3,7 @@
 
 //! Builder for SSH Activity [4007] events.
 
-use crate::builders::SandboxContext;
+use crate::builders::EventContext;
 use crate::enums::{ActionId, ActivityId, AuthTypeId, DispositionId, SeverityId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{OcsfEvent, SshActivityEvent};
@@ -11,7 +11,7 @@ use crate::objects::{Actor, Endpoint};
 
 /// Builder for SSH Activity [4007] events.
 pub struct SshActivityBuilder<'a> {
-    ctx: &'a SandboxContext,
+    ctx: &'a EventContext,
     activity: ActivityId,
     action: Option<ActionId>,
     disposition: Option<DispositionId>,
@@ -28,7 +28,7 @@ pub struct SshActivityBuilder<'a> {
 
 impl<'a> SshActivityBuilder<'a> {
     #[must_use]
-    pub fn new(ctx: &'a SandboxContext) -> Self {
+    pub fn new(ctx: &'a EventContext) -> Self {
         Self {
             ctx,
             activity: ActivityId::Unknown,

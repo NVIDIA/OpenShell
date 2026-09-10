@@ -60,7 +60,7 @@ use openshell_core::{
     settings::{self, SettingValueKind},
 };
 use openshell_ocsf::{
-    ConfigStateChangeBuilder, OCSF_TARGET, OcsfEvent, SandboxContext, SeverityId, StateId, StatusId,
+    ConfigStateChangeBuilder, EventContext, OCSF_TARGET, OcsfEvent, SeverityId, StateId, StatusId,
 };
 use openshell_policy::{
     PolicyMergeOp, ProviderPolicyLayer, canonicalize_advisor_add_rule, compose_effective_policy,
@@ -234,7 +234,7 @@ fn build_gateway_policy_audit_message(
     policy_hash: &str,
     extra_fields: &[(&str, String)],
 ) -> String {
-    let ctx = SandboxContext {
+    let ctx = EventContext {
         sandbox_id: sandbox_id.to_string(),
         sandbox_name: sandbox_name.to_string(),
         container_image: "openshell/gateway".to_string(),

@@ -1149,10 +1149,10 @@ pub(crate) async fn websocket_middleware_preflight(
 
 /// Build the WebSocket preflight input from the sandbox and evaluation
 /// contexts. Kept separate from `websocket_middleware_preflight` (and taking an
-/// explicit `SandboxContext`) so the identifier copy is unit-testable with a
+/// explicit `EventContext`) so the identifier copy is unit-testable with a
 /// real sandbox name, mirroring `middleware_request_input` on the HTTP path.
 fn websocket_preflight_input(
-    sandbox: &openshell_ocsf::SandboxContext,
+    sandbox: &openshell_ocsf::EventContext,
     ctx: &L7EvalContext,
     req: &crate::l7::provider::L7Request,
     scheme: &str,
@@ -3022,7 +3022,7 @@ mod tests {
 
     #[test]
     fn websocket_preflight_input_carries_real_sandbox_name() {
-        let sandbox = openshell_ocsf::SandboxContext {
+        let sandbox = openshell_ocsf::EventContext {
             sandbox_id: "sbx-123".into(),
             sandbox_name: "nightly-build".into(),
             container_image: String::new(),
