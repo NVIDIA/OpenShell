@@ -821,6 +821,40 @@ pub async fn sync_policy_and_fetch_snapshot(
     fetch_settings_snapshot_with_client(&mut client, sandbox_id).await
 }
 
+/// Report an exact runtime configuration generation. Pending registration uses
+/// the snapshot's instance fence; retain that snapshot across registration retries.
+pub async fn report_sandbox_configuration(
+    endpoint: &str,
+    sandbox_id: &str,
+    instance_id: &str,
+    snapshot: Option<&SettingsPollResult>,
+    state: crate::proto::ConfigurationAdmissionState,
+    error: &str,
+) -> Result<()> {
+    let mut client = connect(endpoint).await?;
+    client
+        .report_sandbox_configuration(crate::proto::ReportSandboxConfigurationRequest {
+            sandbox_id: sandbox_id.to_string(),
+            expected_instance_id: snapshot.map_or_else(String::new, |snapshot| {
+                snapshot.configuration_instance_id.clone()
+            }),
+            admission: Some(crate::proto::SandboxConfigurationAdmission {
+                instance_id: instance_id.to_string(),
+                state: state.into(),
+                policy_version: snapshot.map_or(0, |snapshot| snapshot.version),
+                policy_hash: snapshot
+                    .map_or_else(String::new, |snapshot| snapshot.policy_hash.clone()),
+                config_revision: snapshot.map_or(0, |snapshot| snapshot.config_revision),
+                provider_env_revision: snapshot
+                    .map_or(0, |snapshot| snapshot.provider_env_revision),
+                error: error.to_string(),
+            }),
+        })
+        .await
+        .into_diagnostic()?;
+    Ok(())
+}
+
 /// Fetch provider environment variables for a sandbox from `OpenShell` server via gRPC.
 ///
 /// Returns a map of environment variable names to values derived from provider
@@ -919,6 +953,9 @@ pub struct CachedOpenShellClient {
 /// Settings poll result returned by [`CachedOpenShellClient::poll_settings`].
 #[derive(Clone, Debug)]
 pub struct SettingsPollResult {
+    pub configuration_instance_id: String,
+    pub configuration_admitted: bool,
+    pub configuration_error: String,
     pub policy: Option<ProtoSandboxPolicy>,
     pub version: u32,
     pub policy_hash: String,
@@ -940,6 +977,9 @@ pub struct SettingsPollResult {
 
 fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> SettingsPollResult {
     SettingsPollResult {
+        configuration_instance_id: inner.configuration_instance_id,
+        configuration_admitted: inner.configuration_admitted,
+        configuration_error: inner.configuration_error,
         policy: inner.policy,
         version: inner.version,
         policy_hash: inner.policy_hash,

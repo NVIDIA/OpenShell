@@ -1837,8 +1837,15 @@ type GetSandboxConfigResponse struct {
 	// False also covers older gateways that do not advertise this capability;
 	// supervisors preserve their legacy unauthenticated connection behavior.
 	ExtensionAuthenticationEnabled bool `protobuf:"varint,12,opt,name=extension_authentication_enabled,json=extensionAuthenticationEnabled,proto3" json:"extension_authentication_enabled,omitempty"`
-	unknownFields                  protoimpl.UnknownFields
-	sizeCache                      protoimpl.SizeCache
+	// True only after validating this complete policy/provider composition.
+	// Missing (older gateway) is deliberately not admission.
+	ConfigurationAdmitted bool `protobuf:"varint,13,opt,name=configuration_admitted,json=configurationAdmitted,proto3" json:"configuration_admitted,omitempty"`
+	// Bounded, credential-free admission diagnostic. Empty for admitted policy.
+	ConfigurationError string `protobuf:"bytes,14,opt,name=configuration_error,json=configurationError,proto3" json:"configuration_error,omitempty"`
+	// Registration fence for a new supervisor; capture once and retain on retry.
+	ConfigurationInstanceId string `protobuf:"bytes,15,opt,name=configuration_instance_id,json=configurationInstanceId,proto3" json:"configuration_instance_id,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *GetSandboxConfigResponse) Reset() {
@@ -1953,6 +1960,27 @@ func (x *GetSandboxConfigResponse) GetExtensionAuthenticationEnabled() bool {
 		return x.ExtensionAuthenticationEnabled
 	}
 	return false
+}
+
+func (x *GetSandboxConfigResponse) GetConfigurationAdmitted() bool {
+	if x != nil {
+		return x.ConfigurationAdmitted
+	}
+	return false
+}
+
+func (x *GetSandboxConfigResponse) GetConfigurationError() string {
+	if x != nil {
+		return x.ConfigurationError
+	}
+	return ""
+}
+
+func (x *GetSandboxConfigResponse) GetConfigurationInstanceId() string {
+	if x != nil {
+		return x.ConfigurationInstanceId
+	}
+	return ""
 }
 
 // Connection details for one operator-registered supervisor middleware service.
@@ -2220,7 +2248,7 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x05value\"\x86\x01\n" +
 	"\x10EffectiveSetting\x128\n" +
 	"\x05value\x18\x01 \x01(\v2\".openshell.sandbox.v1.SettingValueR\x05value\x128\n" +
-	"\x05scope\x18\x02 \x01(\x0e2\".openshell.sandbox.v1.SettingScopeR\x05scope\"\xd1\x06\n" +
+	"\x05scope\x18\x02 \x01(\x0e2\".openshell.sandbox.v1.SettingScopeR\x05scope\"\xf5\a\n" +
 	"\x18GetSandboxConfigResponse\x12;\n" +
 	"\x06policy\x18\x01 \x01(\v2#.openshell.sandbox.v1.SandboxPolicyR\x06policy\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\rR\aversion\x12\x1f\n" +
@@ -2235,7 +2263,10 @@ const file_sandbox_proto_rawDesc = "" +
 	"\tworkspace\x18\n" +
 	" \x01(\tR\tworkspace\x12C\n" +
 	"\x1epolicy_validation_failure_mode\x18\v \x01(\tR\x1bpolicyValidationFailureMode\x12H\n" +
-	" extension_authentication_enabled\x18\f \x01(\bR\x1eextensionAuthenticationEnabled\x1ac\n" +
+	" extension_authentication_enabled\x18\f \x01(\bR\x1eextensionAuthenticationEnabled\x125\n" +
+	"\x16configuration_admitted\x18\r \x01(\bR\x15configurationAdmitted\x12/\n" +
+	"\x13configuration_error\x18\x0e \x01(\tR\x12configurationError\x12:\n" +
+	"\x19configuration_instance_id\x18\x0f \x01(\tR\x17configurationInstanceId\x1ac\n" +
 	"\rSettingsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
 	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\x99\x02\n" +

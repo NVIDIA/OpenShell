@@ -128,6 +128,9 @@ mod tests {
         assert!(!is_user_callable(
             "/openshell.v1.OpenShell/ReportPolicyStatus"
         ));
+        assert!(!is_user_callable(
+            "/openshell.v1.OpenShell/ReportSandboxConfiguration"
+        ));
         assert!(!is_user_callable("/openshell.v1.OpenShell/PushSandboxLogs"));
         assert!(!is_user_callable(
             "/openshell.v1.OpenShell/GetSandboxProviderEnvironment"

@@ -114,6 +114,25 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 		})
 	}
 	result.ExitCode = CopyInt32Ptr(status.ExitCode)
+	if admission := status.GetConfigurationAdmission(); admission != nil {
+		state := types.ConfigurationAdmissionUnknown
+		switch admission.GetState() {
+		case pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_PENDING:
+			state = types.ConfigurationAdmissionPending
+		case pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_ACCEPTED:
+			state = types.ConfigurationAdmissionAccepted
+		case pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_REJECTED:
+			state = types.ConfigurationAdmissionRejected
+		}
+		result.ConfigurationAdmission = &types.SandboxConfigurationAdmission{
+			State:               state,
+			PolicyVersion:       admission.GetPolicyVersion(),
+			PolicyHash:          admission.GetPolicyHash(),
+			ConfigRevision:      admission.GetConfigRevision(),
+			ProviderEnvRevision: admission.GetProviderEnvRevision(),
+			Error:               admission.GetError(),
+		}
+	}
 
 	return result
 }

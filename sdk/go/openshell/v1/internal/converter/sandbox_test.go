@@ -18,6 +18,33 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
+func TestSandboxConfigurationAdmissionFromProto(t *testing.T) {
+	for _, tc := range []struct {
+		wire pb.ConfigurationAdmissionState
+		want v1.ConfigurationAdmissionState
+	}{
+		{pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_PENDING, v1.ConfigurationAdmissionPending},
+		{pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_ACCEPTED, v1.ConfigurationAdmissionAccepted},
+		{pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_REJECTED, v1.ConfigurationAdmissionRejected},
+		{pb.ConfigurationAdmissionState(99), v1.ConfigurationAdmissionUnknown},
+	} {
+		t.Run(string(tc.want), func(t *testing.T) {
+			wire := &pb.SandboxStatus{ConfigurationAdmission: &pb.SandboxConfigurationAdmission{
+				State: tc.wire, PolicyVersion: 4, PolicyHash: "hash", ConfigRevision: 5,
+				ProviderEnvRevision: 6, Error: "invalid endpoint",
+			}}
+			got := sandboxStatusFromProto(wire)
+			assert.Equal(t, &v1.SandboxConfigurationAdmission{
+				State: tc.want, PolicyVersion: 4, PolicyHash: "hash", ConfigRevision: 5,
+				ProviderEnvRevision: 6, Error: "invalid endpoint",
+			}, got.ConfigurationAdmission)
+			wire.ConfigurationAdmission.Error = "changed"
+			assert.Equal(t, "invalid endpoint", got.ConfigurationAdmission.Error)
+		})
+	}
+	assert.Nil(t, sandboxStatusFromProto(&pb.SandboxStatus{}).ConfigurationAdmission)
+}
+
 func TestSandboxFromProto(t *testing.T) {
 	userNS := true
 	gpuCount := uint32(2)

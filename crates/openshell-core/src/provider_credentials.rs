@@ -572,6 +572,62 @@ impl ProviderCredentialState {
         Ok(inner.current.child_env.len())
     }
 
+    /// Install a validated candidate without repeating fallible compilation.
+    ///
+    /// Existing clones keep observing this live state. Preserve suppressed
+    /// environment keys and identity history so refresh cannot restore removed
+    /// keys or authorize old placeholders for a different provider. Callers
+    /// must serialize installs and revocations, as for bound-environment installs.
+    pub fn install_prepared(&self, prepared: &Self) -> usize {
+        // Release the candidate lock before taking the live lock, including
+        // when a caller passes another handle to the same state.
+        let (snapshot, generations, current_resolver, bindings, non_secret_keys) = {
+            let candidate = prepared
+                .inner
+                .read()
+                .expect("provider credential state poisoned");
+            (
+                (*candidate.current).clone(),
+                candidate.generations.clone(),
+                candidate.current_resolver.clone(),
+                candidate.static_credential_bindings.clone(),
+                candidate.non_secret_environment_keys.clone(),
+            )
+        };
+        let mut inner = self
+            .inner
+            .write()
+            .expect("provider credential state poisoned");
+        let mut snapshot = snapshot;
+        for key in &inner.suppressed_keys {
+            snapshot.child_env.remove(key);
+        }
+        if static_credential_identities(&inner.static_credential_bindings)
+            != static_credential_identities(&bindings)
+        {
+            inner.generations.clear();
+        }
+        inner.generations.extend(generations);
+        while inner.generations.len() > MAX_RETAINED_CREDENTIAL_GENERATIONS {
+            inner.generations.pop_front();
+        }
+        inner.current_resolver = current_resolver;
+        inner.combined_resolver =
+            merge_resolvers(&inner.generations, inner.current_resolver.as_ref());
+        inner
+            .known_static_credential_keys
+            .extend(bindings.keys().cloned());
+        update_static_credential_identity_epochs(
+            &mut inner.static_credential_identity_epochs,
+            snapshot.revision,
+            &bindings,
+        );
+        inner.static_credential_bindings = bindings;
+        inner.non_secret_environment_keys = non_secret_keys;
+        inner.current = Arc::new(snapshot);
+        inner.current.child_env.len()
+    }
+
     /// Atomically remove static provider material after a failed refresh.
     ///
     /// Dynamic token grants retain their independently endpoint-bound state
@@ -2053,6 +2109,67 @@ mod tests {
             Some("openshell:resolve:env:v2_GOOGLE_CLOUD_PROJECT"),
             "a reserved GCP name classified as a bound credential must stay placeholderized"
         );
+    }
+
+    #[test]
+    fn prepared_install_retains_placeholders_for_same_provider_identity() {
+        let make_state = |revision, secret: &str| {
+            ProviderCredentialState::from_bound_environment(
+                revision,
+                HashMap::from([("API_KEY".to_string(), secret.to_string())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([(
+                    "API_KEY".to_string(),
+                    binding("api.example.com", 443, "/**"),
+                )]),
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        let live = make_state(1, "first-secret");
+        let old_placeholder = live.snapshot().child_env["API_KEY"].clone();
+        live.install_prepared(&make_state(2, "second-secret"));
+        let resolver = live
+            .resolver_for_endpoint("api.example.com", 443, "/")
+            .unwrap();
+        assert_eq!(
+            resolver.resolve_placeholder(&old_placeholder),
+            Some("first-secret")
+        );
+        assert_eq!(
+            resolver.resolve_placeholder(&live.snapshot().child_env["API_KEY"]),
+            Some("second-secret"),
+        );
+    }
+
+    #[test]
+    fn prepared_install_preserves_suppression_and_rejects_replaced_identity() {
+        let make_state = |revision, identity: &str, secret: &str| {
+            let mut binding = binding("api.example.com", 443, "/**");
+            binding.credential_identity = identity.to_string();
+            ProviderCredentialState::from_bound_environment(
+                revision,
+                HashMap::from([("API_KEY".to_string(), secret.to_string())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([("API_KEY".to_string(), binding)]),
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        let live = make_state(1, "first:API_KEY", "first-secret");
+        let observer = live.clone();
+        let old_placeholder = live.snapshot().child_env["API_KEY"].clone();
+        live.remove_env_key("API_KEY");
+        let candidate = make_state(2, "second:API_KEY", "second-secret");
+        live.install_prepared(&candidate);
+        assert_eq!(observer.snapshot().revision, 2);
+        assert!(!observer.snapshot().child_env.contains_key("API_KEY"));
+        let resolver = observer
+            .resolver_for_endpoint("api.example.com", 443, "/")
+            .unwrap();
+        assert!(resolver.resolve_placeholder(&old_placeholder).is_none());
     }
 
     #[test]

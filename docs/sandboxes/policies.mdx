@@ -241,6 +241,29 @@ The following steps outline the hot-reload policy update workflow.
 
 ### Validation failures
 
+Before starting a workload, OpenShell validates its effective policy together
+with attached provider rules and credential bindings. An image policy can be
+valid alone and fail after composition, for example when an L4-only endpoint
+overlaps a credentialed provider that requires L7 inspection.
+
+When startup validation fails, the sandbox stays in `Provisioning` with a
+`ConfigurationInvalid` readiness condition. Its workload has not started. Inspect
+the condition with `openshell sandbox get <name>`, then submit a complete repaired
+policy or detach the conflicting provider:
+
+```shell
+openshell policy set <name> --policy repaired-policy.yaml --wait
+openshell sandbox provider detach <name> <provider>
+```
+
+These are alternative repairs; choose the one that matches the intended access.
+The supervisor starts the workload after the repaired configuration passes
+validation. You can replace static policy fields while startup is blocked;
+after activation, the usual static-field restrictions apply. Images without an
+embedded policy use the restrictive baseline and gain network access only from
+operator-selected configuration. Explicit user/global policy precedence remains
+unchanged.
+
 OpenShell validates a complete candidate policy before activating any part of it. Endpoints may overlap when their connection and request-processing metadata agree. For example, two `api.example.com:443` REST entries can contribute different allow and deny rules when they use the same TLS, destination, credential, parser, and enforcement settings. A plain L4 endpoint may overlap an L7 endpoint because it authorizes the destination without contributing request-processing metadata. A more-specific path endpoint may override request-processing metadata from a broader endpoint, such as a `/graphql` GraphQL endpoint alongside a general REST endpoint for the same host. OpenShell rejects the candidate when overlapping exact or wildcard host selectors can both contribute equally specific endpoint configuration and disagree on those fields.
 
 Internal policy-advisor provenance does not make otherwise compatible endpoints ambiguous. This lets an advisor proposal extend a provider-covered host without modifying the provider rule. TLS, destination IP constraints, credential handling, protocol, parser, and equally specific enforcement settings must still agree.
@@ -275,7 +298,7 @@ Operators that explicitly prioritize availability can retain the previous genera
 policy_validation_failure_mode = "retain_last_valid"
 ```
 
-In `retain_last_valid` mode, the rejected candidate remains inactive and the previous valid generation remains active. If no previous valid generation exists, such as during initial startup, OpenShell still fails closed. Restart the gateway after changing `gateway.toml`; connected sandbox supervisors receive the configured posture from the restarted gateway. Individual sandboxes cannot override it.
+In `retain_last_valid` mode, the rejected candidate remains inactive and the previous valid generation remains active. During initial startup, a rejected configuration keeps the workload unstarted in either mode. Restart the gateway after changing `gateway.toml`; connected sandbox supervisors receive the configured posture from the restarted gateway. Individual sandboxes cannot override it.
 
 OCSF configuration and finding events identify the rejected candidate, validation rationale, configured and effective modes, active generation, and whether the previous policy is active. When `retain_last_valid` is configured without a previous valid generation, the effective mode remains `fail_closed`. Connection denials during quarantine include the validation failure as their policy denial rationale.
 
