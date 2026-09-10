@@ -1347,13 +1347,20 @@ pub async fn provider_list(
         .await
         .into_diagnostic()?;
     let response = response.into_inner();
-    crate::output::print_next_page_token(&response.next_page_token);
+    let next_page_token = response.next_page_token;
     let providers = response.providers;
 
     // Handle structured output formats (json, yaml)
-    if crate::output::print_output_collection(output, &providers, provider_to_json)? {
+    if crate::output::print_paginated_output_collection(
+        output,
+        "providers",
+        &providers,
+        &next_page_token,
+        provider_to_json,
+    )? {
         return Ok(());
     }
+    crate::output::print_next_page_token(&next_page_token);
 
     if providers.is_empty() {
         if !names_only {

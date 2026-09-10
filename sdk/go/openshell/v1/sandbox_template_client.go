@@ -71,7 +71,7 @@ func (s *sandboxTemplateClient) list(ctx context.Context, req *pb.ListSandboxTem
 		req.LabelSelector = opts[0].LabelSelector
 	}
 
-	var templates []*SandboxWorkloadTemplate
+	templates := make([]*SandboxWorkloadTemplate, 0)
 	for {
 		resp, err := s.client.ListSandboxTemplates(ctx, req)
 		if err != nil {

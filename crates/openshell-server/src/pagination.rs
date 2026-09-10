@@ -220,4 +220,26 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn token_rejects_malformed_and_unsupported_versions() {
+        let malformed = Pagination::new(10, "not+base64", "sandboxes", &["default"])
+            .expect_err("malformed tokens must be rejected");
+        assert_eq!(malformed.code(), tonic::Code::InvalidArgument);
+
+        let unsupported = URL_SAFE_NO_PAD.encode(
+            PageToken {
+                version: TOKEN_VERSION + 1,
+                method: "sandboxes".to_string(),
+                request_fingerprint: fingerprint(&["default"]),
+                cursor: Some(Cursor::Profile(ProfileCursor {
+                    key: "profile".to_string(),
+                })),
+            }
+            .encode_to_vec(),
+        );
+        let error = Pagination::new(10, &unsupported, "sandboxes", &["default"])
+            .expect_err("unsupported token versions must be rejected");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
 }

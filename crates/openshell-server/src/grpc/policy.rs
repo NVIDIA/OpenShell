@@ -102,6 +102,7 @@ const GLOBAL_SETTINGS_OBJECT_TYPE: &str = "gateway_settings";
 const GLOBAL_SETTINGS_NAME: &str = "global";
 /// Internal object type for durable sandbox-scoped settings.
 pub const SANDBOX_SETTINGS_OBJECT_TYPE: &str = "sandbox_settings";
+const PROVIDER_COMPOSITION_VALIDATION_PAGE_SIZE: u32 = 1000;
 /// Reserved settings key used to store global policy payload.
 const POLICY_SETTING_KEY: &str = "policy";
 /// Sentinel `sandbox_id` used to store global policy revisions.
@@ -2097,43 +2098,50 @@ async fn validate_provider_composition_for_existing_sandboxes(
     state: &ServerState,
 ) -> Result<(), Status> {
     let mut catalogs = HashMap::<String, EffectiveProviderProfileCatalog>::new();
-    let sandboxes: Vec<Sandbox> = state
-        .store
-        .collect_messages(ObjectListQuery::AllWorkspaces)
-        .await
-        .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+    let mut cursor = None;
+    loop {
+        let page = state
+            .store
+            .list_message_page::<Sandbox>(
+                ObjectListQuery::AllWorkspaces,
+                cursor.as_ref(),
+                PROVIDER_COMPOSITION_VALIDATION_PAGE_SIZE,
+            )
+            .await
+            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
 
-    for sandbox in sandboxes {
-        let provider_names = sandbox
-            .spec
-            .as_ref()
-            .map(|spec| spec.providers.as_slice())
-            .unwrap_or_default();
-        if provider_names.is_empty() {
-            continue;
-        }
+        for sandbox in page.messages {
+            let provider_names = sandbox
+                .spec
+                .as_ref()
+                .map(|spec| spec.providers.as_slice())
+                .unwrap_or_default();
+            if provider_names.is_empty() {
+                continue;
+            }
 
-        let workspace = sandbox.object_workspace().to_string();
-        if !catalogs.contains_key(&workspace) {
-            let catalog = state
-                .provider_profile_sources
-                .snapshot_catalog(state.store.as_ref(), &workspace)
-                .await?;
-            catalogs.insert(workspace.clone(), catalog);
-        }
-        let catalog = catalogs
-            .get(&workspace)
-            .expect("catalog was inserted for sandbox workspace");
-        let base_policy = current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
-        let provider_layers = provider_policy_context_with_catalog(
-            state.store.as_ref(),
-            catalog,
-            &workspace,
-            provider_names,
-        )
-        .await?
-        .layers;
-        validate_candidate_effective_policy(&base_policy, &provider_layers).map_err(|error| {
+            let workspace = sandbox.object_workspace().to_string();
+            if !catalogs.contains_key(&workspace) {
+                let catalog = state
+                    .provider_profile_sources
+                    .snapshot_catalog(state.store.as_ref(), &workspace)
+                    .await?;
+                catalogs.insert(workspace.clone(), catalog);
+            }
+            let catalog = catalogs
+                .get(&workspace)
+                .expect("catalog was inserted for sandbox workspace");
+            let base_policy =
+                current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
+            let provider_layers = provider_policy_context_with_catalog(
+                state.store.as_ref(),
+                catalog,
+                &workspace,
+                provider_names,
+            )
+            .await?
+            .layers;
+            validate_candidate_effective_policy(&base_policy, &provider_layers).map_err(|error| {
                 Status::failed_precondition(format!(
                     "cannot activate provider policy composition: sandbox '{}/{}' has an invalid effective policy: {}",
                     workspace,
@@ -2141,9 +2149,13 @@ async fn validate_provider_composition_for_existing_sandboxes(
                     error.message()
                 ))
             })?;
-    }
+        }
 
-    Ok(())
+        let Some(next_cursor) = page.next_cursor else {
+            return Ok(());
+        };
+        cursor = Some(next_cursor);
+    }
 }
 
 pub async fn validate_provider_composition_startup_preflight(
@@ -7275,6 +7287,101 @@ mod tests {
         decode_policy_from_global_settings(&settings)
             .expect("test global policy must decode")
             .expect("test global policy must be present")
+    }
+
+    #[tokio::test]
+    async fn list_sandbox_policies_traverses_multiple_pages_exactly_once() {
+        let state = test_server_state().await;
+        let policy = ProtoSandboxPolicy::default();
+        let payload = policy.encode_to_vec();
+        for version in 1..=7 {
+            state
+                .store
+                .put_policy_revision(
+                    &format!("global-policy-{version}"),
+                    GLOBAL_POLICY_SANDBOX_ID,
+                    "",
+                    version,
+                    &payload,
+                    &format!("hash-{version}"),
+                )
+                .await
+                .expect("store policy revision");
+        }
+
+        let mut versions = Vec::new();
+        let mut page_token = String::new();
+        let mut page_size = 2;
+        loop {
+            let page = handle_list_sandbox_policies(
+                &state,
+                authed_request(ListSandboxPoliciesRequest {
+                    page_size,
+                    page_token,
+                    global: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            versions.extend(page.revisions.into_iter().map(|revision| revision.version));
+            if page.next_page_token.is_empty() {
+                break;
+            }
+            page_token = page.next_page_token;
+            page_size = 3;
+        }
+
+        assert_eq!(versions, vec![7, 6, 5, 4, 3, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn list_sandbox_policies_rejects_token_from_different_filter() {
+        let state = test_server_state().await;
+        let policy = ProtoSandboxPolicy::default();
+        let payload = policy.encode_to_vec();
+        for version in 1..=2 {
+            state
+                .store
+                .put_policy_revision(
+                    &format!("global-policy-{version}"),
+                    GLOBAL_POLICY_SANDBOX_ID,
+                    "",
+                    version,
+                    &payload,
+                    &format!("hash-{version}"),
+                )
+                .await
+                .expect("store policy revision");
+        }
+        let first = handle_list_sandbox_policies(
+            &state,
+            authed_request(ListSandboxPoliciesRequest {
+                page_size: 1,
+                global: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(!first.next_page_token.is_empty());
+
+        let error = handle_list_sandbox_policies(
+            &state,
+            authed_request(ListSandboxPoliciesRequest {
+                page_size: 1,
+                page_token: first.next_page_token,
+                global: true,
+                workspace: "different".to_string(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), Code::InvalidArgument);
     }
 
     #[tokio::test]

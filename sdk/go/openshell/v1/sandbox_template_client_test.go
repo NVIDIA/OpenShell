@@ -256,3 +256,15 @@ func TestSandboxTemplateList_RejectsNegativePagination(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, IsInvalidArgument(err))
 }
+
+func TestSandboxTemplateList_EmptyReturnsNonNilSlice(t *testing.T) {
+	mock := newMockSandboxTemplateServer()
+	client, cleanup := setupSandboxTemplateTest(t, mock)
+	defer cleanup()
+
+	templates, err := client.List(context.Background(), "default")
+
+	require.NoError(t, err)
+	assert.NotNil(t, templates)
+	assert.Empty(t, templates)
+}

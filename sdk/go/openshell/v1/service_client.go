@@ -64,7 +64,7 @@ func (s *serviceClient) list(ctx context.Context, req *pb.ListServicesRequest, o
 	}
 	req.PageSize = pageSize
 
-	var endpoints []*ServiceEndpoint
+	endpoints := make([]*ServiceEndpoint, 0)
 	for {
 		resp, err := s.client.ListServices(ctx, req)
 		if err != nil {

@@ -542,6 +542,13 @@ The token wire format is a private shared protobuf used only by the gateway.
 Public request and response messages repeat the standard AIP fields directly
 instead of wrapping them in a shared pagination message.
 
+The CLI returns paginated JSON and YAML as response-shaped envelopes containing
+the resource collection and `next_page_token`; table output reports a non-empty
+token on stderr. The TUI traverses complete workspace, provider, profile, and
+sandbox collections in one cancellable background refresh task, never overlaps
+periodic list refreshes, and discards results after a gateway or workspace
+change.
+
 Persistence distinguishes one-page operations from exhaustive scans.
 `list_object_page` and `list_message_page` return one keyset page and its next
 cursor. `collect_records` and `collect_messages` exhaust those pages, fail on

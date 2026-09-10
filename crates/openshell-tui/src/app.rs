@@ -599,6 +599,10 @@ pub struct App {
     pub all_workspaces: bool,
     pub workspace_names: Vec<String>,
     pub pending_workspace_refresh: bool,
+    /// Monotonic identity for the active background list refresh.
+    pub list_refresh_generation: u64,
+    /// Active list refresh task. New ticks do not overlap this task.
+    pub list_refresh_handle: Option<tokio::task::JoinHandle<()>>,
 
     // Provider list
     pub provider_profiles: Vec<openshell_core::proto::ProviderProfile>,
@@ -981,6 +985,8 @@ impl App {
             all_workspaces: false,
             workspace_names: Vec::new(),
             pending_workspace_refresh: false,
+            list_refresh_generation: 0,
+            list_refresh_handle: None,
             provider_profiles: Vec::new(),
             provider_entries: Vec::new(),
             provider_names: Vec::new(),
@@ -3479,6 +3485,14 @@ impl App {
         }
     }
 
+    /// Cancel any in-flight collection refresh and invalidate queued results.
+    pub fn cancel_list_refresh(&mut self) {
+        if let Some(handle) = self.list_refresh_handle.take() {
+            handle.abort();
+        }
+        self.list_refresh_generation = self.list_refresh_generation.wrapping_add(1);
+    }
+
     /// Stop the animation ticker if running.
     pub fn stop_anim(&mut self) {
         if let Some(h) = self.anim_handle.take() {
@@ -3490,6 +3504,7 @@ impl App {
     pub fn reset_sandbox_state(&mut self) {
         self.stop_anim();
         self.cancel_log_stream();
+        self.cancel_list_refresh();
         self.sandbox_ids.clear();
         self.sandbox_names.clear();
         self.sandbox_phases.clear();

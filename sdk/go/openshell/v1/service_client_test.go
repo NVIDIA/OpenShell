@@ -251,6 +251,7 @@ func TestServiceList_Empty(t *testing.T) {
 	endpoints, err := client.List(context.Background(), "default", "web-app")
 
 	require.NoError(t, err)
+	assert.NotNil(t, endpoints)
 	assert.Empty(t, endpoints)
 }
 

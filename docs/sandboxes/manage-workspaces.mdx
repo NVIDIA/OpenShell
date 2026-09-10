@@ -126,7 +126,9 @@ openshell workspace member remove \
 
 Add `--output json` or `--output yaml` to list membership records for
 automation. Each record contains `subject` and a normalized `role` of `admin`,
-`user`, or `unknown`. An empty result is an empty collection.
+`user`, or `unknown`. Structured output is an envelope with `members` and
+`next_page_token` fields; pass the returned token to `--page-token` to
+continue. An empty result has an empty `members` collection.
 
 To change a member's role, remove the existing membership and add it again
 with the new role. A Platform Admin must perform any change to `admin`.

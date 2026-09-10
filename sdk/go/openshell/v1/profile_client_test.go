@@ -233,6 +233,7 @@ func TestProfileList_Empty(t *testing.T) {
 	profiles, err := client.List(context.Background(), "default")
 
 	require.NoError(t, err)
+	assert.NotNil(t, profiles)
 	assert.Empty(t, profiles)
 }
 

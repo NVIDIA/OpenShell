@@ -73,7 +73,7 @@ func (p *providerClient) list(ctx context.Context, req *pb.ListProvidersRequest,
 	}
 	req.PageSize = pageSize
 
-	var providers []*Provider
+	providers := make([]*Provider, 0)
 	for {
 		resp, err := p.client.ListProviders(ctx, req)
 		if err != nil {

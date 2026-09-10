@@ -2259,12 +2259,19 @@ pub async fn sandbox_list(
         .into_diagnostic()?;
 
     let response = response.into_inner();
-    crate::output::print_next_page_token(&response.next_page_token);
+    let next_page_token = response.next_page_token;
     let sandboxes = response.sandboxes;
 
-    if crate::output::print_output_collection(output, &sandboxes, sandbox_to_json)? {
+    if crate::output::print_paginated_output_collection(
+        output,
+        "sandboxes",
+        &sandboxes,
+        &next_page_token,
+        sandbox_to_json,
+    )? {
         return Ok(());
     }
+    crate::output::print_next_page_token(&next_page_token);
 
     if sandboxes.is_empty() {
         if !ids_only && !names_only {
@@ -2613,12 +2620,19 @@ pub async fn sandbox_template_list(
         .await
         .into_diagnostic()?;
     let response = response.into_inner();
-    crate::output::print_next_page_token(&response.next_page_token);
+    let next_page_token = response.next_page_token;
     let templates = response.templates;
 
-    if crate::output::print_output_collection(output, &templates, sandbox_template_to_json)? {
+    if crate::output::print_paginated_output_collection(
+        output,
+        "templates",
+        &templates,
+        &next_page_token,
+        sandbox_template_to_json,
+    )? {
         return Ok(());
     }
+    crate::output::print_next_page_token(&next_page_token);
 
     if templates.is_empty() {
         if !names_only {
@@ -3314,15 +3328,22 @@ pub async fn service_list(
         .map_err(|status| service_status_error("list services", "sandbox:read", status))?
         .into_inner();
 
-    crate::output::print_next_page_token(&response.next_page_token);
+    let next_page_token = response.next_page_token.clone();
     let services = response
         .services
         .iter()
         .filter_map(|response| service_endpoint_to_json(response, server))
         .collect::<Vec<_>>();
-    if crate::output::print_output_collection(output, &services, Clone::clone)? {
+    if crate::output::print_paginated_output_collection(
+        output,
+        "services",
+        &services,
+        &next_page_token,
+        Clone::clone,
+    )? {
         return Ok(());
     }
+    crate::output::print_next_page_token(&next_page_token);
 
     if response.services.is_empty() {
         if let Some(sandbox) = sandbox {
@@ -3677,12 +3698,19 @@ pub async fn workspace_list(
         .await
         .into_diagnostic()?;
     let response = response.into_inner();
-    crate::output::print_next_page_token(&response.next_page_token);
+    let next_page_token = response.next_page_token;
     let workspaces = response.workspaces;
 
-    if crate::output::print_output_collection(output, &workspaces, workspace_to_json)? {
+    if crate::output::print_paginated_output_collection(
+        output,
+        "workspaces",
+        &workspaces,
+        &next_page_token,
+        workspace_to_json,
+    )? {
         return Ok(());
     }
+    crate::output::print_next_page_token(&next_page_token);
 
     if workspaces.is_empty() {
         println!("No workspaces found.");
@@ -3849,12 +3877,19 @@ pub async fn workspace_member_list(
         .await
         .into_diagnostic()?;
     let response = response.into_inner();
-    crate::output::print_next_page_token(&response.next_page_token);
+    let next_page_token = response.next_page_token;
     let members = response.members;
 
-    if crate::output::print_output_collection(output, &members, workspace_member_to_json)? {
+    if crate::output::print_paginated_output_collection(
+        output,
+        "members",
+        &members,
+        &next_page_token,
+        workspace_member_to_json,
+    )? {
         return Ok(());
     }
+    crate::output::print_next_page_token(&next_page_token);
 
     if members.is_empty() {
         println!("No members found in workspace {workspace}.");
@@ -5200,12 +5235,19 @@ pub async fn sandbox_policy_list(
         .into_diagnostic()?;
 
     let resp = resp.into_inner();
-    crate::output::print_next_page_token(&resp.next_page_token);
+    let next_page_token = resp.next_page_token;
     let revisions = resp.revisions;
     let structured = policy_revision_list_json("sandbox", Some(name), &revisions)?;
-    if crate::output::print_output_collection(output, &structured, Clone::clone)? {
+    if crate::output::print_paginated_output_collection(
+        output,
+        "revisions",
+        &structured,
+        &next_page_token,
+        Clone::clone,
+    )? {
         return Ok(());
     }
+    crate::output::print_next_page_token(&next_page_token);
 
     if revisions.is_empty() {
         eprintln!("No policy history found for sandbox '{name}'");
@@ -5238,12 +5280,19 @@ pub async fn sandbox_policy_list_global(
         .into_diagnostic()?;
 
     let resp = resp.into_inner();
-    crate::output::print_next_page_token(&resp.next_page_token);
+    let next_page_token = resp.next_page_token;
     let revisions = resp.revisions;
     let structured = policy_revision_list_json("global", None, &revisions)?;
-    if crate::output::print_output_collection(output, &structured, Clone::clone)? {
+    if crate::output::print_paginated_output_collection(
+        output,
+        "revisions",
+        &structured,
+        &next_page_token,
+        Clone::clone,
+    )? {
         return Ok(());
     }
+    crate::output::print_next_page_token(&next_page_token);
 
     if revisions.is_empty() {
         eprintln!("No global policy history found");

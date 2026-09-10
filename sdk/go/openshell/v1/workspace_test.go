@@ -249,6 +249,18 @@ func TestWorkspaceList_WithOptions(t *testing.T) {
 	assert.Equal(t, "team=platform", mock.lastListReq.GetLabelSelector())
 }
 
+func TestWorkspaceList_EmptyReturnsNonNilSlice(t *testing.T) {
+	mock := &mockWorkspaceServer{listResp: &pb.ListWorkspacesResponse{}}
+	conn, cleanup := newMockWorkspaceServer(mock)
+	defer cleanup()
+
+	workspaces, err := newWorkspaceClient(conn).List(context.Background())
+
+	require.NoError(t, err)
+	assert.NotNil(t, workspaces)
+	assert.Empty(t, workspaces)
+}
+
 func TestWorkspaceDelete_Success(t *testing.T) {
 	mock := &mockWorkspaceServer{
 		deleteResp: &pb.DeleteWorkspaceResponse{Deleted: true},
@@ -449,6 +461,20 @@ func TestListMembers_EmptyWorkspace(t *testing.T) {
 
 	require.Error(t, err)
 	assert.True(t, IsInvalidArgument(err))
+}
+
+func TestListMembers_EmptyResultReturnsNonNilSlice(t *testing.T) {
+	mock := &mockWorkspaceServer{
+		listMembersResp: &pb.ListWorkspaceMembersResponse{},
+	}
+	conn, cleanup := newMockWorkspaceServer(mock)
+	defer cleanup()
+
+	members, err := newWorkspaceClient(conn).ListMembers(context.Background(), "test-ws")
+
+	require.NoError(t, err)
+	assert.NotNil(t, members)
+	assert.Empty(t, members)
 }
 
 func TestListMembers_WithOptions(t *testing.T) {

@@ -5911,6 +5911,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_provider_profiles_traverses_multiple_pages_exactly_once() {
+        let state = test_server_state().await;
+        let all = handle_list_provider_profiles(
+            &state,
+            authed_request(ListProviderProfilesRequest {
+                page_size: 100,
+                page_token: String::new(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .profiles;
+
+        let mut listed = Vec::new();
+        let mut page_token = String::new();
+        let mut page_size = 2;
+        loop {
+            let page = handle_list_provider_profiles(
+                &state,
+                authed_request(ListProviderProfilesRequest {
+                    page_size,
+                    page_token,
+                    workspace: "default".to_string(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            listed.extend(page.profiles);
+            if page.next_page_token.is_empty() {
+                break;
+            }
+            page_token = page.next_page_token;
+            page_size = 3;
+        }
+
+        assert_eq!(
+            listed.iter().map(|profile| &profile.id).collect::<Vec<_>>(),
+            all.iter().map(|profile| &profile.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_provider_profiles_rejects_token_from_different_workspace_filter() {
+        let state = test_server_state().await;
+        let first = handle_list_provider_profiles(
+            &state,
+            authed_request(ListProviderProfilesRequest {
+                page_size: 1,
+                page_token: String::new(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(!first.next_page_token.is_empty());
+
+        let error = handle_list_provider_profiles(
+            &state,
+            authed_request(ListProviderProfilesRequest {
+                page_size: 1,
+                page_token: first.next_page_token,
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
     async fn get_provider_profile_returns_profile_or_not_found() {
         let state = test_server_state().await;
         let github = handle_get_provider_profile(

@@ -119,7 +119,7 @@ func (s *sandboxClient) list(ctx context.Context, req *pb.ListSandboxesRequest, 
 		req.LabelSelector = opts[0].LabelSelector
 	}
 
-	var sandboxes []*Sandbox
+	sandboxes := make([]*Sandbox, 0)
 	for {
 		resp, err := s.client.ListSandboxes(ctx, req)
 		if err != nil {

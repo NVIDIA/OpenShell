@@ -262,6 +262,10 @@ Use `--all-workspaces` with `sandbox template list` when you need an admin view 
 openshell sandbox template list --all-workspaces
 ```
 
+For JSON or YAML, template list output contains `templates` and
+`next_page_token` fields. Pass the returned token to `--page-token` to
+continue.
+
 ## Base Sandbox Container
 
 The `base` sandbox container is the default runtime image for standard OpenShell sandboxes unless the gateway overrides its default sandbox image. It is published as `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` and maintained in the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) repository.
@@ -465,9 +469,10 @@ openshell service list --output json
 openshell service list my-sandbox --output yaml
 ```
 
-Each record contains `workspace`, `sandbox`, `service`, `target_port`, and
-`url`. The unnamed service uses an empty `service` string. An empty result is
-an empty collection.
+Structured list output contains `services` and `next_page_token` fields. Each
+record contains `workspace`, `sandbox`, `service`, `target_port`, and `url`.
+The unnamed service uses an empty `service` string. Pass the returned token to
+`--page-token` to continue. An empty result has an empty `services` collection.
 
 Show or delete one endpoint:
 
@@ -507,6 +512,9 @@ Use `-o json` or `-o yaml` for machine-readable output:
 openshell sandbox list -o json
 openshell sandbox list -o yaml
 ```
+
+Structured list output contains `sandboxes` and `next_page_token` fields.
+Pass the returned token to `--page-token` to continue.
 
 Get detailed information about a specific sandbox. The output lists **Policy source** (`sandbox` or `global`), **Revision** (the active policy’s row version for that source), and the formatted active policy YAML:
 

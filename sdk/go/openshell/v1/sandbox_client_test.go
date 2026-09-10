@@ -433,6 +433,7 @@ func TestSandboxList_Empty(t *testing.T) {
 	result, err := client.List(context.Background(), "default")
 
 	require.NoError(t, err)
+	assert.NotNil(t, result)
 	assert.Empty(t, result)
 }
 

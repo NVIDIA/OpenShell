@@ -28,7 +28,7 @@ func (p *profileClient) List(ctx context.Context, workspace string, opts ...List
 		Workspace: workspace,
 		PageSize:  pageSize,
 	}
-	var profiles []*ProviderProfile
+	profiles := make([]*ProviderProfile, 0)
 	for {
 		resp, err := p.client.ListProviderProfiles(ctx, req)
 		if err != nil {

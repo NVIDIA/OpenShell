@@ -22,6 +22,12 @@ struct SandboxListEntry {
     phase: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct SandboxListPage {
+    sandboxes: Vec<SandboxListEntry>,
+    next_page_token: String,
+}
+
 /// Certify status -> create -> list Ready -> exec -> delete -> list empty.
 pub const SMOKE_SCENARIO: Scenario = Scenario {
     name: "smoke",
@@ -185,10 +191,11 @@ async fn find_sandbox(
             .map_err(|error| error.to_string())?;
         result.require_success()?;
 
-        let sandboxes = result
-            .json::<Vec<SandboxListEntry>>()
+        let response = result
+            .json::<SandboxListPage>()
             .map_err(|error| error.to_string())?;
-        if let Some(sandbox) = sandboxes
+        if let Some(sandbox) = response
+            .sandboxes
             .iter()
             .find(|sandbox| sandbox.name == sandbox_name)
         {
@@ -197,16 +204,11 @@ async fn find_sandbox(
                 phase: sandbox.phase.clone(),
             }));
         }
-        let next_page_token = result
-            .stderr()
-            .lines()
-            .find_map(|line| line.strip_prefix("Next page token: "))
-            .unwrap_or_default();
-        if next_page_token.is_empty() {
+        if response.next_page_token.is_empty() {
             return Ok(None);
         }
 
-        page_token = next_page_token.to_string();
+        page_token = response.next_page_token;
         page = page
             .checked_add(1)
             .ok_or_else(|| "sandbox list page counter overflowed".to_string())?;

@@ -58,7 +58,7 @@ func (w *workspaceClient) List(ctx context.Context, opts ...ListOptions) ([]*Wor
 		req.LabelSelector = opts[0].LabelSelector
 	}
 
-	var workspaces []*Workspace
+	workspaces := make([]*Workspace, 0)
 	for {
 		resp, err := w.client.ListWorkspaces(ctx, req)
 		if err != nil {
@@ -143,7 +143,7 @@ func (w *workspaceClient) ListMembers(ctx context.Context, workspace string, opt
 		Workspace: workspace,
 		PageSize:  pageSize,
 	}
-	var members []*WorkspaceMember
+	members := make([]*WorkspaceMember, 0)
 	for {
 		resp, err := w.client.ListWorkspaceMembers(ctx, req)
 		if err != nil {
