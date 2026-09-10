@@ -6674,17 +6674,17 @@ async fn sandbox_policy_merge_validation_data_with_catalog(
 ) -> Result<SandboxPolicyMergeValidationData, Status> {
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let composition_enabled = provider_policy_composition_enabled_in(&global_settings)?;
-    let ProviderPolicyContext {
-        layers,
-        credentialed_scopes,
-        endpointless_provider_names,
-    } = provider_policy_context_with_catalog(
+    let records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
-        catalog,
         workspace,
         provider_names,
     )
     .await?;
+    let ProviderPolicyContext {
+        layers,
+        credentialed_scopes,
+        endpointless_provider_names,
+    } = provider_policy_context_from_records(catalog, &records);
     let provider_layers = if composition_enabled {
         layers
     } else {
@@ -6695,12 +6695,6 @@ async fn sandbox_policy_merge_validation_data_with_catalog(
         provider_layer_count = provider_layers.len(),
         "Composed provider policy and credential context for merge validation"
     );
-    let records = super::provider::load_provider_environment_records(
-        state.store.as_ref(),
-        workspace,
-        provider_names,
-    )
-    .await?;
     Ok(SandboxPolicyMergeValidationData {
         provider_layers,
         catalog: catalog.clone(),
