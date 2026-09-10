@@ -303,6 +303,8 @@ queue_max_bytes = 16777216
 
 Unknown fields are rejected. This is one file destination, not an exporter registry. The existing `ocsf_json_enabled` sandbox setting remains independent.
 
+For Helm installations, set `server.ocsfLog.enabled` to render this table and optionally set `server.ocsfLog.schemaVersion`. The default `server.ocsfLog.path`, `/tmp/gateway-ocsf.jsonl`, is writable in the gateway container with either the StatefulSet or Deployment workload but does not persist across pod restarts. To keep records, mount a volume with `server.extraVolumes` and `server.extraVolumeMounts` and set the path on it. When replicas share a volume, add `subPathExpr: $(OPENSHELL_POD_NAME)` to the mount so each replica writes its own file.
+
 Give each gateway replica its own writable file and an external shipper read access to the containing directory. New files use owner-only permissions on Unix; arrange shipper access deliberately. Rotation renames the active file to a date- and UUID-suffixed sibling. The shipper must follow rotated files and checkpoint its progress. Do not use multiple writers or external copy-truncate rotation on this path.
 
 The gateway queues OCSF independently of `RUST_LOG`, excludes ordinary diagnostics, and preserves native event IDs. It writes up to 100 records per batch with a 500 ms batching interval. One additional bounded batch can be in flight. File errors do not stop sandbox execution: failed writes are not replayed, and subsequent records are discarded during reopen backoff. A restarted writer removes an incomplete trailing line before appending.
