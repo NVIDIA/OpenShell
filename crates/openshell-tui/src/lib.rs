@@ -2074,8 +2074,11 @@ fn format_draft_approve_all_result(
 // ---------------------------------------------------------------------------
 
 fn spawn_list_refresh(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
-    if app.list_refresh_handle.is_some() {
-        return;
+    if let Some(handle) = app.list_refresh_handle.as_ref() {
+        if !handle.is_finished() {
+            return;
+        }
+        app.list_refresh_handle.take();
     }
 
     app.list_refresh_generation = app.list_refresh_generation.wrapping_add(1);
