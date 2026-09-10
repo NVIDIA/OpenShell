@@ -55,12 +55,14 @@ struct MockState {
     last_stop: Mutex<Option<proto::StopSandboxRequest>>,
     last_start: Mutex<Option<proto::StartSandboxRequest>>,
     last_list_request: Mutex<Option<proto::ListSandboxesRequest>>,
+    list_requests: Mutex<Vec<proto::ListSandboxesRequest>>,
     last_exec_request: Mutex<Option<proto::ExecSandboxRequest>>,
     last_workspace_request: Mutex<Option<String>>,
     get_calls: AtomicU32,
     phase_sequence: Vec<proto::SandboxPhase>,
     get_returns_not_found: bool,
     not_found_after: Option<u32>,
+    paginate_list: bool,
     /// When set, `health` rejects any request whose `authorization` header
     /// does not match this exact value (e.g. `"Bearer fresh-token"`).
     require_bearer: Option<String>,
@@ -278,6 +280,7 @@ impl OpenShell for TestOpenShell {
                 workload_template_proto("python", "default"),
                 workload_template_proto("cuda", "gpu"),
             ],
+            next_page_token: String::new(),
         }))
     }
 
@@ -360,12 +363,36 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<proto::ListSandboxesRequest>,
     ) -> Result<Response<proto::ListSandboxesResponse>, Status> {
-        *self.state.last_list_request.lock().await = Some(request.into_inner());
+        let request = request.into_inner();
+        *self.state.last_list_request.lock().await = Some(request.clone());
+        self.state.list_requests.lock().await.push(request.clone());
+        if self.state.paginate_list {
+            let (sandboxes, next_page_token) = if request.page_token.is_empty() {
+                (
+                    vec![sandbox_with_phase("alpha", proto::SandboxPhase::Ready)],
+                    "page-2".to_string(),
+                )
+            } else {
+                assert_eq!(request.page_token, "page-2");
+                (
+                    vec![sandbox_with_phase(
+                        "beta",
+                        proto::SandboxPhase::Provisioning,
+                    )],
+                    String::new(),
+                )
+            };
+            return Ok(Response::new(proto::ListSandboxesResponse {
+                sandboxes,
+                next_page_token,
+            }));
+        }
         Ok(Response::new(proto::ListSandboxesResponse {
             sandboxes: vec![
                 sandbox_with_phase("alpha", proto::SandboxPhase::Ready),
                 sandbox_with_phase("beta", proto::SandboxPhase::Provisioning),
             ],
+            next_page_token: String::new(),
         }))
     }
 
@@ -826,6 +853,7 @@ impl OpenShell for TestOpenShell {
                 workspace_proto("default", proto::datamodel::v1::WorkspacePhase::Active),
                 workspace_proto("staging", proto::datamodel::v1::WorkspacePhase::Active),
             ],
+            next_page_token: String::new(),
         }))
     }
 
@@ -1004,16 +1032,15 @@ async fn sandbox_template_crud_uses_default_workspace() {
 
     let listed = client
         .list_sandbox_templates_all_workspaces(SandboxTemplateListOptions {
-            limit: 10,
-            offset: 2,
+            page_size: 10,
             label_selector: String::new(),
         })
         .await
         .unwrap();
     assert_eq!(listed.len(), 2);
     let observed_list = state.last_template_list.lock().await.clone().unwrap();
-    assert_eq!(observed_list.limit, 10);
-    assert_eq!(observed_list.offset, 2);
+    assert_eq!(observed_list.page_size, 10);
+    assert!(observed_list.page_token.is_empty());
     assert!(selects_all_workspaces(&observed_list.workspace_scope));
 
     let deleted = client.delete_sandbox_template("python").await.unwrap();
@@ -1066,8 +1093,7 @@ async fn list_sandboxes_propagates_filters() {
     let client = connect(&endpoint).await;
 
     let opts = ListOptions {
-        limit: 25,
-        offset: 5,
+        page_size: 25,
         label_selector: Some("team=core".to_string()),
     };
     let items = client.list_sandboxes(opts).await.unwrap();
@@ -1077,9 +1103,36 @@ async fn list_sandboxes_propagates_filters() {
     assert_eq!(items[1].phase, SandboxPhase::Provisioning);
 
     let observed = state.last_list_request.lock().await.clone().unwrap();
-    assert_eq!(observed.limit, 25);
-    assert_eq!(observed.offset, 5);
+    assert_eq!(observed.page_size, 25);
+    assert!(observed.page_token.is_empty());
     assert_eq!(observed.label_selector, "team=core");
+}
+
+#[tokio::test]
+async fn list_sandboxes_follows_continuation_tokens() {
+    let state = Arc::new(MockState {
+        paginate_list: true,
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let items = client
+        .list_sandboxes(ListOptions {
+            page_size: 1,
+            label_selector: Some("team=core".to_string()),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].name, "alpha");
+    assert_eq!(items[1].name, "beta");
+    let requests = state.list_requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].page_token.is_empty());
+    assert_eq!(requests[1].page_token, "page-2");
+    assert_eq!(requests[1].label_selector, "team=core");
 }
 
 #[tokio::test]

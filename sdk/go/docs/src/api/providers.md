@@ -42,7 +42,8 @@ fmt.Println("Provider type:", provider.Type)
 
 ## List
 
-List all registered providers, with optional pagination.
+List all registered providers. The SDK follows gateway continuation tokens
+automatically; `PageSize` controls each request.
 
 ```go
 // List all providers
@@ -54,10 +55,9 @@ for _, p := range providers {
     fmt.Println(p.Name, p.Type)
 }
 
-// With pagination
+// With a smaller page size
 providers, err = client.Providers().List(ctx, "default", v1.ListOptions{
-    Limit:  10,
-    Offset: 0,
+    PageSize: 10,
 })
 
 // Platform Admin only: list across all workspaces

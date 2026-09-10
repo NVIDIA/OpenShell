@@ -150,8 +150,8 @@ export interface SandboxWorkloadTemplateProvenance {
 }
 
 interface PaginationOptions {
-  limit?: number;
-  offset?: number;
+  /** Page size used while collecting every result. */
+  pageSize?: number;
   labelSelector?: string;
 }
 
@@ -175,8 +175,8 @@ export interface SandboxTemplateWorkspaceOptions {
 }
 
 export type SandboxTemplateListOptions = WorkspaceListScope & {
-  limit?: number;
-  offset?: number;
+  /** Page size used while collecting every result. */
+  pageSize?: number;
   /** Optional label selector in key=value comma-separated form. */
   labelSelector?: string;
 };
@@ -687,13 +687,19 @@ export class SandboxTemplateClient {
 
   async list(options?: SandboxTemplateListOptions | null): Promise<SandboxWorkloadTemplate[]> {
     try {
-      const resp = await this.grpc.listSandboxTemplates({
-        limit: options?.limit ?? 0,
-        offset: options?.offset ?? 0,
-        labelSelector: options?.labelSelector ?? '',
-        workspaceScope: listWorkspaceScope(options),
-      });
-      return resp.templates;
+      const templates: SandboxWorkloadTemplate[] = [];
+      let pageToken = '';
+      do {
+        const resp = await this.grpc.listSandboxTemplates({
+          pageSize: options?.pageSize ?? 0,
+          pageToken,
+          labelSelector: options?.labelSelector ?? '',
+          workspaceScope: listWorkspaceScope(options),
+        });
+        templates.push(...resp.templates);
+        pageToken = resp.nextPageToken;
+      } while (pageToken !== '');
+      return templates;
     } catch (e) {
       throw fromConnect(e);
     }
@@ -811,13 +817,19 @@ export class SandboxClient {
 
   async list(options?: ListOptions | null): Promise<SandboxRef[]> {
     try {
-      const resp = await this.grpc.listSandboxes({
-        limit: options?.limit ?? 0,
-        offset: options?.offset ?? 0,
-        labelSelector: options?.labelSelector ?? '',
-        workspaceScope: listWorkspaceScope(options),
-      });
-      return resp.sandboxes.map((s) => sandboxRef(s));
+      const sandboxes: SandboxRef[] = [];
+      let pageToken = '';
+      do {
+        const resp = await this.grpc.listSandboxes({
+          pageSize: options?.pageSize ?? 0,
+          pageToken,
+          labelSelector: options?.labelSelector ?? '',
+          workspaceScope: listWorkspaceScope(options),
+        });
+        sandboxes.push(...resp.sandboxes.map((sandbox) => sandboxRef(sandbox)));
+        pageToken = resp.nextPageToken;
+      } while (pageToken !== '');
+      return sandboxes;
     } catch (e) {
       throw fromConnect(e);
     }

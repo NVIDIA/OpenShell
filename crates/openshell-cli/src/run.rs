@@ -2232,8 +2232,8 @@ async fn sandbox_exec_interactive_grpc(
 #[allow(clippy::too_many_arguments)]
 pub async fn sandbox_list(
     server: &str,
-    limit: u32,
-    offset: u32,
+    page_size: i32,
+    page_token: &str,
     ids_only: bool,
     names_only: bool,
     label_selector: Option<&str>,
@@ -2246,8 +2246,8 @@ pub async fn sandbox_list(
 
     let response = client
         .list_sandboxes(ListSandboxesRequest {
-            limit,
-            offset,
+            page_size,
+            page_token: page_token.to_string(),
             label_selector: label_selector.unwrap_or("").to_string(),
             workspace_scope: Some(if all_workspaces {
                 openshell_core::proto::all_workspaces_selector()
@@ -2258,7 +2258,9 @@ pub async fn sandbox_list(
         .await
         .into_diagnostic()?;
 
-    let sandboxes = response.into_inner().sandboxes;
+    let response = response.into_inner();
+    crate::output::print_next_page_token(&response.next_page_token);
+    let sandboxes = response.sandboxes;
 
     if crate::output::print_output_collection(output, &sandboxes, sandbox_to_json)? {
         return Ok(());
@@ -2587,8 +2589,8 @@ pub async fn sandbox_template_get(
 #[allow(clippy::too_many_arguments)]
 pub async fn sandbox_template_list(
     server: &str,
-    limit: u32,
-    offset: u32,
+    page_size: i32,
+    page_token: &str,
     label_selector: Option<&str>,
     names_only: bool,
     output: &str,
@@ -2599,8 +2601,8 @@ pub async fn sandbox_template_list(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .list_sandbox_templates(ListSandboxTemplatesRequest {
-            limit,
-            offset,
+            page_size,
+            page_token: page_token.to_string(),
             workspace_scope: Some(if all_workspaces {
                 openshell_core::proto::all_workspaces_selector()
             } else {
@@ -2610,7 +2612,9 @@ pub async fn sandbox_template_list(
         })
         .await
         .into_diagnostic()?;
-    let templates = response.into_inner().templates;
+    let response = response.into_inner();
+    crate::output::print_next_page_token(&response.next_page_token);
+    let templates = response.templates;
 
     if crate::output::print_output_collection(output, &templates, sandbox_template_to_json)? {
         return Ok(());
@@ -3028,17 +3032,25 @@ pub async fn sandbox_delete(
     let mut client = grpc_client(server, tls).await?;
 
     let names_to_delete: Vec<String> = if all {
-        // Fetch all sandboxes (use a large page size).
-        let response = client
-            .list_sandboxes(ListSandboxesRequest {
-                limit: 1000,
-                offset: 0,
-                label_selector: String::new(),
-                workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
-            })
-            .await
-            .into_diagnostic()?;
-        let sandboxes = response.into_inner().sandboxes;
+        let mut page_token = String::new();
+        let mut sandboxes = Vec::new();
+        loop {
+            let response = client
+                .list_sandboxes(ListSandboxesRequest {
+                    page_size: 1000,
+                    page_token,
+                    label_selector: String::new(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+                })
+                .await
+                .into_diagnostic()?
+                .into_inner();
+            sandboxes.extend(response.sandboxes);
+            if response.next_page_token.is_empty() {
+                break;
+            }
+            page_token = response.next_page_token;
+        }
         if sandboxes.is_empty() {
             println!("No sandboxes to delete.");
             return Ok(());
@@ -3279,8 +3291,8 @@ fn service_expose_status_error(status: Status) -> miette::Report {
 pub async fn service_list(
     server: &str,
     sandbox: Option<&str>,
-    limit: u32,
-    offset: u32,
+    page_size: i32,
+    page_token: &str,
     workspace: &str,
     all_workspaces: bool,
     output: &str,
@@ -3290,8 +3302,8 @@ pub async fn service_list(
     let response = client
         .list_services(ListServicesRequest {
             sandbox: sandbox.unwrap_or_default().to_string(),
-            limit,
-            offset,
+            page_size,
+            page_token: page_token.to_string(),
             workspace_scope: Some(if all_workspaces {
                 openshell_core::proto::all_workspaces_selector()
             } else {
@@ -3302,6 +3314,7 @@ pub async fn service_list(
         .map_err(|status| service_status_error("list services", "sandbox:read", status))?
         .into_inner();
 
+    crate::output::print_next_page_token(&response.next_page_token);
     let services = response
         .services
         .iter()
@@ -3646,8 +3659,8 @@ pub async fn workspace_get(server: &str, name: &str, tls: &TlsOptions) -> Result
 
 pub async fn workspace_list(
     server: &str,
-    limit: u32,
-    offset: u32,
+    page_size: i32,
+    page_token: &str,
     label_selector: &str,
     output: &str,
     tls: &TlsOptions,
@@ -3657,13 +3670,15 @@ pub async fn workspace_list(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .list_workspaces(ListWorkspacesRequest {
-            limit,
-            offset,
+            page_size,
+            page_token: page_token.to_string(),
             label_selector: label_selector.to_string(),
         })
         .await
         .into_diagnostic()?;
-    let workspaces = response.into_inner().workspaces;
+    let response = response.into_inner();
+    crate::output::print_next_page_token(&response.next_page_token);
+    let workspaces = response.workspaces;
 
     if crate::output::print_output_collection(output, &workspaces, workspace_to_json)? {
         return Ok(());
@@ -3817,8 +3832,8 @@ pub async fn workspace_member_remove(
 pub async fn workspace_member_list(
     server: &str,
     workspace: &str,
-    limit: u32,
-    offset: u32,
+    page_size: i32,
+    page_token: &str,
     output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -3828,12 +3843,14 @@ pub async fn workspace_member_list(
     let response = client
         .list_workspace_members(ListWorkspaceMembersRequest {
             workspace: workspace.to_string(),
-            limit,
-            offset,
+            page_size,
+            page_token: page_token.to_string(),
         })
         .await
         .into_diagnostic()?;
-    let members = response.into_inner().members;
+    let response = response.into_inner();
+    crate::output::print_next_page_token(&response.next_page_token);
+    let members = response.members;
 
     if crate::output::print_output_collection(output, &members, workspace_member_to_json)? {
         return Ok(());
@@ -5163,7 +5180,8 @@ fn policy_for_view(policy: &SandboxPolicy, view: PolicyGetView) -> Cow<'_, Sandb
 pub async fn sandbox_policy_list(
     server: &str,
     name: &str,
-    limit: u32,
+    page_size: i32,
+    page_token: &str,
     output: &str,
     workspace: &str,
     tls: &TlsOptions,
@@ -5173,15 +5191,17 @@ pub async fn sandbox_policy_list(
     let resp = client
         .list_sandbox_policies(ListSandboxPoliciesRequest {
             name: name.to_string(),
-            limit,
-            offset: 0,
+            page_size,
+            page_token: page_token.to_string(),
             global: false,
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?;
 
-    let revisions = resp.into_inner().revisions;
+    let resp = resp.into_inner();
+    crate::output::print_next_page_token(&resp.next_page_token);
+    let revisions = resp.revisions;
     let structured = policy_revision_list_json("sandbox", Some(name), &revisions)?;
     if crate::output::print_output_collection(output, &structured, Clone::clone)? {
         return Ok(());
@@ -5198,7 +5218,8 @@ pub async fn sandbox_policy_list(
 
 pub async fn sandbox_policy_list_global(
     server: &str,
-    limit: u32,
+    page_size: i32,
+    page_token: &str,
     output: &str,
     _workspace: &str,
     tls: &TlsOptions,
@@ -5208,15 +5229,17 @@ pub async fn sandbox_policy_list_global(
     let resp = client
         .list_sandbox_policies(ListSandboxPoliciesRequest {
             name: String::new(),
-            limit,
-            offset: 0,
+            page_size,
+            page_token: page_token.to_string(),
             global: true,
             workspace_scope: None,
         })
         .await
         .into_diagnostic()?;
 
-    let revisions = resp.into_inner().revisions;
+    let resp = resp.into_inner();
+    crate::output::print_next_page_token(&resp.next_page_token);
+    let revisions = resp.revisions;
     let structured = policy_revision_list_json("global", None, &revisions)?;
     if crate::output::print_output_collection(output, &structured, Clone::clone)? {
         return Ok(());

@@ -170,13 +170,13 @@ Phase 1: GetSandboxLogs  →  500 initial lines  →  send via Event::LogLines
 Phase 2: WatchSandbox(follow_logs: true)  →  live tail  →  send via Event::LogLines
 ```
 
-**Sandboxes**: Fetched via `ListSandboxes` on a 2-second tick, scoped to the current workspace (or all workspaces).
+**Sandboxes**: Fetched via `ListSandboxes` on a 2-second tick, scoped to the current workspace (or all workspaces). Follow `next_page_token` until empty so the dashboard reflects the complete collection.
 
-**Providers**: Fetched via `ListProviders` on each tick. Provider profiles are fetched per-workspace via `ListProviderProfiles` and cached in a `ProviderProfileCache` keyed by `(workspace, profile_id)`.
+**Providers**: Fetched via `ListProviders` on each tick. Provider profiles are fetched per-workspace via `ListProviderProfiles` and cached in a `ProviderProfileCache` keyed by `(workspace, profile_id)`. Follow each list RPC's `next_page_token` until empty.
 
 **Settings**: Global settings are fetched via `GetGatewayConfig` on each tick. Sandbox settings are fetched alongside the sandbox policy via `GetSandboxConfig` and refreshed on each tick when viewing a sandbox.
 
-**Workspaces**: The workspace list is fetched via `ListWorkspaces` on each tick.
+**Workspaces**: The workspace list is fetched via `ListWorkspaces` on each tick, following `next_page_token` until empty.
 
 ### Never block the event loop
 
@@ -502,12 +502,15 @@ use openshell_core::proto::{
   `Some(all_workspaces_selector())`; do not use that marker on other requests.
 - `GetSandboxLogsRequest` fields: `sandbox_id`, `lines` (u32), `since_ms` (i64),
   `sources` (Vec<String>), `min_level` (String), `workspace_scope`.
-- `ListSandboxesRequest` fields: `limit` (u32), `offset` (u32),
+- `ListSandboxesRequest` fields: `page_size` (i32), `page_token` (String),
   `label_selector` (String), `workspace_scope`.
-- `ListProvidersRequest` fields: `limit` (u32), `offset` (u32),
+- `ListProvidersRequest` fields: `page_size` (i32), `page_token` (String),
   `workspace_scope`.
-- `ListWorkspacesRequest` fields: `limit` (u32), `offset` (u32),
+- `ListWorkspacesRequest` fields: `page_size` (i32), `page_token` (String),
   `label_selector` (String).
+- Paginated list responses return `next_page_token`. Continue with the same
+  request parameters and that token until it is empty; changing filters or
+  scope invalidates the token.
 - `UpdateConfigRequest` fields include `name` (String, sandbox name or empty for
   global), `setting_key`, `setting_value`, `delete_setting` (bool), `global`
   (bool), and `workspace_scope`. Sandbox-scoped updates require a named selector;

@@ -87,11 +87,8 @@ var WithVersion = types.WithVersion
 // ListPolicyOption configures a List call.
 type ListPolicyOption = types.ListPolicyOption
 
-// WithLimit sets the maximum number of revisions to return.
-var WithLimit = types.WithLimit
-
-// WithOffset sets the pagination offset.
-var WithOffset = types.WithOffset
+// WithPageSize sets the page size used while collecting every revision.
+var WithPageSize = types.WithPageSize
 
 // WithListGlobal enables global policy mode on List. When true, the query
 // retrieves gateway-global policy revisions instead of sandbox-scoped ones.

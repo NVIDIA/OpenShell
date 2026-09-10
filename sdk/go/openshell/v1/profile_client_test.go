@@ -242,13 +242,13 @@ func TestProfileList_WithOptions(t *testing.T) {
 	client, cleanup := setupProfileTest(t, mock)
 	defer cleanup()
 
-	profiles, err := client.List(context.Background(), "default", ListOptions{Limit: 10, Offset: 5})
+	profiles, err := client.List(context.Background(), "default", ListOptions{PageSize: 10})
 
 	require.NoError(t, err)
 	assert.Len(t, profiles, 1)
 	require.NotNil(t, mock.lastListReq)
-	assert.Equal(t, uint32(10), mock.lastListReq.GetLimit())
-	assert.Equal(t, uint32(5), mock.lastListReq.GetOffset())
+	assert.Equal(t, int32(10), mock.lastListReq.GetPageSize())
+	assert.Empty(t, mock.lastListReq.GetPageToken())
 }
 
 func TestProfileList_Error(t *testing.T) {

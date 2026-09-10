@@ -285,6 +285,7 @@ impl OpenShell for TestOpenShell {
             .push(request.into_inner());
         Ok(Response::new(ListSandboxTemplatesResponse {
             templates: Vec::new(),
+            next_page_token: String::new(),
         }))
     }
 
@@ -461,6 +462,7 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<ListProvidersResponse>, Status> {
         Ok(Response::new(ListProvidersResponse {
             providers: self.state.providers.lock().await.clone(),
+            next_page_token: String::new(),
         }))
     }
 
@@ -473,7 +475,10 @@ impl OpenShell for TestOpenShell {
             .map(openshell_providers::ProviderTypeProfile::to_proto)
             .collect();
         Ok(Response::new(
-            openshell_core::proto::ListProviderProfilesResponse { profiles },
+            openshell_core::proto::ListProviderProfilesResponse {
+                profiles,
+                next_page_token: String::new(),
+            },
         ))
     }
 
@@ -1874,7 +1879,7 @@ async fn sandbox_template_list_and_delete_send_workspace_requests() {
     run::sandbox_template_list(
         &server.endpoint,
         25,
-        5,
+        "next-template-page",
         Some("team=runtime"),
         false,
         "table",
@@ -1892,8 +1897,8 @@ async fn sandbox_template_list_and_delete_send_workspace_requests() {
     let list_request = list_requests
         .first()
         .expect("template list request should be recorded");
-    assert_eq!(list_request.limit, 25);
-    assert_eq!(list_request.offset, 5);
+    assert_eq!(list_request.page_size, 25);
+    assert_eq!(list_request.page_token, "next-template-page");
     assert_eq!(list_request.label_selector, "team=runtime");
     assert_eq!(
         selected_workspace(&list_request.workspace_scope),

@@ -162,22 +162,22 @@ async fn find_sandbox(
     sandbox_name: &str,
     step: &str,
 ) -> Result<Option<SandboxListEntry>, String> {
-    let mut offset = 0u32;
+    let mut page_token = String::new();
+    let mut page = 0u32;
 
     loop {
-        let limit = LIST_PAGE_SIZE.to_string();
-        let page_offset = offset.to_string();
+        let page_size = LIST_PAGE_SIZE.to_string();
         let result = runner
-            .step(format!("{step}/{offset}"))
-            .description(format!("sandbox list page at offset {offset} succeeds"))
+            .step(format!("{step}/{page}"))
+            .description(format!("sandbox list page {page} succeeds"))
             .with_timeout(LIST_ATTEMPT_TIMEOUT)
             .run(&[
                 "sandbox",
                 "list",
-                "--limit",
-                &limit,
-                "--offset",
-                &page_offset,
+                "--page-size",
+                &page_size,
+                "--page-token",
+                &page_token,
                 "--output",
                 "json",
             ])
@@ -197,12 +197,18 @@ async fn find_sandbox(
                 phase: sandbox.phase.clone(),
             }));
         }
-        if sandboxes.len() < LIST_PAGE_SIZE as usize {
+        let next_page_token = result
+            .stderr()
+            .lines()
+            .find_map(|line| line.strip_prefix("Next page token: "))
+            .unwrap_or_default();
+        if next_page_token.is_empty() {
             return Ok(None);
         }
 
-        offset = offset
-            .checked_add(LIST_PAGE_SIZE)
-            .ok_or_else(|| "sandbox list pagination offset overflowed".to_string())?;
+        page_token = next_page_token.to_string();
+        page = page
+            .checked_add(1)
+            .ok_or_else(|| "sandbox list page counter overflowed".to_string())?;
     }
 }

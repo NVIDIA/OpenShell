@@ -529,11 +529,26 @@ modes:
   `UpdateProvider`, `UpdateProviderProfiles`, and `UpdateConfig` (policy
   backfill and sandbox annotation updates).
 
-**Lists.** The `list_messages` and `list_messages_with_selector` helpers decode
-protobuf payloads from list results and hydrate `resource_version` from the
-authoritative database column into each decoded message, mirroring the
-`get_message` pattern. This ensures list responses carry correct versions
-without requiring callers to manually hydrate each record.
+**Lists.** Public list RPCs follow AIP-158: requests carry direct `page_size`
+and `page_token` fields, and responses carry `next_page_token`. The gateway
+clamps page sizes to 1,000 and returns opaque base64url continuation tokens.
+Tokens bind the RPC and every request parameter except `page_size`, contain no
+authorization grant, and use immutable keyset cursors rather than database
+offsets. Each page repeats normal authentication and authorization. Pagination
+is weakly consistent under concurrent writes and deletes; it does not provide a
+historical snapshot.
+
+The token wire format is a private shared protobuf used only by the gateway.
+Public request and response messages repeat the standard AIP fields directly
+instead of wrapping them in a shared pagination message.
+
+Persistence distinguishes one-page operations from exhaustive scans.
+`list_object_page` and `list_message_page` return one keyset page and its next
+cursor. `collect_records` and `collect_messages` exhaust those pages, fail on
+database or protobuf decode errors, and hydrate `resource_version` from the
+authoritative database column. Internal callers that require every matching
+record use the exhaustive helpers; bounded lookups continue to use page-level
+methods.
 
 **Deletes.** Delete operations are not yet CAS-protected -- the delete request
 protos do not carry `expected_resource_version`. A `delete_if` primitive exists

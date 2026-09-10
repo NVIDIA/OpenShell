@@ -819,49 +819,61 @@ class SandboxClient:
         self,
         *,
         workspace: str,
-        limit: int = 100,
-        offset: int = 0,
+        page_size: int = 100,
         label_selector: str | None = None,
     ) -> builtins.list[SandboxRef]:
-        request = openshell_pb2.ListSandboxesRequest(
-            workspace_scope=_workspace_scope(workspace),
-            limit=limit,
-            offset=offset,
-            label_selector=label_selector or "",
-        )
-        response = self._stub.ListSandboxes(request, timeout=self._timeout)
-        return [_sandbox_ref(item) for item in response.sandboxes]
+        sandboxes: builtins.list[SandboxRef] = []
+        page_token = ""
+        while True:
+            response = self._stub.ListSandboxes(
+                openshell_pb2.ListSandboxesRequest(
+                    workspace_scope=_workspace_scope(workspace),
+                    page_size=page_size,
+                    page_token=page_token,
+                    label_selector=label_selector or "",
+                ),
+                timeout=self._timeout,
+            )
+            sandboxes.extend(_sandbox_ref(item) for item in response.sandboxes)
+            if not getattr(response, "next_page_token", ""):
+                return sandboxes
+            page_token = response.next_page_token
 
     def list_for_all_workspaces(
         self,
         *,
-        limit: int = 100,
-        offset: int = 0,
+        page_size: int = 100,
         label_selector: str | None = None,
     ) -> builtins.list[SandboxRef]:
-        request = openshell_pb2.ListSandboxesRequest(
-            workspace_scope=_all_workspaces_scope(),
-            limit=limit,
-            offset=offset,
-            label_selector=label_selector or "",
-        )
-        response = self._stub.ListSandboxes(request, timeout=self._timeout)
-        return [_sandbox_ref(item) for item in response.sandboxes]
+        sandboxes: builtins.list[SandboxRef] = []
+        page_token = ""
+        while True:
+            response = self._stub.ListSandboxes(
+                openshell_pb2.ListSandboxesRequest(
+                    workspace_scope=_all_workspaces_scope(),
+                    page_size=page_size,
+                    page_token=page_token,
+                    label_selector=label_selector or "",
+                ),
+                timeout=self._timeout,
+            )
+            sandboxes.extend(_sandbox_ref(item) for item in response.sandboxes)
+            if not getattr(response, "next_page_token", ""):
+                return sandboxes
+            page_token = response.next_page_token
 
     def list_ids(
         self,
         *,
         workspace: str,
-        limit: int = 100,
-        offset: int = 0,
+        page_size: int = 100,
         label_selector: str | None = None,
     ) -> builtins.list[str]:
         return [
             item.id
             for item in self.list(
                 workspace=workspace,
-                limit=limit,
-                offset=offset,
+                page_size=page_size,
                 label_selector=label_selector,
             )
         ]
@@ -869,15 +881,13 @@ class SandboxClient:
     def list_ids_for_all_workspaces(
         self,
         *,
-        limit: int = 100,
-        offset: int = 0,
+        page_size: int = 100,
         label_selector: str | None = None,
     ) -> builtins.list[str]:
         return [
             item.id
             for item in self.list_for_all_workspaces(
-                limit=limit,
-                offset=offset,
+                page_size=page_size,
                 label_selector=label_selector,
             )
         ]
@@ -1181,38 +1191,48 @@ class SandboxTemplateClient:
         self,
         *,
         workspace: str,
-        limit: int = 100,
-        offset: int = 0,
+        page_size: int = 100,
         label_selector: str = "",
     ) -> builtins.list[openshell_pb2.SandboxWorkloadTemplate]:
-        response = self._stub.ListSandboxTemplates(
-            openshell_pb2.ListSandboxTemplatesRequest(
-                workspace_scope=_workspace_scope(workspace),
-                limit=limit,
-                offset=offset,
-                label_selector=label_selector,
-            ),
-            timeout=self._timeout,
-        )
-        return list(response.templates)
+        templates: builtins.list[openshell_pb2.SandboxWorkloadTemplate] = []
+        page_token = ""
+        while True:
+            response = self._stub.ListSandboxTemplates(
+                openshell_pb2.ListSandboxTemplatesRequest(
+                    workspace_scope=_workspace_scope(workspace),
+                    page_size=page_size,
+                    page_token=page_token,
+                    label_selector=label_selector,
+                ),
+                timeout=self._timeout,
+            )
+            templates.extend(response.templates)
+            if not getattr(response, "next_page_token", ""):
+                return templates
+            page_token = response.next_page_token
 
     def list_for_all_workspaces(
         self,
         *,
-        limit: int = 100,
-        offset: int = 0,
+        page_size: int = 100,
         label_selector: str = "",
     ) -> builtins.list[openshell_pb2.SandboxWorkloadTemplate]:
-        response = self._stub.ListSandboxTemplates(
-            openshell_pb2.ListSandboxTemplatesRequest(
-                workspace_scope=_all_workspaces_scope(),
-                limit=limit,
-                offset=offset,
-                label_selector=label_selector,
-            ),
-            timeout=self._timeout,
-        )
-        return list(response.templates)
+        templates: builtins.list[openshell_pb2.SandboxWorkloadTemplate] = []
+        page_token = ""
+        while True:
+            response = self._stub.ListSandboxTemplates(
+                openshell_pb2.ListSandboxTemplatesRequest(
+                    workspace_scope=_all_workspaces_scope(),
+                    page_size=page_size,
+                    page_token=page_token,
+                    label_selector=label_selector,
+                ),
+                timeout=self._timeout,
+            )
+            templates.extend(response.templates)
+            if not getattr(response, "next_page_token", ""):
+                return templates
+            page_token = response.next_page_token
 
     def delete(self, name: str, *, workspace: str) -> bool:
         response = self._stub.DeleteSandboxTemplate(
@@ -1276,19 +1296,24 @@ class WorkspaceClient:
     def list(
         self,
         *,
-        limit: int = 100,
-        offset: int = 0,
+        page_size: int = 100,
         label_selector: str | None = None,
     ) -> builtins.list[WorkspaceRef]:
-        response = self._stub.ListWorkspaces(
-            openshell_pb2.ListWorkspacesRequest(
-                limit=limit,
-                offset=offset,
-                label_selector=label_selector or "",
-            ),
-            timeout=self._timeout,
-        )
-        return [_workspace_ref(ws) for ws in response.workspaces]
+        workspaces: builtins.list[WorkspaceRef] = []
+        page_token = ""
+        while True:
+            response = self._stub.ListWorkspaces(
+                openshell_pb2.ListWorkspacesRequest(
+                    page_size=page_size,
+                    page_token=page_token,
+                    label_selector=label_selector or "",
+                ),
+                timeout=self._timeout,
+            )
+            workspaces.extend(_workspace_ref(ws) for ws in response.workspaces)
+            if not getattr(response, "next_page_token", ""):
+                return workspaces
+            page_token = response.next_page_token
 
     def delete(self, name: str) -> bool:
         response = self._stub.DeleteWorkspace(

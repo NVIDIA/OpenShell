@@ -131,29 +131,32 @@ func (p *policyClient) GetStatus(ctx context.Context, workspace, sandboxName str
 
 func (p *policyClient) List(ctx context.Context, workspace string, opts ...ListPolicyOption) ([]SandboxPolicyRevision, error) {
 	cfg := types.ApplyListPolicyOptions(opts)
+	if cfg.PageSize() < 0 {
+		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "page size must not be negative"}
+	}
 	req := &pb.ListSandboxPoliciesRequest{
-		Limit:  cfg.Limit(),
-		Offset: cfg.Offset(),
-		Global: cfg.Global(),
+		PageSize:  cfg.PageSize(),
+		Global:    cfg.Global(),
 	}
 	if !cfg.Global() {
 		req.WorkspaceScope = namedWorkspaceScope(workspace)
 	}
-	resp, err := p.client.ListSandboxPolicies(ctx, req)
-	if err != nil {
-		return nil, converter.FromGRPCError(err)
-	}
-	revisions := resp.GetRevisions()
-	if len(revisions) == 0 {
-		return nil, nil
-	}
-	result := make([]SandboxPolicyRevision, 0, len(revisions))
-	for _, r := range revisions {
-		if converted := converter.SandboxPolicyRevisionFromProto(r); converted != nil {
-			result = append(result, *converted)
+	var result []SandboxPolicyRevision
+	for {
+		resp, err := p.client.ListSandboxPolicies(ctx, req)
+		if err != nil {
+			return nil, converter.FromGRPCError(err)
 		}
+		for _, revision := range resp.GetRevisions() {
+			if converted := converter.SandboxPolicyRevisionFromProto(revision); converted != nil {
+				result = append(result, *converted)
+			}
+		}
+		if resp.GetNextPageToken() == "" {
+			return result, nil
+		}
+		req.PageToken = resp.GetNextPageToken()
 	}
-	return result, nil
 }
 
 func (p *policyClient) EditDraftChunk(ctx context.Context, workspace, sandboxName, chunkID string, proposedRule *NetworkPolicyRule) error {

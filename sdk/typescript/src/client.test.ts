@@ -438,7 +438,7 @@ describe('create', () => {
 
     const created = await sandbox.create({ name: 'direct', workspace: 'staging', image: 'img' });
     const got = await sandbox.get('lookup', { workspace: 'staging' });
-    const listed = await sandbox.list({ workspace: 'staging', limit: 10 });
+    const listed = await sandbox.list({ workspace: 'staging', pageSize: 10 });
     const deleted = await sandbox.delete('lookup', { workspace: 'staging' });
     await expect(sandbox.waitReady('lookup', 1, { workspace: 'staging' })).resolves.toMatchObject({
       workspace: 'staging',
@@ -481,6 +481,32 @@ describe('create', () => {
     expect(observed.configGets).toContain('staging');
     expect(selectedWorkspace(observed.updatePolicy ?? {})).toBe('staging');
     expect(selectedWorkspace(observed.updateSetting ?? {})).toBe('staging');
+  });
+
+  it('follows sandbox list continuation tokens', async () => {
+    const requests: Array<{ pageToken?: string; pageSize?: number; labelSelector?: string }> = [];
+    const sandbox = client({
+      listSandboxes: (req) => {
+        requests.push(req);
+        if (req.pageToken === '') {
+          return {
+            sandboxes: [readySandbox('first', 'first-id').sandbox ?? {}],
+            nextPageToken: 'page-2',
+          };
+        }
+        return {
+          sandboxes: [readySandbox('second', 'second-id').sandbox ?? {}],
+          nextPageToken: '',
+        };
+      },
+    });
+
+    const listed = await sandbox.list({ pageSize: 1, labelSelector: 'team=core' });
+
+    expect(listed.map((item) => item.name)).toEqual(['first', 'second']);
+    expect(requests).toHaveLength(2);
+    expect(requests[0]).toMatchObject({ pageToken: '', pageSize: 1, labelSelector: 'team=core' });
+    expect(requests[1]).toMatchObject({ pageToken: 'page-2', pageSize: 1, labelSelector: 'team=core' });
   });
 
   it('createFromTemplate rejects an empty template name locally', async () => {
@@ -593,10 +619,10 @@ describe('sandbox templates', () => {
     expect(created.metadata?.resourceVersion).toBe(1n);
   });
 
-  it('get list and delete forward workspace and pagination', async () => {
+  it('get list and delete forward workspace and page size', async () => {
     const observed: {
       get?: ScopedRequest & { name?: string };
-      list?: ScopedRequest & { limit?: number; offset?: number; labelSelector?: string };
+      list?: ScopedRequest & { pageSize?: number; pageToken?: string; labelSelector?: string };
       delete?: ScopedRequest & { name?: string };
     } = {};
     const templates = templateClient({
@@ -627,7 +653,7 @@ describe('sandbox templates', () => {
     });
 
     const got = await templates.get('gpu-kata', { workspace: 'staging' });
-    const listed = await templates.list({ workspace: 'staging', limit: 10, offset: 2, labelSelector: 'team=runtime' });
+    const listed = await templates.list({ workspace: 'staging', pageSize: 10, labelSelector: 'team=runtime' });
     const deleted = await templates.delete('gpu-kata', { workspace: 'staging' });
 
     expect(got.metadata?.name).toBe('gpu-kata');
@@ -636,8 +662,8 @@ describe('sandbox templates', () => {
     expect(observed.get).toMatchObject({ name: 'gpu-kata' });
     expect(selectedWorkspace(observed.get ?? {})).toBe('staging');
     expect(observed.list).toMatchObject({
-      limit: 10,
-      offset: 2,
+      pageSize: 10,
+      pageToken: '',
       labelSelector: 'team=runtime',
     });
     expect(selectedWorkspace(observed.list ?? {})).toBe('staging');

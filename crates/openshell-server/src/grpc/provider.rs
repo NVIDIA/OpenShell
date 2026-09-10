@@ -7,12 +7,14 @@
 
 #[cfg(test)]
 use crate::credentials::RefreshMaterialScope;
+use crate::pagination::Pagination;
 use crate::persistence::{
-    ObjectId, ObjectLabels, ObjectName, ObjectType, Store, WriteCondition, generate_name,
+    ObjectId, ObjectLabels, ObjectListQuery, ObjectName, ObjectType, Store, WriteCondition,
+    generate_name,
 };
 use crate::provider_profile_sources::{
-    EffectiveProviderProfileCatalog, ProviderProfileSources, profile_response_payload,
-    profile_storage_payload, stored_profile_resource_version,
+    EffectiveProviderProfileCatalog, ProfileScope, ProviderProfileSources,
+    profile_response_payload, profile_storage_payload, stored_profile_resource_version,
 };
 use crate::storage_proto::{StoredProviderCredentialRefreshState, StoredProviderProfile};
 use openshell_core::metadata::ObjectWorkspace;
@@ -33,9 +35,7 @@ use tonic::Status;
 use tracing::warn;
 
 use super::validation::{validate_provider_fields, validate_provider_mutable_fields};
-use super::{
-    MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN, MAX_PAGE_SIZE, MAX_PROVIDER_CONFIG_ENTRIES, clamp_limit,
-};
+use super::{MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN, MAX_PROVIDER_CONFIG_ENTRIES};
 
 const GATEWAY_SPIFFE_WORKLOAD_API_SOCKET: &str = "OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET";
 
@@ -277,6 +277,7 @@ pub(super) async fn get_provider_record(
         .map(redact_provider_credentials)
 }
 
+#[cfg(test)]
 pub(super) async fn list_provider_records(
     store: &Store,
     workspace: &str,
@@ -627,32 +628,15 @@ async fn scan_sandboxes_inner<T, F>(
 where
     F: FnMut(Sandbox) -> Option<T>,
 {
-    let mut out = Vec::new();
-    let mut offset = 0u32;
-    loop {
-        let records = if let Some(ws) = workspace {
-            store.list(Sandbox::object_type(), ws, 1000, offset).await
-        } else {
-            store
-                .list_by_type(Sandbox::object_type(), 1000, offset)
-                .await
-        }
+    let query = workspace.map_or(ObjectListQuery::AllWorkspaces, ObjectListQuery::Workspace);
+    let sandboxes: Vec<Sandbox> = store
+        .collect_messages(query)
+        .await
         .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
-        if records.is_empty() {
-            break;
-        }
-        offset = offset
-            .checked_add(
-                u32::try_from(records.len())
-                    .map_err(|_| Status::internal("sandbox page size exceeded u32"))?,
-            )
-            .ok_or_else(|| Status::internal("sandbox pagination offset overflow"))?;
-        for record in records {
-            let sandbox = Sandbox::decode(record.payload.as_slice())
-                .map_err(|e| Status::internal(format!("decode sandbox failed: {e}")))?;
-            if let Some(item) = f(sandbox) {
-                out.push(item);
-            }
+    let mut out = Vec::new();
+    for sandbox in sandboxes {
+        if let Some(item) = f(sandbox) {
+            out.push(item);
         }
     }
     Ok(out)
@@ -664,43 +648,28 @@ async fn providers_using_profile(
     profile_id: &str,
 ) -> Result<Vec<String>, Status> {
     let is_platform_scope = workspace.is_empty();
-    let mut offset = 0u32;
     let mut blocking = Vec::new();
-    loop {
-        let records = if is_platform_scope {
-            store
-                .list_by_type(Provider::object_type(), 1000, offset)
-                .await
-        } else {
-            store
-                .list(Provider::object_type(), workspace, 1000, offset)
-                .await
-        }
+    let query = if is_platform_scope {
+        ObjectListQuery::AllWorkspaces
+    } else {
+        ObjectListQuery::Workspace(workspace)
+    };
+    let providers: Vec<Provider> = store
+        .collect_messages(query)
+        .await
         .map_err(|e| Status::internal(format!("list providers failed: {e}")))?;
-        if records.is_empty() {
-            break;
+    for provider in providers {
+        if provider.profile_workspace != workspace
+            || normalize_profile_id(&provider.r#type).as_deref() != Some(profile_id)
+        {
+            continue;
         }
-        offset = offset
-            .checked_add(
-                u32::try_from(records.len())
-                    .map_err(|_| Status::internal("provider page size exceeded u32"))?,
-            )
-            .ok_or_else(|| Status::internal("provider pagination offset overflow"))?;
-        for record in records {
-            let provider = Provider::decode(record.payload.as_slice())
-                .map_err(|e| Status::internal(format!("decode provider failed: {e}")))?;
-            if provider.profile_workspace != workspace
-                || normalize_profile_id(&provider.r#type).as_deref() != Some(profile_id)
-            {
-                continue;
-            }
-            let label = if is_platform_scope {
-                format!("{}/{}", provider.object_workspace(), provider.object_name())
-            } else {
-                provider.object_name().to_string()
-            };
-            blocking.push(label);
-        }
+        let label = if is_platform_scope {
+            format!("{}/{}", provider.object_workspace(), provider.object_name())
+        } else {
+            provider.object_name().to_string()
+        };
+        blocking.push(label);
     }
     blocking.sort();
     blocking.dedup();
@@ -2569,8 +2538,6 @@ pub(super) async fn handle_list_providers(
 ) -> Result<Response<ListProvidersResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
-
     let scope = authorize_list_workspace_selector(
         &state.store,
         &state.admin_role,
@@ -2579,13 +2546,8 @@ pub(super) async fn handle_list_providers(
         MinWorkspaceRole::User,
     )
     .await?;
-    let providers = if matches!(scope, AuthorizedWorkspaceScope::AllWorkspaces) {
-        let all: Vec<Provider> = state
-            .store
-            .list_all_messages(limit, request.offset)
-            .await
-            .map_err(|e| Status::internal(format!("list providers failed: {e}")))?;
-        all.into_iter().map(redact_provider_credentials).collect()
+    let workspace = if matches!(scope, AuthorizedWorkspaceScope::AllWorkspaces) {
+        None
     } else {
         let AuthorizedWorkspaceScope::Workspace(authz) = scope else {
             unreachable!("all-workspaces scope handled above")
@@ -2593,10 +2555,34 @@ pub(super) async fn handle_list_providers(
         let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
             .await?
             .name;
-        list_provider_records(state.store.as_ref(), &workspace, limit, request.offset).await?
+        Some(workspace)
     };
-
-    Ok(Response::new(ListProvidersResponse { providers }))
+    let scope_fingerprint = workspace.as_deref().unwrap_or("*");
+    let pagination = Pagination::new(
+        request.page_size,
+        &request.page_token,
+        "ListProviders",
+        &[scope_fingerprint],
+    )?;
+    let after = pagination.object_cursor()?;
+    let query = workspace
+        .as_deref()
+        .map_or(ObjectListQuery::AllWorkspaces, ObjectListQuery::Workspace);
+    let page = state
+        .store
+        .list_message_page::<Provider>(query, after.as_ref(), pagination.page_size())
+        .await
+        .map_err(|e| Status::internal(format!("list providers failed: {e}")))?;
+    let providers = page
+        .messages
+        .into_iter()
+        .map(redact_provider_credentials)
+        .collect();
+    let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
+    Ok(Response::new(ListProvidersResponse {
+        providers,
+        next_page_token,
+    }))
 }
 
 /// Return provider profiles visible in the given workspace scope.
@@ -2618,21 +2604,47 @@ pub(super) async fn handle_list_provider_profiles(
     )
     .await?
     .name;
-    let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE) as usize;
-    let offset = request.offset as usize;
+    let pagination = Pagination::new(
+        request.page_size,
+        &request.page_token,
+        "ListProviderProfiles",
+        &[&request.workspace],
+    )?;
+    let after = pagination.profile_cursor()?;
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
-    let profiles = catalog
+    let mut profiles = catalog
         .list_all_scoped_profiles()
         .into_iter()
-        .map(|(_, profile)| profile)
-        .skip(offset)
-        .take(limit)
-        .collect();
-
-    Ok(Response::new(ListProviderProfilesResponse { profiles }))
+        .map(|(scope, profile)| {
+            let scope = match scope {
+                ProfileScope::Static => "static",
+                ProfileScope::Platform => "platform",
+                ProfileScope::Workspace => "workspace",
+            };
+            (format!("{}\0{scope}", profile.id), profile)
+        })
+        .collect::<Vec<_>>();
+    profiles.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    if let Some(after) = after {
+        profiles.retain(|(key, _)| key.as_str() > after);
+    }
+    let page_size = usize::try_from(pagination.page_size())
+        .map_err(|_| Status::internal("page_size does not fit usize"))?;
+    let has_more = profiles.len() > page_size;
+    profiles.truncate(page_size);
+    let next_key = if has_more {
+        profiles.last().map(|(key, _)| key.as_str())
+    } else {
+        None
+    };
+    let next_page_token = pagination.next_profile_token(next_key);
+    Ok(Response::new(ListProviderProfilesResponse {
+        profiles: profiles.into_iter().map(|(_, profile)| profile).collect(),
+        next_page_token,
+    }))
 }
 
 pub(super) async fn handle_get_provider_profile(
@@ -3012,7 +3024,7 @@ pub(super) async fn get_provider_type_profile(
 ) -> Result<Option<ProviderTypeProfile>, Status> {
     // Query stored profiles scoped to the requested workspace.
     let stored: Vec<StoredProviderProfile> = store
-        .list_messages(workspace, 10_000, 0)
+        .collect_messages(ObjectListQuery::Workspace(workspace))
         .await
         .map_err(|e| Status::internal(format!("list provider profiles failed: {e}")))?;
     let id_norm = normalize_profile_id(id);
@@ -5852,8 +5864,8 @@ mod tests {
         let response = handle_list_provider_profiles(
             &state,
             authed_request(ListProviderProfilesRequest {
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 workspace: "default".to_string(),
             }),
         )
@@ -5954,8 +5966,8 @@ mod tests {
         let listed = handle_list_provider_profiles(
             &state,
             authed_request(ListProviderProfilesRequest {
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 workspace: "default".to_string(),
             }),
         )
@@ -13127,8 +13139,8 @@ mod tests {
         let listed = handle_list_providers(
             &state,
             authed_request(ListProvidersRequest {
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -13143,8 +13155,8 @@ mod tests {
         let listed = handle_list_providers(
             &state,
             authed_request(ListProvidersRequest {
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "beta".to_string(),
                 )),
@@ -13174,8 +13186,8 @@ mod tests {
         let listed = handle_list_providers(
             &state,
             authed_request(ListProvidersRequest {
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -13230,8 +13242,8 @@ mod tests {
         let listed = handle_list_providers(
             &state,
             authed_request(ListProvidersRequest {
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
             }),
         )
@@ -13596,8 +13608,8 @@ mod tests {
                 handle_list_provider_profiles(
                     &state,
                     authed_request(ListProviderProfilesRequest {
-                        limit: 200,
-                        offset: 0,
+                        page_size: 200,
+                        page_token: String::new(),
                         workspace,
                     }),
                 )
@@ -13720,8 +13732,8 @@ mod tests {
         let resp = handle_list_provider_profiles(
             &state,
             authed_request(ListProviderProfilesRequest {
-                limit: 200,
-                offset: 0,
+                page_size: 200,
+                page_token: String::new(),
                 workspace: "default".to_string(),
             }),
         )
@@ -13765,8 +13777,8 @@ mod tests {
         let resp = handle_list_provider_profiles(
             &state,
             authed_request(ListProviderProfilesRequest {
-                limit: 200,
-                offset: 0,
+                page_size: 200,
+                page_token: String::new(),
                 workspace: "default".to_string(),
             }),
         )
@@ -13905,8 +13917,8 @@ mod tests {
         let resp = handle_list_provider_profiles(
             &state,
             authed_request(ListProviderProfilesRequest {
-                limit: 200,
-                offset: 0,
+                page_size: 200,
+                page_token: String::new(),
                 workspace: String::new(),
             }),
         )

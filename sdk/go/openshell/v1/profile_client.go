@@ -20,30 +20,28 @@ func newProfileClient(conn grpc.ClientConnInterface) *profileClient {
 }
 
 func (p *profileClient) List(ctx context.Context, workspace string, opts ...ListOptions) ([]*ProviderProfile, error) {
+	pageSize, err := listPageSize(opts)
+	if err != nil {
+		return nil, err
+	}
 	req := &pb.ListProviderProfilesRequest{
 		Workspace: workspace,
+		PageSize:  pageSize,
 	}
-	if len(opts) > 0 {
-		if opts[0].Limit < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
+	var profiles []*ProviderProfile
+	for {
+		resp, err := p.client.ListProviderProfiles(ctx, req)
+		if err != nil {
+			return nil, converter.FromGRPCError(err)
 		}
-		if opts[0].Offset < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "offset must not be negative"}
+		for _, profile := range resp.GetProfiles() {
+			profiles = append(profiles, converter.ProviderProfileFromProto(profile))
 		}
-		req.Limit = uint32(opts[0].Limit)
-		req.Offset = uint32(opts[0].Offset)
+		if resp.GetNextPageToken() == "" {
+			return profiles, nil
+		}
+		req.PageToken = resp.GetNextPageToken()
 	}
-
-	resp, err := p.client.ListProviderProfiles(ctx, req)
-	if err != nil {
-		return nil, converter.FromGRPCError(err)
-	}
-
-	profiles := make([]*ProviderProfile, 0, len(resp.GetProfiles()))
-	for _, pp := range resp.GetProfiles() {
-		profiles = append(profiles, converter.ProviderProfileFromProto(pp))
-	}
-	return profiles, nil
 }
 
 func (p *profileClient) Get(ctx context.Context, workspace, id string) (*ProviderProfile, error) {

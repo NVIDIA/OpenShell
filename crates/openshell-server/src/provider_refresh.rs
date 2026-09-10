@@ -6,13 +6,15 @@
 #![allow(clippy::result_large_err)]
 
 use crate::credentials::RefreshMaterialScope;
-use crate::persistence::{ObjectType, PersistenceError, Store, WriteCondition, current_time_ms};
+use crate::persistence::{
+    ObjectListQuery, ObjectType, PersistenceError, Store, WriteCondition, current_time_ms,
+};
 use openshell_core::ObjectWorkspace;
 use openshell_core::proto::{
     CredentialHandle, Provider, ProviderCredentialRefreshRecoveryAction,
     ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
 };
-use openshell_core::{ObjectId, ObjectName, SetResourceVersion};
+use openshell_core::{ObjectId, ObjectName};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -26,7 +28,6 @@ const DEFAULT_REFRESH_BEFORE_SECONDS: i64 = 300;
 const DEFAULT_MAX_LIFETIME_SECONDS: i64 = 3600;
 const REFRESH_ERROR_RETRY_SECONDS: i64 = 60;
 const REFRESH_CONFIGURATION_RETRY_SECONDS: i64 = 60 * 60;
-const REFRESH_WORKER_PAGE_SIZE: u32 = 1000;
 const MAX_OAUTH_ERROR_RESPONSE_BYTES: usize = 8 * 1024;
 
 pub fn refresh_material_scope(
@@ -171,51 +172,19 @@ pub async fn list_refresh_states_for_provider(
     store: &Store,
     provider_id: &str,
 ) -> Result<Vec<StoredProviderCredentialRefreshState>, Status> {
-    let records = store
-        .list_by_scope(
-            StoredProviderCredentialRefreshState::object_type(),
-            provider_id,
-            1000,
-            0,
-        )
+    store
+        .collect_messages(ObjectListQuery::Scope(provider_id))
         .await
-        .map_err(|e| Status::internal(format!("list provider refresh states failed: {e}")))?;
-
-    let mut states = Vec::with_capacity(records.len());
-    for record in records {
-        let mut state = StoredProviderCredentialRefreshState::decode(record.payload.as_slice())
-            .map_err(|e| Status::internal(format!("decode provider refresh state failed: {e}")))?;
-        state.set_resource_version(record.resource_version);
-        states.push(state);
-    }
-    Ok(states)
+        .map_err(|e| Status::internal(format!("list provider refresh states failed: {e}")))
 }
 
 pub async fn list_all_refresh_states(
     store: &Store,
 ) -> Result<Vec<StoredProviderCredentialRefreshState>, Status> {
-    let mut states = Vec::new();
-    let mut offset = 0;
-    loop {
-        let page = store
-            .list_all_messages::<StoredProviderCredentialRefreshState>(
-                REFRESH_WORKER_PAGE_SIZE,
-                offset,
-            )
-            .await
-            .map_err(|e| Status::internal(format!("list provider refresh states failed: {e}")))?;
-        if page.is_empty() {
-            break;
-        }
-        offset = offset
-            .checked_add(
-                u32::try_from(page.len())
-                    .map_err(|_| Status::internal("provider refresh page size exceeded u32"))?,
-            )
-            .ok_or_else(|| Status::internal("provider refresh pagination offset overflow"))?;
-        states.extend(page);
-    }
-    Ok(states)
+    store
+        .collect_messages(ObjectListQuery::AllWorkspaces)
+        .await
+        .map_err(|e| Status::internal(format!("list provider refresh states failed: {e}")))
 }
 
 pub async fn get_refresh_state(

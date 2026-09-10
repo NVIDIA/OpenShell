@@ -125,11 +125,19 @@ pub trait PolicyStoreExt {
         version: i64,
     ) -> PersistenceResult<Option<PolicyRecord>>;
 
+    #[allow(dead_code)]
     async fn list_policies(
         &self,
         sandbox_id: &str,
         limit: u32,
         offset: u32,
+    ) -> PersistenceResult<Vec<PolicyRecord>>;
+
+    async fn list_policies_before(
+        &self,
+        sandbox_id: &str,
+        limit: u32,
+        before_version: Option<i64>,
     ) -> PersistenceResult<Vec<PolicyRecord>>;
 
     async fn update_policy_status(
@@ -279,6 +287,26 @@ impl PolicyStoreExt for Store {
         match self {
             Self::Postgres(store) => store.list_policies(sandbox_id, limit, offset).await,
             Self::Sqlite(store) => store.list_policies(sandbox_id, limit, offset).await,
+        }
+    }
+
+    async fn list_policies_before(
+        &self,
+        sandbox_id: &str,
+        limit: u32,
+        before_version: Option<i64>,
+    ) -> PersistenceResult<Vec<PolicyRecord>> {
+        match self {
+            Self::Postgres(store) => {
+                store
+                    .list_policies_before(sandbox_id, limit, before_version)
+                    .await
+            }
+            Self::Sqlite(store) => {
+                store
+                    .list_policies_before(sandbox_id, limit, before_version)
+                    .await
+            }
         }
     }
 

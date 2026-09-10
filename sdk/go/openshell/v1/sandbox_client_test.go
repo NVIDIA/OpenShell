@@ -30,6 +30,8 @@ type mockSandboxServer struct {
 	createErr          error
 	getErr             error
 	listErr            error
+	listPages          [][]*pb.Sandbox
+	listRequests       []*pb.ListSandboxesRequest
 	deleteErr          error
 	attachErr          error
 	detachErr          error
@@ -98,11 +100,26 @@ func (s *mockSandboxServer) setPhase(name string, phase pb.SandboxPhase) {
 	}
 }
 
-func (s *mockSandboxServer) ListSandboxes(_ context.Context, _ *pb.ListSandboxesRequest) (*pb.ListSandboxesResponse, error) {
+func (s *mockSandboxServer) ListSandboxes(_ context.Context, req *pb.ListSandboxesRequest) (*pb.ListSandboxesResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.listRequests = append(s.listRequests, proto.Clone(req).(*pb.ListSandboxesRequest))
 	if s.listErr != nil {
 		return nil, s.listErr
+	}
+	if s.listPages != nil {
+		page := 0
+		if req.GetPageToken() == "page-2" {
+			page = 1
+		}
+		nextPageToken := ""
+		if page+1 < len(s.listPages) {
+			nextPageToken = "page-2"
+		}
+		return &pb.ListSandboxesResponse{
+			Sandboxes:     s.listPages[page],
+			NextPageToken: nextPageToken,
+		}, nil
 	}
 	var list []*pb.Sandbox
 	for _, sb := range s.sandboxes {
@@ -428,10 +445,35 @@ func TestSandboxList_WithOptions(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	result, err := client.List(context.Background(), "default", ListOptions{Limit: 10, Offset: 0})
+	result, err := client.List(context.Background(), "default", ListOptions{PageSize: 10})
 
 	require.NoError(t, err)
 	assert.Len(t, result, 1)
+}
+
+func TestSandboxList_FollowsContinuationTokens(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.listPages = [][]*pb.Sandbox{
+		{{Metadata: &dm.ObjectMeta{Name: "first"}}},
+		{{Metadata: &dm.ObjectMeta{Name: "second"}}},
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	result, err := client.List(context.Background(), "default", ListOptions{
+		PageSize:      1,
+		LabelSelector: "team=core",
+	})
+
+	require.NoError(t, err)
+	require.Len(t, result, 2)
+	assert.Equal(t, "first", result[0].Name)
+	assert.Equal(t, "second", result[1].Name)
+	require.Len(t, mock.listRequests, 2)
+	assert.Empty(t, mock.listRequests[0].GetPageToken())
+	assert.Equal(t, "page-2", mock.listRequests[1].GetPageToken())
+	assert.Equal(t, int32(1), mock.listRequests[1].GetPageSize())
+	assert.Equal(t, "team=core", mock.listRequests[1].GetLabelSelector())
 }
 
 func TestSandboxDelete(t *testing.T) {

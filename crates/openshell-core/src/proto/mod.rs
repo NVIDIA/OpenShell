@@ -63,6 +63,11 @@ pub mod middleware {
     pub use super::generated::openshell::middleware::v1;
 }
 
+#[doc(hidden)]
+pub mod pagination {
+    pub use super::generated::openshell::internal::pagination::v1;
+}
+
 pub mod gateway_interceptor {
     pub use super::generated::openshell::gateway_interceptor::v1;
 }

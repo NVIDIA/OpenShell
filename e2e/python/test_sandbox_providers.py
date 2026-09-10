@@ -1091,7 +1091,7 @@ def test_provider_profile_platform_vs_workspace_isolation(
         assert resp.imported, "workspace-scoped import should succeed"
 
         platform_list = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(limit=200, workspace="")
+            openshell_pb2.ListProviderProfilesRequest(page_size=200, workspace="")
         )
         platform_ids = [p.id for p in platform_list.profiles]
         assert platform_id in platform_ids, (
@@ -1102,7 +1102,7 @@ def test_provider_profile_platform_vs_workspace_isolation(
         )
 
         workspace_list = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(limit=200, workspace="default")
+            openshell_pb2.ListProviderProfilesRequest(page_size=200, workspace="default")
         )
         workspace_ids = [p.id for p in workspace_list.profiles]
         assert workspace_id in workspace_ids, (
@@ -1158,14 +1158,14 @@ def test_cross_workspace_profile_ids_do_not_collide(
         assert resp_b.imported, "import into ws-b should succeed"
 
         list_a = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(limit=200, workspace=ws_a)
+            openshell_pb2.ListProviderProfilesRequest(page_size=200, workspace=ws_a)
         )
         assert any(p.id == profile_id for p in list_a.profiles), (
             "profile should appear in ws-a"
         )
 
         list_b = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(limit=200, workspace=ws_b)
+            openshell_pb2.ListProviderProfilesRequest(page_size=200, workspace=ws_b)
         )
         assert any(p.id == profile_id for p in list_b.profiles), (
             "profile should appear in ws-b"

@@ -42,7 +42,7 @@ def test_sandbox_api_crud_and_exec(
         fetched = sandbox_client.get(sb.sandbox.name, workspace="default")
         assert fetched.id == sb.id
 
-        ids = set(sandbox_client.list_ids(workspace="default", limit=100))
+        ids = set(sandbox_client.list_ids(workspace="default", page_size=100))
         assert sb.id in ids
 
         result = sb.exec(["python", "-c", "print('sandbox-ok')"])

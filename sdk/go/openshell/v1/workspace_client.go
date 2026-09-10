@@ -49,29 +49,29 @@ func (w *workspaceClient) Get(ctx context.Context, name string) (*Workspace, err
 }
 
 func (w *workspaceClient) List(ctx context.Context, opts ...ListOptions) ([]*Workspace, error) {
-	req := &pb.ListWorkspacesRequest{}
+	pageSize, err := listPageSize(opts)
+	if err != nil {
+		return nil, err
+	}
+	req := &pb.ListWorkspacesRequest{PageSize: pageSize}
 	if len(opts) > 0 {
-		if opts[0].Limit < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
-		}
-		if opts[0].Offset < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "offset must not be negative"}
-		}
-		req.Limit = uint32(opts[0].Limit)
-		req.Offset = uint32(opts[0].Offset)
 		req.LabelSelector = opts[0].LabelSelector
 	}
 
-	resp, err := w.client.ListWorkspaces(ctx, req)
-	if err != nil {
-		return nil, converter.FromGRPCError(err)
+	var workspaces []*Workspace
+	for {
+		resp, err := w.client.ListWorkspaces(ctx, req)
+		if err != nil {
+			return nil, converter.FromGRPCError(err)
+		}
+		for _, proto := range resp.GetWorkspaces() {
+			workspaces = append(workspaces, converter.WorkspaceFromProto(proto))
+		}
+		if resp.GetNextPageToken() == "" {
+			return workspaces, nil
+		}
+		req.PageToken = resp.GetNextPageToken()
 	}
-
-	workspaces := make([]*Workspace, 0, len(resp.GetWorkspaces()))
-	for _, proto := range resp.GetWorkspaces() {
-		workspaces = append(workspaces, converter.WorkspaceFromProto(proto))
-	}
-	return workspaces, nil
 }
 
 func (w *workspaceClient) Delete(ctx context.Context, name string) error {
@@ -135,28 +135,26 @@ func (w *workspaceClient) ListMembers(ctx context.Context, workspace string, opt
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "workspace name must not be empty"}
 	}
 
+	pageSize, err := listPageSize(opts)
+	if err != nil {
+		return nil, err
+	}
 	req := &pb.ListWorkspaceMembersRequest{
 		Workspace: workspace,
+		PageSize:  pageSize,
 	}
-	if len(opts) > 0 {
-		if opts[0].Limit < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
+	var members []*WorkspaceMember
+	for {
+		resp, err := w.client.ListWorkspaceMembers(ctx, req)
+		if err != nil {
+			return nil, converter.FromGRPCError(err)
 		}
-		if opts[0].Offset < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "offset must not be negative"}
+		for _, proto := range resp.GetMembers() {
+			members = append(members, converter.WorkspaceMemberFromProto(proto))
 		}
-		req.Limit = uint32(opts[0].Limit)
-		req.Offset = uint32(opts[0].Offset)
+		if resp.GetNextPageToken() == "" {
+			return members, nil
+		}
+		req.PageToken = resp.GetNextPageToken()
 	}
-
-	resp, err := w.client.ListWorkspaceMembers(ctx, req)
-	if err != nil {
-		return nil, converter.FromGRPCError(err)
-	}
-
-	members := make([]*WorkspaceMember, 0, len(resp.GetMembers()))
-	for _, proto := range resp.GetMembers() {
-		members = append(members, converter.WorkspaceMemberFromProto(proto))
-	}
-	return members, nil
 }

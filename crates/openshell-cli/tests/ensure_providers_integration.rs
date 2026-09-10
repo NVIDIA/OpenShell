@@ -314,7 +314,10 @@ impl OpenShell for TestOpenShell {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        Ok(Response::new(ListProvidersResponse { providers }))
+        Ok(Response::new(ListProvidersResponse {
+            providers,
+            next_page_token: String::new(),
+        }))
     }
 
     async fn list_provider_profiles(
@@ -326,7 +329,10 @@ impl OpenShell for TestOpenShell {
             .map(openshell_providers::ProviderTypeProfile::to_proto)
             .collect();
         Ok(Response::new(
-            openshell_core::proto::ListProviderProfilesResponse { profiles },
+            openshell_core::proto::ListProviderProfilesResponse {
+                profiles,
+                next_page_token: String::new(),
+            },
         ))
     }
 

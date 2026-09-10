@@ -34,6 +34,13 @@
 use miette::{IntoDiagnostic, Result};
 use std::io::Write;
 
+/// Report a continuation token without corrupting structured stdout.
+pub fn print_next_page_token(next_page_token: &str) {
+    if !next_page_token.is_empty() {
+        eprintln!("Next page token: {next_page_token}");
+    }
+}
+
 /// Print collection output in specified format (json/yaml/table).
 ///
 /// # Returns

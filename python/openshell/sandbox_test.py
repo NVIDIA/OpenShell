@@ -1963,7 +1963,11 @@ def _make_workload_template_proto(
 
 
 class _FakeSandboxStub:
-    def __init__(self, listed: list[openshell_pb2.Sandbox] | None = None) -> None:
+    def __init__(
+        self,
+        listed: list[openshell_pb2.Sandbox] | None = None,
+        listed_pages: list[list[openshell_pb2.Sandbox]] | None = None,
+    ) -> None:
         self.create_request: openshell_pb2.CreateSandboxRequest | None = None
         self.list_request: openshell_pb2.ListSandboxesRequest | None = None
         self.get_request: openshell_pb2.GetSandboxRequest | None = None
@@ -1981,6 +1985,8 @@ class _FakeSandboxStub:
             openshell_pb2.DeleteSandboxTemplateRequest | None
         ) = None
         self._listed = listed or []
+        self._listed_pages = listed_pages
+        self.list_requests: list[openshell_pb2.ListSandboxesRequest] = []
         self._templates: list[openshell_pb2.SandboxWorkloadTemplate] = []
 
     def GetSandbox(
@@ -2061,7 +2067,17 @@ class _FakeSandboxStub:
         timeout: float | None = None,
     ) -> Any:
         self.list_request = request
+        self.list_requests.append(deepcopy(request))
         _ = timeout
+        if self._listed_pages is not None:
+            page = int(request.page_token or "0")
+            next_page_token = (
+                str(page + 1) if page + 1 < len(self._listed_pages) else ""
+            )
+            return SimpleNamespace(
+                sandboxes=list(self._listed_pages[page]),
+                next_page_token=next_page_token,
+            )
         return SimpleNamespace(sandboxes=list(self._listed))
 
     def CreateSandboxTemplate(
@@ -2393,13 +2409,13 @@ def test_sandbox_template_client_crud_forwards_requests() -> None:
     assert _request_workspace(stub.get_template_request) == "default"
 
     listed = client.list(
-        workspace="default", limit=50, offset=10, label_selector="team=runtime"
+        workspace="default", page_size=50, label_selector="team=runtime"
     )
     assert len(listed) == 1
     assert stub.list_template_request is not None
     assert _request_workspace(stub.list_template_request) == "default"
-    assert stub.list_template_request.limit == 50
-    assert stub.list_template_request.offset == 10
+    assert stub.list_template_request.page_size == 50
+    assert stub.list_template_request.page_token == ""
     assert stub.list_template_request.label_selector == "team=runtime"
     assert not _request_selects_all_workspaces(stub.list_template_request)
 
@@ -2413,13 +2429,13 @@ def test_sandbox_template_list_for_all_workspaces_selects_all() -> None:
     stub = _FakeSandboxStub()
     client = _template_client_with_fake_stub(stub)
 
-    client.list_for_all_workspaces(limit=100, offset=5, label_selector="team=runtime")
+    client.list_for_all_workspaces(page_size=100, label_selector="team=runtime")
 
     assert stub.list_template_request is not None
     assert _request_selects_all_workspaces(stub.list_template_request)
     assert _request_workspace(stub.list_template_request) is None
-    assert stub.list_template_request.limit == 100
-    assert stub.list_template_request.offset == 5
+    assert stub.list_template_request.page_size == 100
+    assert stub.list_template_request.page_token == ""
     assert stub.list_template_request.label_selector == "team=runtime"
 
 
@@ -2532,6 +2548,26 @@ def test_list_without_selector_sends_empty_string() -> None:
 
     assert stub.list_request is not None
     assert stub.list_request.label_selector == ""
+
+
+def test_list_follows_continuation_tokens() -> None:
+    stub = _FakeSandboxStub(
+        listed_pages=[
+            [_make_sandbox_proto("sandbox-1", "job-1")],
+            [_make_sandbox_proto("sandbox-2", "job-2")],
+        ]
+    )
+    client = _client_with_fake_stub(stub)
+
+    sandboxes = client.list(
+        workspace="default", page_size=1, label_selector="team=core"
+    )
+
+    assert [sandbox.name for sandbox in sandboxes] == ["job-1", "job-2"]
+    assert len(stub.list_requests) == 2
+    assert stub.list_requests[0].page_token == ""
+    assert stub.list_requests[1].page_token == "1"
+    assert stub.list_requests[1].label_selector == "team=core"
 
 
 def test_list_ids_forwards_label_selector() -> None:

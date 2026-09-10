@@ -59,6 +59,12 @@ Curated calls without a workspace argument explicitly select the `default`
 workspace. Cross-workspace listing uses the separate `*_all_workspaces`
 methods and requires Platform Admin access.
 
+Curated list methods follow continuation tokens until the collection is
+exhausted. `ListOptions::page_size` and
+`SandboxTemplateListOptions::page_size` control the size of each gateway
+request; callers that need explicit page boundaries can use the raw protobuf
+client.
+
 ```rust
 use openshell_sdk::{
     ClientConfig, OpenShellClient, SandboxTemplateCreateSpec,

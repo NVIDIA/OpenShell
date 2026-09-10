@@ -186,13 +186,15 @@ const sandbox = await client.sandbox.createFromTemplate({
 })
 
 await client.sandboxTemplates.get('python', { workspace: 'default' })
-await client.sandboxTemplates.list({ workspace: 'default', limit: 100 })
+await client.sandboxTemplates.list({ workspace: 'default', pageSize: 100 })
 await client.sandboxTemplates.delete('python', { workspace: 'default' })
 ```
 
 Use `allWorkspaces: true` on `list()` for a platform-admin view. The
 discriminated option type makes `workspace` and `allWorkspaces` mutually
 exclusive. Omitting both options explicitly selects the `default` workspace.
+List methods follow continuation tokens automatically; `pageSize` controls
+each gateway request.
 
 ## Surface and roadmap
 

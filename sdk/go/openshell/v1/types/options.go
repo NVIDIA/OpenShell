@@ -12,8 +12,7 @@ type CreateOptions struct {
 
 // ListOptions configures resource listing with pagination and filtering.
 type ListOptions struct {
-	Limit         int
-	Offset        int
+	PageSize      int
 	LabelSelector string
 }
 

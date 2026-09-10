@@ -67,27 +67,26 @@ func (p *providerClient) ListAll(ctx context.Context, opts ...ListOptions) ([]*P
 }
 
 func (p *providerClient) list(ctx context.Context, req *pb.ListProvidersRequest, opts ...ListOptions) ([]*Provider, error) {
-	if len(opts) > 0 {
-		if opts[0].Limit < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
-		}
-		if opts[0].Offset < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "offset must not be negative"}
-		}
-		req.Limit = uint32(opts[0].Limit)
-		req.Offset = uint32(opts[0].Offset)
-	}
-
-	resp, err := p.client.ListProviders(ctx, req)
+	pageSize, err := listPageSize(opts)
 	if err != nil {
-		return nil, converter.FromGRPCError(err)
+		return nil, err
 	}
+	req.PageSize = pageSize
 
-	providers := make([]*Provider, 0, len(resp.GetProviders()))
-	for _, proto := range resp.GetProviders() {
-		providers = append(providers, converter.ProviderFromProto(proto))
+	var providers []*Provider
+	for {
+		resp, err := p.client.ListProviders(ctx, req)
+		if err != nil {
+			return nil, converter.FromGRPCError(err)
+		}
+		for _, proto := range resp.GetProviders() {
+			providers = append(providers, converter.ProviderFromProto(proto))
+		}
+		if resp.GetNextPageToken() == "" {
+			return providers, nil
+		}
+		req.PageToken = resp.GetNextPageToken()
 	}
-	return providers, nil
 }
 
 func (p *providerClient) Update(ctx context.Context, workspace string, provider *Provider) (*Provider, error) {

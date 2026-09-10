@@ -143,16 +143,12 @@ func TestSandboxTemplate_ListRejectsNegativePagination(t *testing.T) {
 	tc := newTestSandboxTemplateClient()
 	ctx := context.Background()
 
-	_, err := tc.List(ctx, "default", types.ListOptions{Limit: -1})
-	require.Error(t, err)
-	assert.True(t, types.IsInvalidArgument(err))
-
-	_, err = tc.List(ctx, "default", types.ListOptions{Offset: -1})
+	_, err := tc.List(ctx, "default", types.ListOptions{PageSize: -1})
 	require.Error(t, err)
 	assert.True(t, types.IsInvalidArgument(err))
 }
 
-func TestSandboxTemplate_ListAppliesPaginationAfterFiltering(t *testing.T) {
+func TestSandboxTemplate_ListReturnsAllFilteredResults(t *testing.T) {
 	tc := newTestSandboxTemplateClient()
 	ctx := context.Background()
 
@@ -180,21 +176,13 @@ func TestSandboxTemplate_ListAppliesPaginationAfterFiltering(t *testing.T) {
 
 	listed, err := tc.List(ctx, "default", types.ListOptions{
 		LabelSelector: "team=runtime",
-		Offset:        1,
-		Limit:         1,
+		PageSize:      1,
 	})
 
 	require.NoError(t, err)
-	require.Len(t, listed, 1)
-	assert.Equal(t, "runtime-b", listed[0].Name)
-
-	listed, err = tc.List(ctx, "default", types.ListOptions{
-		LabelSelector: "team=runtime",
-		Offset:        2,
-	})
-
-	require.NoError(t, err)
-	assert.Empty(t, listed)
+	require.Len(t, listed, 2)
+	assert.Equal(t, "runtime-a", listed[0].Name)
+	assert.Equal(t, "runtime-b", listed[1].Name)
 }
 
 func TestSandboxTemplate_CreateSandboxFromTemplateRequiresExistingTemplate(t *testing.T) {

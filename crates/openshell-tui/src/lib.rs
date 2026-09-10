@@ -36,7 +36,7 @@ use event::{Event, EventHandler};
 /// Duration to show the splash screen before auto-dismissing.
 const SPLASH_DURATION: Duration = Duration::from_secs(3);
 const PROVIDER_PROFILE_SCOPE_WORKSPACE: &str = "workspace";
-const PROVIDER_PROFILE_PAGE_SIZE: u32 = 100;
+const PROVIDER_PROFILE_PAGE_SIZE: i32 = 100;
 
 type ProviderProfileCache = HashMap<(String, String), openshell_core::proto::ProviderProfile>;
 
@@ -2046,25 +2046,37 @@ async fn refresh_data(app: &mut App) {
 }
 
 async fn refresh_workspaces(app: &mut App) {
-    let req = openshell_core::proto::ListWorkspacesRequest {
-        limit: 100,
-        offset: 0,
-        label_selector: String::new(),
-    };
-    match tokio::time::timeout(Duration::from_secs(5), app.client.list_workspaces(req)).await {
-        Ok(Ok(resp)) => {
-            app.workspace_names = resp
-                .into_inner()
-                .workspaces
-                .into_iter()
-                .filter_map(|w| w.metadata.map(|m| m.name))
-                .collect();
-        }
-        Ok(Err(e)) => {
-            app.status_text = format!("failed to list workspaces: {}", e.message());
-        }
-        Err(_) => {
-            app.status_text = "list workspaces timed out".to_string();
+    let mut workspace_names = Vec::new();
+    let mut page_token = String::new();
+    loop {
+        let req = openshell_core::proto::ListWorkspacesRequest {
+            page_size: 100,
+            page_token,
+            label_selector: String::new(),
+        };
+        match tokio::time::timeout(Duration::from_secs(5), app.client.list_workspaces(req)).await {
+            Ok(Ok(resp)) => {
+                let response = resp.into_inner();
+                workspace_names.extend(
+                    response
+                        .workspaces
+                        .into_iter()
+                        .filter_map(|workspace| workspace.metadata.map(|metadata| metadata.name)),
+                );
+                if response.next_page_token.is_empty() {
+                    app.workspace_names = workspace_names;
+                    return;
+                }
+                page_token = response.next_page_token;
+            }
+            Ok(Err(e)) => {
+                app.status_text = format!("failed to list workspaces: {}", e.message());
+                return;
+            }
+            Err(_) => {
+                app.status_text = "list workspaces timed out".to_string();
+                return;
+            }
         }
     }
 }
@@ -2112,17 +2124,26 @@ fn cached_provider_profile(
 }
 
 async fn refresh_providers(app: &mut App) {
-    let req = openshell_core::proto::ListProvidersRequest {
-        limit: 100,
-        offset: 0,
-        workspace_scope: Some(list_workspace_scope(
-            &app.current_workspace,
-            app.all_workspaces,
-        )),
-    };
-    let response =
+    let mut providers = Vec::new();
+    let mut page_token = String::new();
+    loop {
+        let req = openshell_core::proto::ListProvidersRequest {
+            page_size: 100,
+            page_token,
+            workspace_scope: Some(list_workspace_scope(
+                &app.current_workspace,
+                app.all_workspaces,
+            )),
+        };
         match tokio::time::timeout(Duration::from_secs(5), app.client.list_providers(req)).await {
-            Ok(Ok(resp)) => resp.into_inner(),
+            Ok(Ok(resp)) => {
+                let response = resp.into_inner();
+                providers.extend(response.providers);
+                if response.next_page_token.is_empty() {
+                    break;
+                }
+                page_token = response.next_page_token;
+            }
             Ok(Err(e)) => {
                 app.status_text = format!("failed to list providers: {}", e.message());
                 return;
@@ -2131,8 +2152,8 @@ async fn refresh_providers(app: &mut App) {
                 app.status_text = "list providers timed out".to_string();
                 return;
             }
-        };
-    let providers = response.providers;
+        }
+    }
 
     let mut workspaces: std::collections::HashSet<String> = providers
         .iter()
@@ -2149,13 +2170,13 @@ async fn refresh_providers(app: &mut App) {
     for ws in &workspaces {
         let client = app.client.clone();
         let workspace = ws.clone();
-        if let Some(listed) = collect_provider_profile_pages(move |offset| {
+        if let Some(listed) = collect_provider_profile_pages(move |page_token| {
             let mut client = client.clone();
             let workspace = workspace.clone();
             async move {
                 let req = openshell_core::proto::ListProviderProfilesRequest {
-                    limit: PROVIDER_PROFILE_PAGE_SIZE,
-                    offset,
+                    page_size: PROVIDER_PROFILE_PAGE_SIZE,
+                    page_token,
                     workspace,
                 };
                 match tokio::time::timeout(
@@ -2164,7 +2185,10 @@ async fn refresh_providers(app: &mut App) {
                 )
                 .await
                 {
-                    Ok(Ok(response)) => Some(response.into_inner().profiles),
+                    Ok(Ok(response)) => {
+                        let response = response.into_inner();
+                        Some((response.profiles, response.next_page_token))
+                    }
                     _ => None,
                 }
             }
@@ -2218,19 +2242,18 @@ async fn collect_provider_profile_pages<F, Fut>(
     mut fetch_page: F,
 ) -> Option<Vec<openshell_core::proto::ProviderProfile>>
 where
-    F: FnMut(u32) -> Fut,
-    Fut: Future<Output = Option<Vec<openshell_core::proto::ProviderProfile>>>,
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Option<(Vec<openshell_core::proto::ProviderProfile>, String)>>,
 {
     let mut profiles = Vec::new();
-    let mut offset = 0;
+    let mut page_token = String::new();
     loop {
-        let page = fetch_page(offset).await?;
-        let page_len = page.len();
+        let (page, next_page_token) = fetch_page(page_token).await?;
         profiles.extend(page);
-        if page_len < PROVIDER_PROFILE_PAGE_SIZE as usize {
+        if next_page_token.is_empty() {
             return Some(profiles);
         }
-        offset = offset.saturating_add(PROVIDER_PROFILE_PAGE_SIZE);
+        page_token = next_page_token;
     }
 }
 
@@ -2263,8 +2286,8 @@ async fn refresh_global_settings(app: &mut App) {
     // Check for an active global policy only while the caller can read it.
     let policy_req = openshell_core::proto::ListSandboxPoliciesRequest {
         name: String::new(),
-        limit: 1,
-        offset: 0,
+        page_size: 1,
+        page_token: String::new(),
         global: true,
         workspace_scope: None,
     };
@@ -2524,109 +2547,122 @@ async fn refresh_health(app: &mut App) {
 }
 
 async fn refresh_sandboxes(app: &mut App) {
-    let req = openshell_core::proto::ListSandboxesRequest {
-        limit: 100,
-        offset: 0,
-        label_selector: String::new(),
-        workspace_scope: Some(list_workspace_scope(
-            &app.current_workspace,
-            app.all_workspaces,
-        )),
-    };
-    let result = tokio::time::timeout(Duration::from_secs(5), app.client.list_sandboxes(req)).await;
-    match result {
-        Ok(Err(e)) => {
-            app.status_text = format!("failed to list sandboxes: {}", e.message());
-        }
-        Err(_) => {
-            app.status_text = "list sandboxes timed out".to_string();
-        }
-        Ok(Ok(resp)) => {
-            let sandboxes = resp.into_inner().sandboxes;
-            app.sandbox_count = sandboxes.len();
-            app.sandbox_ids = sandboxes
-                .iter()
-                .map(|s| s.object_id().to_string())
-                .collect();
-            app.sandbox_names = sandboxes
-                .iter()
-                .map(|s| s.object_name().to_string())
-                .collect();
-            app.sandbox_phases = sandboxes.iter().map(|s| phase_label(s.phase())).collect();
-            app.sandbox_images = sandboxes
-                .iter()
-                .map(|s| {
-                    s.spec
-                        .as_ref()
-                        .and_then(|spec| spec.template.as_ref())
-                        .map(|t| t.image.as_str())
-                        .filter(|img| !img.is_empty())
-                        .unwrap_or("-")
-                        .to_string()
-                })
-                .collect();
-            app.sandbox_ages = sandboxes
-                .iter()
-                .map(|s| {
-                    s.metadata
-                        .as_ref()
-                        .map_or_else(|| "?".to_string(), |m| format_age(m.created_at_ms))
-                })
-                .collect();
-            app.sandbox_created = sandboxes
-                .iter()
-                .map(|s| {
-                    s.metadata
-                        .as_ref()
-                        .map_or_else(|| "?".to_string(), |m| format_timestamp(m.created_at_ms))
-                })
-                .collect();
-
-            app.sandbox_policy_versions = sandboxes
-                .iter()
-                .map(openshell_core::proto::Sandbox::current_policy_version)
-                .collect();
-
-            // Build NOTES column from active port forwards.
-            let forwards = openshell_core::forward::list_forwards().unwrap_or_default();
-            app.sandbox_notes = sandboxes
-                .iter()
-                .map(|s| {
-                    let name = s.object_name();
-                    openshell_core::forward::build_sandbox_notes(name, &forwards)
-                })
-                .collect();
-
-            // Build LABELS column from metadata.
-            app.sandbox_labels = sandboxes
-                .iter()
-                .map(|s| {
-                    s.object_labels()
-                        .as_ref()
-                        .map(app::format_labels)
-                        .unwrap_or_default()
-                })
-                .collect();
-
-            app.sandbox_annotations = sandboxes
-                .iter()
-                .map(|s| {
-                    s.metadata
-                        .as_ref()
-                        .map(|metadata| app::format_annotations(&metadata.annotations))
-                        .unwrap_or_default()
-                })
-                .collect();
-
-            app.sandbox_workspaces = sandboxes
-                .iter()
-                .map(|s| s.object_workspace().to_string())
-                .collect();
-
-            if app.sandbox_selected >= app.sandbox_count && app.sandbox_count > 0 {
-                app.sandbox_selected = app.sandbox_count - 1;
+    let mut page_token = String::new();
+    let mut sandboxes = Vec::new();
+    loop {
+        let req = openshell_core::proto::ListSandboxesRequest {
+            page_size: 100,
+            page_token,
+            label_selector: String::new(),
+            workspace_scope: Some(list_workspace_scope(
+                &app.current_workspace,
+                app.all_workspaces,
+            )),
+        };
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), app.client.list_sandboxes(req)).await;
+        match result {
+            Ok(Err(e)) => {
+                app.status_text = format!("failed to list sandboxes: {}", e.message());
+                return;
+            }
+            Err(_) => {
+                app.status_text = "list sandboxes timed out".to_string();
+                return;
+            }
+            Ok(Ok(resp)) => {
+                let response = resp.into_inner();
+                sandboxes.extend(response.sandboxes);
+                if response.next_page_token.is_empty() {
+                    break;
+                }
+                page_token = response.next_page_token;
             }
         }
+    }
+
+    app.sandbox_count = sandboxes.len();
+    app.sandbox_ids = sandboxes
+        .iter()
+        .map(|s| s.object_id().to_string())
+        .collect();
+    app.sandbox_names = sandboxes
+        .iter()
+        .map(|s| s.object_name().to_string())
+        .collect();
+    app.sandbox_phases = sandboxes.iter().map(|s| phase_label(s.phase())).collect();
+    app.sandbox_images = sandboxes
+        .iter()
+        .map(|s| {
+            s.spec
+                .as_ref()
+                .and_then(|spec| spec.template.as_ref())
+                .map(|t| t.image.as_str())
+                .filter(|img| !img.is_empty())
+                .unwrap_or("-")
+                .to_string()
+        })
+        .collect();
+    app.sandbox_ages = sandboxes
+        .iter()
+        .map(|s| {
+            s.metadata
+                .as_ref()
+                .map_or_else(|| "?".to_string(), |m| format_age(m.created_at_ms))
+        })
+        .collect();
+    app.sandbox_created = sandboxes
+        .iter()
+        .map(|s| {
+            s.metadata
+                .as_ref()
+                .map_or_else(|| "?".to_string(), |m| format_timestamp(m.created_at_ms))
+        })
+        .collect();
+
+    app.sandbox_policy_versions = sandboxes
+        .iter()
+        .map(openshell_core::proto::Sandbox::current_policy_version)
+        .collect();
+
+    // Build NOTES column from active port forwards.
+    let forwards = openshell_core::forward::list_forwards().unwrap_or_default();
+    app.sandbox_notes = sandboxes
+        .iter()
+        .map(|s| {
+            let name = s.object_name();
+            openshell_core::forward::build_sandbox_notes(name, &forwards)
+        })
+        .collect();
+
+    // Build LABELS column from metadata.
+    app.sandbox_labels = sandboxes
+        .iter()
+        .map(|s| {
+            s.object_labels()
+                .as_ref()
+                .map(app::format_labels)
+                .unwrap_or_default()
+        })
+        .collect();
+
+    app.sandbox_annotations = sandboxes
+        .iter()
+        .map(|s| {
+            s.metadata
+                .as_ref()
+                .map(|metadata| app::format_annotations(&metadata.annotations))
+                .unwrap_or_default()
+        })
+        .collect();
+
+    app.sandbox_workspaces = sandboxes
+        .iter()
+        .map(|s| s.object_workspace().to_string())
+        .collect();
+
+    if app.sandbox_selected >= app.sandbox_count && app.sandbox_count > 0 {
+        app.sandbox_selected = app.sandbox_count - 1;
     }
 }
 
@@ -2896,29 +2932,31 @@ mod provider_profile_pagination_tests {
 
     #[tokio::test]
     async fn profile_fetch_continues_until_page_two_is_collected() {
-        let requested_offsets = Arc::new(Mutex::new(Vec::new()));
-        let offsets = Arc::clone(&requested_offsets);
+        let requested_tokens = Arc::new(Mutex::new(Vec::new()));
+        let tokens = Arc::clone(&requested_tokens);
 
-        let profiles = collect_provider_profile_pages(move |offset| {
-            let offsets = Arc::clone(&offsets);
+        let profiles = collect_provider_profile_pages(move |page_token| {
+            let tokens = Arc::clone(&tokens);
             async move {
-                offsets.lock().unwrap().push(offset);
-                match offset {
-                    0 => Some(
+                tokens.lock().unwrap().push(page_token.clone());
+                match page_token.as_str() {
+                    "" => Some((
                         (0..PROVIDER_PROFILE_PAGE_SIZE)
                             .map(|index| openshell_core::proto::ProviderProfile {
                                 id: format!("profile-{index}"),
                                 ..Default::default()
                             })
                             .collect(),
-                    ),
-                    PROVIDER_PROFILE_PAGE_SIZE => {
-                        Some(vec![openshell_core::proto::ProviderProfile {
+                        "next".to_string(),
+                    )),
+                    "next" => Some((
+                        vec![openshell_core::proto::ProviderProfile {
                             id: "page-two-profile".to_string(),
                             ..Default::default()
-                        }])
-                    }
-                    _ => panic!("unexpected profile page offset {offset}"),
+                        }],
+                        String::new(),
+                    )),
+                    _ => panic!("unexpected profile page token {page_token}"),
                 }
             }
         })
@@ -2926,8 +2964,8 @@ mod provider_profile_pagination_tests {
         .expect("all pages should load");
 
         assert_eq!(
-            *requested_offsets.lock().unwrap(),
-            vec![0, PROVIDER_PROFILE_PAGE_SIZE]
+            *requested_tokens.lock().unwrap(),
+            vec![String::new(), "next".to_string()]
         );
         assert_eq!(profiles.len(), PROVIDER_PROFILE_PAGE_SIZE as usize + 1);
         assert_eq!(profiles.last().unwrap().id, "page-two-profile");

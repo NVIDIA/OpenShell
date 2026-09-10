@@ -1155,8 +1155,12 @@ message GetSandboxTemplateRequest {
 message ListSandboxTemplatesRequest {
   reserved 3, 4;
   reserved "workspace", "all_workspaces";
-  uint32 limit = 1;
-  uint32 offset = 2;
+  // The maximum number of templates to return. Zero uses 100. Values above
+  // 1000 are coerced to 1000; negative values are invalid.
+  int32 page_size = 1;
+  // Token from a previous ListSandboxTemplates response. All other request
+  // parameters except page_size must match the request that produced it.
+  string page_token = 2;
   // Optional label selector in key=value comma-separated form.
   string label_selector = 5;
   // Explicit named or all-workspaces scope.
@@ -1177,6 +1181,8 @@ message SandboxTemplateResponse {
 
 message ListSandboxTemplatesResponse {
   repeated SandboxWorkloadTemplate templates = 1;
+  // Token for the next page. Empty when there are no subsequent pages.
+  string next_page_token = 2;
 }
 
 message DeleteSandboxTemplateResponse {
@@ -1226,8 +1232,12 @@ message GetSandboxRequest {
 message ListSandboxesRequest {
   reserved 4, 5;
   reserved "workspace", "all_workspaces";
-  uint32 limit = 1;
-  uint32 offset = 2;
+  // The maximum number of sandboxes to return. Zero uses 100. Values above
+  // 1000 are coerced to 1000; negative values are invalid.
+  int32 page_size = 1;
+  // Token from a previous ListSandboxes response. All other request parameters
+  // except page_size must match the request that produced it.
+  string page_token = 2;
   // Optional label selector for filtering (format: "key1=value1,key2=value2").
   string label_selector = 3;
   // Explicit named or all-workspaces scope.
@@ -1316,6 +1326,8 @@ message SandboxResponse {
 // List sandboxes response.
 message ListSandboxesResponse {
   repeated Sandbox sandboxes = 1;
+  // Token for the next page. Empty when there are no subsequent pages.
+  string next_page_token = 2;
 }
 
 // List providers attached to a sandbox response.
@@ -1416,10 +1428,12 @@ message ListServicesRequest {
   reserved "workspace", "all_workspaces";
   // Optional sandbox name. Empty lists endpoints for all sandboxes.
   string sandbox = 1;
-  // Page size. Zero uses the server default.
-  uint32 limit = 2;
-  // Page offset.
-  uint32 offset = 3;
+  // The maximum number of services to return. Zero uses 100. Values above
+  // 1000 are coerced to 1000; negative values are invalid.
+  int32 page_size = 2;
+  // Token from a previous ListServices response. All other request parameters
+  // except page_size must match the request that produced it.
+  string page_token = 3;
   // Explicit named or all-workspaces scope.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 6;
 }
@@ -1427,6 +1441,8 @@ message ListServicesRequest {
 // Response containing exposed sandbox service endpoints.
 message ListServicesResponse {
   repeated ServiceEndpointResponse services = 1;
+  // Token for the next page. Empty when there are no subsequent pages.
+  string next_page_token = 2;
 }
 
 // Request to delete an exposed sandbox service endpoint.
@@ -1695,8 +1711,12 @@ message GetProviderRequest {
 message ListProvidersRequest {
   reserved 3, 4;
   reserved "workspace", "all_workspaces";
-  uint32 limit = 1;
-  uint32 offset = 2;
+  // The maximum number of providers to return. Zero uses 100. Values above
+  // 1000 are coerced to 1000; negative values are invalid.
+  int32 page_size = 1;
+  // Token from a previous ListProviders response. All other request parameters
+  // except page_size must match the request that produced it.
+  string page_token = 2;
   // Explicit named or all-workspaces scope.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
 }
@@ -1730,12 +1750,18 @@ message ProviderResponse {
 // List providers response.
 message ListProvidersResponse {
   repeated openshell.datamodel.v1.Provider providers = 1;
+  // Token for the next page. Empty when there are no subsequent pages.
+  string next_page_token = 2;
 }
 
 // List provider type profiles request.
 message ListProviderProfilesRequest {
-  uint32 limit = 1;
-  uint32 offset = 2;
+  // The maximum number of profiles to return. Zero uses 100. Values above
+  // 1000 are coerced to 1000; negative values are invalid.
+  int32 page_size = 1;
+  // Token from a previous ListProviderProfiles response. All other request
+  // parameters except page_size must match the request that produced it.
+  string page_token = 2;
   // Workspace scope. When set, returns workspace-scoped + built-in profiles.
   // When empty, returns platform-scoped + built-in only.
   string workspace = 3;
@@ -2027,6 +2053,8 @@ message ProviderProfileResponse {
 // List provider profiles response.
 message ListProviderProfilesResponse {
   repeated ProviderProfile profiles = 1;
+  // Token for the next page. Empty when there are no subsequent pages.
+  string next_page_token = 2;
 }
 
 // Import custom provider profiles request.
@@ -2308,8 +2336,12 @@ message ListSandboxPoliciesRequest {
   reserved "workspace";
   // Sandbox name (canonical lookup key). Ignored when global is true.
   string name = 1;
-  uint32 limit = 2;
-  uint32 offset = 3;
+  // The maximum number of revisions to return. Zero uses 100. Values above
+  // 1000 are coerced to 1000; negative values are invalid.
+  int32 page_size = 2;
+  // Token from a previous ListSandboxPolicies response. All other request
+  // parameters except page_size must match the request that produced it.
+  string page_token = 3;
   // List global policy revisions instead of sandbox-scoped ones.
   bool global = 4;
   // Explicit workspace scope for sandbox-scoped queries. Omit only when
@@ -2322,6 +2354,8 @@ message ListSandboxPoliciesResponse {
   // Invalid historical payloads remain visible as failed projections so one
   // legacy row cannot hide the rest of the policy history.
   repeated SandboxPolicyRevision revisions = 1;
+  // Token for the next page. Empty when there are no subsequent pages.
+  string next_page_token = 2;
 }
 
 // Report policy load status (called by sandbox runtime after reload attempt).
@@ -2949,8 +2983,12 @@ message GetWorkspaceResponse {
 
 // List workspaces request.
 message ListWorkspacesRequest {
-  uint32 limit = 1;
-  uint32 offset = 2;
+  // The maximum number of workspaces to return. Zero uses 100. Values above
+  // 1000 are coerced to 1000; negative values are invalid.
+  int32 page_size = 1;
+  // Token from a previous ListWorkspaces response. All other request parameters
+  // except page_size must match the request that produced it.
+  string page_token = 2;
   // Optional label selector for filtering (format: "key1=value1,key2=value2").
   string label_selector = 3;
 }
@@ -2958,6 +2996,8 @@ message ListWorkspacesRequest {
 // List workspaces response.
 message ListWorkspacesResponse {
   repeated openshell.datamodel.v1.Workspace workspaces = 1;
+  // Token for the next page. Empty when there are no subsequent pages.
+  string next_page_token = 2;
 }
 
 // Delete workspace request.
@@ -3035,13 +3075,19 @@ message RemoveWorkspaceMemberResponse {
 message ListWorkspaceMembersRequest {
   // Workspace name.
   string workspace = 1;
-  uint32 limit = 2;
-  uint32 offset = 3;
+  // The maximum number of members to return. Zero uses 100. Values above
+  // 1000 are coerced to 1000; negative values are invalid.
+  int32 page_size = 2;
+  // Token from a previous ListWorkspaceMembers response. All other request
+  // parameters except page_size must match the request that produced it.
+  string page_token = 3;
 }
 
 // List workspace members response.
 message ListWorkspaceMembersResponse {
   repeated WorkspaceMember members = 1;
+  // Token for the next page. Empty when there are no subsequent pages.
+  string next_page_token = 2;
 }
 
 // Short-lived credential for one policy-authorized extension service.

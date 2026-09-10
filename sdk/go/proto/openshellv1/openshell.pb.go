@@ -2675,9 +2675,13 @@ func (x *GetSandboxTemplateRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSe
 }
 
 type ListSandboxTemplatesRequest struct {
-	state  protoimpl.MessageState `protogen:"open.v1"`
-	Limit  uint32                 `protobuf:"varint,1,opt,name=limit,proto3" json:"limit,omitempty"`
-	Offset uint32                 `protobuf:"varint,2,opt,name=offset,proto3" json:"offset,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The maximum number of templates to return. Zero uses 100. Values above
+	// 1000 are coerced to 1000; negative values are invalid.
+	PageSize int32 `protobuf:"varint,1,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
+	// Token from a previous ListSandboxTemplates response. All other request
+	// parameters except page_size must match the request that produced it.
+	PageToken string `protobuf:"bytes,2,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
 	// Optional label selector in key=value comma-separated form.
 	LabelSelector string `protobuf:"bytes,5,opt,name=label_selector,json=labelSelector,proto3" json:"label_selector,omitempty"`
 	// Explicit named or all-workspaces scope.
@@ -2716,18 +2720,18 @@ func (*ListSandboxTemplatesRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{34}
 }
 
-func (x *ListSandboxTemplatesRequest) GetLimit() uint32 {
+func (x *ListSandboxTemplatesRequest) GetPageSize() int32 {
 	if x != nil {
-		return x.Limit
+		return x.PageSize
 	}
 	return 0
 }
 
-func (x *ListSandboxTemplatesRequest) GetOffset() uint32 {
+func (x *ListSandboxTemplatesRequest) GetPageToken() string {
 	if x != nil {
-		return x.Offset
+		return x.PageToken
 	}
-	return 0
+	return ""
 }
 
 func (x *ListSandboxTemplatesRequest) GetLabelSelector() string {
@@ -2842,8 +2846,10 @@ func (x *SandboxTemplateResponse) GetTemplate() *SandboxWorkloadTemplate {
 }
 
 type ListSandboxTemplatesResponse struct {
-	state         protoimpl.MessageState     `protogen:"open.v1"`
-	Templates     []*SandboxWorkloadTemplate `protobuf:"bytes,1,rep,name=templates,proto3" json:"templates,omitempty"`
+	state     protoimpl.MessageState     `protogen:"open.v1"`
+	Templates []*SandboxWorkloadTemplate `protobuf:"bytes,1,rep,name=templates,proto3" json:"templates,omitempty"`
+	// Token for the next page. Empty when there are no subsequent pages.
+	NextPageToken string `protobuf:"bytes,2,opt,name=next_page_token,json=nextPageToken,proto3" json:"next_page_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2883,6 +2889,13 @@ func (x *ListSandboxTemplatesResponse) GetTemplates() []*SandboxWorkloadTemplate
 		return x.Templates
 	}
 	return nil
+}
+
+func (x *ListSandboxTemplatesResponse) GetNextPageToken() string {
+	if x != nil {
+		return x.NextPageToken
+	}
+	return ""
 }
 
 type DeleteSandboxTemplateResponse struct {
@@ -3128,9 +3141,13 @@ func (x *GetSandboxRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
 
 // List sandboxes request.
 type ListSandboxesRequest struct {
-	state  protoimpl.MessageState `protogen:"open.v1"`
-	Limit  uint32                 `protobuf:"varint,1,opt,name=limit,proto3" json:"limit,omitempty"`
-	Offset uint32                 `protobuf:"varint,2,opt,name=offset,proto3" json:"offset,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The maximum number of sandboxes to return. Zero uses 100. Values above
+	// 1000 are coerced to 1000; negative values are invalid.
+	PageSize int32 `protobuf:"varint,1,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
+	// Token from a previous ListSandboxes response. All other request parameters
+	// except page_size must match the request that produced it.
+	PageToken string `protobuf:"bytes,2,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
 	// Optional label selector for filtering (format: "key1=value1,key2=value2").
 	LabelSelector string `protobuf:"bytes,3,opt,name=label_selector,json=labelSelector,proto3" json:"label_selector,omitempty"`
 	// Explicit named or all-workspaces scope.
@@ -3169,18 +3186,18 @@ func (*ListSandboxesRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{42}
 }
 
-func (x *ListSandboxesRequest) GetLimit() uint32 {
+func (x *ListSandboxesRequest) GetPageSize() int32 {
 	if x != nil {
-		return x.Limit
+		return x.PageSize
 	}
 	return 0
 }
 
-func (x *ListSandboxesRequest) GetOffset() uint32 {
+func (x *ListSandboxesRequest) GetPageToken() string {
 	if x != nil {
-		return x.Offset
+		return x.PageToken
 	}
-	return 0
+	return ""
 }
 
 func (x *ListSandboxesRequest) GetLabelSelector() string {
@@ -3616,8 +3633,10 @@ func (x *SandboxResponse) GetSandbox() *Sandbox {
 
 // List sandboxes response.
 type ListSandboxesResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Sandboxes     []*Sandbox             `protobuf:"bytes,1,rep,name=sandboxes,proto3" json:"sandboxes,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Sandboxes []*Sandbox             `protobuf:"bytes,1,rep,name=sandboxes,proto3" json:"sandboxes,omitempty"`
+	// Token for the next page. Empty when there are no subsequent pages.
+	NextPageToken string `protobuf:"bytes,2,opt,name=next_page_token,json=nextPageToken,proto3" json:"next_page_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3657,6 +3676,13 @@ func (x *ListSandboxesResponse) GetSandboxes() []*Sandbox {
 		return x.Sandboxes
 	}
 	return nil
+}
+
+func (x *ListSandboxesResponse) GetNextPageToken() string {
+	if x != nil {
+		return x.NextPageToken
+	}
+	return ""
 }
 
 // List providers attached to a sandbox response.
@@ -4164,10 +4190,12 @@ type ListServicesRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Optional sandbox name. Empty lists endpoints for all sandboxes.
 	Sandbox string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
-	// Page size. Zero uses the server default.
-	Limit uint32 `protobuf:"varint,2,opt,name=limit,proto3" json:"limit,omitempty"`
-	// Page offset.
-	Offset uint32 `protobuf:"varint,3,opt,name=offset,proto3" json:"offset,omitempty"`
+	// The maximum number of services to return. Zero uses 100. Values above
+	// 1000 are coerced to 1000; negative values are invalid.
+	PageSize int32 `protobuf:"varint,2,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
+	// Token from a previous ListServices response. All other request parameters
+	// except page_size must match the request that produced it.
+	PageToken string `protobuf:"bytes,3,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
 	// Explicit named or all-workspaces scope.
 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,6,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 	unknownFields  protoimpl.UnknownFields
@@ -4211,18 +4239,18 @@ func (x *ListServicesRequest) GetSandbox() string {
 	return ""
 }
 
-func (x *ListServicesRequest) GetLimit() uint32 {
+func (x *ListServicesRequest) GetPageSize() int32 {
 	if x != nil {
-		return x.Limit
+		return x.PageSize
 	}
 	return 0
 }
 
-func (x *ListServicesRequest) GetOffset() uint32 {
+func (x *ListServicesRequest) GetPageToken() string {
 	if x != nil {
-		return x.Offset
+		return x.PageToken
 	}
-	return 0
+	return ""
 }
 
 func (x *ListServicesRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
@@ -4234,8 +4262,10 @@ func (x *ListServicesRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector
 
 // Response containing exposed sandbox service endpoints.
 type ListServicesResponse struct {
-	state         protoimpl.MessageState     `protogen:"open.v1"`
-	Services      []*ServiceEndpointResponse `protobuf:"bytes,1,rep,name=services,proto3" json:"services,omitempty"`
+	state    protoimpl.MessageState     `protogen:"open.v1"`
+	Services []*ServiceEndpointResponse `protobuf:"bytes,1,rep,name=services,proto3" json:"services,omitempty"`
+	// Token for the next page. Empty when there are no subsequent pages.
+	NextPageToken string `protobuf:"bytes,2,opt,name=next_page_token,json=nextPageToken,proto3" json:"next_page_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4275,6 +4305,13 @@ func (x *ListServicesResponse) GetServices() []*ServiceEndpointResponse {
 		return x.Services
 	}
 	return nil
+}
+
+func (x *ListServicesResponse) GetNextPageToken() string {
+	if x != nil {
+		return x.NextPageToken
+	}
+	return ""
 }
 
 // Request to delete an exposed sandbox service endpoint.
@@ -5937,9 +5974,13 @@ func (x *GetProviderRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector 
 
 // List providers request.
 type ListProvidersRequest struct {
-	state  protoimpl.MessageState `protogen:"open.v1"`
-	Limit  uint32                 `protobuf:"varint,1,opt,name=limit,proto3" json:"limit,omitempty"`
-	Offset uint32                 `protobuf:"varint,2,opt,name=offset,proto3" json:"offset,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The maximum number of providers to return. Zero uses 100. Values above
+	// 1000 are coerced to 1000; negative values are invalid.
+	PageSize int32 `protobuf:"varint,1,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
+	// Token from a previous ListProviders response. All other request parameters
+	// except page_size must match the request that produced it.
+	PageToken string `protobuf:"bytes,2,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
 	// Explicit named or all-workspaces scope.
 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,5,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 	unknownFields  protoimpl.UnknownFields
@@ -5976,18 +6017,18 @@ func (*ListProvidersRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{83}
 }
 
-func (x *ListProvidersRequest) GetLimit() uint32 {
+func (x *ListProvidersRequest) GetPageSize() int32 {
 	if x != nil {
-		return x.Limit
+		return x.PageSize
 	}
 	return 0
 }
 
-func (x *ListProvidersRequest) GetOffset() uint32 {
+func (x *ListProvidersRequest) GetPageToken() string {
 	if x != nil {
-		return x.Offset
+		return x.PageToken
 	}
-	return 0
+	return ""
 }
 
 func (x *ListProvidersRequest) GetWorkspaceScope() *datamodelv1.WorkspaceSelector {
@@ -6162,8 +6203,10 @@ func (x *ProviderResponse) GetProvider() *datamodelv1.Provider {
 
 // List providers response.
 type ListProvidersResponse struct {
-	state         protoimpl.MessageState  `protogen:"open.v1"`
-	Providers     []*datamodelv1.Provider `protobuf:"bytes,1,rep,name=providers,proto3" json:"providers,omitempty"`
+	state     protoimpl.MessageState  `protogen:"open.v1"`
+	Providers []*datamodelv1.Provider `protobuf:"bytes,1,rep,name=providers,proto3" json:"providers,omitempty"`
+	// Token for the next page. Empty when there are no subsequent pages.
+	NextPageToken string `protobuf:"bytes,2,opt,name=next_page_token,json=nextPageToken,proto3" json:"next_page_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6205,11 +6248,22 @@ func (x *ListProvidersResponse) GetProviders() []*datamodelv1.Provider {
 	return nil
 }
 
+func (x *ListProvidersResponse) GetNextPageToken() string {
+	if x != nil {
+		return x.NextPageToken
+	}
+	return ""
+}
+
 // List provider type profiles request.
 type ListProviderProfilesRequest struct {
-	state  protoimpl.MessageState `protogen:"open.v1"`
-	Limit  uint32                 `protobuf:"varint,1,opt,name=limit,proto3" json:"limit,omitempty"`
-	Offset uint32                 `protobuf:"varint,2,opt,name=offset,proto3" json:"offset,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The maximum number of profiles to return. Zero uses 100. Values above
+	// 1000 are coerced to 1000; negative values are invalid.
+	PageSize int32 `protobuf:"varint,1,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
+	// Token from a previous ListProviderProfiles response. All other request
+	// parameters except page_size must match the request that produced it.
+	PageToken string `protobuf:"bytes,2,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
 	// Workspace scope. When set, returns workspace-scoped + built-in profiles.
 	// When empty, returns platform-scoped + built-in only.
 	Workspace     string `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
@@ -6247,18 +6301,18 @@ func (*ListProviderProfilesRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{88}
 }
 
-func (x *ListProviderProfilesRequest) GetLimit() uint32 {
+func (x *ListProviderProfilesRequest) GetPageSize() int32 {
 	if x != nil {
-		return x.Limit
+		return x.PageSize
 	}
 	return 0
 }
 
-func (x *ListProviderProfilesRequest) GetOffset() uint32 {
+func (x *ListProviderProfilesRequest) GetPageToken() string {
 	if x != nil {
-		return x.Offset
+		return x.PageToken
 	}
-	return 0
+	return ""
 }
 
 func (x *ListProviderProfilesRequest) GetWorkspace() string {
@@ -7912,8 +7966,10 @@ func (x *ProviderProfileResponse) GetProfile() *ProviderProfile {
 
 // List provider profiles response.
 type ListProviderProfilesResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Profiles      []*ProviderProfile     `protobuf:"bytes,1,rep,name=profiles,proto3" json:"profiles,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Profiles []*ProviderProfile     `protobuf:"bytes,1,rep,name=profiles,proto3" json:"profiles,omitempty"`
+	// Token for the next page. Empty when there are no subsequent pages.
+	NextPageToken string `protobuf:"bytes,2,opt,name=next_page_token,json=nextPageToken,proto3" json:"next_page_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -7953,6 +8009,13 @@ func (x *ListProviderProfilesResponse) GetProfiles() []*ProviderProfile {
 		return x.Profiles
 	}
 	return nil
+}
+
+func (x *ListProviderProfilesResponse) GetNextPageToken() string {
+	if x != nil {
+		return x.NextPageToken
+	}
+	return ""
 }
 
 // Import custom provider profiles request.
@@ -9713,9 +9776,13 @@ func (x *GetSandboxPolicyStatusResponse) GetActiveVersion() uint32 {
 type ListSandboxPoliciesRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Sandbox name (canonical lookup key). Ignored when global is true.
-	Name   string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Limit  uint32 `protobuf:"varint,2,opt,name=limit,proto3" json:"limit,omitempty"`
-	Offset uint32 `protobuf:"varint,3,opt,name=offset,proto3" json:"offset,omitempty"`
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// The maximum number of revisions to return. Zero uses 100. Values above
+	// 1000 are coerced to 1000; negative values are invalid.
+	PageSize int32 `protobuf:"varint,2,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
+	// Token from a previous ListSandboxPolicies response. All other request
+	// parameters except page_size must match the request that produced it.
+	PageToken string `protobuf:"bytes,3,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
 	// List global policy revisions instead of sandbox-scoped ones.
 	Global bool `protobuf:"varint,4,opt,name=global,proto3" json:"global,omitempty"`
 	// Explicit workspace scope for sandbox-scoped queries. Omit only when
@@ -9762,18 +9829,18 @@ func (x *ListSandboxPoliciesRequest) GetName() string {
 	return ""
 }
 
-func (x *ListSandboxPoliciesRequest) GetLimit() uint32 {
+func (x *ListSandboxPoliciesRequest) GetPageSize() int32 {
 	if x != nil {
-		return x.Limit
+		return x.PageSize
 	}
 	return 0
 }
 
-func (x *ListSandboxPoliciesRequest) GetOffset() uint32 {
+func (x *ListSandboxPoliciesRequest) GetPageToken() string {
 	if x != nil {
-		return x.Offset
+		return x.PageToken
 	}
-	return 0
+	return ""
 }
 
 func (x *ListSandboxPoliciesRequest) GetGlobal() bool {
@@ -9795,7 +9862,9 @@ type ListSandboxPoliciesResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Invalid historical payloads remain visible as failed projections so one
 	// legacy row cannot hide the rest of the policy history.
-	Revisions     []*SandboxPolicyRevision `protobuf:"bytes,1,rep,name=revisions,proto3" json:"revisions,omitempty"`
+	Revisions []*SandboxPolicyRevision `protobuf:"bytes,1,rep,name=revisions,proto3" json:"revisions,omitempty"`
+	// Token for the next page. Empty when there are no subsequent pages.
+	NextPageToken string `protobuf:"bytes,2,opt,name=next_page_token,json=nextPageToken,proto3" json:"next_page_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -9835,6 +9904,13 @@ func (x *ListSandboxPoliciesResponse) GetRevisions() []*SandboxPolicyRevision {
 		return x.Revisions
 	}
 	return nil
+}
+
+func (x *ListSandboxPoliciesResponse) GetNextPageToken() string {
+	if x != nil {
+		return x.NextPageToken
+	}
+	return ""
 }
 
 // Report policy load status (called by sandbox runtime after reload attempt).
@@ -13568,9 +13644,13 @@ func (x *GetWorkspaceResponse) GetWorkspace() *datamodelv1.Workspace {
 
 // List workspaces request.
 type ListWorkspacesRequest struct {
-	state  protoimpl.MessageState `protogen:"open.v1"`
-	Limit  uint32                 `protobuf:"varint,1,opt,name=limit,proto3" json:"limit,omitempty"`
-	Offset uint32                 `protobuf:"varint,2,opt,name=offset,proto3" json:"offset,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The maximum number of workspaces to return. Zero uses 100. Values above
+	// 1000 are coerced to 1000; negative values are invalid.
+	PageSize int32 `protobuf:"varint,1,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
+	// Token from a previous ListWorkspaces response. All other request parameters
+	// except page_size must match the request that produced it.
+	PageToken string `protobuf:"bytes,2,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
 	// Optional label selector for filtering (format: "key1=value1,key2=value2").
 	LabelSelector string `protobuf:"bytes,3,opt,name=label_selector,json=labelSelector,proto3" json:"label_selector,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -13607,18 +13687,18 @@ func (*ListWorkspacesRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{195}
 }
 
-func (x *ListWorkspacesRequest) GetLimit() uint32 {
+func (x *ListWorkspacesRequest) GetPageSize() int32 {
 	if x != nil {
-		return x.Limit
+		return x.PageSize
 	}
 	return 0
 }
 
-func (x *ListWorkspacesRequest) GetOffset() uint32 {
+func (x *ListWorkspacesRequest) GetPageToken() string {
 	if x != nil {
-		return x.Offset
+		return x.PageToken
 	}
-	return 0
+	return ""
 }
 
 func (x *ListWorkspacesRequest) GetLabelSelector() string {
@@ -13630,8 +13710,10 @@ func (x *ListWorkspacesRequest) GetLabelSelector() string {
 
 // List workspaces response.
 type ListWorkspacesResponse struct {
-	state         protoimpl.MessageState   `protogen:"open.v1"`
-	Workspaces    []*datamodelv1.Workspace `protobuf:"bytes,1,rep,name=workspaces,proto3" json:"workspaces,omitempty"`
+	state      protoimpl.MessageState   `protogen:"open.v1"`
+	Workspaces []*datamodelv1.Workspace `protobuf:"bytes,1,rep,name=workspaces,proto3" json:"workspaces,omitempty"`
+	// Token for the next page. Empty when there are no subsequent pages.
+	NextPageToken string `protobuf:"bytes,2,opt,name=next_page_token,json=nextPageToken,proto3" json:"next_page_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -13671,6 +13753,13 @@ func (x *ListWorkspacesResponse) GetWorkspaces() []*datamodelv1.Workspace {
 		return x.Workspaces
 	}
 	return nil
+}
+
+func (x *ListWorkspacesResponse) GetNextPageToken() string {
+	if x != nil {
+		return x.NextPageToken
+	}
+	return ""
 }
 
 // Delete workspace request.
@@ -14040,9 +14129,13 @@ func (x *RemoveWorkspaceMemberResponse) GetRemoved() bool {
 type ListWorkspaceMembersRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Workspace name.
-	Workspace     string `protobuf:"bytes,1,opt,name=workspace,proto3" json:"workspace,omitempty"`
-	Limit         uint32 `protobuf:"varint,2,opt,name=limit,proto3" json:"limit,omitempty"`
-	Offset        uint32 `protobuf:"varint,3,opt,name=offset,proto3" json:"offset,omitempty"`
+	Workspace string `protobuf:"bytes,1,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	// The maximum number of members to return. Zero uses 100. Values above
+	// 1000 are coerced to 1000; negative values are invalid.
+	PageSize int32 `protobuf:"varint,2,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
+	// Token from a previous ListWorkspaceMembers response. All other request
+	// parameters except page_size must match the request that produced it.
+	PageToken     string `protobuf:"bytes,3,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -14084,24 +14177,26 @@ func (x *ListWorkspaceMembersRequest) GetWorkspace() string {
 	return ""
 }
 
-func (x *ListWorkspaceMembersRequest) GetLimit() uint32 {
+func (x *ListWorkspaceMembersRequest) GetPageSize() int32 {
 	if x != nil {
-		return x.Limit
+		return x.PageSize
 	}
 	return 0
 }
 
-func (x *ListWorkspaceMembersRequest) GetOffset() uint32 {
+func (x *ListWorkspaceMembersRequest) GetPageToken() string {
 	if x != nil {
-		return x.Offset
+		return x.PageToken
 	}
-	return 0
+	return ""
 }
 
 // List workspace members response.
 type ListWorkspaceMembersResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Members       []*WorkspaceMember     `protobuf:"bytes,1,rep,name=members,proto3" json:"members,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Members []*WorkspaceMember     `protobuf:"bytes,1,rep,name=members,proto3" json:"members,omitempty"`
+	// Token for the next page. Empty when there are no subsequent pages.
+	NextPageToken string `protobuf:"bytes,2,opt,name=next_page_token,json=nextPageToken,proto3" json:"next_page_token,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -14141,6 +14236,13 @@ func (x *ListWorkspaceMembersResponse) GetMembers() []*WorkspaceMember {
 		return x.Members
 	}
 	return nil
+}
+
+func (x *ListWorkspaceMembersResponse) GetNextPageToken() string {
+	if x != nil {
+		return x.NextPageToken
+	}
+	return ""
 }
 
 // Short-lived credential for one policy-authorized extension service.
@@ -14382,19 +14484,21 @@ const file_openshell_proto_rawDesc = "" +
 	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x02\x10\x03R\tworkspace\"\x94\x01\n" +
 	"\x19GetSandboxTemplateRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12R\n" +
-	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x02\x10\x03R\tworkspace\"\xed\x01\n" +
-	"\x1bListSandboxTemplatesRequest\x12\x14\n" +
-	"\x05limit\x18\x01 \x01(\rR\x05limit\x12\x16\n" +
-	"\x06offset\x18\x02 \x01(\rR\x06offset\x12%\n" +
+	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x02\x10\x03R\tworkspace\"\xfb\x01\n" +
+	"\x1bListSandboxTemplatesRequest\x12\x1b\n" +
+	"\tpage_size\x18\x01 \x01(\x05R\bpageSize\x12\x1d\n" +
+	"\n" +
+	"page_token\x18\x02 \x01(\tR\tpageToken\x12%\n" +
 	"\x0elabel_selector\x18\x05 \x01(\tR\rlabelSelector\x12R\n" +
 	"\x0fworkspace_scope\x18\x06 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05R\tworkspaceR\x0eall_workspaces\"\x97\x01\n" +
 	"\x1cDeleteSandboxTemplateRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12R\n" +
 	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x02\x10\x03R\tworkspace\"\\\n" +
 	"\x17SandboxTemplateResponse\x12A\n" +
-	"\btemplate\x18\x01 \x01(\v2%.openshell.v1.SandboxWorkloadTemplateR\btemplate\"c\n" +
+	"\btemplate\x18\x01 \x01(\v2%.openshell.v1.SandboxWorkloadTemplateR\btemplate\"\x8b\x01\n" +
 	"\x1cListSandboxTemplatesResponse\x12C\n" +
-	"\ttemplates\x18\x01 \x03(\v2%.openshell.v1.SandboxWorkloadTemplateR\ttemplates\"9\n" +
+	"\ttemplates\x18\x01 \x03(\v2%.openshell.v1.SandboxWorkloadTemplateR\ttemplates\x12&\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"9\n" +
 	"\x1dDeleteSandboxTemplateResponse\x12\x18\n" +
 	"\adeleted\x18\x01 \x01(\bR\adeleted\"\xbf\x01\n" +
 	"\x1cBeginRootfsTarStagingRequest\x12\x1b\n" +
@@ -14410,10 +14514,11 @@ const file_openshell_proto_rawDesc = "" +
 	"\rexpires_at_ms\x18\x04 \x01(\x03R\vexpiresAtMs\"\x8c\x01\n" +
 	"\x11GetSandboxRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12R\n" +
-	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x02\x10\x03R\tworkspace\"\xe6\x01\n" +
-	"\x14ListSandboxesRequest\x12\x14\n" +
-	"\x05limit\x18\x01 \x01(\rR\x05limit\x12\x16\n" +
-	"\x06offset\x18\x02 \x01(\rR\x06offset\x12%\n" +
+	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x02\x10\x03R\tworkspace\"\xf4\x01\n" +
+	"\x14ListSandboxesRequest\x12\x1b\n" +
+	"\tpage_size\x18\x01 \x01(\x05R\bpageSize\x12\x1d\n" +
+	"\n" +
+	"page_token\x18\x02 \x01(\tR\tpageToken\x12%\n" +
 	"\x0elabel_selector\x18\x03 \x01(\tR\rlabelSelector\x12R\n" +
 	"\x0fworkspace_scope\x18\x06 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06R\tworkspaceR\x0eall_workspaces\"\xa5\x01\n" +
 	"\x1bListSandboxProvidersRequest\x12!\n" +
@@ -14439,9 +14544,10 @@ const file_openshell_proto_rawDesc = "" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12R\n" +
 	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x02\x10\x03R\tworkspace\"B\n" +
 	"\x0fSandboxResponse\x12/\n" +
-	"\asandbox\x18\x01 \x01(\v2\x15.openshell.v1.SandboxR\asandbox\"L\n" +
+	"\asandbox\x18\x01 \x01(\v2\x15.openshell.v1.SandboxR\asandbox\"t\n" +
 	"\x15ListSandboxesResponse\x123\n" +
-	"\tsandboxes\x18\x01 \x03(\v2\x15.openshell.v1.SandboxR\tsandboxes\"^\n" +
+	"\tsandboxes\x18\x01 \x03(\v2\x15.openshell.v1.SandboxR\tsandboxes\x12&\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"^\n" +
 	"\x1cListSandboxProvidersResponse\x12>\n" +
 	"\tproviders\x18\x01 \x03(\v2 .openshell.datamodel.v1.ProviderR\tproviders\"l\n" +
 	"\x1dAttachSandboxProviderResponse\x12/\n" +
@@ -14474,14 +14580,16 @@ const file_openshell_proto_rawDesc = "" +
 	"\x11GetServiceRequest\x12\x18\n" +
 	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x18\n" +
 	"\aservice\x18\x02 \x01(\tR\aservice\x12R\n" +
-	"\x0fworkspace_scope\x18\x04 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x03\x10\x04R\tworkspace\"\xd8\x01\n" +
+	"\x0fworkspace_scope\x18\x04 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x03\x10\x04R\tworkspace\"\xe6\x01\n" +
 	"\x13ListServicesRequest\x12\x18\n" +
-	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x14\n" +
-	"\x05limit\x18\x02 \x01(\rR\x05limit\x12\x16\n" +
-	"\x06offset\x18\x03 \x01(\rR\x06offset\x12R\n" +
-	"\x0fworkspace_scope\x18\x06 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06R\tworkspaceR\x0eall_workspaces\"Y\n" +
+	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1b\n" +
+	"\tpage_size\x18\x02 \x01(\x05R\bpageSize\x12\x1d\n" +
+	"\n" +
+	"page_token\x18\x03 \x01(\tR\tpageToken\x12R\n" +
+	"\x0fworkspace_scope\x18\x06 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06R\tworkspaceR\x0eall_workspaces\"\x81\x01\n" +
 	"\x14ListServicesResponse\x12A\n" +
-	"\bservices\x18\x01 \x03(\v2%.openshell.v1.ServiceEndpointResponseR\bservices\"\xaf\x01\n" +
+	"\bservices\x18\x01 \x03(\v2%.openshell.v1.ServiceEndpointResponseR\bservices\x12&\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\xaf\x01\n" +
 	"\x14DeleteServiceRequest\x12\x18\n" +
 	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x18\n" +
 	"\aservice\x18\x02 \x01(\tR\aservice\x12R\n" +
@@ -14602,10 +14710,11 @@ const file_openshell_proto_rawDesc = "" +
 	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x02\x10\x03R\tworkspace\"\x8d\x01\n" +
 	"\x12GetProviderRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12R\n" +
-	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x02\x10\x03R\tworkspace\"\xbf\x01\n" +
-	"\x14ListProvidersRequest\x12\x14\n" +
-	"\x05limit\x18\x01 \x01(\rR\x05limit\x12\x16\n" +
-	"\x06offset\x18\x02 \x01(\rR\x06offset\x12R\n" +
+	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x02\x10\x03R\tworkspace\"\xcd\x01\n" +
+	"\x14ListProvidersRequest\x12\x1b\n" +
+	"\tpage_size\x18\x01 \x01(\x05R\bpageSize\x12\x1d\n" +
+	"\n" +
+	"page_token\x18\x02 \x01(\tR\tpageToken\x12R\n" +
 	"\x0fworkspace_scope\x18\x05 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05R\tworkspaceR\x0eall_workspaces\"\xfd\x02\n" +
 	"\x15UpdateProviderRequest\x12<\n" +
 	"\bprovider\x18\x01 \x01(\v2 .openshell.datamodel.v1.ProviderR\bprovider\x12w\n" +
@@ -14618,12 +14727,14 @@ const file_openshell_proto_rawDesc = "" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12R\n" +
 	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x02\x10\x03R\tworkspace\"P\n" +
 	"\x10ProviderResponse\x12<\n" +
-	"\bprovider\x18\x01 \x01(\v2 .openshell.datamodel.v1.ProviderR\bprovider\"W\n" +
+	"\bprovider\x18\x01 \x01(\v2 .openshell.datamodel.v1.ProviderR\bprovider\"\x7f\n" +
 	"\x15ListProvidersResponse\x12>\n" +
-	"\tproviders\x18\x01 \x03(\v2 .openshell.datamodel.v1.ProviderR\tproviders\"i\n" +
-	"\x1bListProviderProfilesRequest\x12\x14\n" +
-	"\x05limit\x18\x01 \x01(\rR\x05limit\x12\x16\n" +
-	"\x06offset\x18\x02 \x01(\rR\x06offset\x12\x1c\n" +
+	"\tproviders\x18\x01 \x03(\v2 .openshell.datamodel.v1.ProviderR\tproviders\x12&\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"w\n" +
+	"\x1bListProviderProfilesRequest\x12\x1b\n" +
+	"\tpage_size\x18\x01 \x01(\x05R\bpageSize\x12\x1d\n" +
+	"\n" +
+	"page_token\x18\x02 \x01(\tR\tpageToken\x12\x1c\n" +
 	"\tworkspace\x18\x03 \x01(\tR\tworkspace\"I\n" +
 	"\x19GetProviderProfileRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1c\n" +
@@ -14767,9 +14878,10 @@ const file_openshell_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"R\n" +
 	"\x17ProviderProfileResponse\x127\n" +
-	"\aprofile\x18\x01 \x01(\v2\x1d.openshell.v1.ProviderProfileR\aprofile\"Y\n" +
+	"\aprofile\x18\x01 \x01(\v2\x1d.openshell.v1.ProviderProfileR\aprofile\"\x81\x01\n" +
 	"\x1cListProviderProfilesResponse\x129\n" +
-	"\bprofiles\x18\x01 \x03(\v2\x1d.openshell.v1.ProviderProfileR\bprofiles\"\x82\x01\n" +
+	"\bprofiles\x18\x01 \x03(\v2\x1d.openshell.v1.ProviderProfileR\bprofiles\x12&\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\x82\x01\n" +
 	"\x1dImportProviderProfilesRequest\x12C\n" +
 	"\bprofiles\x18\x01 \x03(\v2'.openshell.v1.ProviderProfileImportItemR\bprofiles\x12\x1c\n" +
 	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"\xc2\x01\n" +
@@ -14906,15 +15018,17 @@ const file_openshell_proto_rawDesc = "" +
 	"\x0fworkspace_scope\x18\x05 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x04\x10\x05R\tworkspace\"\x88\x01\n" +
 	"\x1eGetSandboxPolicyStatusResponse\x12?\n" +
 	"\brevision\x18\x01 \x01(\v2#.openshell.v1.SandboxPolicyRevisionR\brevision\x12%\n" +
-	"\x0eactive_version\x18\x02 \x01(\rR\ractiveVersion\"\xdb\x01\n" +
+	"\x0eactive_version\x18\x02 \x01(\rR\ractiveVersion\"\xe9\x01\n" +
 	"\x1aListSandboxPoliciesRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
-	"\x05limit\x18\x02 \x01(\rR\x05limit\x12\x16\n" +
-	"\x06offset\x18\x03 \x01(\rR\x06offset\x12\x16\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1b\n" +
+	"\tpage_size\x18\x02 \x01(\x05R\bpageSize\x12\x1d\n" +
+	"\n" +
+	"page_token\x18\x03 \x01(\tR\tpageToken\x12\x16\n" +
 	"\x06global\x18\x04 \x01(\bR\x06global\x12R\n" +
-	"\x0fworkspace_scope\x18\x06 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x05\x10\x06R\tworkspace\"`\n" +
+	"\x0fworkspace_scope\x18\x06 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x05\x10\x06R\tworkspace\"\x88\x01\n" +
 	"\x1bListSandboxPoliciesResponse\x12A\n" +
-	"\trevisions\x18\x01 \x03(\v2#.openshell.v1.SandboxPolicyRevisionR\trevisions\"\xa7\x01\n" +
+	"\trevisions\x18\x01 \x03(\v2#.openshell.v1.SandboxPolicyRevisionR\trevisions\x12&\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\xa7\x01\n" +
 	"\x19ReportPolicyStatusRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x18\n" +
@@ -15192,15 +15306,17 @@ const file_openshell_proto_rawDesc = "" +
 	"\x13GetWorkspaceRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\"W\n" +
 	"\x14GetWorkspaceResponse\x12?\n" +
-	"\tworkspace\x18\x01 \x01(\v2!.openshell.datamodel.v1.WorkspaceR\tworkspace\"l\n" +
-	"\x15ListWorkspacesRequest\x12\x14\n" +
-	"\x05limit\x18\x01 \x01(\rR\x05limit\x12\x16\n" +
-	"\x06offset\x18\x02 \x01(\rR\x06offset\x12%\n" +
-	"\x0elabel_selector\x18\x03 \x01(\tR\rlabelSelector\"[\n" +
+	"\tworkspace\x18\x01 \x01(\v2!.openshell.datamodel.v1.WorkspaceR\tworkspace\"z\n" +
+	"\x15ListWorkspacesRequest\x12\x1b\n" +
+	"\tpage_size\x18\x01 \x01(\x05R\bpageSize\x12\x1d\n" +
+	"\n" +
+	"page_token\x18\x02 \x01(\tR\tpageToken\x12%\n" +
+	"\x0elabel_selector\x18\x03 \x01(\tR\rlabelSelector\"\x83\x01\n" +
 	"\x16ListWorkspacesResponse\x12A\n" +
 	"\n" +
 	"workspaces\x18\x01 \x03(\v2!.openshell.datamodel.v1.WorkspaceR\n" +
-	"workspaces\",\n" +
+	"workspaces\x12&\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\",\n" +
 	"\x16DeleteWorkspaceRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\"3\n" +
 	"\x17DeleteWorkspaceResponse\x12\x18\n" +
@@ -15219,13 +15335,15 @@ const file_openshell_proto_rawDesc = "" +
 	"\tworkspace\x18\x01 \x01(\tR\tworkspace\x12+\n" +
 	"\x11principal_subject\x18\x02 \x01(\tR\x10principalSubject\"9\n" +
 	"\x1dRemoveWorkspaceMemberResponse\x12\x18\n" +
-	"\aremoved\x18\x01 \x01(\bR\aremoved\"i\n" +
+	"\aremoved\x18\x01 \x01(\bR\aremoved\"w\n" +
 	"\x1bListWorkspaceMembersRequest\x12\x1c\n" +
-	"\tworkspace\x18\x01 \x01(\tR\tworkspace\x12\x14\n" +
-	"\x05limit\x18\x02 \x01(\rR\x05limit\x12\x16\n" +
-	"\x06offset\x18\x03 \x01(\rR\x06offset\"W\n" +
+	"\tworkspace\x18\x01 \x01(\tR\tworkspace\x12\x1b\n" +
+	"\tpage_size\x18\x02 \x01(\x05R\bpageSize\x12\x1d\n" +
+	"\n" +
+	"page_token\x18\x03 \x01(\tR\tpageToken\"\x7f\n" +
 	"\x1cListWorkspaceMembersResponse\x127\n" +
-	"\amembers\x18\x01 \x03(\v2\x1d.openshell.v1.WorkspaceMemberR\amembers\"\x7f\n" +
+	"\amembers\x18\x01 \x03(\v2\x1d.openshell.v1.WorkspaceMemberR\amembers\x12&\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\x7f\n" +
 	"\x1aExtensionServiceCredential\x12!\n" +
 	"\fservice_name\x18\x01 \x01(\tR\vserviceName\x12\x1a\n" +
 	"\x05token\x18\x02 \x01(\tB\x04\x88\xb5\x18\x01R\x05token\x12\"\n" +

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{ObjectType, PersistenceError, Store, generate_name, test_store};
+use super::{ObjectListQuery, ObjectType, PersistenceError, Store, generate_name, test_store};
 use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use openshell_core::proto::datamodel::v1::ObjectMeta as ProtoObjectMeta;
 use openshell_core::proto::{ObjectForTest, Sandbox, SandboxPolicy, SandboxSpec};
@@ -122,6 +122,32 @@ async fn sqlite_put_get_round_trip() {
     assert_eq!(record.id, "abc");
     assert_eq!(record.name, "my-sandbox");
     assert_eq!(record.payload, b"payload");
+}
+
+#[tokio::test]
+async fn collect_records_exhausts_multiple_keyset_pages_exactly_once() {
+    let store = test_store().await;
+    let expected = 1005_usize;
+    for index in 0..expected {
+        let id = format!("collect-{index:04}");
+        let name = format!("sandbox-{index:04}");
+        store
+            .put("sandbox", &id, &name, "collect-test", b"payload", None)
+            .await
+            .unwrap();
+    }
+
+    let records = store
+        .collect_records("sandbox", ObjectListQuery::Workspace("collect-test"))
+        .await
+        .unwrap();
+    let ids = records
+        .iter()
+        .map(|record| record.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(records.len(), expected);
+    assert_eq!(ids.len(), expected, "every record is visited exactly once");
 }
 
 #[tokio::test]

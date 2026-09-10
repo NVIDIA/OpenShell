@@ -179,6 +179,9 @@ func (c *fakePolicyClient) List(_ context.Context, workspace string, opts ...v1.
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
 	cfg := types.ApplyListPolicyOptions(opts)
+	if cfg.PageSize() < 0 {
+		return nil, &types.StatusError{Code: types.ErrorInvalidArgument, Message: "page size must not be negative"}
+	}
 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -210,17 +213,6 @@ func (c *fakePolicyClient) List(_ context.Context, workspace string, opts ...v1.
 		}
 		return 0
 	})
-
-	// Apply pagination.
-	offset := int(cfg.Offset())
-	if offset >= len(revisions) {
-		return nil, nil
-	}
-	revisions = revisions[offset:]
-
-	if limit := int(cfg.Limit()); limit > 0 && limit < len(revisions) {
-		revisions = revisions[:limit]
-	}
 
 	result := make([]types.SandboxPolicyRevision, len(revisions))
 	for i, r := range revisions {

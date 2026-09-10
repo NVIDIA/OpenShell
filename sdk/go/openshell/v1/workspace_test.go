@@ -239,14 +239,13 @@ func TestWorkspaceList_WithOptions(t *testing.T) {
 
 	wc := newWorkspaceClient(conn)
 	_, err := wc.List(context.Background(), ListOptions{
-		Limit:         10,
-		Offset:        5,
+		PageSize:      10,
 		LabelSelector: "team=platform",
 	})
 
 	require.NoError(t, err)
-	assert.Equal(t, uint32(10), mock.lastListReq.GetLimit())
-	assert.Equal(t, uint32(5), mock.lastListReq.GetOffset())
+	assert.Equal(t, int32(10), mock.lastListReq.GetPageSize())
+	assert.Empty(t, mock.lastListReq.GetPageToken())
 	assert.Equal(t, "team=platform", mock.lastListReq.GetLabelSelector())
 }
 
@@ -460,9 +459,9 @@ func TestListMembers_WithOptions(t *testing.T) {
 	defer cleanup()
 
 	wc := newWorkspaceClient(conn)
-	_, err := wc.ListMembers(context.Background(), "test-ws", ListOptions{Limit: 5, Offset: 2})
+	_, err := wc.ListMembers(context.Background(), "test-ws", ListOptions{PageSize: 5})
 
 	require.NoError(t, err)
-	assert.Equal(t, uint32(5), mock.lastListMembersReq.GetLimit())
-	assert.Equal(t, uint32(2), mock.lastListMembersReq.GetOffset())
+	assert.Equal(t, int32(5), mock.lastListMembersReq.GetPageSize())
+	assert.Empty(t, mock.lastListMembersReq.GetPageToken())
 }

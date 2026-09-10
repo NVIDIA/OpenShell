@@ -110,28 +110,29 @@ func (s *sandboxClient) ListAll(ctx context.Context, opts ...ListOptions) ([]*Sa
 }
 
 func (s *sandboxClient) list(ctx context.Context, req *pb.ListSandboxesRequest, opts ...ListOptions) ([]*Sandbox, error) {
+	pageSize, err := listPageSize(opts)
+	if err != nil {
+		return nil, err
+	}
+	req.PageSize = pageSize
 	if len(opts) > 0 {
-		if opts[0].Limit < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
-		}
-		if opts[0].Offset < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "offset must not be negative"}
-		}
-		req.Limit = uint32(opts[0].Limit)
-		req.Offset = uint32(opts[0].Offset)
 		req.LabelSelector = opts[0].LabelSelector
 	}
 
-	resp, err := s.client.ListSandboxes(ctx, req)
-	if err != nil {
-		return nil, converter.FromGRPCError(err)
+	var sandboxes []*Sandbox
+	for {
+		resp, err := s.client.ListSandboxes(ctx, req)
+		if err != nil {
+			return nil, converter.FromGRPCError(err)
+		}
+		for _, proto := range resp.GetSandboxes() {
+			sandboxes = append(sandboxes, converter.SandboxFromProto(proto))
+		}
+		if resp.GetNextPageToken() == "" {
+			return sandboxes, nil
+		}
+		req.PageToken = resp.GetNextPageToken()
 	}
-
-	sandboxes := make([]*Sandbox, 0, len(resp.GetSandboxes()))
-	for _, proto := range resp.GetSandboxes() {
-		sandboxes = append(sandboxes, converter.SandboxFromProto(proto))
-	}
-	return sandboxes, nil
 }
 
 func (s *sandboxClient) Delete(ctx context.Context, workspace, name string) error {

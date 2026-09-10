@@ -26,6 +26,7 @@ mod http;
 mod middleware;
 mod multiplex;
 mod otel_tracing;
+mod pagination;
 mod persistence;
 pub(crate) mod policy_store;
 mod provider_profile_sources;

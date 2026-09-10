@@ -89,12 +89,12 @@ fmt.Println(template.Spec.Workload.Image)
 
 ## List
 
-Lists templates in one workspace or across all workspaces.
+Lists every matching template in one workspace or across all workspaces. The
+SDK follows gateway continuation tokens automatically.
 
 ```go
 templates, err := client.SandboxTemplates().List(ctx, "default", v1.ListOptions{
-    Limit:  50,
-    Offset: 0,
+    PageSize: 50,
 })
 
 allTemplates, err := client.SandboxTemplates().ListAll(ctx, v1.ListOptions{

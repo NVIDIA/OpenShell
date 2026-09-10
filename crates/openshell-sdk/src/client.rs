@@ -196,18 +196,27 @@ impl OpenShellClient {
         &self,
         opts: SandboxTemplateListOptions,
     ) -> Result<Vec<SandboxWorkloadTemplate>> {
-        let response = self
-            .unary(|mut grpc| {
-                let request = proto::ListSandboxTemplatesRequest {
-                    limit: opts.limit,
-                    offset: opts.offset,
-                    label_selector: opts.label_selector.clone(),
-                    workspace_scope: Some(proto::workspace_selector("default")),
-                };
-                async move { grpc.list_sandbox_templates(request).await }
-            })
-            .await?;
-        Ok(response.templates)
+        let mut templates = Vec::new();
+        let mut page_token = String::new();
+        loop {
+            let response = self
+                .unary(|mut grpc| {
+                    let page_token = page_token.clone();
+                    let request = proto::ListSandboxTemplatesRequest {
+                        page_size: opts.page_size,
+                        page_token,
+                        label_selector: opts.label_selector.clone(),
+                        workspace_scope: Some(proto::workspace_selector("default")),
+                    };
+                    async move { grpc.list_sandbox_templates(request).await }
+                })
+                .await?;
+            templates.extend(response.templates);
+            if response.next_page_token.is_empty() {
+                return Ok(templates);
+            }
+            page_token = response.next_page_token;
+        }
     }
 
     /// List reusable sandbox templates across all workspaces.
@@ -215,18 +224,27 @@ impl OpenShellClient {
         &self,
         opts: SandboxTemplateListOptions,
     ) -> Result<Vec<SandboxWorkloadTemplate>> {
-        let response = self
-            .unary(|mut grpc| {
-                let request = proto::ListSandboxTemplatesRequest {
-                    limit: opts.limit,
-                    offset: opts.offset,
-                    label_selector: opts.label_selector.clone(),
-                    workspace_scope: Some(proto::all_workspaces_selector()),
-                };
-                async move { grpc.list_sandbox_templates(request).await }
-            })
-            .await?;
-        Ok(response.templates)
+        let mut templates = Vec::new();
+        let mut page_token = String::new();
+        loop {
+            let response = self
+                .unary(|mut grpc| {
+                    let page_token = page_token.clone();
+                    let request = proto::ListSandboxTemplatesRequest {
+                        page_size: opts.page_size,
+                        page_token,
+                        label_selector: opts.label_selector.clone(),
+                        workspace_scope: Some(proto::all_workspaces_selector()),
+                    };
+                    async move { grpc.list_sandbox_templates(request).await }
+                })
+                .await?;
+            templates.extend(response.templates);
+            if response.next_page_token.is_empty() {
+                return Ok(templates);
+            }
+            page_token = response.next_page_token;
+        }
     }
 
     /// Delete a reusable sandbox template by name from the default workspace.
@@ -259,22 +277,27 @@ impl OpenShellClient {
 
     /// List sandboxes.
     pub async fn list_sandboxes(&self, opts: ListOptions) -> Result<Vec<SandboxRef>> {
-        let response = self
-            .unary(|mut grpc| {
-                let request = proto::ListSandboxesRequest {
-                    limit: opts.limit,
-                    offset: opts.offset,
-                    label_selector: opts.label_selector.clone().unwrap_or_default(),
-                    workspace_scope: Some(proto::workspace_selector("default")),
-                };
-                async move { grpc.list_sandboxes(request).await }
-            })
-            .await?;
-        Ok(response
-            .sandboxes
-            .into_iter()
-            .map(SandboxRef::from_proto)
-            .collect())
+        let mut sandboxes = Vec::new();
+        let mut page_token = String::new();
+        loop {
+            let response = self
+                .unary(|mut grpc| {
+                    let page_token = page_token.clone();
+                    let request = proto::ListSandboxesRequest {
+                        page_size: opts.page_size,
+                        page_token,
+                        label_selector: opts.label_selector.clone().unwrap_or_default(),
+                        workspace_scope: Some(proto::workspace_selector("default")),
+                    };
+                    async move { grpc.list_sandboxes(request).await }
+                })
+                .await?;
+            sandboxes.extend(response.sandboxes.into_iter().map(SandboxRef::from_proto));
+            if response.next_page_token.is_empty() {
+                return Ok(sandboxes);
+            }
+            page_token = response.next_page_token;
+        }
     }
 
     /// Delete a sandbox by name.
@@ -384,22 +407,27 @@ impl OpenShellClient {
         &self,
         opts: ListOptions,
     ) -> Result<Vec<SandboxRef>> {
-        let response = self
-            .unary(|mut grpc| {
-                let request = proto::ListSandboxesRequest {
-                    limit: opts.limit,
-                    offset: opts.offset,
-                    label_selector: opts.label_selector.clone().unwrap_or_default(),
-                    workspace_scope: Some(proto::all_workspaces_selector()),
-                };
-                async move { grpc.list_sandboxes(request).await }
-            })
-            .await?;
-        Ok(response
-            .sandboxes
-            .into_iter()
-            .map(SandboxRef::from_proto)
-            .collect())
+        let mut sandboxes = Vec::new();
+        let mut page_token = String::new();
+        loop {
+            let response = self
+                .unary(|mut grpc| {
+                    let page_token = page_token.clone();
+                    let request = proto::ListSandboxesRequest {
+                        page_size: opts.page_size,
+                        page_token,
+                        label_selector: opts.label_selector.clone().unwrap_or_default(),
+                        workspace_scope: Some(proto::all_workspaces_selector()),
+                    };
+                    async move { grpc.list_sandboxes(request).await }
+                })
+                .await?;
+            sandboxes.extend(response.sandboxes.into_iter().map(SandboxRef::from_proto));
+            if response.next_page_token.is_empty() {
+                return Ok(sandboxes);
+            }
+            page_token = response.next_page_token;
+        }
     }
 
     /// Create a new workspace.
@@ -441,21 +469,31 @@ impl OpenShellClient {
 
     /// List workspaces.
     pub async fn list_workspaces(&self, opts: ListOptions) -> Result<Vec<WorkspaceRef>> {
-        let response = self
-            .unary(|mut grpc| {
-                let request = proto::ListWorkspacesRequest {
-                    limit: opts.limit,
-                    offset: opts.offset,
-                    label_selector: opts.label_selector.clone().unwrap_or_default(),
-                };
-                async move { grpc.list_workspaces(request).await }
-            })
-            .await?;
-        Ok(response
-            .workspaces
-            .into_iter()
-            .map(WorkspaceRef::from_proto)
-            .collect())
+        let mut workspaces = Vec::new();
+        let mut page_token = String::new();
+        loop {
+            let response = self
+                .unary(|mut grpc| {
+                    let page_token = page_token.clone();
+                    let request = proto::ListWorkspacesRequest {
+                        page_size: opts.page_size,
+                        page_token,
+                        label_selector: opts.label_selector.clone().unwrap_or_default(),
+                    };
+                    async move { grpc.list_workspaces(request).await }
+                })
+                .await?;
+            workspaces.extend(
+                response
+                    .workspaces
+                    .into_iter()
+                    .map(WorkspaceRef::from_proto),
+            );
+            if response.next_page_token.is_empty() {
+                return Ok(workspaces);
+            }
+            page_token = response.next_page_token;
+        }
     }
 
     /// Delete a workspace by name.
@@ -700,19 +738,28 @@ impl WorkspaceScopedClient {
         &self,
         opts: SandboxTemplateListOptions,
     ) -> Result<Vec<SandboxWorkloadTemplate>> {
-        let response = self
-            .client
-            .unary(|mut grpc| {
-                let request = proto::ListSandboxTemplatesRequest {
-                    limit: opts.limit,
-                    offset: opts.offset,
-                    label_selector: opts.label_selector.clone(),
-                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
-                };
-                async move { grpc.list_sandbox_templates(request).await }
-            })
-            .await?;
-        Ok(response.templates)
+        let mut templates = Vec::new();
+        let mut page_token = String::new();
+        loop {
+            let response = self
+                .client
+                .unary(|mut grpc| {
+                    let page_token = page_token.clone();
+                    let request = proto::ListSandboxTemplatesRequest {
+                        page_size: opts.page_size,
+                        page_token,
+                        label_selector: opts.label_selector.clone(),
+                        workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+                    };
+                    async move { grpc.list_sandbox_templates(request).await }
+                })
+                .await?;
+            templates.extend(response.templates);
+            if response.next_page_token.is_empty() {
+                return Ok(templates);
+            }
+            page_token = response.next_page_token;
+        }
     }
 
     /// Delete a reusable sandbox template by name in this workspace.
@@ -747,23 +794,28 @@ impl WorkspaceScopedClient {
 
     /// List sandboxes in this workspace.
     pub async fn list_sandboxes(&self, opts: ListOptions) -> Result<Vec<SandboxRef>> {
-        let response = self
-            .client
-            .unary(|mut grpc| {
-                let request = proto::ListSandboxesRequest {
-                    limit: opts.limit,
-                    offset: opts.offset,
-                    label_selector: opts.label_selector.clone().unwrap_or_default(),
-                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
-                };
-                async move { grpc.list_sandboxes(request).await }
-            })
-            .await?;
-        Ok(response
-            .sandboxes
-            .into_iter()
-            .map(SandboxRef::from_proto)
-            .collect())
+        let mut sandboxes = Vec::new();
+        let mut page_token = String::new();
+        loop {
+            let response = self
+                .client
+                .unary(|mut grpc| {
+                    let page_token = page_token.clone();
+                    let request = proto::ListSandboxesRequest {
+                        page_size: opts.page_size,
+                        page_token,
+                        label_selector: opts.label_selector.clone().unwrap_or_default(),
+                        workspace_scope: Some(proto::workspace_selector(&self.workspace)),
+                    };
+                    async move { grpc.list_sandboxes(request).await }
+                })
+                .await?;
+            sandboxes.extend(response.sandboxes.into_iter().map(SandboxRef::from_proto));
+            if response.next_page_token.is_empty() {
+                return Ok(sandboxes);
+            }
+            page_token = response.next_page_token;
+        }
     }
 
     /// Delete a sandbox by name in this workspace.

@@ -132,26 +132,19 @@ func TestFakePolicy_List_NoIsolationCrossContamination(t *testing.T) {
 	assert.Nil(t, revisions)
 }
 
-func TestFakePolicy_List_GlobalWithPagination(t *testing.T) {
+func TestFakePolicy_List_GlobalPageSizeStillReturnsAll(t *testing.T) {
 	c := newFakePolicyClient(func() bool { return false })
 
 	c.AddGlobalRevision(types.SandboxPolicyRevision{Version: 1})
 	c.AddGlobalRevision(types.SandboxPolicyRevision{Version: 2})
 	c.AddGlobalRevision(types.SandboxPolicyRevision{Version: 3})
 
-	// Limit to 2.
-	revisions, err := c.List(context.Background(), "", types.WithListGlobal(true), types.WithLimit(2))
+	revisions, err := c.List(context.Background(), "", types.WithListGlobal(true), types.WithPageSize(2))
 	require.NoError(t, err)
-	require.Len(t, revisions, 2)
+	require.Len(t, revisions, 3)
 	assert.Equal(t, uint32(1), revisions[0].Version)
 	assert.Equal(t, uint32(2), revisions[1].Version)
-
-	// Offset by 1, limit 2.
-	revisions, err = c.List(context.Background(), "", types.WithListGlobal(true), types.WithLimit(2), types.WithOffset(1))
-	require.NoError(t, err)
-	require.Len(t, revisions, 2)
-	assert.Equal(t, uint32(2), revisions[0].Version)
-	assert.Equal(t, uint32(3), revisions[1].Version)
+	assert.Equal(t, uint32(3), revisions[2].Version)
 }
 
 func TestFakePolicy_GetStatus_Sandbox(t *testing.T) {

@@ -16,8 +16,10 @@ use crate::auth::workspace_authz::{
     MinWorkspaceRole, authorize_sandbox_workspace, authorize_workspace_selector,
     require_platform_admin, selected_workspace_name,
 };
+use crate::pagination::Pagination;
 use crate::persistence::{
-    DraftChunkRecord, ObjectId, ObjectName, ObjectType, ObjectWorkspace, PolicyRecord, Store,
+    DraftChunkRecord, ObjectId, ObjectListQuery, ObjectName, ObjectType, ObjectWorkspace,
+    PolicyRecord, Store,
 };
 use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
@@ -88,7 +90,7 @@ use super::validation::{
     validate_no_reserved_provider_policy_keys, validate_policy_safety,
     validate_static_fields_unchanged,
 };
-use super::{MAX_PAGE_SIZE, StoredSettingValue, StoredSettings, clamp_limit};
+use super::{StoredSettingValue, StoredSettings};
 use crate::persistence::current_time_ms;
 
 // ---------------------------------------------------------------------------
@@ -2094,49 +2096,44 @@ fn provider_policy_composition_enabled_in(settings: &StoredSettings) -> Result<b
 async fn validate_provider_composition_for_existing_sandboxes(
     state: &ServerState,
 ) -> Result<(), Status> {
-    let mut offset = 0;
     let mut catalogs = HashMap::<String, EffectiveProviderProfileCatalog>::new();
+    let sandboxes: Vec<Sandbox> = state
+        .store
+        .collect_messages(ObjectListQuery::AllWorkspaces)
+        .await
+        .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
 
-    loop {
-        let sandboxes = state
-            .store
-            .list_all_messages::<Sandbox>(MAX_PAGE_SIZE, offset)
-            .await
-            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
-        let page_len = sandboxes.len();
+    for sandbox in sandboxes {
+        let provider_names = sandbox
+            .spec
+            .as_ref()
+            .map(|spec| spec.providers.as_slice())
+            .unwrap_or_default();
+        if provider_names.is_empty() {
+            continue;
+        }
 
-        for sandbox in sandboxes {
-            let provider_names = sandbox
-                .spec
-                .as_ref()
-                .map(|spec| spec.providers.as_slice())
-                .unwrap_or_default();
-            if provider_names.is_empty() {
-                continue;
-            }
-
-            let workspace = sandbox.object_workspace().to_string();
-            if !catalogs.contains_key(&workspace) {
-                let catalog = state
-                    .provider_profile_sources
-                    .snapshot_catalog(state.store.as_ref(), &workspace)
-                    .await?;
-                catalogs.insert(workspace.clone(), catalog);
-            }
-            let catalog = catalogs
-                .get(&workspace)
-                .expect("catalog was inserted for sandbox workspace");
-            let base_policy =
-                current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
-            let provider_layers = provider_policy_context_with_catalog(
-                state.store.as_ref(),
-                catalog,
-                &workspace,
-                provider_names,
-            )
-            .await?
-            .layers;
-            validate_candidate_effective_policy(&base_policy, &provider_layers).map_err(|error| {
+        let workspace = sandbox.object_workspace().to_string();
+        if !catalogs.contains_key(&workspace) {
+            let catalog = state
+                .provider_profile_sources
+                .snapshot_catalog(state.store.as_ref(), &workspace)
+                .await?;
+            catalogs.insert(workspace.clone(), catalog);
+        }
+        let catalog = catalogs
+            .get(&workspace)
+            .expect("catalog was inserted for sandbox workspace");
+        let base_policy = current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
+        let provider_layers = provider_policy_context_with_catalog(
+            state.store.as_ref(),
+            catalog,
+            &workspace,
+            provider_names,
+        )
+        .await?
+        .layers;
+        validate_candidate_effective_policy(&base_policy, &provider_layers).map_err(|error| {
                 Status::failed_precondition(format!(
                     "cannot activate provider policy composition: sandbox '{}/{}' has an invalid effective policy: {}",
                     workspace,
@@ -2144,12 +2141,6 @@ async fn validate_provider_composition_for_existing_sandboxes(
                     error.message()
                 ))
             })?;
-        }
-
-        if page_len < MAX_PAGE_SIZE as usize {
-            break;
-        }
-        offset = offset.saturating_add(MAX_PAGE_SIZE);
     }
 
     Ok(())
@@ -4038,19 +4029,44 @@ pub(super) async fn handle_list_sandbox_policies(
         sandbox.object_id().to_string()
     };
 
-    let limit = clamp_limit(req.limit, 50, MAX_PAGE_SIZE);
-    let records = state
+    let pagination = Pagination::new(
+        req.page_size,
+        &req.page_token,
+        "ListSandboxPolicies",
+        &[
+            &req.name,
+            if req.global { "true" } else { "false" },
+            &workspace,
+        ],
+    )?;
+    let mut records = state
         .store
-        .list_policies(&policy_id, limit, req.offset)
+        .list_policies_before(
+            &policy_id,
+            pagination.page_size() + 1,
+            pagination.policy_cursor()?,
+        )
         .await
         .map_err(|e| Status::internal(format!("list policies failed: {e}")))?;
+    let page_size = usize::try_from(pagination.page_size())
+        .map_err(|_| Status::internal("page size does not fit usize"))?;
+    let has_more = records.len() > page_size;
+    records.truncate(page_size);
+    let next_page_token = pagination.next_policy_token(
+        has_more
+            .then(|| records.last().map(|record| record.version))
+            .flatten(),
+    );
 
     let revisions = records
         .iter()
         .map(|r| policy_record_to_revision(r, false))
         .collect::<Result<Vec<_>, Status>>()?;
 
-    Ok(Response::new(ListSandboxPoliciesResponse { revisions }))
+    Ok(Response::new(ListSandboxPoliciesResponse {
+        revisions,
+        next_page_token,
+    }))
 }
 
 pub(super) async fn handle_report_policy_status(
@@ -7587,7 +7603,7 @@ mod tests {
             &state,
             with_user(Request::new(ListSandboxPoliciesRequest {
                 name: "stored-invalid-history".to_string(),
-                limit: 10,
+                page_size: 10,
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 ..Default::default()
             })),
@@ -13568,8 +13584,8 @@ mod tests {
             &state,
             authed_request(ListSandboxPoliciesRequest {
                 name: sandbox_name.clone(),
-                limit: 10,
-                offset: 0,
+                page_size: 10,
+                page_token: String::new(),
                 global: false,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -13633,8 +13649,8 @@ mod tests {
             &state,
             authed_request(ListSandboxPoliciesRequest {
                 name: sandbox_name.clone(),
-                limit: 10,
-                offset: 0,
+                page_size: 10,
+                page_token: String::new(),
                 global: false,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),

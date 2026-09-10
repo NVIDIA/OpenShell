@@ -19,7 +19,8 @@ use crate::auth::workspace_authz::{
     AuthorizedWorkspaceScope, MinWorkspaceRole, authorize_list_workspace_selector,
     authorize_workspace_selector,
 };
-use crate::persistence::{ObjectType, WriteCondition};
+use crate::pagination::Pagination;
+use crate::persistence::{ObjectListQuery, ObjectType, WriteCondition};
 use crate::service_routing;
 
 const MAX_SERVICE_NAME_LEN: usize = super::MAX_ROUTABLE_NAME_LEN;
@@ -181,7 +182,6 @@ pub(super) async fn handle_list_services(
         validate_endpoint_name("sandbox", &req.sandbox, MAX_SANDBOX_NAME_LEN)?;
     }
 
-    let limit = super::clamp_limit(req.limit, 100, super::MAX_PAGE_SIZE);
     let scope = authorize_list_workspace_selector(
         &state.store,
         &state.admin_role,
@@ -190,47 +190,55 @@ pub(super) async fn handle_list_services(
         MinWorkspaceRole::User,
     )
     .await?;
-    let endpoints: Vec<ServiceEndpoint> =
-        if matches!(scope, AuthorizedWorkspaceScope::AllWorkspaces) {
-            if !req.sandbox.is_empty() {
-                return Err(Status::invalid_argument(
-                    "sandbox filter is not supported with all_workspaces",
-                ));
-            }
-            state.store.list_all_messages(limit, req.offset).await
-        } else {
-            let AuthorizedWorkspaceScope::Workspace(authz) = scope else {
-                unreachable!("all-workspaces scope handled above")
-            };
-            let workspace =
-                super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-                    .await?
-                    .name;
-            if req.sandbox.is_empty() {
-                state
-                    .store
-                    .list_messages(&workspace, limit, req.offset)
-                    .await
-            } else {
-                state
-                    .store
-                    .list_messages_with_selector(
-                        &workspace,
-                        &format!("sandbox={}", req.sandbox),
-                        limit,
-                        req.offset,
-                    )
-                    .await
-            }
+    let workspace = if matches!(scope, AuthorizedWorkspaceScope::AllWorkspaces) {
+        if !req.sandbox.is_empty() {
+            return Err(Status::invalid_argument(
+                "sandbox filter is not supported with all_workspaces",
+            ));
         }
+        None
+    } else {
+        let AuthorizedWorkspaceScope::Workspace(authz) = scope else {
+            unreachable!("all-workspaces scope handled above")
+        };
+        let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+            .await?
+            .name;
+        Some(workspace)
+    };
+    let scope_fingerprint = workspace.as_deref().unwrap_or("*");
+    let pagination = Pagination::new(
+        req.page_size,
+        &req.page_token,
+        "ListServices",
+        &[&req.sandbox, scope_fingerprint],
+    )?;
+    let after = pagination.object_cursor()?;
+    let selector = (!req.sandbox.is_empty()).then(|| format!("sandbox={}", req.sandbox));
+    let query = match (workspace.as_deref(), selector.as_deref()) {
+        (None, None) => ObjectListQuery::AllWorkspaces,
+        (Some(workspace), None) => ObjectListQuery::Workspace(workspace),
+        (Some(workspace), Some(selector)) => ObjectListQuery::WorkspaceSelector {
+            workspace,
+            label_selector: selector,
+        },
+        (None, Some(_)) => unreachable!("all-workspace sandbox filter was rejected"),
+    };
+    let page = state
+        .store
+        .list_message_page::<ServiceEndpoint>(query, after.as_ref(), pagination.page_size())
+        .await
         .map_err(|e| Status::internal(format!("list endpoints failed: {e}")))?;
-
-    let services = endpoints
+    let services = page
+        .messages
         .into_iter()
         .map(|ep| service_endpoint_response(state, ep))
         .collect();
-
-    Ok(Response::new(ListServicesResponse { services }))
+    let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
+    Ok(Response::new(ListServicesResponse {
+        services,
+        next_page_token,
+    }))
 }
 
 pub(super) async fn handle_delete_service(
@@ -429,8 +437,8 @@ mod tests {
             &state,
             authed_request(ListServicesRequest {
                 sandbox: "my-sandbox".to_string(),
-                limit: 0,
-                offset: 0,
+                page_size: 0,
+                page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -493,8 +501,8 @@ mod tests {
             &state,
             authed_request(ListServicesRequest {
                 sandbox: "my-sandbox".to_string(),
-                limit: 0,
-                offset: 0,
+                page_size: 0,
+                page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -563,8 +571,8 @@ mod tests {
             &state,
             authed_request(ListServicesRequest {
                 sandbox: "my-sandbox".to_string(),
-                limit: 0,
-                offset: 0,
+                page_size: 0,
+                page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -772,8 +780,8 @@ mod tests {
             &state,
             authed_request(ListServicesRequest {
                 sandbox: "my-sandbox".to_string(),
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -792,8 +800,8 @@ mod tests {
             &state,
             authed_request(ListServicesRequest {
                 sandbox: "my-sandbox".to_string(),
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "beta".to_string(),
                 )),
@@ -828,8 +836,8 @@ mod tests {
             &state,
             authed_request(ListServicesRequest {
                 sandbox: "my-sandbox".to_string(),
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
@@ -876,8 +884,8 @@ mod tests {
             &state,
             authed_request(ListServicesRequest {
                 sandbox: String::new(),
-                limit: 100,
-                offset: 0,
+                page_size: 100,
+                page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
             }),
         )

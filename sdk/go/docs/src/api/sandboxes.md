@@ -57,16 +57,16 @@ fmt.Println(sb.Status.Phase) // "Ready", "Provisioning", etc.
 
 ## List
 
-Lists sandboxes with optional pagination and label filtering.
+Lists every matching sandbox, following gateway continuation tokens
+automatically. `PageSize` controls the size of each request.
 
 ```go
 // List all sandboxes
 sandboxes, err := client.Sandboxes().List(ctx, "default")
 
-// With pagination and label filtering
+// With a page size and label filtering
 sandboxes, err := client.Sandboxes().List(ctx, "default", v1.ListOptions{
-    Limit:         10,
-    Offset:        0,
+    PageSize:      10,
     LabelSelector: "team=platform",
 })
 

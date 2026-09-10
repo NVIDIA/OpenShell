@@ -363,25 +363,17 @@ func (c *getStatusConfig) Global() bool {
 
 // listPolicyConfig holds configuration for List calls.
 type listPolicyConfig struct {
-	limit  uint32
-	offset uint32
-	global bool
+	pageSize int32
+	global   bool
 }
 
 // ListPolicyOption configures a List call.
 type ListPolicyOption func(*listPolicyConfig)
 
-// WithLimit sets the maximum number of revisions to return.
-func WithLimit(limit uint32) ListPolicyOption {
+// WithPageSize sets the page size used while collecting every revision.
+func WithPageSize(pageSize int32) ListPolicyOption {
 	return func(c *listPolicyConfig) {
-		c.limit = limit
-	}
-}
-
-// WithOffset sets the pagination offset.
-func WithOffset(offset uint32) ListPolicyOption {
-	return func(c *listPolicyConfig) {
-		c.offset = offset
+		c.pageSize = pageSize
 	}
 }
 
@@ -401,14 +393,9 @@ func ApplyListPolicyOptions(opts []ListPolicyOption) listPolicyConfig { //nolint
 	return cfg
 }
 
-// Limit returns the configured limit (0 means server default).
-func (c *listPolicyConfig) Limit() uint32 {
-	return c.limit
-}
-
-// Offset returns the configured offset.
-func (c *listPolicyConfig) Offset() uint32 {
-	return c.offset
+// PageSize returns the configured page size (0 means server default).
+func (c *listPolicyConfig) PageSize() int32 {
+	return c.pageSize
 }
 
 // Global returns whether global policy mode is enabled.

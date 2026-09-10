@@ -58,27 +58,26 @@ func (s *serviceClient) ListAll(ctx context.Context, opts ...ListOptions) ([]*Se
 }
 
 func (s *serviceClient) list(ctx context.Context, req *pb.ListServicesRequest, opts ...ListOptions) ([]*ServiceEndpoint, error) {
-	if len(opts) > 0 {
-		if opts[0].Limit < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
-		}
-		if opts[0].Offset < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "offset must not be negative"}
-		}
-		req.Limit = uint32(opts[0].Limit)
-		req.Offset = uint32(opts[0].Offset)
-	}
-
-	resp, err := s.client.ListServices(ctx, req)
+	pageSize, err := listPageSize(opts)
 	if err != nil {
-		return nil, converter.FromGRPCError(err)
+		return nil, err
 	}
+	req.PageSize = pageSize
 
-	endpoints := make([]*ServiceEndpoint, 0, len(resp.GetServices()))
-	for _, svc := range resp.GetServices() {
-		endpoints = append(endpoints, converter.ServiceEndpointFromProto(svc))
+	var endpoints []*ServiceEndpoint
+	for {
+		resp, err := s.client.ListServices(ctx, req)
+		if err != nil {
+			return nil, converter.FromGRPCError(err)
+		}
+		for _, svc := range resp.GetServices() {
+			endpoints = append(endpoints, converter.ServiceEndpointFromProto(svc))
+		}
+		if resp.GetNextPageToken() == "" {
+			return endpoints, nil
+		}
+		req.PageToken = resp.GetNextPageToken()
 	}
-	return endpoints, nil
 }
 
 func (s *serviceClient) Delete(ctx context.Context, workspace, sandboxName, serviceName string) error {
