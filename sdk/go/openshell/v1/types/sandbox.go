@@ -120,6 +120,29 @@ type SandboxStatus struct {
 	// EndpointStatuses describes configured external tool endpoints and their
 	// last accepted network results, independently of sandbox readiness.
 	EndpointStatuses []EndpointStatus
+	ConfigurationAdmission *SandboxConfigurationAdmission
+}
+
+// ConfigurationAdmissionState describes validation of an effective configuration.
+type ConfigurationAdmissionState string
+
+// Configuration admission states reported by the gateway.
+const (
+	ConfigurationAdmissionUnknown  ConfigurationAdmissionState = "unknown"
+	ConfigurationAdmissionPending  ConfigurationAdmissionState = "pending"
+	ConfigurationAdmissionAccepted ConfigurationAdmissionState = "accepted"
+	ConfigurationAdmissionRejected ConfigurationAdmissionState = "rejected"
+)
+
+// SandboxConfigurationAdmission identifies a validated or rejected configuration.
+// Supervisor instance fencing remains available through the raw protobuf API.
+type SandboxConfigurationAdmission struct {
+	State               ConfigurationAdmissionState
+	PolicyVersion       uint32
+	PolicyHash          string
+	ConfigRevision      uint64
+	ProviderEnvRevision uint64
+	Error               string
 }
 
 // EndpointStatus holds a configured tool endpoint and its last accepted network result.

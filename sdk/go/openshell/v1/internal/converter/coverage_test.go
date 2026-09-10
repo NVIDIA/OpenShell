@@ -124,6 +124,7 @@ func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 		"endpoint_statuses":      true,
 		"current_policy_version": true,
 		"exit_code":              true,
+		"configuration_admission": true,
 	}
 	// These fields coordinate internal gateway/supervisor lifecycle fencing
 	// and idempotent status reconciliation. They remain available only through
