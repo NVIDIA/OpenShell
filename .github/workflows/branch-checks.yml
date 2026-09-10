@@ -208,7 +208,6 @@ jobs:
           fi
 
       - name: Verify Cargo lockfiles unchanged
-        if: always()
         run: |
           tasks/scripts/check-cargo-lockfiles.sh
           git diff --exit-code HEAD -- ':(glob)**/Cargo.lock'
