@@ -103,6 +103,15 @@ mod tests {
 
     use super::SandboxPolicy;
 
+    // SandboxPolicy payload encoded by the pre-0.1.0 schema with
+    // NetworkBinary.harness=true. Keep this fixed fixture to prove that the
+    // current schema continues to accept the former durable wire format.
+    const LEGACY_SANDBOX_POLICY_WITH_HARNESS: &[u8] = &[
+        0x2a, 0x1d, 0x0a, 0x06, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x12, 0x13, 0x1a, 0x11, 0x0a,
+        0x0d, 0x2f, 0x75, 0x73, 0x72, 0x2f, 0x62, 0x69, 0x6e, 0x2f, 0x63, 0x75, 0x72, 0x6c, 0x10,
+        0x01,
+    ];
+
     #[derive(Clone, PartialEq, Message)]
     struct LegacyNetworkBinary {
         #[prost(string, tag = "1")]
@@ -137,8 +146,10 @@ mod tests {
             )]),
         };
 
-        let decoded = SandboxPolicy::decode(legacy.encode_to_vec().as_slice())
-            .expect("legacy policy should decode");
+        assert_eq!(legacy.encode_to_vec(), LEGACY_SANDBOX_POLICY_WITH_HARNESS);
+
+        let decoded = SandboxPolicy::decode(LEGACY_SANDBOX_POLICY_WITH_HARNESS)
+            .expect("legacy policy fixture should decode");
         assert_eq!(
             decoded.network_policies["legacy"].binaries[0].path,
             "/usr/bin/curl"

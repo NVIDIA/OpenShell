@@ -5220,7 +5220,6 @@ network_policies:
                         }],
                         binaries: vec![NetworkBinary {
                             path: "/usr/bin/curl".into(),
-                            ..Default::default()
                         }],
                     },
                 );
