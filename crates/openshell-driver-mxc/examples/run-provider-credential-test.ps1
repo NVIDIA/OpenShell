@@ -275,6 +275,11 @@ try {
         throw "probe did not produce $resultFile within 150 seconds"
     }
     $resultText = [System.IO.File]::ReadAllText($resultFile, [System.Text.Encoding]::UTF8)
+    if (-not [string]::IsNullOrWhiteSpace($githubToken) -and $resultText.Contains($githubToken)) {
+        $rawTokenLeak = $true
+        $resultText = $resultText.Replace($githubToken, "***REDACTED***")
+        [System.IO.File]::WriteAllText($resultFile, $resultText, $utf8NoBom)
+    }
     Write-Host $resultText
     if ($resultText -notmatch 'OVERALL: PASS') {
         throw "in-sandbox provider credential checks failed"
