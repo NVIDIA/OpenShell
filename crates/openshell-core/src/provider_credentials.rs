@@ -329,7 +329,6 @@ impl ProviderCredentialState {
                     .cloned()
                     .collect(),
                 inner.static_credential_bindings.keys().cloned().collect(),
-                allowed.clone(),
                 inner
                     .static_credential_identity_epochs
                     .iter()
@@ -873,6 +872,7 @@ mod tests {
         let token = state.snapshot().child_env["API_KEY"].clone();
         for (host, port, path) in [
             ("api.openai.com", 443, "/v1/responses"),
+            ("api.github.com", 443, "/allowed/foo"),
             ("api.github.com", 444, "/allowed/foo"),
             ("api.github.com", 443, "/other"),
         ] {
@@ -901,17 +901,14 @@ mod tests {
         }
         let (_, classifier, _) =
             state.resolver_and_body_classifier_for_endpoint("api.github.com", 443, "/allowed/foo");
-        assert_eq!(
-            classifier.unwrap().check(&token),
-            Err(BodyCredentialError::EndpointBound)
-        );
+        assert_eq!(classifier.unwrap().check(&token), Ok(()));
         assert_eq!(
             state
                 .resolver_and_body_classifier_for_endpoint("api.github.com", 443, "/allowed/foo")
                 .1
                 .unwrap()
                 .check("sk-OPENSHELL-RESOLVE-ENV-v42_API_KEY"),
-            Err(BodyCredentialError::EndpointBound)
+            Ok(())
         );
         state.revoke_static_provider_environment(43);
         assert!(
@@ -942,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn body_classification_rejects_expired_invalid_and_replaced_foreign_credentials() {
+    fn body_classification_rejects_expired_invalid_and_replaced_credentials() {
         use crate::secrets::body::BodyCredentialError;
         for (value, expires) in [("secret", 1), ("bad\r\nvalue", 0)] {
             let state = ProviderCredentialState::from_bound_environment(
@@ -955,14 +952,16 @@ mod tests {
             )
             .unwrap();
             let token = state.snapshot().child_env["API_KEY"].clone();
-            let classifier = state
-                .resolver_and_body_classifier_for_endpoint("api.openai.com", 443, "/")
-                .1
-                .unwrap();
-            assert_eq!(
-                classifier.check(&token),
-                Err(BodyCredentialError::KnownUnavailable)
-            );
+            for host in ["api.openai.com", "api.github.com"] {
+                let classifier = state
+                    .resolver_and_body_classifier_for_endpoint(host, 443, "/")
+                    .1
+                    .unwrap();
+                assert_eq!(
+                    classifier.check(&token),
+                    Err(BodyCredentialError::KnownUnavailable)
+                );
+            }
         }
         let handle = "a".repeat(64);
         let state = ProviderCredentialState::from_bound_environment(

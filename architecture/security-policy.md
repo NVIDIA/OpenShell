@@ -147,10 +147,12 @@ WebSocket upgrades use the parsed relay, binary frames fail closed, and text
 placeholders require rewrite. REST bodies continue streaming when body rewrite is disabled. The relay holds
 complete placeholder candidates until a request-scoped metadata snapshot can
 classify them. Authoritatively unknown keys and valid credentials with a current
-binding outside the destination host, port, and path pass unchanged. Destination-bound
-references, revoked or invalid identities, and unavailable classification state
+binding pass unchanged, including references bound to the destination itself.
+Revoked or invalid identities and unavailable classification state
 fail closed. Classification never substitutes secret values and shares the request's
 credential revision; stale credential or policy generations terminate forwarding.
+Header rewriting scans only headers. Body bytes received in the initial proxy
+read follow the same body classifier or explicit rewriter as later reads.
 Candidates are limited to 4096 wire bytes, including percent encoding. Malformed
 or oversized candidates fail closed; HTTP trailers retain prefix-based rejection. Explicitly opted-in
 endpoints retain raw passthrough behavior.

@@ -97,7 +97,7 @@ inference request using the provider's documented API shape.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `credential_placeholder_in_request_body` | A body reference is destination-bound, invalid/revoked, or classification metadata is unavailable | Check the controlled denial reason; remove the reference from conversation history or restore provider access. Do not enable body credential rewriting or bypass flags to send tool output. Unknown literals and valid foreign-endpoint placeholders pass unchanged. |
+| `credential_placeholder_in_request_body` | A body reference is invalid/revoked, or classification metadata is unavailable | Check the controlled denial reason; remove the reference from conversation history or restore provider access. Do not enable body credential rewriting or bypass flags to send tool output. Unknown literals and valid issued placeholders pass unchanged, including the model provider’s own placeholder. Header resolution does not enable body rewriting. |
 | `Could not resolve host: inference.local` | Client still uses the removed managed endpoint | Configure the provider's native base URL and attach an endpoint-bearing provider profile |
 | Direct request is denied | Missing attachment, endpoint policy, HTTP rule, or binary authorization | Inspect the attached provider profile and sandbox effective policy |
 | `credential_endpoint_mismatch` | Credential profile does not authorize the request recipient | Correct the host/port/path or import a narrowly scoped profile for the intended endpoint |

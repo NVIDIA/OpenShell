@@ -16,7 +16,6 @@ use std::sync::Arc;
 /// Why a reserved body token cannot be forwarded. Contains no request data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, miette::Diagnostic)]
 pub enum BodyCredentialError {
-    EndpointBound,
     KnownUnavailable,
     ClassificationUnavailable,
     InvalidToken,
@@ -27,7 +26,6 @@ pub enum BodyCredentialError {
 impl BodyCredentialError {
     pub const fn reason(self) -> &'static str {
         match self {
-            Self::EndpointBound => "endpoint_bound",
             Self::KnownUnavailable => "known_unavailable",
             Self::ClassificationUnavailable => "classification_unavailable",
             Self::InvalidToken => "invalid_token",
@@ -60,7 +58,6 @@ pub struct BodyCredentialClassifier {
     values: HashMap<String, ValueStatus>,
     known: HashSet<String>,
     bound: HashSet<String>,
-    allowed: HashSet<String>,
     revisions: HashMap<String, Arc<HashSet<u64>>>,
 }
 
@@ -76,13 +73,11 @@ impl BodyCredentialClassifier {
         resolver: Option<&SecretResolver>,
         known: HashSet<String>,
         bound: HashSet<String>,
-        allowed: HashSet<String>,
         revisions: HashMap<String, Arc<HashSet<u64>>>,
     ) -> Self {
         let mut result = Self {
             known,
             bound,
-            allowed,
             revisions,
             ..Self::default()
         };
@@ -133,10 +128,8 @@ impl BodyCredentialClassifier {
         if !self.known.contains(key) {
             return Ok(());
         }
-        if self.allowed.contains(key) {
-            return Err(BodyCredentialError::EndpointBound);
-        }
-        // A tombstone or a legacy unbound key is not proof of a foreign binding.
+        // A tombstone or a legacy unbound key is not a currently issued credential.
+        // Destination membership does not matter: this guard never resolves body text.
         if !self.bound.contains(key) {
             return Err(BodyCredentialError::KnownUnavailable);
         }
@@ -347,10 +340,68 @@ mod tests {
     }
 
     #[test]
-    fn destination_bound_tokens_never_release_the_marker_at_any_split() {
+    fn issued_tokens_survive_every_wire_split_without_secret_substitution() {
+        use crate::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+        use crate::provider_credentials::ProviderCredentialState;
+        for handle in [String::new(), "a".repeat(64)] {
+            let state = ProviderCredentialState::from_bound_environment(
+                42,
+                HashMap::from([("KEY".into(), "private-test-secret".into())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([(
+                    "KEY".into(),
+                    StaticCredentialBinding {
+                        credential_identity: "provider".into(),
+                        workload_credential_handle: handle,
+                        endpoints: vec![StaticCredentialEndpointBinding {
+                            host: "api.example.com".into(),
+                            port: 443,
+                            path: "/**".into(),
+                        }],
+                    },
+                )]),
+                vec![],
+            )
+            .unwrap();
+            let token = state.snapshot().child_env["KEY"].clone();
+            let alias = format!(
+                "sk-OPENSHELL-RESOLVE-ENV-{}",
+                token.strip_prefix(PLACEHOLDER_PREFIX).unwrap()
+            );
+            for host in ["api.example.com", "other.example.com"] {
+                let (_, classifier, _) =
+                    state.resolver_and_body_classifier_for_endpoint(host, 443, "/chat");
+                for token in [&token, &alias] {
+                    for wire_token in [token.clone(), encode_all(token), token.replace(':', "%3a")]
+                    {
+                        // JSON, arbitrary binary, and EOF-terminated tokens use the same streaming contract.
+                        for body in [
+                            format!(r#"{{"output":"{wire_token}"}}"#).into_bytes(),
+                            [b"\xff\0".as_slice(), wire_token.as_bytes()].concat(),
+                        ] {
+                            for split in 0..=body.len() {
+                                let mut guard = BodyPlaceholderGuard::new(classifier.as_deref());
+                                let mut output = guard.push(&body[..split]).unwrap();
+                                output.extend(guard.push(&body[split..]).unwrap());
+                                output.extend(guard.finish().unwrap());
+                                assert_eq!(output, body, "host {host}, split {split}");
+                                assert!(
+                                    !String::from_utf8_lossy(&output)
+                                        .contains("private-test-secret")
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_tokens_never_release_the_marker_at_any_split() {
         let classifier = BodyCredentialClassifier {
             known: HashSet::from(["KEY".to_owned()]),
-            allowed: HashSet::from(["KEY".to_owned()]),
             ..BodyCredentialClassifier::default()
         };
         for token in ["openshell:resolve:env:KEY", "sk-OPENSHELL-RESOLVE-ENV-KEY"] {
@@ -359,14 +410,14 @@ mod tests {
                 for split in 0..body.len() {
                     let mut guard = BodyPlaceholderGuard::new(Some(&classifier));
                     match guard.push(&body.as_bytes()[..split]) {
-                        Err(error) => assert_eq!(error, BodyCredentialError::EndpointBound),
+                        Err(error) => assert_eq!(error, BodyCredentialError::KnownUnavailable),
                         Ok(output) => {
                             assert!(!super::super::contains_reserved_credential_marker_bytes(
                                 &output
                             ));
                             assert_eq!(
                                 guard.push(&body.as_bytes()[split..]).unwrap_err(),
-                                BodyCredentialError::EndpointBound
+                                BodyCredentialError::KnownUnavailable
                             );
                         }
                     }

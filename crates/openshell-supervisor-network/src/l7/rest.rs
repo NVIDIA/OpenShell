@@ -7219,7 +7219,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guarded_conversation_body_preserves_literals_and_foreign_tokens() {
+    async fn guarded_conversation_body_preserves_literals_own_and_foreign_tokens() {
         use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
         use openshell_core::provider_credentials::ProviderCredentialState;
         let state = ProviderCredentialState::from_bound_environment(
@@ -7247,12 +7247,19 @@ mod tests {
             "api.openai.com",
             "api.anthropic.com",
             "api.githubcopilot.com",
+            "api.github.com",
         ] {
             let (_, classifier, revision) =
                 state.resolver_and_body_classifier_for_endpoint(host, 443, "/v1/responses");
+            let issued = state.snapshot().child_env["GITHUB_TOKEN"].clone();
             for token in [
                 "openshell:resolve:env:KEY".to_owned(),
-                state.snapshot().child_env["GITHUB_TOKEN"].clone(),
+                issued.clone(),
+                issued.replace(':', "%3A"),
+                format!(
+                    "sk-OPENSHELL-RESOLVE-ENV-{}",
+                    issued.strip_prefix("openshell:resolve:env:").unwrap()
+                ),
             ] {
                 let body = format!(
                     r#"{{"input":[{{"type":"function_call_output","output":"Token: {token}"}}]}}"#

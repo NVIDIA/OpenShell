@@ -74,12 +74,14 @@ When a hot reload changes rules, the supervisor publishes a new policy generatio
 
 When REST body credential rewriting is disabled, OpenShell forwards placeholder
 text unchanged if trusted metadata identifies an unknown key or a valid credential
-bound to a different host, port, or path. For example, a documentation example
-referencing an unknown `KEY`, or a GitHub placeholder in an OpenAI conversation,
-does not trigger a body denial. OpenShell does not substitute the secret.
+with a current binding, including to the destination itself. For example, an
+OpenRouter placeholder printed by `printenv` can remain in an OpenRouter
+conversation, just like an unknown documentation example or a GitHub placeholder.
+OpenShell preserves the body bytes and does not substitute the secret. Header
+credential resolution remains separate: the same placeholder can resolve in an
+authentication header while remaining literal text in the body.
 
-A placeholder bound to the destination still fails closed, including inside quoted
-tool output. Known invalid or revoked references and unavailable classification
+Known invalid or revoked references and unavailable classification
 metadata also fail closed. The local HTTP 403 response uses the error code
 `credential_placeholder_in_request_body`. Remove the offending reference from
 conversation history before retrying; if metadata is unavailable, restore provider
@@ -384,7 +386,7 @@ Use the `websocket-credential-rewrite` endpoint option with `protocol: websocket
 
 Use the `request-body-credential-rewrite` endpoint option with `protocol: rest` when an API expects OpenShell-managed credentials in UTF-8 JSON, form, or text request bodies. OpenShell buffers up to 256 KiB, rewrites recognized credential placeholders, updates `Content-Length`, and rejects unresolved placeholders instead of forwarding them. For chunked requests, the 256 KiB limit counts the complete wire representation, including framing, extensions, and trailers. The option is rejected for WebSocket, GraphQL, SQL, and plain L4 endpoints.
 
-Use `allow-uninspected-credentials` only when a provider-credentialed endpoint must remain L4-only, use `tls: skip`, or carry uninspectable WebSocket traffic. Without this explicit opt-in, the gateway rejects credentialed L4-only and `tls: skip` endpoints. REST bodies without placeholders continue to work when body rewrite is disabled; a body containing an OpenShell credential placeholder fails closed.
+Use `allow-uninspected-credentials` only when a provider-credentialed endpoint must remain L4-only, use `tls: skip`, or carry uninspectable WebSocket traffic. Without this explicit opt-in, the gateway rejects credentialed L4-only and `tls: skip` endpoints. When REST body rewriting is disabled, unknown placeholder text and valid issued placeholders pass unchanged; invalid or unavailable references fail closed.
 
 Credential rewrite recognizes the canonical `openshell:resolve:env:KEY` placeholder form and whole-token provider-shaped aliases such as `provider-OPENSHELL-RESOLVE-ENV-API_TOKEN` when the referenced environment key exists in the configured provider credentials.
 

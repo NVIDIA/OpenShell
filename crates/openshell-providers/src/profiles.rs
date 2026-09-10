@@ -3272,10 +3272,10 @@ mod tests {
     }
 
     #[test]
-    fn builtin_agent_conversation_defaults_allow_foreign_github_body_text() {
+    fn builtin_agent_conversation_defaults_preserve_own_and_foreign_body_text() {
         use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
         use openshell_core::provider_credentials::ProviderCredentialState;
-        use openshell_core::secrets::body::{BodyCredentialError, BodyPlaceholderGuard};
+        use openshell_core::secrets::body::BodyPlaceholderGuard;
         let binding = |profile: &ProviderTypeProfile| StaticCredentialBinding {
             credential_identity: profile.id.clone(),
             workload_credential_handle: String::new(),
@@ -3324,6 +3324,7 @@ mod tests {
                 for token in [
                     "openshell:resolve:env:KEY".to_owned(),
                     state.snapshot().child_env["GITHUB_TOKEN"].clone(),
+                    state.snapshot().child_env[&model_key].clone(),
                 ] {
                     let body = format!(r#"{{"tool_output":"Token: {token}"}}"#);
                     let mut guard = BodyPlaceholderGuard::new(Some(&classifier));
@@ -3333,7 +3334,7 @@ mod tests {
                 }
                 assert_eq!(
                     classifier.check(&state.snapshot().child_env[&model_key]),
-                    Err(BodyCredentialError::EndpointBound)
+                    Ok(())
                 );
             }
         }
