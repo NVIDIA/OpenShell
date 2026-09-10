@@ -111,6 +111,8 @@ A valid upstream response can still exceed middleware envelope limits or contain
 
 An unsupported binding or message class is a coverage gap, not a middleware failure. `on_error` does not make an HTTP-only service inspect WebSocket messages, and it does not make V1 inspect binary messages.
 
+For protocols without a supported middleware operation, OpenShell uses its uninspectable-traffic behavior. A matching `fail_closed` configuration blocks that traffic. If all matching configurations use `fail_open`, OpenShell bypasses middleware and emits a detection finding.
+
 Use `fail_open` only when bypassing the stage preserves the intended security policy. OpenShell emits a detection finding for a bypass and a separate state-change finding when it disables a WebSocket stage.
 
 An explicit deny result always stops the chain, regardless of `on_error`. Middleware decisions also remain enforced when the endpoint uses `enforcement: audit`. To observe traffic without blocking it, return an allow decision with findings.

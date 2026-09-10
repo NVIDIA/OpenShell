@@ -241,7 +241,8 @@ them. Requests, results, chain length, execution time, and diagnostics are
 bounded; external free-form diagnostic text is not exposed in responses or
 security logs. See
 [Supervisor Middleware](../docs/extensibility/supervisor-middleware/index.mdx) for
-configuration and protocol details.
+an introduction, or the [configuration guide](../docs/extensibility/supervisor-middleware/configure.mdx)
+for service registration and policy attachment.
 
 `https://inference.local` is special. It bypasses OPA network policy and is
 handled by the inference interception path:
