@@ -1384,7 +1384,9 @@ fn spawn_sidecar_entrypoint_handler(
             control_publisher,
         } = handler;
         let mut session_started = false;
-        let mut session_task: Option<tokio::task::JoinHandle<()>> = None;
+        let mut session_task: Option<
+            openshell_supervisor_process::supervisor_session::SessionHandle,
+        > = None;
         let mut trusted_supervisor_pid = None;
         let terminating = Arc::new(AtomicBool::new(false));
         while let Some(started) = entrypoint_rx.recv().await {

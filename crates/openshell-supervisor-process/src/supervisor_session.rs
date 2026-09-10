@@ -874,7 +874,7 @@ async fn connect_tcp_target(
     netns_fd: Option<RawFd>,
 ) -> Result<tokio::net::TcpStream, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(fd) = netns_fd {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         std::thread::spawn(move || {
             let result = (|| -> std::io::Result<std::net::TcpStream> {
                 #[allow(unsafe_code)]
