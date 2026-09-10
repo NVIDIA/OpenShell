@@ -103,6 +103,14 @@ impl GrpcMiddlewareService {
     ) -> std::result::Result<WebSocketResponseStream, Status> {
         self.service.open_websocket_session(receiver).await
     }
+
+    /// Open a remote HTTP response pre-return stream through the gRPC adapter.
+    pub async fn open_http_response_pre_return(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<HttpResponseEvent>,
+    ) -> std::result::Result<HttpResponseResultStream, Status> {
+        self.service.open_http_response_pre_return(receiver).await
+    }
 }
 
 #[derive(Clone)]
