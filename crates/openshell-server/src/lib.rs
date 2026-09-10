@@ -1045,13 +1045,19 @@ async fn terminate_signal() {
 }
 
 pub use compute::{
-    AcquiredRemoteDriverEndpoint, DriverWatchStream, ManagedDriverProcess, SharedComputeDriver,
+    AcquiredRemoteDriverEndpoint, DriverWatchStream, ManagedDriverProcess,
+    SandboxProviderCredentialsSink, SharedComputeDriver,
 };
 
 /// Driver instance returned by a compiled compute-driver factory.
 pub enum ComputeDriverInstance {
     /// A driver hosted in the gateway process.
     InProcess(SharedComputeDriver),
+    /// An in-process driver with a create-time provider credential side channel.
+    InProcessWithProviderCredentials {
+        driver: SharedComputeDriver,
+        provider_credentials_sink: SandboxProviderCredentialsSink,
+    },
     /// A driver process launched and owned by the gateway.
     ManagedRemote(AcquiredRemoteDriverEndpoint),
 }
@@ -1406,6 +1412,25 @@ async fn build_compute_runtime(
                     registration.name,
                     driver,
                     None,
+                    None,
+                    store,
+                    sandbox_index,
+                    sandbox_watch_bus,
+                    tracing_log_bus,
+                    supervisor_sessions,
+                )
+                .await
+                .map_err(|error| {
+                    Error::execution(format!("failed to create compute runtime: {error}"))
+                })?,
+                ComputeDriverInstance::InProcessWithProviderCredentials {
+                    driver,
+                    provider_credentials_sink,
+                } => ComputeRuntime::from_driver(
+                    registration.name,
+                    driver,
+                    None,
+                    Some(provider_credentials_sink),
                     store,
                     sandbox_index,
                     sandbox_watch_bus,

@@ -15,12 +15,13 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::struct_to_json_value;
+use openshell_core::provider_credentials::ProviderCredentialState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -206,6 +207,10 @@ pub struct MxcComputeBackend {
     registry: Arc<Mutex<HashMap<String, SandboxEntry>>>,
     watch_tx: Arc<broadcast::Sender<WatchSandboxesEvent>>,
     policy_mapper: Arc<dyn PolicyMapper>,
+    /// Provider resolver snapshots staged by the gateway immediately before
+    /// create. The driver consumes each entry exactly once; only placeholder
+    /// child environment values cross into MXC.
+    pending_provider_credentials: Arc<StdMutex<HashMap<String, ProviderCredentialState>>>,
     /// In-process ETW → OCSF audit consumer (Plane A). `Some` only when
     /// `config.etw_audit` is set and the session started; kept alive here so it
     /// stops when the backend is dropped (held purely for its `Drop`, hence
@@ -280,6 +285,37 @@ fn sandbox_environment(sandbox: &DriverSandbox) -> Vec<String> {
         .collect::<Vec<_>>();
     environment.sort_unstable();
     environment
+}
+
+/// Merge provider-owned child environment values into MXC `process.env`.
+///
+/// Provider entries win case-insensitively, matching Windows environment
+/// semantics. Secret values have already been replaced by revision-scoped
+/// placeholders; explicitly classified GCP configuration is resolved by the
+/// shared credential state because SDKs consume it before making a request.
+fn append_provider_child_env(
+    env: &mut Vec<String>,
+    provider_credentials: Option<&ProviderCredentialState>,
+) {
+    let Some(provider_credentials) = provider_credentials else {
+        return;
+    };
+    let mut provider_env = provider_credentials
+        .child_env_with_gcp_resolved()
+        .into_iter()
+        .collect::<Vec<_>>();
+    provider_env.sort_by(|(left, _), (right, _)| left.cmp(right));
+    env.retain(|entry| {
+        let key = entry.split_once('=').map_or(entry.as_str(), |(key, _)| key);
+        !provider_env
+            .iter()
+            .any(|(provider_key, _)| key.eq_ignore_ascii_case(provider_key))
+    });
+    env.extend(
+        provider_env
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}")),
+    );
 }
 
 fn configured_egress_addr(config: &MxcComputeConfig) -> Result<Option<SocketAddr>, tonic::Status> {
@@ -444,9 +480,17 @@ impl MxcComputeBackend {
             // Production policy translation is always handled by the embedded
             // mapper before any MXC lifecycle side effects begin.
             policy_mapper: Arc::new(EmbeddedPolicyMapper),
+            pending_provider_credentials: Arc::new(StdMutex::new(HashMap::new())),
             etw_session,
             attribution,
         }
+    }
+
+    /// Return the in-process create-time provider credential side channel.
+    pub fn provider_credentials_sink(
+        &self,
+    ) -> Arc<StdMutex<HashMap<String, ProviderCredentialState>>> {
+        self.pending_provider_credentials.clone()
     }
 
     /// Test-only constructor wiring the in-process mock `wxc-exec` shim.
@@ -537,6 +581,14 @@ impl MxcComputeBackend {
     pub async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
         let sandbox_id = sandbox.id.clone();
 
+        // Consume before any fallible validation so rejected creates cannot
+        // retain real provider material in the staging map.
+        let provider_credentials = self
+            .pending_provider_credentials
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&sandbox_id);
+
         Self::validate_sandbox_fields(sandbox)?;
         let sandbox_config = sandbox_config(sandbox)?;
         let (egress_addr, reserved_proxy_listener) = match configured_egress_addr(&self.config)? {
@@ -558,6 +610,15 @@ impl MxcComputeBackend {
         // synchronously at the CreateSandbox boundary.
         let policy = sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref());
         let mapped = self.map_sandbox_policy(&sandbox_id, policy, egress_addr)?;
+        if provider_credentials
+            .as_ref()
+            .is_some_and(ProviderCredentialState::requires_proxy_resolution)
+            && egress_addr.is_none()
+        {
+            return Err(tonic::Status::failed_precondition(
+                "mxc provider credentials require governed egress; enable egress_proxy so placeholders can be resolved by the host proxy",
+            ));
+        }
 
         if sandbox
             .spec
@@ -628,6 +689,7 @@ impl MxcComputeBackend {
                 sandbox,
                 sandbox_config,
                 mapped,
+                provider_credentials,
                 reserved_proxy_listener,
                 startup_guard,
             )
@@ -826,6 +888,7 @@ async fn run_lifecycle(
     sandbox: DriverSandbox,
     sandbox_config: MxcSandboxConfig,
     mapped: MappedConfig,
+    provider_credentials: Option<ProviderCredentialState>,
     mut reserved_proxy_listener: Option<std::net::TcpListener>,
     _startup_guard: tokio::sync::OwnedMutexGuard<()>,
 ) {
@@ -845,7 +908,7 @@ async fn run_lifecycle(
                 sandbox_id: Some(sandbox_id.clone()),
                 sandbox_name: Some(sandbox_name.clone()),
                 openshell_endpoint: None,
-                provider_credentials: None,
+                provider_credentials: provider_credentials.clone(),
                 agent_proposals: openshell_core::proposals::AgentProposals::default(),
                 denial_tx: None,
                 activity_tx: None,
@@ -906,6 +969,7 @@ async fn run_lifecycle(
     };
     let command_line = encode_windows_command_line(&sandbox_config.command);
     let mut environment = sandbox_environment(&sandbox);
+    append_provider_child_env(&mut environment, provider_credentials.as_ref());
     append_tls_env_vars(&mut environment, host_proxy_ca_paths.as_ref());
     info!(sandbox = %sandbox_name, count = environment.len(), "MXC process env vars");
     let process = MxcProcess {
@@ -1235,8 +1299,9 @@ mod lifecycle_tests {
     use futures::StreamExt;
     use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
     use openshell_core::proto::{
-        FilesystemPolicy, MiddlewareEndpointSelector, NetworkMiddlewareConfig, SandboxPolicy,
-        UiClipboardAccess, UiPolicy,
+        FilesystemPolicy, MiddlewareEndpointSelector, NetworkBinary, NetworkEndpoint,
+        NetworkMiddlewareConfig, NetworkPolicyRule, SandboxPolicy, StaticCredentialBinding,
+        StaticCredentialEndpointBinding, UiClipboardAccess, UiPolicy,
     };
     use std::time::Duration;
 
@@ -1292,6 +1357,32 @@ mod lifecycle_tests {
         }
     }
 
+    fn github_provider_credentials() -> ProviderCredentialState {
+        ProviderCredentialState::from_bound_environment(
+            42,
+            HashMap::from([(
+                "GITHUB_TOKEN".to_string(),
+                "raw-test-token-must-not-enter-mxc".to_string(),
+            )]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "GITHUB_TOKEN".to_string(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "api.github.com".to_string(),
+                        port: 443,
+                        path: "/**".to_string(),
+                    }],
+                    credential_identity: "provider-github:GITHUB_TOKEN".to_string(),
+                    workload_credential_handle: String::new(),
+                },
+            )]),
+            Vec::new(),
+        )
+        .expect("valid GitHub provider credential state")
+    }
+
     fn with_policy(mut sandbox: DriverSandbox, policy: SandboxPolicy) -> DriverSandbox {
         sandbox.spec.as_mut().unwrap().policy = Some(policy);
         sandbox
@@ -1340,6 +1431,160 @@ mod lifecycle_tests {
         let (addr, _reservation) = allocate_sandbox_proxy_addr(configured).unwrap();
         assert_eq!(addr.ip(), configured.ip());
         assert_ne!(addr.port(), 0);
+    }
+
+    #[test]
+    fn governed_egress_rejects_non_loopback_and_isolation_session() {
+        let mut config = MxcComputeConfig {
+            egress_proxy: true,
+            egress_proxy_addr: "10.0.0.1:18080".into(),
+            ..Default::default()
+        };
+        assert!(
+            configured_egress_addr(&config)
+                .unwrap_err()
+                .message()
+                .contains("127.0.0.1")
+        );
+
+        config.egress_proxy_addr = "127.0.0.1:18080".into();
+        config.backend = MxcBackend::IsolationSession;
+        assert!(
+            configured_egress_addr(&config)
+                .unwrap_err()
+                .message()
+                .contains("MXC M1")
+        );
+    }
+
+    #[test]
+    fn provider_child_environment_overrides_agent_values_with_placeholders() {
+        let credentials = github_provider_credentials();
+        let placeholder = credentials
+            .snapshot()
+            .child_env
+            .get("GITHUB_TOKEN")
+            .cloned()
+            .expect("GitHub placeholder");
+        let mut env = vec![
+            "github_token=agent-value".to_string(),
+            "UNCHANGED=value".to_string(),
+        ];
+
+        append_provider_child_env(&mut env, Some(&credentials));
+
+        assert!(env.contains(&"UNCHANGED=value".to_string()));
+        assert!(!env.iter().any(|entry| entry == "github_token=agent-value"));
+        assert!(env.contains(&format!("GITHUB_TOKEN={placeholder}")));
+        assert!(!env.iter().any(|entry| entry.contains("raw-test-token")));
+    }
+
+    #[tokio::test]
+    async fn provider_state_requiring_resolution_fails_closed_without_governed_egress() {
+        let backend = MxcComputeBackend::new_mocked(MxcComputeConfig::default());
+        let sink = backend.provider_credentials_sink();
+        sink.lock()
+            .expect("provider credential staging lock poisoned")
+            .insert(
+                "sb-provider-no-proxy".to_string(),
+                github_provider_credentials(),
+            );
+
+        let error = backend
+            .create_sandbox(&with_policy(
+                driver_sandbox("sb-provider-no-proxy"),
+                fs_policy(&[]),
+            ))
+            .await
+            .expect_err("provider credentials must require governed egress");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("enable egress_proxy"));
+        assert!(
+            sink.lock()
+                .expect("provider credential staging lock poisoned")
+                .is_empty(),
+            "the driver must consume staged credential material on every create attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn governed_egress_puts_only_provider_placeholder_in_mxc_process_env() {
+        let mut config = MxcComputeConfig {
+            egress_proxy: true,
+            egress_proxy_addr: "127.0.0.1:18080".to_string(),
+            ..Default::default()
+        };
+        config.backend = MxcBackend::ProcessContainer;
+        let backend = MxcComputeBackend::new_mocked(config);
+        let credentials = github_provider_credentials();
+        let placeholder = credentials
+            .snapshot()
+            .child_env
+            .get("GITHUB_TOKEN")
+            .cloned()
+            .expect("GitHub placeholder");
+        backend
+            .provider_credentials_sink()
+            .lock()
+            .expect("provider credential staging lock poisoned")
+            .insert("sb-provider-env".to_string(), credentials);
+
+        let mut policy = fs_policy(&[]);
+        policy.network_policies.insert(
+            "github".to_string(),
+            NetworkPolicyRule {
+                name: "github".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.github.com".to_string(),
+                    port: 443,
+                    protocol: "rest".to_string(),
+                    provider_credentialed: true,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "cmd".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let mut sandbox = with_policy(driver_sandbox("sb-provider-env"), policy);
+        sandbox
+            .spec
+            .as_mut()
+            .expect("sandbox spec")
+            .environment
+            .extend([
+                (
+                    "GITHUB_TOKEN".to_string(),
+                    "raw-agent-env-token".to_string(),
+                ),
+                ("UNCHANGED".to_string(), "value".to_string()),
+            ]);
+
+        backend
+            .create_sandbox(&sandbox)
+            .await
+            .expect("create accepted");
+        wait_for(&backend, "sb-provider-env", |_| {
+            crate::mxc::mock_recorded_config("sb-provider-env").is_some()
+        })
+        .await
+        .expect("MXC config should be recorded");
+
+        let recorded =
+            crate::mxc::mock_recorded_config("sb-provider-env").expect("mock recorded config");
+        let env = recorded["process"]["env"]
+            .as_array()
+            .expect("MXC process env")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(env.contains(&"UNCHANGED=value"));
+        assert!(env.contains(&format!("GITHUB_TOKEN={placeholder}").as_str()));
+        let encoded = recorded.to_string();
+        assert!(!encoded.contains("raw-agent-env-token"));
+        assert!(!encoded.contains("raw-test-token-must-not-enter-mxc"));
     }
 
     #[test]

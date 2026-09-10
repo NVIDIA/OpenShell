@@ -35,9 +35,11 @@ use openshell_core::proto::compute::v1::{
     gateway_listener_requirement::Selector, watch_sandboxes_event,
 };
 use openshell_core::proto::{
-    PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
-    SandboxTemplate, SandboxWorkloadTemplate, ServiceEndpoint, SshSession,
+    PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy as ProtoSandboxPolicy,
+    SandboxSpec, SandboxStatus, SandboxTemplate, SandboxWorkloadTemplate, ServiceEndpoint,
+    SshSession,
 };
+use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{ObjectLabels, ObjectWorkspace};
 use prost::Message;
@@ -63,6 +65,60 @@ pub type DriverWatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
 pub type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
+pub type SandboxProviderCredentialsSink = Arc<StdMutex<HashMap<String, ProviderCredentialState>>>;
+
+/// Driver-specific values that must be delivered atomically with sandbox
+/// creation without expanding the public compute-driver protobuf contract.
+#[derive(Clone, Default)]
+pub struct SandboxCreateRuntimeInputs {
+    pub effective_policy: Option<ProtoSandboxPolicy>,
+    pub provider_credentials: Option<ProviderCredentialState>,
+}
+
+impl SandboxCreateRuntimeInputs {
+    #[must_use]
+    pub(crate) fn new(
+        effective_policy: ProtoSandboxPolicy,
+        provider_credentials: Option<ProviderCredentialState>,
+    ) -> Self {
+        Self {
+            effective_policy: Some(effective_policy),
+            provider_credentials,
+        }
+    }
+}
+
+struct StagedProviderCredentials {
+    sink: SandboxProviderCredentialsSink,
+    sandbox_id: String,
+}
+
+impl StagedProviderCredentials {
+    fn stage(
+        sink: SandboxProviderCredentialsSink,
+        sandbox_id: &str,
+        credentials: ProviderCredentialState,
+    ) -> Self {
+        let mut pending = sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.insert(sandbox_id.to_string(), credentials);
+        drop(pending);
+        Self {
+            sink,
+            sandbox_id: sandbox_id.to_string(),
+        }
+    }
+}
+
+impl Drop for StagedProviderCredentials {
+    fn drop(&mut self) {
+        self.sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.sandbox_id);
+    }
+}
 
 use traced_driver::TracedDriver;
 
@@ -606,6 +662,7 @@ pub struct ComputeRuntime {
     telemetry_compute_driver: TelemetryComputeDriver,
     driver_process: Option<Arc<ManagedDriverProcess>>,
     default_image: String,
+    provider_credentials_sink: Option<SandboxProviderCredentialsSink>,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
@@ -642,6 +699,7 @@ impl ComputeRuntime {
         driver_name: String,
         driver: SharedComputeDriver,
         driver_process: Option<Arc<ManagedDriverProcess>>,
+        provider_credentials_sink: Option<SandboxProviderCredentialsSink>,
         store: Arc<Store>,
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
@@ -739,6 +797,7 @@ impl ComputeRuntime {
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process,
             default_image,
+            provider_credentials_sink,
             store,
             sandbox_index,
             sandbox_watch_bus,
@@ -790,6 +849,7 @@ impl ComputeRuntime {
             endpoint.name,
             driver,
             endpoint.driver_process,
+            None,
             store,
             sandbox_index,
             sandbox_watch_bus,
@@ -802,6 +862,12 @@ impl ComputeRuntime {
     #[must_use]
     pub fn default_image(&self) -> &str {
         &self.default_image
+    }
+
+    /// Whether this in-process driver accepts create-time provider state.
+    #[must_use]
+    pub(crate) fn accepts_create_time_provider_credentials(&self) -> bool {
+        self.provider_credentials_sink.is_some()
     }
 
     #[must_use]
@@ -909,9 +975,26 @@ impl ComputeRuntime {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
-        self.validate_policy_capabilities(sandbox)?;
+        self.validate_sandbox_create_with_runtime_inputs(
+            sandbox,
+            &SandboxCreateRuntimeInputs::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn validate_sandbox_create_with_runtime_inputs(
+        &self,
+        sandbox: &Sandbox,
+        runtime_inputs: &SandboxCreateRuntimeInputs,
+    ) -> Result<(), Status> {
+        self.validate_policy_capabilities(sandbox, runtime_inputs.effective_policy.as_ref())?;
         let mut driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
+        if let Some(effective_policy) = runtime_inputs.effective_policy.as_ref()
+            && let Some(spec) = driver_sandbox.spec.as_mut()
+        {
+            spec.policy = Some(effective_policy.clone());
+        }
         // Peek, never consume: create runs the same path immediately after and
         // must still find the token.
         if let Some(token) = take_staging_token(&mut driver_sandbox) {
@@ -934,11 +1017,13 @@ impl ComputeRuntime {
             .map(|_| ())
     }
 
-    fn validate_policy_capabilities(&self, sandbox: &Sandbox) -> Result<(), Status> {
-        let has_explicit_ui = sandbox
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.policy.as_ref())
+    fn validate_policy_capabilities(
+        &self,
+        sandbox: &Sandbox,
+        effective_policy: Option<&ProtoSandboxPolicy>,
+    ) -> Result<(), Status> {
+        let has_explicit_ui = effective_policy
+            .or_else(|| sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref()))
             .and_then(|policy| policy.ui.as_ref())
             .is_some();
         if has_explicit_ui && !self.driver_info.supports_ui_policy {
@@ -956,9 +1041,31 @@ impl ComputeRuntime {
         sandbox_token: Option<String>,
         await_main_process_attachment: bool,
     ) -> Result<Sandbox, Status> {
+        self.create_sandbox_with_runtime_inputs(
+            sandbox,
+            sandbox_token,
+            await_main_process_attachment,
+            SandboxCreateRuntimeInputs::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn create_sandbox_with_runtime_inputs(
+        &self,
+        sandbox: Sandbox,
+        sandbox_token: Option<String>,
+        await_main_process_attachment: bool,
+        runtime_inputs: SandboxCreateRuntimeInputs,
+    ) -> Result<Sandbox, Status> {
         // Defense in depth for internal callers that bypass the public create
         // handler's ValidateSandboxCreate step. This check has no side effects.
-        self.validate_policy_capabilities(&sandbox)?;
+        self.validate_policy_capabilities(&sandbox, runtime_inputs.effective_policy.as_ref())?;
+        if runtime_inputs.provider_credentials.is_some() && self.provider_credentials_sink.is_none()
+        {
+            return Err(Status::internal(
+                "provider credentials supplied to a compute driver without a create-time sink",
+            ));
+        }
         let sandbox_id = sandbox.object_id().to_string();
         let mut sandbox = sandbox;
 
@@ -973,6 +1080,11 @@ impl ComputeRuntime {
 
         let mut driver_sandbox = driver_sandbox_from_public(&sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
+        if let Some(effective_policy) = runtime_inputs.effective_policy
+            && let Some(spec) = driver_sandbox.spec.as_mut()
+        {
+            spec.policy = Some(effective_policy);
+        }
         if let Some(staged) = staged.as_ref() {
             set_rootfs_tar_path(&mut driver_sandbox, staged.path());
         }
@@ -1022,6 +1134,18 @@ impl ComputeRuntime {
         if let Some(spec) = driver_sandbox.spec.as_mut() {
             spec.await_main_process_attachment = await_main_process_attachment;
         }
+        let _staged_provider_credentials = match (
+            self.provider_credentials_sink.clone(),
+            runtime_inputs.provider_credentials,
+        ) {
+            (Some(sink), Some(credentials)) => Some(StagedProviderCredentials::stage(
+                sink,
+                &sandbox_id,
+                credentials,
+            )),
+            (None, Some(_)) => unreachable!("provider credential sink checked before persistence"),
+            (_, None) => None,
+        };
         match self
             .driver
             .call(
@@ -4949,6 +5073,7 @@ pub async fn new_test_runtime_with_driver(
         telemetry_compute_driver: TelemetryComputeDriver::custom(),
         driver_process: None,
         default_image: "openshell/sandbox:test".to_string(),
+        provider_credentials_sink: None,
         store,
         sandbox_index: SandboxIndex::new(),
         sandbox_watch_bus: SandboxWatchBus::new(),
@@ -5231,6 +5356,9 @@ mod tests {
         workspace_rpcs_unimplemented: bool,
         validate_create_calls: AtomicUsize,
         create_calls: AtomicUsize,
+        provider_credentials_sink: Option<SandboxProviderCredentialsSink>,
+        provider_env_at_create: TestMutex<Option<HashMap<String, String>>>,
+        created_sandboxes: TestMutex<Vec<DriverSandbox>>,
     }
 
     #[tonic::async_trait]
@@ -5330,9 +5458,28 @@ mod tests {
 
         async fn create_sandbox(
             &self,
-            _request: Request<CreateSandboxRequest>,
+            request: Request<CreateSandboxRequest>,
         ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
             self.create_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(sandbox) = request.into_inner().sandbox {
+                if let Some(sink) = &self.provider_credentials_sink {
+                    let credentials = sink
+                        .lock()
+                        .expect("provider credential staging lock poisoned")
+                        .get(&sandbox.id)
+                        .cloned()
+                        .expect("provider credentials must be staged before driver create");
+                    *self
+                        .provider_env_at_create
+                        .lock()
+                        .expect("provider env observation lock poisoned") =
+                        Some(credentials.child_env_with_gcp_resolved());
+                }
+                self.created_sandboxes
+                    .lock()
+                    .expect("created sandbox observation lock poisoned")
+                    .push(sandbox);
+            }
             Ok(tonic::Response::new(CreateSandboxResponse {}))
         }
 
@@ -5829,6 +5976,7 @@ mod tests {
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process: None,
             default_image: "openshell/sandbox:test".to_string(),
+            provider_credentials_sink: None,
             store,
             sandbox_index: SandboxIndex::new(),
             sandbox_watch_bus: SandboxWatchBus::new(),
@@ -5892,6 +6040,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn effective_ui_policy_rejects_before_unsupported_driver_validation() {
+        let driver = Arc::new(TestDriver::default());
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record(
+            "sb-effective-ui",
+            "effective-ui-policy",
+            SandboxPhase::Provisioning,
+        );
+        let runtime_inputs = SandboxCreateRuntimeInputs::new(
+            PublicSandboxPolicy {
+                ui: Some(UiPolicy::default()),
+                ..Default::default()
+            },
+            None,
+        );
+
+        let error = runtime
+            .validate_sandbox_create_with_runtime_inputs(&sandbox, &runtime_inputs)
+            .await
+            .expect_err("an unsupported driver must reject the effective UI policy");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert_eq!(driver.validate_create_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn explicit_ui_policy_reaches_driver_when_capability_is_complete() {
         let driver = Arc::new(TestDriver::default());
         let mut runtime = test_runtime(driver.clone()).await;
@@ -5917,6 +6091,97 @@ mod tests {
             .expect("an absent UI section must preserve existing behavior");
 
         assert_eq!(driver.validate_create_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn create_runtime_inputs_reach_driver_without_persisting_effective_policy_or_secrets() {
+        let sink: SandboxProviderCredentialsSink = Arc::new(TestMutex::new(HashMap::new()));
+        let driver = Arc::new(TestDriver {
+            provider_credentials_sink: Some(sink.clone()),
+            ..Default::default()
+        });
+        let mut runtime = test_runtime(driver.clone()).await;
+        runtime.provider_credentials_sink = Some(sink.clone());
+
+        let mut sandbox = sandbox_record(
+            "sb-provider-inputs",
+            "provider-inputs",
+            SandboxPhase::Provisioning,
+        );
+        sandbox.spec = Some(SandboxSpec {
+            policy: Some(PublicSandboxPolicy {
+                version: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let provider_credentials = ProviderCredentialState::from_environment(
+            17,
+            HashMap::from([("GITHUB_TOKEN".to_string(), "raw-test-token".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let runtime_inputs = SandboxCreateRuntimeInputs::new(
+            PublicSandboxPolicy {
+                version: 2,
+                ..Default::default()
+            },
+            Some(provider_credentials),
+        );
+
+        runtime
+            .create_sandbox_with_runtime_inputs(sandbox, None, false, runtime_inputs)
+            .await
+            .expect("create should succeed");
+
+        let observed_env = driver
+            .provider_env_at_create
+            .lock()
+            .expect("provider env observation lock poisoned")
+            .clone()
+            .expect("driver should observe staged provider credentials");
+        let observed_token = &observed_env["GITHUB_TOKEN"];
+        assert_ne!(observed_token, "raw-test-token");
+        assert!(observed_token.starts_with(openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC));
+        assert!(
+            sink.lock()
+                .expect("provider credential staging lock poisoned")
+                .is_empty(),
+            "create-time credentials must be removed after the driver call"
+        );
+
+        let observed_policy_version = {
+            let created = driver
+                .created_sandboxes
+                .lock()
+                .expect("created sandbox observation lock poisoned");
+            created[0]
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.policy.as_ref())
+                .map(|policy| policy.version)
+        };
+        assert_eq!(
+            observed_policy_version,
+            Some(2),
+            "the driver must receive the effective policy"
+        );
+
+        let persisted = runtime
+            .store
+            .get_message::<Sandbox>("sb-provider-inputs")
+            .await
+            .expect("persisted sandbox lookup should succeed")
+            .expect("sandbox should be persisted");
+        assert_eq!(
+            persisted
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.policy.as_ref())
+                .map(|policy| policy.version),
+            Some(1),
+            "the public sandbox must retain its base policy"
+        );
     }
 
     async fn test_runtime_with_gateway_managed_lifecycle(
@@ -10984,6 +11249,7 @@ mod tests {
         ComputeRuntime::from_driver(
             "test-driver".to_string(),
             Arc::new(TestDriver::default()),
+            None,
             None,
             store,
             SandboxIndex::new(),

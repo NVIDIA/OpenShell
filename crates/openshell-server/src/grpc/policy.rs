@@ -1621,20 +1621,40 @@ async fn current_effective_policy_for_sandbox(
         .as_ref()
         .map(|spec| spec.providers.clone())
         .unwrap_or_default();
+    let provider_records = super::provider::load_provider_environment_records(
+        state.store.as_ref(),
+        workspace,
+        &provider_names,
+    )
+    .await?;
+    current_effective_policy_for_sandbox_with_records(
+        state,
+        catalog,
+        sandbox,
+        sandbox_id,
+        &provider_records,
+    )
+    .await
+}
+
+async fn current_effective_policy_for_sandbox_with_records(
+    state: &ServerState,
+    catalog: &EffectiveProviderProfileCatalog,
+    sandbox: &Sandbox,
+    sandbox_id: &str,
+    provider_records: &[super::provider::ProviderEnvironmentRecord],
+) -> Result<ProtoSandboxPolicy, Status> {
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     if let Some(mut global_policy) = decode_policy_from_global_settings(&global_settings)? {
         // A global policy replaces dynamic policy, but startup-only UI remains
         // anchored to the sandbox spec so reads cannot misrepresent enforcement.
         preserve_sandbox_startup_ui(&mut global_policy, sandbox);
-        return apply_effective_policy_context(
-            state,
+        return apply_effective_policy_context_from_records(
             catalog,
-            workspace,
-            &provider_names,
+            provider_records,
             global_policy,
             PolicySource::Global,
-        )
-        .await;
+        );
     }
 
     let policy = if let Some(record) = state
@@ -1653,15 +1673,12 @@ async fn current_effective_policy_for_sandbox(
         }
     };
 
-    apply_effective_policy_context(
-        state,
+    apply_effective_policy_context_from_records(
         catalog,
-        workspace,
-        &provider_names,
+        provider_records,
         policy,
         PolicySource::Sandbox,
     )
-    .await
 }
 
 async fn effective_policy_for_source(
@@ -1696,17 +1713,26 @@ async fn apply_effective_policy_context(
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
-    mut policy: ProtoSandboxPolicy,
+    policy: ProtoSandboxPolicy,
     policy_source: PolicySource,
 ) -> Result<ProtoSandboxPolicy, Status> {
-    clear_provider_credentialed_markers(&mut policy);
-    let mut provider_context = provider_policy_context_with_catalog(
+    let provider_records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
-        catalog,
         workspace,
         provider_names,
     )
     .await?;
+    apply_effective_policy_context_from_records(catalog, &provider_records, policy, policy_source)
+}
+
+fn apply_effective_policy_context_from_records(
+    catalog: &EffectiveProviderProfileCatalog,
+    provider_records: &[super::provider::ProviderEnvironmentRecord],
+    mut policy: ProtoSandboxPolicy,
+    policy_source: PolicySource,
+) -> Result<ProtoSandboxPolicy, Status> {
+    clear_provider_credentialed_markers(&mut policy);
+    let mut provider_context = provider_policy_context_from_records(catalog, provider_records);
     if !matches!(policy_source, PolicySource::Global) && !provider_context.layers.is_empty() {
         policy = compose_effective_policy(&policy, &provider_context.layers);
     }
@@ -2876,16 +2902,23 @@ async fn provider_policy_context_with_catalog(
     workspace: &str,
     provider_names: &[String],
 ) -> Result<ProviderPolicyContext, Status> {
+    let records =
+        super::provider::load_provider_environment_records(store, workspace, provider_names)
+            .await?;
+    Ok(provider_policy_context_from_records(catalog, &records))
+}
+
+fn provider_policy_context_from_records(
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[super::provider::ProviderEnvironmentRecord],
+) -> ProviderPolicyContext {
     let mut layers = Vec::new();
     let mut credentialed_scopes = Vec::new();
     let mut endpointless_provider_names = HashSet::new();
 
-    for name in provider_names {
-        let provider = store
-            .get_message_by_name::<Provider>(workspace, name)
-            .await
-            .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
-            .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
+    for record in records {
+        let name = &record.name;
+        let provider = &record.provider;
 
         let provider_type = provider.r#type.trim();
         let Some(profile) = super::provider::get_provider_type_profile_for_scope(
@@ -2901,7 +2934,7 @@ async fn provider_policy_context_with_catalog(
             continue;
         };
 
-        if !super::provider::provider_profile_endpoints_are_active(&profile, &provider) {
+        if !super::provider::provider_profile_endpoints_are_active(&profile, provider) {
             endpointless_provider_names.insert(name.clone());
             continue;
         }
@@ -2929,11 +2962,11 @@ async fn provider_policy_context_with_catalog(
         });
     }
 
-    Ok(ProviderPolicyContext {
+    ProviderPolicyContext {
         layers,
         credentialed_scopes,
         endpointless_provider_names,
-    })
+    }
 }
 
 fn endpoint_ports(endpoint: &NetworkEndpoint) -> Vec<u32> {
@@ -3105,6 +3138,125 @@ pub(super) async fn handle_get_gateway_config(
     }))
 }
 
+/// Resolve the effective policy and provider credential snapshot required by
+/// an in-process compute driver at sandbox creation time.
+///
+/// The policy, revision, endpoint bindings, and environment are all derived
+/// from one immutable provider-record snapshot. Raw static credentials remain
+/// in the returned resolver state; only revision-scoped placeholders are
+/// exposed through its child environment.
+pub(super) async fn resolve_sandbox_create_runtime_inputs(
+    state: &ServerState,
+    sandbox: &Sandbox,
+) -> Result<crate::compute::SandboxCreateRuntimeInputs, Status> {
+    if !state.compute.accepts_create_time_provider_credentials() {
+        return Ok(crate::compute::SandboxCreateRuntimeInputs::default());
+    }
+
+    let sandbox_id = sandbox.object_id();
+    let workspace = sandbox.object_workspace();
+    let provider_names = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.as_slice())
+        .unwrap_or_default();
+    let provider_profile_catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), workspace)
+        .await?;
+    let provider_records = super::provider::load_provider_environment_records(
+        state.store.as_ref(),
+        workspace,
+        provider_names,
+    )
+    .await?;
+    let effective_policy = current_effective_policy_for_sandbox_with_records(
+        state,
+        &provider_profile_catalog,
+        sandbox,
+        sandbox_id,
+        &provider_records,
+    )
+    .await?;
+    let policy_credential_bindings =
+        policy_static_credential_endpoint_bindings(Some(&effective_policy))?;
+    validate_policy_credential_binding_context(
+        &provider_profile_catalog,
+        &provider_records,
+        &effective_policy,
+        &policy_credential_bindings,
+    )?;
+    let provider_env_revision = compute_provider_env_revision_from_records_and_policy_bindings(
+        &provider_profile_catalog,
+        &provider_records,
+        &policy_credential_bindings,
+    )?;
+    let mut provider_environment =
+        super::provider::resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
+            state.store.as_ref(),
+            &provider_profile_catalog,
+            &provider_records,
+            &policy_credential_bindings,
+            &state.credentials,
+            Some(sandbox_id),
+        )
+        .await?;
+
+    // MXC uses the binding-capable host proxy. Withhold any static value that
+    // has no endpoint binding instead of exposing it directly to the process.
+    let unbound_static_keys = provider_environment
+        .static_credential_keys
+        .iter()
+        .filter(|key| {
+            !provider_environment
+                .static_credential_bindings
+                .contains_key(*key)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in unbound_static_keys {
+        warn!(
+            sandbox_id,
+            key = %key,
+            "withholding unbound static provider credential from MXC sandbox"
+        );
+        provider_environment.environment.remove(&key);
+        provider_environment.credential_expires_at_ms.remove(&key);
+        provider_environment.static_credential_keys.remove(&key);
+    }
+
+    let provider_credentials = if provider_records.is_empty() {
+        None
+    } else {
+        let non_secret_environment_keys = provider_environment
+            .environment
+            .keys()
+            .filter(|key| !provider_environment.static_credential_keys.contains(*key))
+            .cloned()
+            .collect();
+        Some(
+            openshell_core::provider_credentials::ProviderCredentialState::from_bound_environment(
+                provider_env_revision,
+                provider_environment.environment,
+                provider_environment.credential_expires_at_ms,
+                provider_environment.dynamic_credentials,
+                provider_environment.static_credential_bindings,
+                non_secret_environment_keys,
+            )
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "invalid provider credential binding for sandbox '{sandbox_id}': {error}"
+                ))
+            })?,
+        )
+    };
+
+    Ok(crate::compute::SandboxCreateRuntimeInputs::new(
+        effective_policy,
+        provider_credentials,
+    ))
+}
+
 pub(super) async fn handle_get_sandbox_provider_environment(
     state: &Arc<ServerState>,
     request: Request<GetSandboxProviderEnvironmentRequest>,
@@ -3138,12 +3290,12 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         &provider_names,
     )
     .await?;
-    let effective_policy = current_effective_policy_for_sandbox(
+    let effective_policy = current_effective_policy_for_sandbox_with_records(
         state.as_ref(),
         &provider_profile_catalog,
-        &workspace,
         &sandbox,
         &sandbox_id,
+        &provider_records,
     )
     .await?;
     let policy_credential_bindings =
