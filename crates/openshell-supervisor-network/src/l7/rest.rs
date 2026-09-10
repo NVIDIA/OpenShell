@@ -3472,6 +3472,7 @@ mod tests {
         script: ResponseRelayScript,
         request_only: bool,
         body_gate: Option<ResponseBodyGate>,
+        captured_preflight_headers: Option<Arc<std::sync::Mutex<Vec<HttpHeader>>>>,
     }
 
     #[derive(Clone)]
@@ -3535,6 +3536,7 @@ mod tests {
             );
             let mut script = self.script;
             let body_gate = self.body_gate.clone();
+            let captured_preflight_headers = self.captured_preflight_headers.clone();
             let (sender, receiver) = mpsc::channel(4);
             tokio::spawn(async move {
                 while let Some(event) = requests.recv().await {
@@ -3543,6 +3545,10 @@ mod tests {
                     };
                     let result = match event {
                         http_response_event::Event::Preflight(preflight) => {
+                            if let Some(captured) = &captured_preflight_headers {
+                                *captured.lock().expect("preflight capture lock") =
+                                    preflight.headers.clone();
+                            }
                             if preflight
                                 .config
                                 .as_ref()
@@ -5590,6 +5596,7 @@ mod tests {
                 script: ResponseRelayScript::HeadersOnly,
                 request_only: true,
                 body_gate: None,
+                captured_preflight_headers: None,
             }));
         let empty_runner = openshell_supervisor_middleware::ChainRunner::default();
         for response in [many_headers, opaque_headers] {
@@ -5624,7 +5631,7 @@ mod tests {
     async fn response_middleware_selected_hook_enforces_header_limits() {
         let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n".to_vec();
         for _ in 0..129 {
-            response.extend_from_slice(b"Set-Cookie: a=b\r\n");
+            response.extend_from_slice(b"X-Ordinary: value\r\n");
         }
         response.extend_from_slice(b"\r\n");
         let (runner, chain) = response_middleware_fixture(ResponseRelayScript::HeadersOnly);
@@ -5641,6 +5648,73 @@ mod tests {
         .unwrap();
         assert!(matches!(outcome, RelayOutcome::Consumed));
         assert!(delivered.starts_with(b"HTTP/1.1 502 "));
+    }
+
+    #[tokio::test]
+    async fn response_middleware_omits_credentials_and_preserves_downstream_fields() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner =
+            openshell_supervisor_middleware::ChainRunner::new(Arc::new(ResponseRelayService {
+                script: ResponseRelayScript::HeadersOnly,
+                request_only: false,
+                body_gate: None,
+                captured_preflight_headers: Some(Arc::clone(&captured)),
+            }));
+        let chain = vec![openshell_supervisor_middleware::ChainEntry {
+            name: "response".into(),
+            implementation: "test/response-relay".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        }];
+        let response = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 5\r\n\
+            Cache-Control: public\r\n\
+            Set-Cookie:  session=secret; HttpOnly\r\n\
+            WWW-Authenticate: Bearer realm=private\r\n\
+            Authentication-Info: nextnonce=secret\r\n\
+            Proxy-Authenticate: Basic realm=proxy\r\n\
+            Proxy-Authentication-Info: nextnonce=proxy-secret\r\n\
+            Proxy-Authorization: Basic proxy-secret\r\n\
+            X-OpenShell-Credential-Token: injected-secret\r\n\r\nhello";
+        let mut upstream = response.as_slice();
+        let mut delivered = Vec::new();
+
+        let outcome = relay_response(
+            "GET",
+            &mut upstream,
+            &mut delivered,
+            RelayResponseOptions::default(),
+            Some(response_middleware_context(&runner, &chain, "GET")),
+        )
+        .await
+        .expect("response relay");
+
+        assert!(matches!(outcome, RelayOutcome::Reusable));
+        let observed = captured.lock().expect("preflight capture lock");
+        assert_eq!(
+            observed
+                .iter()
+                .map(|header| header.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["content-length", "cache-control"]
+        );
+        drop(observed);
+
+        let delivered = String::from_utf8(delivered).expect("UTF-8 response");
+        for credential_field in [
+            "Set-Cookie:  session=secret; HttpOnly\r\n",
+            "WWW-Authenticate: Bearer realm=private\r\n",
+            "Authentication-Info: nextnonce=secret\r\n",
+            "Proxy-Authenticate: Basic realm=proxy\r\n",
+            "Proxy-Authentication-Info: nextnonce=proxy-secret\r\n",
+            "Proxy-Authorization: Basic proxy-secret\r\n",
+            "X-OpenShell-Credential-Token: injected-secret\r\n",
+        ] {
+            assert!(delivered.contains(credential_field), "{delivered}");
+        }
+        assert!(delivered.contains("cache-control: private\r\n"));
+        assert!(delivered.ends_with("\r\n\r\nhello"));
     }
 
     #[tokio::test]
@@ -5726,6 +5800,7 @@ mod tests {
                 script,
                 request_only: false,
                 body_gate: None,
+                captured_preflight_headers: None,
             }));
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
             name: "response".into(),
@@ -5991,6 +6066,7 @@ mod tests {
                     entered: Arc::clone(&entered),
                     release: Arc::clone(&release),
                 }),
+                captured_preflight_headers: None,
             }));
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
             name: "response".into(),

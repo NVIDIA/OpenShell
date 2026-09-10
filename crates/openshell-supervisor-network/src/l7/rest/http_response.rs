@@ -306,6 +306,7 @@ where
         }
     };
     let original_headers = parsed.headers.clone();
+    let preserved_credential_headers = parsed.preserved_credential_headers;
     let upstream_declared_trailers = parsed.declared_trailers.clone();
     let connection_nominated_headers = parsed.connection_nominated.clone();
     let input = openshell_supervisor_middleware::HttpResponsePreflightInput {
@@ -419,6 +420,7 @@ where
             client,
             &status_line,
             &preflight.headers,
+            &preserved_credential_headers,
             &upstream_declared_trailers,
             &buffered[header_end..],
             status_code,
@@ -473,6 +475,7 @@ where
         let head = serialize_response_head(
             &status_line,
             &headers,
+            &preserved_credential_headers,
             ResponseFraming::Preserve(body_length),
             server_wants_close,
             &[],
@@ -502,6 +505,7 @@ where
     let streaming_head = serialize_response_head(
         &status_line,
         &preflight.headers,
+        &preserved_credential_headers,
         if chunked_output {
             ResponseFraming::Chunked
         } else {
@@ -699,6 +703,7 @@ where
         let head = serialize_response_head(
             &status_line,
             &headers,
+            &preserved_credential_headers,
             framing,
             server_wants_close,
             &trailer_names,
@@ -745,6 +750,7 @@ async fn relay_headers_only_response<U, C>(
     client: &mut C,
     status_line: &str,
     headers: &[HttpHeader],
+    preserved_credential_headers: &[String],
     declared_trailers: &[String],
     overflow: &[u8],
     status_code: u16,
@@ -759,6 +765,7 @@ where
     let head = serialize_response_head(
         status_line,
         headers,
+        preserved_credential_headers,
         ResponseFraming::Preserve(body_length),
         server_wants_close,
         declared_trailers,
@@ -1038,6 +1045,7 @@ fn emit_http_response_middleware_failure(
 struct ParsedResponseHead {
     representable: bool,
     headers: Vec<HttpHeader>,
+    preserved_credential_headers: Vec<String>,
     connection_nominated: Vec<String>,
     declared_trailers: Vec<String>,
 }
@@ -1081,6 +1089,7 @@ fn parse_response_head_for_middleware(header_bytes: &[u8]) -> Result<ParsedRespo
         }
     }
     let mut headers = Vec::new();
+    let mut preserved_credential_headers = Vec::new();
     for line in header.split("\r\n").skip(1).filter(|line| !line.is_empty()) {
         let (name, value) = line
             .split_once(':')
@@ -1088,6 +1097,13 @@ fn parse_response_head_for_middleware(header_bytes: &[u8]) -> Result<ParsedRespo
         validate_http_field_name(name)?;
         validate_http_field_value(value.trim())?;
         let name = name.to_ascii_lowercase();
+        if openshell_supervisor_middleware::headers::is_response_credential_header(&name) {
+            // Middleware must not observe credential-bearing response fields.
+            // Keep the original line separately so downstream delivery retains
+            // its exact name, whitespace, and value bytes.
+            preserved_credential_headers.push(line.to_string());
+            continue;
+        }
         if nominated.contains(&name) || is_hidden_response_field(&name) {
             continue;
         }
@@ -1101,6 +1117,11 @@ fn parse_response_head_for_middleware(header_bytes: &[u8]) -> Result<ParsedRespo
     Ok(ParsedResponseHead {
         representable,
         headers: if representable { headers } else { Vec::new() },
+        preserved_credential_headers: if representable {
+            preserved_credential_headers
+        } else {
+            Vec::new()
+        },
         connection_nominated,
         declared_trailers,
     })
@@ -1145,7 +1166,9 @@ fn validate_http_field_value(value: &str) -> Result<()> {
 }
 
 fn is_protected_response_field(name: &str) -> bool {
-    name.eq_ignore_ascii_case("content-length") || is_hidden_response_field(name)
+    name.eq_ignore_ascii_case("content-length")
+        || is_hidden_response_field(name)
+        || openshell_supervisor_middleware::headers::is_response_credential_header(name)
 }
 
 fn is_hidden_response_field(name: &str) -> bool {
@@ -1183,6 +1206,7 @@ enum ResponseFraming {
 fn serialize_response_head(
     status_line: &str,
     headers: &[HttpHeader],
+    preserved_credential_headers: &[String],
     framing: ResponseFraming,
     connection_close: bool,
     trailer_names: &[String],
@@ -1197,6 +1221,10 @@ fn serialize_response_head(
         output.push_str(&header.name);
         output.push_str(": ");
         output.push_str(&header.value);
+        output.push_str("\r\n");
+    }
+    for header in preserved_credential_headers {
+        output.push_str(header);
         output.push_str("\r\n");
     }
     match framing {
@@ -2042,6 +2070,7 @@ mod tests {
             let serialized = String::from_utf8(serialize_response_head(
                 "HTTP/1.1 200 OK",
                 &headers,
+                &[],
                 framing,
                 false,
                 &[],

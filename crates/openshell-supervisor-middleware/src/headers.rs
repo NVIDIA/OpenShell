@@ -305,26 +305,37 @@ fn is_request_protected(name: &str) -> bool {
         || name.starts_with("x-openshell-credential")
 }
 
-fn is_response_protected(name: &str) -> bool {
+/// Return whether a response header can carry authentication material and must
+/// never be exposed to middleware.
+#[must_use]
+pub fn is_response_credential_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
     matches!(
-        name,
+        name.as_str(),
         "authentication-info"
-            | "connection"
-            | "content-encoding"
-            | "content-length"
-            | "content-range"
-            | "keep-alive"
             | "proxy-authenticate"
             | "proxy-authentication-info"
             | "proxy-authorization"
-            | "proxy-connection"
             | "set-cookie"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
             | "www-authenticate"
     ) || name.starts_with("x-openshell-credential")
+}
+
+fn is_response_protected(name: &str) -> bool {
+    is_response_credential_header(name)
+        || matches!(
+            name,
+            "connection"
+                | "content-encoding"
+                | "content-length"
+                | "content-range"
+                | "keep-alive"
+                | "proxy-connection"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+        )
 }
 
 fn is_response_remove_only(name: &str) -> bool {
