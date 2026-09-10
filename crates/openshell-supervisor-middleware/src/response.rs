@@ -1175,6 +1175,23 @@ async fn end_stages(stages: &mut [HttpResponseStage], reason: MiddlewareSessionE
     }
 }
 
+async fn handle_opened_preflight_failure(
+    entry: &DescribedChainEntry,
+    current_stage: &mut HttpResponseStage,
+    prior_stages: &mut [HttpResponseStage],
+    reason: &str,
+    invocations: &mut Vec<HttpResponseInvocation>,
+) -> Option<String> {
+    current_stage
+        .end(MiddlewareSessionEndReason::MiddlewareFailure)
+        .await;
+    let failure = collect_preflight_failure(entry, reason, invocations);
+    if failure.is_some() {
+        end_stages(prior_stages, MiddlewareSessionEndReason::MiddlewareFailure).await;
+    }
+    failure
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1211,6 +1228,10 @@ mod tests {
 
     struct ResponseService {
         script: Script,
+    }
+
+    struct PreflightLifecycleService {
+        completion_tx: mpsc::UnboundedSender<(String, Vec<MiddlewareSessionEndReason>)>,
     }
 
     #[derive(Clone)]
@@ -1566,6 +1587,115 @@ mod tests {
         }
     }
 
+    #[tonic::async_trait]
+    impl InProcessMiddleware for PreflightLifecycleService {
+        async fn describe(&self) -> MiddlewareManifest {
+            response_manifest("test/preflight-lifecycle")
+        }
+
+        async fn validate_config(
+            &self,
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> miette::Result<()> {
+            Ok(())
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: HttpRequestView<'_>,
+        ) -> miette::Result<HttpRequestResult> {
+            unreachable!()
+        }
+
+        async fn open_http_response_pre_return(
+            &self,
+            mut requests: mpsc::Receiver<HttpResponseEvent>,
+        ) -> Result<super::super::HttpResponseResultStream, tonic::Status> {
+            let (sender, receiver) = mpsc::channel(4);
+            let completion_tx = self.completion_tx.clone();
+            tokio::spawn(async move {
+                let Some(HttpResponseEvent {
+                    event: Some(http_response_event::Event::Preflight(preflight)),
+                }) = requests.recv().await
+                else {
+                    return;
+                };
+                let config_value = |name: &str| {
+                    preflight
+                        .config
+                        .as_ref()
+                        .and_then(|config| config.fields.get(name))
+                        .and_then(|value| value.kind.as_ref())
+                        .and_then(|kind| match kind {
+                            prost_types::value::Kind::StringValue(value) => Some(value.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default()
+                };
+                let label = config_value("label");
+                let behavior = config_value("behavior");
+                let inspect = |body_mode, header_mutations| HttpResponsePreflightResult {
+                    action: Some(http_response_preflight_result::Action::Inspect(
+                        HttpResponsePreflightInspect {
+                            body_mode,
+                            header_mutations,
+                        },
+                    )),
+                    ..Default::default()
+                };
+                let result = match behavior.as_str() {
+                    "stream" => http_response_event_result::Result::PreflightResult(inspect(
+                        HttpResponseBodyMode::StreamBytes as i32,
+                        Vec::new(),
+                    )),
+                    "wrong-envelope" => http_response_event_result::Result::BodyResult(
+                        HttpResponseBodyResult::default(),
+                    ),
+                    "invalid-diagnostics" => {
+                        let mut result =
+                            inspect(HttpResponseBodyMode::HeadersOnly as i32, Vec::new());
+                        result.reason = "x".repeat(MAX_MIDDLEWARE_REASON_BYTES + 1);
+                        http_response_event_result::Result::PreflightResult(result)
+                    }
+                    "unsupported-body-mode" => http_response_event_result::Result::PreflightResult(
+                        inspect(i32::MAX, Vec::new()),
+                    ),
+                    "invalid-header-mutation" => {
+                        http_response_event_result::Result::PreflightResult(inspect(
+                            HttpResponseBodyMode::HeadersOnly as i32,
+                            vec![write_header("content-length", "1")],
+                        ))
+                    }
+                    "no-action" => http_response_event_result::Result::PreflightResult(
+                        HttpResponsePreflightResult::default(),
+                    ),
+                    behavior => panic!("unknown lifecycle test behavior: {behavior}"),
+                };
+                if sender
+                    .send(Ok(HttpResponseEventResult {
+                        result: Some(result),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+
+                let mut terminal_reasons = Vec::new();
+                while let Some(event) = requests.recv().await {
+                    if let Some(http_response_event::Event::SessionEnd(end)) = event.event
+                        && let Ok(reason) = MiddlewareSessionEndReason::try_from(end.reason)
+                    {
+                        terminal_reasons.push(reason);
+                    }
+                }
+                let _ = completion_tx.send((label, terminal_reasons));
+            });
+            Ok(Box::pin(ReceiverStream::new(receiver)))
+        }
+    }
+
     fn write_header(name: &str, value: &str) -> HeaderMutation {
         HeaderMutation {
             operation: Some(header_mutation::Operation::Write(WriteHeader {
@@ -1616,6 +1746,25 @@ mod tests {
                 .into(),
             },
             on_error: OnError::FailClosed,
+        }
+    }
+
+    fn lifecycle_entry(name: &str, order: i32, behavior: &str, on_error: OnError) -> ChainEntry {
+        let string_value = |value: &str| prost_types::Value {
+            kind: Some(prost_types::value::Kind::StringValue(value.into())),
+        };
+        ChainEntry {
+            name: name.into(),
+            implementation: "test/preflight-lifecycle".into(),
+            order,
+            config: prost_types::Struct {
+                fields: [
+                    ("label".into(), string_value(name)),
+                    ("behavior".into(), string_value(behavior)),
+                ]
+                .into(),
+            },
+            on_error,
         }
     }
 
@@ -1689,6 +1838,61 @@ mod tests {
         assert!(outcome.invocations.iter().all(|invocation| {
             invocation.failure_category.as_deref() == Some("response_not_inspectable")
         }));
+    }
+
+    #[tokio::test]
+    async fn invalid_opened_preflight_stages_receive_one_failure_terminal_event() {
+        for behavior in [
+            "wrong-envelope",
+            "invalid-diagnostics",
+            "unsupported-body-mode",
+            "invalid-header-mutation",
+            "no-action",
+        ] {
+            for on_error in [OnError::FailOpen, OnError::FailClosed] {
+                let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
+                let runner =
+                    ChainRunner::new(Arc::new(PreflightLifecycleService { completion_tx }));
+                let entries = [
+                    lifecycle_entry("prior", 0, "stream", OnError::FailClosed),
+                    lifecycle_entry("invalid", 1, behavior, on_error),
+                ];
+                let mut outcome = runner
+                    .preflight_http_response(&entries, input(200))
+                    .await
+                    .expect("invalid preflight response");
+                assert_eq!(outcome.allowed, on_error == OnError::FailOpen);
+                if let Some(session) = outcome.session.take() {
+                    session.end(MiddlewareSessionEndReason::Normal).await;
+                }
+
+                let mut completions = BTreeMap::new();
+                for _ in 0..2 {
+                    let (label, reasons) =
+                        tokio::time::timeout(Duration::from_secs(1), completion_rx.recv())
+                            .await
+                            .expect("bounded terminal event delivery")
+                            .expect("opened stage completion");
+                    assert!(completions.insert(label, reasons).is_none());
+                }
+                assert_eq!(
+                    completions.get("invalid").map(Vec::as_slice),
+                    Some([MiddlewareSessionEndReason::MiddlewareFailure].as_slice()),
+                    "invalid behavior: {behavior}, policy: {on_error:?}"
+                );
+                let prior_reason = if on_error == OnError::FailOpen {
+                    MiddlewareSessionEndReason::Normal
+                } else {
+                    MiddlewareSessionEndReason::MiddlewareFailure
+                };
+                assert_eq!(
+                    completions.get("prior").map(Vec::as_slice),
+                    Some([prior_reason].as_slice()),
+                    "invalid behavior: {behavior}, policy: {on_error:?}"
+                );
+                assert!(completion_rx.try_recv().is_err());
+            }
+        }
     }
 
     #[test]

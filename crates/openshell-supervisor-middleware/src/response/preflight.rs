@@ -153,15 +153,25 @@ impl ChainRunner {
                     continue;
                 }
             };
+            let mut current_stage = HttpResponseStage {
+                entry: entry.clone(),
+                transport: Some(HttpResponseStageTransport { sender, responses }),
+                mode: StageMode::HeadersOnly,
+                next_sequence: 1,
+                whole_body: Vec::new(),
+            };
             let Some(http_response_event_result::Result::PreflightResult(decision)) =
                 response.result
             else {
-                if let Some(reason) = collect_preflight_failure(
+                if let Some(reason) = handle_opened_preflight_failure(
                     &entry,
+                    &mut current_stage,
+                    &mut stages,
                     "unexpected_response_result",
                     &mut invocations,
-                ) {
-                    end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure).await;
+                )
+                .await
+                {
                     return Ok(failed_preflight_outcome(
                         headers,
                         reason,
@@ -178,8 +188,15 @@ impl ChainRunner {
                 &decision.findings,
                 &decision.metadata,
             ) {
-                if let Some(reason) = collect_preflight_failure(&entry, reason, &mut invocations) {
-                    end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure).await;
+                if let Some(reason) = handle_opened_preflight_failure(
+                    &entry,
+                    &mut current_stage,
+                    &mut stages,
+                    reason,
+                    &mut invocations,
+                )
+                .await
+                {
                     return Ok(failed_preflight_outcome(
                         headers,
                         reason,
@@ -215,14 +232,9 @@ impl ChainRunner {
                         reason_code,
                         failure_category: None,
                     });
-                    let mut skipped = HttpResponseStage {
-                        entry,
-                        transport: Some(HttpResponseStageTransport { sender, responses }),
-                        mode: StageMode::HeadersOnly,
-                        next_sequence: 1,
-                        whole_body: Vec::new(),
-                    };
-                    skipped.end(MiddlewareSessionEndReason::StageSkipped).await;
+                    current_stage
+                        .end(MiddlewareSessionEndReason::StageSkipped)
+                        .await;
                 }
                 Some(http_response_preflight_result::Action::Inspect(inspect)) => {
                     let permitted_modes =
@@ -230,14 +242,15 @@ impl ChainRunner {
                     let mode = match validate_inspect(&entry, &inspect, &permitted_modes) {
                         Ok(mode) => mode,
                         Err(reason) => {
-                            if let Some(reason) =
-                                collect_preflight_failure(&entry, &reason, &mut invocations)
+                            if let Some(reason) = handle_opened_preflight_failure(
+                                &entry,
+                                &mut current_stage,
+                                &mut stages,
+                                &reason,
+                                &mut invocations,
+                            )
+                            .await
                             {
-                                end_stages(
-                                    &mut stages,
-                                    MiddlewareSessionEndReason::MiddlewareFailure,
-                                )
-                                .await;
                                 return Ok(failed_preflight_outcome(
                                     headers,
                                     reason,
@@ -260,14 +273,15 @@ impl ChainRunner {
                             let reason = service
                                 .diagnostic_policy
                                 .header_mutation_error_reason(&error);
-                            if let Some(reason) =
-                                collect_preflight_failure(&entry, &reason, &mut invocations)
+                            if let Some(reason) = handle_opened_preflight_failure(
+                                &entry,
+                                &mut current_stage,
+                                &mut stages,
+                                &reason,
+                                &mut invocations,
+                            )
+                            .await
                             {
-                                end_stages(
-                                    &mut stages,
-                                    MiddlewareSessionEndReason::MiddlewareFailure,
-                                )
-                                .await;
                                 return Ok(failed_preflight_outcome(
                                     headers,
                                     reason,
@@ -306,17 +320,11 @@ impl ChainRunner {
                         reason_code,
                         failure_category: None,
                     });
-                    let mut stage = HttpResponseStage {
-                        entry,
-                        transport: Some(HttpResponseStageTransport { sender, responses }),
-                        mode,
-                        next_sequence: 1,
-                        whole_body: Vec::new(),
-                    };
+                    current_stage.mode = mode;
                     if mode == StageMode::HeadersOnly {
-                        stage.end(MiddlewareSessionEndReason::Normal).await;
+                        current_stage.end(MiddlewareSessionEndReason::Normal).await;
                     } else {
-                        stages.push(stage);
+                        stages.push(current_stage);
                     }
                 }
                 Some(http_response_preflight_result::Action::BlockDelivery(_)) => {
@@ -339,13 +347,7 @@ impl ChainRunner {
                         reason_code: reason_code.clone(),
                         failure_category: None,
                     });
-                    stages.push(HttpResponseStage {
-                        entry: entry.clone(),
-                        transport: Some(HttpResponseStageTransport { sender, responses }),
-                        mode: StageMode::HeadersOnly,
-                        next_sequence: 1,
-                        whole_body: Vec::new(),
-                    });
+                    stages.push(current_stage);
                     end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareDenial).await;
                     return Ok(blocked_preflight_outcome(
                         headers,
@@ -359,13 +361,15 @@ impl ChainRunner {
                     ));
                 }
                 None => {
-                    if let Some(reason) = collect_preflight_failure(
+                    if let Some(reason) = handle_opened_preflight_failure(
                         &entry,
+                        &mut current_stage,
+                        &mut stages,
                         "invalid_preflight_decision",
                         &mut invocations,
-                    ) {
-                        end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure)
-                            .await;
+                    )
+                    .await
+                    {
                         return Ok(failed_preflight_outcome(
                             headers,
                             reason,
