@@ -157,6 +157,25 @@ in platform-specific Nix development shells through reusable workflows and the
 shared `build-rust-binary` action. The image build downloads each binary artifact
 into the staging directory before running Buildx.
 
+The Nix flake exposes one development shell with target-specific toolchains.
+The shared `mkToolchain` function in `nix/toolchain/default.nix` assembles native
+libraries and Cargo environment settings. Linux and Darwin modules select the
+compiler and sysroot and generate the compiler wrapper for their platform.
+The `nix/toolchain/glibc-2.28/` directory contains the pinned glibc build,
+GCC environment, and sysroot assembly used by GNU Linux targets.
+Each toolchain supplies its compiler driver, assembler, archiver, native
+libraries, and Cargo environment through derivation passthru. The shell omits
+an implicit host C compiler; Cargo builds select the appropriate tools with
+`--target`. GNU targets use a glibc 2.28 sysroot and static GCC runtimes, while
+musl targets produce static executables.
+
+On macOS, the shell also provides a native Darwin toolchain with static Z3
+and AWS-LC. Its Clang driver uses the pinned, unprocessed Apple SDK so system
+library stubs, including libiconv and libc++, retain their Apple install names.
+System libraries and frameworks remain dynamically linked. The deployment
+target matches the Nix host platform's minimum macOS version. The Rust toolchain
+does not propagate Nix's replacement system libraries into the link environment.
+
 Gateway and supervisor binaries staged into branch E2E, Release Dev, and Release
 Tag images are compiled through `cargo auditable` (pinned in `mise.toml`), which
 embeds a `.dep-v0` section describing the Rust dependencies actually compiled

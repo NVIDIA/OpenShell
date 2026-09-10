@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 {
+  lib,
   stdenv,
   fetchurl,
+  fetchpatch,
   linuxHeaders,
   bison,
   gawk,
@@ -23,6 +25,13 @@ stdenv.mkDerivation {
     url = "https://ftp.gnu.org/gnu/glibc/glibc-2.28.tar.gz";
     hash = "sha256-8xjW4/H07Qt00oMqxPSR0PuSjkUcntpZTL8cO+569Hw=";
   };
+
+  patches = lib.optionals stdenv.buildPlatform.isDarwin [
+    (fetchpatch {
+      url = "https://raw.githubusercontent.com/NixOS/nixpkgs/022caabb5f2265ad4006c1fa5b1ebe69fb0c3faf/pkgs/development/libraries/glibc/darwin-cross-build.patch";
+      hash = "sha256-RFs6jNY11ZVNnflm7B5NkFbCbVuRiR+RyJmdA993ArE=";
+    })
+  ];
 
   postPatch = ''
     substituteInPlace sysdeps/gnu/Makefile \
@@ -46,6 +55,15 @@ stdenv.mkDerivation {
     mkdir build
     cd build
     configureScript=../configure
+
+    # Keep the cross tools selected by Nix instead of GCC's bare tool names.
+    sed -i \
+      -e '/^AR=/d' \
+      -e '/^AS=/d' \
+      -e '/^LD=/d' \
+      -e '/^OBJCOPY=/d' \
+      -e '/^OBJDUMP=/d' \
+      "$configureScript"
   '';
 
   postConfigure = ''
