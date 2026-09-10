@@ -23,18 +23,29 @@ export type {
   ProviderChangeOptions,
   ProviderRef,
   SandboxConfig,
+  SandboxFromTemplateSpec,
   SandboxPhaseName,
   SandboxPolicy,
   SandboxRef,
+  SandboxResources,
+  SandboxServiceLevel,
   SandboxSpec,
+  SandboxStartup,
+  SandboxTemplateListOptions,
+  SandboxTemplateWorkspaceOptions,
+  SandboxWorkloadConfig,
+  SandboxWorkloadTemplate,
+  SandboxWorkloadTemplateProvenance,
+  SandboxWorkloadTemplateSpec,
   SetPolicyOptions,
   SettingScopeName,
   SettingValue,
   SshSession,
   UpdateConfigResult,
   WaitOptions,
+  WorkspaceListScope,
 } from './client.js';
-export { errorCode, OpenShellClient, SandboxClient } from './client.js';
+export { errorCode, OpenShellClient, SandboxClient, SandboxTemplateClient } from './client.js';
 export type { SdkErrorCode } from './errors.js';
 export { SdkError } from './errors.js';
 export type { ClientCredentialsOptions, OidcTokenProvider } from './oidc.js';

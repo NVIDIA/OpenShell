@@ -10,6 +10,7 @@ overly broad filesystem paths).
 
 from __future__ import annotations
 
+import contextlib
 from typing import TYPE_CHECKING
 
 import grpc
@@ -68,7 +69,13 @@ def test_create_sandbox_rejects_root_user(
 
     stub = sandbox_client._stub
     with pytest.raises(grpc.RpcError) as exc_info:
-        stub.CreateSandbox(openshell_pb2.CreateSandboxRequest(name="", spec=spec))
+        stub.CreateSandbox(
+            openshell_pb2.CreateSandboxRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                name="",
+                spec=spec,
+            )
+        )
 
     assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
     assert "root" in exc_info.value.details().lower()
@@ -92,7 +99,13 @@ def test_create_sandbox_rejects_path_traversal(
 
     stub = sandbox_client._stub
     with pytest.raises(grpc.RpcError) as exc_info:
-        stub.CreateSandbox(openshell_pb2.CreateSandboxRequest(name="", spec=spec))
+        stub.CreateSandbox(
+            openshell_pb2.CreateSandboxRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                name="",
+                spec=spec,
+            )
+        )
 
     assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
     assert "traversal" in exc_info.value.details().lower()
@@ -116,10 +129,70 @@ def test_create_sandbox_rejects_overly_broad_paths(
 
     stub = sandbox_client._stub
     with pytest.raises(grpc.RpcError) as exc_info:
-        stub.CreateSandbox(openshell_pb2.CreateSandboxRequest(name="", spec=spec))
+        stub.CreateSandbox(
+            openshell_pb2.CreateSandboxRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+                name="",
+                spec=spec,
+            )
+        )
 
     assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
     assert "broad" in exc_info.value.details().lower()
+
+
+def test_create_sandbox_materializes_default_mcp_version(
+    sandbox_client: SandboxClient,
+) -> None:
+    """An omitted MCP options stanza is stored with the pinned default version."""
+    policy = _safe_policy()
+    policy.network_policies["mcp_default"].CopyFrom(
+        sandbox_pb2.NetworkPolicyRule(
+            name="mcp_default",
+            endpoints=[
+                sandbox_pb2.NetworkEndpoint(
+                    host="mcp.example.com",
+                    port=443,
+                    protocol="mcp",
+                    rules=[
+                        sandbox_pb2.L7Rule(
+                            allow=sandbox_pb2.L7Allow(method="initialize")
+                        )
+                    ],
+                )
+            ],
+        )
+    )
+    assert not policy.network_policies["mcp_default"].endpoints[0].HasField("mcp")
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+
+    created = sandbox_client.create(workspace="default", spec=spec)
+    try:
+        stored = sandbox_client._stub.GetSandbox(
+            openshell_pb2.GetSandboxRequest(
+                name=created.name,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+            )
+        )
+        stored_endpoint = stored.sandbox.spec.policy.network_policies[
+            "mcp_default"
+        ].endpoints[0]
+
+        assert stored_endpoint.HasField("mcp")
+        assert list(stored_endpoint.mcp.versions) == ["2025-11-25"]
+
+        config = sandbox_client._stub.GetSandboxConfig(
+            sandbox_pb2.GetSandboxConfigRequest(sandbox_id=created.id)
+        )
+        endpoint = config.policy.network_policies["mcp_default"].endpoints[0]
+
+        assert endpoint.HasField("mcp")
+        assert list(endpoint.mcp.versions) == ["2025-11-25"]
+    finally:
+        # Creation can complete before the compute driver reaches Ready, so
+        # cleanup targets the gateway resource directly by its canonical name.
+        with contextlib.suppress(grpc.RpcError):
+            sandbox_client.delete(created.name, workspace="default")
 
 
 def test_update_policy_rejects_immutable_fields(
@@ -155,6 +228,9 @@ def test_update_policy_rejects_immutable_fields(
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.UpdateConfig(
                 openshell_pb2.UpdateConfigRequest(
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(
+                        workspace="default"
+                    ),
                     name=sandbox_name,
                     policy=unsafe_policy,
                 )

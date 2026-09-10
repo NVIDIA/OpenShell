@@ -35,8 +35,8 @@ func (p *providerClient) Refresh() RefreshInterface {
 
 func (p *providerClient) Create(ctx context.Context, workspace string, provider *Provider) (*Provider, error) {
 	resp, err := p.client.CreateProvider(ctx, &pb.CreateProviderRequest{
-		Provider:  converter.ProviderToProto(provider),
-		Workspace: workspace,
+		Provider:       converter.ProviderToProto(provider),
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -46,8 +46,8 @@ func (p *providerClient) Create(ctx context.Context, workspace string, provider 
 
 func (p *providerClient) Get(ctx context.Context, workspace, name string) (*Provider, error) {
 	resp, err := p.client.GetProvider(ctx, &pb.GetProviderRequest{
-		Name:      name,
-		Workspace: workspace,
+		Name:           name,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -57,8 +57,16 @@ func (p *providerClient) Get(ctx context.Context, workspace, name string) (*Prov
 
 func (p *providerClient) List(ctx context.Context, workspace string, opts ...ListOptions) ([]*Provider, error) {
 	req := &pb.ListProvidersRequest{
-		Workspace: workspace,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	}
+	return p.list(ctx, req, opts...)
+}
+
+func (p *providerClient) ListAll(ctx context.Context, opts ...ListOptions) ([]*Provider, error) {
+	return p.list(ctx, &pb.ListProvidersRequest{WorkspaceScope: allWorkspacesScope()}, opts...)
+}
+
+func (p *providerClient) list(ctx context.Context, req *pb.ListProvidersRequest, opts ...ListOptions) ([]*Provider, error) {
 	if len(opts) > 0 {
 		if opts[0].Limit < 0 {
 			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
@@ -68,7 +76,6 @@ func (p *providerClient) List(ctx context.Context, workspace string, opts ...Lis
 		}
 		req.Limit = uint32(opts[0].Limit)
 		req.Offset = uint32(opts[0].Offset)
-		req.AllWorkspaces = opts[0].AllWorkspaces
 	}
 
 	resp, err := p.client.ListProviders(ctx, req)
@@ -86,8 +93,8 @@ func (p *providerClient) List(ctx context.Context, workspace string, opts ...Lis
 func (p *providerClient) Update(ctx context.Context, workspace string, provider *Provider) (*Provider, error) {
 	proto := converter.ProviderToProto(provider)
 	req := &pb.UpdateProviderRequest{
-		Provider:  proto,
-		Workspace: workspace,
+		Provider:       proto,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	}
 	if proto != nil {
 		req.CredentialExpiresAtMs = proto.CredentialExpiresAtMs
@@ -102,8 +109,8 @@ func (p *providerClient) Update(ctx context.Context, workspace string, provider 
 
 func (p *providerClient) Delete(ctx context.Context, workspace, name string) error {
 	_, err := p.client.DeleteProvider(ctx, &pb.DeleteProviderRequest{
-		Name:      name,
-		Workspace: workspace,
+		Name:           name,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return converter.FromGRPCError(err)

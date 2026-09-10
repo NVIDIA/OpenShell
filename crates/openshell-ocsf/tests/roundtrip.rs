@@ -22,7 +22,7 @@ fn ctx() -> SandboxContext {
     SandboxContext {
         sandbox_id: "sb-7f3a9c2e14b8".to_string(),
         sandbox_name: "agent-workspace-01".to_string(),
-        container_image: "ghcr.io/nvidia/openshell/sandbox:0.42.1".to_string(),
+        container_image: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string(),
         hostname: "openshell-sb-7f3a9c2e14b8".to_string(),
         product_version: "0.42.1".to_string(),
         proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -197,12 +197,11 @@ fn api_activity_round_trips() {
         .status(StatusId::Success)
         .http_request(HttpRequest {
             http_method: HttpMethod::Post,
-            url: Some(Url::new("https", "inference.local", "/v1/chat", 443)),
+            url: Some(Url::new("https", "api.example.com", "/v1/chat", 443)),
         })
-        .dst_endpoint(Endpoint::from_domain("inference.local", 443))
+        .dst_endpoint(Endpoint::from_domain("api.example.com", 443))
         .ai_model(AiModel::new("llama-3.1-8b", "nvidia"))
-        .message("inference request routed")
-        .unmapped("route", "system")
+        .message("inference request completed")
         .build();
 
     assert_round_trips("api_activity", &event);

@@ -56,6 +56,7 @@ type SandboxInterface interface {
 	Create(ctx context.Context, workspace, name string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
 	Get(ctx context.Context, workspace, name string) (*Sandbox, error)
 	List(ctx context.Context, workspace string, opts ...ListOptions) ([]*Sandbox, error)
+	ListAll(ctx context.Context, opts ...ListOptions) ([]*Sandbox, error)
 	Stop(ctx context.Context, workspace, name string) (*Sandbox, error)
 	Start(ctx context.Context, workspace, name string) (*Sandbox, error)
 	Delete(ctx context.Context, workspace, name string) error
@@ -66,4 +67,10 @@ type SandboxInterface interface {
 	WaitStopped(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error)
 	Watch(ctx context.Context, workspace, name string, opts ...WatchOptions) (WatchInterface[*Sandbox], error)
 	GetLogs(ctx context.Context, workspace, sandboxName string, opts ...LogOption) (*LogResult, error)
+}
+
+// SandboxTemplateCreateInterface defines additive sandbox creation from named
+// workload templates without widening SandboxInterface.
+type SandboxTemplateCreateInterface interface {
+	CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
 }

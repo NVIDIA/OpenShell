@@ -1,6 +1,8 @@
 ---
 name: review-github-pr
 description: Review a GitHub pull request by summarizing its diff and key design decisions. Use when the user wants to review a PR, understand changes in a branch, or get a code review summary. Trigger keywords - review PR, review pull request, summarize PR, summarize diff, code review, review branch, PR summary, diff summary.
+metadata:
+  internal: true
 ---
 
 # Review GitHub Pull Request

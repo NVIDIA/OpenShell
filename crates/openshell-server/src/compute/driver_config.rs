@@ -3,20 +3,13 @@
 
 //! Selected compute-driver config construction.
 //!
-//! This module owns loading the selected driver config from TOML, applying
-//! driver-specific environment overrides, and applying gateway startup defaults.
-//! It does not acquire, connect to, or start compute drivers.
-
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-pub mod builtin;
+//! This module owns loading the selected driver config from TOML and applying
+//! gateway startup defaults and endpoint overrides. It does not acquire,
+//! connect to, or start compute drivers.
 
 use crate::config_file;
 use crate::defaults::LocalTlsPaths;
-#[cfg(target_os = "windows")]
-use openshell_core::ComputeDriverKind;
 use openshell_core::{Error, Result};
-#[cfg(target_os = "windows")]
-use openshell_driver_mxc::MxcComputeConfig;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -53,15 +46,6 @@ pub struct DriverStartupContext<'a> {
     pub endpoint_overrides: &'a BTreeMap<String, PathBuf>,
 }
 
-/// Build the selected MXC config from TOML. MXC is Windows-only and has no
-/// runtime-default overlay; the driver reads its own settings from the config.
-/// The Linux built-in driver configs now live in the `builtin` submodule
-/// (compiled only off Windows).
-#[cfg(target_os = "windows")]
-pub fn mxc_config_from_context(context: DriverStartupContext<'_>) -> Result<MxcComputeConfig> {
-    driver_config_from_context(context, ComputeDriverKind::Mxc.as_str())
-}
-
 pub fn remote_driver_config_from_context(
     context: DriverStartupContext<'_>,
     name: &str,
@@ -91,16 +75,18 @@ pub struct RemoteDriverConfig {
 pub fn driver_config_from_context<T>(
     context: DriverStartupContext<'_>,
     driver_name: &str,
+    inherited_config_keys: &[&str],
 ) -> Result<T>
 where
     T: Default + serde::de::DeserializeOwned,
 {
-    driver_config_from_file(context.file, driver_name)
+    driver_config_from_file(context.file, driver_name, inherited_config_keys)
 }
 
 fn driver_config_from_file<T>(
     file: Option<&config_file::ConfigFile>,
     driver_name: &str,
+    inherited_config_keys: &[&str],
 ) -> Result<T>
 where
     T: Default + serde::de::DeserializeOwned,
@@ -108,10 +94,11 @@ where
     let Some(file) = file else {
         return Ok(T::default());
     };
-    let merged = config_file::driver_table(
+    let merged = config_file::driver_table_with_inherited_keys(
         driver_name,
         &file.openshell.gateway,
         file.openshell.drivers.get(driver_name),
+        inherited_config_keys,
     );
     merged.try_into().map_err(|e| {
         Error::config(format!(

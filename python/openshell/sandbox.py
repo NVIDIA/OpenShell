@@ -25,8 +25,6 @@ import httpx
 
 from ._proto import (
     datamodel_pb2,
-    inference_pb2,
-    inference_pb2_grpc,
     openshell_pb2,
     openshell_pb2_grpc,
 )
@@ -37,6 +35,16 @@ _ClientCallDetailsBase = namedtuple(
 )
 
 _OAUTH_MAX_RESPONSE_BYTES = 1 << 20
+
+
+def _workspace_scope(workspace: str) -> datamodel_pb2.WorkspaceSelector:
+    if not workspace:
+        raise ValueError("workspace must be non-empty")
+    return datamodel_pb2.WorkspaceSelector(workspace=workspace)
+
+
+def _all_workspaces_scope() -> datamodel_pb2.WorkspaceSelector:
+    return datamodel_pb2.WorkspaceSelector(all_workspaces=datamodel_pb2.AllWorkspaces())
 
 
 class _ClientCallDetails(_ClientCallDetailsBase, grpc.ClientCallDetails):
@@ -395,6 +403,12 @@ class _ImmutableLabels(dict[str, str]):
 
 
 @dataclass(frozen=True)
+class SandboxWorkloadTemplateProvenanceRef:
+    name: str
+    resource_version: str
+
+
+@dataclass(frozen=True)
 class SandboxRef:
     id: str
     name: str
@@ -403,6 +417,7 @@ class SandboxRef:
     # Excluded from equality/hash to preserve the original identity while the
     # immutable mapping remains safe for deepcopy, pickle, and asdict.
     labels: Mapping[str, str] = field(default_factory=_ImmutableLabels, compare=False)
+    created_from_workload_template: SandboxWorkloadTemplateProvenanceRef | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "labels", _ImmutableLabels(self.labels))
@@ -717,7 +732,34 @@ class SandboxClient:
                 spec=request_spec,
                 name=name or "",
                 labels=dict(labels) if labels else {},
-                workspace=workspace,
+                workspace_scope=_workspace_scope(workspace),
+            ),
+            timeout=self._timeout,
+        )
+        sandbox_ref = _sandbox_ref(response.sandbox)
+        if sandbox_ref.id == "":
+            raise SandboxError("CreateSandbox returned empty sandbox id")
+        return sandbox_ref
+
+    def create_from_template(
+        self,
+        *,
+        workspace: str,
+        template_name: str,
+        spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
+    ) -> SandboxRef:
+        if not template_name.strip():
+            raise SandboxError("template_name is required")
+        request_spec = spec if spec is not None else openshell_pb2.SandboxSpec()
+        response = self._stub.CreateSandbox(
+            openshell_pb2.CreateSandboxRequest(
+                spec=request_spec,
+                name=name or "",
+                labels=dict(labels) if labels else {},
+                workspace_scope=_workspace_scope(workspace),
+                workload_template_name=template_name,
             ),
             timeout=self._timeout,
         )
@@ -738,9 +780,34 @@ class SandboxClient:
             self, self.create(workspace=workspace, spec=spec, name=name, labels=labels)
         )
 
+    def create_session_from_template(
+        self,
+        *,
+        workspace: str,
+        template_name: str,
+        spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
+    ) -> SandboxSession:
+        return SandboxSession(
+            self,
+            self.create_from_template(
+                workspace=workspace,
+                template_name=template_name,
+                spec=spec,
+                name=name,
+                labels=labels,
+            ),
+        )
+
+    def sandbox_templates(self) -> SandboxTemplateClient:
+        return SandboxTemplateClient(self._channel, timeout=self._timeout)
+
     def get(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.GetSandbox(
-            openshell_pb2.GetSandboxRequest(name=sandbox_name, workspace=workspace),
+            openshell_pb2.GetSandboxRequest(
+                name=sandbox_name, workspace_scope=_workspace_scope(workspace)
+            ),
             timeout=self._timeout,
         )
         return _sandbox_ref(response.sandbox)
@@ -757,7 +824,7 @@ class SandboxClient:
         label_selector: str | None = None,
     ) -> builtins.list[SandboxRef]:
         request = openshell_pb2.ListSandboxesRequest(
-            workspace=workspace,
+            workspace_scope=_workspace_scope(workspace),
             limit=limit,
             offset=offset,
             label_selector=label_selector or "",
@@ -773,7 +840,7 @@ class SandboxClient:
         label_selector: str | None = None,
     ) -> builtins.list[SandboxRef]:
         request = openshell_pb2.ListSandboxesRequest(
-            all_workspaces=True,
+            workspace_scope=_all_workspaces_scope(),
             limit=limit,
             offset=offset,
             label_selector=label_selector or "",
@@ -817,21 +884,27 @@ class SandboxClient:
 
     def delete(self, sandbox_name: str, *, workspace: str) -> bool:
         response = self._stub.DeleteSandbox(
-            openshell_pb2.DeleteSandboxRequest(name=sandbox_name, workspace=workspace),
+            openshell_pb2.DeleteSandboxRequest(
+                name=sandbox_name, workspace_scope=_workspace_scope(workspace)
+            ),
             timeout=self._timeout,
         )
         return bool(response.deleted)
 
     def stop(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.StopSandbox(
-            openshell_pb2.StopSandboxRequest(name=sandbox_name, workspace=workspace),
+            openshell_pb2.StopSandboxRequest(
+                name=sandbox_name, workspace_scope=_workspace_scope(workspace)
+            ),
             timeout=self._timeout,
         )
         return _sandbox_ref(response.sandbox)
 
     def start(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.StartSandbox(
-            openshell_pb2.StartSandboxRequest(name=sandbox_name, workspace=workspace),
+            openshell_pb2.StartSandboxRequest(
+                name=sandbox_name, workspace_scope=_workspace_scope(workspace)
+            ),
             timeout=self._timeout,
         )
         return _sandbox_ref(response.sandbox)
@@ -1027,72 +1100,128 @@ class SandboxClient:
         )
 
 
-@dataclass(frozen=True)
-class InferenceRouteConfig:
-    provider_name: str
-    model_id: str
-    version: int
-
-
-class InferenceRouteClient:
-    """gRPC client for workspace-scoped inference route configuration."""
+class SandboxTemplateClient:
+    """gRPC client for reusable sandbox template lifecycle operations."""
 
     def __init__(self, channel: grpc.Channel, *, timeout: float = 30.0) -> None:
-        self._stub = inference_pb2_grpc.InferenceStub(channel)
+        self._stub = openshell_pb2_grpc.OpenShellStub(channel)
         self._timeout = timeout
 
     @classmethod
-    def from_sandbox_client(cls, client: SandboxClient) -> InferenceRouteClient:
-        return cls(client._channel, timeout=client._timeout)
+    def from_sandbox_client(cls, client: SandboxClient) -> SandboxTemplateClient:
+        return client.sandbox_templates()
 
-    def set_route(
+    def create(
         self,
         *,
         workspace: str,
-        provider_name: str,
-        model_id: str,
-        no_verify: bool = False,
-    ) -> InferenceRouteConfig:
-        response = self._stub.SetInferenceRoute(
-            inference_pb2.SetInferenceRouteRequest(
-                workspace=workspace,
-                provider_name=provider_name,
-                model_id=model_id,
-                no_verify=no_verify,
+        template: openshell_pb2.SandboxWorkloadTemplate | None = None,
+        name: str | None = None,
+        image: str | None = None,
+        labels: Mapping[str, str] | None = None,
+        annotations: Mapping[str, str] | None = None,
+        environment: Mapping[str, str] | None = None,
+        cpu: str | None = None,
+        memory: str | None = None,
+        gpu_count: int | None = None,
+        gpu: bool = False,
+        driver_config: Mapping[str, Any] | None = None,
+    ) -> openshell_pb2.SandboxWorkloadTemplate:
+        if template is None:
+            if name is None or not name.strip():
+                raise SandboxError("name is required when template is omitted")
+            template = _sandbox_workload_template(
+                name=name,
+                image=image,
+                labels=labels,
+                annotations=annotations,
+                environment=environment,
+                cpu=cpu,
+                memory=memory,
+                gpu_count=gpu_count,
+                gpu=gpu,
+                driver_config=driver_config,
+            )
+        elif (
+            any(value is not None for value in (name, image, cpu, memory, gpu_count))
+            or any(
+                bool(value)
+                for value in (labels, annotations, environment, driver_config)
+            )
+            or gpu
+        ):
+            raise SandboxError(
+                "template cannot be combined with template builder fields"
+            )
+
+        response = self._stub.CreateSandboxTemplate(
+            openshell_pb2.CreateSandboxTemplateRequest(
+                workspace_scope=_workspace_scope(workspace),
+                template=template,
             ),
             timeout=self._timeout,
         )
-        return InferenceRouteConfig(
-            provider_name=response.provider_name,
-            model_id=response.model_id,
-            version=response.version,
-        )
+        return response.template
 
-    def get_route(self, *, workspace: str) -> InferenceRouteConfig:
-        response = self._stub.GetInferenceRoute(
-            inference_pb2.GetInferenceRouteRequest(workspace=workspace),
+    def get(
+        self,
+        name: str,
+        *,
+        workspace: str,
+    ) -> openshell_pb2.SandboxWorkloadTemplate:
+        response = self._stub.GetSandboxTemplate(
+            openshell_pb2.GetSandboxTemplateRequest(
+                name=name, workspace_scope=_workspace_scope(workspace)
+            ),
             timeout=self._timeout,
         )
-        return InferenceRouteConfig(
-            provider_name=response.provider_name,
-            model_id=response.model_id,
-            version=response.version,
-        )
+        return response.template
 
-    def delete_route(
+    def list(
         self,
         *,
         workspace: str,
-        route_name: str = "",
-    ) -> bool:
-        response = self._stub.DeleteInferenceRoute(
-            inference_pb2.DeleteInferenceRouteRequest(
-                workspace=workspace,
-                route_name=route_name,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str = "",
+    ) -> builtins.list[openshell_pb2.SandboxWorkloadTemplate]:
+        response = self._stub.ListSandboxTemplates(
+            openshell_pb2.ListSandboxTemplatesRequest(
+                workspace_scope=_workspace_scope(workspace),
+                limit=limit,
+                offset=offset,
+                label_selector=label_selector,
             ),
             timeout=self._timeout,
         )
-        return response.deleted
+        return list(response.templates)
+
+    def list_for_all_workspaces(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str = "",
+    ) -> builtins.list[openshell_pb2.SandboxWorkloadTemplate]:
+        response = self._stub.ListSandboxTemplates(
+            openshell_pb2.ListSandboxTemplatesRequest(
+                workspace_scope=_all_workspaces_scope(),
+                limit=limit,
+                offset=offset,
+                label_selector=label_selector,
+            ),
+            timeout=self._timeout,
+        )
+        return list(response.templates)
+
+    def delete(self, name: str, *, workspace: str) -> bool:
+        response = self._stub.DeleteSandboxTemplate(
+            openshell_pb2.DeleteSandboxTemplateRequest(
+                name=name, workspace_scope=_workspace_scope(workspace)
+            ),
+            timeout=self._timeout,
+        )
+        return bool(response.deleted)
 
 
 @dataclass(frozen=True)
@@ -1182,6 +1311,7 @@ class Sandbox:
         spec: openshell_pb2.SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
+        template_name: str | None = None,
         timeout: float = 30.0,
         ready_timeout_seconds: float = 120.0,
         auto_refresh: bool = True,
@@ -1207,6 +1337,7 @@ class Sandbox:
         self._name = name
         # Copy so later caller mutation cannot change what gets sent on enter.
         self._labels = dict(labels) if labels is not None else None
+        self._template_name = template_name
         self._timeout = timeout
         self._ready_timeout_seconds = ready_timeout_seconds
         self._auto_refresh = auto_refresh
@@ -1232,10 +1363,12 @@ class Sandbox:
         # Creation metadata cannot be applied when attaching to an existing
         # sandbox; reject it before opening a connection.
         if self._sandbox_input is not None and (
-            self._name is not None or self._labels is not None
+            self._name is not None
+            or self._labels is not None
+            or self._template_name is not None
         ):
             raise SandboxError(
-                "name and labels cannot be set when attaching to an existing sandbox"
+                "name, labels, and template_name cannot be set when attaching to an existing sandbox"
             )
 
         client = SandboxClient.from_active_cluster(
@@ -1248,7 +1381,15 @@ class Sandbox:
         )
         self._client = client
 
-        if self._sandbox_input is None:
+        if self._sandbox_input is None and self._template_name is not None:
+            self._session = client.create_session_from_template(
+                workspace=self._workspace,
+                template_name=self._template_name,
+                spec=self._spec,
+                name=self._name,
+                labels=self._labels,
+            )
+        elif self._sandbox_input is None:
             self._session = client.create_session(
                 workspace=self._workspace,
                 spec=self._spec,
@@ -1374,6 +1515,14 @@ def _serialize_python_callable(
 
 def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
     status = sandbox.status if sandbox.HasField("status") else None
+    provenance = (
+        SandboxWorkloadTemplateProvenanceRef(
+            name=sandbox.created_from_workload_template.name,
+            resource_version=sandbox.created_from_workload_template.resource_version,
+        )
+        if sandbox.HasField("created_from_workload_template")
+        else None
+    )
     return SandboxRef(
         id=sandbox.metadata.id if sandbox.metadata else "",
         name=sandbox.metadata.name if sandbox.metadata else "",
@@ -1386,6 +1535,7 @@ def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
             else None,
         ),
         labels=sandbox.metadata.labels if sandbox.metadata else {},
+        created_from_workload_template=provenance,
     )
 
 
@@ -1396,6 +1546,50 @@ def _default_spec() -> openshell_pb2.SandboxSpec:
     # container image and ensures sandboxes get the full dev-sandbox-policy
     # (including network_policies) out of the box.
     return openshell_pb2.SandboxSpec()
+
+
+def _sandbox_workload_template(
+    *,
+    name: str,
+    image: str | None = None,
+    labels: Mapping[str, str] | None = None,
+    annotations: Mapping[str, str] | None = None,
+    environment: Mapping[str, str] | None = None,
+    cpu: str | None = None,
+    memory: str | None = None,
+    gpu_count: int | None = None,
+    gpu: bool = False,
+    driver_config: Mapping[str, Any] | None = None,
+) -> openshell_pb2.SandboxWorkloadTemplate:
+    if gpu_count is not None and gpu_count <= 0:
+        raise SandboxError("gpu_count must be greater than zero")
+
+    template = openshell_pb2.SandboxWorkloadTemplate()
+    template.metadata.name = name
+    # The gateway permits an empty workload so it can apply the default image
+    # at sandbox create time, but the workload message itself is required.
+    template.spec.workload.SetInParent()
+    if labels:
+        template.metadata.labels.update(dict(labels))
+    if annotations:
+        template.metadata.annotations.update(dict(annotations))
+
+    if image is not None:
+        template.spec.workload.image = image
+    if environment:
+        template.spec.workload.environment.update(dict(environment))
+    if cpu is not None:
+        template.spec.workload.resources.cpu = cpu
+    if memory is not None:
+        template.spec.workload.resources.memory = memory
+    if gpu or gpu_count is not None:
+        template.spec.workload.resources.gpu.SetInParent()
+    if gpu_count is not None:
+        template.spec.workload.resources.gpu.count = gpu_count
+    if driver_config:
+        template.spec.driver_config.update(dict(driver_config))
+
+    return template
 
 
 def _xdg_config_home() -> pathlib.Path:

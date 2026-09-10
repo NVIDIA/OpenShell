@@ -132,6 +132,108 @@ async fn sqlite_connect_runs_embedded_migrations() {
     assert!(records.is_empty());
 }
 
+#[tokio::test]
+async fn sqlite_inference_route_removal_migration_deletes_only_managed_routes() {
+    use sqlx::{Connection, SqliteConnection};
+
+    let migration = super::sqlite::embedded_migration_sql(7)
+        .expect("SQLite migrator must embed removal migration 007");
+    let mut connection = SqliteConnection::connect("sqlite::memory:")
+        .await
+        .expect("connect to migration test database");
+    sqlx::raw_sql(
+        "CREATE TABLE objects (object_type TEXT NOT NULL, id TEXT NOT NULL);\
+         INSERT INTO objects VALUES ('inference_route', 'managed-route');\
+         INSERT INTO objects VALUES ('sandbox', 'preserved-sandbox');",
+    )
+    .execute(&mut connection)
+    .await
+    .expect("seed pre-migration objects");
+
+    sqlx::raw_sql(migration)
+        .execute(&mut connection)
+        .await
+        .expect("run SQLite removal migration");
+
+    let remaining: Vec<(String, String)> =
+        sqlx::query_as("SELECT object_type, id FROM objects ORDER BY object_type, id")
+            .fetch_all(&mut connection)
+            .await
+            .expect("read migrated objects");
+    assert_eq!(
+        remaining,
+        vec![("sandbox".to_string(), "preserved-sandbox".to_string())],
+        "removal migration must purge managed routes without touching other objects"
+    );
+}
+
+#[test]
+fn embedded_migrators_include_inference_route_removal() {
+    for (backend, migration) in [
+        ("sqlite", super::sqlite::embedded_migration_sql(7)),
+        ("postgres", super::postgres::embedded_migration_sql(7)),
+    ] {
+        let sql =
+            migration.unwrap_or_else(|| panic!("{backend} migrator is missing migration 007"));
+        assert!(
+            sql.contains("DELETE FROM objects WHERE object_type = 'inference_route'"),
+            "{backend} migration 007 must purge managed inference route objects"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sqlite_in_memory_store_survives_pool_connection_replacement() {
+    for url in ["sqlite::memory:", "sqlite://?mode=memory"] {
+        let store = super::sqlite::SqliteStore::connect(url)
+            .await
+            .expect("connect to in-memory SQLite");
+        store.migrate().await.expect("migrate in-memory SQLite");
+        store
+            .put(
+                "sandbox",
+                "before-replacement",
+                "before-replacement",
+                "default",
+                b"before",
+                None,
+            )
+            .await
+            .expect("write before connection replacement");
+
+        super::sqlite::replace_pool_connection(&store)
+            .await
+            .expect("replace operational pool connection");
+
+        let preserved = store
+            .get("sandbox", "before-replacement")
+            .await
+            .expect("schema survives connection replacement")
+            .expect("existing object survives connection replacement");
+        assert_eq!(preserved.payload, b"before", "database URL: {url}");
+
+        store
+            .put(
+                "sandbox",
+                "after-replacement",
+                "after-replacement",
+                "default",
+                b"after",
+                None,
+            )
+            .await
+            .expect("write after connection replacement");
+        assert!(
+            store
+                .get("sandbox", "after-replacement")
+                .await
+                .expect("read after connection replacement")
+                .is_some(),
+            "database URL: {url}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn sqlite_connect_restricts_db_file_permissions() {
@@ -364,6 +466,116 @@ async fn sqlite_delete_behavior() {
 
     let deleted_again = store.delete("sandbox", "missing").await.unwrap();
     assert!(!deleted_again);
+}
+
+#[tokio::test]
+async fn delete_many_is_bounded_idempotent_and_type_scoped() {
+    let store = test_store().await;
+    let mut ids = Vec::new();
+    for idx in 0..(super::DELETE_MANY_BATCH_SIZE + 12) {
+        let id = format!("sandbox-{idx}");
+        store
+            .put(
+                "sandbox",
+                &id,
+                &format!("name-{idx}"),
+                "default",
+                b"payload",
+                None,
+            )
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+    store
+        .put(
+            "provider",
+            "other-type",
+            "other-type",
+            "default",
+            b"payload",
+            None,
+        )
+        .await
+        .unwrap();
+
+    ids.extend([
+        "missing".to_string(),
+        "other-type".to_string(),
+        "sandbox-0".to_string(),
+    ]);
+    let expected = u64::try_from(super::DELETE_MANY_BATCH_SIZE + 12).unwrap();
+    assert_eq!(store.delete_many("sandbox", &ids).await.unwrap(), expected);
+    assert_eq!(store.delete_many("sandbox", &ids).await.unwrap(), 0);
+    assert_eq!(store.delete_many("sandbox", &[]).await.unwrap(), 0);
+    assert!(store.get("provider", "other-type").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn file_backed_sqlite_bulk_delete_allows_concurrent_control_reads() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let url = format!("sqlite:{}?mode=rwc", tmp.path().join("bulk.db").display());
+    let store = Store::connect(&url)
+        .await
+        .expect("connect file-backed store");
+    store
+        .put(
+            "provider",
+            "control-row",
+            "control-row",
+            "default",
+            b"control",
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut ids = Vec::new();
+    for idx in 0..500 {
+        let id = format!("session-{idx}");
+        store
+            .put("ssh_session", &id, &id, "default", b"payload", None)
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let read_store = store.clone();
+    let read_stop = stop.clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let reader = tokio::spawn(async move {
+        let mut reads = 0_usize;
+        let mut started_tx = Some(started_tx);
+        while !read_stop.load(Ordering::Relaxed) {
+            read_store
+                .get("provider", "control-row")
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "control row disappeared".to_string())?;
+            reads += 1;
+            if let Some(started_tx) = started_tx.take() {
+                let _ = started_tx.send(());
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok::<usize, String>(reads)
+    });
+    started_rx.await.expect("reader started");
+
+    assert_eq!(store.delete_many("ssh_session", &ids).await.unwrap(), 500);
+    stop.store(true, Ordering::Relaxed);
+    assert!(reader.await.unwrap().unwrap() > 0);
+    assert!(
+        store
+            .get("provider", "control-row")
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -1709,6 +1921,7 @@ async fn cas_update_message_cas_succeeds() {
         }),
         spec: None,
         status: None,
+        ..Sandbox::default()
     };
 
     store.put_message(&sandbox).await.unwrap();
@@ -1751,6 +1964,7 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
         }),
         spec: None,
         status: None,
+        ..Sandbox::default()
     };
 
     store.put_message(&sandbox).await.unwrap();
@@ -1821,6 +2035,7 @@ async fn cas_update_message_cas_rejects_workspace_change() {
         }),
         spec: None,
         status: None,
+        ..Sandbox::default()
     };
 
     store.put_message(&sandbox).await.unwrap();
@@ -1863,6 +2078,7 @@ async fn cas_update_message_cas_rejects_name_change() {
         }),
         spec: None,
         status: None,
+        ..Sandbox::default()
     };
 
     store.put_message(&sandbox).await.unwrap();

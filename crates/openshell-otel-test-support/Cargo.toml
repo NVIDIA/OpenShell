@@ -11,10 +11,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+openshell-otel = { path = "../openshell-otel" }
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "trace"] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

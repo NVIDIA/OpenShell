@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# -- Override the chart name used in generated resource names.
+nameOverride: ""
+# -- Override the full generated resource name.
+fullnameOverride: ""
+
+gateway:
+  serviceAccount:
+    # -- Name of the shared gateway ServiceAccount.
+    name: openshell
+    # -- Namespace containing the shared gateway ServiceAccount.
+    namespace: openshell
+  networkPolicy:
+    # -- Labels selecting gateway pods allowed to reach sandbox SSH.
+    podSelector:
+      app.kubernetes.io/name: openshell
+      app.kubernetes.io/instance: openshell
+
+sandboxServiceAccount:
+  # -- Create the ServiceAccount assigned to sandbox pods.
+  create: true
+  # -- Sandbox ServiceAccount name.
+  name: openshell-sandbox
+  # -- Annotations added to the generated sandbox ServiceAccount.
+  annotations: {}
+
+networkPolicy:
+  # -- Restrict sandbox SSH ingress to the shared gateway pods.
+  enabled: true

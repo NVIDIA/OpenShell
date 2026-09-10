@@ -152,11 +152,54 @@ await client.sandbox.setSetting(name, 'feature.enabled', { value: { case: 'boolV
 
 Sandbox-scoped `setPolicy` may only change `networkPolicies`; static fields (`filesystem`, `landlock`, `process`) must match the create-time policy. Sandbox-scoped setting deletes are rejected by the gateway, so only upsert (`setSetting`) is exposed here.
 
+## Sandbox templates
+
+Sandbox workload templates are reusable, workspace-scoped runtime shapes. They
+own image, environment, resource, and driver-specific settings; sandbox creation
+from a template can still attach labels, providers, and create-time policy.
+
+```ts
+import { OpenShellClient, type SandboxWorkloadTemplate } from '@nvidia/openshell-sdk'
+
+const client = await OpenShellClient.connect({ gateway, oidcToken })
+
+const template: SandboxWorkloadTemplate = await client.sandboxTemplates.create(
+  {
+    metadata: { name: 'python', labels: { team: 'runtime' } },
+    spec: {
+      workload: {
+        image: 'ghcr.io/nvidia/openshell-community/sandboxes/python:latest',
+        environment: { FEATURE_FLAG: 'on' },
+        resources: { cpu: '1', memory: '512Mi' },
+      },
+      driverConfig: { kubernetes: { pod: { runtime_class_name: 'kata-containers' } } },
+    },
+  },
+  { workspace: 'default' },
+)
+
+const sandbox = await client.sandbox.createFromTemplate({
+  templateName: template.metadata!.name,
+  workspace: 'default',
+  providers: ['github'],
+  policy: { version: 1, networkPolicies: {} },
+})
+
+await client.sandboxTemplates.get('python', { workspace: 'default' })
+await client.sandboxTemplates.list({ workspace: 'default', limit: 100 })
+await client.sandboxTemplates.delete('python', { workspace: 'default' })
+```
+
+Use `allWorkspaces: true` on `list()` for a platform-admin view. The
+discriminated option type makes `workspace` and `allWorkspaces` mutually
+exclusive. Omitting both options explicitly selects the `default` workspace.
+
 ## Surface and roadmap
 
 The SDK's goal is agent parity: anything the OpenShell gateway can do should be reachable from typed code, not only the CLI. The API is organized as scoped sub-clients over one shared connection, mirroring the CLI's verbs.
 
 - `client.sandbox` (`SandboxClient`) is available today: sandbox lifecycle, exec, forward, SSH, sandbox-scoped providers, config, and policy.
+- `client.sandboxTemplates` (`SandboxTemplateClient`) is available today: reusable sandbox workload template CRUD.
 - `client.gateway` (`GatewayClient`) is planned: gateway-scoped config and settings, health, and cluster status.
 - `client.providers` (`ProviderClient`) is planned: gateway-scoped provider CRUD and profiles.
 
@@ -169,14 +212,24 @@ Curated methods are added deliberately, so some gateway RPCs are not yet wrapped
 `client.raw` is a generated client for every gateway RPC, including surface the curated sub-clients do not wrap yet (gateway config, provider CRUD, policy status, watch, logs, and the full observed `Sandbox`). `client.transport` is the shared connection, so extra clients reuse one socket. Generated request and response types live at `@nvidia/openshell-sdk/raw`.
 
 ```ts
+import { create } from '@bufbuild/protobuf'
 import { OpenShellClient } from '@nvidia/openshell-sdk'
+import { WorkspaceSelectorSchema } from '@nvidia/openshell-sdk/raw'
 import type { GetGatewayConfigResponse } from '@nvidia/openshell-sdk/raw'
 
 const client = await OpenShellClient.connect({ gateway, oidcToken })
 
 // Reach RPCs the curated surface does not wrap yet:
 const cfg: GetGatewayConfigResponse = await client.raw.getGatewayConfig({})
-const status = await client.raw.getSandboxPolicyStatus({ name: 'my-sandbox', version: 0, global: false })
+const defaultWorkspace = create(WorkspaceSelectorSchema, {
+  selection: { case: 'workspace', value: 'default' },
+})
+const status = await client.raw.getSandboxPolicyStatus({
+  name: 'my-sandbox',
+  version: 0,
+  global: false,
+  workspaceScope: defaultWorkspace,
+})
 ```
 
 The raw layer returns the generated wire messages verbatim, preserving proto distinctions (an omitted optional versus an explicitly empty map) that the curated types may smooth over. As curated sub-clients land, prefer them; `raw` stays as the always-available floor.

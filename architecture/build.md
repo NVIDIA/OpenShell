@@ -10,8 +10,9 @@ OpenShell builds these main artifacts:
 
 | Artifact | Source |
 |---|---|
-| Gateway binary | `crates/openshell-server` |
+| Gateway binary | `crates/openshell-gateway` |
 | CLI binaries and system packages | `crates/openshell-cli` plus release packaging |
+| E2E conformance CLI | `crates/openshell-conformance-cli` |
 | Python SDK wheel | `python/openshell` |
 | TypeScript SDK package | `sdk/typescript` |
 | Gateway container image | `deploy/docker/Dockerfile.gateway` |
@@ -24,22 +25,47 @@ Sandbox community images are built outside this repository.
 
 ## Build Features
 
+Rust builds require Rust 1.94 or newer. TLS and certificate generation use
+AWS-LC, including the CLI and standalone examples. Native and cross-build
+environments must provide the C toolchain required by aws-lc-sys; the Nix
+development shells provide static AWS-LC libraries.
+
+SQLx uses AWS-LC with native certificate roots. The server enables
+`sqlx-core/rustls-native-certs` directly because SQLx's facade does not expose
+that root selection independently of the crypto provider. Credential storage
+continues to use the same AES-256-GCM envelope format across backend changes.
+
 Anonymous telemetry emission is gated behind a default-on `telemetry` Cargo
 feature. It is defined in `openshell-core` (where the emission code, HTTP
 client, and endpoint live) and forwarded by the binary crates that emit or
-collect telemetry: `openshell-server` (gateway), `openshell-sandbox`
+collect telemetry: `openshell-gateway`, `openshell-sandbox`
 (supervisor), and `openshell-driver-vm`. Every crate depends on
 `openshell-core` with `default-features = false`, so the binary crate's feature
 is the single switch that enables `openshell-core/telemetry` for its build
 graph. In-process drivers (`docker`, `kubernetes`, `podman`) inherit the
 gateway's setting through feature unification and carry no passthrough.
 
-Building a binary with `--no-default-features` compiles out telemetry entirely:
-no endpoint, no telemetry HTTP client, and no emission code. With telemetry
-compiled out, `telemetry::enabled()` is always `false` and the `emit_*` helpers
-are no-ops, so the data-model types stay available and dependent crates compile
-unchanged. The runtime `OPENSHELL_TELEMETRY_ENABLED` switch remains the way to
-disable telemetry in a default (telemetry-enabled) build.
+Building a binary without the `telemetry` feature compiles out telemetry
+entirely: no endpoint, no telemetry HTTP client, and no emission code. With
+telemetry compiled out, `telemetry::enabled()` is always `false` and the
+`emit_*` helpers are no-ops, so the data-model types stay available and
+dependent crates compile unchanged. The runtime `OPENSHELL_TELEMETRY_ENABLED`
+switch remains the way to disable telemetry in a default (telemetry-enabled)
+build.
+
+Cargo cannot subtract a single default feature, so each of the three binary
+crates also defines a `defaults-without-telemetry` alias listing every default
+except `telemetry`. Telemetry-free builds use
+`--no-default-features --features defaults-without-telemetry` and stay correct
+as the default set grows, instead of dropping unrelated defaults the way a bare
+`--no-default-features` does on `openshell-sandbox`. The alias is a keep-list,
+not a switch: enabling it on top of the defaults would otherwise yield a
+telemetry-on binary that reads as telemetry-free, so each crate root carries a
+`compile_error!` for the `telemetry` + `defaults-without-telemetry` combination.
+`rust:verify:defaults-without-telemetry` guards both properties — that each
+alias still equals its crate's defaults minus `telemetry`, and that the
+mutual-exclusion error is wired up — and `rust:verify:telemetry-off` builds
+through the alias and inspects the resulting binaries for telemetry markers.
 
 Supervisor upstream TLS root-store selection is controlled by the
 `bundled-ca-roots` Cargo feature (on by default). Default builds use Mozilla
@@ -131,6 +157,28 @@ in platform-specific Nix development shells through reusable workflows and the
 shared `build-rust-binary` action. The image build downloads each binary artifact
 into the staging directory before running Buildx.
 
+The Nix flake exposes one development shell with target-specific toolchains.
+The shared `mkToolchain` function in `nix/toolchain/default.nix` assembles native
+libraries and Cargo environment settings. Linux and Darwin modules select the
+compiler and sysroot and generate the compiler wrapper for their platform.
+The `nix/toolchain/glibc-2.28/` directory contains the pinned glibc build,
+GCC environment, and sysroot assembly used by GNU Linux targets.
+The glibc build reuses a pinned historical Nixpkgs recipe with current build
+tools; its headers, shared libraries, and static archives are assembled into
+the sysroot from separate outputs.
+Each toolchain supplies its compiler driver, assembler, archiver, native
+libraries, and Cargo environment through derivation passthru. The shell omits
+an implicit host C compiler; Cargo builds select the appropriate tools with
+`--target`. GNU targets use a glibc 2.28 sysroot and static GCC runtimes, while
+musl targets produce static executables.
+
+On macOS, the shell also provides a native Darwin toolchain with static Z3
+and AWS-LC. Its Clang driver uses the pinned, unprocessed Apple SDK so system
+library stubs, including libiconv and libc++, retain their Apple install names.
+System libraries and frameworks remain dynamically linked. The deployment
+target matches the Nix host platform's minimum macOS version. The Rust toolchain
+does not propagate Nix's replacement system libraries into the link environment.
+
 Gateway and supervisor binaries staged into branch E2E, Release Dev, and Release
 Tag images are compiled through `cargo auditable` (pinned in `mise.toml`), which
 embeds a `.dep-v0` section describing the Rust dependencies actually compiled
@@ -141,14 +189,15 @@ is a different artifact from the source SBOM produced by `syft dir:.` in
 `tasks/sbom.toml`, which describes the checkout, and from the image SBOM
 attestation below, which describes a published image.
 
-The shared binary build action compiles release artifacts with `cargo auditable`.
+The shared binary build action uses the default Nix shell and compiles release
+artifacts with `cargo auditable build --target <triple>`. Verification and upload
+read binaries from `target/<triple>/release/`.
 Branch E2E, Release Dev, and Release Tag image jobs stage those same artifacts
 instead of rebuilding binaries in Docker. Each binary build scans its output with
 Syft and requires at least one decoded Cargo package before uploading the
-artifact. Darwin builds replace Nix's `libiconv` load command with the macOS
-system install name, ad-hoc sign the modified binary, and fail if `otool -L`
-reports any remaining `/nix/store` dependency. Runtime and Syft verification
-run after that normalization. The CI image gains the pinned `cargo-auditable`
+artifact. The action checks each binary's `--version` output and leaves its
+linkage as produced by the Nix toolchain, without post-link rewriting or
+platform-specific linkage checks. The CI image gains the pinned `cargo-auditable`
 tool through `mise install --locked` but ships no auditable OpenShell binary of
 its own.
 
@@ -240,6 +289,13 @@ pulls and explicit publication. OCI pulls require a trusted manifest digest
 and retain that provenance with the local entry; mutable tags are used only
 for explicit publication.
 
+CLI conformance runs after target provisioning. Action-free scenarios operate
+only through the configured OpenShell CLI. A versioned conformance plan may add
+an ordered sequence of target-supplied host-side actions, such as a gateway
+restart, while the scenario remains responsible for black-box sandbox
+continuity checks. The plan exposes opaque executable paths and timeouts rather
+than driver or package-manager configuration; target setup owns those details.
+
 ## Python Wheel Packaging
 
 The generated protobuf/gRPC stubs under `python/openshell/_proto/` are gitignored
@@ -272,7 +328,7 @@ the release tag.
 
 ## CI and E2E
 
-Required checks run on GitHub Actions. Workflows that use NVIDIA self-hosted runners trigger from copy-pr-bot mirror branches, so trusted PRs are mirrored into `pull-request/<N>` branches before those workflows run. `main` also uses GitHub merge queue so the final queued integration commit is validated before it merges.
+Required checks run on GitHub Actions. Pull-request workflows that use NVIDIA self-hosted runners trigger from copy-pr-bot mirror branches, so trusted PRs are mirrored into `pull-request/<N>` branches before those workflows run. `main` also uses GitHub merge queue so the final queued integration commit is validated before it merges.
 
 The high-level CI model:
 
@@ -289,22 +345,34 @@ disables emission for Rust tests, E2E runs, and release canaries. This prevents
 synthetic activity from contributing to product usage metrics.
 
 Static security checks are deliberately outside the mirror-branch path. They run
-directly on GitHub-hosted runners with no secrets, so the pull-request-triggered
-ones also cover fork pull requests, and none of them consume NVIDIA self-hosted
-capacity. Scanner jobs request `security-events: write` and upload SARIF to Code
-Scanning directly on every event they run on, including fork and Dependabot pull
-requests, which Code Scanning permits for `pull_request` runs despite their
-read-only `GITHUB_TOKEN`. Each scanner also retains its report as a workflow
-artifact. No privileged intermediate workflow relays those uploads.
+directly on GitHub-hosted runners and none of them consume NVIDIA self-hosted
+capacity. The change-oriented ones receive no secrets, so they also cover fork
+pull requests. Codex Security release qualification is the exception: it needs a
+scoped API key, which routes its model calls to NVIDIA-hosted inference while
+the job itself stays GitHub-hosted. That placement is load-bearing rather than
+incidental: on the repository self-hosted runner the scan agent executes no
+shell commands at all, so its preflight never scopes the diff and it seals no
+draft. Scanner jobs request `security-events: write` and upload SARIF to Code
+Scanning directly on every event they run on, including fork and Dependabot
+pull requests, which Code Scanning permits for
+`pull_request` runs despite their read-only `GITHUB_TOKEN`. No privileged
+intermediate workflow relays those uploads. Manually dispatched Codex Security
+runs are the one opt-in exception, described below. Report retention differs by
+scanner: Actionlint, Zizmor, and CodeQL keep their reports as workflow artifacts,
+and Codex Security keeps no raw report.
 Triggers differ by workflow: `.github/workflows/workflow-security.yml` runs on
 `pull_request`, `merge_group`, `main`, and a weekly schedule;
 `.github/workflows/dependency-review.yml` runs on `pull_request` and
-`merge_group` only, because it needs a base and head commit to compare; and
+`merge_group` only, because it needs a base and head commit to compare;
 `.github/workflows/codeql.yml` runs nightly on the default branch (`main`) via
-`schedule`, with `workflow_dispatch` kept for manual diagnostics. CodeQL does
+`schedule`, with `workflow_dispatch` kept for manual diagnostics; and
+`.github/workflows/codex-security.yml` runs on pushed `v*.*.*-pre.*` tags, and is
+also callable through `workflow_call` and `workflow_dispatch`. CodeQL does
 not run on `pull_request`, `merge_group`, or pushes to `main`, so it reports
 repository-level Code Scanning state on the default branch instead of per-PR
 results, and its four-language matrix stays off the per-change critical path.
+Codex Security is release-scoped rather than change-scoped, so it never runs on
+a pull request or merge group.
 
 - **Actionlint and Zizmor** analyze the workflow definitions themselves.
   Repository configuration lives in `.github/actionlint.yml` (self-hosted runner
@@ -329,24 +397,120 @@ results, and its four-language matrix stays off the per-change critical path.
   Go requires a build; the other languages use build mode `none`. Analysis runs
   on the nightly schedule or by manual dispatch. Results are uploaded to Code
   Scanning and always retained as workflow artifacts.
+- **Codex Security** qualifies release candidates rather than individual
+  changes. The job installs a pinned `@openai/codex-security` release into the
+  runner temp directory before the repository is checked out and invokes it by
+  absolute path, so repository-controlled files cannot shadow the scanner. Model
+  calls go to NVIDIA-hosted inference at `https://inference-api.nvidia.com/v1`,
+  declared as a custom Codex provider named `nvidia` that uses the Responses
+  wire API with WebSockets disabled. The scan runs `openai/openai/gpt-5.6-sol`
+  at `medium` reasoning effort, with the multi-agent runtime capped at eight
+  concurrent threads through
+  `features.multi_agent_v2.max_concurrent_threads_per_session`. The
+  `CODEX_SECURITY_API_KEY` secret holds the
+  NVIDIA key and is exposed to the scan step alone, as `OPENAI_API_KEY` so the
+  CLI selects API-key auth and as `NVIDIA_INFERENCE_API_KEY`, the provider
+  `env_key` read by the Codex child process. `CODEX_SECURITY_STATE_DIR` and
+  `SCAN_DIR` are suffixed with `github.run_id` and `github.run_attempt` and
+  created mode `700`, so no scanner state or result set from a previous run or
+  retry attempt is reused even on a runner with a reusable temp directory.
+  `tasks/scripts/codex_security_range.py` resolves the scan range, reusing the
+  tag parsers in `tasks/scripts/release.py` so both stay on one definition of a
+  release tag while requiring the `v` prefix that a release workflow needs. The
+  job stages both files out of the workspace from the workflow's own revision
+  and runs the resolver by absolute path, because a scanned candidate predates
+  them and a revision under scan must not choose its own scan range. The range
+  itself is resolved against the checked-out candidate: the
+  candidate must be a `vX.Y.Z-pre.N` tag that is an ancestor of `origin/main`,
+  and the base is the newest stable `vX.Y.Z` tag merged into the candidate that
+  is strictly older than the release train `vX.Y.Z` the candidate targets. A
+  full-repository scan is only possible when no such stable tag exists and the
+  caller passes `allow_full_bootstrap`. Each candidate scans the cumulative
+  stable-to-candidate diff, so later candidates re-cover earlier ones. SARIF is
+  uploaded against `refs/heads/main` at the candidate commit under the
+  train-scoped category `codex-security/vX.Y.Z`, which makes each candidate's
+  analysis replace the previous one for that train. Automatic pre-release tag
+  pushes and `workflow_call` runs always upload. `workflow_dispatch` runs still
+  perform the scan and the SARIF export, but skip the Code Scanning upload
+  unless the caller sets the `upload_sarif` input, so manual diagnostics do not
+  overwrite a train's published analysis by default. Codex Security 0.1.24
+  cannot apply `--max-cost` to a slash-qualified model identifier, so the run
+  has no CLI-enforced cost ceiling. Spend is bounded instead by the 120-minute
+  job timeout, a single repository-wide concurrency group that serializes
+  qualification so starting a newer candidate cancels an in-flight one, and
+  NVIDIA account-side controls. No raw report is retained.
+- The job clears `kernel.apparmor_restrict_unprivileged_userns` before
+  installing the scanner. Codex confines model-run commands with bubblewrap,
+  which needs unprivileged user namespaces; Ubuntu 24.04 restricts those through
+  AppArmor, so bubblewrap fails to configure the sandbox network namespace
+  (`bwrap: loopback: Failed RTM_NEWADDR`) and the agent executes no commands at
+  all. The failure is silent: the agent retries its shell tool, gives up, and
+  seals no draft, while the scanner only reports a missing or incomplete draft.
+  Lifting a kernel restriction on the runner is what allows the sandbox that
+  confines the agent to start, and the runner is ephemeral and GitHub-hosted.
+- The scan sets `approval_policy="never"`. Codex Security keeps
+  `approvals_reviewer="auto_review"` unconditionally, and that reviewer runs on
+  its own model rather than the configured one. Because the workflow declares a
+  single provider that serves only `openai/openai/gpt-5.6-sol`, any approval
+  request reaches a model the endpoint does not serve, so the agent never gets a
+  shell command approved and seals no draft. The scan stays confined by its
+  `workspace-write` sandbox with network access disabled and by the scanner's
+  own permission profile, which grants read access to the filesystem root and
+  write access only to the workspace roots.
+- A scan that cannot execute commands reports only a missing or incomplete
+  draft, so diagnosing one means reading the scanner's session rollouts under
+  `CODEX_SECURITY_STATE_DIR`, where every shell command the agent ran is
+  recorded. No command at all is the signal that the sandbox failed to start.
 
 Findings never fail these checks; scanner and build failures do. A scanner that
-cannot run, a CodeQL analyzer that does not complete, and an unexpected
-Dependency Graph API error are all errors, which keeps an informational check
-from silently degrading into a no-op. None of these checks are required
-statuses, so they do not gate merges.
+cannot run, a CodeQL analyzer that does not complete, an unexpected Dependency
+Graph API error, and a Codex Security range, scan, or export failure are all
+errors, which keeps an informational check from silently degrading into a no-op.
+Codex Security also rejects any scan scope other than the resolved
+cumulative diff or an approved full bootstrap, so a qualification run either
+covers the whole stable-to-candidate range or fails; a separate no-permission
+job republishes the analysis job's outcome as the
+`OpenShell / Codex Security (informational)` status. None of these checks are
+required statuses, so they do not gate merges.
 
-See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
+Codex Security findings are informational during the observation phase, and the
+workflow only reports on candidates that already exist. Creating pre-release
+tags and gating stable promotion on qualification results are part of
+[RFC 0014](../rfc/0014-release-stability/release-qualification.md) and are not
+implemented yet.
+
+## Artifact Scanning
+
+Two entry points share `tasks/scripts/trivy-scan.sh`: a standalone analysis
+workflow and a pull-request change gate. Nix supplies Trivy, Helm and `yq`.
+
+The standalone workflow scans deployment configuration and supplied OCI
+references independently of release publication. Detailed JSON reports feed the
+differential gate; the summary and published SARIF consolidate configuration
+findings across profiles while preserving resource identity and affected profiles.
+Images and packaged charts retain separate identities based on their full
+references. Publication batches respect GitHub's limit of 20 SARIF runs.
+
+The PR/merge-group gate scans base and candidate with the same scanner and rejects
+new `HIGH` or `CRITICAL` configuration findings. Its stable
+`OpenShell / Trivy Changes` status succeeds when nothing relevant changed.
+Image CVEs need the standalone scan. The reporting and gate invariants are:
+
+- A structurally invalid Trivy report is an error, not an empty finding set.
+- Scanner failures prevent publication of incomplete analyses; findings alone
+  do not prevent publishing complete reports.
+- Findings compare per profile against the same baseline profile, by semantic
+  identity and count rather than line number; a profile absent from the baseline
+  falls back to that identity's maximum across all profiles.
+- The candidate's ignore file is validated, but the baseline's policy applies to
+  both scans, so an exemption takes effect only after merge.
+
+See [CI.md](../CI.md#artifact-scanning) for profiles, report paths, severity
+settings, exceptions, and the contributor and maintainer workflows.
 
 ## Docs Site
 
-Published docs live in `docs/`. Navigation lives in `docs/index.yml`. Fern site
-configuration, components, theme assets, and publish settings live in `fern/`.
-
-Use `mise run docs` for strict validation and `mise run docs:serve` for local
-preview. PR previews are produced by `.github/workflows/branch-docs.yml` when
-Fern credentials are available. Production docs publish from the release tag
-workflow.
+Published docs live in `docs/`, and Fern site configuration lives in `fern/`. See [fern/README.md](../fern/README.md) for the source layout, local development commands, version model, and publishing workflows.
 
 ## Validation Expectations
 

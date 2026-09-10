@@ -1,6 +1,8 @@
 ---
 name: create-rfc
 description: Create OpenShell RFC proposals in rfc/ from a design request. Use when the user asks to write, draft, start, create, or update an RFC, Request for Comments, architecture proposal, API proposal, process proposal, or cross-cutting design proposal that should follow the OpenShell RFC process and template.
+metadata:
+  internal: true
 ---
 
 # Create RFC

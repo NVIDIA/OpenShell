@@ -863,11 +863,8 @@ fn load_provider_profile_source(
     let mapping = value
         .as_mapping_mut()
         .ok_or_else(|| format!("provider profile {source} must be a YAML mapping"))?;
-    mapping.insert(
-        serde_yml::Value::String("id".to_string()),
-        serde_yml::Value::String(profile_id.to_string()),
-    );
-    let profile = serde_yml::from_value::<ProviderTypeProfile>(value)
+    mapping.insert("id", serde_yml::Value::String(profile_id.to_string()));
+    let profile = serde_yml::from_value::<ProviderTypeProfile>(&value)
         .map_err(|err| format!("failed to decode provider profile {source}: {err}"))?
         .to_proto();
     Ok(LoadedProviderProfile { profile })
@@ -1236,8 +1233,7 @@ async fn propagate_policy_to_running_sandboxes(
                 limit,
                 offset,
                 label_selector: String::new(),
-                workspace: String::new(),
-                all_workspaces: true,
+                workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
             })
             .await
             .map_err(|status| format!("list sandboxes failed: {status}"))?
@@ -1260,6 +1256,7 @@ async fn propagate_policy_to_running_sandboxes(
                     policy: Some(policy_state.policy_proto.clone()),
                     annotations: policy_update_annotations(policy_state, &correlation_id),
                     expected_resource_version: resource_version,
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                     ..Default::default()
                 })
                 .await;

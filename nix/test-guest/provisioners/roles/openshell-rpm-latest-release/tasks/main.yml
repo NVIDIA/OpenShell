@@ -1,0 +1,79 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Resolve the guest RPM architecture
+  ansible.builtin.command:
+    cmd: rpm --eval '%{_arch}'
+  register: openshell_rpm_latest_release_arch
+  changed_when: false
+
+- name: Query the latest OpenShell release
+  ansible.builtin.uri:
+    url: "{{ openshell_rpm_latest_release_api_url }}"
+    return_content: true
+    headers:
+      Accept: application/vnd.github+json
+      X-GitHub-Api-Version: 2022-11-28
+  register: openshell_rpm_latest_release
+  changed_when: false
+
+- name: Select latest-release RPM assets for the guest architecture
+  ansible.builtin.set_fact:
+    openshell_rpm_latest_release_cli_assets: >-
+      {{ openshell_rpm_latest_release.json.assets
+         | selectattr('name', 'match', '^openshell-[0-9].*[.]'
+           ~ openshell_rpm_latest_release_arch.stdout ~ '[.]rpm$')
+         | list }}
+    openshell_rpm_latest_release_gateway_assets: >-
+      {{ openshell_rpm_latest_release.json.assets
+         | selectattr('name', 'match', '^openshell-gateway-[0-9].*[.]'
+           ~ openshell_rpm_latest_release_arch.stdout ~ '[.]rpm$')
+         | list }}
+
+- name: Require one latest-release RPM per OpenShell package
+  ansible.builtin.assert:
+    that:
+      - openshell_rpm_latest_release_cli_assets | length == 1
+      - openshell_rpm_latest_release_gateway_assets | length == 1
+    fail_msg: >-
+      expected one OpenShell CLI and gateway RPM for
+      {{ openshell_rpm_latest_release_arch.stdout }} in release
+      {{ openshell_rpm_latest_release.json.tag_name }}
+
+- name: Record the selected latest-release RPM assets
+  ansible.builtin.set_fact:
+    openshell_rpm_latest_release_cli_asset: "{{ openshell_rpm_latest_release_cli_assets | first }}"
+    openshell_rpm_latest_release_gateway_asset: "{{ openshell_rpm_latest_release_gateway_assets | first }}"
+
+- name: Create the latest-release RPM staging directory
+  ansible.builtin.file:
+    path: "{{ openshell_rpm_latest_release_download_dir }}"
+    state: directory
+    mode: "0755"
+  become: true
+
+- name: Download latest-release OpenShell RPMs
+  ansible.builtin.get_url:
+    url: "{{ item.browser_download_url }}"
+    dest: "{{ openshell_rpm_latest_release_download_dir }}/{{ item.name }}"
+    mode: "0644"
+  loop:
+    - "{{ openshell_rpm_latest_release_cli_asset }}"
+    - "{{ openshell_rpm_latest_release_gateway_asset }}"
+  loop_control:
+    label: "{{ item.name }}"
+  become: true
+
+- name: Install latest-release OpenShell RPMs
+  ansible.builtin.dnf:
+    name:
+      - "{{ openshell_rpm_latest_release_download_dir }}/{{ openshell_rpm_latest_release_cli_asset.name }}"
+      - "{{ openshell_rpm_latest_release_download_dir }}/{{ openshell_rpm_latest_release_gateway_asset.name }}"
+    state: present
+    disable_gpg_check: true
+  become: true
+
+- name: Publish latest-release RPM OpenShell installation
+  ansible.builtin.include_role:
+    name: openshell-rpm

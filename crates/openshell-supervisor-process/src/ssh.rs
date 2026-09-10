@@ -1208,7 +1208,7 @@ fn apply_child_env(
         .env(openshell_core::sandbox_env::SANDBOX, "1")
         .env("HOME", session_home)
         .env("USER", session_user)
-        .env("SHELL", "/bin/bash")
+        .env("SHELL", openshell_core::shell::detect_login_shell())
         .env("PATH", &path)
         .env("TERM", term);
 
@@ -1240,6 +1240,33 @@ fn apply_child_env(
 
 const fn login_shell_flag(no_login_shell: bool) -> &'static str {
     if no_login_shell { "-c" } else { "-lc" }
+}
+
+/// Build the shell command for an SSH session using a shell that exists in the
+/// sandbox image (minimal images such as Alpine ship only `/bin/sh`, not bash).
+///
+/// `no_command_arg` is appended only when no explicit command is given: `-i`
+/// for an interactive PTY session, or `None` for the non-PTY stdin path (a
+/// bare shell already reads piped stdin line-by-line). With an explicit
+/// command the login-shell flag is used per `no_login_shell`.
+fn build_ssh_shell_command(
+    shell: &str,
+    command: Option<String>,
+    no_login_shell: bool,
+    no_command_arg: Option<&str>,
+) -> Command {
+    let mut cmd = Command::new(shell);
+    match command {
+        None => {
+            if let Some(arg) = no_command_arg {
+                cmd.arg(arg);
+            }
+        }
+        Some(command) => {
+            cmd.arg(login_shell_flag(no_login_shell)).arg(command);
+        }
+    }
+    cmd
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1276,18 +1303,11 @@ fn spawn_pty_shell(
     let mut reader = master.try_clone()?;
     let mut writer = master.try_clone()?;
 
-    let mut cmd = command.map_or_else(
-        || {
-            let mut c = Command::new("/bin/bash");
-            c.arg("-i");
-            c
-        },
-        |command| {
-            let mut c = Command::new("/bin/bash");
-            c.arg(login_shell_flag(no_login_shell)).arg(command);
-            c
-        },
-    );
+    // Resolve a shell present in the sandbox image; interactive PTY sessions
+    // pass `-i` when no command is given. Runs in the supervisor, so it
+    // inspects the sandbox filesystem.
+    let shell = openshell_core::shell::detect_login_shell();
+    let mut cmd = build_ssh_shell_command(&shell, command, no_login_shell, Some("-i"));
 
     let term = if pty.term.is_empty() {
         "xterm-256color"
@@ -1435,25 +1455,15 @@ fn spawn_pipe_exec(
     resolved_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
 ) -> anyhow::Result<mpsc::Sender<Vec<u8>>> {
-    let mut cmd = command.map_or_else(
-        || {
-            // No command — read from stdin.  Do *not* pass `-i`; interactive
-            // mode reads .bashrc, writes prompts to stderr, and can introduce
-            // just enough latency for VS Code Remote-SSH's platform detection
-            // to time out and fall back to "windows".  Plain `bash` with piped
-            // stdin already reads commands line-by-line (script mode), which is
-            // exactly what VS Code's local server expects.
-            Command::new("/bin/bash")
-        },
-        |command| {
-            let mut c = Command::new("/bin/bash");
-            // Login shell (-l) sources .profile/.bashrc so tool env vars
-            // (VIRTUAL_ENV, etc.) are available. Callers that need a predictable
-            // environment opt out via OPENSHELL_NO_LOGIN_SHELL → plain -c.
-            c.arg(login_shell_flag(no_login_shell)).arg(command);
-            c
-        },
-    );
+    // Resolve a shell present in the sandbox image; minimal images (e.g. Alpine)
+    // don't ship bash, only `/bin/sh`. Runs in the supervisor, so it inspects
+    // the sandbox filesystem. No command → read from stdin with no `-i`:
+    // interactive mode reads .bashrc, writes prompts to stderr, and can add
+    // just enough latency for VS Code Remote-SSH's platform detection to time
+    // out and fall back to "windows". A plain shell with piped stdin already
+    // reads commands line-by-line (script mode), which is what VS Code expects.
+    let shell = openshell_core::shell::detect_login_shell();
+    let mut cmd = build_ssh_shell_command(&shell, command, no_login_shell, None);
 
     let (session_user, session_home) = session_user_and_home(policy, workspace.home());
     apply_child_env(
@@ -1797,7 +1807,39 @@ fn is_loopback_host(host: &str) -> bool {
 )]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
     use std::process::Stdio;
+
+    /// Regression test: SSH sessions run the shell they are given, never a
+    /// hardcoded bash, so sh-only images (e.g. Alpine) work. Covers both the
+    /// interactive PTY path (`-i` when no command) and the non-PTY path.
+    #[test]
+    fn build_ssh_shell_command_uses_given_shell() {
+        // PTY, no command → given shell + interactive flag.
+        let cmd = build_ssh_shell_command("/bin/sh", None, false, Some("-i"));
+        assert_eq!(cmd.get_program(), OsStr::new("/bin/sh"));
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), vec![OsStr::new("-i")]);
+
+        // Non-PTY, no command → bare shell, no args (reads piped stdin).
+        let cmd = build_ssh_shell_command("/bin/sh", None, false, None);
+        assert_eq!(cmd.get_program(), OsStr::new("/bin/sh"));
+        assert_eq!(cmd.get_args().count(), 0);
+
+        // Explicit command → login-shell flag + command, still on the given shell.
+        let cmd = build_ssh_shell_command("/bin/sh", Some("echo hi".into()), false, Some("-i"));
+        assert_eq!(cmd.get_program(), OsStr::new("/bin/sh"));
+        assert_eq!(
+            cmd.get_args().collect::<Vec<_>>(),
+            vec![OsStr::new("-lc"), OsStr::new("echo hi")]
+        );
+
+        // OPENSHELL_NO_LOGIN_SHELL → plain -c.
+        let cmd = build_ssh_shell_command("/bin/sh", Some("echo hi".into()), true, None);
+        assert_eq!(
+            cmd.get_args().collect::<Vec<_>>(),
+            vec![OsStr::new("-c"), OsStr::new("echo hi")]
+        );
+    }
 
     /// Regression test: the direct-tcpip connect path sets `TCP_NODELAY`.
     #[tokio::test]

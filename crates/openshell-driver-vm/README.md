@@ -9,7 +9,7 @@ Standalone libkrun-backed [`ComputeDriver`](../../proto/compute_driver.proto) fo
 ```mermaid
 flowchart LR
     subgraph host["Host process"]
-        gateway["openshell-server<br/>(compute::vm::spawn)"]
+        gateway["openshell-gateway<br/>(vm::spawn)"]
         driver["openshell-driver-vm<br/>├── libkrun (VM)<br/>├── gvproxy (net)<br/>└── openshell-sandbox.zst"]
         gateway <-->|"gRPC over UDS<br/>compute-driver.sock"| driver
     end
@@ -102,7 +102,7 @@ mise run vm:supervisor          # if openshell-sandbox.zst is not already presen
 
 # 2. Build both binaries with the staged artifacts embedded
 OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=$PWD/target/vm-runtime-compressed \
-  cargo build -p openshell-server -p openshell-driver-vm
+  cargo build -p openshell-gateway -p openshell-driver-vm
 
 # 3. macOS only: codesign the driver for Hypervisor.framework
 codesign \
@@ -154,6 +154,14 @@ Select the VM driver with `--drivers vm`, `OPENSHELL_DRIVERS=vm`, or `compute_dr
 | `guest_tls_ca` | unset | CA cert for the guest's mTLS client bundle. Required when `grpc_endpoint` uses `https://`. |
 | `guest_tls_cert` | unset | Guest client certificate. |
 | `guest_tls_key` | unset | Guest client private key. |
+| `https_proxy` | unset | Corporate forward proxy (`http://host:port` or `https://host:port`) the in-guest supervisor chains policy-approved TLS CONNECT egress through. On the libkrun backend a proxy on the gateway host's loopback must be addressed as `http://host.openshell.internal:<port>` — guest egress leaves through gvproxy, which NATs `192.168.127.254` to the host's `127.0.0.1`. The QEMU/TAP backend (GPU sandboxes) has no such NAT and its nftables rules expose only the gateway port to the guest, so a gateway-host proxy URL is rejected at launch there; use an address routable from the guest's masqueraded egress. |
+| `no_proxy` | unset | Comma-separated bypass list for the corporate proxy only. OpenShell policy evaluation still applies. |
+| `proxy_auth_file` | unset | Gateway-host path to a `user:pass` credential file. Staged root-only into the per-sandbox overlay and removed with the sandbox. |
+| `proxy_auth_allow_insecure` | unset | Required with `proxy_auth_file` against an `http://` proxy: acknowledges that Basic auth is cleartext on the connection to the proxy. |
+| `proxy_connect_by_hostname` | unset | Send hostnames rather than validated IPs in CONNECT. Last resort for proxies whose ACLs reject IP targets. |
+| `proxy_ca_bundle` | unset | Gateway-host path to a PEM CA bundle trusted for an `https://` proxy and for certificates a TLS-intercepting proxy re-signs. |
+
+The proxy settings are operator-owned and deployment-level: they are not accepted through `template.driver_config.vm`, and they reach the supervisor on its command line through a per-sandbox argument file the driver writes into the overlay upperdir on every launch, so a sandbox image cannot forge or shadow them. Every present-but-invalid value is fatal at gateway or sandbox startup rather than degrading to a direct dial.
 
 See [`openshell-gateway --help`](../openshell-server/src/cli.rs) for the gateway process flag surface.
 
@@ -254,9 +262,9 @@ Each table is created atomically via `nft -f` on VM start and torn down atomical
   - Matching rustup target: `rustup target add aarch64-unknown-linux-gnu` (or `x86_64-unknown-linux-gnu` for an amd64 guest)
   - `cargo install --locked cargo-zigbuild` and `brew install zig` (or distro equivalent). `vm:supervisor` uses `cargo zigbuild` to cross-compile the in-VM `openshell-sandbox` supervisor binary.
 - [mise](https://mise.jdx.dev/) task runner
-- Docker or Podman socket on the local CLI/gateway host when using
-  `openshell sandbox create --from ./Dockerfile` or `--from ./dir`; the CLI
-  builds the image and the VM driver exports it via the local container engine.
+- Docker or Podman socket on the local CLI/gateway host when building an image
+  before `openshell sandbox create --from <image>`; the VM driver exports the
+  image via the local container engine.
   Docker is tried first; if unavailable, the driver falls back to the Podman
   socket. On Linux, enable the Podman API socket with
   `systemctl --user start podman.socket`
@@ -291,5 +299,5 @@ the user explicitly overrides it.
 
 ## TODOs
 
-- The gateway still configures the driver via CLI args; this will move to a gRPC bootstrap call so the driver interface is uniform across backends. See the `TODO(driver-abstraction)` notes in `crates/openshell-server/src/lib.rs` and `crates/openshell-server/src/compute/vm.rs`.
+- The gateway still configures the driver via CLI args; this will move to a gRPC bootstrap call so the driver interface is uniform across backends. See the `TODO(driver-abstraction)` note in `crates/openshell-gateway/src/vm.rs`.
 - macOS local builds are codesigned by `tasks/scripts/gateway-vm.sh`; the generated Homebrew formula signs the release tarball driver for local installs.

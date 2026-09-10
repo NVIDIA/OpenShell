@@ -764,7 +764,7 @@ mod tests {
                 config: HashMap::from([("region".to_string(), "old".to_string())]),
                 ..Provider::default()
             }),
-            workspace: String::new(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
         };
         let json = codec
             .decode_message_to_json("openshell.v1.CreateProviderRequest", &request)
@@ -1017,6 +1017,7 @@ mod tests {
                 ("policy-signature-kid".to_string(), "kid".to_string()),
                 ("correlation-id".to_string(), "reload-1".to_string()),
             ]),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             ..UpdateConfigRequest::default()
         };
         let body = GrpcFrame {
@@ -1074,8 +1075,9 @@ mod tests {
             name: "demo".to_string(),
             labels: HashMap::new(),
             annotations: HashMap::new(),
-            workspace: String::new(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             await_main_process_attachment: false,
+            workload_template_name: String::new(),
         };
 
         let bytes = request.encode_to_vec();

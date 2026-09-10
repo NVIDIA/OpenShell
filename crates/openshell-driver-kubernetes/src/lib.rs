@@ -14,4 +14,4 @@ pub use config::{
 };
 pub use driver::{KubernetesComputeDriver, KubernetesDriverError};
 pub use grpc::ComputeDriverService;
-pub use openshell_core::OperatorNamespaceAllowlist;
+pub use openshell_core::DynamicStringAllowlist as OperatorNamespaceAllowlist;

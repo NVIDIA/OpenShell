@@ -5,6 +5,16 @@
 //!
 //! This crate provides process sandboxing and monitoring capabilities.
 
+// `defaults-without-telemetry` is an alias for the default feature set minus
+// `telemetry`, not a switch that turns telemetry off. Cargo cannot subtract a
+// default feature, so adding it on top of the defaults would otherwise produce
+// a telemetry-on build that reads as telemetry-free. Fail the build instead.
+#[cfg(all(feature = "telemetry", feature = "defaults-without-telemetry"))]
+compile_error!(
+    "features `telemetry` and `defaults-without-telemetry` are mutually exclusive; \
+     build a telemetry-free supervisor with `--no-default-features --features defaults-without-telemetry`"
+);
+
 mod activity_aggregator;
 mod denial_aggregator;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -112,8 +122,8 @@ pub async fn run_sandbox(
     ssh_socket_path: Option<String>,
     _health_check: bool,
     _health_port: u16,
-    inference_routes: Option<String>,
     ocsf_enabled: Arc<AtomicBool>,
+    ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     network_enabled: bool,
     process_enabled: bool,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
@@ -537,7 +547,6 @@ pub async fn run_sandbox(
                 sandbox_id.as_deref(),
                 sandbox_name_for_agg.as_deref(),
                 openshell_endpoint_for_proxy.as_deref(),
-                inference_routes.as_deref(),
                 denial_tx,
                 activity_tx,
                 agent_proposals.clone(),
@@ -734,6 +743,7 @@ pub async fn run_sandbox(
         let poll_endpoint = endpoint.to_string();
         let poll_engine = engine.clone();
         let poll_ocsf_enabled = ocsf_enabled.clone();
+        let poll_ocsf_schema_version = ocsf_schema_version.clone();
         let poll_pid = entrypoint_pid.clone();
         let poll_provider_credentials = provider_credentials.clone();
         let poll_policy_local = networking.as_ref().map(|n| n.policy_local_ctx.clone());
@@ -749,6 +759,7 @@ pub async fn run_sandbox(
             entrypoint_pid: poll_pid,
             interval_secs: poll_interval_secs,
             ocsf_enabled: poll_ocsf_enabled,
+            ocsf_schema_version: poll_ocsf_schema_version,
             provider_credentials: poll_provider_credentials,
             policy_local_ctx: poll_policy_local,
             agent_proposals: agent_proposals.clone(),
@@ -3329,6 +3340,7 @@ struct PolicyPollLoopContext {
     entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
     ocsf_enabled: Arc<AtomicBool>,
+    ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     provider_credentials: ProviderCredentialState,
     policy_local_ctx: Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>,
     agent_proposals: AgentProposals,
@@ -3771,6 +3783,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             match initial_poll_disposition(&ctx.loaded_policy_origin, &result) {
                 InitialPollDisposition::Acknowledge(candidate) => {
                     apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
                     apply_agent_proposals_enabled(
                         &ctx.agent_proposals,
                         agent_proposals_enabled_from_settings(&result.settings),
@@ -3798,6 +3811,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 InitialPollDisposition::Reconcile => pending_result = Some(result),
                 InitialPollDisposition::TrackOnly => {
                     apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
                     apply_agent_proposals_enabled(
                         &ctx.agent_proposals,
                         agent_proposals_enabled_from_settings(&result.settings),
@@ -4286,6 +4300,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
 
         // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
         apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+        apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
 
         // Apply the agent-proposals feature toggle. On a false→true transition
         // we lazily install the skill so a sandbox that started with the flag
@@ -4336,6 +4351,37 @@ fn extract_bool_setting(
         .and_then(|sv| sv.value.as_ref())
         .and_then(|v| match v {
             setting_value::Value::BoolValue(b) => Some(*b),
+            _ => None,
+        })
+}
+
+fn apply_ocsf_schema_version_setting(
+    version: &std::sync::Mutex<String>,
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+) {
+    let new_version = extract_string_setting(settings, "ocsf_schema_version").unwrap_or_default();
+    if let Ok(mut current) = version.lock()
+        && *current != new_version
+    {
+        info!(
+            ocsf_schema_version = %new_version,
+            "OCSF schema version target changed"
+        );
+        *current = new_version;
+    }
+}
+
+fn extract_string_setting(
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+    key: &str,
+) -> Option<String> {
+    use openshell_core::proto::setting_value;
+    settings
+        .get(key)
+        .and_then(|es| es.value.as_ref())
+        .and_then(|sv| sv.value.as_ref())
+        .and_then(|v| match v {
+            setting_value::Value::StringValue(s) => Some(s.clone()),
             _ => None,
         })
 }
@@ -4866,8 +4912,8 @@ filesystem_policy:
 
     #[test]
     fn discover_policy_restrictive_default_blocks_network() {
-        // In cluster mode we keep proxy mode enabled so `inference.local`
-        // can always be routed through proxy/OPA controls.
+        // Cluster sandboxes keep proxy mode enabled so egress is evaluated by
+        // the network policy engine.
         let proto = openshell_policy::restrictive_default_policy();
         let local_policy = SandboxPolicy::try_from(proto).expect("conversion should succeed");
         assert!(matches!(local_policy.network.mode, NetworkMode::Proxy));
@@ -5035,6 +5081,7 @@ network_policies:
             entrypoint_pid: Arc::new(AtomicU32::new(0)),
             interval_secs: 0,
             ocsf_enabled: Arc::new(AtomicBool::new(false)),
+            ocsf_schema_version: Arc::new(std::sync::Mutex::new(String::new())),
             provider_credentials: ProviderCredentialState::from_child_env_snapshot(
                 0,
                 std::collections::HashMap::new(),

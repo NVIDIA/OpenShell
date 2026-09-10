@@ -48,6 +48,13 @@ struct RelayGateway {
 
 #[tonic::async_trait]
 impl OpenShell for RelayGateway {
+    async fn begin_rootfs_tar_staging(
+        &self,
+        _request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,
+    ) -> Result<Response<openshell_core::proto::BeginRootfsTarStagingResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn report_main_process_exit(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
@@ -81,6 +88,34 @@ impl OpenShell for RelayGateway {
     }
 
     // ------ unused stubs ------
+
+    async fn create_sandbox_template(
+        &self,
+        _request: tonic::Request<openshell_core::proto::CreateSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_sandbox_template(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_sandbox_templates(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListSandboxTemplatesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListSandboxTemplatesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteSandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
 
     type ConnectSupervisorStream = ReceiverStream<Result<GatewayMessage, Status>>;
     async fn connect_supervisor(

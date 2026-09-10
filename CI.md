@@ -24,17 +24,21 @@ Three opt-in labels enable the long-running E2E suites:
 When multiple labels are present, `Branch E2E Checks` builds each generic multi-architecture artifact set once and fans out enabled suites in parallel. Runtime-specific reusable workflows define the Docker, Podman, VM, and Kubernetes lanes. Composite actions own the replaceable Podman, KVM, kind, and mise setup. Each lane depends only on the artifact categories it consumes: VM does not wait for container-driver artifacts or supervisor images, and GPU does not wait for the gateway image. Docker, Podman, GPU, Rust, Python, MCP, and VM E2E reuse matching prebuilt gateway and CLI binaries instead of compiling debug binaries in test jobs. Standalone-driver lanes additionally reuse driver-free gateway and compute-driver artifacts. Kubernetes managed-driver lanes consume published gateway and supervisor images, while the standalone-driver lane composes its gateway image from prebuilt binaries.
 The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated from separate suite result jobs inside that workflow. `test:e2e-kubernetes` is optional while Kubernetes HA and credential-driver behavior are under active iteration: failures are visible in the workflow run but do not publish a required CI gate status.
 
-The GitHub ruleset should require the `OpenShell / ...` statuses published by `Required CI Gates`, not the push-triggered workflow jobs directly.
+The GitHub ruleset should require the `OpenShell / ...` statuses published by
+`Required CI Gates` plus the direct `OpenShell / Trivy Changes` result, not the
+push-triggered workflow jobs themselves.
 
 ## Informational security reports
 
-Security analysis that does not need NVIDIA infrastructure runs directly on
-GitHub-hosted runners. These workflows receive no secrets. The PR-oriented
-reports run on fork pull requests without waiting for copy-pr-bot. Scanner jobs
-request `security-events: write` to publish SARIF to Code Scanning. GitHub
-permits Code Scanning uploads from `pull_request` runs even when fork and
-Dependabot contexts receive a read-only `GITHUB_TOKEN`, so those scanners upload
-results directly and also retain report artifacts:
+Security workflow compute runs directly on GitHub-hosted runners instead of
+NVIDIA self-hosted runners. The PR-oriented workflows receive no secrets and run
+on fork pull requests without waiting for copy-pr-bot. Codex Security release
+qualification is the exception: it runs only for maintainer-created
+pre-release tags and receives a scoped NVIDIA Inference API key for the scan
+step. Scanner jobs request `security-events: write` to publish SARIF to Code
+Scanning. GitHub permits Code Scanning uploads from `pull_request` runs even
+when fork and Dependabot contexts receive a read-only `GITHUB_TOKEN`, so those
+scanners upload results directly:
 
 - `Workflow Security Reports` runs Actionlint and Zizmor. Actionlint reports
   workflow syntax and expression findings. Zizmor reports only High severity,
@@ -50,6 +54,20 @@ results directly and also retain report artifacts:
   E2E test code are excluded. It runs nightly on `main`, remains manually
   dispatchable for diagnostics, uploads results to Code Scanning, and retains
   workflow artifacts.
+- `Codex Security Release Qualification` analyzes each `vX.Y.Z-pre.N`
+  candidate against the previous stable release. Every candidate in a release
+  train therefore rescans the cumulative stable-to-candidate diff. It calls
+  `https://inference-api.nvidia.com/v1` with
+  `openai/openai/gpt-5.6-sol` at medium reasoning effort. The
+  `CODEX_SECURITY_API_KEY` secret must contain an API key authorized for that
+  NVIDIA endpoint. Results are uploaded against the candidate commit on `main`
+  under a category shared by the train, for example
+  `codex-security/v0.1.1`, so later candidates replace earlier analyses. The
+  slash-qualified NVIDIA model identifier prevents Codex Security 0.1.24 from
+  enforcing `--max-cost`, so the workflow relies on its timeout, serialized
+  concurrency, and the inference account's spend controls. Raw reports are not
+  retained as workflow artifacts. Pre-release creation and stable-promotion
+  enforcement remain part of RFC 0014 and are not implemented by this workflow.
 
 Findings do not fail these workflows. Tool startup, configuration, build, and
 analysis failures still fail so a broken scanner cannot appear healthy. The
@@ -62,6 +80,66 @@ Run the workflow-definition scanners locally with:
 nix develop --command actionlint -shellcheck= -pyflakes=
 nix develop --command zizmor --offline --persona=regular --min-severity=high --no-exit-codes .
 ```
+
+## Artifact scanning
+
+`Trivy Scan` is a self-contained `workflow_dispatch`/`workflow_call` step. It
+always scans deployment configuration and optionally scans supplied OCI image
+and chart references. It is not wired into a release workflow; a future analysis
+orchestrator can call it directly.
+
+The scan job checks static deployment files (including Dockerfiles) once, both
+local charts with default values, the OpenShell `HELM_PROFILES` selected in
+`tasks/scripts/trivy-scan.sh`, requested packaged charts, and both Linux
+architectures of each requested image. The profile list includes development
+and E2E overlays for regression coverage, but excludes `values-spire-stack.yaml`,
+which belongs to the external SPIRE chart. A new OpenShell values fixture needs
+an explicit entry in this list to receive Trivy coverage.
+
+Findings are informational by default, but scanner failures still fail the job
+and `fail-on-findings` enables enforcement. Reports retain every severity; the
+gate uses `HIGH,CRITICAL` by default.
+
+All detailed JSON reports are retained in one artifact. The workflow summary and
+Code Scanning configuration report deduplicate the same rule, target, resource,
+and message across profiles, listing the affected profiles in each finding.
+Images and packaged charts retain separate analyses, keyed by full reference
+and platform so different registries or versions cannot overwrite each other.
+SARIF is generated only for publication. The upload job publishes
+only this consolidated configuration SARIF and the artifact analyses, in batches
+of at most 20 runs to respect GitHub's per-file limit. It also publishes complete
+reports when `fail-on-findings` makes the scan job fail; incomplete scans are
+retained as artifacts but are not published to Code Scanning.
+
+`.trivyignore.yaml` is reserved for false positives. Every entry must use at
+least one `**/<concrete-basename>` path; `yq` and `jq` validate this structure
+before scanning.
+
+Run the scanner locally with:
+
+```shell
+nix develop --command tasks/scripts/trivy-scan.sh config
+nix develop --command tasks/scripts/trivy-scan.sh images ghcr.io/nvidia/openshell/gateway:dev
+nix develop --command tasks/scripts/trivy-scan.sh gate
+nix develop --command tasks/scripts/trivy-scan.sh prepare-sarif
+```
+
+Use a fresh `TRIVY_REPORT_DIR` for each scan session. `prepare-sarif` creates
+`code-scanning/uploads/<batch>/`; only these directories are intended for upload.
+
+### Pull-request change gate
+
+`Trivy Changes` scans the base and candidate when a pull request or merge group
+changes deployment configuration or scanner inputs. It fails only for new
+`HIGH` or `CRITICAL` misconfigurations and retains both report sets.
+
+The candidate ignore file is validated, but the baseline policy applies to both
+scans so a change cannot exempt its own finding. Existing profiles are compared
+independently using the detailed reports, before any presentation deduplication;
+a new profile reuses the maximum known occurrence count. A selected fixture
+missing from the candidate fails the scan; a new fixture absent from the base
+has no baseline profile. Invalid Trivy reports fail closed. Image package and
+operating-system CVEs remain the responsibility of the standalone scan.
 
 ## Commit signing
 
@@ -142,14 +220,18 @@ GitHub merge queue is required for `main`. Repository administrators must enable
 - `OpenShell / E2E`
 - `OpenShell / GPU E2E`
 - `OpenShell / Helm Lint`
+- `OpenShell / Trivy Changes`
 
-Do not require the underlying workflow job names directly. `Required CI Gates` publishes stable commit statuses for both PR-head mirror commits and merge-group commits.
+`Required CI Gates` publishes the stable statuses for mirror-based workflows.
+`Trivy Changes` runs directly on pull requests and merge groups and publishes
+its own stable result status.
 
 Merge-group runs use the `merge_group` event. The event is distinct from `pull_request` and `push`, and GitHub will not report required checks for queued PRs unless the workflows include it. In this repository:
 
 - `Branch Checks` runs the standard non-E2E gates on the merge-group SHA.
 - `Branch E2E Checks` runs core E2E and GPU E2E for merge groups. Kubernetes HA E2E remains optional and label-driven on PRs.
 - `Helm Lint` runs for merge groups without the PR diff optimization, because the merge-group branch is the final integration state.
+- `Trivy Changes` compares the merge-group configuration with its base and rejects new High or Critical findings.
 - `Required CI Gates` posts the same `OpenShell / ...` statuses to the merge-group SHA and does not require a `pull-request/<N>` mirror for merge-group events.
 
 Maintainers should add ready PRs to the queue rather than pressing a direct merge button. GitHub removes a PR from the queue if the merge-group checks fail or time out.
@@ -187,6 +269,9 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/workflows/workflow-security.yml` | Runs informational Actionlint and High-severity Zizmor reports on GitHub-hosted runners. |
 | `.github/workflows/dependency-review.yml` | Reports dependency changes when GitHub Dependency Graph is available; otherwise publishes a neutral warning. |
 | `.github/workflows/codeql.yml` | Runs nightly informational CodeQL analysis on `main` for Rust and the Go, Python, and TypeScript SDKs and retains SARIF artifacts. |
+| `.github/workflows/codex-security.yml` | Scans the cumulative diff from the previous stable release to each pre-release candidate and publishes train-scoped SARIF on `main`. |
+| `.github/workflows/trivy-changes.yml` | Blocks pull requests and merge groups that introduce new High or Critical Helm or Dockerfile misconfigurations. |
+| `.github/workflows/trivy-scan.yml` | Manual or reusable scan of supplied OCI image/chart references and deployment configuration. Findings are informational by default and can be configured to fail the workflow. |
 
 ## Release workflows
 
@@ -195,7 +280,7 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | File | Role |
 |---|---|
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway/supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
-| `.github/workflows/release-tag.yml` | Publishes a tagged public release. |
+| `.github/workflows/release-tag.yml` | Publishes a tagged stable release. Its automatic tag trigger excludes `-pre.*`; manual dispatch remains maintainer-controlled. |
 | `.github/workflows/release-canary.yml` | Smoke-tests published artifacts on `macos`, `ubuntu`, `fedora`, and `kubernetes` (kind + Helm) runners. Triggers automatically when `Release Dev` succeeds, and via `workflow_dispatch` on any branch (`gh workflow run release-canary.yml --ref <branch>`). The `kubernetes` job pins to `0.0.0-dev` artifacts; the other jobs install the latest tagged release via `install.sh`. See the `test-release-canary` skill for the manual-dispatch playbook and local kind reproduction. |
 
 ## Required status contexts
@@ -206,8 +291,13 @@ Require these statuses in the branch ruleset for PR and merge-queue CI:
 - `OpenShell / E2E`
 - `OpenShell / GPU E2E`
 - `OpenShell / Helm Lint`
+- `OpenShell / Trivy Changes`
 
-Do not require the underlying workflow jobs directly. PR workflow jobs only appear after copy-pr-bot mirrors trusted code, and merge-group workflow jobs run on temporary queue branches. The stable `OpenShell / ...` contexts prove the expected workflow completed for the commit that GitHub is about to merge.
+For mirror-based workflows, require the statuses published by
+`Required CI Gates`, not their underlying jobs. `OpenShell / Trivy Changes` is
+the stable result job of the direct pull-request workflow. Together these
+contexts prove the expected checks completed for the commit GitHub is about to
+merge.
 
 Do not add the informational Actionlint, Zizmor, Dependency Review, or CodeQL
 jobs to the required status list while they remain in observation mode.

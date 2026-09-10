@@ -2639,7 +2639,8 @@ async fn send_forbidden_json<C: AsyncWrite + Unpin>(
     send_json_response(policy_name, body, client, "403 Forbidden").await
 }
 
-async fn send_json_response<C: AsyncWrite + Unpin>(
+/// Send a platform-owned JSON response with an explicit HTTP status.
+pub(crate) async fn send_json_response<C: AsyncWrite + Unpin>(
     policy_name: &str,
     body: serde_json::Value,
     client: &mut C,

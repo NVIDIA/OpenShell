@@ -28,6 +28,7 @@ const CONDITION_RUNNING: &str = "ContainerRunning";
 const CONDITION_STARTING: &str = "ContainerStarting";
 use openshell_core::driver_utils::{
     CONDITION_EXITED, CONDITION_RUNTIME_RESTART, CONDITION_STOPPED,
+    CONDITION_WORKSPACE_VALIDATION_FAILED, SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED,
 };
 
 pub type WatchStream =
@@ -122,15 +123,12 @@ fn deleted_event(sandbox_id: String) -> WatchSandboxesEvent {
 /// drops (daemon restart, socket error, or clean shutdown), the stream
 /// terminates with a final error item and stops producing events.
 ///
-/// Callers are responsible for reconnecting by calling [`start_watch`] again.
-/// The server's `ComputeRuntime::watch_loop` in `openshell-server` provides
-/// this behaviour with a 2-second backoff: when the stream terminates with an
-/// error, `watch_loop` sleeps and then calls `watch_sandboxes()` again, which
-/// ultimately calls `start_watch()` again and re-syncs state.
+/// Callers are responsible for reconnecting by calling [`start_watch`] again
+/// and re-synchronizing state.
 ///
 /// **Do not add reconnection logic inside this function.**  A local reconnect
-/// would race with `watch_loop`'s retry and produce duplicate initial-sync
-/// events that corrupt the server's sandbox index.
+/// would race with the consumer's retry and produce duplicate initial-sync
+/// events.
 pub async fn start_watch(
     client: PodmanClient,
     lifecycle_event_fences: LifecycleEventFences,
@@ -456,6 +454,11 @@ fn condition_from_state(state: &ContainerState) -> DriverCondition {
                     "OOMKilled",
                     "Container was killed by the OOM killer".to_string(),
                 )
+            } else if state.exit_code == i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED) {
+                (
+                    CONDITION_WORKSPACE_VALIDATION_FAILED,
+                    "OCI WorkingDir is not usable by the sandbox identity".to_string(),
+                )
             } else if matches!(state.exit_code, 137 | 143) {
                 (
                     CONDITION_RUNTIME_RESTART,
@@ -613,6 +616,24 @@ mod tests {
         assert_eq!(cond.status, "False");
         assert_eq!(cond.reason, "ContainerExited");
         assert!(cond.message.contains("code 1"));
+    }
+
+    #[test]
+    fn condition_workspace_validation_exit_is_reported_explicitly() {
+        let state = ContainerState {
+            status: "exited".to_string(),
+            running: false,
+            exit_code: i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED),
+            oom_killed: false,
+            health: None,
+            started_at: None,
+            finished_at: Some("2026-04-14T12:00:00Z".to_string()),
+        };
+
+        let cond = condition_from_state(&state);
+
+        assert_eq!(cond.reason, CONDITION_WORKSPACE_VALIDATION_FAILED);
+        assert!(cond.message.contains("WorkingDir"));
     }
 
     #[test]

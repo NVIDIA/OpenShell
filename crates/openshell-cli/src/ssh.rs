@@ -3,6 +3,7 @@
 
 //! SSH connection and proxy utilities.
 
+use crate::color::Colorize;
 use crate::tls::{TlsOptions, grpc_client};
 use miette::{IntoDiagnostic, Result, WrapErr};
 #[cfg(unix)]
@@ -16,7 +17,6 @@ use openshell_core::proto::{
     tcp_forward_init,
 };
 use openshell_core::{ObjectId, driver_mounts};
-use owo_colors::OwoColorize;
 use std::fs;
 use std::future::Future;
 use std::io::{IsTerminal, Write};
@@ -92,7 +92,7 @@ async fn ssh_session_config(
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
         .await
         .into_diagnostic()?

@@ -3,12 +3,19 @@
 
 //! Shared OpenTelemetry trace export support for `OpenShell` services.
 
+mod driver;
 mod grpc;
 mod propagation;
 
+pub use driver::{
+    BoxGrpcStream, ComputeDriverTracing, DriverTracingConfig, DriverTracingHandle,
+    IN_PROCESS_COMPUTE_DRIVER_TARGET, InProcessRpcTracer, install_driver_tracing,
+};
+
 pub use grpc::{
-    ComputeDriverRpcSpan, RecordGrpcFailure, RecordGrpcStatus, compute_driver_rpc_layer,
-    compute_driver_rpc_operation,
+    COMPUTE_DRIVER_RPC_SERVICE, ComputeDriverRpc, ComputeDriverRpcSpan, RecordGrpcFailure,
+    RecordGrpcStatus, TracedGrpcStream, compute_driver_rpc_layer, compute_driver_rpc_operation,
+    grpc_status_code_name, record_grpc_status, rpc,
 };
 pub use propagation::{
     HeaderMapExtractor, MetadataMapInjector, TraceContextInterceptor, current_trace_context_carrier,
@@ -27,6 +34,27 @@ use tracing_subscriber::layer::{Context, Filter};
 use tracing_subscriber::registry::LookupSpan;
 
 const SDK_UNKNOWN_SERVICE_PREFIX: &str = "unknown_service";
+
+/// Build the resource attributes shared by gateway and compute-driver providers.
+pub fn gateway_resource_attributes(
+    gateway_name: Option<&str>,
+    compute_driver: Option<&str>,
+) -> Vec<KeyValue> {
+    let mut attributes = Vec::new();
+    if let Some(name) = gateway_name.map(str::trim).filter(|name| !name.is_empty()) {
+        attributes.push(KeyValue::new("openshell.gateway.name", name.to_string()));
+    }
+    if let Some(driver) = compute_driver
+        .map(str::trim)
+        .filter(|driver| !driver.is_empty())
+    {
+        attributes.push(KeyValue::new(
+            "openshell.gateway.compute_driver",
+            driver.to_string(),
+        ));
+    }
+    attributes
+}
 
 /// Mark `span` as failed.
 ///
@@ -202,17 +230,18 @@ pub type OtlpLayer<S> = tracing_subscriber::filter::Filtered<
 pub type TargetOtlpLayer<S> =
     tracing_subscriber::filter::Filtered<OpenTelemetryLayer<S, SdkTracer>, TargetPrefixFilter, S>;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TargetPrefixFilter {
-    prefix: Option<&'static str>,
+    prefixes: Vec<&'static str>,
     include: bool,
 }
 
 impl<S> Filter<S> for TargetPrefixFilter {
     fn enabled(&self, metadata: &tracing::Metadata<'_>, _ctx: &Context<'_, S>) -> bool {
         let matches_prefix = self
-            .prefix
-            .is_some_and(|prefix| metadata.target().starts_with(prefix));
+            .prefixes
+            .iter()
+            .any(|prefix| metadata.target().starts_with(prefix));
         metadata.is_span()
             && !metadata.target().starts_with("opentelemetry")
             && (matches_prefix == self.include)
@@ -240,10 +269,22 @@ pub fn layer_for_target_prefix<S>(
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
+    layer_for_target_prefixes(provider, instrumentation_scope, [target_prefix])
+}
+
+/// Build a tracing layer that exports only spans from `target_prefixes`.
+pub fn layer_for_target_prefixes<S>(
+    provider: &SdkTracerProvider,
+    instrumentation_scope: &'static str,
+    target_prefixes: impl IntoIterator<Item = &'static str>,
+) -> TargetOtlpLayer<S>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
     tracing_opentelemetry::layer()
         .with_tracer(provider.tracer(instrumentation_scope))
         .with_filter(TargetPrefixFilter {
-            prefix: Some(target_prefix),
+            prefixes: target_prefixes.into_iter().collect(),
             include: true,
         })
 }
@@ -259,10 +300,24 @@ pub fn layer_excluding_target_prefix<S>(
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
+    layer_excluding_target_prefixes(provider, instrumentation_scope, target_prefix)
+}
+
+/// Build a tracing layer that excludes spans from `target_prefixes`.
+///
+/// An empty iterator excludes no application spans.
+pub fn layer_excluding_target_prefixes<S>(
+    provider: &SdkTracerProvider,
+    instrumentation_scope: &'static str,
+    target_prefixes: impl IntoIterator<Item = &'static str>,
+) -> TargetOtlpLayer<S>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
     tracing_opentelemetry::layer()
         .with_tracer(provider.tracer(instrumentation_scope))
         .with_filter(TargetPrefixFilter {
-            prefix: target_prefix,
+            prefixes: target_prefixes.into_iter().collect(),
             include: false,
         })
 }

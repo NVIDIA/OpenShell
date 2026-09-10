@@ -126,6 +126,7 @@ impl VaultCredentialDriver {
     pub fn from_config(config: &toml::Table) -> CoreResult<Self> {
         let settings = VaultDriverSettings::from_table(config)?;
         let timeout_secs = timeout_secs(config)?;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .build()

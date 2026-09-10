@@ -113,14 +113,18 @@ func (c *fakeProviderClient) Get(_ context.Context, workspace, name string) (*ty
 
 // List returns all providers. ListOptions are accepted for interface
 // compatibility but filtering is not implemented.
-func (c *fakeProviderClient) List(_ context.Context, workspace string, opts ...v1.ListOptions) ([]*types.Provider, error) {
+func (c *fakeProviderClient) List(_ context.Context, workspace string, _ ...v1.ListOptions) ([]*types.Provider, error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
-	if len(opts) > 0 && opts[0].AllWorkspaces {
-		return c.store.ListAll(), nil
-	}
 	return c.store.List(workspace), nil
+}
+
+func (c *fakeProviderClient) ListAll(_ context.Context, _ ...v1.ListOptions) ([]*types.Provider, error) {
+	if c.closedFunc() {
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+	}
+	return c.store.ListAll(), nil
 }
 
 // Update replaces an existing provider's data. ResourceVersion is

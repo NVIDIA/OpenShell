@@ -4,51 +4,20 @@
 use std::collections::HashMap;
 
 use openshell_core::google_cloud;
-use openshell_core::inference;
 
-use crate::{
-    DiscoveredProvider, Provider, ProviderDiscoverySpec, ProviderError, ProviderPlugin,
-    RealDiscoveryContext, discover_with_spec,
-};
+use crate::{Provider, ProviderPlugin, VERTEX_AI_PROJECT_ID_KEY, VERTEX_AI_REGION_KEY};
 
 pub struct VertexProvider;
 
-const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
-    id: "google-vertex-ai",
-    credential_env_vars: inference::VERTEX_AI_CREDENTIAL_KEY_NAMES,
-};
-
 impl ProviderPlugin for VertexProvider {
     fn id(&self) -> &'static str {
-        SPEC.id
-    }
-
-    fn discover_existing(&self) -> Result<Option<DiscoveredProvider>, ProviderError> {
-        let mut discovered = discover_with_spec(&SPEC, &RealDiscoveryContext)?.unwrap_or_default();
-
-        for key in inference::VERTEX_AI_CONFIG_KEY_NAMES {
-            if let Ok(val) = std::env::var(key)
-                && !val.trim().is_empty()
-            {
-                discovered.config.entry(key.to_string()).or_insert(val);
-            }
-        }
-
-        if discovered.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(discovered))
-        }
-    }
-
-    fn credential_env_vars(&self) -> &'static [&'static str] {
-        SPEC.credential_env_vars
+        "google-vertex-ai"
     }
 
     fn inject_env(&self, provider: &Provider, env: &mut HashMap<String, String>) {
         if let Some(project) = provider
             .config
-            .get(inference::VERTEX_AI_PROJECT_ID_KEY)
+            .get(VERTEX_AI_PROJECT_ID_KEY)
             .filter(|v| !v.trim().is_empty())
         {
             let trimmed = project.trim().to_string();
@@ -62,7 +31,7 @@ impl ProviderPlugin for VertexProvider {
 
         if let Some(region) = provider
             .config
-            .get(inference::VERTEX_AI_REGION_KEY)
+            .get(VERTEX_AI_REGION_KEY)
             .filter(|v| !v.trim().is_empty())
         {
             let trimmed = region.trim().to_string();

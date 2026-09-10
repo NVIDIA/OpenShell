@@ -12,11 +12,10 @@ use openshell_core::proto::datamodel::v1::{ObjectMeta, WorkspacePhase, Workspace
 use openshell_core::proto::{
     AddWorkspaceMemberRequest, AddWorkspaceMemberResponse, CreateWorkspaceRequest,
     CreateWorkspaceResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse, GetWorkspaceRequest,
-    GetWorkspaceResponse, InferenceRoute, ListWorkspaceMembersRequest,
-    ListWorkspaceMembersResponse, ListWorkspacesRequest, ListWorkspacesResponse, Provider,
-    RemoveWorkspaceMemberRequest, RemoveWorkspaceMemberResponse, Sandbox, ServiceEndpoint,
-    SshSession, StoredProviderCredentialRefreshState, StoredProviderProfile, Workspace,
-    WorkspaceMember, WorkspaceRole,
+    GetWorkspaceResponse, ListWorkspaceMembersRequest, ListWorkspaceMembersResponse,
+    ListWorkspacesRequest, ListWorkspacesResponse, Provider, RemoveWorkspaceMemberRequest,
+    RemoveWorkspaceMemberResponse, Sandbox, SandboxWorkloadTemplate, ServiceEndpoint, SshSession,
+    Workspace, WorkspaceMember, WorkspaceRole,
 };
 use prost::Message;
 use tonic::{Request, Response, Status};
@@ -28,6 +27,7 @@ use crate::persistence::{
     DRAFT_CHUNK_OBJECT_TYPE, ObjectLabels, ObjectType, POLICY_OBJECT_TYPE, WriteCondition,
     current_time_ms,
 };
+use crate::storage_proto::{StoredProviderCredentialRefreshState, StoredProviderProfile};
 use std::collections::HashMap;
 
 use super::{MAX_PAGE_SIZE, clamp_limit};
@@ -70,7 +70,7 @@ fn membership_filter_subject<'a>(
     }
 }
 
-fn validate_workspace_name(name: &str) -> Result<(), Status> {
+pub fn validate_workspace_name(name: &str) -> Result<(), Status> {
     if name.is_empty() {
         return Err(Status::invalid_argument("workspace name is required"));
     }
@@ -375,6 +375,7 @@ pub(super) async fn handle_delete_workspace(
     let mut blocking = Vec::new();
     for (object_type, label) in [
         (Sandbox::object_type(), "sandbox"),
+        (SandboxWorkloadTemplate::object_type(), "sandbox template"),
         (Provider::object_type(), "provider"),
         (StoredProviderProfile::object_type(), "provider profile"),
         (ServiceEndpoint::object_type(), "service"),
@@ -410,13 +411,7 @@ pub(super) async fn handle_delete_workspace(
     // Cascade-delete non-blocking resources before the final CAS delete.
     // This is safe without a transaction: the workspace is Terminating, so
     // ensure_active rejects new resource creation. If delete_if conflicts
-    // below, the retry will find no routes/members to delete and succeed.
-    state
-        .store
-        .delete_all_in_workspace(InferenceRoute::object_type(), &name)
-        .await
-        .map_err(|e| Status::internal(format!("delete inference routes failed: {e}")))?;
-
+    // below, the retry will find no members to delete and succeed.
     state
         .store
         .delete_all_in_workspace(WorkspaceMember::object_type(), &name)
@@ -811,6 +806,72 @@ mod tests {
             &state,
             Request::new(DeleteWorkspaceRequest {
                 name: "ephemeral".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(resp.deleted);
+    }
+
+    #[tokio::test]
+    async fn delete_workspace_blocked_by_sandbox_template() {
+        let state = test_server_state().await;
+
+        handle_create_workspace(
+            &state,
+            Request::new(CreateWorkspaceRequest {
+                name: "templated".to_string(),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let template = SandboxWorkloadTemplate {
+            metadata: Some(ObjectMeta {
+                id: "template-1".to_string(),
+                name: "gpu-kata".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                resource_version: 0,
+                workspace: "templated".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            spec: None,
+        };
+        state.store.put_message(&template).await.unwrap();
+
+        let err = handle_delete_workspace(
+            &state,
+            Request::new(DeleteWorkspaceRequest {
+                name: "templated".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message().contains("sandbox template"),
+            "error should name sandbox templates as blocking resources: {}",
+            err.message()
+        );
+
+        state
+            .store
+            .delete_by_name(
+                SandboxWorkloadTemplate::object_type(),
+                "templated",
+                "gpu-kata",
+            )
+            .await
+            .unwrap();
+
+        let resp = handle_delete_workspace(
+            &state,
+            Request::new(DeleteWorkspaceRequest {
+                name: "templated".to_string(),
             }),
         )
         .await
@@ -1456,64 +1517,6 @@ mod tests {
         let err = rw.ensure_active().unwrap_err();
         assert_eq!(err.code(), Code::FailedPrecondition);
         assert!(err.message().contains("being deleted"));
-    }
-
-    #[tokio::test]
-    async fn delete_workspace_cascade_deletes_inference_routes() {
-        let state = test_server_state().await;
-
-        handle_create_workspace(
-            &state,
-            Request::new(CreateWorkspaceRequest {
-                name: "route-test".to_string(),
-                labels: HashMap::new(),
-            }),
-        )
-        .await
-        .unwrap();
-
-        let route = InferenceRoute {
-            metadata: Some(ObjectMeta {
-                id: "route-1".to_string(),
-                name: "inference.local".to_string(),
-                created_at_ms: 1_000_000,
-                labels: HashMap::new(),
-                annotations: HashMap::new(),
-                resource_version: 0,
-                workspace: "route-test".to_string(),
-                deletion_timestamp_ms: 0,
-            }),
-            config: Some(openshell_core::proto::InferenceRouteConfig {
-                provider_name: "test-provider".to_string(),
-                model_id: "gpt-4o".to_string(),
-                timeout_secs: 0,
-            }),
-            version: 1,
-        };
-        state.store.put_message(&route).await.unwrap();
-
-        // Inference route should NOT block workspace deletion.
-        let resp = handle_delete_workspace(
-            &state,
-            Request::new(DeleteWorkspaceRequest {
-                name: "route-test".to_string(),
-            }),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        assert!(resp.deleted);
-
-        // Inference route should have been cascade-deleted.
-        let remaining: Vec<InferenceRoute> = state
-            .store
-            .list_messages("route-test", 100, 0)
-            .await
-            .unwrap();
-        assert!(
-            remaining.is_empty(),
-            "inference routes should be cascade-deleted with workspace"
-        );
     }
 
     /// Non-member callers must receive `PERMISSION_DENIED` — not `NOT_FOUND` —

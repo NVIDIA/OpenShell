@@ -79,9 +79,9 @@ its pod. The driver sets `spec.operatingMode: Suspended` for `v1beta1` or
 `spec.replicas: 0` for `v1alpha1`. Start sets `Running` or one replica for the
 same resource, so the replacement pod mounts the existing claim. Delete is the
 only lifecycle operation that removes the Sandbox resource and its owned
-storage. The driver confirms the stop from the published `Suspended`
-condition when available. Legacy `v1alpha1` controllers omit a zero replica
-count from status, so the driver confirms that their backing pod is gone.
+storage. The driver confirms the stop from both the published `Suspended`
+condition and deletion of the backing pod. Legacy `v1alpha1` controllers omit
+a usable stopped condition, so pod deletion alone confirms their stop.
 
 The workspace PVC size defaults to `workspace_default_storage_size`. Set
 `workspace_storage_class` to pin the PVC to a specific `StorageClass`; an empty

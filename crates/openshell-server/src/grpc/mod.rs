@@ -14,41 +14,45 @@ pub mod workspace;
 use openshell_core::proto::{
     AddWorkspaceMemberRequest, AddWorkspaceMemberResponse, ApproveAllDraftChunksRequest,
     ApproveAllDraftChunksResponse, ApproveDraftChunkRequest, ApproveDraftChunkResponse,
-    AttachSandboxProviderRequest, AttachSandboxProviderResponse, ClearDraftChunksRequest,
-    ClearDraftChunksResponse, ComputeDriverCapabilities, ComputeDriverInfo,
-    ConfigureProviderRefreshRequest, ConfigureProviderRefreshResponse, CreateProviderRequest,
-    CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
-    CreateWorkspaceRequest, CreateWorkspaceResponse, DeleteProviderProfileRequest,
-    DeleteProviderProfileResponse, DeleteProviderRefreshRequest, DeleteProviderRefreshResponse,
-    DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DeleteServiceRequest, DeleteServiceResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse, EditDraftChunkRequest,
-    EditDraftChunkResponse, ExchangeProviderSubjectTokenRequest,
-    ExchangeProviderSubjectTokenResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
-    ExposeServiceRequest, FinalizeMainProcessExitRequest, FinalizeMainProcessExitResponse,
-    GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse, GetDraftHistoryRequest,
-    GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
+    AttachSandboxProviderRequest, AttachSandboxProviderResponse, BeginRootfsTarStagingRequest,
+    BeginRootfsTarStagingResponse, ClearDraftChunksRequest, ClearDraftChunksResponse,
+    ComputeDriverCapabilities, ComputeDriverInfo, ConfigureProviderRefreshRequest,
+    ConfigureProviderRefreshResponse, CpuResourceCapabilities, CreateProviderRequest,
+    CreateSandboxRequest, CreateSandboxTemplateRequest, CreateSshSessionRequest,
+    CreateSshSessionResponse, CreateWorkspaceRequest, CreateWorkspaceResponse,
+    DeleteProviderProfileRequest, DeleteProviderProfileResponse, DeleteProviderRefreshRequest,
+    DeleteProviderRefreshResponse, DeleteProviderRequest, DeleteProviderResponse,
+    DeleteSandboxRequest, DeleteSandboxResponse, DeleteSandboxTemplateRequest,
+    DeleteSandboxTemplateResponse, DeleteServiceRequest, DeleteServiceResponse,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DetachSandboxProviderRequest,
+    DetachSandboxProviderResponse, EditDraftChunkRequest, EditDraftChunkResponse,
+    ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
+    ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest, FinalizeMainProcessExitRequest,
+    FinalizeMainProcessExitResponse, GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse,
+    GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetGatewayInfoRequest,
     GetGatewayInfoResponse, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
     GetProviderRefreshStatusResponse, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
     GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
-    GetServiceRequest, GetWorkspaceRequest, GetWorkspaceResponse, HealthRequest, HealthResponse,
-    ImportProviderProfilesRequest, ImportProviderProfilesResponse, IssueSandboxTokenRequest,
-    IssueSandboxTokenResponse, LintProviderProfilesRequest, LintProviderProfilesResponse,
-    ListProviderProfilesRequest, ListProviderProfilesResponse, ListProvidersRequest,
-    ListProvidersResponse, ListSandboxPoliciesRequest, ListSandboxPoliciesResponse,
-    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, ListServicesRequest, ListServicesResponse, ListWorkspaceMembersRequest,
-    ListWorkspaceMembersResponse, ListWorkspacesRequest, ListWorkspacesResponse,
-    ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
-    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RejectDraftChunkRequest,
-    RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
-    RemoveWorkspaceMemberResponse, ReportMainProcessExitRequest, ReportMainProcessExitResponse,
-    ReportPolicyStatusRequest, ReportPolicyStatusResponse, RevokeSshSessionRequest,
-    RevokeSshSessionResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
-    SandboxResponse, ServiceEndpointResponse, ServiceStatus, StartSandboxRequest,
+    GetSandboxTemplateRequest, GetServiceRequest, GetWorkspaceRequest, GetWorkspaceResponse,
+    GpuResourceCapabilities, HealthRequest, HealthResponse, ImportProviderProfilesRequest,
+    ImportProviderProfilesResponse, IssueSandboxTokenRequest, IssueSandboxTokenResponse,
+    LintProviderProfilesRequest, LintProviderProfilesResponse, ListProviderProfilesRequest,
+    ListProviderProfilesResponse, ListProvidersRequest, ListProvidersResponse,
+    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxProvidersRequest,
+    ListSandboxProvidersResponse, ListSandboxTemplatesRequest, ListSandboxTemplatesResponse,
+    ListSandboxesRequest, ListSandboxesResponse, ListServicesRequest, ListServicesResponse,
+    ListWorkspaceMembersRequest, ListWorkspaceMembersResponse, ListWorkspacesRequest,
+    ListWorkspacesResponse, MemoryResourceCapabilities, ProviderProfileResponse, ProviderResponse,
+    PushSandboxLogsRequest, PushSandboxLogsResponse, RefreshSandboxTokenRequest,
+    RefreshSandboxTokenResponse, RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame,
+    RemoveWorkspaceMemberRequest, RemoveWorkspaceMemberResponse, ReportMainProcessExitRequest,
+    ReportMainProcessExitResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
+    ResourceCapabilities, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    RotateProviderCredentialRequest, RotateProviderCredentialResponse, SandboxResponse,
+    SandboxTemplateResponse, ServiceEndpointResponse, ServiceStatus, StartSandboxRequest,
     StopSandboxRequest, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
     SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse,
     UpdateConfigRequest, UpdateConfigResponse, UpdateProviderProfilesRequest,
@@ -187,19 +191,6 @@ enum StoredSettingValue {
 // Utility
 // ---------------------------------------------------------------------------
 
-/// Validate that object metadata is present and contains required fields.
-///
-/// This is a crate-level helper that wraps the validation module's implementation.
-/// Use this from modules outside of `grpc` that need to validate metadata.
-// `tonic::Status` is large but is the API surface of gRPC handlers.
-#[allow(clippy::result_large_err)]
-pub fn validate_object_metadata(
-    metadata: Option<&openshell_core::proto::datamodel::v1::ObjectMeta>,
-    resource_type: &str,
-) -> Result<(), Status> {
-    validation::validate_object_metadata(metadata, resource_type)
-}
-
 // ---------------------------------------------------------------------------
 // Service struct
 // ---------------------------------------------------------------------------
@@ -256,6 +247,10 @@ impl OpenShell for OpenShellService {
                 capabilities: Some(ComputeDriverCapabilities {
                     driver_name: driver.driver_name.clone(),
                     driver_version: driver.driver_version.clone(),
+                    resource_capabilities: driver
+                        .resource_capabilities
+                        .as_ref()
+                        .map(|resources| public_resource_capabilities(*resources)),
                 }),
             })
             .collect();
@@ -274,6 +269,13 @@ impl OpenShell for OpenShellService {
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         sandbox::handle_create_sandbox(&self.state, request).await
+    }
+
+    async fn begin_rootfs_tar_staging(
+        &self,
+        request: Request<BeginRootfsTarStagingRequest>,
+    ) -> Result<Response<BeginRootfsTarStagingResponse>, Status> {
+        sandbox::handle_begin_rootfs_tar_staging(&self.state, request).await
     }
 
     type WatchSandboxStream = sandbox::WatchSandboxStream;
@@ -297,6 +299,34 @@ impl OpenShell for OpenShellService {
         request: Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
         sandbox::handle_list_sandboxes(&self.state, request).await
+    }
+
+    async fn create_sandbox_template(
+        &self,
+        request: Request<CreateSandboxTemplateRequest>,
+    ) -> Result<Response<SandboxTemplateResponse>, Status> {
+        sandbox::handle_create_sandbox_template(&self.state, request).await
+    }
+
+    async fn get_sandbox_template(
+        &self,
+        request: Request<GetSandboxTemplateRequest>,
+    ) -> Result<Response<SandboxTemplateResponse>, Status> {
+        sandbox::handle_get_sandbox_template(&self.state, request).await
+    }
+
+    async fn list_sandbox_templates(
+        &self,
+        request: Request<ListSandboxTemplatesRequest>,
+    ) -> Result<Response<ListSandboxTemplatesResponse>, Status> {
+        sandbox::handle_list_sandbox_templates(&self.state, request).await
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        request: Request<DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<DeleteSandboxTemplateResponse>, Status> {
+        sandbox::handle_delete_sandbox_template(&self.state, request).await
     }
 
     async fn list_sandbox_providers(
@@ -765,6 +795,26 @@ impl OpenShell for OpenShellService {
     }
 }
 
+fn public_resource_capabilities(
+    resources: openshell_core::proto::compute::v1::ResourceCapabilities,
+) -> ResourceCapabilities {
+    ResourceCapabilities {
+        cpu: resources.cpu.as_ref().map(|cpu| CpuResourceCapabilities {
+            limit_supported: cpu.limit_supported,
+        }),
+        memory: resources
+            .memory
+            .as_ref()
+            .map(|memory| MemoryResourceCapabilities {
+                limit_supported: memory.limit_supported,
+            }),
+        gpu: resources.gpu.as_ref().map(|gpu| GpuResourceCapabilities {
+            default_selection_supported: gpu.default_selection_supported,
+            count_selection_supported: gpu.count_selection_supported,
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared test support
 // ---------------------------------------------------------------------------
@@ -875,6 +925,12 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_core::proto::compute::v1::{
+        CpuResourceCapabilities as DriverCpuResourceCapabilities,
+        GpuResourceCapabilities as DriverGpuResourceCapabilities,
+        MemoryResourceCapabilities as DriverMemoryResourceCapabilities,
+        ResourceCapabilities as DriverResourceCapabilities,
+    };
 
     #[test]
     fn clamp_limit_zero_returns_default() {
@@ -899,5 +955,40 @@ mod tests {
             MAX_PAGE_SIZE
         );
         assert_eq!(clamp_limit(u32::MAX, 100, MAX_PAGE_SIZE), MAX_PAGE_SIZE);
+    }
+
+    #[test]
+    fn public_resource_capabilities_preserves_reported_fields() {
+        let driver_capabilities = DriverResourceCapabilities {
+            cpu: Some(DriverCpuResourceCapabilities {
+                limit_supported: true,
+            }),
+            memory: Some(DriverMemoryResourceCapabilities {
+                limit_supported: false,
+            }),
+            gpu: Some(DriverGpuResourceCapabilities {
+                default_selection_supported: true,
+                count_selection_supported: true,
+            }),
+        };
+
+        let capabilities = public_resource_capabilities(driver_capabilities);
+
+        assert!(capabilities.cpu.expect("CPU capabilities").limit_supported);
+        assert!(
+            !capabilities
+                .memory
+                .expect("memory capabilities")
+                .limit_supported
+        );
+        let gpu = capabilities.gpu.expect("GPU capabilities");
+        assert!(gpu.default_selection_supported);
+        assert!(gpu.count_selection_supported);
+    }
+
+    #[test]
+    fn public_resource_capabilities_preserves_absence() {
+        let absent: Option<DriverResourceCapabilities> = None;
+        assert!(absent.map(public_resource_capabilities).is_none());
     }
 }

@@ -4,19 +4,28 @@
 # Helm chart tasks
 
 ["helm:docs"]
-description = "Generate the openshell Helm chart README from Chart.yaml, values.yaml, and README.md.gotmpl"
-run = "helm-docs --chart-search-root deploy/helm/openshell"
+description = "Generate the OpenShell gateway and workspace Helm chart READMEs"
+run = """
+  helm-docs --chart-search-root deploy/helm/openshell
+  helm-docs --chart-search-root deploy/helm/openshell-workspace
+"""
 
 ["helm:docs:check"]
 description = "Verify the openshell Helm chart README is generated and up to date"
 run = """
   set -e
-  tmp="$(mktemp)"
-  trap 'rm -f "$tmp"' EXIT
+  gateway_tmp="$(mktemp)"
+  workspace_tmp="$(mktemp)"
+  trap 'rm -f "$gateway_tmp" "$workspace_tmp"' EXIT
 
-  helm-docs --chart-search-root deploy/helm/openshell --dry-run > "$tmp"
-  if ! diff -u deploy/helm/openshell/README.md "$tmp"; then
+  helm-docs --chart-search-root deploy/helm/openshell --dry-run > "$gateway_tmp"
+  if ! diff -u deploy/helm/openshell/README.md "$gateway_tmp"; then
     echo "Helm chart README is out of sync. Run: mise run helm:docs" >&2
+    exit 1
+  fi
+  helm-docs --chart-search-root deploy/helm/openshell-workspace --dry-run > "$workspace_tmp"
+  if ! diff -u deploy/helm/openshell-workspace/README.md "$workspace_tmp"; then
+    echo "Workspace Helm chart README is out of sync. Run: mise run helm:docs" >&2
     exit 1
   fi
 """
@@ -24,7 +33,7 @@ run_windows = "echo Skipping helm:docs:check: Helm validation is not part of the
 hide = true
 
 ["helm:lint"]
-description = "Lint the openshell Helm chart (defaults + all CI configuration variants)"
+description = "Lint the OpenShell gateway and workspace Helm charts"
 run = """
   set -e
   helm dependency build deploy/helm/openshell
@@ -37,12 +46,14 @@ run = """
     echo "values files: deploy/helm/openshell/values.yaml, $f"
     helm lint deploy/helm/openshell -f "$f" --set agentSandbox.preflight.enabled=false
   done
+  echo "--- helm lint: workspace defaults ---"
+  helm lint deploy/helm/openshell-workspace
   echo "All variants passed."
 """
 run_windows = "echo Skipping helm:lint: Helm validation is not part of the native Windows lane."
 
 ["helm:test"]
-description = "Run Helm chart unit tests"
+description = "Run gateway and workspace Helm chart unit tests"
 run = """
   set -e
   if ! helm plugin list | grep -q unittest; then
@@ -50,6 +61,8 @@ run = """
   fi
   helm dependency build deploy/helm/openshell
   helm unittest deploy/helm/openshell
+  helm unittest deploy/helm/openshell-workspace
+  deploy/helm/test-split-ownership.sh
 """
 run_windows = "echo Skipping helm:test: Helm validation is not part of the native Windows lane."
 

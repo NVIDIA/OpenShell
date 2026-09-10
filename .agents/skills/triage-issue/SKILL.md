@@ -1,6 +1,8 @@
 ---
 name: triage-issue
 description: Assess, validate, and route community-filed issues for human disposition and roadmap placement. Takes a specific issue number or processes a confirmed batch of issues labeled state:triage-needed. Investigates reported behavior, separates objective findings from product decisions, and prepares validated issues for a human yes/no decision. Trigger keywords - triage issue, triage, assess issue, review incoming issue, triage issues.
+metadata:
+  internal: true
 ---
 
 # Triage Issue
@@ -153,9 +155,9 @@ Based on the sub-agent's analysis, also attempt to validate the report directly:
 
 - For bug reports: check the relevant code paths, look for the described failure mode
 - For feature requests: assess feasibility against the existing architecture
-- For gateway deployment or infrastructure issues: reference the `debug-openshell-cluster` skill's known failure patterns
-- For inference and provider-topology issues: reference the `debug-inference` skill's known failure patterns
-- For CLI/usage issues: reference the `openshell-cli` skill's command reference
+- For gateway deployment or infrastructure issues: reference the known failure patterns in `skills/debug-openshell-cluster/SKILL.md`
+- For inference and provider-topology issues: reference `skills/debug-inference/SKILL.md`
+- For CLI/usage issues: reference the workflows in `skills/openshell-cli/SKILL.md` and confirm installed syntax with `openshell --help`
 
 Record impact signals for the human decision: affected users and scope, regression status, workaround availability, severity evidence, and evidence quality. Do not convert those facts into a roadmap or sequencing recommendation.
 

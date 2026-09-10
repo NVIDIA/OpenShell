@@ -144,6 +144,14 @@ fn prepare_with_path_open_mode(
     }
 
     if read_only.is_empty() && read_write.is_empty() {
+        if matches!(
+            policy.landlock.compatibility,
+            LandlockCompatibility::HardRequirement
+        ) {
+            miette::bail!(
+                "landlock.compatibility is hard_requirement but no filesystem paths are configured"
+            );
+        }
         return Ok(None);
     }
 
@@ -522,6 +530,68 @@ mod tests {
             panic!("hard_requirement should accept mixed directory and device paths: {err}");
         }
     }
+    #[test]
+    fn prepare_hard_requirement_no_paths_aborts() {
+        // Zero configured paths under hard_requirement must fail startup rather
+        // than silently running without filesystem restrictions.
+        let policy = hard_requirement_policy(vec![], vec![]);
+        let Err(err) = prepare(&policy, None) else {
+            panic!("should abort with no paths");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hard_requirement") && msg.contains("no filesystem paths"),
+            "error should explain the empty hard_requirement policy: {msg}"
+        );
+    }
+
+    #[test]
+    fn prepare_best_effort_no_paths_is_noop() {
+        let policy = SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy {
+                read_only: vec![],
+                read_write: vec![],
+                include_workdir: false,
+            },
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy {
+                compatibility: LandlockCompatibility::BestEffort,
+            },
+            process: ProcessPolicy::default(),
+        };
+        let prepared = prepare(&policy, None).expect("best_effort no-op should succeed");
+        assert!(prepared.is_none(), "no paths should produce no ruleset");
+    }
+
+    #[test]
+    fn prepare_include_workdir_counts_as_configured_path() {
+        // With no explicit paths but include_workdir set, the workdir must be
+        // treated as a configured path — so the zero-path abort must NOT fire.
+        let policy = SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy {
+                read_only: vec![],
+                read_write: vec![],
+                include_workdir: true,
+            },
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy {
+                compatibility: LandlockCompatibility::HardRequirement,
+            },
+            process: ProcessPolicy::default(),
+        };
+        // Any error (e.g. Landlock unavailable on this host) is acceptable, but
+        // it must not be the "no filesystem paths" abort.
+        if let Err(err) = prepare(&policy, Some("/tmp")) {
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("no filesystem paths"),
+                "workdir should count as a configured path: {msg}"
+            );
+        }
+    }
+
     fn tailored_access(path: &Path, requested_access: BitFlags<AccessFs>) -> BitFlags<AccessFs> {
         let path_fd = PathFd::new(path).unwrap();
         access_for_path_fd(&path_fd, requested_access, ABI::V2).unwrap()

@@ -45,6 +45,14 @@ func (c *fakeServiceClient) List(_ context.Context, _, _ string, _ ...v1.ListOpt
 	return nil, &types.StatusError{Code: types.ErrorUnimplemented, Message: "List is not supported by the fake client"}
 }
 
+// ListAll returns Unimplemented.
+func (c *fakeServiceClient) ListAll(_ context.Context, _ ...v1.ListOptions) ([]*types.ServiceEndpoint, error) {
+	if c.closedFunc() {
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+	}
+	return nil, &types.StatusError{Code: types.ErrorUnimplemented, Message: "ListAll is not supported by the fake client"}
+}
+
 // Delete returns Unimplemented.
 func (c *fakeServiceClient) Delete(_ context.Context, _, _, _ string) error {
 	if c.closedFunc() {

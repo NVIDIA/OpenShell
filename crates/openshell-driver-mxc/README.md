@@ -4,8 +4,11 @@ OpenShell compute driver backed by **Microsoft MXC** (`wxc-exec`) on Windows.
 
 ## Design
 
-This driver implements the gateway's `ComputeDriver` contract as an in-process
-library linked into `openshell-gateway`. `process_container` launches a one-shot
+This driver implements the gateway's ordinary in-process `ComputeDriver`
+contract and is linked into `openshell-gateway`. It sets
+`driver_reports_runtime_readiness`, so the gateway accepts driver-reported
+readiness without a supervisor session. The canonical create-time
+`SandboxPolicy` is carried by `DriverSandboxSpec.policy`. `process_container` launches a one-shot
 AppContainer and is the default. The opt-in `isolation_session` backend uses the
 state-aware `provision` → `start` → `exec` → `stop` → `deprovision` lifecycle.
 The driver launches and monitors the configured workload itself and self-reports
@@ -51,7 +54,9 @@ openshell sandbox create --name mxc-demo --policy demo.yaml `
 
 The `command` array is required and preserves Windows argument boundaries. `cwd` is optional. Environment variables come from the standard sandbox and template environment maps; the driver never copies values from the gateway host environment.
 
-Network policy and live policy replacement or merge updates are rejected while the gateway uses MXC. Delete and recreate the sandbox to apply a different filesystem policy.
+Network policy support depends on the selected containment path. Policy
+replacement and merge updates use the gateway's standard sandbox configuration
+revision contract.
 
 ## Prerequisites (live runs)
 
@@ -64,7 +69,11 @@ no isolation session needed), set `OPENSHELL_MXC_MOCK_WXC=1`.
 
 ## Policy mapping
 
-The production driver maps the typed `SandboxPolicy` to MXC configuration before it inserts a registry entry or invokes `wxc-exec`. Mapping failure therefore returns from `CreateSandbox` without leaving a partial sandbox.
+The production driver maps the typed `SandboxPolicy` carried by the standard
+driver request to MXC configuration before it inserts a registry entry or
+invokes `wxc-exec`. Mapping failure therefore returns from `CreateSandbox`
+without leaving a partial sandbox. There is no in-process policy side channel
+or MXC-specific gateway composition variant.
 
 `EmbeddedPolicyMapper` calls the embedded [`policy_map`](src/policy_map/) module directly and normalizes filesystem paths to Windows form. It does not add gateway-configured host paths. The policy supplied for the sandbox is the only source of filesystem grants.
 

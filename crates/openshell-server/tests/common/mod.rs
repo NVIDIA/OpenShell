@@ -53,6 +53,13 @@ pub struct TestOpenShell;
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn begin_rootfs_tar_staging(
+        &self,
+        _request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,
+    ) -> Result<Response<openshell_core::proto::BeginRootfsTarStagingResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn report_main_process_exit(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
@@ -96,6 +103,34 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         Ok(Response::new(SandboxResponse::default()))
+    }
+
+    async fn create_sandbox_template(
+        &self,
+        _request: tonic::Request<openshell_core::proto::CreateSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_sandbox_template(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_sandbox_templates(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListSandboxTemplatesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListSandboxTemplatesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteSandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn stop_sandbox(
@@ -577,11 +612,6 @@ impl OpenShell for TestOpenShell {
 // ---------------------------------------------------------------------------
 // TLS / PKI helpers (used by TLS integration tests)
 // ---------------------------------------------------------------------------
-
-/// Initialise the rustls crypto provider (idempotent).
-pub fn install_rustls_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
 
 /// PKI bundle: CA cert, server cert+key, client cert+key (all PEM).
 #[allow(clippy::struct_field_names)]

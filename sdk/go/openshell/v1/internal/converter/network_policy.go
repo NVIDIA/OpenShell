@@ -182,6 +182,9 @@ func policyNetworkEndpointToProto(ep *types.PolicyNetworkEndpoint) *sbv1.Network
 
 // --- McpOptions ---
 
+// mcpOptionsFromProto performs a transport conversion only. It leaves an empty
+// version list empty because checked policy and server ingress own default
+// materialization and validation.
 func mcpOptionsFromProto(m *sbv1.McpOptions) *types.McpOptions {
 	if m == nil {
 		return nil
@@ -189,6 +192,7 @@ func mcpOptionsFromProto(m *sbv1.McpOptions) *types.McpOptions {
 	return &types.McpOptions{
 		StrictToolNames:         CopyBoolPtr(m.StrictToolNames),
 		AllowAllKnownMcpMethods: CopyBoolPtr(m.AllowAllKnownMcpMethods),
+		Versions:                CopyStringSlice(m.GetVersions()),
 	}
 }
 
@@ -199,6 +203,7 @@ func mcpOptionsToProto(m *types.McpOptions) *sbv1.McpOptions {
 	return &sbv1.McpOptions{
 		StrictToolNames:         CopyBoolPtr(m.StrictToolNames),
 		AllowAllKnownMcpMethods: CopyBoolPtr(m.AllowAllKnownMcpMethods),
+		Versions:                CopyStringSlice(m.Versions),
 	}
 }
 

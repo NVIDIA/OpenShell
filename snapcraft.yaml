@@ -9,7 +9,7 @@ description: |
   OpenShell provides safe, sandboxed runtimes for autonomous AI agents.
   It offers a CLI for managing gateways, sandboxes, and providers with
   policy-enforced egress routing, credential proxying, and privacy-aware
-  LLM inference routing.
+  profile-backed model-provider access.
 
   The OpenShell snap ships a CLI (`openshell`), a terminal UI
   (`openshell.term`), and a managed gateway daemon (`openshell.gateway`).
@@ -22,12 +22,11 @@ description: |
 
        Support for system-installed Docker is coming in snapd 2.76.
 
-    2. Connect the required interfaces and start the gateway:
+    2. Connect the required interfaces:
 
          sudo snap connect openshell:docker docker:docker-daemon
          sudo snap connect openshell:log-observe
          sudo snap connect openshell:system-observe
-         sudo snap start openshell.gateway
 
     3. Verify the gateway and register it locally:
 

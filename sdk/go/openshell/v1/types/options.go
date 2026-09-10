@@ -15,7 +15,6 @@ type ListOptions struct {
 	Limit         int
 	Offset        int
 	LabelSelector string
-	AllWorkspaces bool
 }
 
 // WatchOptions configures watch behavior.

@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version = 1
+
+[diagnostics]
+command = "/home/openshell/.local/bin/openshell-test-guest-diagnostics"
+timeout_secs = 60
+
+[[runs]]
+scenario = "smoke"
+
+[[runs]]
+scenario = "sandbox-continuity"
+workload_expectation = "reconciled"
+
+[[runs.actions]]
+name = "gateway-upgrade"
+command = "/home/openshell/.local/bin/openshell-test-guest-gateway-upgrade"
+timeout_secs = 120
+
+[[runs.actions]]
+name = "gateway-restart"
+command = "/home/openshell/.local/bin/openshell-test-guest-gateway-restart"
+timeout_secs = 120
