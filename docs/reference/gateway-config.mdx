@@ -20,6 +20,12 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 
 `name` assigns an operator-facing identity to the gateway installation. Set it with `[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`. It defaults to `openshell`; the Helm chart defaults it to the chart fullname so all replicas in one installation share a name. Chart fullnames are only unique within their Kubernetes namespace, so set `server.name` explicitly when one collector receives telemetry from multiple namespaces or clusters. This identity is independent of client-side gateway aliases, TLS names, and `gateway_jwt.gateway_id`.
 
+## Supervisor connections and policy recovery
+
+During supervisor reconnects, the gateway waits at most one second for the optional configuration bootstrap. If a credential backend stalls, the gateway accepts the session without that bootstrap so SSH, exec, and service connections can resume. Supervisor polling continues to supply configuration.
+
+On startup, the gateway repairs missing legacy policy history and skips invalid stored policies. A valid global policy can still override an invalid local policy; otherwise, that sandbox's configuration reads continue to report the validation failure.
+
 ## Package-Managed Locations
 
 Package-managed gateways do not require a TOML file. Create one at the package's optional config location when you need to override built-in defaults. Set `OPENSHELL_GATEWAY_CONFIG` in the launch environment to use a different file.

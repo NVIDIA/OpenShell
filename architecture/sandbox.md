@@ -481,8 +481,10 @@ accepted for one release with a warning and a counter, because sandboxes keep
 their supervisor binary until they are recreated. The gateway includes a configuration bootstrap when it accepts a
 `ConnectSupervisor` session and can send complete component replacements on the
 same stream after policy, settings, or provider state changes.
-Bootstrap construction does not gate the session while polling remains
-authoritative. These payloads describe the latest effective state rather than
+While polling remains authoritative, optional bootstrap construction has a
+one-second budget. The gateway accepts the session without a bootstrap when
+that budget expires, so slow credential backends do not block relay reconnects.
+These payloads describe the latest effective state rather than
 the mutation that produced it. The gateway assigns ordering sequences within
 each session and component, while each snapshot retains its own content
 revision.

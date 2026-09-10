@@ -8078,6 +8078,10 @@ mod tests {
             .await
             .expect("store sandbox with invalid legacy spec");
 
+        backfill_legacy_policy_history(&state)
+            .await
+            .expect("global override must allow startup with an invalid dormant spec");
+
         let response = handle_get_sandbox_config(
             &state,
             with_sandbox(
