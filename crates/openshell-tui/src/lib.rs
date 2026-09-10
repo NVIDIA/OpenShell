@@ -2913,7 +2913,7 @@ async fn fetch_sandbox_draft_counts(
                 let req = openshell_core::proto::GetDraftPolicyRequest {
                     name,
                     status_filter: "pending".to_string(),
-                    workspace,
+                    workspace_scope: Some(named_workspace_scope(workspace)),
                 };
                 let count = match tokio::time::timeout(
                     Duration::from_secs(2),

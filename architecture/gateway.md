@@ -329,7 +329,7 @@ Compute-driver, credential-driver, gateway-interceptor, and
 supervisor-middleware services are compiled contracts for internal extension
 boundaries, not public gateway RPCs. The current public inventory has 74
 methods, 278 messages, and 12 enums
-(`c95ae90962c10fb28747db2b645adf4044562a3d208d84dfe4699d677e4364ee`).
+(`0f14943574349d02bdc61076c8c5a59a98b627325564ef1a6d21d7941825dc46`).
 
 Storage-only messages live in the private, versioned
 `openshell.storage.v1` package under `crates/openshell-server/proto`. The server

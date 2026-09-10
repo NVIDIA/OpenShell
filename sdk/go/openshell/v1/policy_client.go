@@ -135,8 +135,8 @@ func (p *policyClient) List(ctx context.Context, workspace string, opts ...ListP
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "page size must not be negative"}
 	}
 	req := &pb.ListSandboxPoliciesRequest{
-		PageSize:  cfg.PageSize(),
-		Global:    cfg.Global(),
+		PageSize: cfg.PageSize(),
+		Global:   cfg.Global(),
 	}
 	if !cfg.Global() {
 		req.WorkspaceScope = namedWorkspaceScope(workspace)

@@ -274,7 +274,7 @@ func TestServiceListAll_SelectsAllWorkspaces(t *testing.T) {
 	client, cleanup := setupServiceTest(t, mock)
 	defer cleanup()
 
-	endpoints, err := client.ListAll(context.Background(), ListOptions{Limit: 10})
+	endpoints, err := client.ListAll(context.Background(), ListOptions{PageSize: 10})
 
 	require.NoError(t, err)
 	assert.Empty(t, endpoints)

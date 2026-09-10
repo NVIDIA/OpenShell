@@ -7374,7 +7374,7 @@ mod tests {
                 page_size: 1,
                 page_token: first.next_page_token,
                 global: true,
-                workspace: "different".to_string(),
+                name: "different".to_string(),
                 ..Default::default()
             }),
         )
