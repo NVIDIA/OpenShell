@@ -437,6 +437,23 @@ func TestSandboxList_Empty(t *testing.T) {
 	assert.Empty(t, result)
 }
 
+func TestSandboxListAll_SelectsAllWorkspaces(t *testing.T) {
+	mock := newMockSandboxServer()
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	sandboxes, err := client.ListAll(context.Background(), "", ListOptions{
+		PageSize:      10,
+		AllWorkspaces: true,
+	})
+
+	require.NoError(t, err)
+	assert.Empty(t, sandboxes)
+	require.Len(t, mock.listRequests, 1)
+	assert.Equal(t, int32(10), mock.listRequests[0].GetPageSize())
+	assert.NotNil(t, mock.listRequests[0].GetWorkspaceScope().GetAllWorkspaces())
+}
+
 func TestSandboxList_WithOptions(t *testing.T) {
 	mock := newMockSandboxServer()
 	mock.sandboxes["sb1"] = &pb.Sandbox{

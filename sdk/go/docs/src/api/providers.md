@@ -61,7 +61,9 @@ providers, err = client.Providers().ListAll(ctx, "default", v1.ListOptions{
 })
 
 // Platform Admin only: list across all workspaces
-allProviders, err := client.Providers().ListAll(ctx)
+allProviders, err := client.Providers().ListAll(ctx, "", v1.ListOptions{
+    AllWorkspaces: true,
+})
 ```
 
 ## Update

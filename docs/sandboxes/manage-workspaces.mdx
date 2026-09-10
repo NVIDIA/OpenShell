@@ -181,8 +181,9 @@ explicit:
 | `global: true` | Omit `workspace_scope` |
 
 The Rust and Python SDKs expose separate all-workspaces list methods. The Go
-SDK uses `ListAll`, and the TypeScript SDK uses a discriminated option type, so
-a caller cannot select a named workspace and all workspaces in one typed call.
+SDK passes `AllWorkspaces: true` in `ListOptions` to `ListAll`, and the
+TypeScript SDK uses a discriminated option type, so a caller cannot select a
+named workspace and all workspaces in one typed call.
 The TUI starts in the `default` workspace and sends that named selector
 explicitly. Its all-workspaces view sends the marker instead.
 

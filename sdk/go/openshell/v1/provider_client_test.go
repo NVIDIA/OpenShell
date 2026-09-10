@@ -22,6 +22,7 @@ import (
 type mockProviderServer struct {
 	pb.UnimplementedOpenShellServer
 	providers map[string]*dm.Provider
+	lastList  *pb.ListProvidersRequest
 	createErr error
 	getErr    error
 	listErr   error
@@ -57,7 +58,8 @@ func (s *mockProviderServer) GetProvider(_ context.Context, req *pb.GetProviderR
 	return &pb.ProviderResponse{Provider: p}, nil
 }
 
-func (s *mockProviderServer) ListProviders(_ context.Context, _ *pb.ListProvidersRequest) (*pb.ListProvidersResponse, error) {
+func (s *mockProviderServer) ListProviders(_ context.Context, req *pb.ListProvidersRequest) (*pb.ListProvidersResponse, error) {
+	s.lastList = req
 	if s.listErr != nil {
 		return nil, s.listErr
 	}
@@ -204,6 +206,23 @@ func TestProviderList_Empty(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotNil(t, result)
 	assert.Empty(t, result)
+}
+
+func TestProviderListAll_SelectsAllWorkspaces(t *testing.T) {
+	mock := newMockProviderServer()
+	client, cleanup := setupProviderTest(t, mock)
+	defer cleanup()
+
+	providers, err := client.ListAll(context.Background(), "", ListOptions{
+		PageSize:      10,
+		AllWorkspaces: true,
+	})
+
+	require.NoError(t, err)
+	assert.Empty(t, providers)
+	require.NotNil(t, mock.lastList)
+	assert.Equal(t, int32(10), mock.lastList.GetPageSize())
+	assert.NotNil(t, mock.lastList.GetWorkspaceScope().GetAllWorkspaces())
 }
 
 func TestProviderUpdate(t *testing.T) {

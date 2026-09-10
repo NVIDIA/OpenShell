@@ -33,7 +33,9 @@ for _, svc := range services {
 }
 
 // Platform Admin only: list services across all workspaces
-allServices, err := client.Services().ListAll(ctx)
+allServices, err := client.Services().ListAll(ctx, "", "", v1.ListOptions{
+    AllWorkspaces: true,
+})
 ```
 
 ## Delete

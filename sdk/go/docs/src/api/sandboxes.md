@@ -75,7 +75,9 @@ sandboxes, err := client.Sandboxes().ListAll(ctx, "default", v1.ListOptions{
 })
 
 // Platform Admin only: list across all workspaces
-allSandboxes, err := client.Sandboxes().ListAll(ctx)
+allSandboxes, err := client.Sandboxes().ListAll(ctx, "", v1.ListOptions{
+    AllWorkspaces: true,
+})
 ```
 
 ## Delete
