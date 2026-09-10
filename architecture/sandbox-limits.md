@@ -73,7 +73,7 @@ Middleware also validates every non-body envelope component. Important examples
 include 64 KiB service config, 4 KiB request context, 32 KiB target data, 128
 request headers totaling 64 KiB, 64 header mutations, 32 findings per stage,
 and 64 metadata entries. The detailed external contract lives in
-[Supervisor Middleware](../docs/extensibility/supervisor-middleware.mdx).
+[Supervisor Middleware](../docs/extensibility/supervisor-middleware/index.mdx).
 
 The work semaphore bounds aggregate buffered middleware input to approximately
 `32 × 4 MiB`, plus bounded envelope and parser overhead. It is a concurrency

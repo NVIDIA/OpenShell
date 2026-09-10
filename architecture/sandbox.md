@@ -240,7 +240,7 @@ against body-aware L7 policy before later stages or the upstream can observe
 them. Requests, results, chain length, execution time, and diagnostics are
 bounded; external free-form diagnostic text is not exposed in responses or
 security logs. See
-[Supervisor Middleware](../docs/extensibility/supervisor-middleware.mdx) for
+[Supervisor Middleware](../docs/extensibility/supervisor-middleware/index.mdx) for
 configuration and protocol details.
 
 `https://inference.local` is special. It bypasses OPA network policy and is

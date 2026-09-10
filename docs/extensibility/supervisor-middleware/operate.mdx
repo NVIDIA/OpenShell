@@ -1,0 +1,67 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Operate Supervisor Middleware"
+sidebar-title: "Operate Middleware"
+description: "Run and observe operator middleware services and understand shared platform limits."
+keywords: "Supervisor Middleware, Operations, OCSF, Logging, Service Lifecycle"
+position: 5
+---
+
+Operator-run middleware sits on the request path. Plan service availability, gateway restarts, sandbox configuration reloads, and alerting around the failure behavior in each policy attachment.
+
+## Start and update services
+
+- Start registered services before the gateway. The gateway validates every registration during startup.
+- Keep service endpoints reachable from the gateway and sandbox supervisors. Supervisors call services directly on the request path.
+- Restart the gateway after changing registrations.
+- Keep required services available before creating or updating policies. The gateway validates implementation-owned configuration before persisting a policy.
+- Treat `fail_open` as an explicit choice to favor availability over enforcement.
+
+When a sandbox's effective configuration changes, its running supervisor validates the new service registry before installing it. If validation fails, the supervisor keeps the last-known-good registry and emits a configuration failure event.
+
+## Observe middleware
+
+OpenShell emits middleware activity through OCSF logging:
+
+- Each invocation records the policy-local configuration name, attached middleware name, decision, transformation state, and failure state.
+- A denied invocation records a platform-owned reason built from the policy-local name and optional validated reason code. It does not record free-form reason text from the service.
+- A bypass under `fail_open` emits a detection finding.
+- A required stage that fails closed emits a high-severity detection finding.
+- An HTTP-only host match on a WebSocket session emits an informational `binding_not_selected` coverage event.
+- A binary message encountered by an active WebSocket stage emits an informational `unsupported_message_type` event with message type, sequence, and byte count. It is not an invocation or failure.
+- Registry reload success and failure emit configuration state changes.
+
+Built-in findings include their type, label, and aggregate count. Operator-run findings use the registration name, a platform label, and the aggregate count. OpenShell does not log service-provided finding text or diagnostic metadata.
+
+A stage can return at most 32 findings. A 10-stage chain can retain and emit up to 320 findings. Exceeding the per-stage cap makes the response invalid and applies `on_error`.
+
+See [Logging](/observability/logging) for log access and [OCSF JSON Export](/observability/ocsf-json-export) for structured export.
+
+## Size gRPC messages
+
+The 4 MiB platform payload maximum does not include the rest of the protobuf envelope. OpenShell also bounds:
+
+| Component | Limit |
+| --- | --- |
+| Service configuration | 64 KiB. |
+| Request context | 4 KiB. |
+| Target | 32 KiB. |
+| Request headers | 128 lines and 64 KiB encoded. |
+| Discarded free-form reason | 4 KiB. |
+| Validated reason code | 64 bytes. |
+| Header mutations | 64 operations and 64 KiB encoded. |
+| Findings | 32 entries of at most 4 KiB encoded each. |
+| Metadata | 64 entries and 32 KiB total. |
+
+Configure middleware gRPC servers to accept at least 4 MiB plus 293 KiB for requests and responses so they can process every platform-valid envelope.
+
+## Security and deployment limits
+
+- A `fail_closed` selector cannot cover a `tls: skip` endpoint because OpenShell cannot inspect that traffic. An all-`fail_open` match may cover it; OpenShell bypasses middleware and emits a detection finding.
+- Operator-run services use TLS `https://` when gateway JWT signing is enabled unless their registration sets `allow_insecure_transport`. Certificates must chain to the configured custom CA or platform roots, and the hostname must match.
+- Extension and sandbox admission tokens use the same signing key. Audience and `typ` separate them, but the extension credential path cannot rotate or revoke independently.
+- OpenShell does not track or revoke `jti`. Bearer tokens can be replayed until expiry unless the service adds proof of possession or request binding.
+- mTLS client authentication, health checks, runtime registration, and overlapping signing-key rotation are not available.
+
+Protocol-specific runtime limits are documented in [HTTP requests](/extensibility/supervisor-middleware/http#payload-and-capacity-limits) and [WebSocket sessions](/extensibility/supervisor-middleware/websocket#payload-assembly-and-capacity-limits).
