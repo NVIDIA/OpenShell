@@ -26,7 +26,7 @@ The compute driver provisions the workload and trusted components. The logical s
 Boundary construction is embedded in the supervisor, so moving it anywhere else means changing the supervisor. That placement creates three problems:
 
 - A compromise reaches the boundary-building privilege in the same container.
-- Building the boundary inside the agent container requires capabilities that conflict with restricted deployments. Delegating construction removes that requirement but does not guarantee Pod Security Standards compliance. See [codebase-grounding.md](./codebase-grounding.md) and #899 for background.
+- Building the boundary inside the agent container requires capabilities that conflict with restricted deployments. Delegating construction removes that requirement but does not guarantee Pod Security Standards compliance. See #899 for background.
 - Each new placement adds another branch to the supervisor.
 
 All three come from coupling boundary construction to boundary operation. A common interface lets deployments move privilege without changing the supervisor.
@@ -184,7 +184,7 @@ trait ReadyBoundary: Send {
 trait RunningBoundary: Send + Sync {
     fn agent(&self) -> Arc<dyn BoundaryProcess>;
     fn exec(&self) -> Arc<dyn BoundaryExec>;
-    fn port_forward(&self) -> Arc<dyn BoundaryPortForward>;
+    fn loopback_connector(&self) -> Arc<dyn BoundaryLoopbackConnector>;
 }
 ```
 
@@ -232,7 +232,7 @@ struct ExecSession {                              // owned; outlives the exec ca
 }
 
 #[async_trait]
-trait BoundaryPortForward: Send + Sync {
+trait BoundaryLoopbackConnector: Send + Sync {
     async fn connect(&self, target: LoopbackTarget) -> Result<BoundaryDuplexStream, BackendError>;
 }
 
@@ -242,7 +242,7 @@ trait BoundaryTerminal: Send + Sync {
 }
 ```
 
-`ExecSpec` carries command, arguments, environment, working directory, and PTY settings. Streams are owned, non-PTY stdout and stderr remain separate, and PTYs support resize. Port forwarding accepts only validated loopback targets. Exit status and signals are explicit and placement-neutral; a local PID is never the process handle. These operations carry the existing agent, SSH, exec, and forwarding paths behind the contract, and all of them are mandatory conformance.
+`ExecSpec` carries command, arguments, environment, working directory, and PTY settings. Streams are owned, non-PTY stdout and stderr remain separate, and PTYs support resize. The loopback connector accepts only validated loopback targets and supports both port forwarding and service exposure. Exit status and signals are explicit and placement-neutral; a local PID is never the process handle. These operations carry the existing agent, SSH, exec, and forwarding paths behind the contract, and all of them are mandatory conformance.
 
 `BoundaryProcess::wait` returns one stable exit status or `Terminated` error while the backend retains process-exit observation.
 
@@ -318,7 +318,7 @@ Failures resolve as follows:
 
 - an `attach` or `confirm` failure, or network-mediation initialization failure while `Bound`, prevents untrusted workload execution and causes the driver to reclaim the topology;
 - if `start_agent` does not return `Running`, no untrusted process from that attempt remains, and the driver reclaims the topology;
-- if `exec` or port-forward `connect` fails, the backend terminates any process or closes any connection created by that attempt while the boundary otherwise remains active;
+- if `exec` or loopback `connect` fails, the backend terminates any process or closes any connection created by that attempt while the boundary otherwise remains active;
 - after `Running`, supervisor or enforcement loss follows invariant 6; when enforcement loss ends the agent, `BoundaryProcess::wait` fails with `BackendErrorKind::Terminated` where process-exit observation survives;
 - network-mediation errors yield no authorized connection and do not by themselves end `Running`; and
 - retained runtime handles and the network-mediation source reject new operations whenever the boundary ends, except `BoundaryProcess::wait` where the backend can still return its stable result.
@@ -329,15 +329,11 @@ Whenever a boundary ends, the backend terminates remaining workload processes an
 
 The contract fixes the roles; a topology fixes their placement. Components may be co-located with the workload or hosted in trusted services, and one component may implement multiple roles. Every arrangement preserves the same lifecycle, interfaces, and invariants. Actual containment depends on the workload's kernel relationship to the trusted components. The non-normative [topology matrix](./topology-matrix.md) catalogs representative placements.
 
-## Implementation plan
+## Conformance
 
-This RFC defines the contract; implementation lands in three phases:
+Every admitted backend and topology must pass tests for the six contract invariants plus descriptor verification, lifecycle ordering, runtime operations, and failure semantics.
 
-1. **Contract.** Add the common types, descriptor handling, registry, and explicit backend selection from deployment configuration.
-2. **Co-located backend.** Implement the co-located backend behind a deployment flag and route agent launch, egress interception, the network-mediation source, SSH, `exec`, and forwarding through it without changing behavior.
-3. **Conformance and enablement.** Require every admitted backend and topology to pass tests for the six contract invariants plus descriptor verification, lifecycle ordering, runtime operations, and failure semantics. Make the co-located backend the default after parity validation. Parity covers the agent, binary identity, SSH, `exec`, and forwarding paths; enablement also closes the in-pod egress gaps pinned in [codebase-grounding.md](./codebase-grounding.md), which parity alone would preserve.
-
-Delegated backends remain separate design and implementation work.
+The conformance suite exercises each backend in its deployed topology, including delegated components and their transport. It verifies observable contract behavior while transport details remain backend-private.
 
 ## Risks
 
@@ -385,10 +381,3 @@ That would make known deployments explicit, but it would also encode current top
 ## Open questions
 
 None.
-
-## Appendix: codebase grounding
-
-The claims this RFC makes about the current system, and the current-system
-context behind its design, are verified with file:line references in the
-supporting file [codebase-grounding.md](./codebase-grounding.md)
-(against upstream commit `905b554c`, after proxy egress pipeline consolidation).
