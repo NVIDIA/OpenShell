@@ -185,6 +185,13 @@ socket_path = "/tmp/{variant}.sock"
     (results_dir / f"{variant}.exec.stdout").write_bytes(
         b"openshell-conformance-fixture\n"
     )
+    write_json(
+        results_dir / f"{variant}.conformance.json",
+        {
+            "scenarios": [{"name": "smoke", "passed": True, "diagnostic": None}],
+            "passed": True,
+        },
+    )
     (results_dir / f"{variant}.driver.log").write_text(
         "external driver fixture started\n", encoding="utf-8"
     )
@@ -204,6 +211,63 @@ def create_external_bundle(verifier: ModuleType, results_dir: Path) -> None:
             "classification": "pass",
         },
     )
+
+
+def test_single_scenario_verifier_accepts_bound_supplied_artifacts(
+    tmp_path: Path,
+) -> None:
+    verifier = load_verifier()
+    create_external_bundle(verifier, tmp_path)
+    (tmp_path / "comparison.json").unlink()
+    for variant in ("baseline", "candidate"):
+        result_path = tmp_path / f"{variant}.json"
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        for field in (
+            "gateway_origin",
+            "cli_origin",
+            "conformance_origin",
+            "external_driver_origin",
+            "supervisor_origin",
+        ):
+            result[field] = "supplied_override"
+        write_json(result_path, result)
+
+    report = verifier.verify_topology(
+        tmp_path,
+        BASELINE_SHA,
+        CANDIDATE_SHA,
+        "external-driver",
+        verify_comparison=False,
+        require_built_artifacts=False,
+    )
+
+    assert report["comparison_sha256"] is None
+    assert report["baseline"]["raw_output_verified"] is True
+    assert report["candidate"]["artifacts_verified"] is True
+    assert report["candidate"]["conformance_report_verified"] is True
+
+
+def test_single_scenario_verifier_rejects_failed_conformance_report(
+    tmp_path: Path,
+) -> None:
+    verifier = load_verifier()
+    create_external_bundle(verifier, tmp_path)
+    report_path = tmp_path / "candidate.conformance.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["scenarios"][0]["passed"] = False
+    report["scenarios"][0]["diagnostic"] = "fixture failure"
+    report["passed"] = False
+    write_json(report_path, report)
+
+    with pytest.raises(ValueError, match="conformance report did not pass"):
+        verifier.verify_topology(
+            tmp_path,
+            BASELINE_SHA,
+            CANDIDATE_SHA,
+            "external-driver",
+            verify_comparison=False,
+            require_built_artifacts=False,
+        )
 
 
 def test_verifier_recomputes_retained_artifact_hashes(tmp_path: Path) -> None:

@@ -112,23 +112,149 @@ expected_base="docker.io/library/alpine@sha256:$(printf '%064d' 0)"
 [ "${OPENSHELL_E2E_SUPERVISOR_BASE_RUNTIME_IMAGE:-}" = "${expected_base}" ] || exit 27
 printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$OPENSHELL_PARITY_VARIANT" "$OPENSHELL_E2E_CONFIG_SCHEMA_VERSION" "$OPENSHELL_GATEWAY_BIN" "$OPENSHELL_BIN" "$OPENSHELL_CONFORMANCE_BIN" "$MISE_TRUSTED_CONFIG_PATHS" "${OPENSHELL_E2E_PODMAN_OPTION_PROFILE:-}" "${OPENSHELL_PARITY_ORACLE_RESULT:-}" "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-}" "${OPENSHELL_EXTERNAL_DRIVER_BIN:-}" "${OPENSHELL_E2E_SUPERVISOR_BIN:-}" >>"$OPENSHELL_PARITY_TEST_CALLS"
 mkdir -p "$XDG_DATA_HOME/containers/storage"
-case "${OPENSHELL_E2E_CONFIG_SCHEMA_VERSION}" in
-  1) pull_policy=missing ;;
-  2) pull_policy=if_not_present ;;
-esac
-transport=in_tree
-external=false
-if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = 1 ]; then
-  transport=remote_uds
-  external=true
-fi
-runtime_image="localhost/openshell/supervisor@sha256:$(printf '%064d' 0)"
-printf '{"schema_version":%s,"external_compute_driver":%s,"compute_driver_transport":"%s","external_driver_pull_policy":"%s","supervisor_image":"%s","supervisor_image_id":"%064d","supervisor_image_digest":"sha256:%064d","supervisor_runtime_image":"%s"}\n' \
-  "${OPENSHELL_E2E_CONFIG_SCHEMA_VERSION}" "${external}" "${transport}" "${pull_policy}" \
-  "${OPENSHELL_SUPERVISOR_IMAGE}" 0 0 "${runtime_image}" \
-  >"${OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE}"
 printf 'fixture-package-1.0-r0\n' >"${OPENSHELL_PARITY_SUPERVISOR_PACKAGE_CAPTURE}"
-printf 'fixture exec stdout\n' >"${OPENSHELL_PARITY_EXEC_STDOUT_CAPTURE}"
+package_hash="$(sha256sum "${OPENSHELL_PARITY_SUPERVISOR_PACKAGE_CAPTURE}" | cut -d' ' -f1)"
+OPENSHELL_PARITY_FIXTURE_PACKAGE_HASH="${package_hash}" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+variant = os.environ["OPENSHELL_PARITY_VARIANT"]
+schema = int(os.environ["OPENSHELL_E2E_CONFIG_SCHEMA_VERSION"])
+external = os.environ.get("OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER") == "1"
+zero = "0" * 64
+image_digest = f"sha256:{zero}"
+sandbox_runtime = f"ghcr.io/nvidia/openshell-community/sandboxes/base@{image_digest}"
+supervisor_runtime = f"localhost/openshell/supervisor@{image_digest}"
+base_runtime = f"docker.io/library/alpine@{image_digest}"
+pull_policy = "missing" if schema == 1 else "if_not_present"
+gateway_port = 18181
+callback = f"https://host.containers.internal:{gateway_port}"
+driver_socket = f"/tmp/{variant}-driver.sock"
+podman_socket = f"/tmp/{variant}-podman.sock"
+network = f"{variant}-network"
+
+selector = (
+    'compute_drivers = ["podman"]'
+    if schema == 1
+    else 'compute_driver = "podman"'
+)
+config_lines = [
+    "[openshell]",
+    f"version = {schema}",
+    "[openshell.gateway]",
+    selector,
+    "[openshell.drivers.podman]",
+    f'socket_path = "{driver_socket}"',
+]
+if not external:
+    config_lines.extend(
+        [
+            f'network_name = "{network}"',
+            f'default_image = "{sandbox_runtime}"',
+            f'image_pull_policy = "{pull_policy}"',
+            f'supervisor_image = "{supervisor_runtime}"',
+        ]
+    )
+Path(os.environ["OPENSHELL_PARITY_GATEWAY_CONFIG_CAPTURE"]).write_text(
+    "\n".join(config_lines) + "\n", encoding="utf-8"
+)
+
+launch = {
+    "schema_version": schema,
+    "gateway_port": gateway_port,
+    "external_compute_driver": external,
+    "compute_driver_transport": "remote_uds" if external else "in_tree",
+    "external_driver_pull_policy": pull_policy,
+    "supervisor_image": os.environ["OPENSHELL_SUPERVISOR_IMAGE"],
+    "supervisor_image_id": zero,
+    "supervisor_image_digest": image_digest,
+    "supervisor_runtime_image": supervisor_runtime,
+    "supervisor_base_image": "alpine:3.22",
+    "supervisor_base_image_id": zero,
+    "supervisor_base_image_digest": image_digest,
+    "supervisor_base_runtime_image": base_runtime,
+    "supervisor_package_manifest_sha256": os.environ[
+        "OPENSHELL_PARITY_FIXTURE_PACKAGE_HASH"
+    ],
+    "sandbox_image_request": sandbox_runtime,
+    "sandbox_image_id": zero,
+    "sandbox_image_digest": image_digest,
+    "sandbox_runtime_image": sandbox_runtime,
+    "sandbox_client_image_alias": "ghcr.io/nvidia/openshell-community/sandboxes/base:latest",
+    "sandbox_client_image_alias_id": zero,
+    "gateway_sha256_before_execution": os.environ[
+        "OPENSHELL_E2E_EXPECTED_GATEWAY_SHA256"
+    ],
+    "cli_sha256_before_execution": os.environ["OPENSHELL_E2E_EXPECTED_CLI_SHA256"],
+    "conformance_sha256_before_execution": os.environ[
+        "OPENSHELL_E2E_EXPECTED_CONFORMANCE_SHA256"
+    ],
+    "external_driver_sha256_before_execution": os.environ.get(
+        "OPENSHELL_E2E_EXPECTED_EXTERNAL_DRIVER_SHA256", ""
+    ),
+    "supervisor_sha256_before_execution": os.environ[
+        "OPENSHELL_E2E_EXPECTED_SUPERVISOR_SHA256"
+    ],
+    "supervisor_dockerfile_sha256_before_execution": os.environ[
+        "OPENSHELL_E2E_EXPECTED_SUPERVISOR_DOCKERFILE_SHA256"
+    ],
+    "cli_trace_wrapper_sha256_before_execution": os.environ[
+        "OPENSHELL_E2E_EXPECTED_CLI_TRACE_WRAPPER_SHA256"
+    ],
+}
+if external:
+    launch.update(
+        {
+            "external_driver_grpc_endpoint": callback,
+            "external_driver_host_gateway_ip": "host-gateway",
+            "external_driver_userns": None,
+            "external_driver_spiffe": False,
+            "external_driver_proxy": False,
+            "external_driver_app_armor": False,
+            "external_driver_environment": {
+                "OPENSHELL_COMPUTE_DRIVER_SOCKET": driver_socket,
+                "OPENSHELL_PODMAN_SOCKET": podman_socket,
+                "OPENSHELL_SANDBOX_IMAGE": sandbox_runtime,
+                "OPENSHELL_SANDBOX_IMAGE_PULL_POLICY": pull_policy,
+                "OPENSHELL_HEALTH_CHECK_INTERVAL_SECS": 10,
+                "OPENSHELL_GRPC_ENDPOINT": callback,
+                "OPENSHELL_GATEWAY_PORT": gateway_port,
+                "OPENSHELL_NETWORK_NAME": network,
+                "OPENSHELL_STOP_TIMEOUT": 15,
+                "OPENSHELL_SUPERVISOR_IMAGE": supervisor_runtime,
+                "OPENSHELL_PODMAN_TLS_CA": {
+                    "path": f"/tmp/{variant}-pki/ca.crt",
+                    "sha256": "8" * 64,
+                },
+                "OPENSHELL_PODMAN_TLS_CERT": {
+                    "path": f"/tmp/{variant}-pki/tls.crt",
+                    "sha256": "9" * 64,
+                },
+                "OPENSHELL_PODMAN_TLS_KEY": {
+                    "path": f"/tmp/{variant}-pki/tls.key",
+                    "sha256": "a" * 64,
+                },
+                "OPENSHELL_ENABLE_BIND_MOUNTS": True,
+            },
+        }
+    )
+Path(os.environ["OPENSHELL_PARITY_LAUNCH_MANIFEST_CAPTURE"]).write_text(
+    json.dumps(launch, separators=(",", ":")) + "\n", encoding="utf-8"
+)
+PY
+run_id="fixture${OPENSHELL_PARITY_VARIANT}"
+printf 'openshell-conformance-%s\n' "${run_id}" >"${OPENSHELL_PARITY_EXEC_STDOUT_CAPTURE}"
+printf 'CLI conformance run ID: %s\n' "${run_id}" >&2
+printf 'gateway preflight connected: gateway=fixture, authentication=authenticated\n' >&2
+for marker in status create get-ready list-visible/0 exec delete list-empty/query/0; do
+  printf '[run %s][smoke/%s] completed in 1ms: exit 0\n' "${run_id}" "${marker}" >&2
+done
+printf '%s %064d sha256:%064d %s %s %s %s\n' \
+  "${expected_sandbox}" 0 0 "${expected_base}" \
+  "localhost/openshell/supervisor@sha256:$(printf '%064d' 0)" \
+  "ghcr.io/nvidia/openshell-community/sandboxes/base:latest" \
+  "${package_hash}" >&2
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = 1 ]; then
   printf 'fixture external driver log\n' >"${OPENSHELL_PARITY_EXTERNAL_DRIVER_LOG_CAPTURE}"
 fi
@@ -176,7 +302,17 @@ set -euo pipefail
 if [ "${OPENSHELL_PARITY_FAIL_VARIANT:-}" = "${OPENSHELL_PARITY_VARIANT:-}" ] || [ "${OPENSHELL_PARITY_FAIL_VARIANT:-}" = both ]; then
   exit 17
 fi
-printf '{"untrusted":"raw output is intentionally not normalized"}\n'
+if [ "${OPENSHELL_PARITY_TEST_INVALID_REPORT:-0}" = 1 ]; then
+  # Prove the verifier parses retained stdout instead of accepting a success
+  # substring injected into unrelated raw stderr.
+  printf '%s\n' '"passed": true' >&2
+  printf '%s\n' '{"scenarios":[{"name":"smoke","passed":false,"diagnostic":"fixture failure"}],"passed":false}'
+else
+  printf '%s\n' '{'
+  printf '%s\n' '  "scenarios": [{"name":"smoke","passed":true,"diagnostic":null}],'
+  printf '%s\n' '  "passed": true'
+  printf '%s\n' '}'
+fi
 EOF
 for artifact in baseline-gateway baseline-cli candidate-gateway candidate-cli baseline-driver candidate-driver baseline-supervisor candidate-supervisor; do
   printf '#!/usr/bin/env bash\n# %s\nexit 0\n' "${artifact}" >"${WORKDIR}/bin/${artifact}"
@@ -189,6 +325,9 @@ source "${ROOT}/e2e/support/podman-gateway-config.sh"
 [ "$(e2e_podman_external_driver_pull_policy 2)" = if_not_present ] || fail 'schema v2 external pull policy mismatch'
 
 run_harness() {
+  if [ "${OPENSHELL_PARITY_TEST_KEEP_RESULTS_DIR:-0}" != 1 ]; then
+    rm -rf -- "${WORKDIR}/results"
+  fi
   OPENSHELL_PARITY_CAPABILITY_MANIFEST="${WORKDIR}/manifest.toml" \
   OPENSHELL_PARITY_BASELINE_WORKTREE="${ROOT}" \
   OPENSHELL_PARITY_PODMAN_WRAPPER="${WORKDIR}/bin/fake-wrapper" \
@@ -255,12 +394,24 @@ assert_contains "${WORKDIR}/results/candidate.json" '"schema_version":2'
 assert_contains "${WORKDIR}/results/candidate.json" "\"source_sha\":\"${HEAD_SHA}\""
 assert_contains "${WORKDIR}/results/candidate.json" '"success":true'
 assert_contains "${WORKDIR}/results/comparison.json" '"parity":true'
-assert_not_contains "${WORKDIR}/results/baseline.json" 'raw output'
-assert_contains "${WORKDIR}/results/baseline.log" 'raw output is intentionally not normalized'
+assert_contains "${WORKDIR}/results/semantic-verification.json" '"accepted": true'
+assert_not_contains "${WORKDIR}/results/baseline.json" '"scenarios"'
+assert_contains "${WORKDIR}/results/baseline.log" '"scenarios"'
+assert_contains "${WORKDIR}/results/baseline.conformance.json" '"passed":true'
 assert_contains "${WORKDIR}/podman-calls" 'pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest'
 assert_contains "${WORKDIR}/podman-calls" 'pull alpine:3.22'
 assert_contains "${WORKDIR}/podman-calls" 'unshare rm -rf -- '
 assert_contains "${WORKDIR}/podman-calls" 'openshell-parity-run.'
+
+set +e
+OPENSHELL_PARITY_TEST_INVALID_REPORT=1 run_harness >"${WORKDIR}/invalid-report.out" 2>&1
+status=$?
+set -e
+assert_status "${status}" 1
+assert_contains "${WORKDIR}/invalid-report.out" 'conformance report did not pass'
+assert_contains "${WORKDIR}/invalid-report.out" 'semantic verification failed for smoke'
+assert_contains "${WORKDIR}/results/comparison.json" '"classification":"regression"'
+assert_contains "${WORKDIR}/results/comparison.json" '"accepted":false'
 
 set +e
 OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE=untrusted.invalid/sandbox:latest \
@@ -292,6 +443,7 @@ assert_contains "${WORKDIR}/results/baseline.json" '"supervisor_sha256"'
 assert_contains "${WORKDIR}/results/baseline.json" '"supervisor_dockerfile_sha256"'
 assert_contains "${WORKDIR}/results/baseline.json" '"external_driver_sha256"'
 assert_contains "${WORKDIR}/results/comparison.json" '"classification":"pass"'
+assert_contains "${WORKDIR}/results/semantic-verification.json" '"scenario": "external-driver"'
 
 set +e
 OPENSHELL_PARITY_TEST_CANDIDATE_DRIVER_OVERRIDE="${WORKDIR}/bin/baseline-driver" \
@@ -319,8 +471,9 @@ assert_contains "${WORKDIR}/results/baseline.json" '"normalized_result":"baselin
 assert_contains "${WORKDIR}/results/baseline.normalized.json" '"stable":true'
 assert_contains "${WORKDIR}/results/baseline.normalized.json" '"pids_limit":2048'
 assert_contains "${WORKDIR}/results/candidate.normalized.json" '"pids_limit":31'
+assert_not_contains "${WORKDIR}/results/baseline.json" '"scenarios"'
+assert_contains "${WORKDIR}/results/baseline.log" '"scenarios"'
 assert_not_contains "${WORKDIR}/results/baseline.json" 'raw output'
-assert_contains "${WORKDIR}/results/baseline.log" 'raw output is intentionally not normalized'
 assert_contains "${WORKDIR}/results/comparison.json" '"scenario":"podman-options"'
 assert_contains "${WORKDIR}/results/comparison.json" '"parity":false'
 assert_contains "${WORKDIR}/results/comparison.json" '"classification":"intentional_change"'
@@ -335,7 +488,16 @@ assert_status "${status}" 1
 assert_contains "${WORKDIR}/results/comparison.json" '"classification":"regression"'
 assert_contains "${WORKDIR}/results/comparison.json" '"accepted":false'
 
-rm -f "${WORKDIR}/results/candidate.normalized.json"
+# Refuse an existing output path instead of consuming stale evidence from it.
+[ -s "${WORKDIR}/results/candidate.normalized.json" ] || fail 'stale result fixture is missing'
+set +e
+OPENSHELL_PARITY_TEST_KEEP_RESULTS_DIR=1 run_harness --scenario podman-options >"${WORKDIR}/stale-results.out" 2>&1
+status=$?
+set -e
+assert_status "${status}" 2
+assert_contains "${WORKDIR}/stale-results.out" 'parity results directory already exists'
+
+# A fresh run whose wrapper emits no candidate result must fail.
 set +e
 OPENSHELL_PARITY_TEST_SKIP_RESULT=candidate run_harness --scenario podman-options >"${WORKDIR}/missing-result.out" 2>&1
 status=$?
@@ -352,7 +514,7 @@ assert_status "${status}" 1
 assert_contains "${WORKDIR}/results/baseline.json" '"success":false'
 assert_contains "${WORKDIR}/results/candidate.json" '"success":false'
 assert_contains "${WORKDIR}/results/comparison.json" '"parity":false'
-[ "$(wc -l <"${WORKDIR}/calls")" -eq 12 ] || fail 'candidate did not run after baseline failure'
+[ "$(wc -l <"${WORKDIR}/calls")" -eq 14 ] || fail 'candidate did not run after baseline failure'
 
 set +e
 OPENSHELL_PARITY_TEST_MUTATE_ARTIFACT=candidate run_harness >"${WORKDIR}/mutation.out" 2>&1

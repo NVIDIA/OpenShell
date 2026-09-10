@@ -18,6 +18,8 @@ CANDIDATE_WORKTREE="${OPENSHELL_PARITY_CANDIDATE_WORKTREE:-${ROOT}}"
 RESULTS_DIR="${OPENSHELL_PARITY_RESULTS_DIR:-}"
 WRAPPER="${OPENSHELL_PARITY_PODMAN_WRAPPER:-${ROOT}/e2e/with-podman-gateway.sh}"
 PODMAN_OPTIONS_ORACLE="${OPENSHELL_PARITY_PODMAN_OPTIONS_ORACLE:-${ROOT}/e2e/parity/podman-options.sh}"
+CONFORMANCE_TRACE_WRAPPER="${ROOT}/e2e/parity/trace-conformance.sh"
+RESULTS_VERIFIER="${ROOT}/e2e/parity/verify-results.py"
 PODMAN_BIN="${OPENSHELL_PARITY_PODMAN_BIN:-podman}"
 DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 SANDBOX_IMAGE_REQUEST="${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}"
@@ -158,9 +160,19 @@ require_clean_source() {
 }
 
 RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/openshell-parity-run.XXXXXX")"
-RESULTS_DIR="${RESULTS_DIR:-${ROOT}/target/parity/results}"
-mkdir -p "${RESULTS_DIR}"
+if [ -n "${RESULTS_DIR}" ]; then
+  if [ -e "${RESULTS_DIR}" ] || [ -L "${RESULTS_DIR}" ]; then
+    echo "ERROR: parity results directory already exists; choose a fresh path: ${RESULTS_DIR}" >&2
+    exit 2
+  fi
+  mkdir -p "$(dirname "${RESULTS_DIR}")"
+  mkdir -m 0700 "${RESULTS_DIR}"
+else
+  mkdir -p "${ROOT}/target/parity"
+  RESULTS_DIR="$(mktemp -d "${ROOT}/target/parity/run.${SCENARIO}.XXXXXX")"
+fi
 RESULTS_DIR="$(cd "${RESULTS_DIR}" && pwd)"
+echo "Retaining parity evidence in ${RESULTS_DIR}"
 
 require_executable() {
   local label=$1
@@ -342,6 +354,10 @@ if [ "${SCENARIO}" = "podman-options" ] && [ ! -f "${PODMAN_OPTIONS_ORACLE}" ]; 
   echo "ERROR: Podman options oracle does not exist: ${PODMAN_OPTIONS_ORACLE}" >&2
   exit 2
 fi
+if [ "${SCENARIO}" != "podman-options" ] && [ ! -f "${CONFORMANCE_TRACE_WRAPPER}" ]; then
+  echo "ERROR: conformance trace wrapper does not exist: ${CONFORMANCE_TRACE_WRAPPER}" >&2
+  exit 2
+fi
 
 podman_in_resolver_store() {
   local resolver_home="${RUN_DIR}/sandbox-resolver"
@@ -449,23 +465,26 @@ EOF
 COMPARISON_ACCEPTED=false
 COMPARISON_CLASSIFICATION="regression"
 write_comparison() {
-  local baseline_status=$1 candidate_status=$2 parity=false intentional_change_id=null
+  local baseline_status=$1 candidate_status=$2 semantic_verified=$3
+  local parity=false intentional_change_id=null
   COMPARISON_ACCEPTED=false
   COMPARISON_CLASSIFICATION="regression"
 
   if [ "${baseline_status}" = true ] && [ "${candidate_status}" = true ]; then
-    if [ "${SCENARIO}" != "podman-options" ]; then
+    if [ "${SCENARIO}" != "podman-options" ] && [ "${semantic_verified}" = true ]; then
       parity=true
       COMPARISON_ACCEPTED=true
       COMPARISON_CLASSIFICATION="pass"
-    elif [ ! -s "${RESULTS_DIR}/baseline.normalized.json" ] \
-      || [ ! -s "${RESULTS_DIR}/candidate.normalized.json" ]; then
+    elif [ "${SCENARIO}" = "podman-options" ] \
+      && { [ ! -s "${RESULTS_DIR}/baseline.normalized.json" ] \
+        || [ ! -s "${RESULTS_DIR}/candidate.normalized.json" ]; }; then
       COMPARISON_CLASSIFICATION="regression"
-    elif cmp -s "${RESULTS_DIR}/baseline.normalized.json" "${RESULTS_DIR}/candidate.normalized.json"; then
+    elif [ "${SCENARIO}" = "podman-options" ] \
+      && cmp -s "${RESULTS_DIR}/baseline.normalized.json" "${RESULTS_DIR}/candidate.normalized.json"; then
       parity=true
       COMPARISON_ACCEPTED=true
       COMPARISON_CLASSIFICATION="pass"
-    else
+    elif [ "${SCENARIO}" = "podman-options" ]; then
       sed -E 's/"pids_limit":[0-9]+/"pids_limit":IGNORED/' "${RESULTS_DIR}/baseline.normalized.json" >"${RUN_DIR}/baseline.semantic"
       sed -E 's/"pids_limit":[0-9]+/"pids_limit":IGNORED/' "${RESULTS_DIR}/candidate.normalized.json" >"${RUN_DIR}/candidate.semantic"
       if grep -F '"pids_limit":2048' "${RESULTS_DIR}/baseline.normalized.json" >/dev/null \
@@ -504,7 +523,7 @@ run_variant() {
     option_profile="podman-options"
     command=(bash "${PODMAN_OPTIONS_ORACLE}")
   else
-    command=("${conformance}" run --openshell-bin "${cli_trace_wrapper}" --output json)
+    command=(bash "${CONFORMANCE_TRACE_WRAPPER}" run --openshell-bin "${cli_trace_wrapper}" --output json)
   fi
   verify_artifact_digest "${variant} gateway before execution" "${gateway}" "${gateway_digest}" || return 1
   verify_artifact_digest "${variant} CLI before execution" "${cli}" "${cli_digest}" || return 1
@@ -550,6 +569,8 @@ run_variant() {
     OPENSHELL_E2E_EXPECTED_SUPERVISOR_DOCKERFILE_SHA256="${supervisor_dockerfile_digest}" \
     OPENSHELL_E2E_EXPECTED_CLI_TRACE_WRAPPER_SHA256="${cli_trace_wrapper_digest}" \
     OPENSHELL_PARITY_REAL_CLI="${cli}" \
+    OPENSHELL_PARITY_REAL_CONFORMANCE="${conformance}" \
+    OPENSHELL_PARITY_CONFORMANCE_REPORT_CAPTURE="${RESULTS_DIR}/${variant}.conformance.json" \
     OPENSHELL_PARITY_EXEC_STDOUT_CAPTURE="${RESULTS_DIR}/${variant}.exec.stdout" \
     OPENSHELL_PARITY_EXTERNAL_DRIVER_LOG_CAPTURE="${RESULTS_DIR}/${variant}.driver.log" \
     OPENSHELL_SUPERVISOR_IMAGE="${supervisor_image}" \
@@ -590,6 +611,11 @@ run_variant() {
     echo "ERROR: ${variant} CLI trace wrapper did not retain exec stdout." >&2
     result_status=false
   fi
+  if [ "${SCENARIO}" != podman-options ] \
+     && [ ! -s "${RESULTS_DIR}/${variant}.conformance.json" ]; then
+    echo "ERROR: ${variant} conformance trace wrapper did not retain a report." >&2
+    result_status=false
+  fi
   if [ "${SCENARIO}" = external-driver ] && [ ! -s "${RESULTS_DIR}/${variant}.driver.log" ]; then
     echo "ERROR: ${variant} external driver log was not retained." >&2
     result_status=false
@@ -607,7 +633,24 @@ run_variant candidate "${CANDIDATE_SHA}" 2 "${CANDIDATE_GATEWAY}" "${CANDIDATE_C
 
 baseline_success=$([ "${baseline_exit}" -eq 0 ] && printf true || printf false)
 candidate_success=$([ "${candidate_exit}" -eq 0 ] && printf true || printf false)
-write_comparison "${baseline_success}" "${candidate_success}"
+semantic_verified=false
+if [ "${baseline_success}" = true ] && [ "${candidate_success}" = true ] \
+  && [ "${SCENARIO}" != podman-options ]; then
+  if [ ! -f "${RESULTS_VERIFIER}" ]; then
+    echo "ERROR: parity semantic verifier not found: ${RESULTS_VERIFIER}" >&2
+  elif python3 "${RESULTS_VERIFIER}" \
+    --baseline-sha "${BASELINE_SHA}" \
+    --candidate-sha "${CANDIDATE_SHA}" \
+    --scenario "${SCENARIO}" \
+    --results-dir "${RESULTS_DIR}" \
+    --output "${RESULTS_DIR}/semantic-verification.json" \
+    && [ -s "${RESULTS_DIR}/semantic-verification.json" ]; then
+    semantic_verified=true
+  else
+    echo "ERROR: semantic verification failed for ${SCENARIO}." >&2
+  fi
+fi
+write_comparison "${baseline_success}" "${candidate_success}" "${semantic_verified}"
 
 if [ "${COMPARISON_ACCEPTED}" != true ]; then
   echo "ERROR: schema parity comparison classified ${SCENARIO} as a regression." >&2

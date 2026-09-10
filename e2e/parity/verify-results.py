@@ -56,12 +56,33 @@ def require(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
+def verify_conformance_report(path: Path) -> None:
+    report = load_json(path)
+    require(report.get("passed") is True, f"{path}: conformance report did not pass")
+    scenarios = report.get("scenarios")
+    require(
+        isinstance(scenarios, list) and len(scenarios) == 1,
+        f"{path}: expected exactly one conformance scenario",
+    )
+    scenario = scenarios[0]
+    require(isinstance(scenario, dict), f"{path}: invalid conformance scenario")
+    require(scenario.get("name") == "smoke", f"{path}: smoke scenario is missing")
+    require(scenario.get("passed") is True, f"{path}: smoke scenario did not pass")
+    require(
+        scenario.get("diagnostic") is None,
+        f"{path}: successful smoke scenario retained a diagnostic",
+    )
+
+
 def verify_variant(
     results_dir: Path,
     variant: str,
     expected_sha: str,
     schema_version: int,
     scenario: str,
+    *,
+    require_built_artifacts: bool = True,
+    require_conformance_report: bool = False,
 ) -> dict[str, Any]:
     result_path = results_dir / f"{variant}.json"
     launch_path = results_dir / f"{variant}.launch.json"
@@ -98,29 +119,33 @@ def verify_variant(
         f"{result_path}: gateway feature profile mismatch",
     )
     require(result.get("success") is True, f"{result_path}: parity oracle did not pass")
-    require(
-        result.get("gateway_origin") == "built_by_harness",
-        f"{result_path}: gateway was not built by the harness",
+    accepted_origins = (
+        {"built_by_harness"}
+        if require_built_artifacts
+        else {"built_by_harness", "supplied_override"}
     )
-    require(
-        result.get("cli_origin") == "built_by_harness",
-        f"{result_path}: CLI was not built by the harness",
-    )
-    require(
-        result.get("conformance_origin") == "built_by_harness",
-        f"{result_path}: conformance runner was not built by the harness",
-    )
-    require(
-        result.get("supervisor_origin") == "built_by_harness",
-        f"{result_path}: supervisor was not built by the harness",
-    )
+    for field, label in (
+        ("gateway_origin", "gateway"),
+        ("cli_origin", "CLI"),
+        ("conformance_origin", "conformance runner"),
+        ("supervisor_origin", "supervisor"),
+    ):
+        require(
+            result.get(field) in accepted_origins,
+            f"{result_path}: invalid {label} artifact origin",
+        )
 
     external = scenario == "external-driver"
-    expected_driver_origin = "built_by_harness" if external else "not_applicable"
-    require(
-        result.get("external_driver_origin") == expected_driver_origin,
-        f"{result_path}: external driver origin mismatch",
-    )
+    if external:
+        require(
+            result.get("external_driver_origin") in accepted_origins,
+            f"{result_path}: invalid external driver artifact origin",
+        )
+    else:
+        require(
+            result.get("external_driver_origin") == "not_applicable",
+            f"{result_path}: external driver origin mismatch",
+        )
     require(
         launch.get("schema_version") == schema_version,
         f"{launch_path}: schema mismatch",
@@ -473,6 +498,12 @@ def verify_variant(
         f"{log_path}: launch provenance is absent from raw output",
     )
 
+    conformance_report_verified = False
+    conformance_report_path = results_dir / f"{variant}.conformance.json"
+    if require_conformance_report:
+        verify_conformance_report(conformance_report_path)
+        conformance_report_verified = True
+
     raw_evidence_hashes = {
         result_path.name: sha256(result_path),
         launch_path.name: sha256(launch_path),
@@ -480,6 +511,10 @@ def verify_variant(
         config_path.name: sha256(config_path),
         exec_stdout_path.name: sha256(exec_stdout_path),
     }
+    if require_conformance_report:
+        raw_evidence_hashes[conformance_report_path.name] = sha256(
+            conformance_report_path
+        )
     if external:
         driver_log_path = results_dir / f"{variant}.driver.log"
         require(
@@ -488,7 +523,7 @@ def verify_variant(
         )
         raw_evidence_hashes[driver_log_path.name] = sha256(driver_log_path)
 
-    return {
+    verified = {
         "schema_version": schema_version,
         "source_sha": expected_sha,
         "gateway_profile": result["gateway_profile"],
@@ -507,6 +542,9 @@ def verify_variant(
         "raw_output_verified": True,
         "success": True,
     }
+    if conformance_report_verified:
+        verified["conformance_report_verified"] = True
+    return verified
 
 
 def verify_topology(
@@ -514,23 +552,45 @@ def verify_topology(
     baseline_sha: str,
     candidate_sha: str,
     scenario: str,
+    *,
+    verify_comparison: bool = True,
+    require_built_artifacts: bool = True,
 ) -> dict[str, Any]:
     comparison_path = results_dir / "comparison.json"
-    comparison = load_json(comparison_path)
-    require(
-        comparison.get("scenario") == scenario, f"{comparison_path}: scenario mismatch"
-    )
-    for field in ("baseline_success", "candidate_success", "parity", "accepted"):
+    if verify_comparison:
+        comparison = load_json(comparison_path)
         require(
-            comparison.get(field) is True, f"{comparison_path}: {field} is not true"
+            comparison.get("scenario") == scenario,
+            f"{comparison_path}: scenario mismatch",
         )
-    require(
-        comparison.get("classification") == "pass",
-        f"{comparison_path}: classification is not pass",
-    )
+        for field in ("baseline_success", "candidate_success", "parity", "accepted"):
+            require(
+                comparison.get(field) is True,
+                f"{comparison_path}: {field} is not true",
+            )
+        require(
+            comparison.get("classification") == "pass",
+            f"{comparison_path}: classification is not pass",
+        )
 
-    baseline = verify_variant(results_dir, "baseline", baseline_sha, 1, scenario)
-    candidate = verify_variant(results_dir, "candidate", candidate_sha, 2, scenario)
+    baseline = verify_variant(
+        results_dir,
+        "baseline",
+        baseline_sha,
+        1,
+        scenario,
+        require_built_artifacts=require_built_artifacts,
+        require_conformance_report=not verify_comparison,
+    )
+    candidate = verify_variant(
+        results_dir,
+        "candidate",
+        candidate_sha,
+        2,
+        scenario,
+        require_built_artifacts=require_built_artifacts,
+        require_conformance_report=not verify_comparison,
+    )
     baseline_launch = baseline["launch_attestation"]
     candidate_launch = candidate["launch_attestation"]
     for field, label in (
@@ -586,7 +646,7 @@ def verify_topology(
     return {
         "baseline": baseline,
         "candidate": candidate,
-        "comparison_sha256": sha256(comparison_path),
+        "comparison_sha256": sha256(comparison_path) if verify_comparison else None,
         "classification": "pass",
         "parity": True,
         "accepted": True,
@@ -647,8 +707,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline-sha", required=True)
     parser.add_argument("--candidate-sha", required=True)
-    parser.add_argument("--in-tree", required=True, type=Path)
-    parser.add_argument("--external-uds", required=True, type=Path)
+    parser.add_argument("--in-tree", type=Path)
+    parser.add_argument("--external-uds", type=Path)
+    parser.add_argument("--scenario", choices=("smoke", "external-driver"))
+    parser.add_argument("--results-dir", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     return parser.parse_args()
 
@@ -664,6 +726,41 @@ def main() -> None:
         "invalid candidate SHA",
     )
 
+    scenario_mode = args.scenario is not None or args.results_dir is not None
+    if scenario_mode:
+        require(
+            args.scenario is not None and args.results_dir is not None,
+            "--scenario and --results-dir must be provided together",
+        )
+        require(
+            args.in_tree is None and args.external_uds is None,
+            "single-scenario verification cannot use --in-tree or --external-uds",
+        )
+        topology = verify_topology(
+            args.results_dir,
+            args.baseline_sha,
+            args.candidate_sha,
+            args.scenario,
+            verify_comparison=False,
+            require_built_artifacts=False,
+        )
+        report = {
+            "manifest_version": 1,
+            "baseline_commit": args.baseline_sha,
+            "candidate_commit": args.candidate_sha,
+            "scenario": args.scenario,
+            "topology": topology,
+            "classification": "pass",
+            "accepted": True,
+        }
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        return
+
+    require(
+        args.in_tree is not None and args.external_uds is not None,
+        "--in-tree and --external-uds are required for four-run verification",
+    )
     in_tree = verify_topology(
         args.in_tree, args.baseline_sha, args.candidate_sha, "smoke"
     )
