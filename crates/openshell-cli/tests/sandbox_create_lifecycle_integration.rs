@@ -6,19 +6,23 @@
 mod helpers;
 
 use helpers::{EnvVarGuard, build_ca, build_client_cert, build_server_cert};
-use openshell_bootstrap::load_last_sandbox;
+use openshell_bootstrap::oidc_token::OidcTokenBundle;
+use openshell_bootstrap::{GatewayMetadata, load_last_sandbox};
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_core::proto::{
-    AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateProviderRequest,
-    CreateSandboxRequest, CreateSandboxTemplateRequest, CreateSshSessionRequest,
-    CreateSshSessionResponse, DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest,
-    DeleteSandboxResponse, DeleteSandboxTemplateRequest, DetachSandboxProviderRequest,
-    DetachSandboxProviderResponse, ExchangeProviderSubjectTokenRequest,
-    ExchangeProviderSubjectTokenResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
-    GatewayMessage, GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderRequest,
-    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
+    AttachSandboxProviderRequest, AttachSandboxProviderResponse, AuthorizeDelegatedIdentityRequest,
+    AuthorizeDelegatedIdentityResponse, CreateProviderRequest, CreateSandboxRequest,
+    CreateSandboxTemplateRequest, CreateSshSessionRequest, CreateSshSessionResponse,
+    DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
+    DeleteSandboxTemplateRequest, DetachSandboxProviderRequest, DetachSandboxProviderResponse,
+    ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
+    ExecSandboxInput, ExecSandboxRequest, GatewayMessage,
+    GetDelegatedIdentityAuthorizationStatusRequest,
+    GetDelegatedIdentityAuthorizationStatusResponse, GetGatewayConfigRequest,
+    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GetSandboxTemplateRequest,
     GpuResourceRequirements, HealthRequest, HealthResponse, ListProvidersRequest,
     ListProvidersResponse, ListSandboxProvidersRequest, ListSandboxProvidersResponse,
@@ -42,6 +46,8 @@ use tokio::sync::{Mutex, Notify, mpsc};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate as TlsCertificate, Identity, Server, ServerTlsConfig};
 use tonic::{Response, Status};
+use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[derive(Clone, Default)]
 struct SandboxState {
@@ -65,11 +71,24 @@ struct SandboxState {
     template_get_requests: Arc<Mutex<Vec<GetSandboxTemplateRequest>>>,
     template_list_requests: Arc<Mutex<Vec<ListSandboxTemplatesRequest>>>,
     template_delete_requests: Arc<Mutex<Vec<DeleteSandboxTemplateRequest>>>,
+    delegated_authorization_usable: Arc<AtomicBool>,
+    delegated_status_bearers: Arc<Mutex<Vec<String>>>,
+    delegated_authorize_bearers: Arc<Mutex<Vec<String>>>,
+    delegated_authorize_requests: Arc<Mutex<Vec<AuthorizeDelegatedIdentityRequest>>>,
+    create_bearers: Arc<Mutex<Vec<String>>>,
 }
 
 #[derive(Clone, Default)]
 struct TestOpenShell {
     state: SandboxState,
+}
+
+fn authorization_header(metadata: &tonic::metadata::MetadataMap) -> String {
+    metadata
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
 }
 
 #[tonic::async_trait]
@@ -123,6 +142,11 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
+        self.state
+            .create_bearers
+            .lock()
+            .await
+            .push(authorization_header(request.metadata()));
         let request = request.into_inner();
         let name = request.name.clone();
         self.state.create_requests.lock().await.push(request);
@@ -162,6 +186,115 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::StartSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_delegated_identity_authorization_status(
+        &self,
+        request: tonic::Request<GetDelegatedIdentityAuthorizationStatusRequest>,
+    ) -> Result<Response<GetDelegatedIdentityAuthorizationStatusResponse>, Status> {
+        self.state
+            .delegated_status_bearers
+            .lock()
+            .await
+            .push(authorization_header(request.metadata()));
+        let usable = self
+            .state
+            .delegated_authorization_usable
+            .load(Ordering::SeqCst);
+        Ok(Response::new(
+            GetDelegatedIdentityAuthorizationStatusResponse {
+                usable,
+                reauthorization_required: !usable,
+                reason: if usable {
+                    String::new()
+                } else {
+                    "delegated identity authorization is missing".to_string()
+                },
+                credential: None,
+                now_ms: 1,
+            },
+        ))
+    }
+
+    async fn authorize_delegated_identity(
+        &self,
+        request: tonic::Request<AuthorizeDelegatedIdentityRequest>,
+    ) -> Result<Response<AuthorizeDelegatedIdentityResponse>, Status> {
+        self.state
+            .delegated_authorize_bearers
+            .lock()
+            .await
+            .push(authorization_header(request.metadata()));
+        self.state
+            .delegated_authorize_requests
+            .lock()
+            .await
+            .push(request.into_inner());
+        self.state
+            .delegated_authorization_usable
+            .store(true, Ordering::SeqCst);
+        Ok(Response::new(AuthorizeDelegatedIdentityResponse {
+            credential: None,
+            now_ms: 1,
+        }))
+    }
+
+    async fn get_sandbox_delegated_identity_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxDelegatedIdentityStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxDelegatedIdentityStatusResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn withdraw_sandbox_delegated_identity(
+        &self,
+        _request: tonic::Request<openshell_core::proto::WithdrawSandboxDelegatedIdentityRequest>,
+    ) -> Result<Response<openshell_core::proto::WithdrawSandboxDelegatedIdentityResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn extend_sandbox_delegated_identity(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ExtendSandboxDelegatedIdentityRequest>,
+    ) -> Result<Response<openshell_core::proto::ExtendSandboxDelegatedIdentityResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_delegated_identity_credentials(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListDelegatedIdentityCredentialsRequest>,
+    ) -> Result<Response<openshell_core::proto::ListDelegatedIdentityCredentialsResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_delegated_identity_credential_status(
+        &self,
+        _request: tonic::Request<
+            openshell_core::proto::GetDelegatedIdentityCredentialStatusRequest,
+        >,
+    ) -> Result<Response<openshell_core::proto::GetDelegatedIdentityCredentialStatusResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn revoke_delegated_identity_credential(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RevokeDelegatedIdentityCredentialRequest>,
+    ) -> Result<Response<openshell_core::proto::RevokeDelegatedIdentityCredentialResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_delegated_identity_credential(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteDelegatedIdentityCredentialRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteDelegatedIdentityCredentialResponse>, Status>
+    {
         Err(Status::unimplemented("unused"))
     }
 
@@ -433,9 +566,26 @@ impl OpenShell for TestOpenShell {
 
     async fn get_provider(
         &self,
-        _request: tonic::Request<GetProviderRequest>,
+        request: tonic::Request<GetProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
-        Err(Status::not_found("provider not found"))
+        let request = request.into_inner();
+        let provider = self
+            .state
+            .providers
+            .lock()
+            .await
+            .iter()
+            .find(|provider| {
+                provider
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.name == request.name)
+            })
+            .cloned()
+            .ok_or_else(|| Status::not_found("provider not found"))?;
+        Ok(Response::new(ProviderResponse {
+            provider: Some(provider),
+        }))
     }
 
     async fn list_providers(
@@ -1052,6 +1202,12 @@ fn install_fake_ssh(dir: &TempDir) -> std::path::PathBuf {
     install_executable_script(dir, "ssh", "#!/bin/sh\nexit 0\n")
 }
 
+fn install_fake_browser(dir: &TempDir) {
+    let script = "#!/bin/sh\nset -eu\nprintf '%s' \"$1\" > \"$OPENSHELL_TEST_BROWSER_URL_FILE\"\n";
+    install_executable_script(dir, "xdg-open", script);
+    install_executable_script(dir, "open", script);
+}
+
 fn install_fake_pgrep_no_match(dir: &TempDir) -> std::path::PathBuf {
     install_executable_script(dir, "pgrep", "#!/bin/sh\nexit 1\n")
 }
@@ -1433,6 +1589,218 @@ fn test_config() -> run::SandboxCreateConfig<'static> {
         auto_providers_override: Some(false),
         ..Default::default()
     }
+}
+
+#[tokio::test]
+async fn sandbox_create_transfers_a_separate_browser_grant_without_replacing_cli_login() {
+    let oidc = MockServer::start().await;
+    let issuer = oidc.uri();
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token")
+        })))
+        .expect(1)
+        .mount(&oidc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=authorization_code"))
+        .and(body_string_contains("code=delegated-code"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "delegated-access-B",
+            "refresh_token": "delegated-refresh-B",
+            "token_type": "Bearer",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&oidc)
+        .await;
+
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let browser_url_path = xdg_dir.path().join("browser-url");
+    let _env = test_env_with(
+        &fake_ssh_dir,
+        &xdg_dir,
+        &[(
+            "OPENSHELL_TEST_BROWSER_URL_FILE",
+            browser_url_path.display().to_string(),
+        )],
+    );
+    install_fake_ssh(&fake_ssh_dir);
+    install_fake_browser(&fake_ssh_dir);
+    openshell_bootstrap::store_gateway_metadata(
+        "openshell",
+        &GatewayMetadata {
+            name: "openshell".to_string(),
+            gateway_endpoint: server.endpoint.clone(),
+            auth_mode: Some("oidc".to_string()),
+            oidc_issuer: Some(issuer.clone()),
+            oidc_client_id: Some("openshell-cli".to_string()),
+            oidc_audience: Some("openshell-api".to_string()),
+            oidc_scopes: Some("openid sandbox:write platform:admin".to_string()),
+            ..GatewayMetadata::default()
+        },
+    )
+    .unwrap();
+    let cli_login = OidcTokenBundle {
+        access_token: "cli-access-A".to_string(),
+        refresh_token: Some("cli-refresh-A".to_string()),
+        expires_at: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600,
+        ),
+        issuer: issuer.clone(),
+        client_id: "openshell-cli".to_string(),
+    };
+    openshell_bootstrap::oidc_token::store_oidc_token("openshell", &cli_login).unwrap();
+    let refreshed_cli_login = OidcTokenBundle {
+        access_token: "cli-access-A2".to_string(),
+        refresh_token: Some("cli-refresh-A2".to_string()),
+        ..cli_login.clone()
+    };
+    let status_state = server.openshell.state.clone();
+    let refreshed_cli_login_for_update = refreshed_cli_login.clone();
+    let normal_login_update = tokio::spawn(async move {
+        loop {
+            if !status_state
+                .delegated_status_bearers
+                .lock()
+                .await
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        openshell_bootstrap::oidc_token::store_oidc_token(
+            "openshell",
+            &refreshed_cli_login_for_update,
+        )
+        .expect("simulate a concurrent normal CLI token refresh");
+    });
+    let browser_callback = tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let browser_url = loop {
+            if let Ok(value) = fs::read_to_string(&browser_url_path)
+                && !value.is_empty()
+            {
+                break value;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for delegated browser authorization URL"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let authorization_url = url::Url::parse(&browser_url).expect("browser authorization URL");
+        assert_eq!(authorization_url.path(), "/authorize");
+        let query = authorization_url
+            .query_pairs()
+            .into_owned()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            query.get("client_id").map(String::as_str),
+            Some("openshell-cli")
+        );
+        assert_eq!(
+            query.get("scope").map(String::as_str),
+            Some("openid offline_access")
+        );
+        assert_eq!(
+            query.get("audience").map(String::as_str),
+            Some("openshell-api")
+        );
+        assert!(!query.contains_key("prompt"));
+
+        let redirect_uri = query.get("redirect_uri").expect("redirect URI");
+        let state = query.get("state").expect("authorization state");
+        let mut callback_url = url::Url::parse(redirect_uri).expect("callback URL");
+        callback_url
+            .query_pairs_mut()
+            .append_pair("code", "delegated-code")
+            .append_pair("state", state);
+        let response = reqwest::get(callback_url)
+            .await
+            .expect("send browser authorization callback");
+        assert!(response.status().is_success());
+    });
+
+    let mut config = test_config();
+    config.name = Some("delegated-sandbox");
+    config.detach = true;
+    config.delegate_identity_for = Some("5m");
+    let exit_code = run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        config,
+        "default",
+        &test_tls(&server),
+    )
+    .await
+    .expect("sandbox create with delegated identity");
+    normal_login_update.await.expect("normal login update task");
+    browser_callback.await.expect("browser callback task");
+    assert_eq!(exit_code, 0);
+
+    let stored_login = openshell_bootstrap::oidc_token::load_oidc_token("openshell")
+        .expect("normal CLI login remains stored");
+    assert_eq!(stored_login.access_token, refreshed_cli_login.access_token);
+    assert_eq!(
+        stored_login.refresh_token,
+        refreshed_cli_login.refresh_token
+    );
+    assert_eq!(stored_login.issuer, refreshed_cli_login.issuer);
+    assert_eq!(stored_login.client_id, refreshed_cli_login.client_id);
+
+    let authorize_requests = server
+        .openshell
+        .state
+        .delegated_authorize_requests
+        .lock()
+        .await;
+    assert_eq!(authorize_requests.len(), 1);
+    let grant = authorize_requests[0]
+        .grant
+        .as_ref()
+        .expect("transferred delegated grant");
+    assert_eq!(grant.access_token, "delegated-access-B");
+    assert_eq!(grant.refresh_token, "delegated-refresh-B");
+    assert_eq!(grant.scopes, "openid offline_access");
+    assert_eq!(grant.audience, "openshell-api");
+    drop(authorize_requests);
+
+    assert_eq!(
+        *server.openshell.state.delegated_status_bearers.lock().await,
+        vec!["Bearer cli-access-A".to_string()]
+    );
+    assert_eq!(
+        *server
+            .openshell
+            .state
+            .delegated_authorize_bearers
+            .lock()
+            .await,
+        vec!["Bearer cli-access-A2".to_string()]
+    );
+    assert_eq!(
+        *server.openshell.state.create_bearers.lock().await,
+        vec!["Bearer cli-access-A2".to_string()]
+    );
+
+    let requests = create_requests(&server).await;
+    let delegated = requests[0]
+        .delegated_identity
+        .as_ref()
+        .expect("lifecycle window");
+    assert!(delegated.delegated_until_ms > 0);
 }
 
 #[tokio::test]
@@ -2872,7 +3240,7 @@ fn write_oidc_test_credentials(
     let gateway_dir = xdg_dir.path().join("openshell/gateways/openshell");
     fs::write(
         gateway_dir.join("metadata.json"),
-        serde_json::to_vec_pretty(&openshell_bootstrap::GatewayMetadata {
+        serde_json::to_vec_pretty(&GatewayMetadata {
             name: "openshell".to_string(),
             gateway_endpoint: server.endpoint.clone(),
             auth_mode: Some("oidc".to_string()),
@@ -2885,7 +3253,7 @@ fn write_oidc_test_credentials(
     .unwrap();
     fs::write(
         gateway_dir.join("oidc_token.json"),
-        serde_json::to_vec_pretty(&openshell_bootstrap::oidc_token::OidcTokenBundle {
+        serde_json::to_vec_pretty(&OidcTokenBundle {
             access_token: "cached-access-token".to_string(),
             refresh_token: Some("inactive-refresh-token".to_string()),
             expires_at: Some(expires_at),

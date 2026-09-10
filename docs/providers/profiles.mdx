@@ -517,7 +517,18 @@ openshell provider create \
   --runtime-credentials
 ```
 
-For `token_exchange` profiles, the provider also stores the user subject token referenced by `token_grant.subject_token.credential`. That credential is gateway-only: the sandbox does not receive it as environment material, static credential binding metadata, or workload placeholder ownership. Create or update that provider credential from the current gateway OIDC login with `--from-oidc-token`. This requires an active named gateway that was registered for OIDC. The CLI copies the current OIDC access token and its expiry into the provider. If the stored gateway access token is expired and a refresh token is available, the CLI refreshes it first. OpenShell does not store the OIDC refresh token in the provider. When the stored subject-token credential expires, the gateway rejects intermediate token exchange until the provider is updated with a fresh token.
+For `token_exchange` profiles, choose the subject token source explicitly.
+Use `source: provider_credential` when the provider record should hold a subject
+credential named by `token_grant.subject_token.credential`. That credential is
+gateway-only: the sandbox does not receive it as environment material, static
+credential binding metadata, or workload placeholder ownership. Create or update
+that provider credential from the current gateway OIDC login with `--from-oidc-token`.
+This requires an active named gateway that was registered for OIDC. The CLI
+copies the current OIDC access token and its expiry into the provider. If the
+stored gateway access token is expired and a refresh token is available, the CLI
+refreshes it first. OpenShell does not store the OIDC refresh token in the
+provider. When the stored subject-token credential expires, the gateway rejects
+intermediate token exchange until the provider is updated with a fresh token.
 
 ```shell
 openshell provider create \
@@ -531,6 +542,87 @@ openshell provider update custom-api \
 
 OpenShell infers the destination credential when the provider profile has exactly one `token_grant.subject_token.credential`. If a profile declares more than one token-exchange subject credential, pass `--credential <key>` to choose one.
 
+Use `source: sandbox_delegated_identity` when the subject token should be the
+creating user's delegated OIDC identity. Create the provider with
+`--runtime-credentials`, then create sandboxes with an explicit authorization
+window:
+
+```shell
+openshell provider create \
+  --name protected-services \
+  --type protected-services-profile \
+  --runtime-credentials
+
+openshell sandbox create \
+  --provider protected-services \
+  --use-my-identity-for=8h
+```
+
+Delegation must be enabled when the sandbox is created. A sandbox created
+without `--use-my-identity-for` cannot add delegated identity later, although
+the original delegator can extend or withdraw an existing delegation:
+
+```shell
+openshell sandbox delegated-identity status my-sandbox
+openshell sandbox delegated-identity extend my-sandbox --for=24h
+openshell sandbox delegated-identity withdraw my-sandbox
+```
+
+The status command reports `active`, `withdrawn`, `expired`, `revoked`, or
+`credential-missing`. `revoked` means the sandbox delegation window still
+exists, but the gateway-scoped delegated credential no longer authorizes token
+exchange.
+
+The first create or extend that needs delegated identity checks whether the
+authenticated user already has a usable gateway-owned authorization. If not,
+the CLI starts another Authorization Code flow with PKCE, opens the browser, and
+requests only `openid` and `offline_access`. The identity provider may reuse the
+existing browser SSO session. This authorization is separate from
+`openshell gateway login`: the CLI transfers its access and refresh tokens to
+the gateway without writing them to the local `oidc_token.json`, and the normal
+CLI login remains the bearer for every gateway RPC. Later sandboxes reuse the
+gateway-owned authorization without another prompt while it remains usable.
+
+Configure the gateway OIDC client to allow the Authorization Code flow, the
+CLI's loopback callback URI, and refresh tokens for `offline_access`. The IdP
+must create a distinct grant and refresh-token chain for the second browser
+authorization; rotating or single-use refresh tokens are supported. If the IdP
+returns the normal CLI login's refresh token again, OpenShell rejects the
+transfer to prevent two independent owners from rotating the same token. An IdP
+may bind offline access to its login session, so ending that session can still
+invalidate the delegated grant.
+
+If refresh fails because the delegated grant is revoked or no longer active,
+retry `openshell sandbox create --use-my-identity-for=...` or
+`openshell sandbox delegated-identity extend ... --for=...`. The status
+preflight starts a new browser authorization and replaces the unusable
+gateway-owned credential. Running `openshell gateway logout` or
+`openshell gateway login` changes only the normal CLI login and does not repair
+or revoke the delegated grant.
+
+Platform admins can inspect and revoke the gateway-scoped delegated credential
+records:
+
+```shell
+openshell delegated-credential list
+openshell delegated-credential status <credential-id>
+openshell delegated-credential revoke <credential-id>
+openshell delegated-credential delete <credential-id>
+```
+
+Withdrawing a sandbox delegation or revoking its gateway credential stops new
+gateway exchanges immediately. A token already cached by the sandbox
+supervisor can continue to be injected for no more than five minutes. Stop or
+delete the sandbox when containment cannot wait for that cache window. You can
+also revoke the upstream IdP grant, but an already issued access token remains
+usable until its resource server rejects it or it expires unless that system
+enforces immediate revocation.
+
+These controls have different scopes: local gateway logout removes only the
+CLI-owned login, sandbox withdrawal ends one sandbox's delegation window,
+gateway credential revocation disables all sandboxes that reference that user's
+gateway-owned grant, and IdP revocation invalidates the upstream OAuth grant.
+
 Token grant fields:
 
 | Field | Required | Behavior |
@@ -541,9 +633,9 @@ Token grant fields:
 | `jwt_svid_audience` | No | Audience used when requesting the JWT-SVID. When omitted, OpenShell derives an issuer-style audience from Keycloak token endpoint paths or falls back to the full token endpoint URL. |
 | `client_assertion_type` | No | OAuth2 `client_assertion_type` form value. Defaults to RFC 7523 `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`. Set `urn:ietf:params:oauth:client-assertion-type:jwt-spiffe` when the token issuer expects the SPIFFE assertion type. |
 | `scopes` | No | OAuth2 scopes sent as a space-separated `scope` parameter. |
-| `cache_ttl_seconds` | No | Token cache TTL override. When omitted or `0`, OpenShell uses the token response `expires_in` with a 30-second safety margin and one-hour cap, or five minutes minus the margin if the response does not include an expiry. |
+| `cache_ttl_seconds` | No | Token cache TTL override. When omitted or `0`, OpenShell uses the token response `expires_in` with a 30-second safety margin and one-hour cap, or five minutes minus the margin if the response does not include an expiry. For `token_exchange`, OpenShell caps every cache entry at five minutes, including positive overrides; response-derived entries cache for at most four minutes and 30 seconds after the margin. `client_credentials` retains the general one-hour response cap and uncapped positive overrides. |
 | `requested_token_type` | No | RFC 8693 `requested_token_type` sent during token exchange. Defaults to `urn:ietf:params:oauth:token-type:access_token`. |
-| `subject_token` | Required for `token_exchange` | Subject-token source used for the gateway-brokered intermediate exchange. Phase one supports `source: provider_credential`, where `credential` names another credential declared in the same profile. That referenced credential is broker-only and cannot declare workload injection metadata such as env vars, static placement, refresh, or token grant metadata. |
+| `subject_token` | Required for `token_exchange` | Subject-token source used for the gateway-brokered intermediate exchange. Supports `source: provider_credential`, where `credential` names another credential declared in the same profile, and `source: sandbox_delegated_identity`, where the sandbox must have delegated OIDC identity enabled at create time. A provider-credential subject is broker-only and cannot declare workload injection metadata such as env vars, static placement, refresh, or token grant metadata. |
 | `subject_token.subject_token_type` | No | RFC 8693 `subject_token_type` for the stored subject token. Defaults to `urn:ietf:params:oauth:token-type:access_token`. |
 | `audience_overrides` | No | Endpoint-specific final-exchange `audience` and `scopes` overrides selected by host, port, and path. These overrides do not affect the gateway intermediate exchange. |
 

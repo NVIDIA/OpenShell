@@ -23,80 +23,89 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	OpenShell_Health_FullMethodName                        = "/openshell.v1.OpenShell/Health"
-	OpenShell_GetCurrentUser_FullMethodName                = "/openshell.v1.OpenShell/GetCurrentUser"
-	OpenShell_GetGatewayInfo_FullMethodName                = "/openshell.v1.OpenShell/GetGatewayInfo"
-	OpenShell_CreateSandbox_FullMethodName                 = "/openshell.v1.OpenShell/CreateSandbox"
-	OpenShell_BeginRootfsTarStaging_FullMethodName         = "/openshell.v1.OpenShell/BeginRootfsTarStaging"
-	OpenShell_GetSandbox_FullMethodName                    = "/openshell.v1.OpenShell/GetSandbox"
-	OpenShell_ListSandboxes_FullMethodName                 = "/openshell.v1.OpenShell/ListSandboxes"
-	OpenShell_CreateSandboxTemplate_FullMethodName         = "/openshell.v1.OpenShell/CreateSandboxTemplate"
-	OpenShell_GetSandboxTemplate_FullMethodName            = "/openshell.v1.OpenShell/GetSandboxTemplate"
-	OpenShell_ListSandboxTemplates_FullMethodName          = "/openshell.v1.OpenShell/ListSandboxTemplates"
-	OpenShell_DeleteSandboxTemplate_FullMethodName         = "/openshell.v1.OpenShell/DeleteSandboxTemplate"
-	OpenShell_ListSandboxProviders_FullMethodName          = "/openshell.v1.OpenShell/ListSandboxProviders"
-	OpenShell_AttachSandboxProvider_FullMethodName         = "/openshell.v1.OpenShell/AttachSandboxProvider"
-	OpenShell_DetachSandboxProvider_FullMethodName         = "/openshell.v1.OpenShell/DetachSandboxProvider"
-	OpenShell_DeleteSandbox_FullMethodName                 = "/openshell.v1.OpenShell/DeleteSandbox"
-	OpenShell_StopSandbox_FullMethodName                   = "/openshell.v1.OpenShell/StopSandbox"
-	OpenShell_StartSandbox_FullMethodName                  = "/openshell.v1.OpenShell/StartSandbox"
-	OpenShell_CreateSshSession_FullMethodName              = "/openshell.v1.OpenShell/CreateSshSession"
-	OpenShell_ExposeService_FullMethodName                 = "/openshell.v1.OpenShell/ExposeService"
-	OpenShell_GetService_FullMethodName                    = "/openshell.v1.OpenShell/GetService"
-	OpenShell_ListServices_FullMethodName                  = "/openshell.v1.OpenShell/ListServices"
-	OpenShell_DeleteService_FullMethodName                 = "/openshell.v1.OpenShell/DeleteService"
-	OpenShell_RevokeSshSession_FullMethodName              = "/openshell.v1.OpenShell/RevokeSshSession"
-	OpenShell_ExecSandbox_FullMethodName                   = "/openshell.v1.OpenShell/ExecSandbox"
-	OpenShell_ForwardTcp_FullMethodName                    = "/openshell.v1.OpenShell/ForwardTcp"
-	OpenShell_ExecSandboxInteractive_FullMethodName        = "/openshell.v1.OpenShell/ExecSandboxInteractive"
-	OpenShell_CreateProvider_FullMethodName                = "/openshell.v1.OpenShell/CreateProvider"
-	OpenShell_GetProvider_FullMethodName                   = "/openshell.v1.OpenShell/GetProvider"
-	OpenShell_ListProviders_FullMethodName                 = "/openshell.v1.OpenShell/ListProviders"
-	OpenShell_ListProviderProfiles_FullMethodName          = "/openshell.v1.OpenShell/ListProviderProfiles"
-	OpenShell_GetProviderProfile_FullMethodName            = "/openshell.v1.OpenShell/GetProviderProfile"
-	OpenShell_ImportProviderProfiles_FullMethodName        = "/openshell.v1.OpenShell/ImportProviderProfiles"
-	OpenShell_UpdateProviderProfiles_FullMethodName        = "/openshell.v1.OpenShell/UpdateProviderProfiles"
-	OpenShell_LintProviderProfiles_FullMethodName          = "/openshell.v1.OpenShell/LintProviderProfiles"
-	OpenShell_UpdateProvider_FullMethodName                = "/openshell.v1.OpenShell/UpdateProvider"
-	OpenShell_GetProviderRefreshStatus_FullMethodName      = "/openshell.v1.OpenShell/GetProviderRefreshStatus"
-	OpenShell_ConfigureProviderRefresh_FullMethodName      = "/openshell.v1.OpenShell/ConfigureProviderRefresh"
-	OpenShell_RotateProviderCredential_FullMethodName      = "/openshell.v1.OpenShell/RotateProviderCredential"
-	OpenShell_DeleteProviderRefresh_FullMethodName         = "/openshell.v1.OpenShell/DeleteProviderRefresh"
-	OpenShell_DeleteProvider_FullMethodName                = "/openshell.v1.OpenShell/DeleteProvider"
-	OpenShell_DeleteProviderProfile_FullMethodName         = "/openshell.v1.OpenShell/DeleteProviderProfile"
-	OpenShell_GetSandboxConfig_FullMethodName              = "/openshell.v1.OpenShell/GetSandboxConfig"
-	OpenShell_GetGatewayConfig_FullMethodName              = "/openshell.v1.OpenShell/GetGatewayConfig"
-	OpenShell_UpdateConfig_FullMethodName                  = "/openshell.v1.OpenShell/UpdateConfig"
-	OpenShell_GetSandboxPolicyStatus_FullMethodName        = "/openshell.v1.OpenShell/GetSandboxPolicyStatus"
-	OpenShell_ListSandboxPolicies_FullMethodName           = "/openshell.v1.OpenShell/ListSandboxPolicies"
-	OpenShell_ReportPolicyStatus_FullMethodName            = "/openshell.v1.OpenShell/ReportPolicyStatus"
-	OpenShell_GetSandboxProviderEnvironment_FullMethodName = "/openshell.v1.OpenShell/GetSandboxProviderEnvironment"
-	OpenShell_ExchangeProviderSubjectToken_FullMethodName  = "/openshell.v1.OpenShell/ExchangeProviderSubjectToken"
-	OpenShell_GetSandboxLogs_FullMethodName                = "/openshell.v1.OpenShell/GetSandboxLogs"
-	OpenShell_PushSandboxLogs_FullMethodName               = "/openshell.v1.OpenShell/PushSandboxLogs"
-	OpenShell_ConnectSupervisor_FullMethodName             = "/openshell.v1.OpenShell/ConnectSupervisor"
-	OpenShell_ReportMainProcessExit_FullMethodName         = "/openshell.v1.OpenShell/ReportMainProcessExit"
-	OpenShell_FinalizeMainProcessExit_FullMethodName       = "/openshell.v1.OpenShell/FinalizeMainProcessExit"
-	OpenShell_RelayStream_FullMethodName                   = "/openshell.v1.OpenShell/RelayStream"
-	OpenShell_WatchSandbox_FullMethodName                  = "/openshell.v1.OpenShell/WatchSandbox"
-	OpenShell_SubmitPolicyAnalysis_FullMethodName          = "/openshell.v1.OpenShell/SubmitPolicyAnalysis"
-	OpenShell_GetDraftPolicy_FullMethodName                = "/openshell.v1.OpenShell/GetDraftPolicy"
-	OpenShell_ApproveDraftChunk_FullMethodName             = "/openshell.v1.OpenShell/ApproveDraftChunk"
-	OpenShell_RejectDraftChunk_FullMethodName              = "/openshell.v1.OpenShell/RejectDraftChunk"
-	OpenShell_ApproveAllDraftChunks_FullMethodName         = "/openshell.v1.OpenShell/ApproveAllDraftChunks"
-	OpenShell_EditDraftChunk_FullMethodName                = "/openshell.v1.OpenShell/EditDraftChunk"
-	OpenShell_UndoDraftChunk_FullMethodName                = "/openshell.v1.OpenShell/UndoDraftChunk"
-	OpenShell_ClearDraftChunks_FullMethodName              = "/openshell.v1.OpenShell/ClearDraftChunks"
-	OpenShell_GetDraftHistory_FullMethodName               = "/openshell.v1.OpenShell/GetDraftHistory"
-	OpenShell_IssueSandboxToken_FullMethodName             = "/openshell.v1.OpenShell/IssueSandboxToken"
-	OpenShell_RefreshSandboxToken_FullMethodName           = "/openshell.v1.OpenShell/RefreshSandboxToken"
-	OpenShell_CreateWorkspace_FullMethodName               = "/openshell.v1.OpenShell/CreateWorkspace"
-	OpenShell_GetWorkspace_FullMethodName                  = "/openshell.v1.OpenShell/GetWorkspace"
-	OpenShell_ListWorkspaces_FullMethodName                = "/openshell.v1.OpenShell/ListWorkspaces"
-	OpenShell_DeleteWorkspace_FullMethodName               = "/openshell.v1.OpenShell/DeleteWorkspace"
-	OpenShell_AddWorkspaceMember_FullMethodName            = "/openshell.v1.OpenShell/AddWorkspaceMember"
-	OpenShell_RemoveWorkspaceMember_FullMethodName         = "/openshell.v1.OpenShell/RemoveWorkspaceMember"
-	OpenShell_ListWorkspaceMembers_FullMethodName          = "/openshell.v1.OpenShell/ListWorkspaceMembers"
+	OpenShell_Health_FullMethodName                                  = "/openshell.v1.OpenShell/Health"
+	OpenShell_GetCurrentUser_FullMethodName                          = "/openshell.v1.OpenShell/GetCurrentUser"
+	OpenShell_GetGatewayInfo_FullMethodName                          = "/openshell.v1.OpenShell/GetGatewayInfo"
+	OpenShell_CreateSandbox_FullMethodName                           = "/openshell.v1.OpenShell/CreateSandbox"
+	OpenShell_BeginRootfsTarStaging_FullMethodName                   = "/openshell.v1.OpenShell/BeginRootfsTarStaging"
+	OpenShell_GetDelegatedIdentityAuthorizationStatus_FullMethodName = "/openshell.v1.OpenShell/GetDelegatedIdentityAuthorizationStatus"
+	OpenShell_AuthorizeDelegatedIdentity_FullMethodName              = "/openshell.v1.OpenShell/AuthorizeDelegatedIdentity"
+	OpenShell_GetSandboxDelegatedIdentityStatus_FullMethodName       = "/openshell.v1.OpenShell/GetSandboxDelegatedIdentityStatus"
+	OpenShell_WithdrawSandboxDelegatedIdentity_FullMethodName        = "/openshell.v1.OpenShell/WithdrawSandboxDelegatedIdentity"
+	OpenShell_ExtendSandboxDelegatedIdentity_FullMethodName          = "/openshell.v1.OpenShell/ExtendSandboxDelegatedIdentity"
+	OpenShell_GetSandbox_FullMethodName                              = "/openshell.v1.OpenShell/GetSandbox"
+	OpenShell_ListSandboxes_FullMethodName                           = "/openshell.v1.OpenShell/ListSandboxes"
+	OpenShell_CreateSandboxTemplate_FullMethodName                   = "/openshell.v1.OpenShell/CreateSandboxTemplate"
+	OpenShell_GetSandboxTemplate_FullMethodName                      = "/openshell.v1.OpenShell/GetSandboxTemplate"
+	OpenShell_ListSandboxTemplates_FullMethodName                    = "/openshell.v1.OpenShell/ListSandboxTemplates"
+	OpenShell_DeleteSandboxTemplate_FullMethodName                   = "/openshell.v1.OpenShell/DeleteSandboxTemplate"
+	OpenShell_ListSandboxProviders_FullMethodName                    = "/openshell.v1.OpenShell/ListSandboxProviders"
+	OpenShell_AttachSandboxProvider_FullMethodName                   = "/openshell.v1.OpenShell/AttachSandboxProvider"
+	OpenShell_DetachSandboxProvider_FullMethodName                   = "/openshell.v1.OpenShell/DetachSandboxProvider"
+	OpenShell_DeleteSandbox_FullMethodName                           = "/openshell.v1.OpenShell/DeleteSandbox"
+	OpenShell_StopSandbox_FullMethodName                             = "/openshell.v1.OpenShell/StopSandbox"
+	OpenShell_StartSandbox_FullMethodName                            = "/openshell.v1.OpenShell/StartSandbox"
+	OpenShell_CreateSshSession_FullMethodName                        = "/openshell.v1.OpenShell/CreateSshSession"
+	OpenShell_ExposeService_FullMethodName                           = "/openshell.v1.OpenShell/ExposeService"
+	OpenShell_GetService_FullMethodName                              = "/openshell.v1.OpenShell/GetService"
+	OpenShell_ListServices_FullMethodName                            = "/openshell.v1.OpenShell/ListServices"
+	OpenShell_DeleteService_FullMethodName                           = "/openshell.v1.OpenShell/DeleteService"
+	OpenShell_RevokeSshSession_FullMethodName                        = "/openshell.v1.OpenShell/RevokeSshSession"
+	OpenShell_ExecSandbox_FullMethodName                             = "/openshell.v1.OpenShell/ExecSandbox"
+	OpenShell_ForwardTcp_FullMethodName                              = "/openshell.v1.OpenShell/ForwardTcp"
+	OpenShell_ExecSandboxInteractive_FullMethodName                  = "/openshell.v1.OpenShell/ExecSandboxInteractive"
+	OpenShell_CreateProvider_FullMethodName                          = "/openshell.v1.OpenShell/CreateProvider"
+	OpenShell_GetProvider_FullMethodName                             = "/openshell.v1.OpenShell/GetProvider"
+	OpenShell_ListProviders_FullMethodName                           = "/openshell.v1.OpenShell/ListProviders"
+	OpenShell_ListProviderProfiles_FullMethodName                    = "/openshell.v1.OpenShell/ListProviderProfiles"
+	OpenShell_GetProviderProfile_FullMethodName                      = "/openshell.v1.OpenShell/GetProviderProfile"
+	OpenShell_ImportProviderProfiles_FullMethodName                  = "/openshell.v1.OpenShell/ImportProviderProfiles"
+	OpenShell_UpdateProviderProfiles_FullMethodName                  = "/openshell.v1.OpenShell/UpdateProviderProfiles"
+	OpenShell_LintProviderProfiles_FullMethodName                    = "/openshell.v1.OpenShell/LintProviderProfiles"
+	OpenShell_UpdateProvider_FullMethodName                          = "/openshell.v1.OpenShell/UpdateProvider"
+	OpenShell_GetProviderRefreshStatus_FullMethodName                = "/openshell.v1.OpenShell/GetProviderRefreshStatus"
+	OpenShell_ConfigureProviderRefresh_FullMethodName                = "/openshell.v1.OpenShell/ConfigureProviderRefresh"
+	OpenShell_RotateProviderCredential_FullMethodName                = "/openshell.v1.OpenShell/RotateProviderCredential"
+	OpenShell_ListDelegatedIdentityCredentials_FullMethodName        = "/openshell.v1.OpenShell/ListDelegatedIdentityCredentials"
+	OpenShell_GetDelegatedIdentityCredentialStatus_FullMethodName    = "/openshell.v1.OpenShell/GetDelegatedIdentityCredentialStatus"
+	OpenShell_RevokeDelegatedIdentityCredential_FullMethodName       = "/openshell.v1.OpenShell/RevokeDelegatedIdentityCredential"
+	OpenShell_DeleteDelegatedIdentityCredential_FullMethodName       = "/openshell.v1.OpenShell/DeleteDelegatedIdentityCredential"
+	OpenShell_DeleteProviderRefresh_FullMethodName                   = "/openshell.v1.OpenShell/DeleteProviderRefresh"
+	OpenShell_DeleteProvider_FullMethodName                          = "/openshell.v1.OpenShell/DeleteProvider"
+	OpenShell_DeleteProviderProfile_FullMethodName                   = "/openshell.v1.OpenShell/DeleteProviderProfile"
+	OpenShell_GetSandboxConfig_FullMethodName                        = "/openshell.v1.OpenShell/GetSandboxConfig"
+	OpenShell_GetGatewayConfig_FullMethodName                        = "/openshell.v1.OpenShell/GetGatewayConfig"
+	OpenShell_UpdateConfig_FullMethodName                            = "/openshell.v1.OpenShell/UpdateConfig"
+	OpenShell_GetSandboxPolicyStatus_FullMethodName                  = "/openshell.v1.OpenShell/GetSandboxPolicyStatus"
+	OpenShell_ListSandboxPolicies_FullMethodName                     = "/openshell.v1.OpenShell/ListSandboxPolicies"
+	OpenShell_ReportPolicyStatus_FullMethodName                      = "/openshell.v1.OpenShell/ReportPolicyStatus"
+	OpenShell_GetSandboxProviderEnvironment_FullMethodName           = "/openshell.v1.OpenShell/GetSandboxProviderEnvironment"
+	OpenShell_ExchangeProviderSubjectToken_FullMethodName            = "/openshell.v1.OpenShell/ExchangeProviderSubjectToken"
+	OpenShell_GetSandboxLogs_FullMethodName                          = "/openshell.v1.OpenShell/GetSandboxLogs"
+	OpenShell_PushSandboxLogs_FullMethodName                         = "/openshell.v1.OpenShell/PushSandboxLogs"
+	OpenShell_ConnectSupervisor_FullMethodName                       = "/openshell.v1.OpenShell/ConnectSupervisor"
+	OpenShell_ReportMainProcessExit_FullMethodName                   = "/openshell.v1.OpenShell/ReportMainProcessExit"
+	OpenShell_FinalizeMainProcessExit_FullMethodName                 = "/openshell.v1.OpenShell/FinalizeMainProcessExit"
+	OpenShell_RelayStream_FullMethodName                             = "/openshell.v1.OpenShell/RelayStream"
+	OpenShell_WatchSandbox_FullMethodName                            = "/openshell.v1.OpenShell/WatchSandbox"
+	OpenShell_SubmitPolicyAnalysis_FullMethodName                    = "/openshell.v1.OpenShell/SubmitPolicyAnalysis"
+	OpenShell_GetDraftPolicy_FullMethodName                          = "/openshell.v1.OpenShell/GetDraftPolicy"
+	OpenShell_ApproveDraftChunk_FullMethodName                       = "/openshell.v1.OpenShell/ApproveDraftChunk"
+	OpenShell_RejectDraftChunk_FullMethodName                        = "/openshell.v1.OpenShell/RejectDraftChunk"
+	OpenShell_ApproveAllDraftChunks_FullMethodName                   = "/openshell.v1.OpenShell/ApproveAllDraftChunks"
+	OpenShell_EditDraftChunk_FullMethodName                          = "/openshell.v1.OpenShell/EditDraftChunk"
+	OpenShell_UndoDraftChunk_FullMethodName                          = "/openshell.v1.OpenShell/UndoDraftChunk"
+	OpenShell_ClearDraftChunks_FullMethodName                        = "/openshell.v1.OpenShell/ClearDraftChunks"
+	OpenShell_GetDraftHistory_FullMethodName                         = "/openshell.v1.OpenShell/GetDraftHistory"
+	OpenShell_IssueSandboxToken_FullMethodName                       = "/openshell.v1.OpenShell/IssueSandboxToken"
+	OpenShell_RefreshSandboxToken_FullMethodName                     = "/openshell.v1.OpenShell/RefreshSandboxToken"
+	OpenShell_CreateWorkspace_FullMethodName                         = "/openshell.v1.OpenShell/CreateWorkspace"
+	OpenShell_GetWorkspace_FullMethodName                            = "/openshell.v1.OpenShell/GetWorkspace"
+	OpenShell_ListWorkspaces_FullMethodName                          = "/openshell.v1.OpenShell/ListWorkspaces"
+	OpenShell_DeleteWorkspace_FullMethodName                         = "/openshell.v1.OpenShell/DeleteWorkspace"
+	OpenShell_AddWorkspaceMember_FullMethodName                      = "/openshell.v1.OpenShell/AddWorkspaceMember"
+	OpenShell_RemoveWorkspaceMember_FullMethodName                   = "/openshell.v1.OpenShell/RemoveWorkspaceMember"
+	OpenShell_ListWorkspaceMembers_FullMethodName                    = "/openshell.v1.OpenShell/ListWorkspaceMembers"
 )
 
 // OpenShellClient is the client API for OpenShell service.
@@ -129,6 +138,18 @@ type OpenShellClient interface {
 	// CreateSandbox; callers never name a filesystem path themselves. Only a
 	// client sharing the gateway's filesystem can complete the upload.
 	BeginRootfsTarStaging(ctx context.Context, in *BeginRootfsTarStagingRequest, opts ...grpc.CallOption) (*BeginRootfsTarStagingResponse, error)
+	// Inspect whether the authenticated user has a usable gateway-owned
+	// delegated identity authorization.
+	GetDelegatedIdentityAuthorizationStatus(ctx context.Context, in *GetDelegatedIdentityAuthorizationStatusRequest, opts ...grpc.CallOption) (*GetDelegatedIdentityAuthorizationStatusResponse, error)
+	// Transfer a separate OAuth authorization grant to the gateway for use as
+	// the authenticated user's delegated identity.
+	AuthorizeDelegatedIdentity(ctx context.Context, in *AuthorizeDelegatedIdentityRequest, opts ...grpc.CallOption) (*AuthorizeDelegatedIdentityResponse, error)
+	// Fetch delegated identity status for one sandbox.
+	GetSandboxDelegatedIdentityStatus(ctx context.Context, in *GetSandboxDelegatedIdentityStatusRequest, opts ...grpc.CallOption) (*GetSandboxDelegatedIdentityStatusResponse, error)
+	// Withdraw delegated identity from one sandbox.
+	WithdrawSandboxDelegatedIdentity(ctx context.Context, in *WithdrawSandboxDelegatedIdentityRequest, opts ...grpc.CallOption) (*WithdrawSandboxDelegatedIdentityResponse, error)
+	// Extend delegated identity for one sandbox.
+	ExtendSandboxDelegatedIdentity(ctx context.Context, in *ExtendSandboxDelegatedIdentityRequest, opts ...grpc.CallOption) (*ExtendSandboxDelegatedIdentityResponse, error)
 	// Fetch a sandbox by name.
 	GetSandbox(ctx context.Context, in *GetSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
 	// List sandboxes.
@@ -197,6 +218,14 @@ type OpenShellClient interface {
 	ConfigureProviderRefresh(ctx context.Context, in *ConfigureProviderRefreshRequest, opts ...grpc.CallOption) (*ConfigureProviderRefreshResponse, error)
 	// Record a gateway-owned refresh request for one provider credential.
 	RotateProviderCredential(ctx context.Context, in *RotateProviderCredentialRequest, opts ...grpc.CallOption) (*RotateProviderCredentialResponse, error)
+	// List delegated identity credentials visible to the caller.
+	ListDelegatedIdentityCredentials(ctx context.Context, in *ListDelegatedIdentityCredentialsRequest, opts ...grpc.CallOption) (*ListDelegatedIdentityCredentialsResponse, error)
+	// Fetch delegated identity credential status.
+	GetDelegatedIdentityCredentialStatus(ctx context.Context, in *GetDelegatedIdentityCredentialStatusRequest, opts ...grpc.CallOption) (*GetDelegatedIdentityCredentialStatusResponse, error)
+	// Revoke a delegated identity credential.
+	RevokeDelegatedIdentityCredential(ctx context.Context, in *RevokeDelegatedIdentityCredentialRequest, opts ...grpc.CallOption) (*RevokeDelegatedIdentityCredentialResponse, error)
+	// Delete a delegated identity credential.
+	DeleteDelegatedIdentityCredential(ctx context.Context, in *DeleteDelegatedIdentityCredentialRequest, opts ...grpc.CallOption) (*DeleteDelegatedIdentityCredentialResponse, error)
 	// Delete gateway-owned refresh configuration for one provider credential.
 	DeleteProviderRefresh(ctx context.Context, in *DeleteProviderRefreshRequest, opts ...grpc.CallOption) (*DeleteProviderRefreshResponse, error)
 	// Delete a provider by name.
@@ -360,6 +389,56 @@ func (c *openShellClient) BeginRootfsTarStaging(ctx context.Context, in *BeginRo
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(BeginRootfsTarStagingResponse)
 	err := c.cc.Invoke(ctx, OpenShell_BeginRootfsTarStaging_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) GetDelegatedIdentityAuthorizationStatus(ctx context.Context, in *GetDelegatedIdentityAuthorizationStatusRequest, opts ...grpc.CallOption) (*GetDelegatedIdentityAuthorizationStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetDelegatedIdentityAuthorizationStatusResponse)
+	err := c.cc.Invoke(ctx, OpenShell_GetDelegatedIdentityAuthorizationStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) AuthorizeDelegatedIdentity(ctx context.Context, in *AuthorizeDelegatedIdentityRequest, opts ...grpc.CallOption) (*AuthorizeDelegatedIdentityResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AuthorizeDelegatedIdentityResponse)
+	err := c.cc.Invoke(ctx, OpenShell_AuthorizeDelegatedIdentity_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) GetSandboxDelegatedIdentityStatus(ctx context.Context, in *GetSandboxDelegatedIdentityStatusRequest, opts ...grpc.CallOption) (*GetSandboxDelegatedIdentityStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSandboxDelegatedIdentityStatusResponse)
+	err := c.cc.Invoke(ctx, OpenShell_GetSandboxDelegatedIdentityStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) WithdrawSandboxDelegatedIdentity(ctx context.Context, in *WithdrawSandboxDelegatedIdentityRequest, opts ...grpc.CallOption) (*WithdrawSandboxDelegatedIdentityResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(WithdrawSandboxDelegatedIdentityResponse)
+	err := c.cc.Invoke(ctx, OpenShell_WithdrawSandboxDelegatedIdentity_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) ExtendSandboxDelegatedIdentity(ctx context.Context, in *ExtendSandboxDelegatedIdentityRequest, opts ...grpc.CallOption) (*ExtendSandboxDelegatedIdentityResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ExtendSandboxDelegatedIdentityResponse)
+	err := c.cc.Invoke(ctx, OpenShell_ExtendSandboxDelegatedIdentity_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -705,6 +784,46 @@ func (c *openShellClient) RotateProviderCredential(ctx context.Context, in *Rota
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RotateProviderCredentialResponse)
 	err := c.cc.Invoke(ctx, OpenShell_RotateProviderCredential_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) ListDelegatedIdentityCredentials(ctx context.Context, in *ListDelegatedIdentityCredentialsRequest, opts ...grpc.CallOption) (*ListDelegatedIdentityCredentialsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListDelegatedIdentityCredentialsResponse)
+	err := c.cc.Invoke(ctx, OpenShell_ListDelegatedIdentityCredentials_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) GetDelegatedIdentityCredentialStatus(ctx context.Context, in *GetDelegatedIdentityCredentialStatusRequest, opts ...grpc.CallOption) (*GetDelegatedIdentityCredentialStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetDelegatedIdentityCredentialStatusResponse)
+	err := c.cc.Invoke(ctx, OpenShell_GetDelegatedIdentityCredentialStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) RevokeDelegatedIdentityCredential(ctx context.Context, in *RevokeDelegatedIdentityCredentialRequest, opts ...grpc.CallOption) (*RevokeDelegatedIdentityCredentialResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RevokeDelegatedIdentityCredentialResponse)
+	err := c.cc.Invoke(ctx, OpenShell_RevokeDelegatedIdentityCredential_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) DeleteDelegatedIdentityCredential(ctx context.Context, in *DeleteDelegatedIdentityCredentialRequest, opts ...grpc.CallOption) (*DeleteDelegatedIdentityCredentialResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteDelegatedIdentityCredentialResponse)
+	err := c.cc.Invoke(ctx, OpenShell_DeleteDelegatedIdentityCredential_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1119,6 +1238,18 @@ type OpenShellServer interface {
 	// CreateSandbox; callers never name a filesystem path themselves. Only a
 	// client sharing the gateway's filesystem can complete the upload.
 	BeginRootfsTarStaging(context.Context, *BeginRootfsTarStagingRequest) (*BeginRootfsTarStagingResponse, error)
+	// Inspect whether the authenticated user has a usable gateway-owned
+	// delegated identity authorization.
+	GetDelegatedIdentityAuthorizationStatus(context.Context, *GetDelegatedIdentityAuthorizationStatusRequest) (*GetDelegatedIdentityAuthorizationStatusResponse, error)
+	// Transfer a separate OAuth authorization grant to the gateway for use as
+	// the authenticated user's delegated identity.
+	AuthorizeDelegatedIdentity(context.Context, *AuthorizeDelegatedIdentityRequest) (*AuthorizeDelegatedIdentityResponse, error)
+	// Fetch delegated identity status for one sandbox.
+	GetSandboxDelegatedIdentityStatus(context.Context, *GetSandboxDelegatedIdentityStatusRequest) (*GetSandboxDelegatedIdentityStatusResponse, error)
+	// Withdraw delegated identity from one sandbox.
+	WithdrawSandboxDelegatedIdentity(context.Context, *WithdrawSandboxDelegatedIdentityRequest) (*WithdrawSandboxDelegatedIdentityResponse, error)
+	// Extend delegated identity for one sandbox.
+	ExtendSandboxDelegatedIdentity(context.Context, *ExtendSandboxDelegatedIdentityRequest) (*ExtendSandboxDelegatedIdentityResponse, error)
 	// Fetch a sandbox by name.
 	GetSandbox(context.Context, *GetSandboxRequest) (*SandboxResponse, error)
 	// List sandboxes.
@@ -1187,6 +1318,14 @@ type OpenShellServer interface {
 	ConfigureProviderRefresh(context.Context, *ConfigureProviderRefreshRequest) (*ConfigureProviderRefreshResponse, error)
 	// Record a gateway-owned refresh request for one provider credential.
 	RotateProviderCredential(context.Context, *RotateProviderCredentialRequest) (*RotateProviderCredentialResponse, error)
+	// List delegated identity credentials visible to the caller.
+	ListDelegatedIdentityCredentials(context.Context, *ListDelegatedIdentityCredentialsRequest) (*ListDelegatedIdentityCredentialsResponse, error)
+	// Fetch delegated identity credential status.
+	GetDelegatedIdentityCredentialStatus(context.Context, *GetDelegatedIdentityCredentialStatusRequest) (*GetDelegatedIdentityCredentialStatusResponse, error)
+	// Revoke a delegated identity credential.
+	RevokeDelegatedIdentityCredential(context.Context, *RevokeDelegatedIdentityCredentialRequest) (*RevokeDelegatedIdentityCredentialResponse, error)
+	// Delete a delegated identity credential.
+	DeleteDelegatedIdentityCredential(context.Context, *DeleteDelegatedIdentityCredentialRequest) (*DeleteDelegatedIdentityCredentialResponse, error)
 	// Delete gateway-owned refresh configuration for one provider credential.
 	DeleteProviderRefresh(context.Context, *DeleteProviderRefreshRequest) (*DeleteProviderRefreshResponse, error)
 	// Delete a provider by name.
@@ -1321,6 +1460,21 @@ func (UnimplementedOpenShellServer) CreateSandbox(context.Context, *CreateSandbo
 func (UnimplementedOpenShellServer) BeginRootfsTarStaging(context.Context, *BeginRootfsTarStagingRequest) (*BeginRootfsTarStagingResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method BeginRootfsTarStaging not implemented")
 }
+func (UnimplementedOpenShellServer) GetDelegatedIdentityAuthorizationStatus(context.Context, *GetDelegatedIdentityAuthorizationStatusRequest) (*GetDelegatedIdentityAuthorizationStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetDelegatedIdentityAuthorizationStatus not implemented")
+}
+func (UnimplementedOpenShellServer) AuthorizeDelegatedIdentity(context.Context, *AuthorizeDelegatedIdentityRequest) (*AuthorizeDelegatedIdentityResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AuthorizeDelegatedIdentity not implemented")
+}
+func (UnimplementedOpenShellServer) GetSandboxDelegatedIdentityStatus(context.Context, *GetSandboxDelegatedIdentityStatusRequest) (*GetSandboxDelegatedIdentityStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSandboxDelegatedIdentityStatus not implemented")
+}
+func (UnimplementedOpenShellServer) WithdrawSandboxDelegatedIdentity(context.Context, *WithdrawSandboxDelegatedIdentityRequest) (*WithdrawSandboxDelegatedIdentityResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method WithdrawSandboxDelegatedIdentity not implemented")
+}
+func (UnimplementedOpenShellServer) ExtendSandboxDelegatedIdentity(context.Context, *ExtendSandboxDelegatedIdentityRequest) (*ExtendSandboxDelegatedIdentityResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ExtendSandboxDelegatedIdentity not implemented")
+}
 func (UnimplementedOpenShellServer) GetSandbox(context.Context, *GetSandboxRequest) (*SandboxResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetSandbox not implemented")
 }
@@ -1419,6 +1573,18 @@ func (UnimplementedOpenShellServer) ConfigureProviderRefresh(context.Context, *C
 }
 func (UnimplementedOpenShellServer) RotateProviderCredential(context.Context, *RotateProviderCredentialRequest) (*RotateProviderCredentialResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RotateProviderCredential not implemented")
+}
+func (UnimplementedOpenShellServer) ListDelegatedIdentityCredentials(context.Context, *ListDelegatedIdentityCredentialsRequest) (*ListDelegatedIdentityCredentialsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListDelegatedIdentityCredentials not implemented")
+}
+func (UnimplementedOpenShellServer) GetDelegatedIdentityCredentialStatus(context.Context, *GetDelegatedIdentityCredentialStatusRequest) (*GetDelegatedIdentityCredentialStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetDelegatedIdentityCredentialStatus not implemented")
+}
+func (UnimplementedOpenShellServer) RevokeDelegatedIdentityCredential(context.Context, *RevokeDelegatedIdentityCredentialRequest) (*RevokeDelegatedIdentityCredentialResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RevokeDelegatedIdentityCredential not implemented")
+}
+func (UnimplementedOpenShellServer) DeleteDelegatedIdentityCredential(context.Context, *DeleteDelegatedIdentityCredentialRequest) (*DeleteDelegatedIdentityCredentialResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteDelegatedIdentityCredential not implemented")
 }
 func (UnimplementedOpenShellServer) DeleteProviderRefresh(context.Context, *DeleteProviderRefreshRequest) (*DeleteProviderRefreshResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method DeleteProviderRefresh not implemented")
@@ -1635,6 +1801,96 @@ func _OpenShell_BeginRootfsTarStaging_Handler(srv interface{}, ctx context.Conte
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(OpenShellServer).BeginRootfsTarStaging(ctx, req.(*BeginRootfsTarStagingRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_GetDelegatedIdentityAuthorizationStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetDelegatedIdentityAuthorizationStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).GetDelegatedIdentityAuthorizationStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_GetDelegatedIdentityAuthorizationStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).GetDelegatedIdentityAuthorizationStatus(ctx, req.(*GetDelegatedIdentityAuthorizationStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_AuthorizeDelegatedIdentity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AuthorizeDelegatedIdentityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).AuthorizeDelegatedIdentity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_AuthorizeDelegatedIdentity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).AuthorizeDelegatedIdentity(ctx, req.(*AuthorizeDelegatedIdentityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_GetSandboxDelegatedIdentityStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSandboxDelegatedIdentityStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).GetSandboxDelegatedIdentityStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_GetSandboxDelegatedIdentityStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).GetSandboxDelegatedIdentityStatus(ctx, req.(*GetSandboxDelegatedIdentityStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_WithdrawSandboxDelegatedIdentity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(WithdrawSandboxDelegatedIdentityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).WithdrawSandboxDelegatedIdentity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_WithdrawSandboxDelegatedIdentity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).WithdrawSandboxDelegatedIdentity(ctx, req.(*WithdrawSandboxDelegatedIdentityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_ExtendSandboxDelegatedIdentity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExtendSandboxDelegatedIdentityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).ExtendSandboxDelegatedIdentity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_ExtendSandboxDelegatedIdentity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).ExtendSandboxDelegatedIdentity(ctx, req.(*ExtendSandboxDelegatedIdentityRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2200,6 +2456,78 @@ func _OpenShell_RotateProviderCredential_Handler(srv interface{}, ctx context.Co
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(OpenShellServer).RotateProviderCredential(ctx, req.(*RotateProviderCredentialRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_ListDelegatedIdentityCredentials_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListDelegatedIdentityCredentialsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).ListDelegatedIdentityCredentials(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_ListDelegatedIdentityCredentials_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).ListDelegatedIdentityCredentials(ctx, req.(*ListDelegatedIdentityCredentialsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_GetDelegatedIdentityCredentialStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetDelegatedIdentityCredentialStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).GetDelegatedIdentityCredentialStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_GetDelegatedIdentityCredentialStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).GetDelegatedIdentityCredentialStatus(ctx, req.(*GetDelegatedIdentityCredentialStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_RevokeDelegatedIdentityCredential_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RevokeDelegatedIdentityCredentialRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).RevokeDelegatedIdentityCredential(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_RevokeDelegatedIdentityCredential_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).RevokeDelegatedIdentityCredential(ctx, req.(*RevokeDelegatedIdentityCredentialRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_DeleteDelegatedIdentityCredential_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteDelegatedIdentityCredentialRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).DeleteDelegatedIdentityCredential(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_DeleteDelegatedIdentityCredential_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).DeleteDelegatedIdentityCredential(ctx, req.(*DeleteDelegatedIdentityCredentialRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2840,6 +3168,26 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _OpenShell_BeginRootfsTarStaging_Handler,
 		},
 		{
+			MethodName: "GetDelegatedIdentityAuthorizationStatus",
+			Handler:    _OpenShell_GetDelegatedIdentityAuthorizationStatus_Handler,
+		},
+		{
+			MethodName: "AuthorizeDelegatedIdentity",
+			Handler:    _OpenShell_AuthorizeDelegatedIdentity_Handler,
+		},
+		{
+			MethodName: "GetSandboxDelegatedIdentityStatus",
+			Handler:    _OpenShell_GetSandboxDelegatedIdentityStatus_Handler,
+		},
+		{
+			MethodName: "WithdrawSandboxDelegatedIdentity",
+			Handler:    _OpenShell_WithdrawSandboxDelegatedIdentity_Handler,
+		},
+		{
+			MethodName: "ExtendSandboxDelegatedIdentity",
+			Handler:    _OpenShell_ExtendSandboxDelegatedIdentity_Handler,
+		},
+		{
 			MethodName: "GetSandbox",
 			Handler:    _OpenShell_GetSandbox_Handler,
 		},
@@ -2958,6 +3306,22 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RotateProviderCredential",
 			Handler:    _OpenShell_RotateProviderCredential_Handler,
+		},
+		{
+			MethodName: "ListDelegatedIdentityCredentials",
+			Handler:    _OpenShell_ListDelegatedIdentityCredentials_Handler,
+		},
+		{
+			MethodName: "GetDelegatedIdentityCredentialStatus",
+			Handler:    _OpenShell_GetDelegatedIdentityCredentialStatus_Handler,
+		},
+		{
+			MethodName: "RevokeDelegatedIdentityCredential",
+			Handler:    _OpenShell_RevokeDelegatedIdentityCredential_Handler,
+		},
+		{
+			MethodName: "DeleteDelegatedIdentityCredential",
+			Handler:    _OpenShell_DeleteDelegatedIdentityCredential_Handler,
 		},
 		{
 			MethodName: "DeleteProviderRefresh",

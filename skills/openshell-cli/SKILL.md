@@ -188,9 +188,10 @@ openshell provider refresh rotate my-provider --credential-key ACCESS_TOKEN
 
 Prefer `--secret-material-env KEY[=ENVVAR]` for secret refresh material. `--material KEY=VALUE` is for non-secret material; `--secret-material-key` marks supplied material keys as secret.
 
-The gateway stores secret refresh material through its active credential driver.
-With Vault selected, refresh tokens, client secrets, and private keys live in
-Vault alongside injectable provider credentials; refresh state contains only
+The gateway stores secret refresh material and delegated identity OAuth tokens
+through its active credential driver. With Vault selected, refresh tokens,
+delegated access tokens, client secrets, and private keys live in Vault
+alongside injectable provider credentials; generic gateway records contain only
 opaque handles. A credential-backend read or write failure makes refresh fail
 closed rather than falling back to inline storage. Before OpenShell 0.1.0, the
 gateway does not migrate legacy inline refresh material or move secrets between
@@ -198,6 +199,22 @@ credential backends. Reconfigure affected grants after upgrading, and remove or
 reconfigure credentials while the original backend remains available before
 changing backends. Do not run mixed gateway versions against the same refresh
 records.
+
+Sandbox delegated identity uses an OAuth authorization separate from the normal
+CLI login. On the first `sandbox create --use-my-identity-for=<duration>`, or
+after the gateway-owned grant becomes unusable, the CLI opens the browser for a
+separate Authorization Code flow with PKCE for `openid offline_access` and
+transfers that bundle to the gateway. It may reuse the existing browser SSO
+session, but never stores the delegated bundle in the local `oidc_token.json`;
+gateway RPCs continue to use the normal CLI bearer. The IdP must enable the
+authorization code flow, the CLI's loopback callback URI, and offline access for
+the configured client, and issue a distinct refresh-token chain for the second
+authorization. A healthy gateway-owned grant is reused without prompting.
+
+To repair an inactive or revoked delegated grant, retry sandbox create or run
+`openshell sandbox delegated-identity extend <sandbox> --for=<duration>` and
+complete the new browser authorization. Gateway logout/login affects only the
+normal CLI login and does not repair or revoke delegated identity.
 
 Gateway-managed refresh credentials use an identity-stable workload handle.
 Routine automatic refresh and `provider refresh rotate` update the access token
@@ -423,6 +440,25 @@ stopped or completed. Starting a retained `Completed` or
 `Error/MainProcessFailed` sandbox launches a fresh canonical-main instance and
 invalidates SSH sessions from the previous runtime generation. Delete remains
 the operation that removes retained state.
+
+A sandbox created with delegated identity has a narrower authorization model.
+Only its original delegator can start or interact with it. Workspace and
+Platform Admins can stop it for immediate containment or delete it to release
+resources, but cannot start it; other Workspace Users cannot perform those
+operations. Withdrawing delegated identity or revoking its gateway credential
+can take up to five minutes to stop a supervisor-cached token from being
+injected. Stop or delete the sandbox when that delay is unacceptable, and use
+the IdP's revocation controls when the upstream grant must also be revoked.
+Already issued access tokens remain subject to the upstream resource server's
+expiry and revocation behavior.
+
+Use `openshell sandbox create --use-my-identity-for=<duration>` to establish the
+initial per-sandbox window. The CLI prompts for the separate delegated grant
+only when the gateway does not already hold a usable one for that user. Use
+`openshell sandbox delegated-identity status`, `extend`, and `withdraw` for one
+sandbox. Platform admins use `openshell delegated-credential list`, `status`,
+`revoke`, and `delete` for the shared gateway credential; these admin commands
+cannot authorize a grant on another user's behalf.
 
 ---
 

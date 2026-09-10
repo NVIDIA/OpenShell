@@ -20,6 +20,7 @@ mod compute;
 pub mod config_file;
 mod credentials;
 mod defaults;
+mod delegated_identity;
 mod gateway_listener;
 mod grpc;
 mod http;
@@ -705,6 +706,7 @@ pub(crate) async fn run_server(
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
+    delegated_identity::spawn_credential_cleanup_worker(state.clone(), Duration::from_mins(1));
 
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());

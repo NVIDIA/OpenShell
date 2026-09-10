@@ -11,7 +11,8 @@
 
 use crate::ServerState;
 use crate::auth::workspace_authz::{
-    MinWorkspaceRole, authorize_sandbox_workspace, authorize_workspace, require_platform_admin,
+    AuthGrant, MinWorkspaceRole, authorize_sandbox_workspace, authorize_workspace,
+    require_platform_admin,
 };
 use crate::persistence::{ObjectLabels, ObjectType, WriteCondition, generate_name};
 use futures::future;
@@ -43,6 +44,7 @@ use openshell_core::{GetResourceVersion, ObjectId, ObjectName, ObjectWorkspace};
 use prost::Message;
 use prost_types::{Struct, Value, value::Kind};
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -120,9 +122,12 @@ impl Drop for WatchSandboxStream {
     }
 }
 
-/// Fetch a sandbox by ID and authorize the caller in one step, returning
-/// `NOT_FOUND` for both missing and unauthorized sandboxes so that callers
-/// cannot distinguish the two cases (CWE-203).
+/// Fetch a sandbox by ID and authorize the caller in one step.
+///
+/// Workspace RBAC denials are normalized to `NOT_FOUND`, matching the legacy
+/// cross-workspace behavior. Delegated-identity denials remain
+/// `PERMISSION_DENIED`: workspace users may see the sandbox, but only the
+/// delegating principal may perform delegated-identity-sensitive operations.
 pub(super) async fn fetch_and_authorize_sandbox(
     state: &Arc<ServerState>,
     principal: &crate::auth::principal::Principal,
@@ -149,6 +154,8 @@ pub(super) async fn fetch_and_authorize_sandbox(
             e
         }
     })?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, principal, &sandbox)
+        .await?;
     Ok(sandbox)
 }
 
@@ -163,23 +170,25 @@ fn generate_routable_name() -> String {
 // Sandbox lifecycle handlers
 // ---------------------------------------------------------------------------
 
-pub(super) async fn handle_create_sandbox(
+pub(super) fn handle_create_sandbox(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxRequest>,
-) -> Result<Response<SandboxResponse>, Status> {
-    let create_request = request.get_ref().clone();
-    let result = handle_create_sandbox_inner(state, request).await;
-    let created_sandbox = result
-        .as_ref()
-        .ok()
-        .and_then(|response| response.get_ref().sandbox.as_ref());
-    emit_sandbox_create_telemetry(
-        state,
-        &create_request,
-        created_sandbox,
-        TelemetryOutcome::from_success(result.is_ok()),
-    );
-    result
+) -> Pin<Box<dyn Future<Output = Result<Response<SandboxResponse>, Status>> + Send + '_>> {
+    Box::pin(async move {
+        let create_request = request.get_ref().clone();
+        let result = handle_create_sandbox_inner(state, request).await;
+        let created_sandbox = result
+            .as_ref()
+            .ok()
+            .and_then(|response| response.get_ref().sandbox.as_ref());
+        emit_sandbox_create_telemetry(
+            state,
+            &create_request,
+            created_sandbox,
+            TelemetryOutcome::from_success(result.is_ok()),
+        );
+        result
+    })
 }
 
 /// Allocate a gateway-owned staging slot for a local rootfs tar archive.
@@ -327,6 +336,7 @@ async fn handle_create_sandbox_inner(
     let request = request.into_inner();
     let await_main_process_attachment = request.await_main_process_attachment;
     let workload_template_name = request.workload_template_name.trim().to_string();
+    let delegated_identity_request = request.delegated_identity;
 
     validate_create_sandbox_request_pre_io(&request, &workload_template_name)?;
 
@@ -389,7 +399,7 @@ async fn handle_create_sandbox_inner(
             .authorize(&token, &workspace, &subject)?;
     }
 
-    let _sandbox_sync_guard = if spec.providers.is_empty() {
+    let _sandbox_sync_guard = if spec.providers.is_empty() && delegated_identity_request.is_none() {
         None
     } else {
         Some(state.compute.sandbox_sync_guard().await)
@@ -495,8 +505,19 @@ async fn handle_create_sandbox_inner(
             status
         })?;
 
-    // Mint a gateway JWT whenever the issuer is configured. Compute runtimes
-    // that bootstrap through another authentication mechanism may ignore it.
+    let delegated_identity = crate::delegated_identity::prepare_for_sandbox_create(
+        state,
+        &principal,
+        &sandbox,
+        delegated_identity_request,
+    )
+    .await?;
+
+    // Mint the gateway JWT for singleplayer drivers. K8s sandboxes skip
+    // this mint and bootstrap via `IssueSandboxToken` at supervisor
+    // startup; identifying "is this K8s?" lives in the compute layer, so
+    // we mint unconditionally here when the issuer is configured and let
+    // the K8s driver simply ignore the field.
     let sandbox_token = state.sandbox_jwt_issuer.as_ref().map(|issuer| {
         issuer.mint(&id).map(|minted| {
             tracing::info!(
@@ -512,10 +533,34 @@ async fn handle_create_sandbox_inner(
         None => None,
     };
 
-    let sandbox = state
+    crate::delegated_identity::store_prepared_sandbox_delegation(
+        state,
+        delegated_identity.as_ref(),
+    )
+    .await?;
+    let sandbox = match state
         .compute
         .create_sandbox(sandbox, sandbox_token, await_main_process_attachment)
-        .await?;
+        .await
+    {
+        Ok(sandbox) => sandbox,
+        Err(status) => {
+            if let Err(cleanup_status) =
+                crate::delegated_identity::delete_prepared_sandbox_delegation(
+                    state,
+                    delegated_identity.as_ref(),
+                )
+                .await
+            {
+                warn!(
+                    sandbox_id = %id,
+                    error = %cleanup_status,
+                    "failed to clean up prepared delegated identity after sandbox create failure"
+                );
+            }
+            return Err(status);
+        }
+    };
 
     info!(
         sandbox_id = %id,
@@ -1054,6 +1099,8 @@ pub(super) async fn handle_list_sandbox_providers(
         .await?
         .name;
     let sandbox = sandbox_by_name(state, &workspace, &req.sandbox_name).await?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
     let providers = providers_for_sandbox(state, &sandbox, &workspace).await?;
     Ok(Response::new(ListSandboxProvidersResponse { providers }))
 }
@@ -1104,6 +1151,8 @@ pub(super) async fn handle_attach_sandbox_provider(
 
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     let sandbox = sandbox_by_name(state, &workspace, &request.sandbox_name).await?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
     let sandbox_id = sandbox
         .metadata
         .as_ref()
@@ -1239,6 +1288,8 @@ pub(super) async fn handle_detach_sandbox_provider(
 
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     let sandbox = sandbox_by_name(state, &workspace, &request.sandbox_name).await?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
     let sandbox_id = sandbox
         .metadata
         .as_ref()
@@ -1344,6 +1395,16 @@ async fn handle_delete_sandbox_inner(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
+    let sandbox = sandbox_by_name(state, &workspace, &name).await?;
+    if !matches!(
+        authz.grant,
+        AuthGrant::PlatformAdmin | AuthGrant::Member(openshell_core::proto::WorkspaceRole::Admin)
+    ) {
+        crate::delegated_identity::ensure_delegated_identity_sandbox_user(
+            state, &principal, &sandbox,
+        )
+        .await?;
+    }
 
     let result = state.compute.delete_sandbox(&workspace, &name).await?;
     if result.deleted {
@@ -1392,6 +1453,15 @@ async fn handle_stop_sandbox_inner(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
+    let persisted = sandbox_by_name(state, &workspace, &req.name).await?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_lifecycle_operation(
+        state,
+        &principal,
+        authz.grant,
+        &persisted,
+        crate::delegated_identity::DelegatedSandboxLifecycleOperation::Stop,
+    )
+    .await?;
     let sandbox = state.compute.stop_sandbox(&workspace, &req.name).await?;
     info!(sandbox_name = %req.name, "StopSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
@@ -1436,6 +1506,15 @@ async fn handle_start_sandbox_inner(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
+    let persisted = sandbox_by_name(state, &workspace, &req.name).await?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_lifecycle_operation(
+        state,
+        &principal,
+        authz.grant,
+        &persisted,
+        crate::delegated_identity::DelegatedSandboxLifecycleOperation::Start,
+    )
+    .await?;
     let sandbox = state.compute.start_sandbox(&workspace, &req.name).await?;
     info!(sandbox_name = %req.name, "StartSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
@@ -2412,6 +2491,14 @@ pub(super) async fn handle_revoke_ssh_session(
             e
         }
     })?;
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(&session.sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
 
     let resource_version = session
         .metadata
@@ -3091,6 +3178,8 @@ async fn run_exec_with_russh(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::identity::{Identity, IdentityProvider};
+    use crate::auth::principal::{Principal, UserPrincipal};
     use crate::grpc::test_support::{
         authed_request, test_server_state, test_server_state_with_driver,
     };
@@ -3098,6 +3187,10 @@ mod tests {
     use openshell_core::GatewayProviderProfileSourceConfig;
     use openshell_core::proto::GpuResourceRequirements;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
+    use openshell_core::proto::{
+        DelegatedIdentityRequest, SandboxDelegatedIdentity, SandboxDelegatedIdentityRecord,
+        WorkspaceMember, WorkspaceRole,
+    };
 
     async fn test_server_state_with_user_only_github_profile() -> Arc<ServerState> {
         let mut state = test_server_state().await;
@@ -3570,6 +3663,100 @@ mod tests {
             Some(Kind::StringValue(value)) => Some(value.as_str()),
             _ => None,
         }
+    }
+
+    async fn put_delegated_test_sandbox(
+        state: &Arc<ServerState>,
+        name: &str,
+        principal_subject: &str,
+    ) {
+        let sandbox = test_sandbox(name, Vec::new());
+        let sandbox_id = sandbox.object_id().to_string();
+        let record_id =
+            crate::delegated_identity::sandbox_delegated_identity_record_id(&sandbox_id);
+        let workspace = sandbox.object_workspace().to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+        state
+            .store
+            .put_scoped_message(
+                &SandboxDelegatedIdentityRecord {
+                    metadata: Some(ObjectMeta {
+                        id: record_id.clone(),
+                        name: record_id,
+                        created_at_ms: 1_000_000,
+                        labels: HashMap::new(),
+                        resource_version: 0,
+                        annotations: HashMap::new(),
+                        workspace,
+                        deletion_timestamp_ms: 0,
+                    }),
+                    sandbox_id: sandbox_id.clone(),
+                    delegated_identity: Some(SandboxDelegatedIdentity {
+                        credential_id: "delegated-credential".to_string(),
+                        principal_subject: principal_subject.to_string(),
+                        delegated_until_ms: 2_000_000,
+                        withdrawn_at_ms: 0,
+                    }),
+                },
+                &sandbox_id,
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn put_workspace_member(state: &Arc<ServerState>, subject: &str, role: WorkspaceRole) {
+        state
+            .store
+            .put_message(&WorkspaceMember {
+                metadata: Some(ObjectMeta {
+                    id: format!("workspace-member-{subject}"),
+                    name: subject.to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                principal_subject: subject.to_string(),
+                role: role.into(),
+            })
+            .await
+            .unwrap();
+    }
+
+    fn user_request<T>(mut request: Request<T>, subject: &str) -> Request<T> {
+        request
+            .extensions_mut()
+            .insert(Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: subject.to_string(),
+                    display_name: None,
+                    roles: vec![],
+                    scopes: vec![],
+                    provider: IdentityProvider::Oidc,
+                },
+            }));
+        request
+    }
+
+    fn user_request_with_roles<T>(
+        mut request: Request<T>,
+        subject: &str,
+        roles: &[&str],
+    ) -> Request<T> {
+        request
+            .extensions_mut()
+            .insert(Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: subject.to_string(),
+                    display_name: None,
+                    roles: roles.iter().map(|role| (*role).to_string()).collect(),
+                    scopes: vec![],
+                    provider: IdentityProvider::Oidc,
+                },
+            }));
+        request
     }
 
     #[tokio::test]
@@ -4140,6 +4327,7 @@ mod tests {
                 workspace: String::new(),
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
+                delegated_identity: None,
             }),
         )
         .await
@@ -4165,6 +4353,7 @@ mod tests {
                 workspace: String::new(),
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
+                delegated_identity: None,
             }),
         )
         .await
@@ -4202,6 +4391,7 @@ mod tests {
                 workspace: String::new(),
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
+                delegated_identity: None,
             }),
         )
         .await
@@ -4566,6 +4756,7 @@ mod tests {
                 workspace: String::new(),
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
+                delegated_identity: None,
             }),
         )
         .await
@@ -4627,6 +4818,7 @@ mod tests {
                 workspace: String::new(),
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
+                delegated_identity: None,
             }),
         )
         .await
@@ -4692,6 +4884,7 @@ mod tests {
                 workspace: String::new(),
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
+                delegated_identity: None,
             }),
         )
         .await
@@ -4724,6 +4917,7 @@ mod tests {
                 workspace: String::new(),
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
+                delegated_identity: None,
             }),
         )
         .await
@@ -4758,6 +4952,7 @@ mod tests {
                     workspace: String::new(),
                     await_main_process_attachment: false,
                     workload_template_name: String::new(),
+                    delegated_identity: None,
                 }),
             )
             .await
@@ -4780,6 +4975,45 @@ mod tests {
             response.sandbox.unwrap().spec.unwrap().providers,
             vec!["work-github".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_with_delegated_identity_waits_for_sandbox_sync_guard() {
+        let state = test_server_state().await;
+        let guard = state.compute.sandbox_sync_guard().await;
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            handle_create_sandbox(
+                &task_state,
+                authed_request(CreateSandboxRequest {
+                    name: "guarded-delegated".to_string(),
+                    spec: Some(SandboxSpec::default()),
+                    labels: HashMap::new(),
+                    annotations: HashMap::new(),
+                    workspace: String::new(),
+                    await_main_process_attachment: false,
+                    workload_template_name: String::new(),
+                    delegated_identity: Some(DelegatedIdentityRequest {
+                        delegated_until_ms: current_time_ms() + 600_000,
+                    }),
+                }),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !task.is_finished(),
+            "sandbox create with delegated identity should wait for sandbox sync guard"
+        );
+        drop(guard);
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("create should finish after guard release")
+            .expect("join create task")
+            .expect_err("create without configured OIDC should fail after acquiring the guard");
+        assert!(status.message().contains("OIDC"));
     }
 
     #[tokio::test]
@@ -5306,6 +5540,7 @@ mod tests {
                 workspace: "default".to_string(),
                 workload_template_name: "gpu-kata".to_string(),
                 await_main_process_attachment: false,
+                delegated_identity: None,
             }),
         )
         .await
@@ -5388,6 +5623,7 @@ mod tests {
                 workspace: "default".to_string(),
                 workload_template_name: "default-image".to_string(),
                 await_main_process_attachment: false,
+                delegated_identity: None,
             }),
         )
         .await
@@ -5435,6 +5671,7 @@ mod tests {
                 workspace: "default".to_string(),
                 workload_template_name: "default-gpu".to_string(),
                 await_main_process_attachment: false,
+                delegated_identity: None,
             }),
         )
         .await
@@ -5472,6 +5709,7 @@ mod tests {
                 workspace: "default".to_string(),
                 workload_template_name: "corrupt-template".to_string(),
                 await_main_process_attachment: false,
+                delegated_identity: None,
             }),
         )
         .await
@@ -5507,6 +5745,7 @@ mod tests {
                 workspace: "default".to_string(),
                 workload_template_name: "gpu-kata".to_string(),
                 await_main_process_attachment: false,
+                delegated_identity: None,
             }),
         )
         .await
@@ -5530,6 +5769,7 @@ mod tests {
                 workspace: "default".to_string(),
                 workload_template_name: "Invalid_Template_Name".to_string(),
                 await_main_process_attachment: false,
+                delegated_identity: None,
             }),
         )
         .await
@@ -5556,6 +5796,7 @@ mod tests {
                 workspace: "default".to_string(),
                 workload_template_name: "missing-template".to_string(),
                 await_main_process_attachment: false,
+                delegated_identity: None,
             }),
         )
         .await
@@ -5582,6 +5823,7 @@ mod tests {
                 workspace: "missing-workspace".to_string(),
                 workload_template_name: String::new(),
                 await_main_process_attachment: false,
+                delegated_identity: None,
             }),
         )
         .await
@@ -5895,6 +6137,416 @@ mod tests {
                 .finalize_main_process_exit("sandbox-work")
         );
         assert!(!sandbox_relay_reachable(&state, &sandbox));
+    }
+
+    #[tokio::test]
+    async fn delegated_identity_sandbox_allows_delegating_user_to_create_ssh_session() {
+        let state = test_server_state().await;
+        put_delegated_test_sandbox(&state, "work", "alice").await;
+
+        let response = handle_create_ssh_session(
+            &state,
+            user_request(
+                Request::new(CreateSshSessionRequest {
+                    sandbox_id: "sandbox-work".to_string(),
+                }),
+                "alice",
+            ),
+        )
+        .await
+        .expect("delegating user should be allowed")
+        .into_inner();
+
+        assert_eq!(response.sandbox_id, "sandbox-work");
+    }
+
+    #[tokio::test]
+    async fn delegated_identity_sandbox_rejects_other_user_create_ssh_session() {
+        let state = test_server_state().await;
+        put_delegated_test_sandbox(&state, "work", "alice").await;
+
+        let err = handle_create_ssh_session(
+            &state,
+            user_request(
+                Request::new(CreateSshSessionRequest {
+                    sandbox_id: "sandbox-work".to_string(),
+                }),
+                "bob",
+            ),
+        )
+        .await
+        .expect_err("non-delegating user should be denied");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("delegating principal"));
+    }
+
+    #[tokio::test]
+    async fn delegated_identity_sandbox_remains_visible_to_workspace_user() {
+        let state = test_server_state().await;
+        put_delegated_test_sandbox(&state, "work", "alice").await;
+
+        let response = handle_get_sandbox(
+            &state,
+            user_request(
+                Request::new(GetSandboxRequest {
+                    name: "work".to_string(),
+                    workspace: "default".to_string(),
+                }),
+                "bob",
+            ),
+        )
+        .await
+        .expect("workspace user should still see the sandbox")
+        .into_inner();
+        assert_eq!(
+            response.sandbox.as_ref().unwrap().object_id(),
+            "sandbox-work"
+        );
+
+        let response = handle_list_sandboxes(
+            &state,
+            user_request(
+                Request::new(ListSandboxesRequest {
+                    limit: 100,
+                    offset: 0,
+                    label_selector: String::new(),
+                    workspace: "default".to_string(),
+                    all_workspaces: false,
+                }),
+                "bob",
+            ),
+        )
+        .await
+        .expect("workspace user should still list the sandbox")
+        .into_inner();
+        assert_eq!(response.sandboxes.len(), 1);
+        assert_eq!(response.sandboxes[0].object_id(), "sandbox-work");
+    }
+
+    #[tokio::test]
+    async fn delegated_identity_sandbox_allows_delegator_lifecycle_operations() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        put_workspace_member(&state, "alice", WorkspaceRole::User).await;
+        put_delegated_test_sandbox(&state, "work", "alice").await;
+
+        let stopped = handle_stop_sandbox_inner(
+            &state,
+            user_request(
+                Request::new(StopSandboxRequest {
+                    name: "work".to_string(),
+                    workspace: "default".to_string(),
+                }),
+                "alice",
+            ),
+        )
+        .await
+        .expect("delegator should be allowed to stop delegated sandbox")
+        .into_inner()
+        .sandbox
+        .expect("stopped sandbox");
+        assert_eq!(stopped.phase(), SandboxPhase::Stopped as i32);
+
+        let started = handle_start_sandbox_inner(
+            &state,
+            user_request(
+                Request::new(StartSandboxRequest {
+                    name: "work".to_string(),
+                    workspace: "default".to_string(),
+                }),
+                "alice",
+            ),
+        )
+        .await
+        .expect("delegator should be allowed to start delegated sandbox")
+        .into_inner()
+        .sandbox
+        .expect("started sandbox");
+        assert_eq!(started.phase(), SandboxPhase::Starting as i32);
+
+        let deleted = handle_delete_sandbox_inner(
+            &state,
+            user_request(
+                Request::new(DeleteSandboxRequest {
+                    name: "work".to_string(),
+                    workspace: "default".to_string(),
+                }),
+                "alice",
+            ),
+        )
+        .await
+        .expect("delegator should be allowed to delete delegated sandbox")
+        .into_inner();
+        assert!(deleted.deleted);
+    }
+
+    #[tokio::test]
+    async fn delegated_identity_sandbox_allows_workspace_admin_stop_but_rejects_start() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        put_workspace_member(&state, "bob", WorkspaceRole::Admin).await;
+        put_delegated_test_sandbox(&state, "work", "alice").await;
+
+        handle_stop_sandbox_inner(
+            &state,
+            user_request(
+                Request::new(StopSandboxRequest {
+                    name: "work".to_string(),
+                    workspace: "default".to_string(),
+                }),
+                "bob",
+            ),
+        )
+        .await
+        .expect("workspace admin should be allowed to stop delegated sandbox");
+
+        let error = handle_start_sandbox_inner(
+            &state,
+            user_request(
+                Request::new(StartSandboxRequest {
+                    name: "work".to_string(),
+                    workspace: "default".to_string(),
+                }),
+                "bob",
+            ),
+        )
+        .await
+        .expect_err("workspace admin must not start delegated sandbox");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert!(error.message().contains("delegating principal"));
+    }
+
+    #[tokio::test]
+    async fn delegated_identity_sandbox_allows_platform_admin_stop_but_rejects_start() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        put_delegated_test_sandbox(&state, "work", "alice").await;
+
+        handle_stop_sandbox_inner(
+            &state,
+            user_request_with_roles(
+                Request::new(StopSandboxRequest {
+                    name: "work".to_string(),
+                    workspace: "default".to_string(),
+                }),
+                "platform-admin",
+                &["openshell-admin"],
+            ),
+        )
+        .await
+        .expect("platform admin should be allowed to stop delegated sandbox");
+
+        let error = handle_start_sandbox_inner(
+            &state,
+            user_request_with_roles(
+                Request::new(StartSandboxRequest {
+                    name: "work".to_string(),
+                    workspace: "default".to_string(),
+                }),
+                "platform-admin",
+                &["openshell-admin"],
+            ),
+        )
+        .await
+        .expect_err("platform admin must not start delegated sandbox");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert!(error.message().contains("delegating principal"));
+    }
+
+    #[tokio::test]
+    async fn delegated_identity_sandbox_rejects_other_user_start_and_stop() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        put_workspace_member(&state, "bob", WorkspaceRole::User).await;
+        put_delegated_test_sandbox(&state, "work", "alice").await;
+
+        let start_error = handle_start_sandbox_inner(
+            &state,
+            user_request(
+                Request::new(StartSandboxRequest {
+                    name: "work".to_string(),
+                    workspace: "default".to_string(),
+                }),
+                "bob",
+            ),
+        )
+        .await
+        .expect_err("other workspace user must not start delegated sandbox");
+        assert_eq!(start_error.code(), tonic::Code::PermissionDenied);
+
+        let stop_error = handle_stop_sandbox_inner(
+            &state,
+            user_request(
+                Request::new(StopSandboxRequest {
+                    name: "work".to_string(),
+                    workspace: "default".to_string(),
+                }),
+                "bob",
+            ),
+        )
+        .await
+        .expect_err("other workspace user must not stop delegated sandbox");
+        assert_eq!(stop_error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn ordinary_sandbox_retains_workspace_user_start_stop_access() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        put_workspace_member(&state, "bob", WorkspaceRole::User).await;
+        state
+            .store
+            .put_message(&test_sandbox("work", Vec::new()))
+            .await
+            .unwrap();
+
+        handle_stop_sandbox_inner(
+            &state,
+            user_request(
+                Request::new(StopSandboxRequest {
+                    name: "work".to_string(),
+                    workspace: "default".to_string(),
+                }),
+                "bob",
+            ),
+        )
+        .await
+        .expect("workspace user should retain ordinary sandbox stop access");
+        handle_start_sandbox_inner(
+            &state,
+            user_request(
+                Request::new(StartSandboxRequest {
+                    name: "work".to_string(),
+                    workspace: "default".to_string(),
+                }),
+                "bob",
+            ),
+        )
+        .await
+        .expect("workspace user should retain ordinary sandbox start access");
+    }
+
+    #[tokio::test]
+    async fn delegated_identity_sandbox_rejects_other_user_delete() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        put_workspace_member(&state, "bob", WorkspaceRole::User).await;
+        put_delegated_test_sandbox(&state, "work", "alice").await;
+
+        let err = handle_delete_sandbox(
+            &state,
+            user_request(
+                Request::new(DeleteSandboxRequest {
+                    name: "work".to_string(),
+                    workspace: "default".to_string(),
+                }),
+                "bob",
+            ),
+        )
+        .await
+        .expect_err("non-delegating user should be denied");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("delegating principal"));
+        assert!(
+            state
+                .store
+                .get_message::<Sandbox>("sandbox-work")
+                .await
+                .unwrap()
+                .is_some(),
+            "denied delete must not remove the sandbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_identity_sandbox_allows_workspace_admin_delete() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        put_workspace_member(&state, "bob", WorkspaceRole::Admin).await;
+        put_delegated_test_sandbox(&state, "work", "alice").await;
+
+        let response = handle_delete_sandbox(
+            &state,
+            user_request(
+                Request::new(DeleteSandboxRequest {
+                    name: "work".to_string(),
+                    workspace: "default".to_string(),
+                }),
+                "bob",
+            ),
+        )
+        .await
+        .expect("workspace admin should be allowed to delete delegated sandbox")
+        .into_inner();
+
+        assert!(response.deleted);
+    }
+
+    #[tokio::test]
+    async fn delegated_identity_sandbox_allows_platform_admin_delete() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        put_delegated_test_sandbox(&state, "work", "alice").await;
+
+        let response = handle_delete_sandbox(
+            &state,
+            user_request_with_roles(
+                Request::new(DeleteSandboxRequest {
+                    name: "work".to_string(),
+                    workspace: "default".to_string(),
+                }),
+                "bob",
+                &["openshell-admin"],
+            ),
+        )
+        .await
+        .expect("platform admin should be allowed to delete delegated sandbox")
+        .into_inner();
+
+        assert!(response.deleted);
+    }
+
+    #[tokio::test]
+    async fn delegated_identity_sandbox_rejects_other_user_revoke_ssh_session() {
+        let state = test_server_state().await;
+        put_delegated_test_sandbox(&state, "work", "alice").await;
+        let token = handle_create_ssh_session(
+            &state,
+            user_request(
+                Request::new(CreateSshSessionRequest {
+                    sandbox_id: "sandbox-work".to_string(),
+                }),
+                "alice",
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+
+        let err = handle_revoke_ssh_session(
+            &state,
+            user_request(
+                Request::new(RevokeSshSessionRequest {
+                    token: token.clone(),
+                }),
+                "bob",
+            ),
+        )
+        .await
+        .expect_err("non-delegating user should be denied");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("delegating principal"));
+        let session = state
+            .store
+            .get_message::<SshSession>(&token)
+            .await
+            .unwrap()
+            .expect("session should still exist after denied revocation");
+        assert!(!session.revoked);
     }
 
     #[tokio::test]

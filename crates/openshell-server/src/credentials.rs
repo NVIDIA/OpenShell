@@ -54,7 +54,7 @@ use crate::persistence::{PersistenceError, Store, WriteCondition};
 
 const DEFAULT_CREDENTIAL_DRIVER_STARTUP_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS: u64 = 30;
-const REFRESH_MATERIAL_CREDENTIAL_KEY_DOMAIN: &[u8] =
+const SECRET_MATERIAL_CREDENTIAL_KEY_DOMAIN: &[u8] =
     b"openshell-refresh-material-credential-key-v1";
 const COMMON_CREDENTIAL_DRIVER_FIELDS: &[&str] = &[
     "transport",
@@ -114,6 +114,31 @@ pub struct RefreshMaterialScope<'a> {
     pub workspace: &'a str,
     pub provider_id: &'a str,
     pub credential_key: &'a str,
+}
+
+/// Gateway-owned secret material stored through the provider-shaped
+/// credential-driver protocol.
+///
+/// The owner fields form a reserved internal namespace. `key_namespace` is
+/// hashed together with each fixed material name before it reaches a driver,
+/// so callers cannot choose backend keys or paths directly.
+#[derive(Debug, Clone, Copy)]
+pub struct SecretMaterialScope<'a> {
+    pub owner_name: &'a str,
+    pub workspace: &'a str,
+    pub owner_id: &'a str,
+    pub key_namespace: &'a str,
+}
+
+impl<'a> From<RefreshMaterialScope<'a>> for SecretMaterialScope<'a> {
+    fn from(scope: RefreshMaterialScope<'a>) -> Self {
+        Self {
+            owner_name: scope.provider_name,
+            workspace: scope.workspace,
+            owner_id: scope.provider_id,
+            key_namespace: scope.credential_key,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -393,27 +418,45 @@ impl CredentialRuntime {
         material: &HashMap<String, String>,
         existing_handles: &HashMap<String, CredentialHandle>,
     ) -> Result<HashMap<String, CredentialHandle>, Status> {
+        self.store_secret_material_with_object_id(
+            scope.into(),
+            object_id,
+            material,
+            existing_handles,
+        )
+        .await
+    }
+
+    /// Store gateway-only secret material through the active credential
+    /// driver. The returned handles are opaque to the owning subsystem.
+    pub async fn store_secret_material_with_object_id(
+        &self,
+        scope: SecretMaterialScope<'_>,
+        object_id: &str,
+        material: &HashMap<String, String>,
+        existing_handles: &HashMap<String, CredentialHandle>,
+    ) -> Result<HashMap<String, CredentialHandle>, Status> {
         let mut values_by_storage_key = HashMap::with_capacity(material.len());
         let mut handles_by_storage_key = HashMap::with_capacity(existing_handles.len());
         let mut material_by_storage_key = HashMap::with_capacity(material.len());
 
         for (material_key, value) in material {
-            let storage_key = refresh_material_storage_key(scope.credential_key, material_key);
+            let storage_key = secret_material_storage_key(scope.key_namespace, material_key);
             material_by_storage_key.insert(storage_key.clone(), material_key.clone());
             values_by_storage_key.insert(storage_key, value.clone());
         }
         for (material_key, handle) in existing_handles {
             handles_by_storage_key.insert(
-                refresh_material_storage_key(scope.credential_key, material_key),
+                secret_material_storage_key(scope.key_namespace, material_key),
                 handle.clone(),
             );
         }
 
         let stored = self
             .store_provider_credentials_with_object_id(
-                scope.provider_name,
+                scope.owner_name,
                 scope.workspace,
-                scope.provider_id,
+                scope.owner_id,
                 object_id,
                 &values_by_storage_key,
                 &handles_by_storage_key,
@@ -427,7 +470,7 @@ impl CredentialRuntime {
                     .map(|material_key| (material_key, handle))
                     .ok_or_else(|| {
                         Status::internal(
-                            "credential driver returned an unknown refresh material key",
+                            "credential driver returned an unknown secret material key",
                         )
                     })
             })
@@ -439,24 +482,32 @@ impl CredentialRuntime {
         scope: RefreshMaterialScope<'_>,
         handles: &HashMap<String, CredentialHandle>,
     ) -> Result<HashMap<String, String>, Status> {
+        self.resolve_secret_material(scope.into(), handles).await
+    }
+
+    pub async fn resolve_secret_material(
+        &self,
+        scope: SecretMaterialScope<'_>,
+        handles: &HashMap<String, CredentialHandle>,
+    ) -> Result<HashMap<String, String>, Status> {
         if handles.is_empty() {
             return Ok(HashMap::new());
         }
         let mut material_by_storage_key = HashMap::with_capacity(handles.len());
         let mut storage_handles = HashMap::with_capacity(handles.len());
         for (material_key, handle) in handles {
-            let storage_key = refresh_material_storage_key(scope.credential_key, material_key);
+            let storage_key = secret_material_storage_key(scope.key_namespace, material_key);
             material_by_storage_key.insert(storage_key.clone(), material_key.clone());
             storage_handles.insert(storage_key, handle.clone());
         }
         // Reuse the normal driver-batched resolver with a synthetic provider.
-        // Refresh inputs are gateway-only and have no provider-level expiry;
+        // Gateway-only secret inputs have no provider-level expiry;
         // passing zero below prevents an expired injectable credential from
         // suppressing resolution of an otherwise valid refresh-material handle.
         let provider = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                id: scope.provider_id.to_string(),
-                name: scope.provider_name.to_string(),
+                id: scope.owner_id.to_string(),
+                name: scope.owner_name.to_string(),
                 workspace: scope.workspace.to_string(),
                 ..Default::default()
             }),
@@ -473,7 +524,7 @@ impl CredentialRuntime {
                     .map(|material_key| (material_key, value))
                     .ok_or_else(|| {
                         Status::internal(
-                            "credential driver resolved an unknown refresh material key",
+                            "credential driver resolved an unknown secret material key",
                         )
                     })
             })
@@ -485,19 +536,28 @@ impl CredentialRuntime {
         scope: RefreshMaterialScope<'_>,
         handles: &HashMap<String, CredentialHandle>,
     ) -> Result<(), Status> {
+        self.delete_secret_material_handles(scope.into(), handles)
+            .await
+    }
+
+    pub async fn delete_secret_material_handles(
+        &self,
+        scope: SecretMaterialScope<'_>,
+        handles: &HashMap<String, CredentialHandle>,
+    ) -> Result<(), Status> {
         let storage_handles = handles
             .iter()
             .map(|(material_key, handle)| {
                 (
-                    refresh_material_storage_key(scope.credential_key, material_key),
+                    secret_material_storage_key(scope.key_namespace, material_key),
                     handle.clone(),
                 )
             })
             .collect();
         self.delete_provider_credential_handles(
-            scope.provider_name,
+            scope.owner_name,
             scope.workspace,
-            scope.provider_id,
+            scope.owner_id,
             &storage_handles,
         )
         .await
@@ -508,23 +568,32 @@ impl CredentialRuntime {
         scope: RefreshMaterialScope<'_>,
         deletions: &[StoredRefreshMaterialDeletion],
     ) -> Result<(), Status> {
+        self.delete_secret_material_deletions(scope.into(), deletions)
+            .await
+    }
+
+    pub async fn delete_secret_material_deletions(
+        &self,
+        scope: SecretMaterialScope<'_>,
+        deletions: &[StoredRefreshMaterialDeletion],
+    ) -> Result<(), Status> {
         let futures = deletions.iter().map(|deletion| async move {
             if deletion.material_key.is_empty() {
                 return Err(Status::failed_precondition(
-                    "pending refresh-material deletion has no material key",
+                    "pending secret-material deletion has no material key",
                 ));
             }
             let handle = deletion.handle.clone().ok_or_else(|| {
                 Status::failed_precondition(
-                    "pending refresh-material deletion has no credential handle",
+                    "pending secret-material deletion has no credential handle",
                 )
             })?;
             let storage_key =
-                refresh_material_storage_key(scope.credential_key, &deletion.material_key);
+                secret_material_storage_key(scope.key_namespace, &deletion.material_key);
             self.delete_provider_credential_handle(
-                scope.provider_name,
+                scope.owner_name,
                 scope.workspace,
-                scope.provider_id,
+                scope.owner_id,
                 &storage_key,
                 handle,
             )
@@ -736,11 +805,14 @@ impl CredentialRuntime {
     }
 }
 
-fn refresh_material_storage_key(credential_key: &str, material_key: &str) -> String {
+fn secret_material_storage_key(key_namespace: &str, material_key: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(REFRESH_MATERIAL_CREDENTIAL_KEY_DOMAIN);
+    // Preserve the original refresh-material domain and output prefix so
+    // existing provider-refresh handles remain resolvable after extracting
+    // this generic gateway-secret helper.
+    hasher.update(SECRET_MATERIAL_CREDENTIAL_KEY_DOMAIN);
     hasher.update([0]);
-    hasher.update(credential_key.as_bytes());
+    hasher.update(key_namespace.as_bytes());
     hasher.update([0]);
     hasher.update(material_key.as_bytes());
     format!("openshell.refresh.{:x}", hasher.finalize())
