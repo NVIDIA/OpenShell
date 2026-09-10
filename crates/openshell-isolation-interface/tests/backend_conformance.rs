@@ -90,10 +90,10 @@ struct MockSource<K>(PhantomData<K>);
 
 #[async_trait]
 impl<K: MockKind> NetworkMediationSource for MockSource<K> {
-    async fn accept(&self) -> Result<PendingNetworkOpen, BackendError> {
+    async fn accept_tcp(&self) -> Result<PendingTcpOpen, BackendError> {
         let (near, _far) = tokio::io::duplex(64);
-        let (result, _result_rx) = oneshot::channel();
-        Ok(PendingNetworkOpen {
+        let (decision, _decision_rx) = oneshot::channel();
+        Ok(PendingTcpOpen {
             stream: Box::new(near),
             binary_identity: Ok(BinaryIdentity {
                 binary_path: PathBuf::from("/usr/bin/agent"),
@@ -109,7 +109,19 @@ impl<K: MockKind> NetworkMediationSource for MockSource<K> {
                 process_generation: 1,
             },
             policy_generation: 1,
-            result,
+            decision,
+        })
+    }
+
+    async fn accept_dns(&self) -> Result<PendingDnsQuery, BackendError> {
+        let (response, _response_rx) = oneshot::channel();
+        Ok(PendingDnsQuery {
+            message: vec![0; 12],
+            transport: DnsTransport::Udp,
+            binary_identity: Err(ResolveError::Failed(
+                "mock DNS attribution unavailable".to_string(),
+            )),
+            response,
         })
     }
 }
@@ -121,10 +133,10 @@ struct UnattributedSource;
 
 #[async_trait]
 impl NetworkMediationSource for UnattributedSource {
-    async fn accept(&self) -> Result<PendingNetworkOpen, BackendError> {
+    async fn accept_tcp(&self) -> Result<PendingTcpOpen, BackendError> {
         let (near, _far) = tokio::io::duplex(64);
-        let (result, _result_rx) = oneshot::channel();
-        Ok(PendingNetworkOpen {
+        let (decision, _decision_rx) = oneshot::channel();
+        Ok(PendingTcpOpen {
             stream: Box::new(near),
             binary_identity: Err(ResolveError::Failed("hash unavailable".to_string())),
             destination: "203.0.113.10:443".parse().unwrap(),
@@ -134,8 +146,14 @@ impl NetworkMediationSource for UnattributedSource {
                 process_generation: 1,
             },
             policy_generation: 1,
-            result,
+            decision,
         })
+    }
+
+    async fn accept_dns(&self) -> Result<PendingDnsQuery, BackendError> {
+        Err(BackendError::Unavailable(
+            "mock DNS mediation unavailable".to_string(),
+        ))
     }
 }
 
@@ -560,7 +578,7 @@ async fn runtime_interfaces_survive_lifecycle_consumption() {
         .await
         .expect("start");
 
-    let conn = source.accept().await.expect("accept after consumption");
+    let conn = source.accept_tcp().await.expect("accept after consumption");
     let identity = conn.binary_identity.expect("identity resolves");
     assert_eq!(identity.binary_path, PathBuf::from("/usr/bin/agent"));
 }
@@ -721,7 +739,7 @@ async fn pending_network_open_carries_socket_bound_identity() {
         .expect("attach");
     let conn = bound
         .network_mediation_source()
-        .accept()
+        .accept_tcp()
         .await
         .expect("accept");
     let identity = conn.binary_identity.expect("identity resolves");
@@ -740,7 +758,7 @@ async fn missing_digest_is_none_never_empty() {
     // The secondary backend resolves path-only identity: the digest is `None`,
     // so policy that requires a digest cannot authorize the connection.
     let source = MockSource::<Secondary>(PhantomData);
-    let conn = source.accept().await.expect("accept");
+    let conn = source.accept_tcp().await.expect("accept");
     let identity = conn.binary_identity.expect("identity resolves");
     assert!(identity.binary_digest.is_none());
 }
@@ -757,7 +775,7 @@ async fn unresolved_identity_travels_with_the_pending_open_and_fails_closed() {
     // Attribution failure does not tear down the source: the connection is
     // delivered carrying `Err`, and the mediation service denies it.
     let source = UnattributedSource;
-    let conn = source.accept().await.expect("accept");
+    let conn = source.accept_tcp().await.expect("accept");
     assert!(conn.binary_identity.is_err());
 }
 
