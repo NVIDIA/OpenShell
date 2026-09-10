@@ -109,6 +109,8 @@ activity, and correlation-vector links remain available for five seconds so
 already in-flight ETW records can arrive, but retired PID evidence cannot resolve
 them. Records without matching generation evidence remain unattributed.
 
+The MXC credential handoff is also fixed at sandbox creation. The gateway rejects expiring static provider credentials because the in-process MXC driver has no live credential-refresh channel. Dynamic token grants remain request-time operations in the host proxy. Recreate the sandbox after rotating or revoking a non-expiring static credential.
+
 ## Prerequisites (live runs)
 
 - Windows 11 Insider build ≥ 26300.8553

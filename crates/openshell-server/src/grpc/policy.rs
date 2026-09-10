@@ -3224,6 +3224,7 @@ pub(super) async fn resolve_sandbox_create_runtime_inputs(
         provider_environment.credential_expires_at_ms.remove(&key);
         provider_environment.static_credential_keys.remove(&key);
     }
+    validate_create_time_provider_credential_lifetimes(sandbox_id, &provider_environment)?;
 
     let provider_credentials = if provider_records.is_empty() {
         None
@@ -3255,6 +3256,33 @@ pub(super) async fn resolve_sandbox_create_runtime_inputs(
         effective_policy,
         provider_credentials,
     ))
+}
+
+fn validate_create_time_provider_credential_lifetimes(
+    sandbox_id: &str,
+    provider_environment: &super::provider::ProviderEnvironment,
+) -> Result<(), Status> {
+    let mut expiring_static_keys = provider_environment
+        .static_credential_keys
+        .iter()
+        .filter(|key| {
+            provider_environment
+                .credential_expires_at_ms
+                .get(*key)
+                .is_some_and(|expires_at_ms| *expires_at_ms > 0)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    expiring_static_keys.sort();
+
+    if expiring_static_keys.is_empty() {
+        Ok(())
+    } else {
+        Err(Status::failed_precondition(format!(
+            "compute driver cannot refresh expiring provider credentials for running sandbox '{sandbox_id}'; recreate the sandbox with non-expiring credentials (expiring keys: {})",
+            expiring_static_keys.join(", ")
+        )))
+    }
 }
 
 pub(super) async fn handle_get_sandbox_provider_environment(
@@ -7301,6 +7329,7 @@ mod tests {
     use crate::auth::principal::{
         Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
     };
+    use crate::grpc::provider::ProviderEnvironment;
     use crate::grpc::test_support::{authed_request, test_server_state};
     use crate::persistence::test_store;
     use std::collections::HashMap;
@@ -11492,6 +11521,41 @@ mod tests {
 
         assert_eq!(legacy_env, v2_env);
         assert_eq!(v2_env.get("GITHUB_TOKEN"), Some(&"ghp-test".to_string()));
+    }
+
+    #[test]
+    fn create_time_provider_credentials_reject_expiring_static_values() {
+        let provider_environment = ProviderEnvironment {
+            credential_expires_at_ms: HashMap::from([
+                ("B_TOKEN".to_string(), 20_000),
+                ("A_TOKEN".to_string(), 10_000),
+                ("NON_SECRET".to_string(), 30_000),
+            ]),
+            static_credential_keys: HashSet::from(["A_TOKEN".to_string(), "B_TOKEN".to_string()]),
+            ..Default::default()
+        };
+
+        let error = validate_create_time_provider_credential_lifetimes(
+            "sandbox-expiring",
+            &provider_environment,
+        )
+        .expect_err("expiring static credentials must fail closed");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("A_TOKEN, B_TOKEN"));
+        assert!(!error.message().contains("NON_SECRET"));
+    }
+
+    #[test]
+    fn create_time_provider_credentials_allow_non_expiring_static_values() {
+        let provider_environment = ProviderEnvironment {
+            credential_expires_at_ms: HashMap::from([("STATIC_TOKEN".to_string(), 0)]),
+            static_credential_keys: HashSet::from(["STATIC_TOKEN".to_string()]),
+            ..Default::default()
+        };
+
+        validate_create_time_provider_credential_lifetimes("sandbox-static", &provider_environment)
+            .expect("non-expiring static credentials are supported");
     }
 
     #[tokio::test]

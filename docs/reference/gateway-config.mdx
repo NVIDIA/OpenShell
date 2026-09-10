@@ -829,7 +829,7 @@ Set `egress_proxy = true` with a loopback seed such as `egress_proxy_addr = "127
 
 Supply the workload command and optional working directory through the sandbox's `mxc` driver configuration, for example `{"mxc":{"command":["cmd","/c","echo hello"],"cwd":"C:\\work"}}`.
 
-Attached provider credentials require this governed-egress path. The gateway gives MXC only revision-scoped environment placeholders and keeps real values in the host proxy's endpoint-bound resolver. Provider keys override matching `agent_env` entries case-insensitively. Sandbox creation fails when attached provider material exists but `egress_proxy` is disabled. MXC takes its provider snapshot at creation; recreate the sandbox after attaching, detaching, or rotating a provider.
+Attached provider credentials require this governed-egress path. The gateway gives MXC only revision-scoped environment placeholders and keeps real values in the host proxy's endpoint-bound resolver. Provider keys override matching sandbox environment entries case-insensitively. Sandbox creation fails when attached provider material exists but `egress_proxy` is disabled. MXC takes its static provider snapshot at creation and rejects credentials with an expiration timestamp because it has no live refresh channel. Dynamic token grants continue to mint credentials per request in the host proxy. Recreate the sandbox after attaching, detaching, rotating, or revoking a non-expiring static provider credential.
 
 ### MicroVM
 
