@@ -116,7 +116,17 @@ function Invoke-NativeCaptured([string]$filePath, [string[]]$argumentList) {
 
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
-    if (-not $process.Start()) { throw "failed to start $filePath" }
+    try {
+        if (-not $process.Start()) { throw "failed to start $filePath" }
+    } catch {
+        $message = $_.Exception.Message
+        if ($message -match '(?i)Application Control policy has blocked this file') {
+            $sha256 = try { (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash } catch { "unavailable" }
+            $signature = try { (Get-AuthenticodeSignature -LiteralPath $filePath).Status } catch { "unavailable" }
+            throw "Application Control blocked CLI launch '$filePath' (SHA256=$sha256; Authenticode=$signature). Review CodeIntegrity/Operational event 3077 to identify the blocking policy, then deploy or allow an approved binary. Original error: $message"
+        }
+        throw
+    }
     $stdout = $process.StandardOutput.ReadToEndAsync()
     $stderr = $process.StandardError.ReadToEndAsync()
     $process.WaitForExit()
@@ -174,8 +184,8 @@ function Start-Gw {
     # config path containing a space gets split and the gateway's arg parser rejects it.
     $env:OPENSHELL_GATEWAY_CONFIG = $toml
     $p = Start-Process -FilePath $gateway `
-        -ArgumentList @("--disable-tls", "--db-url", "sqlite::memory:", "--log-level", "info") `
-        -WorkingDirectory $here -PassThru -NoNewWindow `
+        -ArgumentList @("--disable-tls", "--db-url", "sqlite::memory:", "--port", $Port, "--log-level", "info") `
+        -WorkingDirectory $here -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput $gwLog -RedirectStandardError $gwErrLog
     $deadline = (Get-Date).AddSeconds(30)
     while ((Get-Date) -lt $deadline) {
@@ -388,6 +398,12 @@ try {
     # --- Mode setup -----------------------------------------------------------
 
     Step "Pre-flight (mode=$(if ($Mock) {'MOCK'} else {'REAL'}), backend=$Backend)"
+    $cliProbe = Invoke-NativeCaptured $cli @("--version")
+    $cliProbeText = ($cliProbe.Output -join "`n")
+    if ($cliProbe.ExitCode -ne 0) {
+        throw "CLI pre-flight failed for '$cli' (exit $($cliProbe.ExitCode)): $cliProbeText"
+    }
+    Ok "CLI executable allowed: $($cliProbe.Output -join ' ')"
 
     if ($Mock) {
         $env:OPENSHELL_MXC_MOCK_WXC = "1"

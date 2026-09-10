@@ -102,6 +102,9 @@ them. Records without matching generation evidence remain unattributed.
 - Windows 11 Insider build ≥ 26300.8553
 - `IsoSessionApp.dll` present and registered
 - `wxc-exec.exe` built with `--features isolation_session`
+- Any enforced App Control policy allows both `openshell-gateway.exe` and
+  `openshell.exe`. Diagnose executable blocks with event 3077 in the
+  `Microsoft-Windows-CodeIntegrity/Operational` log.
 
 For off-box smoke tests against the in-process mock shim (no `wxc-exec`,
 no isolation session needed), set `OPENSHELL_MXC_MOCK_WXC=1`.

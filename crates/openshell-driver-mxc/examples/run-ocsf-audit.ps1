@@ -23,6 +23,9 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\run-ocsf-audit.ps1 `
 #     -WxcExecPath C:\mxc-kit\bin\wxc-exec.exe
 #
+# By default the per-sandbox egress proxy is ON so the full event set (including
+# SandboxProxyConfigured) is produced. Pass -NoProxy to omit only that one event.
+#
 # The deliverable is the OCSF audit log (openshell-ocsf.<date>.log) inside the
 # results-*.zip the script produces. Pass -ShareOut '\\server\share' to also copy
 # the bundle to a shared location (off by default).
@@ -35,6 +38,8 @@ param(
   [string] $ShareDir     = "C:\work\openshell-mxc-demo",
   # How many sandboxes to create (each drives a full event burst).
   [int]    $SandboxCount = 2,
+  # Disable the per-sandbox egress proxy (omits the SandboxProxyConfigured event).
+  [switch] $NoProxy,
   # Gateway bind port (matches the gateway default) + CLI registration name.
   [int]    $Port         = 17670,
   [string] $GatewayName  = "openshell-mxc-ocsf",
@@ -90,6 +95,7 @@ $helloPath = Join-Path $ShareDir "hello.txt"
 $gw       = $null
 $gatewayEtwSessions = @()
 $passed   = $true
+$proxyOn  = -not $NoProxy
 
 try {
   # 1. Validate artifacts + privilege.
@@ -127,6 +133,12 @@ try {
   } else {
     $tomlText = [regex]::Replace($tomlText, '(?m)^\[openshell\.drivers\.mxc\]\s*$', "[openshell.drivers.mxc]`r`netw_audit = true")
   }
+  $proxyVal = if ($proxyOn) { 'true' } else { 'false' }
+  if ($tomlText -match '(?m)^\s*#?\s*egress_proxy\s*=') {
+    $tomlText = [regex]::Replace($tomlText, '(?m)^\s*#?\s*egress_proxy\s*=.*$', "egress_proxy = $proxyVal")
+  } else {
+    $tomlText = [regex]::Replace($tomlText, '(?m)^\[openshell\.drivers\.mxc\]\s*$', "[openshell.drivers.mxc]`r`negress_proxy = $proxyVal")
+  }
   Set-Content $toml -Value $tomlText -Encoding UTF8
 
   $shareDirPolicy = $ShareDir.Replace('\', '/')
@@ -156,7 +168,7 @@ try {
     $driverConfig
   }
 
-  Info "backend=process_container  etw_audit=true"
+  Info "backend=process_container  etw_audit=true  egress_proxy=$proxyVal"
   Info "workload cwd=$shareDirPolicy  policy grant=$shareDirPolicy"
 
   # 3. Port must be free. Auto-clear a stale OUR-gateway; refuse anything else.
@@ -318,7 +330,9 @@ finally {
   # Event-type coverage (detected from the human-readable shorthand lines).
   function Seen([string]$pat) { [bool]($logText | Select-String -Pattern $pat -Quiet) }
 
-  # Expected happy-path ETW->OCSF event types for this run.
+  # Expected happy-path ETW->OCSF event types for THIS run. The egress-proxy
+  # event only fires when the proxy is enabled, so it only counts toward the
+  # expected total when -NoProxy was NOT passed.
   $coreEvents = [ordered]@{
     "sandbox lifecycle (start)"     = Seen "(?i)ocsf:.*LIFECYCLE:"
     "OS policy enforced"            = Seen "(?i)ocsf:.*OS policy enforced"
@@ -328,6 +342,7 @@ finally {
     "console reference plumbed"     = Seen "(?i)ocsf:.*console reference plumbed"
     "process launch (executable identity)" = Seen "(?i)ocsf:.*PROC:LAUNCH"
   }
+  if ($proxyOn) { $coreEvents["egress proxy configured"] = Seen "(?i)ocsf:.*proxy configured" }
 
   # Findings are anomaly / fallback signals - reported separately, NOT part of
   # the expected-coverage denominator (a clean run may emit none).
@@ -358,6 +373,7 @@ user             : $env:USERNAME   (admin=$admin  perfLogUsers=$plu)
 verdict          : $verdict
 event coverage   : $coreObserved of $coreExpected expected event types fired   (+ $findingsObserved anomaly finding(s))
 queue overload   : $(if ($consumerOverloaded) { 'YES - ETW records dropped; audit coverage gap' } else { 'no dropped ETW records observed' })
+proxy            : $(if ($proxyOn) { 'on (full event set)' } else { 'off (-NoProxy; omits egress proxy event)' })
 workload output  : $(if ($workloadCompleted) { $helloPath } else { '(missing)' })
 wxc_exec         : $WxcExecPath
 backend          : process_container
