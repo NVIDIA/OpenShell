@@ -253,8 +253,14 @@ its compatibility metadata as a custom OCI artifact. Normal test runs ensure
 the exact local entry exists, invoking the cache builder automatically on a
 miss before booting a disposable overlay. The separate cache app owns OCI
 pulls and explicit publication. OCI pulls require a trusted manifest digest
-and retain that provenance with the local entry; mutable tags are used only
-for explicit publication.
+  and retain that provenance with the local entry; mutable tags are used only
+  for explicit publication.
+
+The conformance workflow also builds a branch Snap for an Ubuntu QEMU guest.
+The guest installs snapd and Docker Snap, installs the unsigned candidate,
+connects its required interfaces, registers the local gateway, and verifies
+`openshell status`. Sandbox smoke conformance remains separate from this
+package-installation check.
 
 ## Python Wheel Packaging
 

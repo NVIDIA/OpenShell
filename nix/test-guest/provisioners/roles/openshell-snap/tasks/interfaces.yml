@@ -1,0 +1,30 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Stop OpenShell Snap gateway service before Docker connection
+  become: true
+  ansible.builtin.systemd_service:
+    name: "{{ openshell_snap_gateway_service }}"
+    state: stopped
+
+- name: Reset failed OpenShell Snap gateway service
+  become: true
+  ansible.builtin.command:
+    cmd: systemctl reset-failed {{ openshell_snap_gateway_service }}
+  changed_when: false
+
+- name: Connect Docker Snap interface
+  become: true
+  ansible.builtin.command:
+    cmd: snap connect openshell:docker docker:docker-daemon
+
+- name: Connect log-observe interface
+  become: true
+  ansible.builtin.command:
+    cmd: snap connect openshell:log-observe
+
+- name: Connect system-observe interface
+  become: true
+  ansible.builtin.command:
+    cmd: snap connect openshell:system-observe
