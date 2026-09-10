@@ -18,7 +18,7 @@
 //!   and anything MXC cannot express (ports, protocol, L7 rules, binary scope)
 //!   is recorded in the loss report. Use this when MXC enforces network on its
 //!   own, with no `OpenShell` proxy in the loop.
-//! - [`split_policy`] — the *lossless* split for the Windows MXC compute
+//! - [`split_policy`] — the governed-egress split for the Windows MXC compute
 //!   driver: MXC handles filesystem + containment + a `network.proxy` redirect,
 //!   while the full `OpenShell` network policy is preserved in a trimmed policy
 //!   enforced by the host CONNECT proxy.

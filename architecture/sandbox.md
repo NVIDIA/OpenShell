@@ -52,6 +52,17 @@ paths, such as proxy support files or GPU device paths when a GPU is present.
 These internal allowances must stay sandbox-scoped and avoid exposing host
 secrets. For example, MXC governed egress grants the generated public CA bundle
 while the ephemeral CA private key remains in the host proxy's memory.
+This limitation does not prevent MXC sandboxes from launching in general.
+Filesystem policies work normally, and a `process_container` sandbox with
+governed egress enabled can still enforce `network_policies` through the host
+proxy. The limitation applies only when the effective policy contains
+`network_middlewares`, which select built-in or remote services that inspect or
+transform network traffic. The MXC host proxy does not currently receive the
+gateway registry that resolves those services. MXC therefore rejects such a
+policy synchronously during `CreateSandbox`, before it inserts runtime state or
+invokes `wxc-exec`, rather than running a chain with missing implementations.
+Remove the middleware entries or use a compute driver whose sandbox supervisor
+receives the gateway middleware registry.
 
 ## Network and Provider Access
 

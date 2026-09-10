@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Loss-report model shared by the coarse map and the lossless split.
+//! Loss-report model shared by the coarse map and the governed-egress split.
 
 use std::collections::HashSet;
 

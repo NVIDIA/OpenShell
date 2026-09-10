@@ -142,7 +142,7 @@ fn all_example_policies_map_with_invariants() {
 }
 
 #[test]
-fn all_example_policies_split_with_lossless_invariants() {
+fn all_example_policies_split_with_expected_invariants() {
     let root = examples_root();
     let mut policies = Vec::new();
     discover(&root, &mut policies);
@@ -216,12 +216,28 @@ fn all_example_policies_split_with_lossless_invariants() {
         assert_eq!(cfg["network"]["proxy"]["localhost"], 18080);
         assert!(cfg["network"]["proxy"].get("host").is_none());
         assert!(cfg["network"]["proxy"].get("port").is_none());
-        assert!(
-            result.loss.iter().all(|i| i.severity != "error"),
-            "processcontainer split must not emit error losses for {}: {:?}",
-            path.display(),
-            result.loss
-        );
+        let errors: Vec<_> = result
+            .loss
+            .iter()
+            .filter(|item| item.severity == "error")
+            .collect();
+        if policy.network_middlewares.is_empty() {
+            assert!(
+                errors.is_empty(),
+                "processcontainer split must not emit error losses for {}: {:?}",
+                path.display(),
+                result.loss
+            );
+        } else {
+            assert_eq!(
+                errors.len(),
+                1,
+                "middleware policy must have one fail-closed loss for {}: {:?}",
+                path.display(),
+                result.loss
+            );
+            assert_eq!(errors[0].path, "network_middlewares");
+        }
     }
 }
 

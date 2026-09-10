@@ -692,6 +692,9 @@ internal filesystem grant so HTTPS clients can read the injected trust path;
 the CA private key remains in gateway memory.
 Governed egress requires `process_container` until MXC supports `network.proxy`
 for isolation sessions.
+MXC rejects policies containing `network_middlewares` before launch because
+this host-proxy path does not yet receive the gateway's built-in and remote
+middleware registry.
 
 The driver records executable identity in process audit events and omits raw
 command arguments because they can contain credentials or personal data. See
