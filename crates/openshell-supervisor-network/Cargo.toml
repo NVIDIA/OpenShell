@@ -13,6 +13,7 @@ rust-version.workspace = true
 [dependencies]
 openshell-core = { path = "../openshell-core", features = ["oauth"] }
 openshell-ocsf = { path = "../openshell-ocsf" }
+openshell-otel = { path = "../openshell-otel" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
 

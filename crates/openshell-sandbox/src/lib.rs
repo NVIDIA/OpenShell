@@ -950,6 +950,44 @@ pub async fn run_sandbox(
             None
         };
 
+        // OTEL relay: describe the OTLP receiver for the supervisor session,
+        // which binds it only once the gateway confirms the otel_export
+        // capability. All current topologies keep the process supervisor
+        // co-located with the agent, so 127.0.0.1 is reachable from agent
+        // processes. Future topologies that move the supervisor out of the
+        // workload pod would need to derive the bind address from the
+        // topology and update OTEL_EXPORTER_OTLP_ENDPOINT to match.
+        let otel_relay = {
+            #[cfg(target_os = "linux")]
+            {
+                let bind_addr: std::net::SocketAddr =
+                    openshell_core::sandbox_env::OTLP_RECEIVER_ADDR
+                        .parse()
+                        .expect("OTLP_RECEIVER_ADDR is a valid socket address");
+                let metadata = openshell_supervisor_process::otlp::SandboxMetadata {
+                    sandbox_id: sandbox_id.clone().unwrap_or_default(),
+                    workspace_id: workspace_rx.borrow().clone(),
+                    policy: sandbox_name_for_agg.clone().unwrap_or_default(),
+                    user: resolved_process_identity
+                        .uid()
+                        .map_or_else(String::new, |uid| uid.to_string()),
+                    image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
+                    driver: std::env::var(openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY)
+                        .unwrap_or_else(|_| "container".to_string()),
+                };
+                Some(openshell_supervisor_process::otlp::RelaySetup {
+                    config: openshell_supervisor_process::otlp::RelayConfig::default(),
+                    metadata,
+                    bind_addr,
+                })
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                debug!("OTEL relay not available on this platform");
+                None
+            }
+        };
+
         let process = openshell_supervisor_process::run::run_process(
             program,
             args,
@@ -978,6 +1016,7 @@ pub async fn run_sandbox(
             bypass_denial_tx,
             #[cfg(target_os = "linux")]
             bypass_activity_tx,
+            otel_relay,
         );
 
         if let Some(control_closed) = process_control_closed.as_mut() {
@@ -1345,7 +1384,9 @@ fn spawn_sidecar_entrypoint_handler(
             control_publisher,
         } = handler;
         let mut session_started = false;
-        let mut session_task: Option<tokio::task::JoinHandle<()>> = None;
+        let mut session_task: Option<
+            openshell_supervisor_process::supervisor_session::SessionHandle,
+        > = None;
         let mut trusted_supervisor_pid = None;
         let terminating = Arc::new(AtomicBool::new(false));
         while let Some(started) = entrypoint_rx.recv().await {
@@ -1454,6 +1495,7 @@ fn spawn_sidecar_entrypoint_handler(
                     Some(supervisor_pid),
                     Arc::clone(&terminating),
                     started.instance_id.clone(),
+                    None,
                 ));
                 session_started = true;
                 info!("sidecar supervisor session task spawned");

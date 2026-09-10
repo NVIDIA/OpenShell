@@ -39,6 +39,19 @@ pub fn tls_env_vars(
     ]
 }
 
+pub fn otel_env_vars(endpoint: &str, protocol: &str) -> [(&'static str, String); 2] {
+    [
+        (
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT,
+            endpoint.to_owned(),
+        ),
+        (
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_PROTOCOL,
+            protocol.to_owned(),
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
