@@ -415,6 +415,12 @@ Configure VM driver values such as `grpc_endpoint`, `driver_dir`, `state_dir`, `
 
 The gateway starts `openshell-driver-vm` over a private Unix socket and passes its process ID so the driver can reject unexpected local clients. The driver's standalone TCP listener is disabled unless `--allow-unauthenticated-tcp` is set for local development.
 
+Scripts that invoke the experimental standalone driver directly must use
+`--grpc-endpoint` and the `--upstream-proxy*` option family. Schema v2 removes
+the previous `--openshell-endpoint`, `--https-proxy`, `--no-proxy`, and
+`--proxy-*` spellings; gateway-managed deployments do not use those options
+directly.
+
 ### Local image resolution
 
 The VM driver resolves sandbox images from a local container engine before falling back to registry pulls. It tries Docker first, then uses the same Podman socket discovery as the Podman driver. On Linux with Podman, enable the API socket so the driver can find local images:

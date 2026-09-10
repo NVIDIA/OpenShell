@@ -1063,7 +1063,20 @@ pub enum ComputeDriverInstance {
 pub trait ComputeDriverFactory: Send + Sync {
     /// Validate selected-driver configuration without starting a driver,
     /// connecting a transport, or modifying runtime state.
-    fn validate_config(&self, context: ComputeDriverConfigContext<'_>) -> Result<()>;
+    ///
+    /// The default preserves source compatibility for existing out-of-tree
+    /// factories during normal startup. Package preflight rejects a selected
+    /// factory unless [`Self::supports_config_preflight`] is also overridden
+    /// to return `true`.
+    fn validate_config(&self, _context: ComputeDriverConfigContext<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether [`Self::validate_config`] fully validates this factory's
+    /// configuration without runtime side effects.
+    fn supports_config_preflight(&self) -> bool {
+        false
+    }
 
     async fn build(&self, context: ComputeDriverBuildContext<'_>) -> Result<ComputeDriverInstance>;
 }
@@ -1076,7 +1089,6 @@ pub struct ComputeDriverRegistration {
     detect: Option<fn() -> bool>,
     factory: Arc<dyn ComputeDriverFactory>,
     telemetry_category: TelemetryComputeDriver,
-    inherited_config_keys: &'static [&'static str],
     local_singleplayer: bool,
     supports_mtls_user_auth: bool,
     in_process_tracing: Option<openshell_otel::ComputeDriverTracing>,
@@ -1109,17 +1121,22 @@ impl ComputeDriverRegistration {
             detect,
             factory: Arc::new(factory),
             telemetry_category: TelemetryComputeDriver::custom(),
-            inherited_config_keys: &[],
             local_singleplayer: false,
             supports_mtls_user_auth: true,
             in_process_tracing: None,
         })
     }
 
-    /// Select gateway-wide defaults understood by this driver's config type.
+    /// Compatibility no-op retained for source compatibility with schema-v1
+    /// factory registrations. Schema v2 never inherits gateway keys into a
+    /// driver table; move every driver setting under
+    /// `[openshell.drivers.<name>]`.
+    #[deprecated(
+        since = "0.0.0",
+        note = "schema v2 does not inherit gateway keys into driver configuration"
+    )]
     #[must_use]
-    pub fn with_inherited_config_keys(mut self, keys: &'static [&'static str]) -> Self {
-        self.inherited_config_keys = keys;
+    pub fn with_inherited_config_keys(self, _keys: &'static [&'static str]) -> Self {
         self
     }
 
@@ -1314,7 +1331,6 @@ pub struct ComputeDriverConfigContext<'a> {
     gateway_bind_address: SocketAddr,
     gateway_log_level: &'a str,
     driver_startup: compute::driver_config::DriverStartupContext<'a>,
-    inherited_config_keys: &'static [&'static str],
 }
 
 impl ComputeDriverConfigContext<'_> {
@@ -1353,11 +1369,7 @@ impl ComputeDriverConfigContext<'_> {
     where
         T: Default + serde::de::DeserializeOwned,
     {
-        compute::driver_config::driver_config_from_context(
-            self.driver_startup,
-            self.driver_name,
-            self.inherited_config_keys,
-        )
+        compute::driver_config::driver_config_from_context(self.driver_startup, self.driver_name)
     }
 }
 
@@ -1453,6 +1465,7 @@ async fn build_compute_runtime(
         config.bind_address,
         &config.log_level,
         driver_startup,
+        false,
     )?;
     let telemetry_compute_driver = driver.telemetry_compute_driver(registry);
     info!(driver = %driver.name(), "Using compute driver");
@@ -1476,7 +1489,6 @@ async fn build_compute_runtime(
                     gateway_bind_address: config.bind_address,
                     gateway_log_level: &config.log_level,
                     driver_startup,
-                    inherited_config_keys: registration.inherited_config_keys,
                 },
                 shutdown_rx,
             };
@@ -1593,10 +1605,17 @@ fn validate_compute_driver_config(
     gateway_bind_address: SocketAddr,
     gateway_log_level: &str,
     driver_startup: compute::driver_config::DriverStartupContext<'_>,
+    require_preflight_support: bool,
 ) -> Result<ConfiguredComputeDriver> {
     let driver = resolve_configured_compute_driver(registry, driver_name, driver_startup)?;
     match &driver {
         ConfiguredComputeDriver::Registered(registration) => {
+            if require_preflight_support && !registration.factory.supports_config_preflight() {
+                return Err(Error::config(format!(
+                    "compute driver '{}' does not support side-effect-free configuration preflight",
+                    registration.name
+                )));
+            }
             registration
                 .factory
                 .validate_config(ComputeDriverConfigContext {
@@ -1605,7 +1624,6 @@ fn validate_compute_driver_config(
                     gateway_bind_address,
                     gateway_log_level,
                     driver_startup,
-                    inherited_config_keys: registration.inherited_config_keys,
                 })?;
         }
         ConfiguredComputeDriver::Remote { name } => {
@@ -1893,15 +1911,10 @@ mod tests {
     #[derive(Clone, Copy)]
     struct TestComputeDriverFactory;
 
+    // Omitting validate_config exercises source compatibility for out-of-tree
+    // factories written before package preflight introduced that hook.
     #[async_trait::async_trait]
     impl super::ComputeDriverFactory for TestComputeDriverFactory {
-        fn validate_config(
-            &self,
-            _context: super::ComputeDriverConfigContext<'_>,
-        ) -> openshell_core::Result<()> {
-            Ok(())
-        }
-
         async fn build(
             &self,
             _context: super::ComputeDriverBuildContext<'_>,

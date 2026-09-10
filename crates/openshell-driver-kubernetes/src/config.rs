@@ -460,14 +460,16 @@ impl KubernetesComputeConfig {
         Ok(())
     }
 
-    /// Translate a validated shared policy to Kubernetes's API vocabulary.
-    #[must_use]
-    pub fn image_pull_policy_value(policy: ImagePullPolicy) -> &'static str {
+    /// Translate a shared policy to Kubernetes's API vocabulary.
+    pub fn image_pull_policy_value(policy: ImagePullPolicy) -> Result<&'static str, String> {
         match policy {
-            ImagePullPolicy::Always => "Always",
-            ImagePullPolicy::IfNotPresent => "IfNotPresent",
-            ImagePullPolicy::Never => "Never",
-            ImagePullPolicy::Newer => unreachable!("newer must be rejected during validation"),
+            ImagePullPolicy::Always => Ok("Always"),
+            ImagePullPolicy::IfNotPresent => Ok("IfNotPresent"),
+            ImagePullPolicy::Never => Ok("Never"),
+            ImagePullPolicy::Newer => Err(
+                "image pull policy 'newer' is supported only by the Podman compute driver"
+                    .to_string(),
+            ),
         }
     }
 
@@ -920,7 +922,7 @@ mod tests {
             (ImagePullPolicy::Never, "Never"),
         ] {
             assert_eq!(
-                KubernetesComputeConfig::image_pull_policy_value(policy),
+                KubernetesComputeConfig::image_pull_policy_value(policy).unwrap(),
                 expected
             );
         }
@@ -928,6 +930,12 @@ mod tests {
 
     #[test]
     fn image_pull_policy_rejects_newer_for_sandbox_and_supervisor_images() {
+        assert!(
+            KubernetesComputeConfig::image_pull_policy_value(ImagePullPolicy::Newer)
+                .unwrap_err()
+                .contains("supported only by the Podman")
+        );
+
         for (sandbox, supervisor) in [
             (Some(ImagePullPolicy::Newer), None),
             (None, Some(ImagePullPolicy::Newer)),

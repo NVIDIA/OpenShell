@@ -144,18 +144,16 @@ pub struct RemoteDriverConfig {
 pub fn driver_config_from_context<T>(
     context: DriverStartupContext<'_>,
     driver_name: &str,
-    inherited_config_keys: &[&str],
 ) -> Result<T>
 where
     T: Default + serde::de::DeserializeOwned,
 {
-    driver_config_from_file(context.file, driver_name, inherited_config_keys)
+    driver_config_from_file(context.file, driver_name)
 }
 
 fn driver_config_from_file<T>(
     file: Option<&config_file::ConfigFile>,
     driver_name: &str,
-    inherited_config_keys: &[&str],
 ) -> Result<T>
 where
     T: Default + serde::de::DeserializeOwned,
@@ -163,11 +161,10 @@ where
     let Some(file) = file else {
         return Ok(T::default());
     };
-    let merged = config_file::driver_table_with_inherited_keys(
+    let merged = config_file::driver_table(
         driver_name,
         &file.openshell.gateway,
         file.openshell.drivers.get(driver_name),
-        inherited_config_keys,
     );
     reject_driver_owned_guest_tls_fields(&merged)?;
     merged.try_into().map_err(|e| {
@@ -361,12 +358,9 @@ socket_path = "/run/openshell/kyma.sock"
             );
             let file: config_file::ConfigFile = toml::from_str(&source).expect("valid TOML");
 
-            let local_error = driver_config_from_context::<EmptyDriverConfig>(
-                test_context(Some(&file)),
-                "kyma",
-                &[],
-            )
-            .expect_err("local driver TLS field must be rejected");
+            let local_error =
+                driver_config_from_context::<EmptyDriverConfig>(test_context(Some(&file)), "kyma")
+                    .expect_err("local driver TLS field must be rejected");
             assert!(local_error.to_string().contains(field));
             assert!(local_error.to_string().contains("[openshell.gateway]"));
 

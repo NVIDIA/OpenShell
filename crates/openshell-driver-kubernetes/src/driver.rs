@@ -1506,18 +1506,24 @@ impl KubernetesComputeDriver {
             .resolve_sandbox_identity_in_namespace(&target_namespace)
             .await;
 
+        let image_pull_policy = self
+            .config
+            .image_pull_policy
+            .map(KubernetesComputeConfig::image_pull_policy_value)
+            .transpose()
+            .map_err(KubernetesDriverError::Precondition)?;
+        let supervisor_image_pull_policy = self
+            .config
+            .supervisor_image_pull_policy
+            .map(KubernetesComputeConfig::image_pull_policy_value)
+            .transpose()
+            .map_err(KubernetesDriverError::Precondition)?;
         let params = SandboxPodParams {
             default_image: &self.config.default_image,
-            image_pull_policy: self
-                .config
-                .image_pull_policy
-                .map(KubernetesComputeConfig::image_pull_policy_value),
+            image_pull_policy,
             image_pull_secrets: &self.config.image_pull_secrets,
             supervisor_image: &self.config.supervisor_image,
-            supervisor_image_pull_policy: self
-                .config
-                .supervisor_image_pull_policy
-                .map(KubernetesComputeConfig::image_pull_policy_value),
+            supervisor_image_pull_policy,
             supervisor_sideload_method: self.config.supervisor_sideload_method,
             topology: self.config.topology,
             proxy_uid: self.config.sidecar.proxy_uid,

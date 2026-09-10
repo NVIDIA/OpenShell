@@ -625,15 +625,6 @@ pub fn driver_table(
     }
 }
 
-pub(crate) fn driver_table_with_inherited_keys(
-    driver_name: &str,
-    gateway: &GatewayFileSection,
-    raw: Option<&toml::Value>,
-    _inherited_config_keys: &[&str],
-) -> toml::Value {
-    driver_table(driver_name, gateway, raw)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -110,6 +110,10 @@ struct UnsupportedWindowsFactory {
 #[cfg(target_os = "windows")]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for UnsupportedWindowsFactory {
+    fn supports_config_preflight(&self) -> bool {
+        true
+    }
+
     fn validate_config(
         &self,
         _context: openshell_server::ComputeDriverConfigContext<'_>,
@@ -137,6 +141,10 @@ struct MxcFactory;
 #[cfg(all(target_os = "windows", feature = "compute-driver-mxc"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for MxcFactory {
+    fn supports_config_preflight(&self) -> bool {
+        true
+    }
+
     fn validate_config(
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,
@@ -228,6 +236,10 @@ struct KubernetesFactory;
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-kubernetes"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for KubernetesFactory {
+    fn supports_config_preflight(&self) -> bool {
+        true
+    }
+
     fn validate_config(
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,
@@ -277,6 +289,10 @@ struct DockerFactory;
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-docker"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for DockerFactory {
+    fn supports_config_preflight(&self) -> bool {
+        true
+    }
+
     fn validate_config(
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,
@@ -318,6 +334,10 @@ struct PodmanFactory;
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-podman"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for PodmanFactory {
+    fn supports_config_preflight(&self) -> bool {
+        true
+    }
+
     fn validate_config(
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,
@@ -374,6 +394,10 @@ struct VmFactory;
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-vm"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for VmFactory {
+    fn supports_config_preflight(&self) -> bool {
+        true
+    }
+
     fn validate_config(
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,

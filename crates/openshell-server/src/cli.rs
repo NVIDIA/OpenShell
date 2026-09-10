@@ -678,6 +678,10 @@ impl crate::ComputeDriverFactory for PreflightTestFactory {
         Ok(())
     }
 
+    fn supports_config_preflight(&self) -> bool {
+        true
+    }
+
     async fn build(
         &self,
         _context: crate::ComputeDriverBuildContext<'_>,
@@ -802,6 +806,7 @@ fn run_effective_config_preflight(
                 SocketAddr::new(run.bind_address, run.port),
                 &run.log_level,
                 driver_startup,
+                true,
             )?;
         } else if file.is_some() {
             // Runtime auto-detection may connect local API sockets or launch a
@@ -820,6 +825,7 @@ fn run_effective_config_preflight(
                     SocketAddr::new(run.bind_address, run.port),
                     &run.log_level,
                     driver_startup,
+                    true,
                 )?;
             }
         }
@@ -1220,11 +1226,29 @@ mod tests {
             Ok(())
         }
 
+        fn supports_config_preflight(&self) -> bool {
+            true
+        }
+
         async fn build(
             &self,
             _context: crate::ComputeDriverBuildContext<'_>,
         ) -> openshell_core::Result<crate::ComputeDriverInstance> {
             unreachable!("CLI metadata tests do not build drivers")
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct LegacyFactory;
+
+    // Deliberately implements only the pre-preflight factory contract.
+    #[async_trait::async_trait]
+    impl crate::ComputeDriverFactory for LegacyFactory {
+        async fn build(
+            &self,
+            _context: crate::ComputeDriverBuildContext<'_>,
+        ) -> openshell_core::Result<crate::ComputeDriverInstance> {
+            unreachable!("preflight must not build a legacy driver")
         }
     }
 
@@ -1241,6 +1265,10 @@ mod tests {
             Err(openshell_core::Error::config(
                 "selected driver validation hook invoked",
             ))
+        }
+
+        fn supports_config_preflight(&self) -> bool {
+            true
         }
 
         async fn build(
@@ -1873,6 +1901,44 @@ mod tests {
         .expect_err("selected driver validation hook must run");
         assert!(error.to_string().contains("validation hook invoked"));
         assert_eq!(REJECTING_VALIDATION_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn config_preflight_rejects_factory_without_side_effect_free_validation() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config_home = tempfile::tempdir().unwrap();
+        let _config_home =
+            EnvVarGuard::set("XDG_CONFIG_HOME", config_home.path().to_str().unwrap());
+        let _config = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+        let _canonical = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER");
+        let _legacy = EnvVarGuard::remove("OPENSHELL_DRIVERS");
+        let (run, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--compute-driver",
+            "legacy",
+            "--disable-tls",
+        ]);
+        let mut registry = crate::ComputeDriverRegistry::new();
+        registry
+            .install(
+                crate::ComputeDriverRegistration::new("legacy", 100, None, LegacyFactory).unwrap(),
+            )
+            .unwrap();
+
+        let error = super::run_config_preflight_with_drivers(
+            super::ConfigPreflightArgs::default(),
+            run,
+            &matches,
+            &registry,
+        )
+        .expect_err("unsupported source-free preflight must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("does not support side-effect-free")
+        );
     }
 
     #[test]

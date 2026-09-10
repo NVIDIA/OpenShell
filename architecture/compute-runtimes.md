@@ -130,7 +130,10 @@ their own `ComputeDriverFactory` registrations and hand the completed registry
 to `run_cli_with_compute_drivers`. Factories expose the same side-effect-free
 configuration validation to package preflight and runtime startup, receive only
 the selected `[openshell.drivers.<name>]` table, and return either an in-process
-driver or a gateway-managed remote endpoint when built. If a selected config file
+driver or a gateway-managed remote endpoint when built. Existing out-of-tree
+factories that implement only runtime construction remain source-compatible and
+can start normally, but package preflight fails closed until they explicitly
+advertise and implement side-effect-free configuration validation. If a selected config file
 omits the selector, preflight validates each configured table that belongs to an
 auto-detectable registration. It does not run runtime detection probes because
 those probes can connect local sockets or launch bounded discovery commands.

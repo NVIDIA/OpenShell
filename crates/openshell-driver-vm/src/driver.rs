@@ -2430,7 +2430,6 @@ impl VmDriver {
             None => None,
         };
         let sandbox_token = sandbox_token.map(str::to_string);
-        let proxy_auth = self.read_proxy_auth_credential().await?;
         let overlay_disk = overlay_disk.to_path_buf();
         let overlay_size_bytes = self
             .config
@@ -2476,7 +2475,6 @@ impl VmDriver {
                 &overlay_disk,
                 tls_materials.as_ref(),
                 sandbox_token.as_deref(),
-                proxy_auth.as_deref(),
                 preparation,
                 overlay_size_bytes,
             )
@@ -2488,26 +2486,6 @@ impl VmDriver {
             write_sandbox_owner_state(state_dir, owner_state).await?;
         }
         span_status.finish(Ok(owner_state))
-    }
-
-    async fn read_proxy_auth_credential(&self) -> Result<Option<String>, String> {
-        let Some(path) = self.config.upstream_proxy.proxy_auth_file.as_ref() else {
-            return Ok(None);
-        };
-        let path = path.clone();
-        Ok(Some(
-            tokio::task::spawn_blocking(move || {
-                let path = path
-                    .to_str()
-                    .ok_or_else(|| "proxy_auth_file must be valid UTF-8".to_string())?;
-                let raw = openshell_core::driver_utils::read_upstream_proxy_credential_file(path)?;
-                openshell_core::driver_utils::parse_upstream_proxy_credential(&raw)
-                    .map(str::to_owned)
-                    .map_err(|error| format!("proxy_auth_file is invalid: {error}"))
-            })
-            .await
-            .map_err(|error| format!("proxy_auth_file read task failed: {error}"))??,
-        ))
     }
 
     fn resolved_sandbox_image(&self, sandbox: &Sandbox) -> Option<String> {
@@ -6090,7 +6068,6 @@ fn create_sandbox_overlay_image_from_template(
     overlay_disk: &Path,
     tls_materials: Option<&GuestTlsMaterials>,
     sandbox_token: Option<&str>,
-    proxy_auth: Option<&str>,
 ) -> Result<(), String> {
     clone_or_copy_sparse_file(template_path, overlay_disk)?;
     if let Some(tls) = tls_materials {
@@ -6098,9 +6075,6 @@ fn create_sandbox_overlay_image_from_template(
     }
     if let Some(token) = sandbox_token {
         inject_guest_sandbox_token(overlay_disk, token)?;
-    }
-    if let Some(credential) = proxy_auth {
-        inject_guest_proxy_auth(overlay_disk, credential)?;
     }
     Ok(())
 }
@@ -6110,7 +6084,6 @@ fn prepare_sandbox_overlay_image(
     overlay_disk: &Path,
     tls_materials: Option<&GuestTlsMaterials>,
     sandbox_token: Option<&str>,
-    proxy_auth: Option<&str>,
     preparation: OverlayPreparation,
     expected_size_bytes: u64,
 ) -> Result<(), String> {
@@ -6122,9 +6095,6 @@ fn prepare_sandbox_overlay_image(
                 }
                 if let Some(token) = sandbox_token {
                     inject_guest_sandbox_token(overlay_disk, token)?;
-                }
-                if let Some(credential) = proxy_auth {
-                    inject_guest_proxy_auth(overlay_disk, credential)?;
                 }
                 return Ok(());
             }
@@ -6157,7 +6127,6 @@ fn prepare_sandbox_overlay_image(
         overlay_disk,
         tls_materials,
         sandbox_token,
-        proxy_auth,
     )
 }
 
@@ -6184,12 +6153,6 @@ fn inject_guest_sandbox_token(overlay_disk: &Path, token: &str) -> Result<(), St
     let token_path = overlay_upper_path(GUEST_SANDBOX_TOKEN_PATH);
     write_rootfs_image_file(overlay_disk, &token_path, format!("{token}\n").as_bytes())?;
     set_rootfs_image_file_mode(overlay_disk, &token_path, 0o600)
-}
-
-fn inject_guest_proxy_auth(overlay_disk: &Path, credential: &str) -> Result<(), String> {
-    let path = overlay_upper_path(GUEST_UPSTREAM_PROXY_AUTH_PATH);
-    write_rootfs_image_file(overlay_disk, &path, format!("{credential}\n").as_bytes())?;
-    set_rootfs_image_file_mode(overlay_disk, &path, 0o600)
 }
 
 #[allow(clippy::result_large_err)]
@@ -8561,7 +8524,6 @@ mod tests {
             &overlay,
             None,
             None,
-            None,
             OverlayPreparation::PreserveExisting,
             "saved-overlay".len() as u64,
         )
@@ -8583,7 +8545,6 @@ mod tests {
         prepare_sandbox_overlay_image(
             &template,
             &overlay,
-            None,
             None,
             None,
             OverlayPreparation::PreserveExisting,

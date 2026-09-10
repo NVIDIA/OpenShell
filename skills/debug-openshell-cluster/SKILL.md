@@ -670,16 +670,17 @@ openshell logs <sandbox-name>
 
 When VM sandbox egress routes through a corporate HTTP forward proxy, the
 operator-owned settings live under `[openshell.drivers.vm]` and the gateway
-forwards them to the `openshell-driver-vm` subprocess as `--https-proxy`,
-`--no-proxy`, `--proxy-auth-file`, `--proxy-auth-allow-insecure`,
-`--proxy-connect-by-hostname`, and `--proxy-ca-bundle`. Both the gateway and
+forwards them to the `openshell-driver-vm` subprocess as `--upstream-proxy`,
+`--upstream-no-proxy`, `--upstream-proxy-auth-file`,
+`--upstream-proxy-auth-allow-insecure`,
+`--upstream-proxy-connect-by-hostname`, and `--upstream-proxy-ca-bundle`. Both the gateway and
 the driver validate them at startup, so any present-but-invalid value fails
 closed with an error naming the key rather than reverting to a direct dial.
 Confirm the configuration and the resulting driver argv first:
 
 ```bash
 grep -A20 '^\[openshell.drivers.vm\]' <gateway.toml> | grep -E 'https_proxy|no_proxy|proxy_auth_file|proxy_auth_allow_insecure|proxy_connect_by_hostname|proxy_ca_bundle'
-ps -o args= -p "$(pgrep -f openshell-driver-vm | head -n1)" | tr ' ' '\n' | grep -A1 -- '--proxy\|--https-proxy\|--no-proxy'
+ps -o args= -p "$(pgrep -f openshell-driver-vm | head -n1)" | tr ' ' '\n' | grep -A1 -- '--upstream-proxy\|--upstream-no-proxy'
 ```
 
 Reachability is the most common failure, and it depends on the VM backend.

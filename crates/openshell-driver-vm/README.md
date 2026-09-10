@@ -167,7 +167,12 @@ For gateway-managed VM drivers, configure `guest_tls_ca`, `guest_tls_cert`, and
 `guest_tls_key` together under `[openshell.gateway]`; the gateway validates and
 injects that bundle into only the selected local driver. The standalone
 `openshell-driver-vm` CLI retains its `--guest-tls-*` inputs for independent
-operation.
+operation. Standalone invocations use `--grpc-endpoint` and the
+`--upstream-proxy`, `--upstream-no-proxy`, `--upstream-proxy-auth-file`,
+`--upstream-proxy-auth-allow-insecure`, `--upstream-proxy-connect-by-hostname`,
+and `--upstream-proxy-ca-bundle` flags. Replace the removed
+`--openshell-endpoint`, `--https-proxy`, `--no-proxy`, and `--proxy-*` spellings
+in existing scripts.
 
 See [`openshell-gateway --help`](../openshell-server/src/cli.rs) for the gateway process flag surface.
 
