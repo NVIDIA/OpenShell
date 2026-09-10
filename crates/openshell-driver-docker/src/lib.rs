@@ -24,8 +24,9 @@ use futures::{Stream, StreamExt};
 use openshell_core::config::{DEFAULT_SANDBOX_PIDS_LIMIT, DEFAULT_STOP_TIMEOUT_SECS};
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
-    CONDITION_EXITED, CONDITION_RUNTIME_RESTART, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
-    LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE,
+    CONDITION_EXITED, CONDITION_RUNTIME_RESTART, CONDITION_WORKSPACE_VALIDATION_FAILED,
+    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
+    LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE, SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED,
     SUPERVISOR_IMAGE_BINARY_PATH, extract_first_tar_entry, supervisor_image_should_refresh,
     temp_extract_container_name, validate_linux_elf_binary, write_cache_binary_atomic,
 };
@@ -38,14 +39,15 @@ use openshell_core::progress::{
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
 };
 use openshell_core::proto::compute::v1::{
-    CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition, DriverPlatformEvent,
-    DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate, EnsureWorkspaceRequest,
-    EnsureWorkspaceResponse, GatewayListenerRequirement, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    CpuResourceCapabilities, CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest,
+    DeleteSandboxResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition,
+    DriverPlatformEvent, DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate,
+    EnsureWorkspaceRequest, EnsureWorkspaceResponse, GatewayListenerRequirement,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
-    GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest,
-    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    GpuResourceCapabilities, GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse,
+    MemoryResourceCapabilities, ResourceCapabilities, StartSandboxRequest, StartSandboxResponse,
+    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
     compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
@@ -208,10 +210,15 @@ struct DockerDriverRuntimeConfig {
     supervisor_bin: PathBuf,
     guest_tls: Option<DockerGuestTlsPaths>,
     daemon_version: String,
-    supports_gpu: bool,
-    allow_all_default_gpu: bool,
+    gpu: DockerGpuRuntimeCapabilities,
     sandbox_pids_limit: i64,
     enable_bind_mounts: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DockerGpuRuntimeCapabilities {
+    cdi_supported: bool,
+    wsl_all_gpu_fallback_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -497,12 +504,16 @@ impl DockerComputeDriver {
         let info = docker.info().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon info: {err}"))
         })?;
-        let supports_gpu = info
+        let cdi_supported = info
             .cdi_spec_dirs
             .as_ref()
             .is_some_and(|dirs| !dirs.is_empty());
         let cdi_gpu_inventory = docker_cdi_gpu_inventory(&info);
-        let allow_all_default_gpu = docker_info_reports_wsl2(&info);
+        let wsl_all_gpu_fallback_enabled = docker_info_reports_wsl2(&info);
+        let gpu = DockerGpuRuntimeCapabilities {
+            cdi_supported,
+            wsl_all_gpu_fallback_enabled,
+        };
         validate_sandbox_pids_limit(docker_config.sandbox_pids_limit)?;
         let gateway_port = gateway_bind_address.port();
         if gateway_port == 0 {
@@ -552,8 +563,7 @@ impl DockerComputeDriver {
                 supervisor_bin,
                 guest_tls,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
-                supports_gpu,
-                allow_all_default_gpu,
+                gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
                 enable_bind_mounts: docker_config.enable_bind_mounts,
             },
@@ -561,7 +571,7 @@ impl DockerComputeDriver {
             pending: Arc::new(Mutex::new(HashMap::new())),
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 cdi_gpu_inventory,
-                allow_all_default_gpu,
+                gpu.wsl_all_gpu_fallback_enabled,
             )),
             lifecycle_event_fences: DockerLifecycleEventFences::default(),
         };
@@ -582,6 +592,20 @@ impl DockerComputeDriver {
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
             driver_reports_runtime_readiness: false,
+            resource_capabilities: Some(ResourceCapabilities {
+                cpu: Some(CpuResourceCapabilities {
+                    limit_supported: true,
+                }),
+                memory: Some(MemoryResourceCapabilities {
+                    limit_supported: true,
+                }),
+                gpu: Some(GpuResourceCapabilities {
+                    default_selection_supported: self.config.gpu.cdi_supported,
+                    count_selection_supported: self.config.gpu.cdi_supported,
+                }),
+            }),
+            rootfs_tar_staging_dir: String::new(),
+            rootfs_tar_max_bytes: 0,
         }
     }
 
@@ -613,7 +637,7 @@ impl DockerComputeDriver {
             DockerSandboxDriverConfig::from_template(template).map_err(Status::invalid_argument)?;
         validate_docker_driver_mounts(&driver_config.mounts, config.enable_bind_mounts)?;
         let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
-        Self::validate_gpu_request(gpu_requirements, config.supports_gpu, &driver_config)?;
+        Self::validate_gpu_request(gpu_requirements, config.gpu.cdi_supported, &driver_config)?;
         Ok(ValidatedDockerSandbox {
             template,
             driver_config,
@@ -721,7 +745,7 @@ impl DockerComputeDriver {
             .map_err(|err| internal_status("query Docker daemon info", err))?;
         self.gpu_selector.refresh(
             docker_cdi_gpu_inventory(&info),
-            self.config.allow_all_default_gpu,
+            self.config.gpu.wsl_all_gpu_fallback_enabled,
         );
         Ok(())
     }
@@ -771,7 +795,7 @@ impl DockerComputeDriver {
             return Ok(Some(sandbox));
         }
 
-        Ok(self.pending_snapshot(sandbox_id, sandbox_name).await)
+        self.pending_snapshot(sandbox_id, sandbox_name).await
     }
 
     async fn current_snapshots(&self) -> Result<Vec<DriverSandbox>, Status> {
@@ -1044,7 +1068,9 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<bool, Status> {
-        let pending = self.remove_pending_sandbox(sandbox_id, sandbox_name).await;
+        let pending = self
+            .remove_pending_sandbox(sandbox_id, sandbox_name)
+            .await?;
         if let Some(record) = pending.as_ref()
             && let Some(task) = record.task.as_ref()
         {
@@ -1078,6 +1104,11 @@ impl DockerComputeDriver {
                     }
                 }
             }
+            // Container gone and no in-memory record survived (gateway
+            // restarted after an out-of-band `docker rm`). DeleteSandbox is
+            // the only thing that ever reclaims the token file, so reclaim it
+            // here too.
+            cleanup_sandbox_token_file_for_delete(sandbox_id, None, &self.config);
             return Ok(false);
         };
         let Some(target) = summary_container_target(&container) else {
@@ -1109,7 +1140,10 @@ impl DockerComputeDriver {
             .find_managed_container_summary(sandbox_id, sandbox_name)
             .await?
         else {
-            if let Some(record) = self.remove_pending_sandbox(sandbox_id, sandbox_name).await {
+            if let Some(record) = self
+                .remove_pending_sandbox(sandbox_id, sandbox_name)
+                .await?
+            {
                 if let Some(task) = record.task {
                     task.abort();
                 }
@@ -1226,10 +1260,11 @@ impl DockerComputeDriver {
 
     async fn reserve_pending_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
         let mut pending = self.pending.lock().await;
-        if pending
-            .values()
-            .any(|record| record.sandbox.id == sandbox.id || record.sandbox.name == sandbox.name)
-        {
+        if pending.values().any(|record| {
+            record.sandbox.id == sandbox.id
+                || (record.sandbox.name == sandbox.name
+                    && record.sandbox.workspace == sandbox.workspace)
+        }) {
             return Err(Status::already_exists("sandbox already exists"));
         }
 
@@ -1252,12 +1287,12 @@ impl DockerComputeDriver {
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
-    ) -> Option<DriverSandbox> {
+    ) -> Result<Option<DriverSandbox>, Status> {
         let pending = self.pending.lock().await;
-        pending
-            .values()
-            .find(|record| pending_sandbox_matches(&record.sandbox, sandbox_id, sandbox_name))
-            .map(|record| record.sandbox.clone())
+        let Some(id) = resolve_pending_id(&pending, sandbox_id, sandbox_name)? else {
+            return Ok(None);
+        };
+        Ok(pending.get(&id).map(|record| record.sandbox.clone()))
     }
 
     async fn pending_snapshot_map(&self) -> HashMap<String, DriverSandbox> {
@@ -1277,12 +1312,12 @@ impl DockerComputeDriver {
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
-    ) -> Option<PendingSandboxRecord> {
+    ) -> Result<Option<PendingSandboxRecord>, Status> {
         let mut pending = self.pending.lock().await;
-        let id = pending.iter().find_map(|(id, record)| {
-            pending_sandbox_matches(&record.sandbox, sandbox_id, sandbox_name).then(|| id.clone())
-        })?;
-        pending.remove(&id)
+        let Some(id) = resolve_pending_id(&pending, sandbox_id, sandbox_name)? else {
+            return Ok(None);
+        };
+        Ok(pending.remove(&id))
     }
 
     async fn fail_pending_sandbox(
@@ -1537,21 +1572,14 @@ impl DockerComputeDriver {
             .map_err(|err| internal_status("find Docker sandbox container", err))?;
 
         Ok(containers.into_iter().find(|summary| {
-            let Some(labels) = summary.labels.as_ref() else {
-                return false;
-            };
-            let namespace_matches = labels
-                .get(LABEL_SANDBOX_NAMESPACE)
-                .is_some_and(|value| value == &self.config.sandbox_namespace);
-            let id_matches = sandbox_id.is_empty()
-                || labels
-                    .get(LABEL_SANDBOX_ID)
-                    .is_some_and(|value| value == sandbox_id);
-            let name_matches = sandbox_name.is_empty()
-                || labels
-                    .get(LABEL_SANDBOX_NAME)
-                    .is_some_and(|value| value == sandbox_name);
-            namespace_matches && id_matches && name_matches
+            summary.labels.as_ref().is_some_and(|labels| {
+                managed_container_identity_matches(
+                    labels,
+                    &self.config.sandbox_namespace,
+                    sandbox_id,
+                    sandbox_name,
+                )
+            })
         }))
     }
 
@@ -2139,9 +2167,73 @@ fn pending_sandbox_snapshot(
     }
 }
 
-fn pending_sandbox_matches(sandbox: &DriverSandbox, sandbox_id: &str, sandbox_name: &str) -> bool {
-    (!sandbox_id.is_empty() && sandbox.id == sandbox_id)
-        || (!sandbox_name.is_empty() && sandbox.name == sandbox_name)
+/// Decides whether a managed container satisfies a lifecycle request.
+///
+/// `sandbox_id` is authoritative, matching [`resolve_pending_id`]. Requiring
+/// the name to agree as well would discard a correct id match whenever the
+/// caller pairs it with a stale name, leaving the container and its token file
+/// behind while the driver reports the sandbox as absent.
+///
+/// A request with no identifier matches nothing. `require_sandbox_identifier`
+/// rejects that upstream, but the label filters degenerate to "every managed
+/// container in the namespace", so this does not rely on the caller to guard it.
+fn managed_container_identity_matches(
+    labels: &HashMap<String, String>,
+    namespace: &str,
+    sandbox_id: &str,
+    sandbox_name: &str,
+) -> bool {
+    if labels
+        .get(LABEL_SANDBOX_NAMESPACE)
+        .is_none_or(|value| value != namespace)
+    {
+        return false;
+    }
+    if !sandbox_id.is_empty() {
+        return labels
+            .get(LABEL_SANDBOX_ID)
+            .is_some_and(|value| value == sandbox_id);
+    }
+    !sandbox_name.is_empty()
+        && labels
+            .get(LABEL_SANDBOX_NAME)
+            .is_some_and(|value| value == sandbox_name)
+}
+
+/// Resolves a lifecycle request to at most one pending sandbox id.
+///
+/// `sandbox_id` is authoritative: when the caller supplies one, the name is
+/// never consulted as an alternative. The name fallback rejects ambiguity
+/// instead of letting `HashMap` iteration order pick a match, because sandbox
+/// names are unique per workspace and the driver request carries no workspace.
+fn resolve_pending_id(
+    pending: &HashMap<String, PendingSandboxRecord>,
+    sandbox_id: &str,
+    sandbox_name: &str,
+) -> Result<Option<String>, Status> {
+    if !sandbox_id.is_empty() {
+        return Ok(pending
+            .contains_key(sandbox_id)
+            .then(|| sandbox_id.to_string()));
+    }
+    if sandbox_name.is_empty() {
+        return Ok(None);
+    }
+
+    let mut matches = pending
+        .iter()
+        .filter(|(_, record)| record.sandbox.name == sandbox_name)
+        .map(|(id, _)| id.clone());
+
+    let Some(id) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(Status::failed_precondition(
+            "sandbox_name matches multiple pending sandboxes; specify sandbox_id",
+        ));
+    }
+    Ok(Some(id))
 }
 
 fn provisioning_condition() -> DriverCondition {
@@ -3473,8 +3565,10 @@ fn driver_status_from_summary(
 
 /// Refine an exited Docker sandbox's `Ready` condition from inspected state.
 ///
-/// A signal kill (exit 137/143 = SIGKILL/SIGTERM, not OOM) is the signature of
-/// a machine/daemon restart terminating a running container. Reclassify it from
+/// A workspace-validation exit is reported distinctly so users can repair the
+/// OCI working directory rather than diagnose a generic crash. A signal kill
+/// (exit 137/143 = SIGKILL/SIGTERM, not OOM) is the signature of a
+/// machine/daemon restart terminating a running container. Reclassify it from
 /// the generic terminal `ContainerExited` to the recoverable
 /// `ContainerRuntimeRestart` so gateway startup can revive it. OOM kills and
 /// ordinary application exits stay `ContainerExited` and terminal.
@@ -3482,7 +3576,7 @@ fn apply_docker_exit_classification(sandbox: &mut DriverSandbox, state: &Contain
     if state.oom_killed == Some(true) {
         return;
     }
-    let Some(code) = state.exit_code.filter(|&code| matches!(code, 137 | 143)) else {
+    let Some(code) = state.exit_code else {
         return;
     };
     let Some(condition) = sandbox
@@ -3495,8 +3589,13 @@ fn apply_docker_exit_classification(sandbox: &mut DriverSandbox, state: &Contain
     if condition.reason != CONDITION_EXITED {
         return;
     }
-    condition.reason = CONDITION_RUNTIME_RESTART.to_string();
-    condition.message = format!("Container terminated by signal (exit code {code})");
+    if code == i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED) {
+        condition.reason = CONDITION_WORKSPACE_VALIDATION_FAILED.to_string();
+        condition.message = "OCI WorkingDir is not usable by the sandbox identity".to_string();
+    } else if matches!(code, 137 | 143) {
+        condition.reason = CONDITION_RUNTIME_RESTART.to_string();
+        condition.message = format!("Container terminated by signal (exit code {code})");
+    }
 }
 
 fn container_ready_condition(

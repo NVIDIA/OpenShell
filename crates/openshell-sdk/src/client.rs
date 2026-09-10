@@ -4,14 +4,14 @@
 //! High-level async client over the gateway gRPC surface.
 //!
 //! Covers the sandbox-focused MVP slice: health, sandbox CRUD, readiness /
-//! deletion waits, and non-streaming exec. Other RPCs (inference, providers,
-//! policy, logs, settings, SSH, forwarding) are reachable via
-//! [`OpenShellClient::raw_grpc`] / [`OpenShellClient::raw_inference`].
+//! deletion waits, and non-streaming exec. Other RPCs (providers, policy,
+//! logs, settings, SSH, and forwarding) are reachable via
+//! [`OpenShellClient::raw_grpc`].
 
 use crate::auth::{BearerSlot, EdgeAuthInterceptor, bearer_metadata};
 use crate::config::{AuthConfig, ClientConfig};
 use crate::error::{Result, SdkError};
-use crate::raw::{AuthedGrpcClient, AuthedInferenceClient};
+use crate::raw::AuthedGrpcClient;
 use crate::refresh::{RefreshedToken, TokenSource};
 use crate::transport;
 use crate::types::{
@@ -112,24 +112,6 @@ impl OpenShellClient {
     pub async fn raw_grpc_fresh(&self) -> Result<AuthedGrpcClient> {
         self.ensure_fresh().await?;
         Ok(self.raw_grpc())
-    }
-
-    /// Authenticated gRPC client for the inference service.
-    ///
-    /// Like [`OpenShellClient::raw_grpc`], this does not drive OIDC refresh;
-    /// use [`OpenShellClient::raw_inference_fresh`] when a refresher is wired.
-    pub fn raw_inference(&self) -> AuthedInferenceClient {
-        proto::inference_client::InferenceClient::with_interceptor(
-            self.channel.clone(),
-            self.interceptor.clone(),
-        )
-    }
-
-    /// Like [`OpenShellClient::raw_inference`], but proactively refreshes the
-    /// bearer token first (see [`OpenShellClient::raw_grpc_fresh`]).
-    pub async fn raw_inference_fresh(&self) -> Result<AuthedInferenceClient> {
-        self.ensure_fresh().await?;
-        Ok(self.raw_inference())
     }
 
     /// Force an OIDC refresh and write the new token into the live bearer

@@ -39,8 +39,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-conformance-cli/` | Conformance CLI | Distributable `list` and `run` entrypoint for gateway conformance |
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
 | `crates/openshell-sandbox/` | Sandbox runtime | Container supervision, policy-enforced egress routing |
-| `crates/openshell-policy/` | Policy engine | Filesystem, network, process, and inference constraints |
-| `crates/openshell-router/` | Privacy router | Privacy-aware LLM routing |
+| `crates/openshell-policy/` | Policy engine | Filesystem, network, and process constraints |
 | `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
 | `crates/openshell-gateway-interceptors/` | Gateway interceptors | Intercepts and transforms configured gRPC requests at the gateway routing boundary |
 | `crates/openshell-ocsf/` | OCSF logging | OCSF v1.8.0 event types, builders, shorthand/JSONL formatters, tracing layers |
@@ -57,7 +56,6 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-driver-db-credstore/` | Database credential driver | In-process `CredentialDriver` backend for gateway database credential storage |
 | `crates/openshell-driver-kubernetes/` | Kubernetes compute driver | In-process `ComputeDriver` backend for K8s sandbox pods |
 | `crates/openshell-driver-docker/` | Docker compute driver | In-process `ComputeDriver` backend for local Docker sandbox containers |
-| `crates/openshell-driver-mxc/` | MXC compute driver | Windows in-process `ComputeDriver` backend for MXC sandbox execution |
 | `crates/openshell-driver-podman/` | Podman compute driver | In-process `ComputeDriver` backend for local Podman sandbox containers |
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
 | `crates/openshell-driver-mxc/` | Microsoft MXC compute driver | In-process Windows AppContainer and isolation-session compute backend |
@@ -65,7 +63,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-server-macros/` | Server macros | Compile-time helpers for gateway RPC authorization |
 | `crates/openshell-supervisor-middleware/` | Middleware runtime | Generic middleware registry, remote service integration, and chain execution |
 | `crates/openshell-supervisor-middleware-builtins/` | Built-in middleware | First-party in-process middleware implementations |
-| `crates/openshell-supervisor-network/` | Network supervisor | Proxying, L7 enforcement, policy evaluation, and inference routing |
+| `crates/openshell-supervisor-network/` | Network supervisor | Proxying, L7 enforcement, policy evaluation, and provider credential injection |
 | `crates/openshell-supervisor-process/` | Process supervisor | Process lifecycle, namespace, and bypass monitoring |
 | `crates/openshell-vfio/` | VFIO support | PCI and GPU passthrough preparation and lifecycle |
 | `python/openshell/` | Python SDK | Python bindings and CLI packaging |
@@ -116,7 +114,7 @@ Use an OCSF builder + `ocsf_emit!()` for events that represent **observable sand
 - SSH authentication (accepted, denied, nonce replay)
 - Process lifecycle (start, exit, timeout, signal failure)
 - Security findings (unsafe policy, unavailable controls, replay attacks)
-- Configuration changes (policy load/reload, TLS setup, inference routes, settings)
+- Configuration changes (policy load/reload, TLS setup, provider attachments, settings)
 - Application lifecycle (supervisor start, SSH server ready)
 
 ### When to use plain tracing
@@ -138,7 +136,7 @@ Use `info!()`, `debug!()`, `warn!()` for **internal operational plumbing** that 
 | SSH sessions | `SshActivityBuilder` | Authentication, channel operations |
 | Process start/stop | `ProcessActivityBuilder` | Entrypoint lifecycle, signal failures |
 | Security alerts | `DetectionFindingBuilder` | Nonce replay, bypass detection, unsafe policy. Dual-emit with the domain event. |
-| Policy/config changes | `ConfigStateChangeBuilder` | Policy load, Landlock apply, TLS setup, inference routes, settings |
+| Policy/config changes | `ConfigStateChangeBuilder` | Policy load, Landlock apply, TLS setup, provider attachments, settings |
 | Supervisor lifecycle | `AppLifecycleBuilder` | Sandbox start, SSH server ready/failed |
 
 ### Severity guidelines
@@ -257,9 +255,9 @@ When behavior, commands, or development workflows change, review the related age
 - When making changes, update the relevant documentation in the `architecture/` directory.
 - When changes affect user-facing behavior, update the relevant published docs pages under `docs/` and navigation in `docs/index.yml`.
 - When changing gateway TOML fields, driver-specific config options, config defaults, or Helm rendering of `gateway.toml`, update `docs/reference/gateway-config.mdx` in the same branch.
-- `fern/` contains the Fern site config, components, preview workflow inputs, and publish settings.
+- `fern/` contains the Fern site config, components, preview workflow inputs, publish settings, and publishing documentation in `fern/README.md`.
 - Follow the docs style guide in [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx): active voice, minimal formatting, no filler introductions, `shell` fences for copyable commands, and no duplicate body H1.
-- Fern PR previews run through `.github/workflows/branch-docs.yml`, and production publish runs through the `publish-fern-docs` job in `.github/workflows/release-tag.yml` for stable release tags.
+- Fern PR previews run through `.github/workflows/branch-docs.yml`. Release Dev publishes `dev`, and Release Tag publishes an immutable stable version plus `latest`. Both production paths call `.github/workflows/sync-docs.yml` once.
 - Use the `update-docs-from-commits` skill to scan recent commits and draft doc updates.
 
 ### Architecture Docs

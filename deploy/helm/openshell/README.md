@@ -266,7 +266,7 @@ discovery endpoint or its TLS CA.
 | server.oidc.audience | string | `"openshell-cli"` | Expected audience claim for the API resource server. This should match the server's --oidc-audience, NOT the CLI client ID. |
 | server.oidc.caConfigMapName | string | `""` | Name of a ConfigMap containing a CA certificate bundle (key: ca.crt) for verifying the OIDC issuer's TLS certificate. Required when the issuer uses a non-public CA (e.g. OpenShift ingress, private PKI). |
 | server.oidc.issuer | string | `""` | OIDC issuer URL (e.g. https://keycloak.example.com/realms/openshell). |
-| server.oidc.jwksTtl | int | `3600` | JWKS key cache TTL in seconds. |
+| server.oidc.jwksTtl | int | `3600` | JWKS key cache TTL in seconds. Must be greater than zero. |
 | server.oidc.rolesClaim | string | `""` | Dot-separated path to the roles array in the JWT claims. Keycloak: "realm_access.roles", Entra ID: "roles", Okta: "groups". |
 | server.oidc.scopesClaim | string | `""` | Dot-separated path to the scopes array in the JWT claims. |
 | server.oidc.userRole | string | `""` | Role name for standard user access. |

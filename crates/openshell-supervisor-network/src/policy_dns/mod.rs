@@ -580,7 +580,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 answer: TrustedAnswer {
                     addresses,
-                    ttl: Duration::from_secs(300),
+                    ttl: Duration::from_mins(5),
                 },
             },
             Arc::new(ResolvedEndpointStore::new(
@@ -984,6 +984,6 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             clamp_mapping_ttl(Duration::from_secs(10)),
             Duration::from_secs(10)
         );
-        assert_eq!(clamp_mapping_ttl(Duration::from_secs(300)), MAX_MAPPING_TTL);
+        assert_eq!(clamp_mapping_ttl(Duration::from_mins(5)), MAX_MAPPING_TTL);
     }
 }

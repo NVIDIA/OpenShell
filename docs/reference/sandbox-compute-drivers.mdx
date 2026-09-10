@@ -133,6 +133,20 @@ request. The VM driver accepts `gpu_device_ids`, for example
 accepts at most one entry and allows either `--gpu` or `--gpu 1` when
 `gpu_device_ids` is set.
 
+## Resource Capability Reporting
+
+API clients can read each configured driver's static resource request support
+from the protected `GetGatewayInfo` response. The capability response describes
+which request forms a driver implements. It does not report live resource
+inventory, availability, or scheduling capacity, so a supported request can
+still fail when the selected runtime cannot provide the resource.
+
+CPU and memory capabilities report whether the driver enforces a resource
+limit. GPU capabilities report whether the driver accepts a default GPU request
+and an explicit GPU count. An omitted `resource_capabilities` message, or an
+omitted CPU, memory, or GPU capability, means the driver did not report that
+capability. A reported `false` value means that request form is unsupported.
+
 For Kubernetes, `pod.runtime_class_name` maps to PodSpec `runtimeClassName`.
 It overrides the gateway's configured default runtime class for that sandbox,
 while a typed `SandboxTemplate.runtime_class_name` value from the API still
@@ -143,7 +157,7 @@ the gateway. If the primary listener covers that address, the gateway reuses
 it and sandbox JWT authentication restricts the supervisor to its callback RPC
 allowlist. If the primary listener is not reachable through that address, the
 gateway creates an additional callback-only listener. Use the primary endpoint
-for CLI, administrator, health, reflection, inference-route management, and
+for CLI, administrator, health, reflection, provider management, and
 HTTP requests. A `PermissionDenied` response from an additional callback-only
 listener is expected for those requests. Do not broaden the primary listener
 to `0.0.0.0` solely to make sandbox callbacks reachable.
@@ -152,7 +166,7 @@ to `0.0.0.0` solely to make sandbox callbacks reachable.
 
 [Docker](https://www.docker.com/get-started/)-backed sandboxes run as containers on the gateway host. Use Docker for local development, single-machine gateways, and hosts that already use Docker Desktop or Docker Engine.
 
-The gateway talks to the Docker daemon to create sandbox containers. Docker is also required for local image builds from directories or Dockerfiles.
+The gateway talks to the Docker daemon to create sandbox containers.
 
 Docker Desktop and compatible macOS runtimes route `host.openshell.internal`
 through an IPv4 host-gateway alias. The gateway reuses an IPv4 primary listener
@@ -240,6 +254,26 @@ The gateway talks to the Podman API socket. The Podman driver requires Podman 5.
 For maintainer-level implementation details, refer to the [Podman driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/README.md) and [Podman networking notes](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/NETWORKING.md).
 
 Select Podman with `compute_drivers = ["podman"]` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, `host_gateway_ip`, `sandbox_ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.podman]`.
+
+### macOS Podman Socket Path
+
+On macOS, Homebrew-installed Podman does not create the default socket path
+that the driver probes (`~/.local/share/containers/podman/machine/podman.sock`).
+The actual API socket lives under `/var/folders/` in a path that macOS can
+rotate after a reboot.
+
+If the gateway fails with `Podman socket not found; is podman machine running?`
+while `podman machine list` shows a running machine, set the
+`OPENSHELL_PODMAN_SOCKET` environment variable to the dynamic socket path:
+
+```shell
+export OPENSHELL_PODMAN_SOCKET="$(podman machine inspect --format '{{.ConnectionInfo.PodmanSocket.Path}}')"
+```
+
+Add this to your shell profile or gateway launch environment so it resolves
+correctly after each reboot. Alternatively, set `socket_path` in
+`[openshell.drivers.podman]` to the current path, but note that the path may
+change when macOS rotates `/var/folders/`.
 
 Podman sandboxes default to a 45-second graceful stop window before Podman escalates from `SIGTERM` to `SIGKILL`. Set `stop_timeout_secs` in gateway config, or `OPENSHELL_STOP_TIMEOUT` for the standalone driver, when a local runtime needs a different teardown window.
 

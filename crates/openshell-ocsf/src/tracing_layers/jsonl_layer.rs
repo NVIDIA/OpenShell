@@ -12,6 +12,7 @@ use tracing::Subscriber;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
+use crate::format::downgrade::downgrade_event;
 use crate::tracing_layers::event_bridge::{OCSF_TARGET, clone_current_event};
 
 /// A tracing `Layer` that intercepts OCSF events and writes JSONL output.
@@ -23,9 +24,15 @@ use crate::tracing_layers::event_bridge::{OCSF_TARGET, clone_current_event};
 /// `false`, the layer short-circuits without writing. This allows the sandbox
 /// to hot-toggle OCSF JSONL output at runtime via the `ocsf_json_enabled`
 /// setting without rebuilding the subscriber.
+///
+/// An optional target schema version can be set via
+/// [`with_target_version`](Self::with_target_version). When set, events are
+/// downgraded to the target version before writing (stripping fields and
+/// profiles that don't exist in older schema versions).
 pub struct OcsfJsonlLayer<W: Write + Send + 'static> {
     writer: Mutex<W>,
     enabled: Option<Arc<AtomicBool>>,
+    target_version: Option<Arc<Mutex<String>>>,
 }
 
 impl<W: Write + Send + 'static> OcsfJsonlLayer<W> {
@@ -35,6 +42,7 @@ impl<W: Write + Send + 'static> OcsfJsonlLayer<W> {
         Self {
             writer: Mutex::new(writer),
             enabled: None,
+            target_version: None,
         }
     }
 
@@ -45,6 +53,16 @@ impl<W: Write + Send + 'static> OcsfJsonlLayer<W> {
     #[must_use]
     pub fn with_enabled_flag(mut self, flag: Arc<AtomicBool>) -> Self {
         self.enabled = Some(flag);
+        self
+    }
+
+    /// Attach a shared target schema version for downgrade filtering.
+    ///
+    /// When set, events are downgraded to the target version before writing.
+    /// The version can be changed at runtime via the shared mutex.
+    #[must_use]
+    pub fn with_target_version(mut self, version: Arc<Mutex<String>>) -> Self {
+        self.target_version = Some(version);
         self
     }
 }
@@ -67,9 +85,29 @@ where
         }
 
         if let Some(ocsf_event) = clone_current_event()
-            && let Ok(line) = ocsf_event.to_json_line()
             && let Ok(mut w) = self.writer.lock()
         {
+            let line = if let Some(ref target) = self.target_version
+                && let Ok(version) = target.lock()
+                && !version.is_empty()
+            {
+                let Ok(mut json) = serde_json::to_value(&ocsf_event) else {
+                    return;
+                };
+                downgrade_event(&mut json, &version);
+                match serde_json::to_string(&json) {
+                    Ok(mut s) => {
+                        s.push('\n');
+                        s
+                    }
+                    Err(_) => return,
+                }
+            } else {
+                match ocsf_event.to_json_line() {
+                    Ok(l) => l,
+                    Err(_) => return,
+                }
+            };
             let _ = w.write_all(line.as_bytes());
         }
     }

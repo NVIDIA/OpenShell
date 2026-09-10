@@ -31,7 +31,6 @@ WORKSPACE_CRATES = frozenset(
         "openshell-core",
         "openshell-policy",
         "openshell-providers",
-        "openshell-router",
         "openshell-sandbox",
         "openshell-server",
         "openshell-tui",

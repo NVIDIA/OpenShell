@@ -95,7 +95,6 @@ additive concrete-client accessors such as `SandboxTemplates()`:
 | `Providers()` | `ProviderInterface` | Full CRUD, Ensure |
 | `Workspaces()` | `WorkspaceInterface` | Full CRUD, Members |
 | `Health()` | `HealthInterface` | Configurable result |
-| `Inference()` | `InferenceInterface` | Route CRUD |
 | `Policy()` | `PolicyInterface` | List, GetStatus (draft ops return Unimplemented) |
 | `Exec()` | `ExecInterface` | Returns Unimplemented |
 | `Files()` | `FileInterface` | Returns Unimplemented |

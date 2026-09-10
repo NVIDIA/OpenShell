@@ -49,7 +49,7 @@ bytes = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
-hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "http2", "tls12", "logging", "ring"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "http2", "tls12", "logging", "aws-lc-rs"] }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
@@ -91,7 +91,7 @@ nix = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }
-rcgen = { version = "0.13", features = ["crypto", "pem"] }
+rcgen = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 temp-env = "0.3"

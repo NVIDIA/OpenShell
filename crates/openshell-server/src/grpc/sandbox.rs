@@ -32,7 +32,10 @@ use openshell_core::proto::{
     TcpForwardFrame, TcpForwardInit, TcpRelayTarget, WatchSandboxRequest, relay_open,
     tcp_forward_init,
 };
-use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
+use openshell_core::proto::{
+    BeginRootfsTarStagingRequest, BeginRootfsTarStagingResponse, Sandbox, SandboxPhase,
+    SandboxTemplate, SshSession,
+};
 use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryOutcome,
 };
@@ -58,9 +61,9 @@ use super::provider::{
     get_provider_record, is_valid_env_key, validate_provider_environment_keys_unique_with_catalog,
 };
 use super::validation::{
-    level_matches, source_matches, validate_dns1123_label, validate_exec_request_fields,
-    validate_no_reserved_provider_policy_keys, validate_policy_safety,
-    validate_sandbox_governance_spec, validate_sandbox_spec,
+    level_matches, source_matches, validate_and_canonicalize_policy, validate_dns1123_label,
+    validate_exec_request_fields, validate_no_reserved_provider_policy_keys,
+    validate_policy_safety, validate_sandbox_governance_spec, validate_sandbox_spec,
 };
 use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, clamp_limit};
 use crate::persistence::current_time_ms;
@@ -177,6 +180,73 @@ pub(super) async fn handle_create_sandbox(
         TelemetryOutcome::from_success(result.is_ok()),
     );
     result
+}
+
+/// Allocate a gateway-owned staging slot for a local rootfs tar archive.
+///
+/// The caller writes the archive to the returned path and then names the token
+/// on `CreateSandbox`. It never names a filesystem path of its own choosing.
+pub(super) async fn handle_begin_rootfs_tar_staging(
+    state: &Arc<ServerState>,
+    request: Request<BeginRootfsTarStagingRequest>,
+) -> Result<Response<BeginRootfsTarStagingResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let request = request.into_inner();
+
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &request.workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .ensure_active()?;
+
+    let subject = principal_subject(&principal)?;
+    let slot = state.compute.rootfs_tar_staging().begin(
+        &workspace,
+        &subject,
+        &request.file_name,
+        request.size_bytes,
+    )?;
+
+    Ok(Response::new(BeginRootfsTarStagingResponse {
+        staging_token: slot.token,
+        upload_path: slot.upload_path.to_string_lossy().into_owned(),
+        max_bytes: slot.max_bytes,
+        expires_at_ms: slot.expires_at_ms,
+    }))
+}
+
+/// Stable caller identity used to bind a staging slot to its requester.
+fn principal_subject(principal: &crate::auth::principal::Principal) -> Result<String, Status> {
+    match principal {
+        crate::auth::principal::Principal::User(user) => Ok(user.identity.subject.clone()),
+        _ => Err(Status::permission_denied(
+            "rootfs tar staging requires a user principal",
+        )),
+    }
+}
+
+/// Read the staging token a caller named for the active driver, without
+/// removing it. The gateway consumes it later, inside `create_sandbox`.
+fn staging_token_in_spec(spec: &SandboxSpec, driver_name: &str) -> Option<String> {
+    let config = spec.template.as_ref()?.driver_config.as_ref()?;
+    let Kind::StructValue(driver_config) = config.fields.get(driver_name)?.kind.as_ref()? else {
+        return None;
+    };
+    match driver_config
+        .fields
+        .get(crate::compute::rootfs_tar::STAGING_TOKEN_FIELD)?
+        .kind
+        .as_ref()?
+    {
+        Kind::StringValue(token) => Some(token.clone()),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,16 +367,27 @@ async fn handle_create_sandbox_inner(
         (resolved, Some(provenance))
     };
 
-    // Every newly persisted sandbox has one explicit canonical process. This
-    // portable default also preserves compatibility with callers compiled
-    // before the main-process field was introduced.
+    // Leave an omitted command empty rather than persisting a concrete shell:
+    // the supervisor resolves the default login shell against the sandbox image
+    // (bash when present, otherwise /bin/sh on minimal images like Alpine),
+    // which the gateway cannot do since it does not see the sandbox filesystem.
+    // The default is an interactive login shell, so request a TTY.
     if spec.command.is_empty() {
-        spec.command = vec!["/bin/bash".to_string(), "-l".to_string()];
         spec.tty = true;
     }
 
     // Validate field sizes before any create-side effects.
     validate_sandbox_spec(&request.name, &spec)?;
+
+    // A staging slot may only be redeemed by the caller it was issued to. This
+    // is the only point in the create path where the principal is in scope.
+    if let Some(token) = staging_token_in_spec(&spec, state.compute.configured_driver_name()) {
+        let subject = principal_subject(&principal)?;
+        state
+            .compute
+            .rootfs_tar_staging()
+            .authorize(&token, &workspace, &subject)?;
+    }
 
     let _sandbox_sync_guard = if spec.providers.is_empty() {
         None
@@ -344,6 +425,16 @@ async fn handle_create_sandbox_inner(
     if let Some(ref mut policy) = spec.policy {
         super::policy::clear_provider_credentialed_markers(policy);
         validate_no_reserved_provider_policy_keys(policy)?;
+        *policy = validate_and_canonicalize_policy(policy.clone())?;
+    }
+
+    // Process identity and MCP default materialization can increase the
+    // protobuf size. Recheck the exact canonical spec before any middleware or
+    // compute boundary can observe or persist it. The initial check remains
+    // above so requests that are already oversized still fail before I/O.
+    validate_sandbox_spec(&request.name, &spec)?;
+
+    if let Some(ref policy) = spec.policy {
         validate_policy_safety(policy)?;
         crate::middleware::validate_policy(state.middleware_registry.as_ref(), policy).await?;
     }
@@ -4119,6 +4210,344 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("_provider_work_github"));
         assert!(err.message().contains("reserved '_provider_' prefix"));
+    }
+
+    fn mcp_policy_with_options(
+        mcp: Option<openshell_core::proto::McpOptions>,
+    ) -> openshell_core::proto::SandboxPolicy {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "mcp".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "mcp".to_string(),
+                endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                    host: "mcp.example.com".to_string(),
+                    port: 443,
+                    protocol: "mcp".to_string(),
+                    mcp,
+                    // Keep this fixture valid independently of MCP version
+                    // defaulting: without allow-all, MCP endpoints require an
+                    // explicit method rule at the L7 validation boundary.
+                    rules: vec![openshell_core::proto::L7Rule {
+                        allow: Some(openshell_core::proto::L7Allow {
+                            method: "tools/list".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        policy
+    }
+
+    fn mcp_policy_with_versions(versions: &[&str]) -> openshell_core::proto::SandboxPolicy {
+        mcp_policy_with_options(Some(openshell_core::proto::McpOptions {
+            versions: versions.iter().map(ToString::to_string).collect(),
+            ..Default::default()
+        }))
+    }
+
+    fn mcp_padding_rule_name_for_policy_size(target_size: usize) -> String {
+        let mut policy = mcp_policy_with_versions(&["2025-11-25"]);
+        openshell_policy::ensure_sandbox_process_identity(&mut policy);
+        let mut policy = validate_and_canonicalize_policy(policy)
+            .expect("explicit default MCP policy must be canonicalizable");
+        policy.network_policies.insert(
+            "padding".to_string(),
+            openshell_core::proto::NetworkPolicyRule::default(),
+        );
+
+        // The padding rule has no endpoints and therefore does not change the
+        // policy's behavior. Iterative adjustment accounts for protobuf varint
+        // length-prefix growth while targeting the exact encoded boundary.
+        for _ in 0..4 {
+            let current_size = policy.encoded_len();
+            if current_size == target_size {
+                break;
+            }
+
+            let padding = &mut policy
+                .network_policies
+                .get_mut("padding")
+                .expect("padding rule must exist")
+                .name;
+            if current_size < target_size {
+                padding.push_str(&"x".repeat(target_size - current_size));
+            } else {
+                let new_len = padding
+                    .len()
+                    .checked_sub(current_size - target_size)
+                    .expect("padding adjustment must remain nonnegative");
+                padding.truncate(new_len);
+            }
+        }
+
+        assert_eq!(policy.encoded_len(), target_size);
+        policy
+            .network_policies
+            .remove("padding")
+            .expect("padding rule must exist")
+            .name
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_canonicalizes_mcp_versions_before_persistence() {
+        let state = test_server_state().await;
+
+        handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                name: "mcp-canonical".to_string(),
+                spec: Some(SandboxSpec {
+                    policy: Some(mcp_policy_with_versions(&["2025-11-25", "2025-03-26"])),
+                    ..Default::default()
+                }),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                workspace: String::new(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("supported MCP versions must be accepted");
+
+        let stored = state
+            .store
+            .get_message_by_name::<Sandbox>("default", "mcp-canonical")
+            .await
+            .expect("stored sandbox lookup must succeed")
+            .expect("created sandbox must be persisted");
+        let policy = stored
+            .spec
+            .expect("sandbox spec")
+            .policy
+            .expect("sandbox policy");
+        let versions = &policy.network_policies["mcp"].endpoints[0]
+            .mcp
+            .as_ref()
+            .expect("MCP options")
+            .versions;
+        assert_eq!(versions, &["2025-03-26", "2025-11-25"]);
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_materializes_default_mcp_version_before_persistence() {
+        let state = test_server_state().await;
+        let cases = [
+            ("mcp-def-no-opts", None),
+            (
+                "mcp-def-empty",
+                Some(openshell_core::proto::McpOptions::default()),
+            ),
+            (
+                "mcp-def-explicit",
+                Some(openshell_core::proto::McpOptions {
+                    versions: vec!["2025-11-25".to_string()],
+                    ..Default::default()
+                }),
+            ),
+        ];
+        let mut expected_policy = None;
+        let mut expected_bytes = None;
+
+        for (sandbox_name, mcp) in cases {
+            handle_create_sandbox(
+                &state,
+                authed_request(CreateSandboxRequest {
+                    name: sandbox_name.to_string(),
+                    spec: Some(SandboxSpec {
+                        policy: Some(mcp_policy_with_options(mcp)),
+                        ..Default::default()
+                    }),
+                    labels: HashMap::new(),
+                    annotations: HashMap::new(),
+                    workspace: String::new(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("defaultable MCP versions must be accepted");
+
+            let stored = state
+                .store
+                .get_message_by_name::<Sandbox>("default", sandbox_name)
+                .await
+                .expect("stored sandbox lookup must succeed")
+                .expect("created sandbox must be persisted");
+            let policy = stored
+                .spec
+                .expect("sandbox spec")
+                .policy
+                .expect("sandbox policy");
+            let options = policy.network_policies["mcp"].endpoints[0]
+                .mcp
+                .as_ref()
+                .expect("MCP options must be materialized before persistence");
+            assert_eq!(options.versions, ["2025-11-25"], "{sandbox_name}");
+
+            let encoded = policy.encode_to_vec();
+            if let Some(expected) = expected_policy.as_ref() {
+                assert_eq!(
+                    &policy, expected,
+                    "default spellings must persist the same canonical policy: {sandbox_name}"
+                );
+                assert_eq!(
+                    encoded,
+                    *expected_bytes
+                        .as_ref()
+                        .expect("canonical policy bytes accompany the expected policy"),
+                    "default spellings must persist identical policy bytes: {sandbox_name}"
+                );
+            } else {
+                expected_policy = Some(policy);
+                expected_bytes = Some(encoded);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_bounds_canonical_mcp_policy_size_for_all_default_spellings() {
+        let state = test_server_state().await;
+        let max_policy_size = super::super::MAX_POLICY_SIZE;
+
+        for (boundary, target_size, should_accept) in [
+            ("fit", max_policy_size, true),
+            ("over", max_policy_size + 1, false),
+        ] {
+            let padding_name = mcp_padding_rule_name_for_policy_size(target_size);
+            let cases = [
+                ("omitted", None),
+                ("empty", Some(openshell_core::proto::McpOptions::default())),
+                (
+                    "explicit",
+                    Some(openshell_core::proto::McpOptions {
+                        versions: vec!["2025-11-25".to_string()],
+                        ..Default::default()
+                    }),
+                ),
+            ];
+
+            for (spelling, mcp) in cases {
+                let sandbox_name = format!("mcp-{boundary}-{spelling}");
+                let mut policy = mcp_policy_with_options(mcp);
+                openshell_policy::ensure_sandbox_process_identity(&mut policy);
+                policy.network_policies.insert(
+                    "padding".to_string(),
+                    openshell_core::proto::NetworkPolicyRule {
+                        name: padding_name.clone(),
+                        ..Default::default()
+                    },
+                );
+
+                let raw_size = policy.encoded_len();
+                if spelling == "explicit" {
+                    assert_eq!(raw_size, target_size, "{sandbox_name}");
+                } else {
+                    assert!(raw_size < target_size, "{sandbox_name}: {raw_size}");
+                }
+
+                let canonical = validate_and_canonicalize_policy(policy.clone())
+                    .expect("defaultable MCP policy must be canonicalizable");
+                assert_eq!(canonical.encoded_len(), target_size, "{sandbox_name}");
+
+                let result = handle_create_sandbox(
+                    &state,
+                    authed_request(CreateSandboxRequest {
+                        name: sandbox_name.clone(),
+                        spec: Some(SandboxSpec {
+                            policy: Some(policy),
+                            ..Default::default()
+                        }),
+                        labels: HashMap::new(),
+                        annotations: HashMap::new(),
+                        workspace: String::new(),
+                        ..Default::default()
+                    }),
+                )
+                .await;
+
+                if should_accept {
+                    result.expect("canonical policy at the size limit must be accepted");
+                    let stored = state
+                        .store
+                        .get_message_by_name::<Sandbox>("default", &sandbox_name)
+                        .await
+                        .expect("stored sandbox lookup must succeed")
+                        .expect("accepted sandbox must be persisted");
+                    let stored_policy = stored
+                        .spec
+                        .expect("sandbox spec")
+                        .policy
+                        .expect("sandbox policy");
+                    assert_eq!(stored_policy, canonical, "{sandbox_name}");
+                    assert_eq!(
+                        stored_policy.encoded_len(),
+                        max_policy_size,
+                        "{sandbox_name}"
+                    );
+                } else {
+                    let error = result.expect_err("oversized canonical policy must be rejected");
+                    assert_eq!(error.code(), tonic::Code::InvalidArgument, "{sandbox_name}");
+                    assert_eq!(
+                        error.message(),
+                        format!(
+                            "policy serialized size exceeds maximum ({target_size} > {max_policy_size})"
+                        ),
+                        "{sandbox_name}"
+                    );
+                    let stored = state
+                        .store
+                        .get_message_by_name::<Sandbox>("default", &sandbox_name)
+                        .await
+                        .expect("stored sandbox lookup must succeed");
+                    assert!(
+                        stored.is_none(),
+                        "oversized policy must not persist sandbox {sandbox_name}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_rejects_invalid_mcp_versions_without_persisting() {
+        let state = test_server_state().await;
+        let cases: &[(&str, &[&str])] = &[
+            ("mcp-duplicate-versions", &["2025-11-25", "2025-11-25"]),
+            ("mcp-unsupported-version", &["2026-07-28"]),
+        ];
+
+        for &(sandbox_name, versions) in cases {
+            let error = handle_create_sandbox(
+                &state,
+                authed_request(CreateSandboxRequest {
+                    name: sandbox_name.to_string(),
+                    spec: Some(SandboxSpec {
+                        policy: Some(mcp_policy_with_versions(versions)),
+                        ..Default::default()
+                    }),
+                    labels: HashMap::new(),
+                    annotations: HashMap::new(),
+                    workspace: String::new(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect_err("invalid MCP versions must reject sandbox creation");
+
+            assert_eq!(error.code(), tonic::Code::InvalidArgument, "{sandbox_name}");
+            let stored = state
+                .store
+                .get_message_by_name::<Sandbox>("default", sandbox_name)
+                .await
+                .expect("stored sandbox lookup must succeed");
+            assert!(
+                stored.is_none(),
+                "invalid MCP versions must not persist sandbox {sandbox_name}"
+            );
+        }
     }
 
     #[tokio::test]

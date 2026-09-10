@@ -995,7 +995,7 @@ mod tests {
             Config::new(None)
                 .with_grpc_rate_limit(Some(10), Some(60))
                 .grpc_rate_limit(),
-            Some((10, Duration::from_secs(60)))
+            Some((10, Duration::from_mins(1)))
         );
     }
 

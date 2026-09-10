@@ -139,6 +139,13 @@ fn workload_template_proto(name: &str, workspace: &str) -> proto::SandboxWorkloa
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn begin_rootfs_tar_staging(
+        &self,
+        _request: tonic::Request<proto::BeginRootfsTarStagingRequest>,
+    ) -> Result<Response<proto::BeginRootfsTarStagingResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn report_main_process_exit(
         &self,
         _request: tonic::Request<proto::ReportMainProcessExitRequest>,

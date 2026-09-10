@@ -505,7 +505,7 @@ mod tests {
         l2.renew(&mut guard2).await.unwrap();
 
         // Replica-1 cannot re-acquire (lease exists)
-        let l1_retry = lease(store.clone(), "replica-1", Duration::from_secs(60));
+        let l1_retry = lease(store.clone(), "replica-1", Duration::from_mins(1));
         let err = l1_retry.try_acquire().await.unwrap_err();
         assert!(matches!(err, LeaseError::AlreadyHeld));
 

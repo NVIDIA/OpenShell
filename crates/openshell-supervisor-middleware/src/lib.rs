@@ -33,7 +33,8 @@ use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response as TonicResponse, Status as TonicStatus};
 
 pub use openshell_core::middleware::{
-    HttpRequestView, InProcessMiddleware, SupervisorMiddlewareEndpoint, WebSocketResponseStream,
+    HttpRequestView, HttpResponseResultStream, InProcessMiddleware, SupervisorMiddlewareEndpoint,
+    WebSocketResponseStream,
 };
 pub type MiddlewareService =
     dyn SupervisorMiddleware<EvaluateWebSocketSessionStream = WebSocketResponseStream>;
@@ -179,6 +180,13 @@ impl InProcessMiddleware for EndpointInProcessAdapter {
         requests: tokio::sync::mpsc::Receiver<openshell_core::proto::WebSocketSessionEvent>,
     ) -> std::result::Result<WebSocketResponseStream, tonic::Status> {
         self.endpoint.open_websocket_session(requests).await
+    }
+
+    async fn open_http_response_pre_return(
+        &self,
+        requests: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpResponseEvent>,
+    ) -> std::result::Result<HttpResponseResultStream, tonic::Status> {
+        self.endpoint.open_http_response_pre_return(requests).await
     }
 }
 
@@ -836,6 +844,12 @@ fn supported_binding(source: &str, binding: &MiddlewareBinding) -> Result<Suppor
             Some(SupervisorMiddlewarePhase::PreCredentials),
         ) => Ok(SupportedBinding::HttpPreCredentials),
         (
+            Some(SupervisorMiddlewareOperation::HttpResponse),
+            Some(SupervisorMiddlewarePhase::PreReturn),
+        ) => Err(miette!(
+            "{source} advertises HTTP_RESPONSE/PRE_RETURN, which is not yet supported"
+        )),
+        (
             Some(SupervisorMiddlewareOperation::WebsocketMessage),
             Some(SupervisorMiddlewarePhase::PreCredentials),
         ) => Ok(SupportedBinding::WebSocketPreCredentials),
@@ -843,7 +857,7 @@ fn supported_binding(source: &str, binding: &MiddlewareBinding) -> Result<Suppor
             Some(SupervisorMiddlewareOperation::WebsocketMessage),
             Some(SupervisorMiddlewarePhase::PreReturn),
         ) => Err(miette!(
-            "{source} advertises WEBSOCKET_MESSAGE/PRE_RETURN, which is reserved for PR 2"
+            "{source} advertises WEBSOCKET_MESSAGE/PRE_RETURN, which is not yet supported"
         )),
         _ => Err(miette!(
             "{source} advertises an unsupported middleware operation/phase pair"
@@ -1430,6 +1444,20 @@ impl ChainRunner {
                 entries,
                 SupervisorMiddlewareOperation::WebsocketMessage,
                 SupervisorMiddlewarePhase::PreCredentials,
+            )
+            .await?
+            .entries)
+    }
+
+    pub async fn describe_http_response_chain(
+        &self,
+        entries: &[ChainEntry],
+    ) -> Result<Vec<DescribedChainEntry>> {
+        Ok(self
+            .describe_chain_for(
+                entries,
+                SupervisorMiddlewareOperation::HttpResponse,
+                SupervisorMiddlewarePhase::PreReturn,
             )
             .await?
             .entries)
@@ -3658,6 +3686,30 @@ mod tests {
     }
 
     #[test]
+    fn manifest_rejects_http_response_pre_return_binding_until_dispatch_is_available() {
+        let registration = external_registration(4096);
+        let manifest = MiddlewareManifest {
+            name: "example/response".into(),
+            service_version: "test".into(),
+            bindings: vec![MiddlewareBinding {
+                operation: SupervisorMiddlewareOperation::HttpResponse as i32,
+                phase: SupervisorMiddlewarePhase::PreReturn as i32,
+                max_payload_bytes: 4096,
+                timeout: "500ms".into(),
+            }],
+            expected_audience: String::new(),
+        };
+
+        let error = validate_external_manifest(&registration, &manifest, 4096, false)
+            .expect_err("HTTP response pre-return binding must remain unavailable");
+        assert!(
+            error
+                .to_string()
+                .contains("HTTP_RESPONSE/PRE_RETURN, which is not yet supported")
+        );
+    }
+
+    #[test]
     fn manifest_accepts_forward_websocket_binding_and_reserves_return_phase() {
         let binding = |phase| MiddlewareBinding {
             operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
@@ -3676,8 +3728,8 @@ mod tests {
 
         manifest.bindings = vec![binding(SupervisorMiddlewarePhase::PreReturn)];
         let error = validate_manifest_bindings("test WebSocket service", &manifest, None)
-            .expect_err("return-path binding stays reserved for PR 2");
-        assert!(error.to_string().contains("reserved for PR 2"));
+            .expect_err("return-path WebSocket binding is not yet supported");
+        assert!(error.to_string().contains("not yet supported"));
     }
 
     #[test]
@@ -4713,7 +4765,7 @@ mod tests {
         close_on_first_message: bool,
         messages: Arc<std::sync::atomic::AtomicUsize>,
         session_ends: Option<
-            tokio::sync::mpsc::UnboundedSender<openshell_core::proto::WebSocketSessionEndReason>,
+            tokio::sync::mpsc::UnboundedSender<openshell_core::proto::MiddlewareSessionEndReason>,
         >,
     }
 
@@ -4804,7 +4856,7 @@ mod tests {
                         Some(web_socket_session_event::Event::SessionEnd(end)) => {
                             if let Some(session_ends) = &session_ends
                                 && let Ok(reason) =
-                                    openshell_core::proto::WebSocketSessionEndReason::try_from(
+                                    openshell_core::proto::MiddlewareSessionEndReason::try_from(
                                         end.reason,
                                     )
                             {
@@ -5089,14 +5141,14 @@ mod tests {
             assert!(!text.invocations[0].failed);
 
             session
-                .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+                .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
                 .await;
         }
     }
 
     #[tokio::test]
     async fn explicit_websocket_preflight_denial_is_authoritative_for_both_error_modes() {
-        use openshell_core::proto::WebSocketSessionEndReason;
+        use openshell_core::proto::MiddlewareSessionEndReason;
 
         for on_error in [OnError::FailOpen, OnError::FailClosed] {
             let (session_ends_tx, mut session_ends_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5132,7 +5184,7 @@ mod tests {
             assert!(!outcome.allowed);
             assert_eq!(
                 outcome.terminal_reason,
-                Some(WebSocketSessionEndReason::MiddlewareDenial)
+                Some(MiddlewareSessionEndReason::MiddlewareDenial)
             );
             assert_eq!(
                 outcome.reason,
@@ -5170,7 +5222,7 @@ mod tests {
             assert!(!outcome.invocations[0].failed);
             assert_eq!(
                 session_ends_rx.recv().await,
-                Some(WebSocketSessionEndReason::MiddlewareDenial)
+                Some(MiddlewareSessionEndReason::MiddlewareDenial)
             );
             assert!(
                 session_ends_rx.try_recv().is_err(),
@@ -5181,7 +5233,7 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_websocket_preflight_denial_ends_every_opened_stage() {
-        use openshell_core::proto::WebSocketSessionEndReason;
+        use openshell_core::proto::MiddlewareSessionEndReason;
 
         let (first_end_tx, mut first_end_rx) = tokio::sync::mpsc::unbounded_channel();
         let (denier_end_tx, mut denier_end_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5223,7 +5275,7 @@ mod tests {
         assert!(!outcome.allowed);
         assert_eq!(
             outcome.terminal_reason,
-            Some(WebSocketSessionEndReason::MiddlewareDenial)
+            Some(MiddlewareSessionEndReason::MiddlewareDenial)
         );
         assert_eq!(
             outcome
@@ -5240,7 +5292,7 @@ mod tests {
         for receiver in [&mut first_end_rx, &mut denier_end_rx, &mut last_end_rx] {
             assert_eq!(
                 receiver.recv().await,
-                Some(WebSocketSessionEndReason::MiddlewareDenial)
+                Some(MiddlewareSessionEndReason::MiddlewareDenial)
             );
             assert!(
                 receiver.try_recv().is_err(),
@@ -5317,7 +5369,7 @@ mod tests {
             "middleware_failed: request_message_over_capacity"
         );
         session
-            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
             .await;
     }
 
@@ -5374,7 +5426,7 @@ mod tests {
         assert!(!redacted.invocations[0].stage_disabled);
 
         session
-            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
             .await;
     }
 
@@ -5420,7 +5472,7 @@ mod tests {
         );
         assert!(outcome.invocations[0].transformed);
         session
-            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
             .await;
     }
 
@@ -5506,7 +5558,7 @@ mod tests {
         assert!(target.query.is_empty());
         assert_eq!(observed.requested_subprotocols, ["realtime"]);
         session
-            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
             .await;
         let _ = shutdown_tx.send(());
         server_task
@@ -5617,7 +5669,7 @@ mod tests {
         drop(work);
 
         session
-            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
             .await;
         let _ = shutdown_tx.send(());
         server_task
@@ -5879,7 +5931,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), session_ends_rx.recv())
                 .await
                 .expect("skipped stage must receive session_end"),
-            Some(openshell_core::proto::WebSocketSessionEndReason::StageSkipped)
+            Some(openshell_core::proto::MiddlewareSessionEndReason::StageSkipped)
         );
         assert!(
             session_ends_rx.try_recv().is_err(),
@@ -5925,7 +5977,7 @@ mod tests {
         sessions
             .pop()
             .expect("retained session")
-            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
             .await;
         assert_eq!(runner.registry.session_admission.available_permits(), 1);
 
@@ -5967,7 +6019,7 @@ mod tests {
         sessions
             .pop()
             .expect("retained old-generation session")
-            .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
             .await;
         let admitted = replacement
             .preflight_websocket(&chain, websocket_preflight_input("new-generation-admitted"))

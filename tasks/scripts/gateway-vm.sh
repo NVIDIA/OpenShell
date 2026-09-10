@@ -351,7 +351,6 @@ signing_key_path = "${TLS_DIR}/jwt/signing.pem"
 public_key_path = "${TLS_DIR}/jwt/public.pem"
 kid_path = "${TLS_DIR}/jwt/kid"
 gateway_id = "${GATEWAY_NAME}"
-ttl_secs = 3600
 
 [openshell.drivers.vm]
 default_image = "${SANDBOX_IMAGE}"

@@ -74,6 +74,7 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 | Docker | Gateway process logs, Docker daemon health, sandbox containers, image pulls. |
 | Podman | Podman socket, rootless networking, sandbox containers, image pulls. |
 | Kubernetes | Helm release, gateway workload, service, secrets, sandbox pods, events. |
+| OpenShift | Same as Kubernetes, plus SecurityContextConstraints (SCCs) and, for external access, an OpenShift `Route`. Detect OpenShift by the presence of the `route.openshift.io` API group (`oc api-resources --api-group=route.openshift.io`). |
 | VM | VM driver logs, rootfs availability, host virtualization support. |
 | Extension | External driver process, Unix socket ownership/mode, configured driver name, capability handshake, gateway logs. |
 
@@ -686,6 +687,8 @@ configuration — check that the gateway spawned the driver binary you expect
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
 | Kubernetes sandbox pod stuck pending, workspace PVC unbound | Cluster has no default `StorageClass` and OpenShell does not set `storageClassName` on the workspace PVC (clusters with a default `StorageClass` bind fine without it) | `kubectl -n openshell describe pvc`; set `server.workspaceStorageClass` (gateway config `workspace_storage_class`) to a valid `StorageClass` |
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
+| OpenShift gateway pod fails to start with an SCC/`runAsUser` error (e.g. `unable to validate against any security context constraint`) | Chart's default `podSecurityContext`/`securityContext` hardcodes `runAsUser`/`fsGroup`, which the restricted-v2 SCC rejects; it must instead inject the namespace-assigned UID/GID range | `oc -n openshell describe pod <pod>`; deploy with `podSecurityContext: null` and clear `securityContext.runAsUser` (see `deploy/helm/openshell/ci/values-openshift-scc.yaml`) |
+| OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | The `openshell-sandbox` service account lacks the privileged SCC it needs | `oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell`; remove with `remove-scc-from-user` when done |
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |
 | Edge or OIDC gateway returns `Unauthenticated` | Stored login expired, audience/scopes mismatch, or gateway auth configuration changed | `openshell gateway info`, `openshell gateway login <name>`, gateway auth logs |
 | Gateway fails before serving health after enabling an interceptor | Interceptor endpoint unavailable or manifest/binding validation failed | Gateway and interceptor logs; interceptor socket; `binding_policy`, phases, and failure policy |

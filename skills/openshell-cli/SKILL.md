@@ -1,6 +1,6 @@
 ---
 name: openshell-cli
-description: Guide agents through using the OpenShell CLI (openshell) for sandbox management, gateway registration, provider configuration and refresh, policy iteration, settings, service exposure, BYOC workflows, and inference routing. Covers basic through advanced multi-step workflows. Trigger keywords - openshell, sandbox create, sandbox exec, sandbox connect, logs, provider create, provider profile, provider refresh, policy set, policy get, settings, service expose, forward, port forward, BYOC, bring your own container, inference, use openshell, run openshell, CLI usage, manage sandbox, manage provider, gateway add, gateway select.
+description: Guide agents through using the OpenShell CLI (openshell) for sandbox management, gateway registration, provider configuration and refresh, policy iteration, settings, service exposure, BYOC workflows, and attached-provider inference. Covers basic through advanced multi-step workflows. Trigger keywords - openshell, sandbox create, sandbox exec, sandbox connect, logs, provider create, provider profile, provider refresh, policy set, policy get, settings, service expose, forward, port forward, BYOC, bring your own container, inference, use openshell, run openshell, CLI usage, manage sandbox, manage provider, gateway add, gateway select.
 ---
 
 # OpenShell CLI
@@ -9,7 +9,7 @@ Guide agents through using the `openshell` CLI for sandbox and platform manageme
 
 ## Overview
 
-The OpenShell CLI (`openshell`) is the primary interface for managing sandboxes, providers, policies, settings, exposed services, inference routes, and gateway registrations. Gateway service lifecycle is handled outside the CLI by packages, systemd, or Helm. This skill teaches agents how to orchestrate CLI commands for common and complex workflows.
+The OpenShell CLI (`openshell`) is the primary interface for managing sandboxes, providers, policies, settings, exposed services, and gateway registrations. Gateway service lifecycle is handled outside the CLI by packages, systemd, or Helm. This skill teaches agents how to orchestrate CLI commands for common and complex workflows.
 
 **Companion skill**: For creating or modifying sandbox policy YAML content (network rules, L7 inspection, access presets), use the `generate-sandbox-policy` skill. This skill covers the CLI *commands* for the policy lifecycle; `generate-sandbox-policy` covers policy *content authoring*.
 
@@ -582,15 +582,16 @@ Review the proposed scope, candidate hash, prover findings, and application erro
 
 Build a custom container image and run it as a sandbox.
 
-### Create a sandbox from a Dockerfile
+### Create a sandbox from a pre-built image
 
 ```bash
-openshell sandbox create --from ./Dockerfile --name my-app
+docker build -t my-app:latest .
+openshell sandbox create --from my-app:latest --name my-app
 ```
 
-The `--from` flag accepts a Dockerfile path, a directory containing a Dockerfile, a full image reference such as `myregistry.com/img:tag`, or a community sandbox name such as `ollama`.
+The `--from` flag accepts an existing full image reference such as `myregistry.com/img:tag`, or a community sandbox name such as `ollama`. Build local Dockerfiles first with the same container engine as the local gateway, then pass the image tag.
 
-Local Dockerfile and directory builds require a local gateway because the CLI builds through the local Docker daemon. Use a registry image reference for remote gateways. Bare community names resolve under `ghcr.io/nvidia/openshell-community/sandboxes` unless `OPENSHELL_COMMUNITY_REGISTRY` overrides the prefix.
+Use `docker build -t my-app:latest` for Docker gateways. For Podman gateways, use `podman build -t localhost/my-app:latest` and pass `localhost/my-app:latest` to `--from`. For remote gateways, push the image to a registry reachable by the gateway. Bare community names resolve under `ghcr.io/nvidia/openshell-community/sandboxes` unless `OPENSHELL_COMMUNITY_REGISTRY` overrides the prefix.
 
 For Docker and Podman gateways, custom images should declare a non-root OCI
 `USER`. Each explicit `process.run_as_user` or `process.run_as_group` policy
@@ -619,7 +620,7 @@ Manage or iterate on the sandbox:
 openshell forward list
 openshell forward stop 8080 my-app
 openshell sandbox delete my-app
-openshell sandbox create --from ./Dockerfile --name my-app --forward 8080
+openshell sandbox create --from my-app:latest --name my-app --forward 8080
 ```
 
 Use structured output when automation needs the tracked forward metadata and
@@ -636,7 +637,7 @@ the forwarded socket.
 Create and forward in one command:
 
 ```bash
-openshell sandbox create --from ./Dockerfile --forward 8080 -- ./start-server.sh
+openshell sandbox create --from my-app:latest --forward 8080 -- ./start-server.sh
 ```
 
 The `--forward` flag starts a background port forward before the command runs.
@@ -700,29 +701,23 @@ The user does not need to disconnect. Policy updates are hot-reloaded; `--wait` 
 openshell sandbox delete work-session
 ```
 
-## Workflow 7: Managed Inference
+## Workflow 7: Inference with Attached Providers
 
-Configure the user-facing `inference.local` route or the system inference route used by platform functions.
-
-Ensure the provider exists, then set the route:
-
-```bash
-openshell provider list
-openshell inference set \
-  --provider nvidia \
-  --model nvidia/nemotron-3-nano-30b-a3b
-```
-
-This updates the managed `inference.local` route. Endpoint verification runs before the route is saved. Use `--no-verify` only when verification is intentionally impossible, and use `--timeout SECONDS` to configure the request timeout. Add `--system` to `set` or `update` for the platform-only system route.
-
-Inspect both configurations:
+Inference uses the same provider attachment workflow as other credentialed
+services. Import or select a profile that authorizes the provider's native
+endpoint, create the provider, and attach it only to sandboxes that need it:
 
 ```bash
-openshell inference get
-openshell inference get --system
+openshell provider profile import -f ./inference-provider.yaml
+openshell provider create --name model-provider --type <profile-id> --credential <KEY>
+openshell sandbox provider attach work-session model-provider
+openshell sandbox exec work-session -- <client-command>
 ```
 
-Agents send HTTPS requests to `inference.local`; the sandbox intercepts them and routes them through the configured inference route. Sandbox policy remains separate from inference route configuration.
+The application owns the native base URL, model, request shape, and timeout.
+Launch a new process after attaching a provider so it inherits the provider
+credential placeholder. Use the `debug-inference` skill for endpoint, policy,
+credential-binding, or migration failures.
 
 ## Workflow 8: Gateway Management
 
@@ -744,7 +739,7 @@ openshell gateway add https://gateway.example.com --name production
 openshell gateway remove local
 ```
 
-`https://` registrations default to edge authentication. Use `gateway login` and `gateway logout` to refresh or clear stored authentication. For an OIDC gateway, supply `--oidc-issuer` and, when needed, `--oidc-client-id`, `--oidc-audience`, and `--oidc-scopes`. For remote mTLS gateways, use `--remote USER@HOST` or an `ssh://` endpoint.
+`https://` registrations default to edge authentication. Use `gateway login` and `gateway logout` to refresh or clear stored authentication. For an OIDC gateway, supply `--oidc-issuer` and, when needed, `--oidc-client-id`, `--oidc-audience`, and `--oidc-scopes`. If automatic OIDC refresh fails, protected commands stop before sending an RPC and direct the user to run `openshell gateway login <name>`; `openshell status` still reports gateway reachability and authentication separately. For remote mTLS gateways, use `--remote USER@HOST` or an `ssh://` endpoint.
 
 For one-off automation, `--gateway-endpoint URL` connects directly without stored metadata. Limit `--gateway-insecure` to explicitly trusted development endpoints.
 
@@ -770,6 +765,9 @@ openshell settings delete work-session --key ocsf_json_enabled
 
 openshell settings get --global --json
 openshell settings set --global --key ocsf_json_enabled --value true
+
+# OCSF schema version downgrade for SIEM compatibility (allowed: "1.1", "1.3")
+openshell settings set --global --key ocsf_schema_version --value "1.1"
 ```
 
 Global mutations prompt for confirmation. Use `--yes` only in reviewed automation.
@@ -832,4 +830,4 @@ $ openshell sandbox upload --help
 |-------|------------|
 | `generate-sandbox-policy` | Creating or modifying policy YAML content (network rules, L7 inspection, access presets, endpoint configuration, and network middleware) |
 | `debug-openshell-cluster` | Diagnosing gateway deployment, runtime, or health failures |
-| `debug-inference` | Diagnosing `inference.local`, host-backed local inference, and provider base URL issues |
+| `debug-inference` | Diagnosing attached-provider inference, native endpoints, host-backed models, and migration from `inference.local` |

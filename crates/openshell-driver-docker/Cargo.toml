@@ -45,7 +45,7 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 prost-types = { workspace = true }
 tar = "0.4"
-temp-env = "0.3"
+temp-env = { version = "0.3", features = ["async_closure"] }
 tempfile = "3"
 tracing-subscriber = { workspace = true }
 

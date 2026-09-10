@@ -193,7 +193,7 @@ pub async fn handle_refresh_sandbox_token(
 }
 
 const MAX_EXTENSION_CREDENTIALS_PER_REFRESH: usize = 64;
-const DEFAULT_EXTENSION_TOKEN_TTL: Duration = Duration::from_secs(15 * 60);
+const DEFAULT_EXTENSION_TOKEN_TTL: Duration = Duration::from_mins(15);
 
 #[allow(clippy::result_large_err)]
 fn mint_extension_credentials(
@@ -323,7 +323,7 @@ mod tests {
             mat.signing_key_pem.as_bytes(),
             mat.kid,
             "test-gateway",
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
         )
         .unwrap();
         state.sandbox_jwt_issuer = Some(Arc::new(issuer));

@@ -197,22 +197,13 @@ message NetworkEndpoint {
 }
 
 // MCP options are grouped so MCP-specific policy can grow without adding more
-// top-level NetworkEndpoint fields. Current enforcement targets the active
-// 2025-11-25 Streamable HTTP/tools behavior, while preserving space for
-// version-profile policy if OpenShell adopts 2026-07-28 draft behavior later.
-//
-// Planned policy extensions should use OpenShell-owned static definitions for
-// MCP method/version profiles rather than treating dependency enums as the
-// policy contract. Candidate profile checks include request metadata/header
-// validation, response/SSE introspection, trusted annotation handling,
-// resultType/cache metadata validation, x-mcp-header tool-definition checks,
-// and subscriptions/listen handling.
+// top-level NetworkEndpoint fields. OpenShell owns the supported revision
+// profiles instead of treating dependency enums as the policy contract.
 //
 // Sources:
-// - https://modelcontextprotocol.io/specification/2025-11-25/server/tools
-// - https://modelcontextprotocol.io/specification/draft/changelog
-// - https://modelcontextprotocol.io/specification/draft/basic/transports/streamable-http
-// - https://modelcontextprotocol.io/specification/draft/server/tools
+// - https://modelcontextprotocol.io/specification/2025-03-26/basic/transports
+// - https://modelcontextprotocol.io/specification/2025-06-18/basic/transports
+// - https://modelcontextprotocol.io/specification/2025-11-25/basic/transports
 message McpOptions {
   // Hardening boundary for tools/call params.name. When unset or true, the
   // supervisor enforces the MCP recommended tool-name syntax
@@ -226,6 +217,19 @@ message McpOptions {
   // MCP-family methods at the method layer unless a tool-name policy narrows
   // tools/call. When unset or false, explicit method rules are required.
   optional bool allow_all_known_mcp_methods = 2;
+  // Exact MCP protocol revisions accepted by the endpoint's policy schema.
+  // Authors may omit this field. Because proto3 repeated fields do not retain
+  // presence, omission reaches protobuf ingress as an empty list. Checked
+  // normalization materializes OpenShell's pinned default revision
+  // "2025-11-25" before producing canonical downstream state, which is always
+  // nonempty.
+  //
+  // An explicit nonempty list remains an exact allowlist. Duplicates, moving
+  // aliases such as "draft" and "latest", and unknown dates are invalid.
+  // Normalization stores valid values in canonical semantic order. These
+  // values identify core revisions; they do not enable separate SEP overlays
+  // or select runtime parsing and forwarding behavior.
+  repeated string versions = 3;
 }
 
 // Trusted GraphQL operation classification.

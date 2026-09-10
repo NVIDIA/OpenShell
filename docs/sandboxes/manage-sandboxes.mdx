@@ -23,9 +23,11 @@ openshell sandbox create -- claude
 The trailing command is the sandbox's canonical main process. OpenShell starts
 it once, streams its output, and returns its exit status. Exit code 0 leaves a
 retained sandbox in `Completed`; a nonzero exit leaves it in `Error` with a
-`MainProcessFailed` condition. With no trailing command, OpenShell
-starts `/bin/bash -l` in a retained pseudo-terminal. Add `--detach` to create
-the sandbox without attaching:
+`MainProcessFailed` condition. With no trailing command, OpenShell starts a
+login shell in a retained pseudo-terminal: `/bin/bash -l` when the image
+provides bash, otherwise a shell detected in the image such as `/bin/sh` on
+minimal bases like Alpine. Add `--detach` to create the sandbox without
+attaching:
 
 ```shell
 openshell sandbox create --name worker --detach -- ./worker
@@ -142,20 +144,70 @@ openshell sandbox create \
 
 ### Custom Containers
 
-Use `--from` to create a sandbox from the base image, another pre-built sandbox name, a local directory, or a container image:
+Use `--from` to create a sandbox from the base image, another pre-built sandbox name, a rootfs tar archive, or a container image:
 
 ```shell
 openshell sandbox create --from base
 openshell sandbox create --from ollama
-openshell sandbox create --from ./my-sandbox-dir
+openshell sandbox create --from ./rootfs.tar
 openshell sandbox create --from my-registry.example.com/my-image:latest
 ```
 
 Bare names such as `base` and `ollama` resolve to images under `ghcr.io/nvidia/openshell-community/sandboxes`. Set `OPENSHELL_COMMUNITY_REGISTRY` when you need to use an internal mirror.
 
-Local directories and Dockerfiles require a local gateway because the CLI builds
-through the local Docker daemon. Use a registry image reference for remote
-gateways.
+`--from` does not build local Dockerfiles or directories. Build and tag the
+image with the container engine used by your local gateway, then pass the
+resulting image reference:
+
+```shell
+# Docker gateway
+docker build -t my-image:latest .
+openshell sandbox create --from my-image:latest
+
+# Podman gateway
+podman build -t localhost/my-image:latest .
+openshell sandbox create --from localhost/my-image:latest
+```
+
+For a remote gateway, push the image to a registry that the gateway can pull
+from and use that registry image reference.
+
+<Warning>
+**Pre-0.1.0 breaking change:** `openshell sandbox create --from ./Dockerfile`
+and directory sources no longer build images. Build and tag the image before
+you create the sandbox.
+</Warning>
+
+#### Rootfs Tar Archives
+
+A rootfs tar archive (`.tar`, `.tar.gz`, `.tgz`) is a flat filesystem produced
+by `docker export`, `podman export`, or `buildah mount` plus `tar`. It lets you
+create a sandbox without a registry or a running image daemon:
+
+```shell
+docker create --name export-me my-image:latest
+docker export -o rootfs.tar export-me
+docker rm export-me
+
+openshell sandbox create --from ./rootfs.tar
+```
+
+Rootfs tar sources require a local gateway running the VM compute driver. The
+CLI asks the gateway for a staging slot, writes the archive to the location the
+gateway allocates, and passes back a single-use token; the gateway resolves that
+token to a path for the driver. Because the CLI writes the archive directly to
+the gateway host's filesystem, the two must share a filesystem and run as the
+same user. Gateways using the Docker, Podman, or Kubernetes drivers reject
+rootfs tar sources.
+
+Gzip-compressed archives (`.tar.gz`, `.tgz`) are decompressed while the gateway
+stages them, so the sandbox sees the same filesystem either way. Compression is
+detected from the archive contents, not the file name.
+
+The gateway caps archive size (10 GiB by default, configurable with the VM
+driver's `rootfs_tar_max_bytes`), and reclaims an unused staging slot after 30
+minutes. The cap applies to the expanded archive too: a compressed source that
+decompresses past the limit is rejected.
 
 ## Reuse Workload Templates
 
@@ -493,7 +545,7 @@ OpenShell Terminal combines sandbox status and live logs in a single real-time d
 openshell term
 ```
 
-Use the terminal to spot blocked connections marked `action=deny` and inference-related proxy activity. If a connection is blocked unexpectedly, add the host to your network policy. Refer to [Policies](/sandboxes/policies) for the workflow.
+Use the terminal to spot blocked connections marked `action=deny` and provider-related proxy activity. If a connection is blocked unexpectedly, add the host to your network policy or update the attached provider profile. Refer to [Policies](/sandboxes/policies) for the workflow.
 
 The dashboard has three panels stacked vertically: Gateways, Providers (or Global Settings), and Sandboxes. Navigate within a panel with `Up`/`Down` or `j`/`k`. At a list boundary the cursor overflows into the adjacent panel, skipping empty panels. Use `Tab`/`Shift+Tab` to cycle panels directly. Press `h`/`l` or `Left`/`Right` in the middle panel to switch between the Providers and Global Settings tabs.
 
