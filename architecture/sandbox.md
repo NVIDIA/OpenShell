@@ -165,11 +165,6 @@ host selectors choose the chain independently of the network rule that admitted
 the request. Policy-local map keys identify configs, while built-in names or
 operator-owned registration names identify implementations.
 
-The configured-literal content-guard example shares matching semantics across
-request bodies, complete response bodies, and client WebSocket text messages.
-It requires whole-body response inspection and returns a middleware failure
-when that mode is unavailable.
-
 Built-ins run in-process against a borrowed view of the chain's current HTTP
 request state. Operator services retain the bounded protobuf/gRPC contract, and
 the remote adapter materializes an owned HTTP evaluation only when a request
@@ -192,27 +187,11 @@ middleware registry validates implementation-owned config. The generic
 registry and chain runner live in `openshell-supervisor-middleware`; first-party
 implementations live in `openshell-supervisor-middleware-builtins`.
 
-Valid HTTP that cannot fit the response middleware protocol, including non-UTF-8
-header values or an oversized preflight envelope, fails each selected stage
-according to its `on_error` policy. An all-fail-open chain relays the original
-bytes; a fail-closed stage prevents delivery. The relay validates HTTP syntax
-and protected trailer declarations before allowing this bypass.
-
-The same selected chain can inspect the matching final HTTP response before it
-returns to the workload. Response stages select header-only, whole-body, or
-streaming mode independently. The relay preserves upstream framing for a
-header-only chain and owns normalized downstream framing only when body bytes
-can change. Whole-body stages delay commitment and share one non-resetting,
-120-second accumulation deadline per response, defined in the response relay.
-Body stages receive a final body result and then one trailer exchange;
-trailer mutations can only change or remove
-existing, non-protected names. Intentional blocks return the canonical 403
-before commitment and abort delivery without injected bytes after commitment. Streaming input units flush after bounded coalescing even within a
-content-length body or transfer chunk. Coalescing cancels only input acquisition;
-deadline transitions and downstream writes finish outside those timeouts.
-The response runtime caps aggregate retained body data across stages and pending
-output at 8 MiB. A transformation that exceeds the budget follows its stage's
-failure policy, preserving its input when failing open.
+The selected middleware chain can also inspect the final HTTP response before
+it returns to the workload. Stages select header-only, whole-body, or streaming
+inspection independently. The relay owns response framing when body bytes can
+change. Stage failures follow policy-local `on_error`; explicit denials always
+block delivery. Once delivery has started, blocking aborts the response.
 
 The supervisor installs policy and middleware registry changes as one runtime
 generation and preserves the last-known-good generation if preparation fails.
