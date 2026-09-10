@@ -53,7 +53,7 @@ var WithLogMinLevel = types.WithLogMinLevel
 
 // SandboxInterface defines lifecycle operations on sandboxes.
 type SandboxInterface interface {
-	Create(ctx context.Context, workspace, name string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
+	Create(ctx context.Context, workspace, name string, spec *SandboxSpec, opts ...CreateOption) (*Sandbox, error)
 	Get(ctx context.Context, workspace, name string) (*Sandbox, error)
 	List(ctx context.Context, workspace string, opts ...ListOptions) ([]*Sandbox, error)
 	Stop(ctx context.Context, workspace, name string) (*Sandbox, error)
@@ -71,5 +71,5 @@ type SandboxInterface interface {
 // SandboxTemplateCreateInterface defines additive sandbox creation from named
 // workload templates without widening SandboxInterface.
 type SandboxTemplateCreateInterface interface {
-	CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
+	CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, opts ...CreateOption) (*Sandbox, error)
 }
