@@ -21,6 +21,7 @@ use bollard::query_parameters::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+use openshell_core::cdi::{CdiContext, CdiSpecDirectory, cdi_spec_mount_path};
 use openshell_core::config::{DEFAULT_SANDBOX_PIDS_LIMIT, DEFAULT_STOP_TIMEOUT_SECS};
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
@@ -210,15 +211,62 @@ struct DockerDriverRuntimeConfig {
     supervisor_bin: PathBuf,
     guest_tls: Option<DockerGuestTlsPaths>,
     daemon_version: String,
-    gpu: DockerGpuRuntimeCapabilities,
+    gpu: DockerGpuRuntimeConfig,
     sandbox_pids_limit: i64,
     enable_bind_mounts: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct DockerGpuRuntimeCapabilities {
-    cdi_supported: bool,
+#[derive(Debug, Clone, Default)]
+struct DockerGpuRuntimeConfig {
+    cdi_spec_dirs: Vec<String>,
     wsl_all_gpu_fallback_enabled: bool,
+}
+
+impl DockerGpuRuntimeConfig {
+    fn supports_gpu(&self) -> bool {
+        !self.cdi_spec_dirs.is_empty()
+    }
+
+    fn cdi_context(&self, gpu_device_ids: Option<&[String]>) -> Result<Option<CdiContext>, Status> {
+        let Some(gpu_device_ids) = gpu_device_ids.filter(|device_ids| !device_ids.is_empty())
+        else {
+            return Ok(None);
+        };
+        self.require_cdi_spec_dirs()?;
+        Ok(Some(CdiContext::new(
+            gpu_device_ids.to_vec(),
+            self.cdi_spec_dirs
+                .iter()
+                .enumerate()
+                .map(|(index, source)| CdiSpecDirectory::new(cdi_spec_mount_path(index), source))
+                .collect(),
+        )))
+    }
+
+    fn cdi_spec_bind_strings(
+        &self,
+        gpu_device_ids: Option<&[String]>,
+    ) -> Result<Vec<String>, Status> {
+        let Some(_) = gpu_device_ids.filter(|device_ids| !device_ids.is_empty()) else {
+            return Ok(Vec::new());
+        };
+        self.require_cdi_spec_dirs()?;
+        Ok(self
+            .cdi_spec_dirs
+            .iter()
+            .enumerate()
+            .map(|(index, source)| format!("{source}:{}:ro,z", cdi_spec_mount_path(index)))
+            .collect())
+    }
+
+    fn require_cdi_spec_dirs(&self) -> Result<(), Status> {
+        if self.cdi_spec_dirs.is_empty() {
+            return Err(Status::failed_precondition(
+                "docker GPU sandboxes require Docker CDI spec directories reported by the daemon",
+            ));
+        }
+        Ok(())
+}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -504,16 +552,11 @@ impl DockerComputeDriver {
         let info = docker.info().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon info: {err}"))
         })?;
-        let cdi_supported = info
-            .cdi_spec_dirs
-            .as_ref()
-            .is_some_and(|dirs| !dirs.is_empty());
-        let cdi_gpu_inventory = docker_cdi_gpu_inventory(&info);
-        let wsl_all_gpu_fallback_enabled = docker_info_reports_wsl2(&info);
-        let gpu = DockerGpuRuntimeCapabilities {
-            cdi_supported,
-            wsl_all_gpu_fallback_enabled,
+        let gpu = DockerGpuRuntimeConfig {
+            cdi_spec_dirs: info.cdi_spec_dirs.clone().unwrap_or_default(),
+            wsl_all_gpu_fallback_enabled: docker_info_reports_wsl2(&info),
         };
+        let cdi_gpu_inventory = docker_cdi_gpu_inventory(&info);
         validate_sandbox_pids_limit(docker_config.sandbox_pids_limit)?;
         let gateway_port = gateway_bind_address.port();
         if gateway_port == 0 {
@@ -563,7 +606,7 @@ impl DockerComputeDriver {
                 supervisor_bin,
                 guest_tls,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
-                gpu,
+                gpu: gpu.clone(),
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
                 enable_bind_mounts: docker_config.enable_bind_mounts,
             },
@@ -600,8 +643,8 @@ impl DockerComputeDriver {
                     limit_supported: true,
                 }),
                 gpu: Some(GpuResourceCapabilities {
-                    default_selection_supported: self.config.gpu.cdi_supported,
-                    count_selection_supported: self.config.gpu.cdi_supported,
+                    default_selection_supported: self.config.gpu.supports_gpu(),
+                    count_selection_supported: self.config.gpu.supports_gpu(),
                 }),
             }),
             rootfs_tar_staging_dir: String::new(),
@@ -637,7 +680,7 @@ impl DockerComputeDriver {
             DockerSandboxDriverConfig::from_template(template).map_err(Status::invalid_argument)?;
         validate_docker_driver_mounts(&driver_config.mounts, config.enable_bind_mounts)?;
         let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
-        Self::validate_gpu_request(gpu_requirements, config.gpu.cdi_supported, &driver_config)?;
+        Self::validate_gpu_request(gpu_requirements, config.gpu.supports_gpu(), &driver_config)?;
         Ok(ValidatedDockerSandbox {
             template,
             driver_config,
@@ -935,12 +978,6 @@ impl DockerComputeDriver {
             image.ref = %template.image,
         ))
         .await?;
-        let token_file_created = write_sandbox_token_file(sandbox, &self.config)
-            .await
-            .map_err(|status| {
-                DockerProvisioningFailure::new("SandboxTokenWriteFailed", status.message())
-            })?;
-
         let container_name = container_name_for_sandbox(sandbox);
         let gpu_devices = self
             .resolve_gpu_cdi_devices(
@@ -950,9 +987,13 @@ impl DockerComputeDriver {
             )
             .await
             .map_err(|status| {
-                if token_file_created {
-                    cleanup_sandbox_token_file(sandbox, &self.config);
-                }
+                DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
+            })?;
+        let cdi_context = self
+            .config
+            .gpu
+            .cdi_context(gpu_devices.as_deref())
+            .map_err(|status| {
                 DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
             })?;
         let create_body = build_container_create_body_for_image(
@@ -963,11 +1004,24 @@ impl DockerComputeDriver {
             &image,
         )
         .map_err(|status| {
-            if token_file_created {
-                cleanup_sandbox_token_file(sandbox, &self.config);
-            }
             DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
         })?;
+        if let Some(cdi_context) = cdi_context.as_ref()
+            && let Err(status) = write_cdi_context_file(sandbox, &self.config, cdi_context)
+        {
+            cleanup_cdi_context_file(sandbox, &self.config);
+            return Err(DockerProvisioningFailure::new(
+                "CdiContextWriteFailed",
+                status.message(),
+            ));
+        }
+        if let Err(status) = write_sandbox_token_file(sandbox, &self.config).await {
+            cleanup_cdi_context_file(sandbox, &self.config);
+            return Err(DockerProvisioningFailure::new(
+                "SandboxTokenWriteFailed",
+                status.message(),
+            ));
+        }
         async {
             openshell_otel::record_error_result(
                 self.docker
@@ -981,9 +1035,7 @@ impl DockerComputeDriver {
                     )
                     .await
                     .map_err(|err| {
-                        if token_file_created {
-                            cleanup_sandbox_token_file(sandbox, &self.config);
-                        }
+                        cleanup_sandbox_state_files(sandbox, &self.config);
                         DockerProvisioningFailure::from_status(
                             "ContainerCreateFailed",
                             create_status_from_docker_error("create docker sandbox container", err),
@@ -1020,24 +1072,13 @@ impl DockerComputeDriver {
         ))
         .await;
         if let Err(err) = start_result {
-            let cleanup = self
-                .docker
-                .remove_container(
-                    &container_name,
-                    Some(RemoveContainerOptionsBuilder::default().force(true).build()),
-                )
-                .await;
-            if let Err(cleanup_err) = cleanup {
-                warn!(
-                    sandbox_id = %sandbox.id,
-                    container_name,
-                    error = %cleanup_err,
-                    "Failed to clean up Docker container after start failure"
-                );
-            }
-            if token_file_created {
-                cleanup_sandbox_token_file(sandbox, &self.config);
-            }
+            self.cleanup_created_container_after_failure(
+                &sandbox.id,
+                &container_name,
+                "container start failure",
+            )
+            .await;
+            cleanup_sandbox_state_files(sandbox, &self.config);
             return Err(DockerProvisioningFailure::from_status(
                 "ContainerStartFailed",
                 create_status_from_docker_error("start docker sandbox container", err),
@@ -1061,6 +1102,30 @@ impl DockerComputeDriver {
         }
 
         span_status.finish(Ok(()))
+    }
+
+    async fn cleanup_created_container_after_failure(
+        &self,
+        sandbox_id: &str,
+        container_name: &str,
+        phase: &'static str,
+    ) {
+        let cleanup = self
+            .docker
+            .remove_container(
+                container_name,
+                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+            )
+            .await;
+        if let Err(cleanup_err) = cleanup {
+            warn!(
+                sandbox_id = %sandbox_id,
+                container_name = %container_name,
+                phase,
+                error = %cleanup_err,
+                "Failed to clean up Docker container after provisioning failure"
+            );
+        }
     }
 
     async fn delete_sandbox_inner(
@@ -1092,11 +1157,11 @@ impl DockerComputeDriver {
                     .await
                 {
                     Ok(()) => {
-                        cleanup_sandbox_token_file(&record.sandbox, &self.config);
+                        cleanup_sandbox_state_files(&record.sandbox, &self.config);
                         return Ok(true);
                     }
                     Err(err) if is_not_found_error(&err) => {
-                        cleanup_sandbox_token_file(&record.sandbox, &self.config);
+                        cleanup_sandbox_state_files(&record.sandbox, &self.config);
                         return Ok(true);
                     }
                     Err(err) => {
@@ -1124,11 +1189,11 @@ impl DockerComputeDriver {
             .await
         {
             Ok(()) => {
-                cleanup_sandbox_token_file_for_delete(sandbox_id, pending.as_ref(), &self.config);
+                cleanup_sandbox_state_files_for_delete(sandbox_id, pending.as_ref(), &self.config);
                 Ok(true)
             }
             Err(err) if is_not_found_error(&err) => {
-                cleanup_sandbox_token_file_for_delete(sandbox_id, pending.as_ref(), &self.config);
+                cleanup_sandbox_state_files_for_delete(sandbox_id, pending.as_ref(), &self.config);
                 Ok(pending.is_some())
             }
             Err(err) => Err(internal_status("delete docker sandbox container", err)),
@@ -1147,7 +1212,7 @@ impl DockerComputeDriver {
                 if let Some(task) = record.task {
                     task.abort();
                 }
-                cleanup_sandbox_token_file(&record.sandbox, &self.config);
+                cleanup_sandbox_state_files(&record.sandbox, &self.config);
                 self.publish_deleted(record.sandbox.id);
                 return Ok(());
             }
@@ -1325,7 +1390,7 @@ impl DockerComputeDriver {
         sandbox: &DriverSandbox,
         failure: &DockerProvisioningFailure,
     ) {
-        cleanup_sandbox_token_file(sandbox, &self.config);
+        cleanup_sandbox_state_files(sandbox, &self.config);
         let snapshot = pending_sandbox_snapshot(
             sandbox,
             &self.config.sandbox_namespace,
@@ -2680,6 +2745,7 @@ fn docker_volume_is_bind_backed(volume: &bollard::models::Volume) -> bool {
 fn build_binds(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
+    gpu_device_ids: Option<&[String]>,
 ) -> Result<Vec<String>, Status> {
     let mut binds = vec![format!(
         "{}:{}:ro,z",
@@ -2706,6 +2772,13 @@ fn build_binds(
             SANDBOX_TOKEN_MOUNT_PATH
         ));
     }
+    if cdi_context_requested(gpu_device_ids) {
+        binds.push(format!(
+            "{}:{}:ro,z",
+            cdi_context_host_path(sandbox, config)?.display(),
+            openshell_core::cdi::CDI_CONTEXT_PATH
+        ));
+    }
     Ok(binds)
 }
 
@@ -2730,6 +2803,57 @@ fn sandbox_token_host_path_by_id(
             "resolve sandbox token state directory failed: {err}"
         ))
     })
+}
+
+fn cdi_context_host_path(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<PathBuf, Status> {
+    cdi_context_host_path_by_id(&sandbox.id, config)
+}
+
+fn cdi_context_host_path_by_id(
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<PathBuf, Status> {
+    openshell_core::driver_utils::sandbox_token_path(
+        "docker-cdi-contexts",
+        Some(&config.sandbox_namespace),
+        sandbox_id,
+    )
+    .map(|path| path.with_file_name(openshell_core::cdi::CDI_CONTEXT_FILE_NAME))
+    .map_err(|err| Status::internal(format!("resolve CDI context state directory failed: {err}")))
+}
+
+fn write_cdi_context_file(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+    context: &CdiContext,
+) -> Result<(), Status> {
+    let path = cdi_context_host_path(sandbox, config)?;
+    if let Some(parent) = path.parent() {
+        openshell_core::paths::create_dir_restricted(parent).map_err(|err| {
+            Status::internal(format!(
+                "create CDI context directory {} failed: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    let json = serde_json::to_vec(context)
+        .map_err(|err| Status::internal(format!("encode CDI context failed: {err}")))?;
+    std::fs::write(&path, json).map_err(|err| {
+        Status::internal(format!(
+            "write CDI context file {} failed: {err}",
+            path.display()
+        ))
+    })?;
+    openshell_core::paths::set_file_owner_only(&path).map_err(|err| {
+        Status::internal(format!(
+            "restrict CDI context file {} failed: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(())
 }
 
 async fn write_sandbox_token_file(
@@ -2772,6 +2896,15 @@ fn cleanup_sandbox_token_file(sandbox: &DriverSandbox, config: &DockerDriverRunt
     cleanup_sandbox_token_file_by_id(&sandbox.id, config);
 }
 
+fn cleanup_cdi_context_file(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) {
+    cleanup_cdi_context_file_by_id(&sandbox.id, config);
+}
+
+fn cleanup_sandbox_state_files(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) {
+    cleanup_sandbox_token_file(sandbox, config);
+    cleanup_cdi_context_file(sandbox, config);
+}
+
 fn cleanup_sandbox_token_file_for_delete(
     sandbox_id: &str,
     pending: Option<&PendingSandboxRecord>,
@@ -2782,6 +2915,27 @@ fn cleanup_sandbox_token_file_for_delete(
     } else if let Some(record) = pending {
         cleanup_sandbox_token_file(&record.sandbox, config);
     }
+}
+
+fn cleanup_cdi_context_file_for_delete(
+    sandbox_id: &str,
+    pending: Option<&PendingSandboxRecord>,
+    config: &DockerDriverRuntimeConfig,
+) {
+    if !sandbox_id.is_empty() {
+        cleanup_cdi_context_file_by_id(sandbox_id, config);
+    } else if let Some(record) = pending {
+        cleanup_cdi_context_file(&record.sandbox, config);
+    }
+}
+
+fn cleanup_sandbox_state_files_for_delete(
+    sandbox_id: &str,
+    pending: Option<&PendingSandboxRecord>,
+    config: &DockerDriverRuntimeConfig,
+) {
+    cleanup_sandbox_token_file_for_delete(sandbox_id, pending, config);
+    cleanup_cdi_context_file_for_delete(sandbox_id, pending, config);
 }
 
 fn cleanup_sandbox_token_file_by_id(sandbox_id: &str, config: &DockerDriverRuntimeConfig) {
@@ -2803,15 +2957,39 @@ fn cleanup_sandbox_token_file_by_id(sandbox_id: &str, config: &DockerDriverRunti
     }
 }
 
+fn cleanup_cdi_context_file_by_id(sandbox_id: &str, config: &DockerDriverRuntimeConfig) {
+    let Ok(path) = cdi_context_host_path_by_id(sandbox_id, config) else {
+        return;
+    };
+    if let Err(err) = std::fs::remove_file(&path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            sandbox_id = %sandbox_id,
+            path = %path.display(),
+            error = %err,
+            "Failed to remove Docker CDI context file"
+        );
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
 #[cfg(test)]
-fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) -> Vec<String> {
-    build_environment_for_oci_user(sandbox, config, "")
+fn build_environment(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+    include_cdi_context: bool,
+) -> Vec<String> {
+    build_environment_for_oci_user(sandbox, config, "", include_cdi_context)
 }
 
 fn build_environment_for_oci_user(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
     oci_user: &str,
+    include_cdi_context: bool,
 ) -> Vec<String> {
     let mut environment = HashMap::from([
         ("HOME".to_string(), "/root".to_string()),
@@ -2870,6 +3048,14 @@ fn build_environment_for_oci_user(
     environment.insert(
         openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
         openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.to_string(),
+    );
+    environment.insert(
+        openshell_core::sandbox_env::CDI_CONTEXT.to_string(),
+        if include_cdi_context {
+            openshell_core::cdi::CDI_CONTEXT_PATH.to_string()
+        } else {
+            String::new()
+        },
     );
     // The root supervisor executes namespace helpers during bootstrap; keep
     // their search path driver-owned even when the template/spec set PATH.
@@ -2956,6 +3142,10 @@ fn os_or_kernel_reports_wsl2(value: &str) -> bool {
 
 fn docker_gpu_selection_status(err: CdiGpuSelectionError) -> Status {
     Status::failed_precondition(err.to_string())
+}
+
+fn cdi_context_requested(gpu_device_ids: Option<&[String]>) -> bool {
+    gpu_device_ids.is_some_and(|device_ids| !device_ids.is_empty())
 }
 
 #[cfg(test)]
@@ -3094,7 +3284,12 @@ fn build_container_create_body_for_image(
         // The image workspace may need to be created or rejected by the
         // supervisor, so do not let the OCI runtime chdir there first.
         working_dir: Some("/".to_string()),
-        env: Some(build_environment_for_oci_user(sandbox, config, &image.user)),
+        env: Some(build_environment_for_oci_user(
+            sandbox,
+            config,
+            &image.user,
+            cdi_context_requested(gpu_device_ids),
+        )),
         entrypoint: Some(vec![SUPERVISOR_MOUNT_PATH.to_string()]),
         // Replace the image CMD with the supervisor's resolved workspace
         // argument so Docker cannot append inherited image arguments.
@@ -3106,7 +3301,8 @@ fn build_container_create_body_for_image(
             pids_limit: docker_pids_limit(config.sandbox_pids_limit)?,
             device_requests,
             binds: {
-                let mut binds = build_binds(sandbox, config)?;
+                let mut binds = build_binds(sandbox, config, gpu_device_ids)?;
+                binds.extend(config.gpu.cdi_spec_bind_strings(gpu_device_ids)?);
                 binds.extend(user_bind_strings);
                 Some(binds)
             },
