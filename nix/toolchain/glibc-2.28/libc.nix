@@ -30,7 +30,7 @@ glibc.overrideAttrs (old: {
     hash = "sha256-8xjW4/H07Qt00oMqxPSR0PuSjkUcntpZTL8cO+569Hw=";
   };
   hardeningDisable = old.hardeningDisable ++ [ "pic" ];
-  configureFlags = old.configureFlags ++ [ "--disable-werror" ];
+  configureFlags = lib.remove "--enable-obsolete-rpc" old.configureFlags ++ [ "--disable-werror" ];
   postPatch = old.postPatch + ''
     # Fixes a bug in Make that triggers infinte recursion on expansion.
     substituteInPlace sysdeps/gnu/Makefile \
