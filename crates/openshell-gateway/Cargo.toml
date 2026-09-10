@@ -44,8 +44,9 @@ in-tree-compute-drivers = [
     "compute-driver-kubernetes",
     "compute-driver-podman",
     "compute-driver-vm",
-    "dep:openshell-driver-mxc",
+    "compute-driver-mxc",
 ]
+compute-driver-mxc = ["dep:openshell-driver-mxc"]
 compute-driver-docker = ["dep:openshell-driver-docker", "dep:openshell-otel"]
 compute-driver-kubernetes = ["dep:openshell-driver-kubernetes", "dep:openshell-otel"]
 compute-driver-podman = ["dep:openshell-driver-podman", "dep:openshell-otel"]

@@ -252,6 +252,13 @@ in the gateway build graph, but their Unix-socket standalone binaries do not.
 
 Windows must continue to reject unsupported compute drivers clearly.
 
+The gateway's `compute-driver-mxc` feature independently links and registers
+MXC on Windows. Each other `compute-driver-*` feature installs its own Windows
+rejection stub without linking that driver crate. The default
+`in-tree-compute-drivers` alias enables all five features. An MXC-only build
+uses `--no-default-features --features compute-driver-mxc` (add `telemetry`
+and `bundled-z3` as needed).
+
 | Driver | Windows build behavior | Runtime behavior |
 |---|---|---|
 | Docker | Driver crate excluded; gateway registration stub retained. | Gateway construction returns unsupported. |
@@ -263,11 +270,16 @@ The focused contract tasks for either native architecture run:
 
 ```text
 windows_builtin_compute_drivers_report_unsupported
+default_registry_contains_exactly_the_enabled_compute_drivers
 ```
 
-These tests are also included in the full x64 workspace test run. The focused
-task is available for local diagnosis; GitHub Actions does not re-run it after
-the full suite.
+The same tasks also run gateway library tests for protocol-only, MXC-only,
+Docker-stub-only, and MXC plus Docker-stub builds. Their logs use
+`test-<target>-selective-<variant>.log`.
+
+The default-feature tests are also included in the full workspace test run.
+The focused task is available for local diagnosis and selective-build
+validation; GitHub Actions does not re-run it after the full suite.
 
 ## Test Accounting Guidance
 

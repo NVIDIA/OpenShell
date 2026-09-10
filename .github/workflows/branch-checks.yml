@@ -189,6 +189,7 @@ jobs:
           cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-kubernetes
           cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-podman
           cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-vm
+          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-mxc
           cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker,compute-driver-vm
 
       - name: Verify the defaults-without-telemetry feature alias tracks the default feature set

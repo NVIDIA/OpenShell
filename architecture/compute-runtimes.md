@@ -135,9 +135,11 @@ compiled registration with the same name.
 
 The `openshell-gateway` composition crate exposes one feature per first-party
 registration: `compute-driver-kubernetes`, `compute-driver-docker`,
-`compute-driver-podman`, and `compute-driver-vm`. Builds can enable any subset.
-The default `in-tree-compute-drivers` feature remains an alias for all four
-and retains the Windows MXC registration and unsupported-driver stubs.
+`compute-driver-podman`, `compute-driver-vm`, and `compute-driver-mxc`. Builds
+can enable any subset. MXC links only on Windows; the other four features
+install rejection stubs on Windows and link their drivers on other platforms.
+The default `in-tree-compute-drivers` feature remains an alias for all five,
+preserving each platform's default registrations.
 `openshell-server` has no compute driver dependencies or backend-name dispatch.
 Protocol-only gateway builds disable the default features and link no
 compute-driver crates. E2E lanes compose that gateway with Docker, Podman,

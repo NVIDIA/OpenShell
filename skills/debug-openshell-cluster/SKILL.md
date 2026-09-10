@@ -30,6 +30,10 @@ configuration selects a driver that was not compiled in, the gateway treats
 the name as an external driver and reports a missing `socket_path` unless an
 endpoint is configured.
 
+On Windows, custom binaries can include MXC independently. Registrations for
+Docker, Podman, Kubernetes, and VM are rejection stubs when included; they do
+not enable those runtimes on Windows.
+
 See the [compute driver reference](https://docs.nvidia.com/openshell/latest/reference/sandbox-compute-drivers.md)
 for selective-build options and external-driver configuration.
 

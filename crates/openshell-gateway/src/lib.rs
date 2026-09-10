@@ -20,7 +20,7 @@ compile_error!(
 mod vm;
 
 #[cfg(any(
-    all(target_os = "windows", feature = "in-tree-compute-drivers"),
+    all(target_os = "windows", feature = "compute-driver-mxc"),
     all(
         not(target_os = "windows"),
         any(
@@ -33,16 +33,11 @@ mod vm;
 ))]
 use openshell_core::telemetry::TelemetryComputeDriver;
 #[cfg(any(
-    all(target_os = "windows", feature = "in-tree-compute-drivers"),
-    all(
-        not(target_os = "windows"),
-        any(
-            feature = "compute-driver-docker",
-            feature = "compute-driver-kubernetes",
-            feature = "compute-driver-podman",
-            feature = "compute-driver-vm"
-        )
-    )
+    target_os = "windows",
+    feature = "compute-driver-docker",
+    feature = "compute-driver-kubernetes",
+    feature = "compute-driver-podman",
+    feature = "compute-driver-vm"
 ))]
 use openshell_server::ComputeDriverRegistration;
 use openshell_server::ComputeDriverRegistry;
@@ -62,12 +57,14 @@ pub fn install_default_compute_drivers() -> ComputeDriverRegistry {
         )
     ))]
     install_in_tree_compute_drivers(&mut registry);
-    #[cfg(all(target_os = "windows", feature = "in-tree-compute-drivers"))]
+    #[cfg(all(target_os = "windows", feature = "compute-driver-mxc"))]
     install_mxc_compute_driver(&mut registry);
+    #[cfg(target_os = "windows")]
+    install_unsupported_windows_compute_drivers(&mut registry);
     registry
 }
 
-#[cfg(all(target_os = "windows", feature = "in-tree-compute-drivers"))]
+#[cfg(all(target_os = "windows", feature = "compute-driver-mxc"))]
 fn install_mxc_compute_driver(registry: &mut ComputeDriverRegistry) {
     let registration = ComputeDriverRegistration::new("mxc", u16::MAX, None, MxcFactory)
         .expect("first-party driver name is valid")
@@ -76,8 +73,21 @@ fn install_mxc_compute_driver(registry: &mut ComputeDriverRegistry) {
     registry
         .install(registration)
         .expect("first-party driver names are unique");
+}
 
-    for name in ["docker", "kubernetes", "podman", "vm"] {
+#[cfg(target_os = "windows")]
+fn install_unsupported_windows_compute_drivers(registry: &mut ComputeDriverRegistry) {
+    let names: &[&str] = &[
+        #[cfg(feature = "compute-driver-docker")]
+        "docker",
+        #[cfg(feature = "compute-driver-kubernetes")]
+        "kubernetes",
+        #[cfg(feature = "compute-driver-podman")]
+        "podman",
+        #[cfg(feature = "compute-driver-vm")]
+        "vm",
+    ];
+    for &name in names {
         let registration = ComputeDriverRegistration::new(
             name,
             u16::MAX,
@@ -91,13 +101,13 @@ fn install_mxc_compute_driver(registry: &mut ComputeDriverRegistry) {
     }
 }
 
-#[cfg(all(target_os = "windows", feature = "in-tree-compute-drivers"))]
+#[cfg(target_os = "windows")]
 #[derive(Clone, Copy)]
 struct UnsupportedWindowsFactory {
     name: &'static str,
 }
 
-#[cfg(all(target_os = "windows", feature = "in-tree-compute-drivers"))]
+#[cfg(target_os = "windows")]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for UnsupportedWindowsFactory {
     async fn build(
@@ -108,16 +118,16 @@ impl openshell_server::ComputeDriverFactory for UnsupportedWindowsFactory {
     }
 }
 
-#[cfg(all(target_os = "windows", feature = "in-tree-compute-drivers"))]
+#[cfg(target_os = "windows")]
 fn unsupported_windows_compute_driver(name: &str) -> openshell_core::Error {
     openshell_core::Error::config(format!("compute driver '{name}' is unsupported on Windows"))
 }
 
-#[cfg(all(target_os = "windows", feature = "in-tree-compute-drivers"))]
+#[cfg(all(target_os = "windows", feature = "compute-driver-mxc"))]
 #[derive(Clone, Copy)]
 struct MxcFactory;
 
-#[cfg(all(target_os = "windows", feature = "in-tree-compute-drivers"))]
+#[cfg(all(target_os = "windows", feature = "compute-driver-mxc"))]
 #[async_trait::async_trait]
 impl openshell_server::ComputeDriverFactory for MxcFactory {
     async fn build(
@@ -400,19 +410,17 @@ fn apply_guest_tls(
     }
 }
 
-#[cfg(all(test, target_os = "windows", feature = "in-tree-compute-drivers"))]
+#[cfg(all(test, target_os = "windows"))]
 mod windows_tests {
     use super::*;
 
     #[test]
     fn windows_builtin_compute_drivers_report_unsupported() {
         let registry = install_default_compute_drivers();
-        assert_eq!(
-            registry.installed_driver_names().collect::<Vec<_>>(),
-            ["docker", "kubernetes", "mxc", "podman", "vm"]
-        );
-
-        for name in ["docker", "kubernetes", "podman", "vm"] {
+        for name in registry
+            .installed_driver_names()
+            .filter(|name| *name != "mxc")
+        {
             let message = unsupported_windows_compute_driver(name).to_string();
             assert!(
                 message.contains("unsupported on Windows"),
@@ -422,7 +430,7 @@ mod windows_tests {
     }
 }
 
-#[cfg(all(test, not(target_os = "windows")))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -433,6 +441,8 @@ mod tests {
             "docker",
             #[cfg(feature = "compute-driver-kubernetes")]
             "kubernetes",
+            #[cfg(all(target_os = "windows", feature = "compute-driver-mxc"))]
+            "mxc",
             #[cfg(feature = "compute-driver-podman")]
             "podman",
             #[cfg(feature = "compute-driver-vm")]
