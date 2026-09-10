@@ -34,6 +34,53 @@ tests:
           path: spec.template.spec.containers[0].args
           content: "--jwt-only"
         documentIndex: 3
+      - equal:
+          path: spec.template.spec.securityContext.runAsNonRoot
+          value: true
+        documentIndex: 3
+      - equal:
+          path: spec.template.spec.securityContext.seccompProfile.type
+          value: RuntimeDefault
+        documentIndex: 3
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.runAsNonRoot
+          value: true
+        documentIndex: 3
+
+  - it: supports certgen-specific security context overrides
+    template: templates/certgen.yaml
+    set:
+      pkiInitJob.podSecurityContext:
+        runAsNonRoot: false
+        seccompProfile:
+          type: Localhost
+          localhostProfile: profiles/certgen.json
+      pkiInitJob.securityContext:
+        runAsNonRoot: false
+        runAsUser: 1234
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext
+          value:
+            runAsNonRoot: false
+            seccompProfile:
+              type: Localhost
+              localhostProfile: profiles/certgen.json
+        documentIndex: 3
+      - equal:
+          path: spec.template.spec.containers[0].securityContext
+          value:
+            runAsNonRoot: false
+            runAsUser: 1234
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+        documentIndex: 3
 
   - it: renders JWT-only certgen hook when cert-manager owns TLS
     template: templates/certgen.yaml

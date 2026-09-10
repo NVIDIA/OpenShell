@@ -204,6 +204,8 @@ discovery endpoint or its TLS CA.
 | openshiftRoute.enabled | bool | `false` | Create an OpenShift Route with TLS passthrough. |
 | openshiftRoute.host | string | `""` | Hostname for the Route. Must match a SAN on the gateway's server cert. |
 | pkiInitJob.enabled | bool | `true` | Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets. When certManager.enabled=true, cert-manager owns TLS and this same hook runs in JWT-only mode even if pkiInitJob.enabled remains true. |
+| pkiInitJob.podSecurityContext | object | `{"runAsNonRoot":true,"seccompProfile":{"type":"RuntimeDefault"}}` | Pod security context for the certificate-generation hook. |
+| pkiInitJob.securityContext | object | `{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"runAsNonRoot":true}` | Container security context for the certificate-generation hook. |
 | pkiInitJob.serverDnsNames | list | `[]` | Extra DNS SANs to append to the server certificate. |
 | pkiInitJob.serverIpAddresses | list | `[]` | Extra IP SANs to append to the server certificate. |
 | podAnnotations | object | `{}` | Extra annotations to add to the gateway pod. |

@@ -330,6 +330,13 @@ If the gateway pod is pending with `MountVolume.SetUp failed for volume
 `templates/certgen.yaml` output and the hook Job logs; cert-manager creates TLS
 Secrets but does not create the sandbox JWT signing Secret.
 
+The certgen hook defaults to a Restricted Pod Security-compatible pod and
+container security context. If admission rejects it, inspect the effective
+`pkiInitJob.podSecurityContext` and `pkiInitJob.securityContext` values and the
+rendered Job; overrides must retain `runAsNonRoot: true`, a `RuntimeDefault` or
+`Localhost` seccomp profile, `allowPrivilegeEscalation: false`, and dropped
+`ALL` capabilities.
+
 If the gateway exits with `failed to read sandbox JWT signing key from
 /etc/openshell-jwt/signing.pem`, verify that `openshell-jwt-keys` contains
 `signing.pem`, `public.pem`, and `kid`, and that the gateway workload mounts the

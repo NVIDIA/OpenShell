@@ -455,6 +455,18 @@ pkiInitJob:
   # Secrets. When certManager.enabled=true, cert-manager owns TLS and this same
   # hook runs in JWT-only mode even if pkiInitJob.enabled remains true.
   enabled: true
+  # -- Pod security context for the certificate-generation hook.
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  # -- Container security context for the certificate-generation hook.
+  securityContext:
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
   # -- Extra DNS SANs to append to the server certificate.
   serverDnsNames: []
   # -- Extra IP SANs to append to the server certificate.

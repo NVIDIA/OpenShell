@@ -74,6 +74,8 @@ spec:
     spec:
       restartPolicy: OnFailure
       serviceAccountName: {{ $hookName }}
+      securityContext:
+        {{- toYaml .Values.pkiInitJob.podSecurityContext | nindent 8 }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -83,10 +85,7 @@ spec:
           image: {{ include "openshell.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
+            {{- toYaml .Values.pkiInitJob.securityContext | nindent 12 }}
           env:
             - name: POD_NAMESPACE
               valueFrom:
