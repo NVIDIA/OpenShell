@@ -483,6 +483,12 @@ service OpenShell {
     };
   }
 
+  // Register startup and acknowledge an exact validated runtime configuration.
+  rpc ReportSandboxConfiguration(ReportSandboxConfigurationRequest)
+      returns (ReportSandboxConfigurationResponse) {
+    option (openshell.options.v1.authorization) = { auth_mode: "sandbox" };
+  }
+
   // Get provider environment for a sandbox (called by sandbox supervisor at startup).
   rpc GetSandboxProviderEnvironment(GetSandboxProviderEnvironmentRequest)
       returns (GetSandboxProviderEnvironmentResponse) {
@@ -1077,6 +1083,8 @@ message SandboxStatus {
   // Currently populated for MCP-over-HTTP endpoints. These passive results
   // remain separate from sandbox lifecycle conditions and readiness.
   repeated EndpointStatus endpoint_statuses = 10;
+  // Independent of infrastructure phase; retained across driver observations.
+  SandboxConfigurationAdmission configuration_admission = 11;
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.
@@ -2384,6 +2392,32 @@ message ReportPolicyStatusRequest {
 
 // Report policy status response.
 message ReportPolicyStatusResponse {}
+
+enum ConfigurationAdmissionState {
+  CONFIGURATION_ADMISSION_STATE_UNSPECIFIED = 0;
+  CONFIGURATION_ADMISSION_STATE_PENDING = 1;
+  CONFIGURATION_ADMISSION_STATE_ACCEPTED = 2;
+  CONFIGURATION_ADMISSION_STATE_REJECTED = 3;
+}
+
+message SandboxConfigurationAdmission {
+  string instance_id = 1;
+  ConfigurationAdmissionState state = 2;
+  uint32 policy_version = 3;
+  string policy_hash = 4;
+  uint64 config_revision = 5;
+  uint64 provider_env_revision = 6;
+  string error = 7;
+}
+
+message ReportSandboxConfigurationRequest {
+  string sandbox_id = 1;
+  SandboxConfigurationAdmission admission = 2;
+  // Pending registration replaces only this previously observed instance.
+  string expected_instance_id = 3;
+}
+
+message ReportSandboxConfigurationResponse {}
 
 // A versioned policy revision with metadata.
 message SandboxPolicyRevision {
