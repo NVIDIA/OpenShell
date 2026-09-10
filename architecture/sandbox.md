@@ -457,6 +457,9 @@ Security-relevant sandbox behavior uses OCSF structured events; internal
 diagnostics use ordinary tracing.
 The OCSF device describes the sandbox environment, with type ID Other and type
 label `Sandbox`; its operating system is a separate attribute.
+Gateway-origin events describe the gateway process's OS, independently of any
+associated sandbox. Linux supervisor events retain Linux as their device OS,
+including when a native macOS or Windows gateway manages the sandbox.
 
 ## Policy Proposals
 

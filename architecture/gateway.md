@@ -821,6 +821,35 @@ startup and disables export. Export is best-effort — the SDK logs runtime
 failures, and a failed batch is dropped rather than retried. Buffered spans
 flush after the server loop exits so `SIGTERM` does not drop in-flight traces.
 
+### OCSF file collection
+
+The gateway owns one optional native OCSF JSONL output, configured through
+`openshell.gateway.ocsf_log`. An in-process bounded queue captures
+gateway-produced OCSF records independently of diagnostic filtering and sandbox
+log subscriptions, including events without a sandbox association. It preserves
+event identity and does not translate records into destination-specific schemas.
+
+Console formatting and sandbox log subscriptions also read the structured event:
+the console renders shorthand, and the log bus routes by the affected container's
+UID. Gateway-wide events have no sandbox subscription. These consumers remain
+available without enabling JSONL output. Event origin identifies the producer
+(`Gateway` or `Supervisor`), independently of the affected sandbox.
+
+Tracing callbacks queue serialized records with count and byte bounds; overflow
+drops incoming records. A dedicated filesystem worker owns appends, recovery of
+incomplete tails, daily rename-based rotation, and retention. Failed writes are
+not replayed, and subsequent records are discarded during bounded reopen backoff.
+Metrics expose writer failures and known or uncertain losses outside the output.
+Tail recovery reports discarded bytes, not an invented missing-record count.
+
+Each replica requires its own file. An external shipper owns rotation discovery,
+checkpoints, remote retries, credentials, and SIEM or OTLP conversion. Retention
+must exceed expected shipper outages to avoid pruning unread segments. Concurrent
+writers and external copy-truncate rotation are unsupported. Output failures do
+not block sandbox execution. Shutdown allows five seconds to drain; an outstanding
+OS write cannot be cancelled and remains uncertain. Flush is not fsync, and neither
+the queue nor append results promise durable acceptance or audit completeness.
+
 ### Package-managed gateway registry
 
 The CLI reads its active-gateway and per-gateway metadata from

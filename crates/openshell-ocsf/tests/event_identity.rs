@@ -5,7 +5,9 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use openshell_ocsf::{ActivityId, EventContext, NetworkActivityBuilder, OcsfEvent, SeverityId};
+use openshell_ocsf::{
+    ActivityId, EventContext, EventOrigin, NetworkActivityBuilder, OcsfEvent, SeverityId,
+};
 
 fn sandbox_ctx(container_image: &str) -> EventContext {
     EventContext {
@@ -16,6 +18,22 @@ fn sandbox_ctx(container_image: &str) -> EventContext {
         product_version: "0.42.1".to_string(),
         proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
         proxy_port: 8888,
+        origin: EventOrigin::Supervisor,
+    }
+}
+
+fn gateway_ctx(sandbox_id: &str, sandbox_name: &str) -> EventContext {
+    EventContext {
+        sandbox_id: sandbox_id.to_string(),
+        sandbox_name: sandbox_name.to_string(),
+        container_image: String::new(),
+        hostname: "openshell-gateway-0".to_string(),
+        product_version: "0.42.1".to_string(),
+        proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        proxy_port: 0,
+        origin: EventOrigin::Gateway {
+            name: "production-us-west".to_string(),
+        },
     }
 }
 
@@ -54,6 +72,27 @@ fn the_sandbox_id_is_carried_by_the_container() {
 
     assert_eq!(json["container"]["uid"], "sb-1");
     assert_eq!(json["container"]["name"], "agent-01");
+}
+
+#[test]
+fn a_gateway_event_about_a_sandbox_still_names_that_container() {
+    let json = event(&gateway_ctx("sb-7", "agent-07"))
+        .to_json()
+        .expect("serializes");
+
+    assert_eq!(json["container"]["uid"], "sb-7");
+    assert_eq!(json["container"]["name"], "agent-07");
+    assert_eq!(json["metadata"]["product"]["name"], "OpenShell Gateway");
+}
+
+#[test]
+fn a_gateway_event_about_no_sandbox_omits_the_container() {
+    let json = event(&gateway_ctx("", "")).to_json().expect("serializes");
+
+    assert!(
+        json.get("container").is_none(),
+        "an event with no sandbox association has no container: {json}"
+    );
 }
 
 #[test]

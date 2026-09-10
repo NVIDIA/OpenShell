@@ -500,7 +500,23 @@ async fn run_from_args(
 ) -> Result<()> {
     let prepared = prepare_server_config_with_drivers(&mut args, &matches, &compute_drivers)?;
 
+    // Initialize OCSF identity before tracing can emit gateway events.
+    let gateway_identity = crate::gateway_ocsf::GatewayIdentity {
+        name: prepared.config.name.clone(),
+        hostname: crate::compute::lease::replica_id(),
+    };
+    if !crate::gateway_ocsf::set_identity(gateway_identity) {
+        tracing::debug!("gateway OCSF identity already initialized, keeping existing");
+    }
+
     let tracing_log_bus = TracingLogBus::new();
+    let ocsf_log = prepared
+        .config_file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.ocsf_log.clone())
+        .map(crate::ocsf_log::OcsfLog::start)
+        .transpose()
+        .into_diagnostic()?;
     let otlp_config = prepared
         .config_file
         .as_ref()
@@ -514,9 +530,11 @@ async fn run_from_args(
         &prepared.config.compute_driver_endpoints,
     );
     let (tracing_handle, setup_error) = crate::tracing_setup::install(
-        EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(&prepared.config.log_level)),
+        &EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new(&prepared.config.log_level))
+            .to_string(),
         &tracing_log_bus,
+        ocsf_log.as_ref(),
         otlp_config,
         compute_driver_tracing,
         gateway_resource,
@@ -579,6 +597,10 @@ async fn run_from_args(
     let result = Box::pin(run_server(prepared, tracing_log_bus, compute_drivers)).await;
 
     tracing_handle.shutdown();
+
+    if let Some(log) = ocsf_log {
+        log.shutdown().await;
+    }
 
     result.into_diagnostic()
 }
