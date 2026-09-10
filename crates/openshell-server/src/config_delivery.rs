@@ -13,7 +13,7 @@ use metrics::counter;
 use openshell_core::proto::{
     ConfigBootstrap, ProviderEnvironmentSnapshot, Sandbox, SandboxConfigSnapshot,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Code, Status};
 use tracing::warn;
 
@@ -143,13 +143,6 @@ impl ConfigComponents {
         .into_iter()
         .filter_map(|(selected, component)| selected.then_some(component))
     }
-
-    fn only(component: ConfigComponentKind) -> Self {
-        Self {
-            sandbox_config: component == ConfigComponentKind::SandboxConfig,
-            provider_environment: component == ConfigComponentKind::ProviderEnvironment,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -185,20 +178,21 @@ struct FanoutKey {
     component: ConfigComponentKind,
 }
 
-/// Coalesces publications and runs one worker per sandbox and component.
+/// Coalesces publications and bounds workers per sandbox and component.
 ///
 /// The map entry is also the worker lease. Its boolean is set when another
 /// mutation arrives during a build or route operation. The worker then rebuilds
 /// the current full snapshot once, regardless of how many mutations arrived.
 ///
-/// Workers are spawned eagerly so coalescing stays exact, but snapshot
-/// construction itself is bounded by `build_permits`. A fleet-wide change
-/// therefore queues on the semaphore instead of saturating the database pool
-/// and credential backends all at once.
+/// Each pending map entry owns a delivery permit for its worker. Direct
+/// publications fail fast when all permits are held. Fanout workers wait for a
+/// permit before admitting the next recipient, which bounds both spawned tasks
+/// and pending keys while still walking the full recipient list.
 #[derive(Debug)]
 pub struct ConfigDeliveryQueue {
     pending: Mutex<HashMap<DeliveryKey, bool>>,
     fanout_pending: Mutex<HashMap<FanoutKey, bool>>,
+    delivery_permits: Arc<Semaphore>,
     build_permits: Semaphore,
 }
 
@@ -211,10 +205,12 @@ impl Default for ConfigDeliveryQueue {
 impl ConfigDeliveryQueue {
     #[must_use]
     pub fn new(max_concurrent_builds: usize) -> Self {
+        let max_concurrent_builds = max_concurrent_builds.max(1);
         Self {
             pending: Mutex::default(),
             fanout_pending: Mutex::default(),
-            build_permits: Semaphore::new(max_concurrent_builds.max(1)),
+            delivery_permits: Arc::new(Semaphore::new(max_concurrent_builds)),
+            build_permits: Semaphore::new(max_concurrent_builds),
         }
     }
 
@@ -249,16 +245,45 @@ impl ConfigDeliveryQueue {
         tokio::time::timeout(CONFIG_SNAPSHOT_BUILD_TIMEOUT, build).await
     }
 
-    fn enqueue(&self, key: DeliveryKey) -> bool {
+    fn enqueue(&self, key: DeliveryKey) -> DeliveryEnqueue {
         let mut pending = self.pending.lock().unwrap();
         match pending.entry(key) {
             Entry::Occupied(mut entry) => {
                 *entry.get_mut() = true;
-                false
+                DeliveryEnqueue::Coalesced
+            }
+            Entry::Vacant(entry) => {
+                let Ok(permit) = Arc::clone(&self.delivery_permits).try_acquire_owned() else {
+                    return DeliveryEnqueue::Full;
+                };
+                entry.insert(true);
+                DeliveryEnqueue::StartWorker(permit)
+            }
+        }
+    }
+
+    async fn enqueue_from_fanout(&self, key: DeliveryKey) -> DeliveryEnqueue {
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if let Entry::Occupied(mut entry) = pending.entry(key.clone()) {
+                *entry.get_mut() = true;
+                return DeliveryEnqueue::Coalesced;
+            }
+        }
+
+        let permit = Arc::clone(&self.delivery_permits)
+            .acquire_owned()
+            .await
+            .expect("delivery worker semaphore is never closed");
+        let mut pending = self.pending.lock().unwrap();
+        match pending.entry(key) {
+            Entry::Occupied(mut entry) => {
+                *entry.get_mut() = true;
+                DeliveryEnqueue::Coalesced
             }
             Entry::Vacant(entry) => {
                 entry.insert(true);
-                true
+                DeliveryEnqueue::StartWorker(permit)
             }
         }
     }
@@ -310,6 +335,13 @@ impl ConfigDeliveryQueue {
             pending.contains_key(key)
         }
     }
+}
+
+#[derive(Debug)]
+enum DeliveryEnqueue {
+    StartWorker(OwnedSemaphorePermit),
+    Coalesced,
+    Full,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,18 +414,49 @@ fn enqueue_sandbox(state: &Arc<ServerState>, sandbox_id: &str, components: Confi
             sandbox_id: sandbox_id.to_string(),
             component,
         };
-        if state.config_delivery_queue.enqueue(key.clone()) {
-            let state = Arc::clone(state);
-            tokio::spawn(async move {
-                loop {
-                    state.config_delivery_queue.take(&key);
-                    publish_sandbox_component_now(&state, &key).await;
-                    if !state.config_delivery_queue.finish_pass(&key) {
-                        break;
-                    }
-                }
-            });
+        match state.config_delivery_queue.enqueue(key.clone()) {
+            DeliveryEnqueue::StartWorker(permit) => {
+                spawn_delivery_worker(state, key, permit);
+            }
+            DeliveryEnqueue::Coalesced => {}
+            DeliveryEnqueue::Full => {
+                record_delivery_worker_full(sandbox_id, component.name());
+            }
         }
+    }
+}
+
+fn spawn_delivery_worker(state: &Arc<ServerState>, key: DeliveryKey, permit: OwnedSemaphorePermit) {
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let _permit = permit;
+        loop {
+            state.config_delivery_queue.take(&key);
+            publish_sandbox_component_now(&state, &key).await;
+            if !state.config_delivery_queue.finish_pass(&key) {
+                break;
+            }
+        }
+    });
+}
+
+async fn enqueue_sandbox_from_fanout(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    component: ConfigComponentKind,
+) {
+    let key = DeliveryKey {
+        sandbox_id: sandbox_id.to_string(),
+        component,
+    };
+    match state
+        .config_delivery_queue
+        .enqueue_from_fanout(key.clone())
+        .await
+    {
+        DeliveryEnqueue::StartWorker(permit) => spawn_delivery_worker(state, key, permit),
+        DeliveryEnqueue::Coalesced => {}
+        DeliveryEnqueue::Full => unreachable!("fanout waits for delivery worker capacity"),
     }
 }
 
@@ -505,8 +568,20 @@ async fn publish_fanout_now(state: &Arc<ServerState>, key: &FanoutKey) {
                 continue;
             }
         }
-        enqueue_sandbox(state, &sandbox_id, ConfigComponents::only(key.component));
+        enqueue_sandbox_from_fanout(state, &sandbox_id, key.component).await;
     }
+}
+
+fn record_delivery_worker_full(sandbox_id: &str, component: &'static str) {
+    counter!(
+        "openshell_supervisor_config_delivery_workers_total",
+        "outcome" => "queue_full",
+    )
+    .increment(1);
+    warn!(
+        sandbox_id,
+        component, "supervisor configuration delivery worker queue is full"
+    );
 }
 
 fn record_delivery(component: &'static str, disposition: DeliveryDisposition) {
@@ -558,13 +633,22 @@ mod tests {
     fn queue_coalesces_repeated_component_changes_while_worker_is_active() {
         let queue = ConfigDeliveryQueue::default();
         let key = key("sb-1", ConfigComponentKind::SandboxConfig);
-        assert!(queue.enqueue(key.clone()));
+        let DeliveryEnqueue::StartWorker(permit) = queue.enqueue(key.clone()) else {
+            panic!("first publication must start a worker");
+        };
         queue.take(&key);
-        assert!(!queue.enqueue(key.clone()));
-        assert!(!queue.enqueue(key.clone()));
+        assert!(matches!(
+            queue.enqueue(key.clone()),
+            DeliveryEnqueue::Coalesced
+        ));
+        assert!(matches!(
+            queue.enqueue(key.clone()),
+            DeliveryEnqueue::Coalesced
+        ));
         assert!(queue.finish_pass(&key));
         queue.take(&key);
         assert!(!queue.finish_pass(&key));
+        drop(permit);
     }
 
     #[test]
@@ -651,10 +735,47 @@ mod tests {
 
     #[test]
     fn queue_runs_components_and_sandboxes_independently() {
-        let queue = ConfigDeliveryQueue::default();
-        assert!(queue.enqueue(key("sb-1", ConfigComponentKind::SandboxConfig)));
-        assert!(queue.enqueue(key("sb-1", ConfigComponentKind::ProviderEnvironment)));
-        assert!(queue.enqueue(key("sb-2", ConfigComponentKind::SandboxConfig)));
+        let queue = ConfigDeliveryQueue::new(3);
+        assert!(matches!(
+            queue.enqueue(key("sb-1", ConfigComponentKind::SandboxConfig)),
+            DeliveryEnqueue::StartWorker(_)
+        ));
+        assert!(matches!(
+            queue.enqueue(key("sb-1", ConfigComponentKind::ProviderEnvironment)),
+            DeliveryEnqueue::StartWorker(_)
+        ));
+        assert!(matches!(
+            queue.enqueue(key("sb-2", ConfigComponentKind::SandboxConfig)),
+            DeliveryEnqueue::StartWorker(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn fleet_fanout_waits_without_creating_unbounded_delivery_workers() {
+        const ROUTED_SANDBOXES: usize = 10_000;
+        let queue = Arc::new(ConfigDeliveryQueue::new(1));
+        let first = key("sandbox-0", ConfigComponentKind::SandboxConfig);
+        let DeliveryEnqueue::StartWorker(_blocked_worker) = queue.enqueue(first) else {
+            panic!("first publication must start a worker");
+        };
+
+        let sandbox_ids = (1..ROUTED_SANDBOXES)
+            .map(|index| format!("sandbox-{index}"))
+            .collect::<Vec<_>>();
+        let fanout = async {
+            for sandbox_id in sandbox_ids {
+                for component in ConfigComponents::ALL.selected() {
+                    let _ = queue.enqueue_from_fanout(key(&sandbox_id, component)).await;
+                }
+            }
+        };
+        tokio::pin!(fanout);
+        tokio::select! {
+            () = &mut fanout => panic!("fanout must wait for worker capacity"),
+            () = tokio::task::yield_now() => {}
+        }
+
+        assert_eq!(queue.pending.lock().unwrap().len(), 1);
     }
 
     #[test]
