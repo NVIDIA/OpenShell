@@ -1,6 +1,6 @@
 ---
 name: openshell-cli
-description: Guide agents through using the OpenShell CLI (openshell) for sandbox management, gateway registration, provider configuration and refresh, policy iteration, settings, service exposure, BYOC workflows, and attached-provider inference. Covers basic through advanced multi-step workflows. Trigger keywords - openshell, sandbox create, sandbox exec, sandbox connect, logs, provider create, provider profile, provider refresh, policy set, policy get, settings, service expose, forward, port forward, BYOC, bring your own container, inference, use openshell, run openshell, CLI usage, manage sandbox, manage provider, gateway add, gateway select.
+description: Guide agents through using the OpenShell CLI (openshell) for sandbox management, gateway registration, provider configuration and refresh, profile management, policy iteration, settings, service exposure, BYOC workflows, and attached-provider inference. Covers basic through advanced multi-step workflows. Trigger keywords - openshell, sandbox create, sandbox exec, sandbox connect, logs, provider create, profile list, profile describe, provider refresh, policy set, policy get, settings, service expose, forward, port forward, BYOC, bring your own container, inference, use openshell, run openshell, CLI usage, manage sandbox, manage provider, gateway add, gateway select.
 ---
 
 # OpenShell CLI
@@ -37,6 +37,7 @@ Use `openshell --help` and nested `--help` output as the authority for the insta
 - [Manage gateways](https://docs.nvidia.com/openshell/latest/sandboxes/manage-gateways.md)
 - [Manage sandboxes](https://docs.nvidia.com/openshell/latest/sandboxes/manage-sandboxes.md)
 - [Manage providers](https://docs.nvidia.com/openshell/latest/sandboxes/manage-providers.md)
+- [Profiles](https://docs.nvidia.com/openshell/latest/providers/profiles.md)
 - [Sandbox policies](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md)
 - [Inference routing](https://docs.nvidia.com/openshell/latest/sandboxes/inference-routing.md)
 
@@ -111,9 +112,9 @@ openshell sandbox delete <name>
 
 Providers supply credentials and provider-specific configuration to sandboxes. Provider types come from built-in and custom profiles; do not rely on a hard-coded type list. Discover the profiles available on the selected gateway:
 
-```bash
-openshell provider list-profiles
-openshell provider list-profiles --output json
+```shell
+openshell profile list
+openshell profile list --type provider --output json
 ```
 
 ### Create a provider from local credentials
@@ -136,7 +137,7 @@ Bare `KEY` reads the value from the environment variable of that name and avoids
 Other credential sources are `--from-gcloud-adc` for compatible profiles and `--runtime-credentials` when the gateway or sandbox resolves the required credentials at runtime.
 
 Static provider credentials resolve only for hosts, ports, and paths declared by
-the provider profile. Use `provider profile export` to inspect that boundary
+the provider profile. Use `profile export` to inspect that boundary
 when a placeholder is present but requests receive
 `credential_endpoint_mismatch`. A profileless static provider fails closed
 because the gateway cannot construct a binding.
@@ -154,11 +155,16 @@ enforced.
 
 ### Inspect and manage provider profiles
 
-```bash
-openshell provider profile export github --output yaml
-openshell provider profile lint --file ./my-profile.yaml
-openshell provider profile import --file ./my-profile.yaml
+```shell
+openshell profile describe github
+openshell profile export github --output yaml
+openshell profile lint --file ./my-profile.yaml
+openshell profile import --file ./my-profile.yaml
 ```
+
+Use `profile describe` to inspect a definition's credentials, endpoints, policy rules, binaries, source, and scope before creating a provider. List and describe accept table, JSON, and YAML output; use `--workspace` for a workspace catalog or `--global` for platform scope. Use `profile export` when preparing an editable definition, `profile update <id> --file <file>` to replace an existing custom profile with its current resource version, and `profile delete <id>...` to remove custom profiles. Provider instances remain under `provider`.
+
+Existing scripts can continue using `provider list-profiles` and `provider profile export/import/update/lint/delete`. These commands share the top-level handlers and preserve their arguments, output options, and workspace/global flags. Prefer `profile` when writing new commands.
 
 ### List, inspect, update, delete
 
@@ -243,6 +249,7 @@ openshell sandbox create \
 ```
 
 Key flags:
+
 - `--provider`: Attach configured credential providers for API keys, tokens, and other secrets (repeatable)
 - `--policy`: Custom policy YAML (otherwise uses built-in default or `OPENSHELL_SANDBOX_POLICY` env var)
 - `--gpu [COUNT]`: Request the driver's default GPU selection or a specific GPU count
@@ -477,6 +484,7 @@ openshell logs dev --tail --source sandbox
 ```
 
 Look for log lines with `action: deny` -- these indicate blocked network requests. The logs include:
+
 - **Destination host and port** (what was blocked)
 - **Binary path** (which process attempted the connection)
 - **Deny reason** (why it was blocked)
@@ -492,6 +500,7 @@ The `--full` flag includes the effective policy, including provider-composed ent
 ### Step 4: Modify the policy
 
 Edit `current-policy.yaml` to allow the blocked actions. **For policy content authoring, delegate to the `generate-sandbox-policy` skill.** That skill handles:
+
 - Network endpoint rule structure
 - L4 vs REST, WebSocket, JSON-RPC, MCP, and SQL L7 policy decisions
 - Access presets (`read-only`, `read-write`, `full`)
@@ -521,6 +530,7 @@ endpoint, or an explicit binding to an endpointless AWS profile. Fix the
 conflicting endpoint selectors or credential source and submit again.
 
 The `--wait` flag blocks until the sandbox confirms the policy is loaded (polls every second). Exit codes:
+
 - **0**: Policy loaded successfully
 - **1**: Policy load failed
 - **124**: Timeout (default 60 seconds)

@@ -109,10 +109,10 @@ wait_for_port_forward
 
 "${OS[@]}" sandbox delete "$SANDBOX_NAME" >/dev/null 2>&1 || true
 "${OS[@]}" provider delete "$PROVIDER_NAME" >/dev/null 2>&1 || true
-"${OS[@]}" provider profile delete "$PROFILE_ID" >/dev/null 2>&1 || true
+"${OS[@]}" profile delete "$PROFILE_ID" >/dev/null 2>&1 || true
 
-run "${OS[@]}" provider profile lint -f "$PROFILE_FILE"
-run "${OS[@]}" provider profile import -f "$PROFILE_FILE"
+run "${OS[@]}" profile lint -f "$PROFILE_FILE"
+run "${OS[@]}" profile import -f "$PROFILE_FILE"
 run "${OS[@]}" provider create --name "$PROVIDER_NAME" --type "$PROFILE_ID" --runtime-credentials
 run "${OS[@]}" sandbox create --name "$SANDBOX_NAME" --provider "$PROVIDER_NAME" --no-tty -- echo "sandbox ready"
 

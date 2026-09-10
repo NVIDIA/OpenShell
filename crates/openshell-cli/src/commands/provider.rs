@@ -1439,62 +1439,106 @@ pub async fn provider_list(
     Ok(())
 }
 
+/// List the provider profiles visible in the requested workspace.
 pub async fn provider_list_profiles(
     server: &str,
     output: &str,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
+    let rendered = provider_list_profiles_text(server, output, workspace, tls).await?;
+    println!("{}", rendered.trim_end());
+    Ok(())
+}
+
+/// Fetch and render every page of the visible provider profile catalog.
+pub async fn provider_list_profiles_text(
+    server: &str,
+    output: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<String> {
+    const PAGE_SIZE: u32 = 100;
+
     let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .list_provider_profiles(ListProviderProfilesRequest {
-            limit: 100,
-            offset: 0,
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?;
-    let mut profiles = response.into_inner().profiles;
+    let mut profiles = Vec::new();
+    let mut offset: u32 = 0;
+    loop {
+        let page = client
+            .list_provider_profiles(ListProviderProfilesRequest {
+                limit: PAGE_SIZE,
+                offset,
+                workspace: workspace.to_string(),
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner()
+            .profiles;
+        let page_len = page.len();
+        profiles.extend(page);
+        // The RPC has no next-page token; a short page marks the end of the
+        // catalog. Preserve every scope when profiles share the same name.
+        if page_len < PAGE_SIZE as usize {
+            break;
+        }
+        offset = offset
+            .checked_add(PAGE_SIZE)
+            .ok_or_else(|| miette!("provider profile catalog exceeds the pagination limit"))?;
+    }
     profiles.sort_by(|left, right| {
-        left.category
-            .cmp(&right.category)
-            .then_with(|| left.id.cmp(&right.id))
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.scope.cmp(&right.scope))
+            .then_with(|| left.source.cmp(&right.source))
     });
     let dto_profiles = profiles
         .iter()
         .map(ProviderTypeProfile::from_proto)
         .collect::<Vec<_>>();
 
-    if crate::output::print_output_direct(
-        output,
-        || profiles_to_json(&dto_profiles).into_diagnostic(),
-        || profiles_to_yaml(&dto_profiles).into_diagnostic(),
-    )? {
-        return Ok(());
+    match output {
+        "json" => profiles_to_json(&dto_profiles).into_diagnostic(),
+        "yaml" => profiles_to_yaml(&dto_profiles).into_diagnostic(),
+        "table" => Ok(format_provider_profile_table(&profiles)),
+        _ => Err(miette!("unsupported output format: {output}")),
     }
+}
 
-    if profiles.is_empty() {
-        println!("No provider profiles found.");
-        return Ok(());
-    }
-
-    println!("{}", "Available Provider Profiles:".cyan().bold());
-    let id_width = provider_profile_id_width(&profiles);
-    let display_width = provider_profile_display_width(&profiles);
-    let source_width = provider_profile_source_width(&profiles);
-    let scope_width = provider_profile_scope_width(&profiles);
-    let mut current_category = i32::MIN;
-    for profile in &profiles {
-        if profile.category != current_category {
-            current_category = profile.category;
-            println!();
-            println!("  {}", display_provider_category(current_category).bold());
-            print_provider_type_header(id_width, scope_width, source_width, display_width);
-        }
-        print_provider_type_row(profile, id_width, scope_width, source_width, display_width);
-    }
-
+/// Describe one resolved provider profile without retrieving provider credentials.
+pub async fn provider_profile_describe(
+    server: &str,
+    id: &str,
+    output: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let rendered = provider_profile_describe_text(server, id, output, workspace, tls).await?;
+    println!("{}", rendered.trim_end());
     Ok(())
+}
+
+/// Fetch and render a profile definition using workspace-aware resolution.
+pub async fn provider_profile_describe_text(
+    server: &str,
+    id: &str,
+    output: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<String> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .get_provider_profile(GetProviderProfileRequest {
+            id: id.to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+    let profile = response
+        .into_inner()
+        .profile
+        .ok_or_else(|| miette!("provider profile '{id}' not found"))?;
+
+    format_provider_profile_description(&profile, output)
 }
 
 pub async fn provider_profile_export(
@@ -2092,7 +2136,6 @@ fn display_provider_category(category: i32) -> &'static str {
 }
 
 const PROVIDER_PROFILE_ID_MAX_WIDTH: usize = 32;
-const PROVIDER_PROFILE_DISPLAY_MAX_WIDTH: usize = 40;
 const PROVIDER_PROFILE_SOURCE_MAX_WIDTH: usize = 24;
 
 fn provider_profile_id_width(profiles: &[ProviderProfile]) -> usize {
@@ -2104,21 +2147,6 @@ fn provider_profile_id_width(profiles: &[ProviderProfile]) -> usize {
                 .chars()
                 .count()
                 .min(PROVIDER_PROFILE_ID_MAX_WIDTH)
-        })
-        .max()
-        .unwrap_or(2)
-        .max(2)
-}
-
-fn provider_profile_display_width(profiles: &[ProviderProfile]) -> usize {
-    profiles
-        .iter()
-        .map(|profile| {
-            profile
-                .display_name
-                .chars()
-                .count()
-                .min(PROVIDER_PROFILE_DISPLAY_MAX_WIDTH)
         })
         .max()
         .unwrap_or(4)
@@ -2149,40 +2177,184 @@ fn provider_profile_source_width(profiles: &[ProviderProfile]) -> usize {
         .max(6)
 }
 
-fn print_provider_type_header(
-    id_width: usize,
-    scope_width: usize,
-    source_width: usize,
-    display_width: usize,
-) {
-    let endpoints = "ENDPOINTS";
-    println!(
-        "    {:<id_width$}  {:<scope_width$}  {:<source_width$}  {:<display_width$}  {endpoints}",
-        "ID", "SCOPE", "SOURCE", "NAME"
+fn format_provider_profile_table(profiles: &[ProviderProfile]) -> String {
+    use std::fmt::Write as _;
+
+    if profiles.is_empty() {
+        return "No profiles found.\n".to_string();
+    }
+
+    let id_width = provider_profile_id_width(profiles);
+    let scope_width = provider_profile_scope_width(profiles);
+    let source_width = provider_profile_source_width(profiles);
+    let category_width = profiles
+        .iter()
+        .map(|profile| display_provider_category(profile.category).len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
+    let mut rendered = String::new();
+    let _ = writeln!(
+        rendered,
+        "{:<id_width$}  {:<8}  {:<category_width$}  {:<source_width$}  {:<scope_width$}",
+        "NAME", "TYPE", "CATEGORY", "SOURCE", "SCOPE"
     );
+
+    for profile in profiles {
+        let name = truncate_display(&profile.id, PROVIDER_PROFILE_ID_MAX_WIDTH);
+        let category = display_provider_category(profile.category);
+        let source = truncate_display(&profile.source, PROVIDER_PROFILE_SOURCE_MAX_WIDTH);
+        let _ = writeln!(
+            rendered,
+            "{name:<id_width$}  {:<8}  {category:<category_width$}  {source:<source_width$}  {:<scope_width$}",
+            "provider", profile.scope
+        );
+    }
+    rendered
 }
 
-fn print_provider_type_row(
-    profile: &ProviderProfile,
-    id_width: usize,
-    scope_width: usize,
-    source_width: usize,
-    display_width: usize,
-) {
-    let inference = if profile.inference_capable {
-        " inference"
-    } else {
-        ""
-    };
-    let id = truncate_display(&profile.id, PROVIDER_PROFILE_ID_MAX_WIDTH);
-    let scope = &profile.scope;
-    let source = truncate_display(&profile.source, PROVIDER_PROFILE_SOURCE_MAX_WIDTH);
-    let display_name = truncate_display(&profile.display_name, PROVIDER_PROFILE_DISPLAY_MAX_WIDTH);
-    println!(
-        "    {id:<id_width$}  {scope:<scope_width$}  {source:<source_width$}  {display_name:<display_width$}  {:<2}{}",
-        profile.endpoints.len(),
-        inference
-    );
+fn format_provider_profile_description(profile: &ProviderProfile, output: &str) -> Result<String> {
+    let dto = ProviderTypeProfile::from_proto(profile);
+    match output {
+        "json" => profile_to_json(&dto).into_diagnostic(),
+        "yaml" => profile_to_yaml(&dto).into_diagnostic(),
+        "table" => Ok(format_provider_profile_details(profile)),
+        _ => Err(miette!("unsupported output format: {output}")),
+    }
+}
+
+fn format_provider_profile_details(profile: &ProviderProfile) -> String {
+    use std::fmt::Write as _;
+
+    let mut rendered = format!("{} (provider)\n", profile.id);
+    for (label, value) in [
+        ("Category", display_provider_category(profile.category)),
+        ("Display name", profile.display_name.as_str()),
+        ("Description", profile.description.as_str()),
+        ("Source", profile.source.as_str()),
+        ("Scope", profile.scope.as_str()),
+    ] {
+        let value = if value.is_empty() {
+            "not specified"
+        } else {
+            value
+        };
+        let _ = writeln!(rendered, "{label}: {value}");
+    }
+    let _ = writeln!(rendered, "Inference capable: {}", profile.inference_capable);
+
+    rendered.push_str("\nCredentials:\n");
+    if profile.credentials.is_empty() {
+        rendered.push_str("  None declared.\n");
+    }
+    // Profiles declare credential names and injection metadata. Never resolve
+    // local discovery sources or provider instances while describing a profile.
+    for credential in &profile.credentials {
+        let requirement = if credential.required {
+            "required"
+        } else {
+            "optional"
+        };
+        let _ = writeln!(rendered, "  {} ({requirement})", credential.name);
+        if !credential.description.is_empty() {
+            let _ = writeln!(rendered, "    Description: {}", credential.description);
+        }
+        let env_vars = if credential.env_vars.is_empty() {
+            "none declared".to_string()
+        } else {
+            credential.env_vars.join(", ")
+        };
+        let _ = writeln!(rendered, "    Environment variables: {env_vars}");
+        let auth_style = if credential.auth_style.is_empty() {
+            "not specified"
+        } else {
+            &credential.auth_style
+        };
+        let _ = writeln!(rendered, "    Authentication: {auth_style}");
+        if !credential.header_name.is_empty() {
+            let _ = writeln!(rendered, "    Header: {}", credential.header_name);
+        }
+        if !credential.query_param.is_empty() {
+            let _ = writeln!(rendered, "    Query parameter: {}", credential.query_param);
+        }
+    }
+
+    rendered.push_str("\nEndpoints (declared policy):\n");
+    if profile.endpoints.is_empty() {
+        rendered.push_str("  None declared.\n");
+    }
+    for endpoint in &profile.endpoints {
+        let host = if endpoint.host.is_empty() {
+            "any host matching allowed IPs"
+        } else {
+            &endpoint.host
+        };
+        let _ = writeln!(rendered, "  {host}");
+        // The endpoint contract gives the repeated ports field precedence over
+        // the single port; display the effective declared set in that order.
+        let ports = if !endpoint.ports.is_empty() {
+            endpoint
+                .ports
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else if endpoint.port != 0 {
+            endpoint.port.to_string()
+        } else {
+            "not specified".to_string()
+        };
+        let _ = writeln!(rendered, "    Ports: {ports}");
+        if !endpoint.path.is_empty() {
+            let _ = writeln!(rendered, "    Path: {}", endpoint.path);
+        }
+        let protocol = match endpoint.protocol.as_str() {
+            "" => "tcp (default; no L7 inspection)",
+            "tcp" => "tcp (no L7 inspection)",
+            protocol => protocol,
+        };
+        let _ = writeln!(rendered, "    Protocol: {protocol}");
+        // An explicit rule set can include writes even when other endpoints
+        // use read-only presets. Report its shape without guessing its access.
+        let access = if !endpoint.access.is_empty() {
+            endpoint.access.as_str()
+        } else if !endpoint.rules.is_empty() {
+            "custom rules"
+        } else {
+            "not specified"
+        };
+        let _ = writeln!(rendered, "    Access: {access}");
+        if !endpoint.rules.is_empty() || !endpoint.deny_rules.is_empty() {
+            let _ = writeln!(
+                rendered,
+                "    Rules: {} allow, {} deny",
+                endpoint.rules.len(),
+                endpoint.deny_rules.len()
+            );
+        }
+        let enforcement = if endpoint.enforcement.is_empty() {
+            "audit (default)"
+        } else {
+            &endpoint.enforcement
+        };
+        let _ = writeln!(rendered, "    Enforcement: {enforcement}");
+        if !endpoint.allowed_ips.is_empty() {
+            let _ = writeln!(
+                rendered,
+                "    Allowed IPs: {}",
+                endpoint.allowed_ips.join(", ")
+            );
+        }
+    }
+
+    rendered.push_str("\nBinaries:\n");
+    if profile.binaries.is_empty() {
+        rendered.push_str("  None declared.\n");
+    }
+    for binary in &profile.binaries {
+        let _ = writeln!(rendered, "  {}", binary.path);
+    }
+    rendered
 }
 
 pub struct ProviderUpdateOptions<'a> {
@@ -2386,6 +2558,185 @@ mod tests {
         ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant, ProviderProfile,
         ProviderProfileCredential, datamodel::v1::ObjectMeta,
     };
+
+    #[test]
+    fn profile_list_table_includes_type_category_source_and_scope() {
+        let profiles = vec![
+            ProviderProfile {
+                id: "github".to_string(),
+                category: ProviderProfileCategory::SourceControl as i32,
+                source: "builtin".to_string(),
+                scope: "platform".to_string(),
+                ..Default::default()
+            },
+            ProviderProfile {
+                id: "github".to_string(),
+                category: ProviderProfileCategory::SourceControl as i32,
+                source: "user".to_string(),
+                scope: "workspace".to_string(),
+                ..Default::default()
+            },
+            ProviderProfile {
+                id: "search".to_string(),
+                category: ProviderProfileCategory::Knowledge as i32,
+                source: "interceptor/search".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let rendered = format_provider_profile_table(&profiles);
+        let rows = rendered.lines().collect::<Vec<_>>();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows[0].split_whitespace().collect::<Vec<_>>(),
+            ["NAME", "TYPE", "CATEGORY", "SOURCE", "SCOPE"]
+        );
+        assert_eq!(
+            rows[1].split_whitespace().collect::<Vec<_>>(),
+            [
+                "github", "provider", "SOURCE", "CONTROL", "builtin", "platform"
+            ]
+        );
+        assert_eq!(
+            rows[2].split_whitespace().collect::<Vec<_>>(),
+            [
+                "github",
+                "provider",
+                "SOURCE",
+                "CONTROL",
+                "user",
+                "workspace"
+            ]
+        );
+        assert_eq!(
+            rows[3].split_whitespace().collect::<Vec<_>>(),
+            ["search", "provider", "KNOWLEDGE", "interceptor/search"]
+        );
+    }
+
+    #[test]
+    fn profile_list_table_reports_empty_catalog() {
+        assert_eq!(format_provider_profile_table(&[]), "No profiles found.\n");
+    }
+
+    #[test]
+    fn profile_description_keeps_credential_values_out_of_human_output() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _credential = EnvVarGuard::set("GITHUB_TOKEN", "test-private-token-value");
+        let mut profile = openshell_providers::builtin_profiles()
+            .iter()
+            .find(|profile| profile.id == "github")
+            .expect("the built-in catalog contains GitHub")
+            .to_proto();
+        profile.source = "builtin".to_string();
+        profile.scope = "platform".to_string();
+
+        let rendered =
+            format_provider_profile_description(&profile, "table").expect("profile details render");
+        assert!(rendered.starts_with("github (provider)\nCategory: SOURCE CONTROL\n"));
+        assert!(
+            rendered.contains("Display name: GitHub\nDescription: GitHub API and Git operations\n")
+        );
+        assert!(rendered.contains("Source: builtin\nScope: platform\n"));
+        assert!(rendered.contains("Environment variables: GITHUB_TOKEN, GH_TOKEN\n"));
+        assert!(rendered.contains("Authentication: bearer\n"));
+        assert!(rendered.contains("Header: authorization\n"));
+        assert!(!rendered.contains("test-private-token-value"));
+        assert!(!rendered.contains("Default URL"));
+        assert!(rendered.contains("Protocol: graphql\n"));
+        assert!(rendered.contains("Path: /graphql\n"));
+        assert_eq!(rendered.matches("Access: read-only\n").count(), 2);
+        assert!(rendered.contains("Access: custom rules\n    Rules: 4 allow, 0 deny\n"));
+        assert!(rendered.contains("Enforcement: enforce\n"));
+        assert!(rendered.contains("  /usr/bin/gh\n"));
+        assert!(rendered.contains("  /usr/local/bin/git\n"));
+    }
+
+    #[test]
+    fn profile_description_distinguishes_defaults_and_explicit_policy() {
+        let profile = ProviderProfile {
+            id: "custom".to_string(),
+            endpoints: vec![
+                openshell_core::proto::NetworkEndpoint {
+                    host: "api.example.com".to_string(),
+                    port: 443,
+                    ports: vec![8443, 9443],
+                    ..Default::default()
+                },
+                openshell_core::proto::NetworkEndpoint {
+                    host: "write.example.com".to_string(),
+                    port: 443,
+                    protocol: "rest".to_string(),
+                    access: "read-write".to_string(),
+                    enforcement: "audit".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let rendered = format_provider_profile_details(&profile);
+        assert!(rendered.contains("Ports: 8443, 9443\n"));
+        assert!(rendered.contains("Protocol: tcp (default; no L7 inspection)\n"));
+        assert!(rendered.contains("Access: not specified\n    Enforcement: audit (default)\n"));
+        assert!(rendered.contains("Access: read-write\n    Enforcement: audit\n"));
+        assert!(!rendered.contains("read-only"));
+        assert!(rendered.contains("Credentials:\n  None declared.\n"));
+        assert!(rendered.contains("Binaries:\n  None declared.\n"));
+    }
+
+    #[test]
+    fn profile_description_structured_output_preserves_full_definition() {
+        let profile = parse_profile_yaml(
+            r"
+id: custom
+display_name: Custom API
+category: data
+source: user
+scope: workspace
+resource_version: 7
+annotations: { owner: example }
+credentials:
+  - name: token
+    env_vars: [CUSTOM_TOKEN]
+    required: true
+    auth_style: bearer
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    allow_encoded_slash: true
+    rules:
+      - allow:
+          method: GET
+          path: /records/**
+          query: { mode: safe }
+    deny_rules:
+      - method: GET
+        path: /records/private/**
+binaries: [/usr/bin/curl]
+",
+        )
+        .expect("valid profile fixture");
+        let proto = profile.to_proto();
+        for output in ["json", "yaml"] {
+            let rendered = format_provider_profile_description(&proto, output)
+                .expect("structured description renders");
+            let roundtrip = if output == "json" {
+                parse_profile_json(&rendered)
+            } else {
+                parse_profile_yaml(&rendered)
+            }
+            .expect("structured description is a full profile document");
+            assert_eq!(roundtrip, ProviderTypeProfile::from_proto(&proto));
+            assert!(rendered.contains("allow_encoded_slash"));
+            assert!(rendered.contains("/records/private/**"));
+            assert!(rendered.contains("CUSTOM_TOKEN"));
+        }
+    }
 
     #[test]
     fn attached_provider_json_is_sorted_and_secret_safe() {

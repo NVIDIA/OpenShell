@@ -34,7 +34,7 @@ container; bind it to an address reachable from the gateway runtime.
 
 ```bash
 openshell provider get <provider>
-openshell provider profile export <profile-id> -o yaml
+openshell profile export <profile-id> -o yaml
 ```
 
 Check that the profile:
@@ -49,8 +49,8 @@ endpoint-bearing profile. A base URL stored only in provider configuration does
 not authorize a new endpoint.
 
 ```bash
-openshell provider profile lint -f ./provider-profile.yaml
-openshell provider profile import -f ./provider-profile.yaml
+openshell profile lint -f ./provider-profile.yaml
+openshell profile import -f ./provider-profile.yaml
 openshell provider create --name <provider> --type <profile-id>
 ```
 

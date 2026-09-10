@@ -836,14 +836,14 @@ async fn podman_provider_token_exchange_injects_bearer_header() {
     let _target = start_protected_target(target_port).await;
 
     run_cli_ignore_error(&["provider", "delete", &provider_name, "--yes"]).await;
-    run_cli_ignore_error(&["provider", "profile", "delete", &profile_type, "--yes"]).await;
+    run_cli_ignore_error(&["profile", "delete", &profile_type, "--yes"]).await;
 
     let profile = write_profile(&profile_type, token_port, target_port);
     let profile_path = profile
         .path()
         .to_str()
         .expect("profile path should be UTF-8");
-    run_cli(&["provider", "profile", "import", "-f", profile_path])
+    run_cli(&["profile", "import", "-f", profile_path])
         .await
         .expect("import provider profile");
     run_cli(&[
@@ -883,7 +883,7 @@ async fn podman_provider_token_exchange_injects_bearer_header() {
     };
 
     run_cli_ignore_error(&["provider", "delete", &provider_name, "--yes"]).await;
-    run_cli_ignore_error(&["provider", "profile", "delete", &profile_type, "--yes"]).await;
+    run_cli_ignore_error(&["profile", "delete", &profile_type, "--yes"]).await;
     sandbox.cleanup().await;
 
     assert!(

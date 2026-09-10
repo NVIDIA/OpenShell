@@ -286,7 +286,7 @@ policy_signature_for_sandbox() {
 profile_signature_for_profile() {
   local profile_id="$1"
 
-  "${CLI[@]}" provider profile export "$profile_id" -o json \
+  "${CLI[@]}" profile export "$profile_id" -o json \
     | awk -F'"' '/"openshell.nvidia.com\/profile-signature":/ { print $4; exit }'
 }
 
@@ -300,7 +300,7 @@ wait_for_profile() {
   } >>"$SETUP_LOG"
 
   for _ in {1..60}; do
-    if "${CLI[@]}" provider profile export "$profile_id" -o yaml >>"$SETUP_LOG" 2>&1; then
+    if "${CLI[@]}" profile export "$profile_id" -o yaml >>"$SETUP_LOG" 2>&1; then
       printf 'INFO %s\n' "$label"
       return
     fi
@@ -439,12 +439,12 @@ configure_gateway() {
 }
 
 run_suite() {
-  expect_output_contains "lists github profile" "github" "${CLI[@]}" provider list-profiles
-  expect_output_contains "lists slack profile" "slack" "${CLI[@]}" provider list-profiles
-  expect_output_not_contains "hides codex profile" "codex" "${CLI[@]}" provider list-profiles
-  expect_output_not_contains "hides google cloud profile" "google-cloud" "${CLI[@]}" provider list-profiles
-  expect_output_contains "github profile has governance profile signature" "openshell.nvidia.com/profile-signature" "${CLI[@]}" provider profile export github -o json
-  expect_output_contains "github profile has governance profile hash" "openshell.nvidia.com/profile-hash" "${CLI[@]}" provider profile export github -o json
+  expect_output_contains "lists github profile" "github" "${CLI[@]}" profile list
+  expect_output_contains "lists slack profile" "slack" "${CLI[@]}" profile list
+  expect_output_not_contains "hides codex profile" "codex" "${CLI[@]}" profile list
+  expect_output_not_contains "hides google cloud profile" "google-cloud" "${CLI[@]}" profile list
+  expect_output_contains "github profile has governance profile signature" "openshell.nvidia.com/profile-signature" "${CLI[@]}" profile export github -o json
+  expect_output_contains "github profile has governance profile hash" "openshell.nvidia.com/profile-hash" "${CLI[@]}" profile export github -o json
 
   cat >"$TMPDIR/disallowed-profile.yaml" <<'EOF'
 id: custom-slack
@@ -456,8 +456,8 @@ endpoints: []
 binaries: []
 EOF
 
-  expect_failure "denies provider profile delete" "${CLI[@]}" provider profile delete slack
-  expect_failure "denies disallowed provider profile import" "${CLI[@]}" provider profile import -f "$TMPDIR/disallowed-profile.yaml"
+  expect_failure "denies provider profile delete" "${CLI[@]}" profile delete slack
+  expect_failure "denies disallowed provider profile import" "${CLI[@]}" profile import -f "$TMPDIR/disallowed-profile.yaml"
 
   run_step "allows github provider create" "${CLI[@]}" provider create --name github --type github --credential GITHUB_TOKEN=dummy
   run_step "allows slack provider create" "${CLI[@]}" provider create --name slack --type slack --credential SLACK_BOT_TOKEN=dummy
@@ -583,7 +583,7 @@ endpoints:
     enforcement: enforce
 binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]
 EOF
-  wait_for_output_contains "gateway sees github profile reload" "profile-reload.example" "${CLI[@]}" provider profile export github -o yaml
+  wait_for_output_contains "gateway sees github profile reload" "profile-reload.example" "${CLI[@]}" profile export github -o yaml
   wait_for_output_contains "effective policy has reloaded github profile" "profile-reload.example" "${CLI[@]}" policy get "$SANDBOX_NAME" --full -o json
   local reloaded_github_profile_signature=""
   {

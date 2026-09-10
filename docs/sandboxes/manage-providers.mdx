@@ -22,7 +22,8 @@ Provider profiles include metadata for known endpoints and binaries. View
 the available profiles before creating a provider:
 
 ```shell
-openshell provider list-profiles
+openshell profile list
+openshell profile describe github
 ```
 
 ## Create a Provider
@@ -112,12 +113,12 @@ Update a custom provider profile after exporting it, editing its endpoints,
 binaries, or credential metadata, and preserving the exported `resource_version`:
 
 ```shell
-openshell provider profile export my-api -o yaml > my-api-profile.yaml
-openshell provider profile update my-api -f my-api-profile.yaml
+openshell profile export my-api -o yaml > my-api-profile.yaml
+openshell profile update my-api -f my-api-profile.yaml
 ```
 
 Import remains create-only and fails if the profile ID already exists. Use
-`provider profile update <id>` for existing custom profiles. Built-in profiles are
+`profile update <id>` for existing custom profiles. Built-in profiles are
 read-only. The target ID must match the profile ID in the file. Update accepts
 one file at a time and rejects stale resource versions. Updated profile policy
 applies to all provider instances of that type on the next sandbox config sync.
@@ -125,7 +126,7 @@ applies to all provider instances of that type on the next sandbox config sync.
 Delete one or more custom provider profiles by ID:
 
 ```shell
-openshell provider profile delete custom-api custom-alt
+openshell profile delete custom-api custom-alt
 ```
 
 When a multi-profile delete fails for one entry, the CLI reports that profile's
@@ -401,7 +402,7 @@ closed instead of being forwarded to the upstream service.
 Export the profile used by a provider to inspect its credential boundary:
 
 ```shell
-openshell provider profile export github -o yaml
+openshell profile export github -o yaml
 ```
 
 For the built-in GitHub profile, `GITHUB_TOKEN` and `GH_TOKEN` can resolve for

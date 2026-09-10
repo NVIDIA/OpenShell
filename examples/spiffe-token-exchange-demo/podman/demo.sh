@@ -639,10 +639,10 @@ SUBJECT_TOKEN="$(curl -fsS "http://127.0.0.1:${TOKEN_ISSUER_PORT}/demo-subject-t
 
 "${OS[@]}" sandbox delete "$SANDBOX_NAME" >/dev/null 2>&1 || true
 "${OS[@]}" provider delete "$PROVIDER_NAME" >/dev/null 2>&1 || true
-"${OS[@]}" provider profile delete "$PROFILE_ID" >/dev/null 2>&1 || true
+"${OS[@]}" profile delete "$PROFILE_ID" >/dev/null 2>&1 || true
 
-run "${OS[@]}" provider profile lint -f "$RENDERED_PROFILE"
-run "${OS[@]}" provider profile import -f "$RENDERED_PROFILE"
+run "${OS[@]}" profile lint -f "$RENDERED_PROFILE"
+run "${OS[@]}" profile import -f "$RENDERED_PROFILE"
 run "${OS[@]}" provider create --name "$PROVIDER_NAME" --type "$PROFILE_ID" --credential "subject_token=${SUBJECT_TOKEN}"
 run "${OS[@]}" sandbox create --name "$SANDBOX_NAME" --provider "$PROVIDER_NAME" --keep --no-tty -- echo "sandbox ready"
 

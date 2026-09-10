@@ -128,7 +128,7 @@ Then run:
 ```bash
 export GATEWAY=https://127.0.0.1:8097
 
-openshell --gateway "$OPENSHELL_GATEWAY" --gateway-endpoint "$GATEWAY" provider profile import \
+openshell --gateway "$OPENSHELL_GATEWAY" --gateway-endpoint "$GATEWAY" profile import \
   -f "$OPENSHELL_REPO/examples/spiffe-token-exchange-demo/provider-profile.yaml"
 
 openshell --gateway "$OPENSHELL_GATEWAY" --gateway-endpoint "$GATEWAY" provider create \
