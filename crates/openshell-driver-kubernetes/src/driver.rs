@@ -3851,12 +3851,9 @@ fn sandbox_template_to_k8s_with_validated_config(
     apply_pod_driver_config(&mut spec, &driver_config.pod);
 
     // Per-sandbox portable intent overrides the cluster-wide default. This
-    // driver owns the Kubernetes-specific `hostUsers` translation. Accept the
-    // former platform_config encoding during rolling upgrades from gateways
-    // that predate the typed field.
+    // driver owns the Kubernetes-specific `hostUsers` translation.
     let use_user_namespaces = template
         .user_namespaces
-        .or_else(|| platform_config_bool(template, "host_users").map(|host_users| !host_users))
         .unwrap_or(params.enable_user_namespaces);
 
     if use_user_namespaces {
@@ -4465,15 +4462,6 @@ fn platform_config_string(template: &SandboxTemplate, key: &str) -> Option<Strin
     let value = config.fields.get(key)?;
     match value.kind.as_ref() {
         Some(prost_types::value::Kind::StringValue(s)) if !s.is_empty() => Some(s.clone()),
-        _ => None,
-    }
-}
-
-fn platform_config_bool(template: &SandboxTemplate, key: &str) -> Option<bool> {
-    let config = template.platform_config.as_ref()?;
-    let value = config.fields.get(key)?;
-    match value.kind.as_ref() {
-        Some(prost_types::value::Kind::BoolValue(value)) => Some(*value),
         _ => None,
     }
 }
@@ -7728,7 +7716,7 @@ mod tests {
     }
 
     #[test]
-    fn user_namespaces_accepts_legacy_host_users_encoding() {
+    fn user_namespaces_ignores_legacy_host_users_encoding() {
         let template = SandboxTemplate {
             platform_config: Some(Struct {
                 fields: std::iter::once((
@@ -7751,10 +7739,9 @@ mod tests {
             &params,
         );
 
-        assert_eq!(
-            pod_template["spec"]["hostUsers"],
-            serde_json::json!(false),
-            "legacy host_users: false must still enable user namespaces"
+        assert!(
+            pod_template["spec"]["hostUsers"].is_null(),
+            "legacy host_users must not enable user namespaces"
         );
     }
 

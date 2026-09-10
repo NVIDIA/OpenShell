@@ -42,6 +42,14 @@ Process-identity omissions are preserved across this boundary so every driver
 can apply its native image or runtime defaults. Driver-requested listeners are
 structurally validated and remain restricted to sandbox callback RPCs.
 
+`DriverSandboxTemplate.user_namespaces` is the sole portable representation of
+user-namespace intent. Drivers that implement the intent map this typed field to
+their runtime; Kubernetes maps it to `hostUsers: false`. The gateway does not
+encode that intent in `platform_config`, and drivers do not read the former
+Kubernetes-specific `platform_config.host_users` key. Gateways and external
+drivers that implement the legacy encoding must not be mixed with this typed-only
+contract when per-sandbox user namespaces are required.
+
 Canonical main-process support is part of the `ComputeDriver` contract. Every
 in-tree and extension driver must forward the exact specification; it is not an
 optional capability that drivers can omit or negotiate.

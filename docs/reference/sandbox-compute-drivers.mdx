@@ -40,6 +40,27 @@ an exited canonical process remains a terminal sandbox result. Exit code zero
 produces `Completed`; a nonzero or signal-normalized exit produces `Error`
 with the exact exit code. Driver and supervisor failures remain `Error`.
 
+## Compute Driver Compatibility
+
+OpenShell `0.1.0` establishes `DriverSandboxTemplate.user_namespaces` as the
+only compute-driver representation of portable user-namespace intent. The
+Kubernetes driver maps the typed value to PodSpec `hostUsers`; Docker, Podman,
+MicroVM, and MXC do not currently implement this optional intent. In-process
+and standalone first-party drivers use the same protobuf contract and driver
+implementation.
+
+| Gateway contract | External Kubernetes driver contract | Per-sandbox user namespaces |
+|---|---|---|
+| Typed `user_namespaces` | Typed `user_namespaces` | Supported. |
+| Typed `user_namespaces` | Legacy `platform_config.host_users` | Unsupported. The driver does not consume the typed field. |
+| Legacy `platform_config.host_users` | Typed `user_namespaces` | Unsupported. The driver ignores the removed opaque encoding. |
+
+Keep an external Kubernetes driver on the same release train as its gateway
+when using per-sandbox user namespaces. Out-of-tree drivers that implement
+this intent must regenerate bindings from the `0.1.0` compute-driver protobuf
+and read `user_namespaces`; `platform_config.host_users` is not emitted or
+honored.
+
 ## Configure a Compute Driver
 
 Configure the compute driver on the gateway. Current releases accept one driver per gateway. Set `compute_drivers` in the gateway TOML file:
