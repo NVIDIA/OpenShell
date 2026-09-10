@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use openshell_core::GatewayProviderProfileSourceConfig;
 use openshell_core::mcp::normalize_provider_profile_mcp_fields;
-use openshell_core::proto::{ProviderProfile, StoredProviderProfile};
+use openshell_core::proto::ProviderProfile;
 use openshell_gateway_interceptors::{
     GatewayInterceptorProfileSource, GatewayInterceptorRuntime,
     ProviderProfileSourceSnapshot as InterceptorProfileSnapshot,
@@ -24,6 +24,7 @@ use tonic::Status;
 use tracing::debug;
 
 use crate::persistence::{ObjectType, Store};
+use crate::storage_proto::StoredProviderProfile;
 
 const BUILTIN_SOURCE_ID: &str = "builtin";
 const USER_SOURCE_ID: &str = "user";

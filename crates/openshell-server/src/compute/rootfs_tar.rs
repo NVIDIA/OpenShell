@@ -23,7 +23,7 @@ use tonic::Status;
 use tracing::{info, warn};
 
 /// How long an allocated slot survives without being consumed.
-const STAGING_TOKEN_TTL: Duration = Duration::from_secs(30 * 60);
+const STAGING_TOKEN_TTL: Duration = Duration::from_mins(30);
 /// Outstanding slots one caller may hold. Bounds the directories a single
 /// authenticated caller can create by calling `begin` in a loop.
 const MAX_SLOTS_PER_CALLER: usize = 4;

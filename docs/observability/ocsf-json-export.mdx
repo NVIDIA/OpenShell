@@ -64,6 +64,8 @@ sinks rotate daily and retain the three most recent files.
 
 ## JSON Record Structure
 
+`metadata.uid` uniquely identifies an event and stays unchanged when that record is serialized again. Use `container.uid` to associate the event with its sandbox, not `metadata.uid`. Records without a sandbox association omit the container; unknown images are omitted rather than represented by an empty image name.
+
 Each line is a complete OCSF v1.8.0 JSON object. Here is an example of a network connection event:
 
 ```json
@@ -165,33 +167,6 @@ The `class_uid` field identifies the event type:
 | 2004 | Detection Finding | `FINDING:` |
 | 5019 | Device Config State Change | `CONFIG:` |
 | 6002 | Application Lifecycle | `LIFECYCLE:` |
-| 6003 | API Activity | `API:INFERENCE` |
-
-### API Activity [6003] — AI Inference
-
-When the inference proxy routes a model call through `inference.local`, an API Activity event is emitted with the `ai_operation` profile:
-
-```json
-{
-  "class_uid": 6003,
-  "class_name": "API Activity",
-  "activity_id": 99,
-  "activity_name": "Other",
-  "api": { "operation": "POST /v1/messages" },
-  "actor": { "process": { "name": "openshell-supervisor", "pid": 1 } },
-  "src_endpoint": { "ip": "127.0.0.1", "port": 3128 },
-  "ai_model": { "name": "claude-haiku-4-5-20251001", "ai_provider": "https://api.anthropic.com/v1" },
-  "metadata": { "version": "1.8.0", "profiles": ["container", "host", "ai_operation"] },
-  "status": "Success",
-  "unmapped": { "latency_ms": 701 }
-}
-```
-
-The shorthand log renders this as:
-
-```text
-OCSF API:INFERENCE [INFO] Success claude-haiku-4-5-20251001 via https://api.anthropic.com/v1 701ms [POST /v1/messages]
-```
 
 ## SIEM Schema Version Compatibility
 
@@ -264,6 +239,8 @@ cat /var/log/openshell-ocsf.2026-04-01.log | \
 ```
 
 ## Relationship to Shorthand Logs
+
+Sandbox events identify the sandbox environment with `device.type_id: 99` (Other) and `device.type: "Sandbox"`. The operating system is reported separately in `device.os.name`; the device type does not classify the underlying host or compute backend.
 
 The shorthand format in `openshell.YYYY-MM-DD.log` and the JSON format in `openshell-ocsf.YYYY-MM-DD.log` are derived from the same OCSF events. The shorthand is a human-readable projection; the JSON is the full structured record when no schema downgrade is configured. When `ocsf_schema_version` is set, the JSON export is a lossy projection of the internal event model. Both formats are generated at the same time from the same event data.
 

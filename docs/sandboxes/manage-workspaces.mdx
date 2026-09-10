@@ -9,8 +9,8 @@ position: 3
 ---
 
 An OpenShell workspace is an access and resource isolation boundary. Sandboxes,
-sandbox workload templates, providers, services, policies, settings, and
-inference routes belong to a workspace and are not visible to members of other
+sandbox workload templates, providers, provider profiles, services, policies,
+and settings belong to a workspace and are not visible to members of other
 workspaces.
 
 The CLI targets the `default` workspace unless you set `--workspace` or
@@ -193,8 +193,8 @@ openshell workspace delete team-ml
 A custom workspace must not contain sandboxes, sandbox workload templates,
 providers, provider profiles, services, SSH sessions, settings, policies, draft
 policy chunks, or credential refresh state. Remove those resources before
-retrying deletion. OpenShell removes membership records and inference routes as
-part of successful workspace deletion.
+retrying deletion. OpenShell removes membership records as part of successful
+workspace deletion.
 
 ## Next Steps
 

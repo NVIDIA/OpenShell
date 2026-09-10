@@ -11,23 +11,106 @@ sibling script imports directly as `sync_docs_website`.
 from __future__ import annotations
 
 from argparse import Namespace
-from typing import TYPE_CHECKING, cast
+from pathlib import Path
+from typing import cast
 
 import pytest
 import sync_docs_website as sdw
 import yaml
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def read_yaml(path: Path) -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
+def read_workflow(name: str) -> dict:
+    path = Path(__file__).resolve().parents[2] / ".github" / "workflows" / name
+    return yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+
+
+def test_release_workflows_sync_and_publish_docs_once() -> None:
+    dev = read_workflow("release-dev.yml")
+    tag = read_workflow("release-tag.yml")
+    dev_job = dev["jobs"]["publish-fern-docs"]
+    tag_job = tag["jobs"]["publish-fern-docs"]
+
+    assert dev_job["needs"] == [
+        "compute-versions",
+        "release-dev",
+        "release-helm",
+        "trigger-wheel-publish",
+    ]
+    assert dev_job["uses"] == "./.github/workflows/sync-docs.yml"
+    assert dev_job["with"]["channel"] == "dev"
+    assert (
+        dev_job["with"]["release_version"]
+        == "${{ needs.compute-versions.outputs.docs_version }}"
+    )
+    assert dev_job["with"]["publish"] == "true"
+    assert dev_job["with"]["display_name"] == "Dev"
+    assert dev_job["with"]["availability"] == "beta"
+
+    assert tag_job["needs"] == [
+        "compute-versions",
+        "release",
+        "publish-sdk-typescript",
+        "release-helm",
+        "trigger-wheel-publish",
+    ]
+    assert tag_job["uses"] == "./.github/workflows/sync-docs.yml"
+    assert tag_job["with"]["channel"] == "latest"
+    assert (
+        tag_job["with"]["release_version"]
+        == "${{ needs.compute-versions.outputs.semver }}"
+    )
+    assert "version_slug" not in tag_job["with"]
+    assert (
+        tag_job["with"]["display_name"]
+        == "Latest (v${{ needs.compute-versions.outputs.semver }})"
+    )
+    assert tag_job["with"]["publish"] == "true"
+    assert "is_prerelease != 'true'" in tag_job["if"]
+
+    for workflow_name in ("release-dev.yml", "release-tag.yml"):
+        workflow_path = (
+            Path(__file__).resolve().parents[2]
+            / ".github"
+            / "workflows"
+            / workflow_name
+        )
+        workflow_text = workflow_path.read_text(encoding="utf-8")
+        assert workflow_text.count("uses: ./.github/workflows/sync-docs.yml") == 1
+        assert "fern generate --docs" not in workflow_text
+
+
+def test_sync_workflow_serializes_sync_and_publish() -> None:
+    workflow = read_workflow("sync-docs.yml")
+    triggers = workflow["on"]
+    publish_input = triggers["workflow_call"]["inputs"]["publish"]
+    assert publish_input["type"] == "boolean"
+    assert publish_input["default"] == "false"
+    assert workflow["concurrency"]["group"] == "docs-website"
+    assert workflow["concurrency"]["queue"] == "max"
+    publish_workflow = read_workflow("publish-docs-website.yml")
+    assert publish_workflow["concurrency"]["queue"] == "max"
+
+    steps = workflow["jobs"]["sync"]["steps"]
+    step_names = [step["name"] for step in steps]
+    assert step_names.index("Commit docs website changes") < step_names.index(
+        "Publish Fern docs"
+    )
+    publish_step = next(step for step in steps if step["name"] == "Publish Fern docs")
+    assert publish_step["if"] == "${{ inputs.publish }}"
+    assert publish_step["working-directory"] == "docs-website/fern"
+    update_step = next(step for step in steps if step["name"] == "Update docs snapshot")
+    assert "git -C source rev-parse HEAD" in update_step["run"]
+    assert '--source-sha "$SOURCE_SHA"' in update_step["run"]
+
+
 def test_resolve_slug_channels() -> None:
     assert sdw.resolve_slug("dev", "") == "dev"
     assert sdw.resolve_slug("latest", "") == "latest"
+    assert sdw.resolve_slug("stable", "v0.1.0") == "v0.1.0"
     assert sdw.resolve_slug("version", "v0.0.36") == "v0.0.36"
 
 
@@ -53,6 +136,38 @@ def test_resolve_display_name() -> None:
     assert sdw.resolve_display_name("latest", "latest", "abc123", "") == "Latest"
     assert sdw.resolve_display_name("version", "v0.0.36", "v0.0.36", "") == "v0.0.36"
     assert sdw.resolve_display_name("dev", "dev", "main", "Custom") == "Custom"
+
+
+def test_resolve_availability() -> None:
+    assert sdw.resolve_availability("dev", "") == "beta"
+    assert sdw.resolve_availability("latest", "") is None
+    assert sdw.resolve_availability("version", "") is None
+    assert sdw.resolve_availability("version", "deprecated") == "deprecated"
+    with pytest.raises(ValueError):
+        sdw.resolve_availability("dev", "alpha")
+
+
+def test_parse_and_render_versions_preserves_availability() -> None:
+    raw_versions = [
+        {
+            "display-name": "v0.0.36",
+            "path": "./versions/v0.0.36.yml",
+            "slug": "v0.0.36",
+            "availability": "deprecated",
+        }
+    ]
+
+    entries = sdw.parse_versions(raw_versions)
+
+    assert entries == [
+        sdw.VersionEntry(
+            "v0.0.36",
+            "v0.0.36",
+            "./versions/v0.0.36.yml",
+            "deprecated",
+        )
+    ]
+    assert sdw.render_versions(entries) == raw_versions
 
 
 def test_ordered_entries_pins_latest_then_dev() -> None:
@@ -113,7 +228,7 @@ def _make_docs_website_tree(root: Path) -> None:
     (fern / "docs.yml").write_text(yaml.safe_dump({"versions": []}), encoding="utf-8")
 
 
-def test_sync_docs_creates_snapshot(tmp_path: Path) -> None:
+def test_sync_docs_creates_planned_latest_and_dev_selector(tmp_path: Path) -> None:
     source = tmp_path / "source"
     website = tmp_path / "docs-website"
     _make_source_tree(source)
@@ -124,10 +239,27 @@ def test_sync_docs_creates_snapshot(tmp_path: Path) -> None:
             operation="sync",
             source_root=source,
             docs_website_root=website,
+            channel="latest",
+            source_ref="release-sha",
+            source_sha="release-sha",
+            release_version="0.0.116",
+            version_slug="",
+            display_name="Latest (v0.0.116)",
+            availability="",
+        )
+    )
+    sdw.sync_docs(
+        Namespace(
+            operation="sync",
+            source_root=source,
+            docs_website_root=website,
             channel="dev",
             source_ref="main",
+            source_sha="dev-sha",
+            release_version="0.0.117.dev56",
             version_slug="",
-            display_name="",
+            display_name="Dev",
+            availability="beta",
         )
     )
 
@@ -139,10 +271,362 @@ def test_sync_docs_creates_snapshot(tmp_path: Path) -> None:
     assert version_nav["navigation"][0]["path"] == "../pages-dev/intro.mdx"
 
     docs_yml = read_yaml(fern / "docs.yml")
-    slugs = [entry["slug"] for entry in docs_yml["versions"]]
-    assert slugs == ["dev"]
-    assert docs_yml["versions"][0]["path"] == "./versions/dev.yml"
+    assert docs_yml["versions"] == [
+        {
+            "display-name": "Latest (v0.0.116)",
+            "path": "./versions/latest.yml",
+            "slug": "latest",
+        },
+        {
+            "display-name": "Dev",
+            "path": "./versions/dev.yml",
+            "slug": "dev",
+            "availability": "beta",
+        },
+    ]
     assert "./components" in docs_yml["experimental"]["mdx-components"]
+
+
+def test_sync_docs_preserves_other_version_availability(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    website = tmp_path / "docs-website"
+    _make_source_tree(source)
+    _make_docs_website_tree(website)
+    docs_yml_path = website / "fern" / "docs.yml"
+    docs_yml_path.write_text(
+        yaml.safe_dump(
+            {
+                "versions": [
+                    {
+                        "display-name": "v0.0.36",
+                        "path": "./versions/v0.0.36.yml",
+                        "slug": "v0.0.36",
+                        "availability": "deprecated",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sdw.sync_docs(
+        Namespace(
+            operation="sync",
+            source_root=source,
+            docs_website_root=website,
+            channel="dev",
+            source_ref="main",
+            source_sha="dev-sha",
+            release_version="0.0.117.dev56",
+            version_slug="",
+            display_name="Dev (v0.0.117.dev56)",
+            availability="beta",
+        )
+    )
+
+    versions = read_yaml(docs_yml_path)["versions"]
+    assert versions == [
+        {
+            "display-name": "Dev (v0.0.117.dev56)",
+            "path": "./versions/dev.yml",
+            "slug": "dev",
+            "availability": "beta",
+        },
+        {
+            "display-name": "v0.0.36",
+            "path": "./versions/v0.0.36.yml",
+            "slug": "v0.0.36",
+            "availability": "deprecated",
+        },
+    ]
+
+
+def test_stable_sync_creates_immutable_version_and_promotes_latest(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    website = tmp_path / "docs-website"
+    _make_source_tree(source)
+    _make_docs_website_tree(website)
+
+    sdw.sync_docs(
+        Namespace(
+            source_root=source,
+            docs_website_root=website,
+            channel="stable",
+            source_ref="v0.2.0",
+            source_sha="new-sha",
+            release_version="0.2.0",
+            version_slug="v0.2.0",
+            display_name="",
+            availability="",
+            allow_rollback=False,
+        )
+    )
+
+    fern = website / "fern"
+    assert (fern / "pages-v0.2.0" / "intro.mdx").is_file()
+    assert (fern / "pages-latest" / "intro.mdx").is_file()
+    versions = read_yaml(fern / "docs.yml")["versions"]
+    assert [entry["slug"] for entry in versions] == ["latest", "v0.2.0"]
+    assert versions[0]["display-name"] == "Latest (v0.2.0)"
+    assert versions[0]["availability"] == "stable"
+    assert versions[1]["availability"] == "stable"
+    snapshots = read_yaml(fern / sdw.SNAPSHOT_METADATA_FILE)["snapshots"]
+    assert snapshots["latest"] == {
+        "source-ref": "v0.2.0",
+        "source-sha": "new-sha",
+        "version": "0.2.0",
+    }
+    assert snapshots["v0.2.0"] == {
+        "source-ref": "v0.2.0",
+        "source-sha": "new-sha",
+        "version": "0.2.0",
+    }
+
+
+def test_n_minus_one_sync_does_not_move_latest_backwards(tmp_path: Path) -> None:
+    current = tmp_path / "current"
+    maintenance = tmp_path / "maintenance"
+    website = tmp_path / "docs-website"
+    _make_source_tree(current)
+    _make_source_tree(maintenance)
+    (current / "docs" / "intro.mdx").write_text("# Current\n", encoding="utf-8")
+    (maintenance / "docs" / "intro.mdx").write_text("# Maintenance\n", encoding="utf-8")
+    _make_docs_website_tree(website)
+
+    for source, source_sha, version in (
+        (current, "current-sha", "0.3.1"),
+        (maintenance, "maintenance-sha", "0.2.7"),
+    ):
+        sdw.sync_docs(
+            Namespace(
+                source_root=source,
+                docs_website_root=website,
+                channel="stable",
+                source_ref=f"v{version}",
+                source_sha=source_sha,
+                release_version=version,
+                version_slug=f"v{version}",
+                display_name="",
+                availability="",
+                allow_rollback=False,
+            )
+        )
+
+    fern = website / "fern"
+    assert (fern / "pages-latest" / "intro.mdx").read_text(
+        encoding="utf-8"
+    ) == "# Current\n"
+    assert (fern / "pages-v0.2.7" / "intro.mdx").read_text(
+        encoding="utf-8"
+    ) == "# Maintenance\n"
+    snapshots = read_yaml(fern / sdw.SNAPSHOT_METADATA_FILE)["snapshots"]
+    assert snapshots["latest"] == {
+        "source-ref": "v0.3.1",
+        "source-sha": "current-sha",
+        "version": "0.3.1",
+    }
+
+
+def test_stable_sync_preserves_newer_legacy_latest_without_metadata(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    website = tmp_path / "docs-website"
+    _make_source_tree(source)
+    _make_docs_website_tree(website)
+    fern = website / "fern"
+    (fern / "pages-latest").mkdir()
+    (fern / "pages-latest" / "intro.mdx").write_text(
+        "# Existing latest\n", encoding="utf-8"
+    )
+    (fern / "docs.yml").write_text(
+        yaml.safe_dump(
+            {
+                "versions": [
+                    {
+                        "display-name": "Latest (v0.3.1)",
+                        "path": "./versions/latest.yml",
+                        "slug": "latest",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sdw.sync_docs(
+        Namespace(
+            source_root=source,
+            docs_website_root=website,
+            channel="stable",
+            source_ref="v0.2.7",
+            source_sha="maintenance-sha",
+            release_version="0.2.7",
+            version_slug="v0.2.7",
+            display_name="",
+            availability="",
+            allow_rollback=False,
+        )
+    )
+
+    assert (fern / "pages-latest" / "intro.mdx").read_text(
+        encoding="utf-8"
+    ) == "# Existing latest\n"
+    snapshots = read_yaml(fern / sdw.SNAPSHOT_METADATA_FILE)["snapshots"]
+    assert snapshots["latest"] == {
+        "source-ref": "",
+        "source-sha": "",
+        "version": "0.3.1",
+    }
+
+
+def test_dev_sync_rejects_stale_or_conflicting_updates(tmp_path: Path) -> None:
+    current = tmp_path / "current"
+    stale = tmp_path / "stale"
+    website = tmp_path / "docs-website"
+    _make_source_tree(current)
+    _make_source_tree(stale)
+    (current / "docs" / "intro.mdx").write_text("# Current\n", encoding="utf-8")
+    (stale / "docs" / "intro.mdx").write_text("# Stale\n", encoding="utf-8")
+    _make_docs_website_tree(website)
+
+    def sync(source: Path, source_sha: str, version: str) -> None:
+        sdw.sync_docs(
+            Namespace(
+                source_root=source,
+                docs_website_root=website,
+                channel="dev",
+                source_ref="main",
+                source_sha=source_sha,
+                release_version=version,
+                version_slug="",
+                display_name=f"Dev (v{version})",
+                availability="beta",
+                allow_rollback=False,
+            )
+        )
+
+    sync(current, "current-sha", "0.3.2.dev10")
+    sync(stale, "stale-sha", "0.3.2.dev9")
+    intro = website / "fern" / "pages-dev" / "intro.mdx"
+    assert intro.read_text(encoding="utf-8") == "# Current\n"
+
+    with pytest.raises(ValueError, match="already points to current-sha"):
+        sync(stale, "other-sha", "0.3.2.dev10")
+
+
+def test_dev_sync_allows_explicit_rollback(tmp_path: Path) -> None:
+    current = tmp_path / "current"
+    stale = tmp_path / "stale"
+    website = tmp_path / "docs-website"
+    _make_source_tree(current)
+    _make_source_tree(stale)
+    (current / "docs" / "intro.mdx").write_text("# Current\n", encoding="utf-8")
+    (stale / "docs" / "intro.mdx").write_text("# Rolled back\n", encoding="utf-8")
+    _make_docs_website_tree(website)
+
+    def sync(source: Path, source_sha: str, version: str, allow_rollback: bool) -> None:
+        sdw.sync_docs(
+            Namespace(
+                source_root=source,
+                docs_website_root=website,
+                channel="dev",
+                source_ref="main",
+                source_sha=source_sha,
+                release_version=version,
+                version_slug="",
+                display_name=f"Dev (v{version})",
+                availability="beta",
+                allow_rollback=allow_rollback,
+            )
+        )
+
+    sync(current, "current-sha", "0.3.2.dev10", False)
+    sync(stale, "rollback-sha", "0.3.2.dev9", True)
+
+    fern = website / "fern"
+    assert (fern / "pages-dev" / "intro.mdx").read_text(
+        encoding="utf-8"
+    ) == "# Rolled back\n"
+    snapshots = read_yaml(fern / sdw.SNAPSHOT_METADATA_FILE)["snapshots"]
+    assert snapshots["dev"] == {
+        "source-ref": "main",
+        "source-sha": "rollback-sha",
+        "version": "0.3.2.dev9",
+    }
+
+
+def test_immutable_snapshot_cannot_change_source(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    website = tmp_path / "docs-website"
+    _make_source_tree(source)
+    _make_docs_website_tree(website)
+    args = Namespace(
+        source_root=source,
+        docs_website_root=website,
+        channel="stable",
+        source_ref="main",
+        source_sha="release-sha",
+        release_version="0.2.0",
+        version_slug="v0.2.0",
+        display_name="",
+        availability="",
+        allow_rollback=False,
+    )
+    sdw.sync_docs(args)
+
+    args.source_sha = "different-sha"
+    with pytest.raises(ValueError, match=r"immutable snapshot v0\.2\.0"):
+        sdw.sync_docs(args)
+
+
+def test_only_dev_refreshes_shared_fern_files(tmp_path: Path) -> None:
+    dev = tmp_path / "dev"
+    release = tmp_path / "release"
+    website = tmp_path / "docs-website"
+    _make_source_tree(dev)
+    _make_source_tree(release)
+    (dev / "fern" / "components" / "Card.tsx").write_text(
+        "export const Card = 'dev';\n", encoding="utf-8"
+    )
+    (release / "fern" / "components" / "Card.tsx").write_text(
+        "export const Card = 'release';\n", encoding="utf-8"
+    )
+    _make_docs_website_tree(website)
+
+    sdw.sync_docs(
+        Namespace(
+            source_root=dev,
+            docs_website_root=website,
+            channel="dev",
+            source_ref="main",
+            source_sha="dev-sha",
+            release_version="0.2.1.dev1",
+            version_slug="",
+            display_name="Dev (v0.2.1.dev1)",
+            availability="beta",
+            allow_rollback=False,
+        )
+    )
+    sdw.sync_docs(
+        Namespace(
+            source_root=release,
+            docs_website_root=website,
+            channel="stable",
+            source_ref="v0.2.0",
+            source_sha="release-sha",
+            release_version="0.2.0",
+            version_slug="v0.2.0",
+            display_name="",
+            availability="",
+            allow_rollback=False,
+        )
+    )
+
+    card = website / "fern" / "components" / "Card.tsx"
+    assert card.read_text(encoding="utf-8") == "export const Card = 'dev';\n"
 
 
 def test_remove_docs_drops_snapshot(tmp_path: Path) -> None:
@@ -157,8 +641,10 @@ def test_remove_docs_drops_snapshot(tmp_path: Path) -> None:
         docs_website_root=website,
         channel="version",
         source_ref="v0.0.36",
+        source_sha="release-sha",
         version_slug="v0.0.36",
         display_name="",
+        availability="deprecated",
     )
     sdw.sync_docs(base)
 
@@ -175,6 +661,7 @@ def test_remove_docs_drops_snapshot(tmp_path: Path) -> None:
             source_ref="",
             version_slug="v0.0.36",
             display_name="",
+            availability="",
         )
     )
 
@@ -182,3 +669,74 @@ def test_remove_docs_drops_snapshot(tmp_path: Path) -> None:
     assert not (fern / "versions" / "v0.0.36.yml").exists()
     docs_yml = read_yaml(fern / "docs.yml")
     assert [entry["slug"] for entry in docs_yml["versions"]] == []
+
+
+@pytest.mark.parametrize("channel", ["stable", "version"])
+def test_immutable_snapshot_uses_resolved_commit_identity(
+    tmp_path: Path, channel: str
+) -> None:
+    source = tmp_path / "source"
+    website = tmp_path / "docs-website"
+    _make_source_tree(source)
+    _make_docs_website_tree(website)
+    args = Namespace(
+        source_root=source,
+        docs_website_root=website,
+        channel=channel,
+        source_ref="main",
+        source_sha="first-sha",
+        release_version="0.2.0" if channel == "stable" else "",
+        version_slug="v0.2.0",
+        display_name="",
+        availability="",
+        allow_rollback=False,
+    )
+    sdw.sync_docs(args)
+
+    (source / "docs" / "intro.mdx").write_text("# Changed\n", encoding="utf-8")
+    args.source_sha = "second-sha"
+
+    with pytest.raises(ValueError, match=r"immutable snapshot v0\.2\.0"):
+        sdw.sync_docs(args)
+    assert (website / "fern" / "pages-v0.2.0" / "intro.mdx").read_text(
+        encoding="utf-8"
+    ) == "# Intro\n"
+
+
+def test_stable_promotion_replaces_latest_page_components(tmp_path: Path) -> None:
+    old = tmp_path / "old"
+    new = tmp_path / "new"
+    website = tmp_path / "docs-website"
+    _make_source_tree(old)
+    _make_source_tree(new)
+    (old / "docs" / "_components").mkdir()
+    (old / "docs" / "_components" / "Widget.tsx").write_text(
+        "export const Widget = 'old';\n", encoding="utf-8"
+    )
+    (new / "docs" / "_components").mkdir()
+    (new / "docs" / "_components" / "Widget.tsx").write_text(
+        "export const Widget = 'new';\n", encoding="utf-8"
+    )
+    _make_docs_website_tree(website)
+
+    for source, source_sha, version in (
+        (old, "old-sha", "1.0.0"),
+        (new, "new-sha", "1.1.0"),
+    ):
+        sdw.sync_docs(
+            Namespace(
+                source_root=source,
+                docs_website_root=website,
+                channel="stable",
+                source_ref=f"v{version}",
+                source_sha=source_sha,
+                release_version=version,
+                version_slug=f"v{version}",
+                display_name="",
+                availability="",
+                allow_rollback=False,
+            )
+        )
+
+    widget = website / "fern" / "pages-latest" / "_components" / "Widget.tsx"
+    assert widget.read_text(encoding="utf-8") == "export const Widget = 'new';\n"

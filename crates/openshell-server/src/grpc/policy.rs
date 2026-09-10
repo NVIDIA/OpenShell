@@ -22,6 +22,9 @@ use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
 #[cfg(test)]
 use crate::provider_profile_sources::ProviderProfileSources;
+use crate::storage_proto::StoredProviderCredentialRefreshState;
+#[cfg(test)]
+use crate::storage_proto::StoredProviderProfile;
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
@@ -2747,7 +2750,7 @@ fn compute_provider_env_revision_from_records_and_policy_bindings(
 }
 
 fn hash_provider_refresh_states(
-    states: &[openshell_core::proto::StoredProviderCredentialRefreshState],
+    states: &[StoredProviderCredentialRefreshState],
     hasher: &mut Sha256,
 ) -> Result<(), Status> {
     let mut states = states.iter().collect::<Vec<_>>();
@@ -3215,7 +3218,13 @@ pub(super) async fn handle_update_config(
     let update = request.get_ref();
     let should_emit_policy_failure = should_emit_config_update_policy_telemetry(sandbox_caller)
         && (update.policy.is_some() || !update.merge_operations.is_empty());
-    let result = handle_update_config_inner(state, request, &principal, sandbox_caller).await;
+    let result = Box::pin(handle_update_config_inner(
+        state,
+        request,
+        &principal,
+        sandbox_caller,
+    ))
+    .await;
     if result.is_err() && should_emit_policy_failure {
         emit_sandbox_policy_update_failure();
     }
@@ -4599,7 +4608,7 @@ pub(super) async fn handle_submit_policy_analysis(
         // string means findings or infrastructure error, both of which
         // require human attention.
         if auto_approve_enabled
-            && let Err(err) = auto_approve_chunk(
+            && let Err(err) = Box::pin(auto_approve_chunk(
                 state,
                 &effective_id,
                 AutoApproveChunkContext {
@@ -4608,7 +4617,7 @@ pub(super) async fn handle_submit_policy_analysis(
                     source: &req.analysis_mode,
                     resolved_from,
                 },
-            )
+            ))
             .await
         {
             persist_pending_application_error(state, &effective_id, &err).await;
@@ -9419,7 +9428,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .put_message(&openshell_core::proto::StoredProviderProfile {
+            .put_message(&StoredProviderProfile {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "profile-generic".to_string(),
                     name: "generic".to_string(),
@@ -9470,7 +9479,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .put_message(&openshell_core::proto::StoredProviderProfile {
+            .put_message(&StoredProviderProfile {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "profile-gh".to_string(),
                     name: "gh".to_string(),
@@ -9513,7 +9522,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .put_message(&openshell_core::proto::StoredProviderProfile {
+            .put_message(&StoredProviderProfile {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "profile-custom-api".to_string(),
                     name: "custom-api".to_string(),
@@ -9585,7 +9594,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .put_message(&openshell_core::proto::StoredProviderProfile {
+            .put_message(&StoredProviderProfile {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "profile-custom-api".to_string(),
                     name: "custom-api".to_string(),
@@ -9754,29 +9763,28 @@ mod tests {
     async fn provider_policy_layers_respect_profile_workspace_scope() {
         let store = test_store().await;
 
-        let make_stored_profile =
-            |id: &str, workspace: &str, host: &str| openshell_core::proto::StoredProviderProfile {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                    id: format!("profile-{id}-{workspace}"),
-                    name: id.to_string(),
-                    created_at_ms: 1_000_000,
-                    labels: HashMap::new(),
-                    resource_version: 0,
-                    annotations: HashMap::new(),
-                    workspace: workspace.to_string(),
-                    deletion_timestamp_ms: 0,
-                }),
-                profile: Some(openshell_core::proto::ProviderProfile {
-                    id: id.to_string(),
-                    display_name: format!("{host} profile"),
-                    endpoints: vec![NetworkEndpoint {
-                        host: host.to_string(),
-                        port: 443,
-                        ..Default::default()
-                    }],
+        let make_stored_profile = |id: &str, workspace: &str, host: &str| StoredProviderProfile {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: format!("profile-{id}-{workspace}"),
+                name: id.to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: workspace.to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            profile: Some(openshell_core::proto::ProviderProfile {
+                id: id.to_string(),
+                display_name: format!("{host} profile"),
+                endpoints: vec![NetworkEndpoint {
+                    host: host.to_string(),
+                    port: 443,
                     ..Default::default()
-                }),
-            };
+                }],
+                ..Default::default()
+            }),
+        };
 
         store
             .put_message(&make_stored_profile(
@@ -9867,9 +9875,7 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_config_materializes_default_mcp_version_after_provider_composition() {
-        use openshell_core::proto::{
-            ProviderProfile, ProviderProfileCategory, StoredProviderProfile,
-        };
+        use openshell_core::proto::{ProviderProfile, ProviderProfileCategory};
 
         let state = test_server_state().await;
         state
@@ -10090,9 +10096,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_config_gates_uninspected_endpointless_credential_binding() {
-        use openshell_core::proto::{
-            ProviderProfile, ProviderProfileCategory, StoredProviderProfile,
-        };
+        use openshell_core::proto::{ProviderProfile, ProviderProfileCategory};
 
         let state = test_server_state().await;
         state
@@ -10472,9 +10476,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_attachment_preflight_rejects_composed_ambiguity() {
-        use openshell_core::proto::{
-            ProviderProfile, ProviderProfileCategory, StoredProviderProfile,
-        };
+        use openshell_core::proto::{ProviderProfile, ProviderProfileCategory};
 
         let state = test_server_state().await;
         state
@@ -10545,7 +10547,7 @@ mod tests {
     async fn sandbox_config_rejects_invalid_provider_composed_policy() {
         use openshell_core::proto::{
             MiddlewareEndpointSelector, NetworkMiddlewareConfig, ProviderProfile,
-            ProviderProfileCategory, StoredProviderProfile,
+            ProviderProfileCategory,
         };
 
         let state = test_server_state().await;
@@ -10706,7 +10708,7 @@ mod tests {
         use crate::grpc::provider::handle_update_provider_profiles;
         use openshell_core::proto::{
             ProviderProfile, ProviderProfileCategory, ProviderProfileImportItem,
-            StoredProviderProfile, UpdateProviderProfilesRequest,
+            UpdateProviderProfilesRequest,
         };
 
         fn stored_profile(host: &str) -> StoredProviderProfile {
@@ -11037,7 +11039,6 @@ mod tests {
         use openshell_core::proto::{
             GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest,
             NetworkCredentialBinding, ProviderProfile, ProviderProfileCategory,
-            StoredProviderProfile,
         };
 
         let state = test_server_state().await;
@@ -11259,7 +11260,7 @@ mod tests {
     async fn invalid_static_binding_does_not_suppress_valid_dynamic_credentials() {
         use openshell_core::proto::{
             GetSandboxProviderEnvironmentRequest, ProviderCredentialTokenGrant, ProviderProfile,
-            ProviderProfileCategory, ProviderProfileCredential, StoredProviderProfile,
+            ProviderProfileCategory, ProviderProfileCredential,
         };
 
         let state = test_server_state().await;
@@ -11352,7 +11353,6 @@ mod tests {
             GetSandboxProviderEnvironmentRequest, ProviderCredentialTokenGrant,
             ProviderCredentialTokenGrantSubjectToken, ProviderCredentialTokenGrantType,
             ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
-            StoredProviderProfile,
         };
 
         let state = test_server_state().await;
@@ -11557,7 +11557,7 @@ mod tests {
     async fn provider_environment_revision_and_payload_share_immutable_record_snapshot() {
         use openshell_core::proto::{
             ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCategory,
-            ProviderProfileCredential, StoredProviderProfile,
+            ProviderProfileCredential,
         };
 
         fn dynamic_profile(
@@ -11745,8 +11745,7 @@ mod tests {
         use crate::grpc::provider::handle_update_provider_profiles;
         use openshell_core::proto::{
             ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCategory,
-            ProviderProfileCredential, ProviderProfileImportItem, StoredProviderProfile,
-            UpdateProviderProfilesRequest,
+            ProviderProfileCredential, ProviderProfileImportItem, UpdateProviderProfilesRequest,
         };
         use std::time::Duration;
 
@@ -11862,9 +11861,7 @@ mod tests {
     #[tokio::test]
     async fn platform_profile_narrowing_changes_platform_provider_revision_when_shadowed() {
         use crate::persistence::WriteCondition;
-        use openshell_core::proto::{
-            ProviderProfile, ProviderProfileCategory, StoredProviderProfile,
-        };
+        use openshell_core::proto::{ProviderProfile, ProviderProfileCategory};
 
         fn stored_profile(workspace: &str, path: &str) -> StoredProviderProfile {
             StoredProviderProfile {
@@ -15619,7 +15616,6 @@ mod tests {
         use openshell_core::proto::{
             FilesystemPolicy, L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint,
             ProviderProfile, ProviderProfileCategory, SandboxPhase, SandboxPolicy, SandboxSpec,
-            StoredProviderProfile,
         };
 
         let state = test_server_state().await;
@@ -17806,9 +17802,7 @@ mod tests {
     }
 
     async fn install_ambiguous_provider_binding(state: &Arc<ServerState>, suffix: &str) {
-        use openshell_core::proto::{
-            ProviderProfile, ProviderProfileCategory, StoredProviderProfile,
-        };
+        use openshell_core::proto::{ProviderProfile, ProviderProfileCategory};
 
         let profile_name = format!("ambiguous-{suffix}");
         let provider_name = format!("provider-{suffix}");

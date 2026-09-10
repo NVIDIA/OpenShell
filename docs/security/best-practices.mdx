@@ -9,7 +9,7 @@ keywords: "Generative AI, Cybersecurity, Security, Policy, Sandbox, Landlock, Se
 position: 1
 ---
 
-OpenShell enforces sandbox security across four layers: network, filesystem, process, and inference.
+OpenShell enforces sandbox security across four layers: network, filesystem, process, and provider credentials.
 This page documents every configurable control, its default, what it protects, and the risk of relaxing it.
 
 For the full policy YAML schema, refer to the [Policy Schema](/reference/policy-schema).
@@ -31,7 +31,7 @@ You can update dynamic controls on a running sandbox with `openshell policy upda
 | Network | Unauthorized outbound connections and data exfiltration. | CONNECT proxy + OPA policy engine | Yes. Use `openshell policy update`, `openshell policy set`, or operator approval in the TUI. |
 | Filesystem | System binary tampering, credential theft, config manipulation. | Landlock LSM (kernel level) | No. Requires sandbox re-creation. |
 | Process | Privilege escalation, fork bombs, dangerous syscalls. | Seccomp BPF + privilege drop (`setuid`/`setgid`) | No. Requires sandbox re-creation. |
-| Inference | Credential exposure, unauthorized model access. | Proxy intercept of `inference.local` | Yes. Use `openshell inference set`. |
+| Provider credentials | Credential exposure and unauthorized service access. | Network policy plus profile endpoint binding and proxy substitution | Yes. Attach or detach providers and update dynamic policy. |
 
 ## Network Controls
 
@@ -233,22 +233,19 @@ This ordering is intentional: named network-namespace setup still relies on priv
 6. Landlock filesystem restrictions.
 7. Runtime seccomp socket domain and syscall filters.
 
-## Inference Controls
+## Provider-backed Inference Controls
 
-OpenShell routes all inference traffic through the gateway to isolate provider credentials from the sandbox.
-
-### Routed Inference through `inference.local`
-
-The proxy intercepts HTTPS CONNECT requests to `inference.local` and routes matching inference API requests through the sandbox-local router.
-The agent never receives the provider API key.
+Inference providers use the same endpoint-bound credential mechanism as other
+providers. Attach a profile-backed provider only to sandboxes that need it.
+The agent receives an opaque placeholder, not the real API key or access token.
 
 | Aspect | Detail |
 |---|---|
-| Default | Always active. The proxy handles `inference.local` before OPA policy evaluation. The gateway injects credentials on the host side. |
-| Keep-alive isolation | If a sandbox reuses a keep-alive connection that previously carried a routed inference request for a subsequent non-inference request, the proxy denies the non-inference request with `connection not allowed by policy` and closes the connection. This prevents agents from reusing an inference-authorized connection for other destinations. |
-| What you can change | Configure inference routes with `openshell inference set`. |
-| Risk if bypassed | If an inference provider's host is added directly to `network_policies`, the agent could reach it with a stolen or hardcoded key, bypassing credential isolation. |
-| Recommendation | Do not add inference provider hosts to `network_policies`. Use OpenShell inference routing instead. |
+| Default | No model-provider access. A sandbox must attach a provider and policy must admit the native endpoint and calling binary. |
+| Credential boundary | The placeholder resolves only for hosts, ports, and paths authorized by the provider profile. |
+| What you can change | Attach or detach providers and adjust the profile or sandbox policy. Model and timeout configuration remain in the native client. |
+| Risk if relaxed | Broad endpoint paths or binary globs can expose more of a provider's API than the workload needs. `allow_uninspected_credentials` removes L7 visibility and should be exceptional. |
+| Recommendation | Use narrow endpoint paths and binaries, inspect the effective policy, and keep credentials in provider records rather than workload environment configuration. |
 
 ## Gateway Security
 

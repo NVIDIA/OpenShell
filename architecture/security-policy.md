@@ -15,7 +15,7 @@ For the field-by-field YAML reference, use
 | Filesystem | Landlock restricts read-only and read-write paths. |
 | Process | The supervisor launches the agent as an unprivileged user with reduced capabilities. |
 | Network | The proxy evaluates destination, port, calling binary, and optional L7 rules. |
-| Inference | `inference.local` is configured through gateway inference settings, not OPA network policy. |
+| Provider access | Attached provider profiles contribute endpoint and binary rules; credentials remain bound to profile-authorized endpoints. |
 | Runtime settings | Typed settings are delivered with policy and can be global or sandbox scoped. |
 
 Filesystem and process policy are startup-time controls. Network policy is

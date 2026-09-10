@@ -1,415 +1,130 @@
 ---
 name: debug-inference
-description: Debug why inference.local, direct external inference, or supervisor-only system inference is failing. Use when the user cannot reach a local model server, has provider base URL issues, sees inference verification failures, hits protocol mismatches, or needs to diagnose inference on local vs remote gateways. Trigger keywords - debug inference, inference.local, system inference, sandbox-system, local inference, ollama, vllm, sglang, trtllm, NIM, inference failing, model server unreachable, failed to verify inference endpoint, host.openshell.internal.
+description: Debug inference clients that use an attached provider and its native endpoint, including hosted APIs and host-local Ollama, vLLM, SGLang, TRT-LLM, LM Studio, or NIM. Use for provider attachment, endpoint policy, credential substitution, topology, and migration from the removed inference.local endpoint. Trigger keywords - debug inference, inference.local, local inference, ollama, lm studio, vllm, sglang, trtllm, NIM, inference failing, model server unreachable, credential_endpoint_mismatch, host.openshell.internal.
 ---
 
 # Debug Inference
 
-Diagnose why OpenShell inference is failing and recommend exact fix commands.
+Diagnose inference as ordinary provider-authorized network traffic. OpenShell no
+longer supplies a managed inference route, rewrites request shapes, or selects a
+model. The application calls the provider's native endpoint and owns its base
+URL, model, request format, and timeout.
 
-Use `openshell` CLI commands to inspect the active gateway, provider records, managed inference config, and sandbox behavior. Use a short sandbox probe when needed to confirm end-to-end routing.
+Use installed `openshell --help` output as the authority for command syntax.
+Refer to the published [provider management guide](https://docs.nvidia.com/openshell/latest/sandboxes/manage-providers.md)
+and [provider profile guide](https://docs.nvidia.com/openshell/latest/providers/profiles.md)
+for current behavior.
 
-## Overview
+## Diagnostic Workflow
 
-OpenShell supports three inference paths. Diagnose the correct one first.
-
-1. **Managed inference** through `https://inference.local`
-   - Configured by `openshell inference set`
-   - Shared by every sandbox on the active gateway
-   - Credentials and model are injected by OpenShell
-2. **Direct external inference** to hosts like `api.openai.com`
-   - Controlled by `network_policies`
-   - Requires the application to call the external host directly
-   - Requires provider attachment and network access to be configured separately
-3. **System inference** used by platform functions
-   - Configured by `openshell inference set --system`
-   - Uses the `sandbox-system` route
-   - Consumed in-process by the sandbox supervisor and not exposed to sandbox user code through `inference.local`
-
-For local or self-hosted engines such as Ollama, vLLM, SGLang, TRT-LLM, and many NIM deployments, the most common managed inference pattern is an `openai` provider with `OPENAI_BASE_URL` pointing at a host the gateway can reach.
-
-## Prerequisites
-
-- `openshell` is on the PATH
-- The active gateway is running
-- You know the failing setup, or can infer it from commands and config
-
-Use `openshell --help` and nested `--help` output as the authority for the installed CLI version. Use the published [inference routing guide](https://docs.nvidia.com/openshell/latest/sandboxes/inference-routing.md) for route behavior and [provider management guide](https://docs.nvidia.com/openshell/latest/sandboxes/manage-providers.md) for credential and profile concepts.
-
-## Tools Available
-
-Use these commands first:
-
-```bash
-# Which gateway is active, and can the CLI reach it?
-openshell status
-
-# Show both the user-facing and system inference routes
-openshell inference get
-
-# Show only the supervisor-only system route
-openshell inference get --system
-
-# Inspect the provider record referenced by the relevant route
-openshell provider get <provider-name>
-
-# Inspect gateway topology details when remote/local confusion is suspected
-openshell gateway info
-
-# Run a minimal end-to-end probe from a sandbox
-openshell sandbox create -- curl https://inference.local/v1/chat/completions --json '{"messages":[{"role":"user","content":"hello"}],"max_tokens":10}'
-```
-
-## Workflow
-
-When the user asks to debug inference, run diagnostics automatically in this order. Stop and report findings as soon as a root cause is identified.
-
-### Determine Context
-
-Establish these facts first:
-
-1. Is sandbox code calling `https://inference.local`, is the application calling a direct external host, or is a platform function using system inference?
-2. Which gateway is active, and is it local, remote, or cloud?
-3. Which provider, model, and timeout are configured for the relevant route?
-4. Is the upstream local to the gateway host, or somewhere else?
-
-### Step 0: Check the Active Gateway
-
-Run:
+### 1. Confirm Gateway and Sandbox Context
 
 ```bash
 openshell status
 openshell gateway info
+openshell sandbox get <sandbox>
 ```
 
-Look for:
+For a host-local model server, `host.openshell.internal` identifies the machine
+running the gateway. It does not identify the operator's laptop when the gateway
+is remote. A server listening only on `127.0.0.1` may also be unreachable from a
+container; bind it to an address reachable from the gateway runtime.
 
-- Active gateway name and endpoint
-- Whether the gateway is local or remote
-- Whether `host.openshell.internal` would point to the local machine or a remote host
-
-Common mistake:
-
-- **Laptop-local model + remote gateway**: `host.openshell.internal` points to the remote gateway host, not your laptop. A laptop-local Ollama or vLLM server will not be reachable without a tunnel or shared reachable network path.
-
-### Step 1: Check Whether the Relevant Route Is Configured
-
-Run:
+### 2. Inspect the Provider and Its Profile
 
 ```bash
-openshell inference get
-openshell inference get --system
+openshell provider get <provider>
+openshell provider profile export <profile-id> -o yaml
 ```
 
-Interpretation:
+Check that the profile:
 
-- `openshell inference get` shows both the user-facing `inference.local` route and the system route. `--system` isolates the system route.
-- **The `inference.local` route is `Not configured`**: managed inference has no backend. Configure it without `--system`:
+- Names the exact endpoint host, port, and protocol the client calls.
+- Allows the client binary.
+- Declares the credential key and intended authentication style.
+- Uses narrow HTTP rules when the provider should expose only part of an API.
 
-  ```bash
-  openshell inference set --provider <name> --model <id>
-  ```
-
-- **System inference is `Not configured`**: platform functions have no system backend. Configure it separately:
-
-  ```bash
-  openshell inference set --system --provider <name> --model <id>
-  ```
-
-- **Provider, model, and timeout shown**: Continue to provider inspection for the relevant route.
-
-### Step 2: Inspect the Provider Record
-
-Run:
+For a custom or self-hosted OpenAI-compatible endpoint, import an
+endpoint-bearing profile. A base URL stored only in provider configuration does
+not authorize a new endpoint.
 
 ```bash
-openshell provider get <provider-name>
+openshell provider profile lint -f ./provider-profile.yaml
+openshell provider profile import -f ./provider-profile.yaml
+openshell provider create --name <provider> --type <profile-id>
 ```
 
-Check:
+Add the required `--credential KEY` or `--credential KEY=VALUE` arguments shown
+by the profile. Never broaden endpoint policy merely to silence a credential
+binding error.
 
-- Provider type matches the client API shape and is supported for managed inference
-  - `openai` for OpenAI-compatible engines such as Ollama, vLLM, SGLang, TRT-LLM, and many NIM deployments
-  - `anthropic` for Anthropic Messages API
-  - `nvidia` for NVIDIA-hosted OpenAI-compatible endpoints
-  - `deepinfra` for DeepInfra's OpenAI-compatible endpoint
-  - `google-vertex-ai` for Vertex AI; Claude models use Anthropic Messages and other models use OpenAI Chat Completions
-  - `aws-bedrock` only through a configured Bedrock-compatible bridge today
-- Required credential key exists
-- `*_BASE_URL` override is correct when using a self-hosted endpoint
-
-An `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` override is route-only. It does not
-authorize the fixed public-vendor endpoint or expose the alternate-upstream key
-for substitution there. Use an imported endpoint-bearing custom profile when a
-sandbox needs direct access to the alternate upstream.
-
-Fix examples:
+### 3. Confirm Attachment
 
 ```bash
-openshell provider create --name ollama --type openai --credential OPENAI_API_KEY=empty --config OPENAI_BASE_URL=http://host.openshell.internal:11434/v1
-
-openshell provider update ollama --credential OPENAI_API_KEY=empty --config OPENAI_BASE_URL=http://host.openshell.internal:11434/v1
+openshell sandbox provider list <sandbox>
+openshell sandbox provider attach <sandbox> <provider>
 ```
 
-`provider update` preserves the provider type and does not accept `--type`. Prefer bare credential keys, such as `--credential OPENAI_API_KEY`, when reading a real secret from the CLI environment.
-
-### Step 3: Check Local Host Reachability
-
-For host-backed local inference, confirm the upstream server:
-
-- Binds to `0.0.0.0`, not only `127.0.0.1`
-- Runs on the same machine as the gateway
-- Is reachable through `host.openshell.internal`, the host's LAN IP, or another reachable hostname
-
-Common mistakes:
-
-- **Base URL uses `127.0.0.1` or `localhost`**: usually wrong for managed inference. Replace with `host.openshell.internal` or the host's LAN IP.
-- **Server binds only to loopback**: reconfigure it to bind to `0.0.0.0`.
-- **Inference engine runs as a system service**: changing the bind address may require updating the service configuration and restarting the service before the new listener becomes reachable.
-
-### Step 4: Check Request Shape
-
-User-facing managed inference only works for `https://inference.local` and supported inference API paths.
-
-Supported patterns include:
-
-- `POST /v1/chat/completions`
-- `POST /v1/completions`
-- `POST /v1/responses`
-- `POST /v1/embeddings`
-- `POST /v1/messages`
-- `GET /v1/models`
-- `GET /v1/models/*`
-- `POST /model/{modelId}/invoke` for bridge-fronted `aws-bedrock`
-
-Common mistakes:
-
-- **Wrong scheme**: `http://inference.local` instead of `https://inference.local`
-- **Unsupported path**: request does not match a known inference API
-- **Protocol mismatch**: Anthropic client against an `openai` provider, or vice versa
-- **Provider-specific mismatch**: Vertex Claude requests must use `/v1/messages`; other Vertex models currently use `/v1/chat/completions`; Bedrock uses its model-in-path invoke shape
-
-Fix guidance:
-
-- Use a supported path and provider type
-- Point OpenAI-compatible SDKs at `https://inference.local/v1`
-- If the SDK requires an API key, pass any non-empty placeholder such as `test`
-
-### Step 5: Probe from a Sandbox
-
-This probe validates the user-facing `inference.local` route. It does not exercise supervisor-only system inference.
-
-Run a minimal request from inside a sandbox:
+Launch a new process after attaching a provider so it inherits newly available
+credential placeholders:
 
 ```bash
-openshell sandbox create -- curl https://inference.local/v1/chat/completions --json '{"messages":[{"role":"user","content":"hello"}],"max_tokens":10}'
+openshell sandbox exec <sandbox> -- env
 ```
 
-Interpretation:
-
-- **`cluster inference is not configured`**: set the managed gateway route with `openshell inference set`
-- **`connection not allowed by policy`** on `inference.local`: unsupported method or path
-- **`no compatible route`**: provider type and client API shape do not match
-- **Connection refused / upstream unavailable / verification failures**: base URL, bind address, topology, or credentials are wrong
-
-For system inference failures, inspect the platform function and sandbox supervisor/network logs after confirming `openshell inference get --system`. User code cannot call the `sandbox-system` route directly.
-
-### Step 6: Reapply or Repair the Managed Route
-
-After fixing the provider, use `update` for a partial change or `set` to replace the route:
+Do not print or copy credential values into diagnostic output. Detaching a
+provider revokes its policy and credential access:
 
 ```bash
-openshell inference set --provider <name> --model <id>
-openshell inference update --provider <name>
-openshell inference update --model <id>
-openshell inference update --timeout 120
+openshell sandbox provider detach <sandbox> <provider>
 ```
 
-Add `--system` to target the system route. Without it, these commands target `inference.local`. A timeout of `0` uses the 60-second default; increase it for models with long reasoning or idle streaming phases.
+### 4. Verify Native Client Configuration
 
-If the endpoint is intentionally offline and you only want to save the config:
+The application must use the real upstream contract:
 
-```bash
-openshell inference set --provider <name> --model <id> --no-verify
-```
+- Native provider base URL, not `https://inference.local`.
+- Real model ID, not a placeholder that OpenShell used to rewrite.
+- Native OpenAI, Anthropic, Vertex, or other provider request shape.
+- Application-owned timeout and retry settings.
+- The credential environment variable declared by the attached profile.
 
-Use `--no-verify` only when the endpoint is intentionally offline or the provider protocol cannot be verified, such as the current bridge-fronted Bedrock flow. Inference updates are hot-reloaded to running sandboxes within about 5 seconds by default.
+Probe the exact endpoint from a newly launched sandbox process. Start with a
+non-secret discovery endpoint when the provider offers one, then send a minimal
+inference request using the provider's documented API shape.
 
-### Step 7: Diagnose Direct External Inference
-
-If the application calls `api.openai.com`, `api.anthropic.com`, or another external host directly, this is not a managed inference issue.
-
-Check instead:
-
-1. The application is configured to call the external hostname directly
-2. A provider with the needed credentials exists
-3. The sandbox has that provider attached (`openshell sandbox provider list [name]`)
-4. `network_policies` allow that host, port, and HTTP rules
-
-If the response reports `credential_endpoint_mismatch`, the provider is attached
-but its credential profile does not authorize that request recipient. Run
-`openshell provider get <provider-name>` to identify the provider type, then
-inspect its profile endpoints with
-`openshell provider profile export <type> -o yaml`. That export uses the current
-workspace scope; add `--global` when the provider was created with
-`--global-profile`. Compare the profile's endpoint host, port, and path with the
-direct request. Correct the provider selection or profile endpoint when that
-recipient is intentional. Do not widen the sandbox network policy to work around
-the mismatch: policy admission and credential endpoint authorization are
-separate checks, and the provider profile should authorize only intended
-credential recipients.
-
-If the response reports `request_authority_mismatch`, compare the HTTP request
-authority with the CONNECT tunnel endpoint. The host and effective port must
-match. For a tunnel to `api.example.com:8443`, send
-`Host: api.example.com:8443`; omitting the non-default port makes the request
-authority use the transport default and OpenShell rejects it. An absolute-form
-request target must use the same authority.
-
-Attach or detach a provider on an existing sandbox with `openshell sandbox provider attach <sandbox> <provider>` and `openshell sandbox provider detach <sandbox> <provider>`.
-
-Use the `generate-sandbox-policy` skill when the user needs help authoring policy YAML.
-
-## Fix: Local Host Inference Timeouts (Firewall)
-
-Use this fix when a sandbox can reach `https://inference.local`, but OpenShell reports an upstream timeout against a host-local backend such as Ollama.
-
-Example symptom:
-
-```json
-{"error":"request to http://host.docker.internal:11434/v1/models timed out"}
-```
-
-### When This Happens
-
-This failure commonly appears on Linux hosts that:
-
-- Run the OpenShell gateway in Docker
-- Route `inference.local` to a host-local OpenAI-compatible endpoint such as Ollama
-- Have a host firewall or networking configuration that denies container-to-host traffic by default
-
-In this case, OpenShell routing is usually working correctly. The failing hop is container-to-host traffic on the backend port.
-
-### Why CoreDNS Is Not the Cause
-
-This is not the same issue as the Colima CoreDNS fix.
-
-OpenShell injects `host.docker.internal` and `host.openshell.internal` into sandbox workloads when the selected compute platform supports it. That path bypasses runtime DNS lookup. If the request still times out, the usual cause is host firewall or network policy, not DNS.
-
-### Verify the Problem
-
-1. Confirm the model server works on the host:
-
-   ```bash
-   curl -sS http://127.0.0.1:11434/v1/models
-   ```
-
-2. Confirm the host gateway address also works on the host:
-
-   ```bash
-   curl -sS http://172.17.0.1:11434/v1/models
-   ```
-
-3. Test the same endpoint from a gateway or sandbox container on the Docker network:
-
-   ```bash
-   docker ps --filter name=openshell --format '{{.Names}}'
-   docker exec <container-name> wget -qO- -T 5 http://host.docker.internal:11434/v1/models
-   ```
-
-If steps 1 and 2 succeed but step 3 times out, the host firewall or network configuration is blocking the container-to-host path.
-
-### Fix
-
-Allow the Docker bridge network used by the OpenShell gateway and sandbox containers to reach the host-local inference port. The exact command depends on your firewall tooling (iptables, nftables, firewalld, UFW, etc.), but the rule should allow:
-
-- **Source**: the Docker bridge subnet used by OpenShell containers (commonly `172.18.0.0/16`)
-- **Destination**: the host gateway IP injected into sandbox workloads for `host.docker.internal` (commonly `172.17.0.1`)
-- **Port**: the inference server port (e.g. `11434/tcp` for Ollama)
-
-To find the actual values on your system:
-
-```bash
-# Docker bridge subnet for the OpenShell network
-docker network inspect $(docker network ls --filter name=openshell -q) --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
-
-# Host gateway IP visible from inside the container
-docker exec <container-name> cat /etc/hosts | grep host.docker.internal
-```
-
-Adjust the source subnet, destination IP, or port to match your local Docker network layout.
-
-### Verify the Fix
-
-1. Re-run the container network check:
-
-   ```bash
-   docker exec <container-name> wget -qO- -T 5 http://host.docker.internal:11434/v1/models
-   ```
-
-2. Re-test from a sandbox:
-
-   ```bash
-   curl -sS https://inference.local/v1/models
-   ```
-
-Both commands should return the upstream model list.
-
-### If It Still Fails
-
-- Confirm the backend listens on a host-reachable address: `ss -ltnp | rg ':11434\b'`
-- Confirm the provider points at the host alias path you expect: `openshell provider get <provider-name>`
-- Confirm the active inference route: `openshell inference get`
-- Inspect sandbox logs for upstream timeout details: `openshell logs <sandbox-name> --since 10m`
-
-## Common Failure Patterns
+### 5. Interpret Common Failures
 
 | Symptom | Likely cause | Fix |
-|---------|--------------|-----|
-| `openshell inference get` shows `Not configured` | No managed inference route configured | `openshell inference set --provider <name> --model <id>` |
-| System inference is `Not configured` | Platform-only route has no backend | `openshell inference set --system --provider <name> --model <id>` |
-| `failed to verify inference endpoint` | Bad base URL, wrong credentials, wrong provider type, or upstream not reachable | Fix provider config, then rerun `openshell inference set`; use `--no-verify` only when the endpoint is intentionally offline |
-| Base URL uses `127.0.0.1` | Loopback points at the wrong runtime | Use `host.openshell.internal` or another gateway-reachable host |
-| Local engine works only when gateway is local | Gateway moved to remote host | Run the engine on the gateway host, add a tunnel, or use direct external access |
-| `connection not allowed by policy` on `inference.local` | Unsupported path or method | Use a supported inference API path |
-| `no compatible route` | Provider type does not match request shape | Create or select a provider of the matching type, or change the client API |
-| `inference.local` works but a platform function fails | User route is configured but `sandbox-system` is missing or wrong | `openshell inference get --system`; configure or update with `--system`; inspect supervisor logs |
-| Direct call to external host is denied | Missing policy or provider attachment | Update `network_policies` and launch sandbox with the right provider |
-| Direct call returns `credential_endpoint_mismatch` | Attached provider profile does not authorize the request host, port, or path | Inspect the provider profile endpoints; select or update the profile only if it intentionally authorizes that recipient |
-| Direct call returns `request_authority_mismatch` | HTTP authority does not match the CONNECT host and effective port | Include the explicit non-default port in `Host` and use the same authority in absolute-form targets |
-| SDK fails on empty auth token | Client requires a non-empty API key even though OpenShell injects the real one | Use any placeholder token such as `test` |
-| Upstream timeout from container to host-local backend | Host firewall or network config blocks container-to-host traffic | Allow the Docker bridge subnet to reach the inference port on the host gateway IP (see firewall fix section above) |
+|---|---|---|
+| `Could not resolve host: inference.local` | Client still uses the removed managed endpoint | Configure the provider's native base URL and attach an endpoint-bearing provider profile |
+| Direct request is denied | Missing attachment, endpoint policy, HTTP rule, or binary authorization | Inspect the attached provider profile and sandbox effective policy |
+| `credential_endpoint_mismatch` | Credential profile does not authorize the request recipient | Correct the host/port/path or import a narrowly scoped profile for the intended endpoint |
+| `request_authority_mismatch` | HTTP authority differs from the CONNECT destination | Use the same host and effective port in both authorities |
+| Credential variable is absent | Provider was not attached when this process launched, or profiles collide on a key | Attach the provider and launch a new process; resolve duplicate keys explicitly |
+| Upstream rejects the model or body | Client relied on removed model/request rewriting | Configure the real model and provider-native request format in the application |
+| `127.0.0.1` works on the host but not in the sandbox | Loopback refers to different runtime | Use `host.openshell.internal` or another gateway-reachable endpoint and profile |
+| Host-local request times out | Server bind address, gateway topology, or host firewall blocks container-to-host traffic | Verify the listener and permit only the required gateway network path and port |
 
-## Full Diagnostic Dump
+## Host-Local Inference Checklist
 
-Run this when you want a compact report before deciding on a fix:
+For Ollama, LM Studio, vLLM, SGLang, TRT-LLM, and local NIM deployments:
 
-```bash
-echo "=== Gateway Status ==="
-openshell status
+1. Verify the engine from the gateway host.
+2. Verify it listens on an address reachable from the gateway runtime.
+3. Import a custom profile naming `host.openshell.internal` and the actual port.
+4. Restrict the profile to the intended binaries and API paths.
+5. Create and attach the provider.
+6. Configure the application's base URL, model, and timeout.
+7. Probe the native endpoint from a newly launched sandbox process.
 
-echo "=== Gateway Info ==="
-openshell gateway info
+## Reporting
 
-echo "=== Managed Inference ==="
-openshell inference get
+Report:
 
-echo "=== System Inference Only ==="
-openshell inference get --system
-
-echo "=== Providers ==="
-openshell provider list
-
-echo "=== Selected Provider ==="
-openshell provider get <provider-name>
-
-echo "=== Sandbox Probe ==="
-openshell sandbox create -- curl https://inference.local/v1/chat/completions --json '{"messages":[{"role":"user","content":"hello"}],"max_tokens":10}'
-```
-
-When you report back, state:
-
-1. Which inference path is failing (`inference.local`, direct external, or system inference)
-2. Whether gateway topology is part of the problem
-3. The most likely root cause
-4. The exact fix commands the user should run
+1. The active gateway and whether topology contributes to the failure.
+2. The provider, profile, attachment, endpoint, and client binary involved.
+3. The exact failed host, port, path, and request authority without secrets.
+4. Whether the client still relies on removed managed-routing behavior.
+5. The narrowest profile, attachment, or application configuration change that
+   resolves the problem.

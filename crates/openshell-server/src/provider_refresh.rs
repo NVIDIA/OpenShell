@@ -11,7 +11,6 @@ use openshell_core::ObjectWorkspace;
 use openshell_core::proto::{
     CredentialHandle, Provider, ProviderCredentialRefreshRecoveryAction,
     ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
-    StoredProviderCredentialRefreshState, StoredRefreshMaterialDeletion,
 };
 use openshell_core::{ObjectId, ObjectName, SetResourceVersion};
 use prost::Message;
@@ -20,6 +19,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tonic::{Code, Status};
 use tracing::{info, warn};
+
+use crate::storage_proto::{StoredProviderCredentialRefreshState, StoredRefreshMaterialDeletion};
 
 const DEFAULT_REFRESH_BEFORE_SECONDS: i64 = 300;
 const DEFAULT_MAX_LIFETIME_SECONDS: i64 = 3600;
@@ -1537,6 +1538,7 @@ async fn request_token(
         }
     }
 
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -2016,12 +2018,12 @@ mod tests {
     };
     use crate::credentials::CredentialRuntime;
     use crate::persistence::{current_time_ms, test_store};
+    use crate::storage_proto::StoredProviderCredentialRefreshState;
     use openshell_core::Config;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::proto::{
         CredentialHandle, Provider, ProviderCredentialRefreshRecoveryAction,
         ProviderCredentialRefreshStrategy, Sandbox, SandboxSpec,
-        StoredProviderCredentialRefreshState,
     };
     use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
     use std::collections::HashMap;
@@ -2401,6 +2403,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let response = reqwest::get(format!("{}/oversized", mock_server.uri()))
             .await
             .unwrap();

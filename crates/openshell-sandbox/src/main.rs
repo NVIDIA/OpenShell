@@ -165,12 +165,6 @@ struct Args {
     #[arg(long, env = openshell_core::sandbox_env::SSH_SOCKET_PATH)]
     ssh_socket_path: Option<String>,
 
-    /// Path to YAML inference routes for standalone routing.
-    /// When set, inference routes are loaded from this file instead of
-    /// fetching a bundle from the gateway.
-    #[arg(long, env = "OPENSHELL_INFERENCE_ROUTES")]
-    inference_routes: Option<String>,
-
     /// Enable health check endpoint.
     #[arg(long)]
     health_check: bool,
@@ -533,7 +527,6 @@ fn main() -> Result<()> {
             .build()
             .into_diagnostic()?;
         return runtime.block_on(async move {
-            let _ = rustls::crypto::ring::default_provider().install_default();
             let exit = openshell_supervisor_process::debug_rpc::run(&raw_args[2..]).await?;
             std::process::exit(exit);
         });
@@ -578,9 +571,6 @@ fn main() -> Result<()> {
         .into_diagnostic()?;
 
     let result = runtime.block_on(async move {
-        // Install rustls crypto provider before any TLS connections (including log push).
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
         // Set up optional log push layer (gRPC mode only).
         let log_push_state = if let (Some(sandbox_id), Some(endpoint)) =
             (&args.sandbox_id, &args.openshell_endpoint)
@@ -717,7 +707,6 @@ fn main() -> Result<()> {
             args.ssh_socket_path,
             args.health_check,
             args.health_port,
-            args.inference_routes,
             ocsf_enabled,
             ocsf_schema_version,
             args.mode.network,

@@ -369,7 +369,6 @@ mod tests {
         let codec = ProtoJsonCodec::openshell().unwrap();
         for (message_name, field_name) in [
             ("openshell.datamodel.v1.Provider", "credentials"),
-            ("openshell.inference.v1.ResolvedRoute", "api_key"),
             ("openshell.compute.v1.DriverSandboxSpec", "sandbox_token"),
             ("openshell.v1.IssueSandboxTokenResponse", "token"),
             ("openshell.v1.RefreshSandboxTokenResponse", "token"),
@@ -378,10 +377,6 @@ mod tests {
             ("openshell.v1.RevokeSshSessionRequest", "token"),
             ("openshell.v1.TcpForwardInit", "authorization_token"),
             ("openshell.v1.SshSession", "token"),
-            (
-                "openshell.v1.StoredProviderCredentialRefreshState",
-                "material",
-            ),
             ("openshell.v1.ConfigureProviderRefreshRequest", "material"),
             (
                 "openshell.v1.GetSandboxProviderEnvironmentResponse",
