@@ -149,8 +149,9 @@ export OPENSHELL_WORKSPACE=team-ml
 openshell sandbox list
 ```
 
-An empty workspace value resolves to `default`. It never means all
-workspaces.
+When `--workspace` is omitted, the CLI intentionally selects the `default`
+workspace. An empty workspace name is invalid and never means either `default`
+or all workspaces.
 
 Platform Admins can opt into cross-workspace list operations:
 
@@ -159,6 +160,29 @@ openshell sandbox list --all-workspaces
 openshell provider list --all-workspaces
 openshell service list --all-workspaces
 ```
+
+The public API represents this choice with a `WorkspaceSelector` oneof. Set
+`workspace` to a non-empty name, including the literal `default`, or set the
+`all_workspaces` marker on list requests that support it. Omitting the selector
+or sending an unset selector is invalid for workspace-scoped operations. The
+all-workspaces variant is accepted only by sandbox, sandbox template, provider,
+and service list requests, and it requires Platform Admin access.
+
+Clients migrating from the previous request fields should make the scope
+explicit:
+
+| Previous request | Typed selector |
+| --- | --- |
+| `workspace: "team-ml"` | `workspace_scope.workspace: "team-ml"` |
+| Empty or omitted `workspace` for the default | `workspace_scope.workspace: "default"` |
+| `all_workspaces: true` | `workspace_scope.all_workspaces: {}` |
+| `global: true` | Omit `workspace_scope` |
+
+The Rust and Python SDKs expose separate all-workspaces list methods. The Go
+SDK uses `ListAll`, and the TypeScript SDK uses a discriminated option type, so
+a caller cannot select a named workspace and all workspaces in one typed call.
+The TUI starts in the `default` workspace and sends that named selector
+explicitly. Its all-workspaces view sends the marker instead.
 
 Provider profiles and policy also have explicit `--global` operations. Those
 operations target platform scope and require Platform Admin access. A
