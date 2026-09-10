@@ -1,0 +1,126 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Configure Supervisor Middleware"
+sidebar-title: "Configure Middleware"
+description: "Choose, register, and attach supervisor middleware to sandbox traffic."
+keywords: "Supervisor Middleware, Configuration, Network Policy, Extension Authentication"
+position: 2
+---
+
+Configure middleware in two places. Register operator-run services in gateway TOML, then attach built-in or registered middleware to destination hosts in sandbox policy.
+
+## Choose a middleware type
+
+| Type | Registration | Payload limit | Deployment |
+| --- | --- | --- | --- |
+| Built-in | None. | Defined by OpenShell. | Runs inside the supervisor. |
+| Operator-run service | Required in gateway TOML. | Set by the operator, up to the service capability. | Runs as a separate service reachable by the gateway and supervisors. |
+
+`openshell/regex` is an example built-in middleware. It replaces simple, self-contained token patterns in UTF-8 HTTP bodies and client WebSocket text messages. The initial pattern recognizes `sk-` tokens. It does not infer values from fields such as a JSON `password` property, and it does not guarantee that it will detect or remove every sensitive value.
+
+Its `config` accepts `mode: redact`, which is also the default. Policy validation rejects unknown fields and non-string values. Custom expressions are not configurable.
+
+Operator-run services advertise the operation and phase pairs they support. V1 defines `HTTP_REQUEST/PRE_CREDENTIALS`, `HTTP_RESPONSE/PRE_RETURN`, and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`. A service may advertise any combination.
+
+## Register an operator-run service
+
+Start the service before the gateway, then add its registration to the local gateway TOML:
+
+```toml
+[[openshell.supervisor.middleware]]
+name = "local-content-guard"
+grpc_endpoint = "https://content-guard.example:50051"
+tls_ca_cert_path = "/etc/openshell/content-guard-ca.pem"
+audience = "urn:example:content-guard"
+max_payload_bytes = 262144
+timeout = "500ms"
+```
+
+| Field | Description |
+| --- | --- |
+| `name` | Operator-owned name used by policy attachments and diagnostics. Names must be unique. The `openshell/` namespace is reserved for built-ins. |
+| `grpc_endpoint` | Service address reachable from the gateway and sandbox supervisors. Authenticated extensions use TLS `https://`. |
+| `tls_ca_cert_path` | Optional PEM trust roots for a private HTTPS service. Custom roots replace platform roots and retain hostname verification. |
+| `audience` | Exact audience expected by the service. Defaults to `urn:openshell:extension:middleware:<name>`. |
+| `allow_insecure_transport` | Allows plaintext `http://` without a bearer credential. Defaults to `false`. Use it only on a network that already authenticates callers. |
+| `max_payload_bytes` | Operator ceiling for inspectable logical payloads across all advertised bindings, up to the 4 MiB platform maximum. |
+| `timeout` | Optional service-wide RPC timeout from `10ms` through `30s`. Defaults to `500ms`. |
+
+Each binding returned by `Describe` may advertise a shorter timeout. OpenShell uses the smaller of the binding and service values. The service timeout applies to `Describe` and `ValidateConfig`. The effective binding timeout applies to request evaluation, response preflight and unit results, WebSocket preflight, and each WebSocket message. Response and WebSocket streams have no connection-wide deadline.
+
+The gateway calls `Describe` and validates every registration before it accepts traffic. Startup fails if a service is unavailable, returns an invalid capability, or exposes duplicate bindings for one operation and phase. The manifest `name` is diagnostic metadata and does not need to match the operator registration name.
+
+Registration is static. Restart the gateway after you add, remove, or change a service. See [Gateway Configuration](/reference/gateway-config#supervisor-middleware-services) for the full TOML context.
+
+## Authenticate OpenShell callers
+
+When gateway JWT signing is configured, OpenShell attaches a short-lived EdDSA bearer token to every remote middleware RPC. Gateway calls use `caller_kind: gateway`. Sandbox supervisor calls use `caller_kind: supervisor` and include the sandbox ID. Supervisors request credentials by registration name through `RefreshSandboxToken`; the gateway authorizes that name against the sandbox's effective policy.
+
+Return the expected audience in the `expected_audience` field of the `Describe` manifest. After authentication succeeds, OpenShell compares this field with the operator-configured audience and refuses to start on a mismatch. A strict service may reject the token before returning its manifest, in which case startup reports an authentication failure. Leave the field empty to skip the consistency check.
+
+Provision the trusted gateway URL, expected gateway ID, and public key or JWKS with the service. The expected issuer is exactly `openshell-gateway:<gateway_id>`. After initial trust is established, `GET /.well-known/openid-configuration` and its `jwks_uri` provide key refresh. This document is OIDC-shaped, but its `issuer` is the gateway identity rather than the URL that serves the document. Compare `iss` with the configured value and fetch updates only over authenticated TLS from the trusted gateway URL.
+
+Cache keys by `kid` and validate:
+
+- `typ` is exactly `openshell-ext+jwt`.
+- `alg` is pinned to `EdDSA` rather than selected from the token.
+- The signature, expected issuer, exact audience, and positive expiry.
+- `caller_kind`, plus the sandbox identity when the service scopes behavior per sandbox.
+
+Extension tokens and sandbox-to-gateway bootstrap tokens use the same signing key but have different audiences and `typ` values. Each extension token also carries a `jti`. OpenShell reuses a token until rotation and does not track `jti`, so do not reject a repeated value as a replay. Per-request replay resistance requires proof of possession or request binding.
+
+Set `allow_insecure_transport = true` only when the surrounding network authenticates callers. OpenShell then sends no credential to the service, and the gateway refuses to mint one if asked. The gateway logs a warning for the registration at every startup.
+
+## Attach middleware in policy
+
+Add configurations to the top-level `network_middlewares` map. Each map key is a stable policy-local identity:
+
+```yaml
+network_middlewares:
+  regex-redactor:
+    name: Redact API tokens
+    middleware: openshell/regex
+    order: 10
+    config:
+      mode: redact
+    on_error: fail_closed
+    endpoints:
+      include: ["*.example.com"]
+      exclude: ["trusted.example.com"]
+```
+
+The optional `name` defaults to the map key. `middleware` names a built-in or operator-run registration. A policy accepts at most 10 configurations.
+
+`include` selects destination hosts. `exclude` takes precedence. Each configuration accepts at most 32 combined patterns. Matching is case-insensitive and uses the same exact-host and DNS glob behavior as network policy endpoints. `*` matches one DNS label, `**` matches one or more labels, and an intra-label pattern such as `*-api.example.com` works. Policy validation rejects brace alternates such as `{prod,staging}`.
+
+Matching configurations run once each by ascending `order`. Order values must be unique across the complete policy, even when selectors do not overlap. The default is `0`, so set explicit values when a policy has multiple configurations.
+
+See [Policy Schema](/reference/policy-schema#network-middleware) for the complete field reference.
+
+## Choose failure behavior
+
+`on_error` applies after OpenShell selects a supported binding and that stage fails. Failures include an unavailable service, rejected configuration, invalid result, timeout, or payload over the stage limit.
+
+| Value | Request behavior | Response behavior | WebSocket behavior |
+| --- | --- | --- | --- |
+| `fail_closed` | Denies the request. This is the default. | Returns `502 response_delivery_failed` before commitment or aborts delivery after commitment. | Rejects the upgrade or closes the connection. |
+| `fail_open` | Skips the failed stage. | Disables the stage and continues with the retained input. | Disables a broken stage for the rest of the connection and continues the remaining chain. |
+
+A valid upstream response can still exceed middleware envelope limits or contain header bytes that the middleware protocol cannot represent. OpenShell relays the original response when every selected response stage uses `fail_open`. Any selected `fail_closed` stage causes the canonical `502` delivery failure. Malformed or unsafe HTTP does not qualify for this bypass.
+
+An unsupported binding or message class is a coverage gap, not a middleware failure. `on_error` does not make an HTTP-only service inspect WebSocket messages, and it does not make V1 inspect binary messages.
+
+For protocols without a supported middleware operation, OpenShell uses its uninspectable-traffic behavior. A matching `fail_closed` configuration blocks that traffic. If all matching configurations use `fail_open`, OpenShell bypasses middleware and emits a detection finding.
+
+Use `fail_open` only when bypassing the stage preserves the intended security policy. OpenShell emits a detection finding for a bypass and a separate state-change finding when it disables a WebSocket stage.
+
+An explicit deny result always stops the chain, regardless of `on_error`. Middleware decisions also remain enforced when the endpoint uses `enforcement: audit`. To observe traffic without blocking it, return an allow decision with findings.
+
+Continue with the [HTTP request guide](/extensibility/supervisor-middleware/http) or [WebSocket session guide](/extensibility/supervisor-middleware/websocket) for protocol-specific results and limits.
+
+## Run the content guard example
+
+The [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard) implements request, response, and WebSocket bindings in one service. It matches configured literal terms in UTF-8 request bodies, complete response bodies, and client WebSocket text messages. It supports redaction and denial but is not a general PII detector.
+
+The example includes a policy, local fixture, and smoke launcher.

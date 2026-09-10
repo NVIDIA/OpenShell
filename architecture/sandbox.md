@@ -219,8 +219,9 @@ against body-aware L7 policy before later stages or the upstream can observe
 them. Requests, results, chain length, execution time, and diagnostics are
 bounded; external free-form diagnostic text is not exposed in responses or
 security logs. See
-[Supervisor Middleware](../docs/extensibility/supervisor-middleware.mdx) for
-configuration and protocol details.
+[Supervisor Middleware](../docs/extensibility/supervisor-middleware/index.mdx) for
+an introduction, or the [configuration guide](../docs/extensibility/supervisor-middleware/configure.mdx)
+for service registration and policy attachment.
 
 Inference providers use the same egress path as other external services. An
 attached provider profile contributes endpoint and binary policy. The proxy

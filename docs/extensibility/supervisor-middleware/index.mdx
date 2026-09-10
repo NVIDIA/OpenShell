@@ -1,0 +1,65 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Supervisor Middleware"
+sidebar-title: "Supervisor Middleware"
+slug: "extensibility/supervisor-middleware"
+description: "Inspect, block, or change sandbox requests and responses with supervisor middleware."
+keywords: "Generative AI, Cybersecurity, AI Agents, Supervisor Middleware, Extensibility, Request Filtering"
+position: 1
+---
+
+Supervisor middleware lets you inspect, block, or change the content that an agent sends and receives over the network. The sandbox's supervisor, which enforces its network policy, runs middleware as traffic passes between the agent and an external service.
+
+## Why use middleware
+
+A network policy can allow an agent to call an API, but you may also need to check what the agent sends to that API or what the API returns. Middleware lets you add those checks without changing the agent's code.
+
+For example, you can use middleware to:
+
+- Redact recognized API token patterns from outgoing request bodies.
+- Reject requests that contain content your organization prohibits.
+- Remove sensitive content from HTTP responses before the agent receives it.
+- Check outgoing WebSocket text messages during a session.
+
+The checks depend on the middleware you choose. OpenShell includes a basic token-pattern redactor, and you can run your own service for custom checks and transformations. See [Configure middleware](/extensibility/supervisor-middleware/configure) for the built-in redactor's limits and an example content guard service.
+
+## How it fits into a request
+
+OpenShell checks network and application-layer policy first. If policy blocks a request, it never reaches middleware.
+
+For an allowed request, OpenShell selects middleware by destination host. It runs the selected checks in the order you configure, then adds provider credentials and sends the request to the external service. Request middleware cannot see the provider credentials that OpenShell adds afterward.
+
+When the service returns an HTTP response, response middleware can inspect or change it before OpenShell delivers it to the agent. An outgoing request check and an incoming response check are separate capabilities, so choose middleware that supports the direction you need.
+
+Middleware can also inspect outgoing WebSocket text messages. It does not inspect binary messages or messages returning from the service over a WebSocket connection.
+
+If middleware explicitly denies a request or message, OpenShell blocks it even when network policy allows it. You also choose what happens if a check fails or its service is unavailable. By default, OpenShell stops the affected traffic. You can configure it to continue without the failed check when that is acceptable.
+
+## Choose a guide
+
+<Cards>
+
+<Card title="Configure middleware" href="/extensibility/supervisor-middleware/configure">
+
+Start here to choose middleware, connect your own service, and select which destinations it checks.
+</Card>
+
+<Card title="HTTP requests" href="/extensibility/supervisor-middleware/http">
+
+Check or change outgoing requests and incoming responses. Learn what middleware can read and modify, and how failures affect delivery.
+</Card>
+
+<Card title="WebSocket sessions" href="/extensibility/supervisor-middleware/websocket">
+
+Check outgoing text messages during a connection. Learn which messages middleware sees and when OpenShell closes a session.
+</Card>
+
+<Card title="Operate middleware" href="/extensibility/supervisor-middleware/operate">
+
+Run middleware services, apply configuration changes, and use logs to understand decisions and failures.
+</Card>
+
+</Cards>
+
+For field definitions, see [Policy Schema](/reference/policy-schema#network-middleware) and [Gateway Configuration](/reference/gateway-config#supervisor-middleware-services).

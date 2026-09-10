@@ -1,0 +1,29 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Extensibility"
+sidebar-title: "Overview"
+description: "Add custom checks to sandbox traffic and gateway operations."
+keywords: "Supervisor Middleware, Gateway Interceptors, Extensibility"
+position: 0
+---
+
+OpenShell lets you add custom checks and transformations to sandbox traffic and gateway API operations. You can use these extensions to connect your organization's content checks, policy rules, or audit services to OpenShell.
+
+Choose an extension based on what you need to control. Supervisor middleware handles network traffic between an agent and external services. Gateway interceptors handle selected API operations that create or change OpenShell resources. You can use both in the same deployment.
+
+## Supervisor middleware
+
+Use supervisor middleware when you need to check the content an agent sends or receives. For example, you might redact recognized API tokens from outgoing requests, block prohibited content, or remove sensitive content from an HTTP response before the agent sees it.
+
+Middleware runs in the sandbox's network request and response flow. You select destination hosts in sandbox policy and choose a built-in implementation or a service you operate.
+
+Start with [Supervisor Middleware](/extensibility/supervisor-middleware) to learn how it works and choose a setup or protocol guide.
+
+## Gateway interceptors
+
+Use gateway interceptors when you need to enforce rules on how people and applications manage OpenShell resources. For example, you might apply an approved policy to new sandboxes, reject unauthorized policy changes, or report completed operations to an audit service.
+
+Interceptors run as external services that the gateway calls for selected API operations. They can modify or reject an operation before it takes effect, or observe it after it succeeds.
+
+Start with [Gateway Interceptors](/extensibility/gateway-interceptors) to choose operations and connect an interceptor service.
