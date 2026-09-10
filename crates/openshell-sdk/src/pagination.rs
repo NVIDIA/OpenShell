@@ -116,4 +116,28 @@ mod tests {
 
         assert_eq!(pager.collect_all().await.unwrap(), vec![1, 2, 3]);
     }
+
+    #[tokio::test]
+    async fn failed_fetch_retries_the_same_token() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let mut pager = Pager::new("resume".to_string(), move |token| {
+            let calls = observed.clone();
+            async move {
+                assert_eq!(token, "resume");
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(crate::error::SdkError::connect("temporary failure"))
+                } else {
+                    Ok(Page {
+                        items: vec![1],
+                        next_page_token: String::new(),
+                    })
+                }
+            }
+        });
+
+        assert!(pager.next_page().await.is_err());
+        assert_eq!(pager.next_page().await.unwrap().unwrap().items, vec![1]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 }

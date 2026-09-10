@@ -3,7 +3,10 @@
 
 package v1
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // Page is one response page from a list operation.
 type Page[T any] struct {
@@ -38,6 +41,9 @@ func (p *Pager[T]) NextPage(ctx context.Context) (*Page[T], error) {
 	page, err := p.fetch(ctx, *p.nextPageToken)
 	if err != nil {
 		return nil, err
+	}
+	if page == nil {
+		return nil, errors.New("pager fetch returned a nil page")
 	}
 	if page.Items == nil {
 		page.Items = make([]T, 0)

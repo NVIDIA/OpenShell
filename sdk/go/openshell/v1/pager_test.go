@@ -68,3 +68,14 @@ func TestPagerNormalizesEmptyItems(t *testing.T) {
 	assert.NotNil(t, page.Items)
 	assert.Empty(t, page.Items)
 }
+
+func TestPagerRejectsNilPage(t *testing.T) {
+	pager := NewPager("resume-token", func(_ context.Context, token string) (*Page[string], error) {
+		assert.Equal(t, "resume-token", token)
+		return nil, nil
+	})
+
+	page, err := pager.NextPage(context.Background())
+	assert.Nil(t, page)
+	assert.EqualError(t, err, "pager fetch returned a nil page")
+}

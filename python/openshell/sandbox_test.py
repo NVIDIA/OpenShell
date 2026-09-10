@@ -23,6 +23,8 @@ from openshell.sandbox import (
     _PYTHON_CLOUDPICKLE_BOOTSTRAP,
     _SANDBOX_PYTHON_BIN,
     ClientCredentialsAuth,
+    Page,
+    Pager,
     Sandbox,
     SandboxClient,
     SandboxError,
@@ -2574,6 +2576,38 @@ def test_list_follows_continuation_tokens() -> None:
     assert stub.list_requests[0].page_token == ""
     assert stub.list_requests[1].page_token == "1"
     assert stub.list_requests[1].label_selector == "team=core"
+
+
+def test_list_passes_initial_page_token() -> None:
+    stub = _FakeSandboxStub(
+        listed_pages=[
+            [_make_sandbox_proto("sandbox-1", "skipped")],
+            [_make_sandbox_proto("sandbox-2", "resumed")],
+        ]
+    )
+    client = _client_with_fake_stub(stub)
+
+    page = next(client.list(workspace="default", page_token="1"))
+
+    assert [sandbox.name for sandbox in page.items] == ["resumed"]
+    assert stub.list_requests[0].page_token == "1"
+
+
+def test_pager_retries_same_token_after_fetch_error() -> None:
+    tokens: list[str] = []
+
+    def fetch(token: str) -> Page[int]:
+        tokens.append(token)
+        if len(tokens) == 1:
+            raise RuntimeError("temporary failure")
+        return Page(items=[1], next_page_token="")
+
+    pager = Pager(fetch, page_token="resume")
+    with pytest.raises(RuntimeError, match="temporary failure"):
+        next(pager)
+
+    assert next(pager).items == [1]
+    assert tokens == ["resume", "resume"]
 
 
 def test_list_ids_forwards_label_selector() -> None:
