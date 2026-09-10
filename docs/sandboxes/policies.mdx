@@ -102,7 +102,23 @@ See [Supervisor Middleware](/extensibility/supervisor-middleware) for registrati
 
 When a sandbox runs in proxy mode (the default), OpenShell automatically adds baseline filesystem paths required for the sandbox child process to function: `/usr`, `/lib`, `/etc`, and `/var/log` (read-only), plus `/tmp` (read-write). When `filesystem.include_workdir` is `true`, OpenShell also adds the resolved working directory as read-write. Paths like `/app` are included in the baseline set but are only added if they exist in the container image.
 
-For GPU sandboxes, OpenShell also adds existing GPU device nodes as read-write paths. CUDA workloads require write access to procfs for thread metadata, so GPU baseline enrichment moves `/proc` from read-only to read-write when GPU devices are present.
+For GPU sandboxes without a CDI context, OpenShell also adds existing GPU
+device nodes as read-write paths. CUDA workloads require write access to procfs
+for thread metadata, so GPU baseline enrichment moves `/proc` from read-only to
+read-write when GPU devices or CDI specs are present.
+
+Docker GPU/CDI sandboxes receive CDI-derived filesystem requirements instead
+of the hard-coded GPU device and library baseline. The supervisor resolves the
+selected CDI device specs inside the sandbox and adds CDI device nodes as
+read-write paths and CDI mount destinations as read-only paths. CDI
+`additionalGids` are applied as supplemental groups before agent processes drop
+privileges.
+
+Writable CDI mount destinations are fail-closed. OpenShell accepts a writable
+CDI mount only when it targets a single file and that exact path is already
+listed in `filesystem_policy.read_write`. Writable CDI directory mounts and
+CDI paths such as `/`, `/dev`, `/proc`, `/sys`, `/run`, or `/usr` are rejected
+during sandbox startup.
 
 This filtering prevents a missing baseline path from degrading Landlock enforcement. Without it, a single missing path could cause the entire Landlock ruleset to fail, leaving the sandbox with no filesystem restrictions at all.
 
