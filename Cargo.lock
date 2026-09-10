@@ -4668,6 +4668,7 @@ version = "0.0.0"
 dependencies = [
  "base64",
  "crossterm 0.28.1",
+ "futures",
  "indexmap",
  "miette",
  "openshell-bootstrap",

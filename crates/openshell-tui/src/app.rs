@@ -603,6 +603,10 @@ pub struct App {
     pub list_refresh_generation: u64,
     /// Active list refresh task. New ticks do not overlap this task.
     pub list_refresh_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Monotonic identity for the active draft-count refresh.
+    pub draft_counts_refresh_generation: u64,
+    /// Active draft-count refresh task. New ticks do not overlap this task.
+    pub draft_counts_refresh_handle: Option<tokio::task::JoinHandle<()>>,
 
     // Provider list
     pub provider_profiles: Vec<openshell_core::proto::ProviderProfile>,
@@ -987,6 +991,8 @@ impl App {
             pending_workspace_refresh: false,
             list_refresh_generation: 0,
             list_refresh_handle: None,
+            draft_counts_refresh_generation: 0,
+            draft_counts_refresh_handle: None,
             provider_profiles: Vec::new(),
             provider_entries: Vec::new(),
             provider_names: Vec::new(),
@@ -3491,6 +3497,15 @@ impl App {
             handle.abort();
         }
         self.list_refresh_generation = self.list_refresh_generation.wrapping_add(1);
+        self.cancel_draft_counts_refresh();
+    }
+
+    /// Cancel any in-flight draft-count refresh and invalidate queued results.
+    pub fn cancel_draft_counts_refresh(&mut self) {
+        if let Some(handle) = self.draft_counts_refresh_handle.take() {
+            handle.abort();
+        }
+        self.draft_counts_refresh_generation = self.draft_counts_refresh_generation.wrapping_add(1);
     }
 
     /// Stop the animation ticker if running.

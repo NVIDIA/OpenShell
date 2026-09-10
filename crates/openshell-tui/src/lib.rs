@@ -18,6 +18,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use futures::{StreamExt, stream};
 use miette::{IntoDiagnostic, Result};
 use openshell_bootstrap::list_gateways_with_source;
 use openshell_core::auth::EdgeAuthInterceptor;
@@ -38,6 +39,7 @@ use event::{Event, EventHandler};
 const SPLASH_DURATION: Duration = Duration::from_secs(3);
 const PROVIDER_PROFILE_SCOPE_WORKSPACE: &str = "workspace";
 const PROVIDER_PROFILE_PAGE_SIZE: i32 = 100;
+const DRAFT_COUNT_REFRESH_CONCURRENCY: usize = 16;
 
 type ProviderProfileCache = HashMap<(String, String), openshell_core::proto::ProviderProfile>;
 type TuiClient = OpenShellClient<InterceptedService<Channel, EdgeAuthInterceptor>>;
@@ -51,6 +53,16 @@ pub(crate) struct ListRefreshResult {
     workspaces: Result<Vec<String>, String>,
     providers: Result<ProviderListRefresh, String>,
     sandboxes: Result<Vec<openshell_core::proto::Sandbox>, String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DraftCountsRefreshResult {
+    generation: u64,
+    gateway_name: String,
+    workspace: String,
+    all_workspaces: bool,
+    sandboxes: Vec<(String, String)>,
+    counts: Vec<usize>,
 }
 
 #[derive(Debug)]
@@ -211,6 +223,10 @@ pub async fn run(
             }
             Some(Event::ListRefreshCompleted(result)) => {
                 apply_list_refresh(&mut app, result);
+                spawn_sandbox_draft_counts_refresh(&mut app, events.sender());
+            }
+            Some(Event::DraftCountsRefreshCompleted(result)) => {
+                apply_sandbox_draft_counts_refresh(&mut app, result);
             }
             Some(Event::LogLines(lines)) => {
                 app.sandbox_log_lines.extend(lines);
@@ -282,7 +298,8 @@ pub async fn run(
                 }
                 // Refresh draft chunks + counts immediately after any action.
                 refresh_draft_chunks(&mut app).await;
-                refresh_sandbox_draft_counts(&mut app).await;
+                app.cancel_draft_counts_refresh();
+                spawn_sandbox_draft_counts_refresh(&mut app, events.sender());
             }
             Some(Event::GlobalSettingsFetched(result)) => match result {
                 Ok((settings, revision)) => {
@@ -372,7 +389,7 @@ pub async fn run(
                 spawn_list_refresh(&mut app, events.sender());
 
                 // Refresh per-sandbox draft counts for badges (dashboard + detail).
-                refresh_sandbox_draft_counts(&mut app).await;
+                spawn_sandbox_draft_counts_refresh(&mut app, events.sender());
 
                 // Auto-refresh sandbox detail (policy, settings, drafts) on
                 // every tick when viewing a sandbox.  The gRPC call is
@@ -2120,6 +2137,7 @@ fn apply_list_refresh(app: &mut App, result: ListRefreshResult) {
     if result.all_workspaces != app.all_workspaces {
         return;
     }
+    app.cancel_draft_counts_refresh();
 
     match result.workspaces {
         Ok(workspaces) => app.workspace_names = workspaces,
@@ -2832,31 +2850,127 @@ async fn refresh_draft_chunks(app: &mut App) {
     }
 }
 
-/// Fetch the count of pending draft recommendations for every sandbox.
-///
-/// This runs on the Dashboard tick so the sandbox list can show notification
-/// badges without entering the sandbox detail view.
-async fn refresh_sandbox_draft_counts(app: &mut App) {
-    let names: Vec<String> = app.sandbox_names.clone();
-    let workspaces: Vec<String> = app.sandbox_workspaces.clone();
-    let mut counts = vec![0usize; names.len()];
-    for (i, name) in names.iter().enumerate() {
-        let ws = workspaces
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| app.current_workspace.clone());
-        let req = openshell_core::proto::GetDraftPolicyRequest {
-            name: name.clone(),
-            status_filter: "pending".to_string(),
-            workspace_scope: Some(named_workspace_scope(ws)),
-        };
-        if let Ok(Ok(resp)) =
-            tokio::time::timeout(Duration::from_secs(2), app.client.get_draft_policy(req)).await
-        {
-            counts[i] = resp.into_inner().chunks.len();
+/// Start a bounded, non-overlapping background refresh of pending draft counts.
+fn spawn_sandbox_draft_counts_refresh(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
+    if let Some(handle) = app.draft_counts_refresh_handle.as_ref() {
+        if !handle.is_finished() {
+            return;
         }
+        app.draft_counts_refresh_handle.take();
     }
-    app.sandbox_draft_counts = counts;
+
+    let sandboxes: Vec<_> = app
+        .sandbox_names
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, name)| {
+            let workspace = app
+                .sandbox_workspaces
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| app.current_workspace.clone());
+            (name, workspace)
+        })
+        .collect();
+    if sandboxes.is_empty() {
+        app.sandbox_draft_counts.clear();
+        return;
+    }
+
+    app.draft_counts_refresh_generation = app.draft_counts_refresh_generation.wrapping_add(1);
+    let generation = app.draft_counts_refresh_generation;
+    let gateway_name = app.gateway_name.clone();
+    let workspace = app.current_workspace.clone();
+    let all_workspaces = app.all_workspaces;
+    let client = app.client.clone();
+    let refresh_sandboxes = sandboxes.clone();
+    let handle = tokio::spawn(async move {
+        let counts = fetch_sandbox_draft_counts(client, refresh_sandboxes).await;
+        let _ = tx.send(Event::DraftCountsRefreshCompleted(
+            DraftCountsRefreshResult {
+                generation,
+                gateway_name,
+                workspace,
+                all_workspaces,
+                sandboxes,
+                counts,
+            },
+        ));
+    });
+    app.draft_counts_refresh_handle = Some(handle);
+}
+
+async fn fetch_sandbox_draft_counts(
+    client: TuiClient,
+    sandboxes: Vec<(String, String)>,
+) -> Vec<usize> {
+    let count = sandboxes.len();
+    let results = stream::iter(sandboxes.into_iter().enumerate().map(
+        |(index, (name, workspace))| {
+            let mut client = client.clone();
+            async move {
+                let req = openshell_core::proto::GetDraftPolicyRequest {
+                    name,
+                    status_filter: "pending".to_string(),
+                    workspace,
+                };
+                let count = match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    client.get_draft_policy(req),
+                )
+                .await
+                {
+                    Ok(Ok(resp)) => resp.into_inner().chunks.len(),
+                    _ => 0,
+                };
+                (index, count)
+            }
+        },
+    ))
+    .buffer_unordered(DRAFT_COUNT_REFRESH_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    let mut counts = vec![0; count];
+    for (index, value) in results {
+        counts[index] = value;
+    }
+    counts
+}
+
+fn apply_sandbox_draft_counts_refresh(app: &mut App, result: DraftCountsRefreshResult) {
+    if result.generation != app.draft_counts_refresh_generation {
+        return;
+    }
+    app.draft_counts_refresh_handle.take();
+    if (
+        result.gateway_name.as_str(),
+        result.workspace.as_str(),
+        result.all_workspaces,
+    ) != (
+        app.gateway_name.as_str(),
+        app.current_workspace.as_str(),
+        app.all_workspaces,
+    ) {
+        return;
+    }
+    let current: Vec<_> = app
+        .sandbox_names
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, name)| {
+            let workspace = app
+                .sandbox_workspaces
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| app.current_workspace.clone());
+            (name, workspace)
+        })
+        .collect();
+    if result.sandboxes == current {
+        app.sandbox_draft_counts = result.counts;
+    }
 }
 
 fn phase_label(phase: i32) -> String {

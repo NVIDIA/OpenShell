@@ -222,7 +222,11 @@ pub(super) async fn handle_list_services(
             workspace,
             label_selector: selector,
         },
-        (None, Some(_)) => unreachable!("all-workspace sandbox filter was rejected"),
+        (None, Some(_)) => {
+            return Err(Status::invalid_argument(
+                "sandbox filter cannot be combined with all_workspaces",
+            ));
+        }
     };
     let page = state
         .store

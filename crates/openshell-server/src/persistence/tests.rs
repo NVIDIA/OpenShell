@@ -208,6 +208,22 @@ fn embedded_migrators_include_inference_route_removal() {
     }
 }
 
+#[test]
+fn embedded_migrators_include_pagination_indexes() {
+    for (backend, migration) in [
+        ("sqlite", super::sqlite::embedded_migration_sql(8)),
+        ("postgres", super::postgres::embedded_migration_sql(8)),
+    ] {
+        let sql =
+            migration.unwrap_or_else(|| panic!("{backend} migrator is missing migration 008"));
+        assert!(
+            sql.contains("objects_workspace_page_idx")
+                && sql.contains("objects_all_workspaces_page_idx"),
+            "{backend} migration 008 must add both keyset pagination indexes"
+        );
+    }
+}
+
 #[tokio::test]
 async fn sqlite_in_memory_store_survives_pool_connection_replacement() {
     for url in ["sqlite::memory:", "sqlite://?mode=memory"] {
