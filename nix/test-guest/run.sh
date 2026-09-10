@@ -34,6 +34,7 @@ if [ "${OPENSHELL_TEST_GUEST_RUNTIME:-}" != 1 ] ||
 	[ ! -d "${OPENSHELL_TEST_GUEST_DISTROS:-}" ] ||
 	[ ! -d "${OPENSHELL_TEST_GUEST_CONFIGURATIONS:-}" ] ||
 	[ ! -d "${OPENSHELL_TEST_GUEST_PROVISIONERS:-}" ] ||
+	[ ! -d "${OPENSHELL_TEST_GUEST_PUBLIC_PROVISIONERS:-}" ] ||
 	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_LIB:-}" ] ||
 	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_RUNNER:-}" ]; then
 	echo "run this script through 'nix run .#test-guest -- ...'" >&2
@@ -155,7 +156,7 @@ if [ "${list}" -eq 1 ]; then
 		printf '  %s\n' "${entry##*/}"
 	done
 	echo "Provisions:"
-	for entry in "${OPENSHELL_TEST_GUEST_PROVISIONERS}"/*; do
+	for entry in "${OPENSHELL_TEST_GUEST_PUBLIC_PROVISIONERS}"/*; do
 		if [ -d "${entry}" ]; then
 			printf '  %s\n' "${entry##*/}"
 		fi
@@ -195,17 +196,32 @@ for item in "${configurations[@]}"; do
 		;;
 	esac
 done
+openshell_source_count=0
+candidate_binaries_source_requested=false
 for item in "${provisions[@]}"; do
 	if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
-		[ ! -d "${OPENSHELL_TEST_GUEST_PROVISIONERS}/${item}" ]; then
+		[ ! -d "${OPENSHELL_TEST_GUEST_PUBLIC_PROVISIONERS}/${item}" ]; then
 		echo "unknown provisioner: ${item:-<empty>}" >&2
 		exit 2
 	fi
-	if [ "${item}" = gateway-podman ] && [ -z "${podman_mode}" ]; then
-		echo "gateway-podman requires --with podman-rootful or --with podman-rootless" >&2
+	if [ "${item}" = openshell-candidate-binaries-source ]; then
+		candidate_binaries_source_requested=true
+	fi
+	case "${item}" in
+	openshell-*-source)
+		openshell_source_count=$((openshell_source_count + 1))
+		;;
+	esac
+	if [ "${item}" = gateway-for-podman-compute-driver ] && [ -z "${podman_mode}" ]; then
+		echo "gateway-for-podman-compute-driver requires --with podman-rootful or --with podman-rootless" >&2
 		exit 2
 	fi
 done
+
+if [ "${candidate_binaries_source_requested}" = true ] && [ "${openshell_source_count}" -ne 1 ]; then
+	echo "openshell-candidate-binaries-source cannot be combined with another OpenShell source" >&2
+	exit 2
+fi
 
 if [ -n "${requested_ssh_port}" ] && {
 	[[ ! ${requested_ssh_port} =~ ^[0-9]+$ ]] ||

@@ -1,0 +1,52 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+- name: Verify candidate OpenShell binaries
+  ansible.builtin.stat:
+    path: "{{ item.source }}"
+  loop: "{{ openshell_binaries_candidate_artifacts }}"
+  register: openshell_binaries_candidate_artifact_stats
+
+- name: Require candidate OpenShell binaries
+  ansible.builtin.assert:
+    that: item.stat.exists
+    fail_msg: "missing candidate OpenShell binary: {{ item.item.source }}"
+  loop: "{{ openshell_binaries_candidate_artifact_stats.results }}"
+  loop_control:
+    label: "{{ item.item.source }}"
+
+- name: Create the candidate binary apply command directory
+  ansible.builtin.file:
+    path: "{{ openshell_binaries_candidate_apply_command | dirname }}"
+    state: directory
+    mode: "0700"
+
+- name: Install the candidate binary apply command
+  ansible.builtin.copy:
+    dest: "{{ openshell_binaries_candidate_apply_command }}"
+    mode: "0700"
+    content: |
+      #!/usr/bin/env bash
+      set -Eeuo pipefail
+      {% for artifact in openshell_binaries_candidate_artifacts %}
+      sudo install -D -m {{ artifact.mode }} -- {{ artifact.source | quote }} {{ artifact.destination | quote }}
+      {% endfor %}
+
+- name: Determine whether the candidate binaries are the initial OpenShell source
+  ansible.builtin.set_fact:
+    openshell_binaries_candidate_is_initial: "{{ openshell_install_source is not defined }}"
+
+- name: Install candidate binaries as the initial OpenShell state
+  ansible.builtin.command:
+    cmd: "{{ openshell_binaries_candidate_apply_command }}"
+  when: openshell_binaries_candidate_is_initial
+
+- name: Publish the initial candidate binary OpenShell contract
+  ansible.builtin.include_role:
+    name: openshell-binaries-contract
+  vars:
+    openshell_binaries_contract_cli_bin: "{{ openshell_binaries_candidate_cli_bin }}"
+    openshell_binaries_contract_gateway_bin: "{{ openshell_binaries_candidate_gateway_bin }}"
+    openshell_binaries_contract_sandbox_archive: "{{ openshell_binaries_candidate_sandbox_archive }}"
+  when: openshell_binaries_candidate_is_initial

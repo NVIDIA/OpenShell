@@ -65,15 +65,12 @@
     label: "{{ item.name }}"
   become: true
 
-- name: Install latest-release OpenShell RPMs
-  ansible.builtin.dnf:
-    name:
-      - "{{ openshell_rpm_latest_release_download_dir }}/{{ openshell_rpm_latest_release_cli_asset.name }}"
-      - "{{ openshell_rpm_latest_release_download_dir }}/{{ openshell_rpm_latest_release_gateway_asset.name }}"
-    state: present
-    disable_gpg_check: true
-  become: true
-
-- name: Publish latest-release RPM OpenShell installation
+- name: Prepare the latest-release RPM source
   ansible.builtin.include_role:
-    name: openshell-rpm
+    name: openshell-rpm-source
+  vars:
+    openshell_rpm_source_name: latest-release
+    openshell_rpm_source_cli_package: >-
+      {{ openshell_rpm_latest_release_download_dir }}/{{ openshell_rpm_latest_release_cli_asset.name }}
+    openshell_rpm_source_gateway_package: >-
+      {{ openshell_rpm_latest_release_download_dir }}/{{ openshell_rpm_latest_release_gateway_asset.name }}

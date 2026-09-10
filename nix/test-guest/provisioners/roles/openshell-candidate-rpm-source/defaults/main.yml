@@ -1,0 +1,7 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+openshell_rpm_candidate_staging_dir: /var/lib/openshell-test-guest/artifacts
+openshell_rpm_candidate_cli_package: "{{ openshell_rpm_candidate_staging_dir }}/openshell.rpm"
+openshell_rpm_candidate_gateway_package: "{{ openshell_rpm_candidate_staging_dir }}/openshell-gateway.rpm"

@@ -169,11 +169,10 @@ jobs:
             --distro fedora \
             --with podman-rootless \
             --with selinux \
-            --copy "${candidate_cli_package[0]}:/var/lib/openshell-conformance/candidate/openshell.rpm" \
-            --copy "${candidate_gateway_package[0]}:/var/lib/openshell-conformance/candidate/openshell-gateway.rpm" \
+            --copy "${candidate_cli_package[0]}:/var/lib/openshell-test-guest/artifacts/openshell.rpm" \
+            --copy "${candidate_gateway_package[0]}:/var/lib/openshell-test-guest/artifacts/openshell-gateway.rpm" \
             --copy conformance-input/openshell-conformance:/tmp/openshell-conformance \
-            --copy nix/test-guest/conformance-plans/gateway-upgrade-restart.toml:/tmp/conformance-plan.toml \
-            --provision openshell-rpm-latest-release \
-            --provision gateway-podman \
-            --provision openshell-rpm-gateway-upgrade \
+            --copy nix/test-guest/conformance-plans/gateway-restart.toml:/tmp/conformance-plan.toml \
+            --provision openshell-candidate-rpm-source \
+            --provision gateway-for-podman-compute-driver \
             -- /tmp/openshell-conformance run --plan /tmp/conformance-plan.toml

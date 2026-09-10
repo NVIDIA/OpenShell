@@ -51,10 +51,13 @@ nix/test-guest/
     └── selinux.yml
 └── provisioners/
     └── roles/
-        ├── gateway-podman/
-        ├── openshell-development/
-        ├── openshell-rpm/
-        └── openshell-rpm-gateway-upgrade/
+        ├── gateway-for-podman-compute-driver/
+        ├── openshell-candidate-binaries-source/
+        ├── openshell-binaries-contract/
+        ├── openshell-candidate-rpm-source/
+        ├── openshell-rpm-contract/
+        ├── openshell-latest-release-rpm-source/
+        └── openshell-rpm-source/
 ```
 
 - `default.nix` assembles the guest and cache flake apps. It selects host architecture and acceleration, supplies the runtime tools, and exposes distro profiles and configuration playbooks as Nix-store catalogs.
@@ -93,7 +96,7 @@ required by OpenShell sandbox callbacks. Ubuntu 24.04 ships Podman 4, which
 does not provide that helper.
 
 `podman-rootful` installs Podman, enables its system API socket, and records
-the selected mode for the `gateway-podman` provisioner. The provisioner then
+the selected mode for the `gateway-for-podman-compute-driver` provisioner. The provisioner then
 starts the selected OpenShell installation as root. It does not write a
 rootful-specific gateway setting; the gateway discovers the Podman socket
 available to its service account. The rootless configuration records its mode
@@ -153,19 +156,25 @@ nix run .#test-guest -- \
 
 Configurations are Ansible playbooks stored under `nix/test-guest/configuration/`. Ansible runs on the host using the VM's ephemeral SSH key and loopback port. The guest does not install Ansible.
 
-Configurations run in the order provided on the command line. OpenShell packages and copied files are installed after all configurations succeed.
-
-`--install` packages and `--copy` files are applied by a dedicated per-run
-transfer step. `--copy` preserves each source file's ordinary permission bits
-unless an octal mode is supplied. They are not stored in prepared VM cache
-entries.
+Configurations run in the order provided on the command line. Package and file
+artifacts are applied after all configurations succeed. `--install` installs a
+generic Debian or RPM package directly; `--copy` stages a file at a guest path
+and preserves its ordinary permission bits. Neither is stored in prepared VM
+cache entries.
 
 ## System provisioners
 
-`--provision NAME` applies a target-specific system setup after packages and
+`--provision NAME` applies target-specific system setup after packages and
 copied artifacts are present. Unlike `--with`, provisioners are not cached.
-They can therefore install and start an OpenShell system without coupling the
-prepared guest image to a particular build or driver configuration.
+Stage OpenShell artifacts with `--copy`, then use an ordered source installer
+provisioner to make OpenShell available without coupling the prepared guest
+image to a particular build or driver configuration.
+
+OpenShell source provisioners run in command-line order. The first source
+installs and publishes the initial OpenShell state; later sources only make
+their packages and target-side apply commands available. This lets a scenario
+prepare guest state before initial installation and gives lifecycle actions the
+exact source artifacts they must install later.
 
 Provisioners that support gateway continuity install a target-control command:
 
@@ -192,27 +201,29 @@ timeout_secs = 120
 EOF
 ```
 
-`openshell-development` expects these copied guest paths:
+`openshell-candidate-binaries-source` makes staged raw candidate artifacts available.
+When it is the first OpenShell source provisioner, it installs them into the
+candidate binary OpenShell state. Stage these guest paths with `--copy`:
 
-- `/usr/local/bin/openshell`
-- `/usr/local/bin/openshell-gateway`
-- `/usr/local/lib/openshell-sandbox.tar`
+- `/var/lib/openshell-test-guest/artifacts/openshell`
+- `/var/lib/openshell-test-guest/artifacts/openshell-gateway`
+- `/var/lib/openshell-test-guest/artifacts/openshell-sandbox.tar`
 
-Compose it with `gateway-podman` after either Podman configuration. The role
+Compose it with `gateway-for-podman-compute-driver` after either Podman configuration. The role
 uses the recorded mode to select the corresponding service account. It
-generates configuration only for development artifacts; RPM installations
+generates configuration only for candidate binaries; RPM installations
 retain their packaged service and first-start configuration. For example, run
 conformance after the rootless provisioners complete:
 
 ```shell
 nix run .#test-guest -- \
   --distro fedora --with podman-rootless --with selinux \
-  --copy ./openshell:/usr/local/bin/openshell \
+  --copy ./openshell:/var/lib/openshell-test-guest/artifacts/openshell \
   --copy ./openshell-conformance:/usr/local/bin/openshell-conformance \
-  --copy ./openshell-gateway:/usr/local/bin/openshell-gateway \
-  --copy ./openshell-sandbox.tar:/usr/local/lib/openshell-sandbox.tar \
-  --provision openshell-development \
-  --provision gateway-podman \
+  --copy ./openshell-gateway:/var/lib/openshell-test-guest/artifacts/openshell-gateway \
+  --copy ./openshell-sandbox.tar:/var/lib/openshell-test-guest/artifacts/openshell-sandbox.tar \
+  --provision openshell-candidate-binaries-source \
+  --provision gateway-for-podman-compute-driver \
   -- /usr/local/bin/openshell-conformance run --plan - <<'EOF'
 version = 1
 
@@ -227,17 +238,31 @@ timeout_secs = 120
 EOF
 ```
 
-`openshell-rpm` expects OpenShell to have been installed with `--install`. It
-uses the RPM-owned `/usr/bin` binaries and `openshell-gateway` user service,
-without copied development artifacts or a supervisor archive. Compose it with
-`gateway-podman` to start the installed version. The existing upgrade flow uses
-the same role with the rootless configuration before
-`openshell-rpm-gateway-upgrade`.
+`openshell-candidate-rpm-source` makes staged candidate RPMs available and publishes a
+target-side candidate apply command. Stage the CLI and gateway packages as
+`/var/lib/openshell-test-guest/artifacts/openshell.rpm` and
+`/var/lib/openshell-test-guest/artifacts/openshell-gateway.rpm`.
 
-`openshell-rpm-latest-release` downloads and installs the latest stable
-OpenShell GitHub release for the guest architecture, then publishes the same
-RPM installation contract. Compose it with `gateway-podman` and an RPM gateway
-action when testing an upgrade from the current release.
+`openshell-latest-release-rpm-source` downloads the latest stable OpenShell GitHub
+release for the guest architecture, stores its versioned RPMs under
+`/var/lib/openshell-conformance/baseline`, and publishes a target-side
+latest-release apply command.
+
+For gateway restart continuity, provision the candidate source first so it
+initializes the guest:
+
+```shell
+--provision openshell-candidate-rpm-source \
+--provision gateway-for-podman-compute-driver
+```
+
+The gateway-restart plan runs one `gateway-restart` action to verify continuity
+across the restart.
+
+`openshell-binaries-contract`, `openshell-rpm-contract`, and
+`openshell-rpm-source` are internal composition roles used by the public source
+provisioners. They are available only as dependencies of public source roles,
+not as `--provision` entry points.
 
 Versioned plans under `nix/test-guest/conformance-plans/` bind conformance
 scenarios to the stable action-command contracts installed by provisioners.
