@@ -157,6 +157,28 @@ in platform-specific Nix development shells through reusable workflows and the
 shared `build-rust-binary` action. The image build downloads each binary artifact
 into the staging directory before running Buildx.
 
+The Nix flake exposes one development shell with target-specific toolchains.
+The shared `mkToolchain` function in `nix/toolchain/default.nix` assembles native
+libraries and Cargo environment settings. Linux and Darwin modules select the
+compiler and sysroot and generate the compiler wrapper for their platform.
+The `nix/toolchain/glibc-2.28/` directory contains the pinned glibc build,
+GCC environment, and sysroot assembly used by GNU Linux targets.
+The glibc build reuses a pinned historical Nixpkgs recipe with current build
+tools; its headers, shared libraries, and static archives are assembled into
+the sysroot from separate outputs.
+Each toolchain supplies its compiler driver, assembler, archiver, native
+libraries, and Cargo environment through derivation passthru. The shell omits
+an implicit host C compiler; Cargo builds select the appropriate tools with
+`--target`. GNU targets use a glibc 2.28 sysroot and static GCC runtimes, while
+musl targets produce static executables.
+
+On macOS, the shell also provides a native Darwin toolchain with static Z3
+and AWS-LC. Its Clang driver uses the pinned, unprocessed Apple SDK so system
+library stubs, including libiconv and libc++, retain their Apple install names.
+System libraries and frameworks remain dynamically linked. The deployment
+target matches the Nix host platform's minimum macOS version. The Rust toolchain
+does not propagate Nix's replacement system libraries into the link environment.
+
 Gateway and supervisor binaries staged into branch E2E, Release Dev, and Release
 Tag images are compiled through `cargo auditable` (pinned in `mise.toml`), which
 embeds a `.dep-v0` section describing the Rust dependencies actually compiled
@@ -167,14 +189,15 @@ is a different artifact from the source SBOM produced by `syft dir:.` in
 `tasks/sbom.toml`, which describes the checkout, and from the image SBOM
 attestation below, which describes a published image.
 
-The shared binary build action compiles release artifacts with `cargo auditable`.
+The shared binary build action uses the default Nix shell and compiles release
+artifacts with `cargo auditable build --target <triple>`. Verification and upload
+read binaries from `target/<triple>/release/`.
 Branch E2E, Release Dev, and Release Tag image jobs stage those same artifacts
 instead of rebuilding binaries in Docker. Each binary build scans its output with
 Syft and requires at least one decoded Cargo package before uploading the
-artifact. Darwin builds replace Nix's `libiconv` load command with the macOS
-system install name, ad-hoc sign the modified binary, and fail if `otool -L`
-reports any remaining `/nix/store` dependency. Runtime and Syft verification
-run after that normalization. The CI image gains the pinned `cargo-auditable`
+artifact. The action checks each binary's `--version` output and leaves its
+linkage as produced by the Nix toolchain, without post-link rewriting or
+platform-specific linkage checks. The CI image gains the pinned `cargo-auditable`
 tool through `mise install --locked` but ships no auditable OpenShell binary of
 its own.
 
@@ -487,13 +510,7 @@ settings, exceptions, and the contributor and maintainer workflows.
 
 ## Docs Site
 
-Published docs live in `docs/`. Navigation lives in `docs/index.yml`. Fern site
-configuration, components, theme assets, and publish settings live in `fern/`.
-
-Use `mise run docs` for strict validation and `mise run docs:serve` for local
-preview. PR previews are produced by `.github/workflows/branch-docs.yml` when
-Fern credentials are available. Production docs publish from the release tag
-workflow.
+Published docs live in `docs/`, and Fern site configuration lives in `fern/`. See [fern/README.md](../fern/README.md) for the source layout, local development commands, version model, and publishing workflows.
 
 ## Validation Expectations
 

@@ -39,6 +39,8 @@ When enabled, OCSF JSON records are written to `/var/log/openshell-ocsf.YYYY-MM-
 
 ## JSON Record Structure
 
+`metadata.uid` uniquely identifies an event and stays unchanged when that record is serialized again. Use `container.uid` to associate the event with its sandbox, not `metadata.uid`. Records without a sandbox association omit the container; unknown images are omitted rather than represented by an empty image name.
+
 Each line is a complete OCSF v1.8.0 JSON object. Here is an example of a network connection event:
 
 ```json
@@ -212,6 +214,8 @@ cat /var/log/openshell-ocsf.2026-04-01.log | \
 ```
 
 ## Relationship to Shorthand Logs
+
+Sandbox events identify the sandbox environment with `device.type_id: 99` (Other) and `device.type: "Sandbox"`. The operating system is reported separately in `device.os.name`; the device type does not classify the underlying host or compute backend.
 
 The shorthand format in `openshell.YYYY-MM-DD.log` and the JSON format in `openshell-ocsf.YYYY-MM-DD.log` are derived from the same OCSF events. The shorthand is a human-readable projection; the JSON is the full structured record when no schema downgrade is configured. When `ocsf_schema_version` is set, the JSON export is a lossy projection of the internal event model. Both formats are generated at the same time from the same event data.
 
