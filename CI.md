@@ -81,12 +81,93 @@ nix develop --command actionlint -shellcheck= -pyflakes=
 nix develop --command zizmor --offline --persona=regular --min-severity=high --no-exit-codes .
 ```
 
+## Run the security scans together
+
+`Security Scan` (`.github/workflows/security-scan.yml`) calls Codex Security,
+CodeQL, Trivy, Cargo Deny, and Workflow Security Reports (Actionlint/Zizmor) in
+parallel. Run it manually from Actions or call it from another workflow. All
+children scan `candidate_ref`, which must be an existing `vX.Y.Z-pre.N` tag
+because Codex qualifies pre-releases. Codex compares it with the previous stable;
+the other scanners analyze the candidate snapshot. Cargo Deny uses its existing
+NVIDIA self-hosted runner and CI container.
+
+```shell
+gh workflow run security-scan.yml --ref main \
+  -f candidate_ref=v0.1.1-pre.1 \
+  -F allow-high-critical=true
+```
+
+To integrate it into a larger workflow, run it after the job that pushes the
+candidate tag and publishes the artifacts. This example assumes an existing
+`build` job with outputs named `candidate_tag`, `gateway_image`, `sandbox_image`,
+and `chart_ref`; adapt those names to your workflow:
+
+```yaml
+jobs:
+  security:
+    needs: build
+    uses: ./.github/workflows/security-scan.yml
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+      security-events: write
+    with:
+      candidate_ref: ${{ needs.build.outputs.candidate_tag }}
+      stable_ref: v0.1.0 # Optional; otherwise resolved automatically.
+      images: |
+        ${{ needs.build.outputs.gateway_image }}
+        ${{ needs.build.outputs.sandbox_image }}
+      charts: ${{ needs.build.outputs.chart_ref }}
+      allow-high-critical: false
+    secrets:
+      CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+```
+
+Set `needs: security` on a downstream promotion job to require successful scans.
+
+`CODEX_SECURITY_API_KEY` is required; `CACHIX_AUTH_TOKEN` is optional. The parent
+publishes SARIF, including Codex results for manual parent runs. Codex keeps its
+release-train category on `main`; CodeQL, Trivy, and workflow reports publish
+against the candidate tag and commit. Existing standalone triggers stay active.
+
+The parent fails on HIGH/CRITICAL findings from Codex, CodeQL, Trivy, and Zizmor.
+Set `allow-high-critical: true` to report those findings without failing; it
+defaults to `false`. Scanner setup, execution, and report publication errors
+still fail. Reports are published before the finding threshold is enforced.
+
+Codex uses each finding's severity; CodeQL uses the rule's security score
+(at least 7.0); Trivy uses `HIGH,CRITICAL`, including vulnerabilities without an
+upstream fix; Zizmor uses its High severity. Actionlint remains informational.
+Existing scanner exceptions still apply.
+
+Cargo Deny runs only `cargo deny check advisories` in the parent. It keeps its
+native failure behavior and configured exceptions, regardless of
+`allow-high-critical`; it has no HIGH/CRITICAL filter. Its standalone runs still
+check all dependency policies.
+
+Codex scans the cumulative diff from `stable_ref` to `candidate_ref`. Both inputs
+are tag names, not arbitrary commit SHAs. Omit `stable_ref` to resolve the previous
+stable automatically; set `allow_full_bootstrap: true` to permit a full scan when
+no previous stable exists.
+
+Trivy accepts optional `images` and `charts`, one reference per line. Images can
+use tags or digests, such as `ghcr.io/nvidia/openshell/gateway:0.1.1-pre.1` or
+`ghcr.io/nvidia/openshell/gateway@sha256:<digest>`. Charts use versioned OCI
+references, such as `oci://ghcr.io/nvidia/openshell/helm-chart:0.1.1-pre.1`.
+Artifacts must already be published and accessible to the workflow. The caller
+selects artifacts matching the candidate; the workflow does not verify that
+association. Without artifact inputs, Trivy scans only the candidate's deployment
+configuration.
+Dependency Review and Trivy Changes keep their separate comparison workflows.
+
 ## Artifact scanning
 
 `Trivy Scan` is a self-contained `workflow_dispatch`/`workflow_call` step. It
 always scans deployment configuration and optionally scans supplied OCI image
-and chart references. It is not wired into a release workflow; a future analysis
-orchestrator can call it directly.
+and chart references. `Security Scan` calls it alongside the other independent
+scanners; release workflows can also call it directly.
 
 The scan job checks static deployment files (including Dockerfiles) once, both
 local charts with default values, the OpenShell `HELM_PROFILES` selected in

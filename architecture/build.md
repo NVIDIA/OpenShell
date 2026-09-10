@@ -344,12 +344,32 @@ Triggers differ by workflow: `.github/workflows/workflow-security.yml` runs on
 `.github/workflows/codeql.yml` runs nightly on the default branch (`main`) via
 `schedule`, with `workflow_dispatch` kept for manual diagnostics; and
 `.github/workflows/codex-security.yml` runs on pushed `v*.*.*-pre.*` tags, and is
-also callable through `workflow_call` and `workflow_dispatch`. CodeQL does
-not run on `pull_request`, `merge_group`, or pushes to `main`, so it reports
+also callable through `workflow_call` and `workflow_dispatch`. CodeQL has no
+automatic `pull_request`, `merge_group`, or push trigger, so it reports
 repository-level Code Scanning state on the default branch instead of per-PR
 results, and its four-language matrix stays off the per-change critical path.
 Codex Security is release-scoped rather than change-scoped, so it never runs on
-a pull request or merge group.
+a pull request or merge group automatically.
+
+`.github/workflows/security-scan.yml` is a manual and reusable parent for Codex
+Security, CodeQL, Trivy, Cargo Deny, and Actionlint/Zizmor. Each child runs
+independently against the supplied pre-release tag; Codex retains its cumulative
+stable-to-candidate range. The parent forwards OCI references to Trivy and
+publishes SARIF, including Codex results on manual parent runs. Codex publishes
+against the candidate commit on `main`; the other SARIF producers use the
+candidate tag and commit. Cargo Deny retains its self-hosted runner and CI
+container. Dependency Review and Trivy Changes remain separate comparison
+workflows. Existing standalone triggers remain active.
+
+The parent enforces HIGH/CRITICAL findings for Codex, CodeQL, Trivy, and Zizmor.
+Its `allow-high-critical` input disables that threshold while keeping execution
+and publication failures fatal. Each scanner evaluates its existing report
+after publication. Actionlint stays informational; Cargo Deny runs its native
+advisory check, which is independent of the severity override. Standalone
+finding policies are unchanged. Child concurrency groups distinguish the
+scanner as well as the caller, so sibling workflows cannot cancel one another.
+Codex retains its repository-wide release qualification group.
+See [CI.md](../CI.md#run-the-security-scans-together) for invocation examples.
 
 - **Actionlint and Zizmor** analyze the workflow definitions themselves.
   Repository configuration lives in `.github/actionlint.yml` (self-hosted runner
@@ -372,8 +392,8 @@ a pull request or merge group.
   integration targets the cfg override does not reach. Examples remain in scope,
   and E2E test code stays excluded because `e2e/` is not an analyzed path. Only
   Go requires a build; the other languages use build mode `none`. Analysis runs
-  on the nightly schedule or by manual dispatch. Results are uploaded to Code
-  Scanning and always retained as workflow artifacts.
+  on the nightly schedule, by manual dispatch, or through `workflow_call`.
+  Results are uploaded to Code Scanning and always retained as workflow artifacts.
 - **Codex Security** qualifies release candidates rather than individual
   changes. The job installs a pinned `@openai/codex-security` release into the
   runner temp directory before the repository is checked out and invokes it by
@@ -439,7 +459,9 @@ a pull request or merge group.
   `CODEX_SECURITY_STATE_DIR`, where every shell command the agent ran is
   recorded. No command at all is the signal that the sandbox failed to start.
 
-Findings never fail these checks; scanner and build failures do. A scanner that
+Findings do not fail standalone informational runs; reusable callers can enable
+HIGH/CRITICAL enforcement with `fail-on-findings`. Scanner and build failures
+always fail. A scanner that
 cannot run, a CodeQL analyzer that does not complete, an unexpected Dependency
 Graph API error, and a Codex Security range, scan, or export failure are all
 errors, which keeps an informational check from silently degrading into a no-op.
