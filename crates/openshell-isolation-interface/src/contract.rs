@@ -24,7 +24,7 @@
 //! `attach` is atomic from the caller's perspective: it establishes and binds
 //! the boundary, returns `Bound`, or fails closed. It never binds a resource
 //! already bound to an active boundary. Binary identity travels on every
-//! [`PendingNetworkOpen`], resolved for that exact socket and process
+//! [`PendingTcpOpen`], resolved for that exact socket and process
 //! generation; an unresolved identity denies the open.
 //!
 //! The contract is transport-neutral. Concrete topology implementations keep
@@ -352,16 +352,11 @@ pub trait IsolationBackend: Send + Sync {
 /// code is running.
 #[async_trait]
 pub trait BoundBoundary: Send {
-    /// The mediation service's backend-neutral source of workload connections.
+    /// The mediation service's backend-neutral source of workload network
+    /// requests. TCP and DNS remain typed operations so consumers cannot mix
+    /// their framing, decisions, or response semantics.
     /// Retained by the supervisor before consuming `Bound`.
     fn network_mediation_source(&self) -> Arc<dyn NetworkMediationSource>;
-
-    /// Optional transport for workload DNS exchanges. Backends that expose
-    /// this source keep DNS inside the supervisor-owned policy path rather
-    /// than granting the workload access to a resolver socket.
-    fn dns_mediation_source(&self) -> Option<Arc<dyn DnsMediationSource>> {
-        None
-    }
 
     /// Trusted host-side dial target for the well-known host-gateway aliases.
     ///
@@ -703,7 +698,7 @@ pub trait BoundaryLoopbackConnector: Send + Sync {
 // ============================================================================
 
 /// Executable identity for one accepted connection, resolved by the backend and
-/// delivered on [`PendingNetworkOpen`] before the mediation service evaluates
+/// delivered on [`PendingTcpOpen`] before the mediation service evaluates
 /// policy.
 ///
 /// A missing digest is `None`, never an empty value; policy that requires an
@@ -777,21 +772,36 @@ pub struct NetworkSocketMetadata {
 
 /// Typed supervisor decision for one pending TCP open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NetworkOpenResult {
+pub enum TcpOpenDecision {
     /// L4 authorization and a bounded relay handler are ready. L7 policy still
     /// applies to bytes after the local connection commits.
     RelayReady,
     /// The socket remains unchanged and connect returns this positive errno.
-    Denied { errno: i32 },
+    Denied(TcpOpenDenial),
+}
+
+/// Placement-neutral reason why a staged TCP open was not committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpOpenDenial {
+    /// The admitted network policy rejected the request.
+    PolicyDenied,
+    /// The backend could not resolve authoritative executable identity.
+    IdentityUnavailable,
+    /// The requested destination could not be validated.
+    InvalidDestination,
+    /// A bounded mediation resource was exhausted.
+    ResourceExhausted,
+    /// The mediation path became unavailable before commit.
+    MediationUnavailable,
 }
 
 /// A staged workload TCP open delivered before its local relay is committed.
 ///
 /// An `Err` identity must be denied and audited. The supervisor owns
 /// `result`; dropping it cancels the open without changing the workload socket.
-pub struct PendingNetworkOpen {
+pub struct PendingTcpOpen {
     /// Staged byte stream whose workload side is committed only after
-    /// [`NetworkOpenResult::RelayReady`].
+    /// [`TcpOpenDecision::RelayReady`].
     pub stream: BoundaryDuplexStream,
     /// Executable identity, resolved by the backend for this connection.
     pub binary_identity: Result<BinaryIdentity, ResolveError>,
@@ -802,7 +812,7 @@ pub struct PendingNetworkOpen {
     /// Policy generation under which the request was created.
     pub policy_generation: u64,
     /// Single-use completion channel back to the sandbox broker.
-    pub result: oneshot::Sender<NetworkOpenResult>,
+    pub decision: oneshot::Sender<TcpOpenDecision>,
 }
 
 /// A logical per-boundary stream of workload connections, consumed by the
@@ -811,13 +821,17 @@ pub struct PendingNetworkOpen {
 /// It may wrap a dedicated listener or a demultiplexed view over shared
 /// transport; how it reaches a co-located proxy, a sidecar, or a shared
 /// mediation service is backend-private. A trusted backend component associates
-/// every returned connection with its active boundary without relying solely on
-/// a transport tuple or workload-provided identifier. An `Err` from `accept`
-/// means the source itself is unusable and fails the boundary closed.
+/// every returned request with its active boundary without relying solely on a
+/// transport tuple or workload-provided identifier. TCP and DNS use separate
+/// accepts so they can be consumed concurrently with independent backpressure.
+/// An `Err` means that mediation lane is unusable and fails closed.
 #[async_trait]
 pub trait NetworkMediationSource: Send + Sync {
     /// Await the next staged workload TCP open.
-    async fn accept(&self) -> Result<PendingNetworkOpen, BackendError>;
+    async fn accept_tcp(&self) -> Result<PendingTcpOpen, BackendError>;
+
+    /// Await the next workload DNS query.
+    async fn accept_dns(&self) -> Result<PendingDnsQuery, BackendError>;
 }
 
 /// DNS transport used by one workload exchange.
@@ -825,14 +839,15 @@ pub trait NetworkMediationSource: Send + Sync {
 pub enum DnsTransport {
     /// One DNS wire datagram without a TCP length prefix.
     Udp,
-    /// One two-byte-length-prefixed DNS message.
+    /// One DNS message received over a TCP resolver connection.
     Tcp,
 }
 
 /// One workload DNS request and its fail-closed response channel.
-pub struct MediatedDnsQuery {
-    /// DNS request bytes in the framing selected by [`Self::transport`].
-    pub request: Vec<u8>,
+pub struct PendingDnsQuery {
+    /// Exactly one DNS wire message, without a DNS-over-TCP length prefix.
+    /// The backend removes and restores transport framing.
+    pub message: Vec<u8>,
     /// Workload DNS transport.
     pub transport: DnsTransport,
     /// Identity of the process that issued the DNS request when the backend
@@ -843,12 +858,4 @@ pub struct MediatedDnsQuery {
     pub binary_identity: Result<BinaryIdentity, ResolveError>,
     /// Single-use response channel owned by the backend adapter.
     pub response: oneshot::Sender<Result<Vec<u8>, BackendError>>,
-}
-
-/// Logical per-boundary stream of DNS exchanges. The backend handles syscall,
-/// packet, or guest-agent transport details; the supervisor owns policy DNS.
-#[async_trait]
-pub trait DnsMediationSource: Send + Sync {
-    /// Await the next DNS query from this boundary.
-    async fn accept(&self) -> Result<MediatedDnsQuery, BackendError>;
 }
