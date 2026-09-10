@@ -33,11 +33,9 @@ jobs:
           - arch: x86_64
             triple: x86_64-unknown-linux-gnu
             runner: linux-amd64-cpu8
-            interpreter: /lib64/ld-linux-x86-64.so.2
           - arch: aarch64
             triple: aarch64-unknown-linux-gnu
             runner: linux-arm64-cpu8
-            interpreter: /lib/ld-linux-aarch64.so.1
           - arch: aarch64
             triple: aarch64-apple-darwin
             runner: macos-15-xlarge
@@ -81,4 +79,3 @@ jobs:
           triple: ${{ matrix.triple }}
           cargo-version: ${{ inputs['cargo-version'] }}
           image-tag: ${{ inputs['image-tag'] }}
-          interpreter: ${{ matrix.interpreter }}

@@ -33,10 +33,6 @@ on:
         required: false
         type: string
         default: ""
-      interpreter:
-        required: false
-        type: string
-        default: ""
       checkout-ref:
         required: false
         type: string
@@ -71,4 +67,3 @@ jobs:
           image-tag: ${{ inputs['image-tag'] }}
           artifact-name: ${{ inputs['artifact-name'] }}
           extra-cargo-flags: ${{ inputs['extra-cargo-flags'] }}
-          interpreter: ${{ inputs.interpreter }}

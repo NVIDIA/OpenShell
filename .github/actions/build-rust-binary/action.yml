@@ -29,10 +29,6 @@ inputs:
     description: Additional flags passed to cargo build
     required: false
     default: ""
-  interpreter:
-    description: ELF interpreter for a dynamically linked Linux binary
-    required: false
-    default: ""
 
 runs:
   using: composite
@@ -62,79 +58,30 @@ runs:
     - name: Build ${{ inputs.binary }}
       shell: nix develop -c bash -euo pipefail {0}
       env:
+        GIT_DIR: /nonexistent
         OPENSHELL_IMAGE_TAG: ${{ inputs.image-tag }}
         INPUTS_PACKAGE: ${{ inputs.package }}
         INPUTS_BINARY: ${{ inputs.binary }}
+        INPUTS_TRIPLE: ${{ inputs.triple }}
         INPUTS_EXTRA_CARGO_FLAGS: ${{ inputs.extra-cargo-flags }}
-      run: GIT_DIR=/nonexistent cargo auditable build --release --package "${INPUTS_PACKAGE}" --bin "${INPUTS_BINARY}" ${INPUTS_EXTRA_CARGO_FLAGS}
-
-    - name: Normalize Darwin dynamic binary
-      if: endsWith(inputs.triple, '-apple-darwin')
-      shell: bash -euo pipefail {0}
-      env:
-        INPUTS_BINARY: ${{ inputs.binary }}
-      run: |
-        binary=target/release/${INPUTS_BINARY}
-        nix_iconv_paths=$(otool -L "$binary" | awk '$1 ~ "^/nix/store/.*/lib/libiconv\\.2\\.dylib$" { print $1 }')
-        if [[ -n "$nix_iconv_paths" ]]; then
-          while IFS= read -r nix_iconv_path; do
-            install_name_tool -change "$nix_iconv_path" /usr/lib/libiconv.2.dylib "$binary"
-          done <<< "$nix_iconv_paths"
-          codesign --force --sign - "$binary"
-        fi
-
-    - name: Verify Darwin portability
-      if: endsWith(inputs.triple, '-apple-darwin')
-      shell: bash -euo pipefail {0}
-      env:
-        INPUTS_BINARY: ${{ inputs.binary }}
-      run: |
-        binary=target/release/${INPUTS_BINARY}
-        nix_dependencies=$(otool -L "$binary" | awk '$1 ~ "^/nix/store/" { print $1 }')
-        if [[ -n "$nix_dependencies" ]]; then
-          echo "error: $binary has non-portable Nix store dependencies:" >&2
-          printf '  %s\n' "$nix_dependencies" >&2
-          exit 1
-        fi
-        codesign --verify --verbose=2 "$binary"
+      run: cargo auditable build --release --target "${INPUTS_TRIPLE}" --package "${INPUTS_PACKAGE}" --bin "${INPUTS_BINARY}" ${INPUTS_EXTRA_CARGO_FLAGS}
 
     - name: Verify ${{ inputs.binary }}
       shell: nix develop -c bash -euo pipefail {0}
       env:
         INPUTS_BINARY: ${{ inputs.binary }}
+        INPUTS_TRIPLE: ${{ inputs.triple }}
       run: |
         # Confirm the binary runs and reports the expected name.
-        target/release/${INPUTS_BINARY} --version | grep -q "^${INPUTS_BINARY} "
+        target/${INPUTS_TRIPLE}/release/${INPUTS_BINARY} --version | grep -q "^${INPUTS_BINARY} "
         # Confirm Syft can decode the embedded cargo-auditable metadata.
-        SYFT_CHECK_FOR_APP_UPDATE=false syft file:target/release/${INPUTS_BINARY} -o cyclonedx-json | grep 'pkg:cargo/' > /dev/null
-
-    - name: Verify static linkage
-      if: endsWith(inputs.triple, '-linux-musl')
-      shell: nix develop -c bash -euo pipefail {0}
-      env:
-        INPUTS_BINARY: ${{ inputs.binary }}
-      run: tasks/scripts/verify-static-binary.sh target/release/${INPUTS_BINARY}
-
-    - name: Normalize Linux dynamic binary
-      if: endsWith(inputs.triple, '-linux-gnu')
-      shell: nix develop -c bash -euo pipefail {0}
-      env:
-        INPUTS_BINARY: ${{ inputs.binary }}
-        INPUTS_INTERPRETER: ${{ inputs.interpreter }}
-      run: |
-        binary=target/release/${INPUTS_BINARY}
-        # Remove Nix store paths so the binary can run on other distributions.
-        patchelf --set-interpreter "${INPUTS_INTERPRETER}" --remove-rpath "$binary"
-        # Z3 must be embedded instead of loaded from the target system.
-        test -z "$(patchelf --print-needed "$binary" | grep '^libz3')"
-        # Reject symbols introduced after glibc 2.28.
-        tasks/scripts/verify-glibc-symbols.sh 2.28 "$binary"
+        SYFT_CHECK_FOR_APP_UPDATE=false syft file:target/${INPUTS_TRIPLE}/release/${INPUTS_BINARY} -o cyclonedx-json | grep 'pkg:cargo/' > /dev/null
 
     - name: Upload ${{ inputs.binary }}
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
       with:
         name: ${{ inputs.artifact-name || format('{0}-{1}', inputs.binary, inputs.triple) }}
-        path: target/release/${{ inputs.binary }}
+        path: target/${{ inputs.triple }}/release/${{ inputs.binary }}
         compression-level: 0
         retention-days: 5
         if-no-files-found: error

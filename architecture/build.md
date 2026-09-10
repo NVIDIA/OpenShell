@@ -186,14 +186,15 @@ is a different artifact from the source SBOM produced by `syft dir:.` in
 `tasks/sbom.toml`, which describes the checkout, and from the image SBOM
 attestation below, which describes a published image.
 
-The shared binary build action compiles release artifacts with `cargo auditable`.
+The shared binary build action uses the default Nix shell and compiles release
+artifacts with `cargo auditable build --target <triple>`. Verification and upload
+read binaries from `target/<triple>/release/`.
 Branch E2E, Release Dev, and Release Tag image jobs stage those same artifacts
 instead of rebuilding binaries in Docker. Each binary build scans its output with
 Syft and requires at least one decoded Cargo package before uploading the
-artifact. Darwin builds replace Nix's `libiconv` load command with the macOS
-system install name, ad-hoc sign the modified binary, and fail if `otool -L`
-reports any remaining `/nix/store` dependency. Runtime and Syft verification
-run after that normalization. The CI image gains the pinned `cargo-auditable`
+artifact. The action checks each binary's `--version` output and leaves its
+linkage as produced by the Nix toolchain, without post-link rewriting or
+platform-specific linkage checks. The CI image gains the pinned `cargo-auditable`
 tool through `mise install --locked` but ships no auditable OpenShell binary of
 its own.
 
