@@ -514,6 +514,13 @@ Published docs live in `docs/`, and Fern site configuration lives in `fern/`. Se
 
 ## Validation Expectations
 
+Rust lint tasks and branch checks run Clippy with warnings denied for the
+workspace, E2E crate, and the standalone governance-interceptor and
+supervisor-middleware-content-guard examples, including all Cargo targets.
+The lint task also validates every tracked Cargo lockfile, so pre-commit
+and local CI catch stale resolutions in standalone workspaces. Rust validation
+commands use `--locked` to prevent implicit lockfile updates.
+
 - Run `mise run pre-commit` before committing.
 - Run `mise run test` after code changes.
 - Run `mise run e2e` for sandbox, policy, driver, or deployment changes when the
