@@ -98,7 +98,7 @@ templates, err := client.SandboxTemplates().List(ctx, "default", v1.ListOptions{
 })
 
 allTemplates, err := client.SandboxTemplates().ListAll(ctx, v1.ListOptions{
-    Limit: 50,
+    PageSize: 50,
 })
 ```
 
