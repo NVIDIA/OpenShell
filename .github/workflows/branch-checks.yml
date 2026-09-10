@@ -172,7 +172,7 @@ jobs:
           OPENSHELL_TELEMETRY_ENABLED: "false"
         run: |
           cargo nextest run --profile ci --workspace --features openshell-server/test-support
-          cargo test --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
+          cargo nextest run --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
 
       - name: Verify telemetry can be compiled out
         run: |
