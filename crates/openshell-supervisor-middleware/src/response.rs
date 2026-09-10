@@ -3,6 +3,16 @@
 
 //! HTTP response pre-return middleware chain execution.
 
+mod preflight;
+mod validation;
+
+#[cfg(test)]
+use validation::permitted_body_modes;
+use validation::{
+    BodyAction, CurrentBodyAction, encoded_header_bytes, strip_stale_integrity,
+    validate_body_result, validate_trailers_result,
+};
+
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -31,10 +41,27 @@ use super::{
 };
 
 const STREAM_CHANNEL_CAPACITY: usize = 4;
+const SESSION_END_TIMEOUT: Duration = Duration::from_millis(10);
 pub const MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES: usize = 64 * 1024;
 /// Maximum logical body bytes retained across a session's stage buffers and
 /// pending output. Temporary exchange copies have the per-binding payload cap.
 pub const MAX_HTTP_RESPONSE_RETAINED_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Return whether a response metadata field becomes stale after body changes.
+#[must_use]
+pub fn is_stale_http_response_integrity_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "accept-ranges"
+            | "etag"
+            | "content-md5"
+            | "digest"
+            | "content-digest"
+            | "repr-digest"
+            | "signature"
+            | "signature-input"
+    )
+}
 
 #[derive(Debug, Clone)]
 pub struct HttpResponsePreflightInput {
@@ -139,6 +166,31 @@ struct HttpResponseStageTransport {
     responses: super::HttpResponseResultStream,
 }
 
+impl HttpResponseStageTransport {
+    async fn end(self, reason: MiddlewareSessionEndReason) {
+        let _ = tokio::time::timeout(SESSION_END_TIMEOUT, self.end_inner(reason)).await;
+    }
+
+    async fn end_inner(self, reason: MiddlewareSessionEndReason) {
+        if self.sender.send(session_end_event(reason)).await.is_err() {
+            return;
+        }
+        self.drain().await;
+    }
+
+    async fn drain(self) {
+        let Self {
+            sender,
+            mut responses,
+        } = self;
+        // Keep the response stream alive while half-closing the request side.
+        // Dropping both handles together schedules an HTTP/2 CANCEL and can
+        // discard the terminal event before remote middleware receives it.
+        drop(sender);
+        while responses.next().await.is_some() {}
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StageMode {
     HeadersOnly,
@@ -165,11 +217,7 @@ impl HttpResponseStage {
 
     async fn end(&mut self, reason: MiddlewareSessionEndReason) {
         if let Some(transport) = self.transport.take() {
-            let _ = tokio::time::timeout(
-                Duration::from_millis(10),
-                transport.sender.send(session_end_event(reason)),
-            )
-            .await;
+            transport.end(reason).await;
         }
     }
 }
@@ -834,741 +882,6 @@ impl HttpResponseSession {
     }
 }
 
-impl ChainRunner {
-    /// Apply selected stages' failure policies when valid HTTP cannot be encoded
-    /// in the middleware protocol. The caller must validate HTTP safety first.
-    pub fn http_response_input_unrepresentable(
-        &self,
-        entries: &[DescribedChainEntry],
-    ) -> HttpResponsePreflightOutcome {
-        response_preflight_input_failure(entries, Vec::new(), "response_input_unrepresentable")
-    }
-
-    pub async fn preflight_http_response(
-        &self,
-        entries: &[ChainEntry],
-        input: HttpResponsePreflightInput,
-    ) -> miette::Result<HttpResponsePreflightOutcome> {
-        let described = self.describe_http_response_chain(entries).await?;
-        if described.is_empty() {
-            return Ok(empty_preflight_outcome(input.headers));
-        }
-        if validate_preflight_input(&input).is_err() {
-            return Ok(response_preflight_input_failure(
-                &described,
-                input.headers,
-                "response_input_over_capacity",
-            ));
-        }
-        let session_admission = match self.try_reserve_middleware_session() {
-            MiddlewareSessionAdmission::Admitted(admission) => admission,
-            MiddlewareSessionAdmission::AtCapacity => {
-                return Ok(response_session_capacity_exhausted(
-                    described,
-                    input.headers,
-                ));
-            }
-        };
-        let _work = self.reserve_middleware_work_admission().await?;
-        let original_restriction = body_restriction(&input);
-        let mut headers = input.headers.clone();
-        let mut stages = Vec::new();
-        let mut findings = Vec::new();
-        let mut metadata = BTreeMap::new();
-        let mut invocations = Vec::new();
-
-        for entry in described {
-            let Some(service) = entry.service.as_ref() else {
-                if let Some(reason) =
-                    collect_preflight_failure(&entry, "binding_not_described", &mut invocations)
-                {
-                    end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure).await;
-                    return Ok(failed_preflight_outcome(
-                        headers,
-                        reason,
-                        findings,
-                        metadata,
-                        invocations,
-                    ));
-                }
-                continue;
-            };
-            let (sender, receiver) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
-            let preflight = HttpResponsePreflight {
-                context: Some(input.context.clone()),
-                target: Some(input.target.clone()),
-                status_code: u32::from(input.status_code),
-                headers: headers.clone(),
-                middleware_name: entry.entry.implementation.clone(),
-                config: Some(entry.entry.config.clone()),
-                max_payload_bytes: entry.max_payload_bytes as u64,
-                permitted_body_modes: permitted_body_modes(
-                    &input,
-                    &entry,
-                    original_restriction.as_deref(),
-                ),
-            };
-            let timeout = entry.timeout;
-            let opened = tokio::time::timeout(timeout, async {
-                sender
-                    .send(HttpResponseEvent {
-                        event: Some(http_response_event::Event::Preflight(preflight)),
-                    })
-                    .await
-                    .map_err(|_| tonic::Status::unavailable("middleware request stream closed"))?;
-                let mut responses = service
-                    .service
-                    .open_http_response_pre_return(receiver)
-                    .await?;
-                let response = responses.next().await.ok_or_else(|| {
-                    tonic::Status::unavailable("middleware result stream closed")
-                })??;
-                Ok::<_, tonic::Status>((responses, response))
-            })
-            .await;
-            let (responses, response) = match opened {
-                Ok(Ok(opened)) => opened,
-                Ok(Err(error)) => {
-                    let reason = if error.code() == tonic::Code::DeadlineExceeded {
-                        "middleware_timeout".to_string()
-                    } else {
-                        service.diagnostic_policy.error_reason(&error)
-                    };
-                    if let Some(reason) =
-                        collect_preflight_failure(&entry, &reason, &mut invocations)
-                    {
-                        end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure)
-                            .await;
-                        return Ok(failed_preflight_outcome(
-                            headers,
-                            reason,
-                            findings,
-                            metadata,
-                            invocations,
-                        ));
-                    }
-                    continue;
-                }
-                Err(_) => {
-                    if let Some(reason) =
-                        collect_preflight_failure(&entry, "middleware_timeout", &mut invocations)
-                    {
-                        end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure)
-                            .await;
-                        return Ok(failed_preflight_outcome(
-                            headers,
-                            reason,
-                            findings,
-                            metadata,
-                            invocations,
-                        ));
-                    }
-                    continue;
-                }
-            };
-            let Some(http_response_event_result::Result::PreflightResult(decision)) =
-                response.result
-            else {
-                if let Some(reason) = collect_preflight_failure(
-                    &entry,
-                    "unexpected_response_result",
-                    &mut invocations,
-                ) {
-                    end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure).await;
-                    return Ok(failed_preflight_outcome(
-                        headers,
-                        reason,
-                        findings,
-                        metadata,
-                        invocations,
-                    ));
-                }
-                continue;
-            };
-            if let Err(reason) = validate_diagnostics(
-                &decision.reason,
-                &decision.reason_code,
-                &decision.findings,
-                &decision.metadata,
-            ) {
-                if let Some(reason) = collect_preflight_failure(&entry, reason, &mut invocations) {
-                    end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure).await;
-                    return Ok(failed_preflight_outcome(
-                        headers,
-                        reason,
-                        findings,
-                        metadata,
-                        invocations,
-                    ));
-                }
-                continue;
-            }
-            let reason_code =
-                (!decision.reason_code.is_empty()).then(|| decision.reason_code.clone());
-            let decision_findings = decision.findings;
-            let decision_metadata = decision.metadata;
-            match decision.action {
-                Some(http_response_preflight_result::Action::Skip(_)) => {
-                    collect_preflight_diagnostics(
-                        &entry,
-                        decision_findings,
-                        decision_metadata,
-                        &mut findings,
-                        &mut metadata,
-                    );
-                    invocations.push(HttpResponseInvocation {
-                        config_name: entry.entry.name.clone(),
-                        implementation: entry.entry.implementation.clone(),
-                        outcome: HttpResponseInvocationOutcome::Skip,
-                        sequence: None,
-                        input_size: 0,
-                        output_size: None,
-                        failed: false,
-                        stage_disabled: false,
-                        reason_code,
-                        failure_category: None,
-                    });
-                    let mut skipped = HttpResponseStage {
-                        entry,
-                        transport: Some(HttpResponseStageTransport { sender, responses }),
-                        mode: StageMode::HeadersOnly,
-                        next_sequence: 1,
-                        whole_body: Vec::new(),
-                    };
-                    skipped.end(MiddlewareSessionEndReason::StageSkipped).await;
-                }
-                Some(http_response_preflight_result::Action::Inspect(inspect)) => {
-                    let permitted_modes =
-                        permitted_body_modes(&input, &entry, original_restriction.as_deref());
-                    let mode = match validate_inspect(&entry, &inspect, &permitted_modes) {
-                        Ok(mode) => mode,
-                        Err(reason) => {
-                            if let Some(reason) =
-                                collect_preflight_failure(&entry, &reason, &mut invocations)
-                            {
-                                end_stages(
-                                    &mut stages,
-                                    MiddlewareSessionEndReason::MiddlewareFailure,
-                                )
-                                .await;
-                                return Ok(failed_preflight_outcome(
-                                    headers,
-                                    reason,
-                                    findings,
-                                    metadata,
-                                    invocations,
-                                ));
-                            }
-                            continue;
-                        }
-                    };
-                    let updated = match headers::apply(
-                        headers::HeaderAuthority::Response,
-                        &headers,
-                        &input.connection_nominated_headers,
-                        &inspect.header_mutations,
-                    ) {
-                        Ok(updated) => updated,
-                        Err(error) => {
-                            let reason = service
-                                .diagnostic_policy
-                                .header_mutation_error_reason(&error);
-                            if let Some(reason) =
-                                collect_preflight_failure(&entry, &reason, &mut invocations)
-                            {
-                                end_stages(
-                                    &mut stages,
-                                    MiddlewareSessionEndReason::MiddlewareFailure,
-                                )
-                                .await;
-                                return Ok(failed_preflight_outcome(
-                                    headers,
-                                    reason,
-                                    findings,
-                                    metadata,
-                                    invocations,
-                                ));
-                            }
-                            continue;
-                        }
-                    };
-                    headers = updated;
-                    if mode == StageMode::Stream {
-                        strip_stale_integrity(&mut headers);
-                    }
-                    collect_preflight_diagnostics(
-                        &entry,
-                        decision_findings,
-                        decision_metadata,
-                        &mut findings,
-                        &mut metadata,
-                    );
-                    invocations.push(HttpResponseInvocation {
-                        config_name: entry.entry.name.clone(),
-                        implementation: entry.entry.implementation.clone(),
-                        outcome: match mode {
-                            StageMode::HeadersOnly => HttpResponseInvocationOutcome::HeadersOnly,
-                            StageMode::WholeBody => HttpResponseInvocationOutcome::WholeBody,
-                            StageMode::Stream => HttpResponseInvocationOutcome::Stream,
-                        },
-                        sequence: None,
-                        input_size: 0,
-                        output_size: None,
-                        failed: false,
-                        stage_disabled: false,
-                        reason_code,
-                        failure_category: None,
-                    });
-                    let mut stage = HttpResponseStage {
-                        entry,
-                        transport: Some(HttpResponseStageTransport { sender, responses }),
-                        mode,
-                        next_sequence: 1,
-                        whole_body: Vec::new(),
-                    };
-                    if mode == StageMode::HeadersOnly {
-                        stage.end(MiddlewareSessionEndReason::Normal).await;
-                    } else {
-                        stages.push(stage);
-                    }
-                }
-                Some(http_response_preflight_result::Action::BlockDelivery(_)) => {
-                    collect_preflight_diagnostics(
-                        &entry,
-                        decision_findings,
-                        decision_metadata,
-                        &mut findings,
-                        &mut metadata,
-                    );
-                    invocations.push(HttpResponseInvocation {
-                        config_name: entry.entry.name.clone(),
-                        implementation: entry.entry.implementation.clone(),
-                        outcome: HttpResponseInvocationOutcome::BlockDelivery,
-                        sequence: None,
-                        input_size: 0,
-                        output_size: None,
-                        failed: false,
-                        stage_disabled: false,
-                        reason_code: reason_code.clone(),
-                        failure_category: None,
-                    });
-                    stages.push(HttpResponseStage {
-                        entry: entry.clone(),
-                        transport: Some(HttpResponseStageTransport { sender, responses }),
-                        mode: StageMode::HeadersOnly,
-                        next_sequence: 1,
-                        whole_body: Vec::new(),
-                    });
-                    end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareDenial).await;
-                    return Ok(blocked_preflight_outcome(
-                        headers,
-                        super::MiddlewareDenial {
-                            config_name: entry.entry.name.clone(),
-                            reason_code,
-                        },
-                        findings,
-                        metadata,
-                        invocations,
-                    ));
-                }
-                None => {
-                    if let Some(reason) = collect_preflight_failure(
-                        &entry,
-                        "invalid_preflight_decision",
-                        &mut invocations,
-                    ) {
-                        end_stages(&mut stages, MiddlewareSessionEndReason::MiddlewareFailure)
-                            .await;
-                        return Ok(failed_preflight_outcome(
-                            headers,
-                            reason,
-                            findings,
-                            metadata,
-                            invocations,
-                        ));
-                    }
-                }
-            }
-        }
-
-        if stages.is_empty() {
-            drop(session_admission);
-            return Ok(HttpResponsePreflightOutcome {
-                allowed: true,
-                reason: String::new(),
-                denial: None,
-                headers,
-                session: None,
-                findings,
-                metadata,
-                invocations,
-                session_capacity_exhausted: false,
-            });
-        }
-        let defer_output_until_finish = stages
-            .iter()
-            .any(|stage| stage.is_active() && stage.mode == StageMode::WholeBody);
-        Ok(HttpResponsePreflightOutcome {
-            allowed: true,
-            reason: String::new(),
-            denial: None,
-            headers,
-            session: Some(HttpResponseSession {
-                runner: self.clone(),
-                stages,
-                findings: Vec::new(),
-                metadata: BTreeMap::new(),
-                invocations: Vec::new(),
-                session_admission: Some(session_admission),
-                body_transformed: false,
-                retained_body_bytes: 0,
-                defer_output_until_finish,
-                deferred_output: Vec::new(),
-                connection_nominated_headers: input.connection_nominated_headers,
-                whole_body_deadline: None,
-            }),
-            findings,
-            metadata,
-            invocations,
-            session_capacity_exhausted: false,
-        })
-    }
-}
-
-enum BodyAction {
-    PassThrough,
-    Transform(Vec<u8>),
-    BlockDelivery,
-    SkipRemaining(CurrentBodyAction),
-}
-
-enum CurrentBodyAction {
-    PassThrough,
-    Transform(Vec<u8>),
-}
-
-struct BodyDecision {
-    action: BodyAction,
-    reason_code: String,
-    findings: Vec<Finding>,
-    metadata: std::collections::HashMap<String, String>,
-}
-
-struct TrailersDecision {
-    headers: Vec<HttpHeader>,
-    reason_code: String,
-    findings: Vec<Finding>,
-    metadata: std::collections::HashMap<String, String>,
-}
-
-fn validate_trailers_result(
-    result: HttpResponseEventResult,
-    trailers: &[HttpHeader],
-    entry: &DescribedChainEntry,
-    connection_nominated_headers: &[String],
-) -> Result<TrailersDecision, String> {
-    let Some(http_response_event_result::Result::TrailersResult(result)) = result.result else {
-        return Err("unexpected_response_result".into());
-    };
-    validate_diagnostics(
-        &result.reason,
-        &result.reason_code,
-        &result.findings,
-        &result.metadata,
-    )
-    .map_err(str::to_string)?;
-    if result.trailer_mutations.len() > headers::MAX_HEADER_MUTATIONS {
-        return Err("header_mutation_count_over_capacity".into());
-    }
-    let encoded_mutations = result
-        .trailer_mutations
-        .iter()
-        .fold(0usize, |total, mutation| {
-            total.saturating_add(mutation.encoded_len())
-        });
-    if encoded_mutations > MAX_MIDDLEWARE_HEADER_MUTATION_WIRE_BYTES {
-        return Err("header_mutation_bytes_over_capacity".into());
-    }
-    let headers = headers::apply(
-        headers::HeaderAuthority::ResponseTrailers,
-        trailers,
-        connection_nominated_headers,
-        &result.trailer_mutations,
-    )
-    .map_err(|error| {
-        entry.service.as_ref().map_or_else(
-            || error.to_string(),
-            |service| {
-                service
-                    .diagnostic_policy
-                    .header_mutation_error_reason(&error)
-            },
-        )
-    })?;
-    Ok(TrailersDecision {
-        headers,
-        reason_code: result.reason_code,
-        findings: result.findings,
-        metadata: result.metadata,
-    })
-}
-
-fn encoded_header_bytes(headers: &[HttpHeader]) -> usize {
-    headers.iter().fold(0usize, |total, header| {
-        total.saturating_add(header.encoded_len())
-    })
-}
-
-fn validate_body_result(
-    result: HttpResponseEventResult,
-    sequence: u64,
-    max_payload_bytes: usize,
-) -> Result<BodyDecision, &'static str> {
-    let Some(http_response_event_result::Result::BodyResult(body)) = result.result else {
-        return Err("unexpected_response_result");
-    };
-    if body.sequence != sequence {
-        return Err("response_body_sequence_mismatch");
-    }
-    validate_diagnostics(
-        &body.reason,
-        &body.reason_code,
-        &body.findings,
-        &body.metadata,
-    )?;
-    let action = match body.action {
-        Some(http_response_body_result::Action::PassThrough(HttpResponseBodyPassThrough {})) => {
-            BodyAction::PassThrough
-        }
-        Some(http_response_body_result::Action::Transform(transform)) => BodyAction::Transform(
-            validate_replacement(transform.replacement, max_payload_bytes)?,
-        ),
-        Some(http_response_body_result::Action::BlockDelivery(_)) => BodyAction::BlockDelivery,
-        Some(http_response_body_result::Action::SkipRemaining(skip)) => {
-            let current = match skip.current {
-                Some(http_response_body_skip_remaining::Current::PassThrough(
-                    HttpResponseBodyPassThrough {},
-                )) => CurrentBodyAction::PassThrough,
-                Some(http_response_body_skip_remaining::Current::Transform(transform)) => {
-                    CurrentBodyAction::Transform(validate_replacement(
-                        transform.replacement,
-                        max_payload_bytes,
-                    )?)
-                }
-                None => return Err("invalid_response_body_skip_remaining_action"),
-            };
-            BodyAction::SkipRemaining(current)
-        }
-        None => return Err("invalid_response_body_decision"),
-    };
-    Ok(BodyDecision {
-        action,
-        reason_code: body.reason_code,
-        findings: body.findings,
-        metadata: body.metadata,
-    })
-}
-
-fn validate_replacement(
-    replacement: Option<http_response_body_transform::Replacement>,
-    max_payload_bytes: usize,
-) -> Result<Vec<u8>, &'static str> {
-    let Some(http_response_body_transform::Replacement::Data(replacement)) = replacement else {
-        return Err("response_body_replacement_missing");
-    };
-    if replacement.len() > max_payload_bytes {
-        return Err("response_body_replacement_over_capacity");
-    }
-    Ok(replacement)
-}
-
-fn validate_inspect(
-    entry: &DescribedChainEntry,
-    inspect: &openshell_core::proto::HttpResponsePreflightInspect,
-    permitted_modes: &[i32],
-) -> Result<StageMode, String> {
-    let mode = match HttpResponseBodyMode::try_from(inspect.body_mode) {
-        Ok(HttpResponseBodyMode::HeadersOnly) => StageMode::HeadersOnly,
-        Ok(HttpResponseBodyMode::WholeBodyBytes) => StageMode::WholeBody,
-        Ok(HttpResponseBodyMode::StreamBytes) => StageMode::Stream,
-        Ok(HttpResponseBodyMode::Unspecified) | Err(_) => {
-            return Err("invalid_response_body_mode".into());
-        }
-    };
-    if !permitted_modes.contains(&inspect.body_mode) {
-        return Err("response_body_mode_not_permitted".into());
-    }
-    if inspect.header_mutations.len() > headers::MAX_HEADER_MUTATIONS {
-        return Err("header_mutation_count_over_capacity".into());
-    }
-    let encoded_mutations = inspect
-        .header_mutations
-        .iter()
-        .fold(0usize, |total, mutation| {
-            total.saturating_add(mutation.encoded_len())
-        });
-    if encoded_mutations > MAX_MIDDLEWARE_HEADER_MUTATION_WIRE_BYTES {
-        return Err("header_mutation_bytes_over_capacity".into());
-    }
-    if entry.max_payload_bytes == 0 && mode != StageMode::HeadersOnly {
-        return Err("response_payload_limit_invalid".into());
-    }
-    Ok(mode)
-}
-
-fn validate_preflight_input(input: &HttpResponsePreflightInput) -> miette::Result<()> {
-    if input.context.encoded_len() > MAX_MIDDLEWARE_CONTEXT_BYTES {
-        return Err(miette::miette!("response context exceeds platform limit"));
-    }
-    if input.target.encoded_len() > MAX_MIDDLEWARE_TARGET_BYTES {
-        return Err(miette::miette!("response target exceeds platform limit"));
-    }
-    if input.headers.len() > MAX_MIDDLEWARE_HEADERS {
-        return Err(miette::miette!(
-            "response header count exceeds platform limit"
-        ));
-    }
-    if input.headers.iter().fold(0usize, |total, header| {
-        total.saturating_add(header.encoded_len())
-    }) > MAX_MIDDLEWARE_HEADER_BYTES
-    {
-        return Err(miette::miette!("response headers exceed platform limit"));
-    }
-    Ok(())
-}
-
-fn validate_diagnostics(
-    reason: &str,
-    reason_code: &str,
-    findings: &[Finding],
-    metadata: &std::collections::HashMap<String, String>,
-) -> Result<(), &'static str> {
-    if reason.len() > MAX_MIDDLEWARE_REASON_BYTES {
-        return Err("response_reason_over_capacity");
-    }
-    if !reason_code.is_empty()
-        && (reason_code.len() > MAX_MIDDLEWARE_REASON_CODE_BYTES
-            || !is_stable_reason_code(reason_code))
-    {
-        return Err("response_reason_code_invalid");
-    }
-    if findings.len() > MAX_MIDDLEWARE_FINDINGS_PER_STAGE {
-        return Err("response_findings_over_capacity");
-    }
-    if findings
-        .iter()
-        .any(|finding| finding.encoded_len() > MAX_MIDDLEWARE_FINDING_BYTES)
-    {
-        return Err("response_finding_over_capacity");
-    }
-    if metadata.len() > MAX_MIDDLEWARE_METADATA_ENTRIES {
-        return Err("response_metadata_count_over_capacity");
-    }
-    if metadata.iter().fold(0usize, |total, (key, value)| {
-        total.saturating_add(key.len()).saturating_add(value.len())
-    }) > MAX_MIDDLEWARE_METADATA_BYTES
-    {
-        return Err("response_metadata_bytes_over_capacity");
-    }
-    Ok(())
-}
-
-fn body_restriction(input: &HttpResponsePreflightInput) -> Option<String> {
-    if input.target.method.eq_ignore_ascii_case("HEAD")
-        || input.status_code == 204
-        || input.status_code == 304
-    {
-        return Some("bodyless_response".into());
-    }
-    if input.status_code == 206
-        || input
-            .headers
-            .iter()
-            .any(|header| header.name.eq_ignore_ascii_case("content-range"))
-        || input.headers.iter().any(|header| {
-            header.name.eq_ignore_ascii_case("content-type")
-                && header
-                    .value
-                    .split(';')
-                    .next()
-                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("multipart/byteranges"))
-        })
-    {
-        return Some("unsupported_partial_response".into());
-    }
-    if input.headers.iter().any(|header| {
-        header.name.eq_ignore_ascii_case("cache-control")
-            && header.value.split(',').any(|directive| {
-                directive
-                    .split('=')
-                    .next()
-                    .is_some_and(|name| name.trim().eq_ignore_ascii_case("no-transform"))
-            })
-    }) {
-        return Some("response_no_transform".into());
-    }
-    if input.headers.iter().any(|header| {
-        header.name.eq_ignore_ascii_case("content-encoding")
-            && header
-                .value
-                .split(',')
-                .any(|coding| !coding.trim().eq_ignore_ascii_case("identity"))
-    }) {
-        return Some("unsupported_content_encoding".into());
-    }
-    None
-}
-
-fn permitted_body_modes(
-    input: &HttpResponsePreflightInput,
-    entry: &DescribedChainEntry,
-    body_restriction: Option<&str>,
-) -> Vec<i32> {
-    let mut modes = vec![HttpResponseBodyMode::HeadersOnly as i32];
-    if body_restriction.is_some() {
-        return modes;
-    }
-    if input
-        .declared_body_length
-        .is_none_or(|length| length <= entry.max_payload_bytes as u64)
-        && !is_open_ended_response(input)
-    {
-        modes.push(HttpResponseBodyMode::WholeBodyBytes as i32);
-    }
-    if entry.max_payload_bytes > 0 {
-        modes.push(HttpResponseBodyMode::StreamBytes as i32);
-    }
-    modes
-}
-
-fn is_open_ended_response(input: &HttpResponsePreflightInput) -> bool {
-    input.headers.iter().any(|header| {
-        header.name.eq_ignore_ascii_case("content-type")
-            && matches!(
-                header.value.split(';').next().map(str::trim),
-                Some(value)
-                    if value.eq_ignore_ascii_case("text/event-stream")
-                        || value.eq_ignore_ascii_case("multipart/x-mixed-replace")
-            )
-    })
-}
-
-fn strip_stale_integrity(headers: &mut Vec<HttpHeader>) {
-    headers.retain(|header| {
-        !matches!(
-            header.name.to_ascii_lowercase().as_str(),
-            "accept-ranges"
-                | "etag"
-                | "content-md5"
-                | "digest"
-                | "content-digest"
-                | "repr-digest"
-                | "signature"
-                | "signature-input"
-        )
-    });
-}
-
 async fn exchange(
     stage: &mut HttpResponseStage,
     event: HttpResponseEvent,
@@ -1901,7 +1214,9 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct RemoteResponseService;
+    struct RemoteResponseService {
+        session_end_tx: Option<mpsc::UnboundedSender<MiddlewareSessionEndReason>>,
+    }
 
     #[tonic::async_trait]
     impl openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware
@@ -1970,6 +1285,7 @@ mod tests {
             })));
             let mut requests = futures::stream::iter([first]).chain(requests);
             let (sender, receiver) = mpsc::channel(4);
+            let session_end_tx = self.session_end_tx.clone();
             tokio::spawn(async move {
                 while let Some(Ok(event)) = requests.next().await {
                     match event.event {
@@ -1999,7 +1315,15 @@ mod tests {
                                 break;
                             }
                         }
-                        Some(http_response_event::Event::SessionEnd(_)) | None => break,
+                        Some(http_response_event::Event::SessionEnd(end)) => {
+                            if let Some(sender) = &session_end_tx
+                                && let Ok(reason) = MiddlewareSessionEndReason::try_from(end.reason)
+                            {
+                                let _ = sender.send(reason);
+                            }
+                            break;
+                        }
+                        None => break,
                         _ => {}
                     }
                 }
@@ -3021,9 +2345,13 @@ mod tests {
             .expect("bind response middleware");
         let address = listener.local_addr().expect("response middleware address");
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (session_end_tx, mut session_end_rx) = mpsc::unbounded_channel();
+        let service = RemoteResponseService {
+            session_end_tx: Some(session_end_tx),
+        };
         let server = tonic::transport::Server::builder()
-            .add_service(SupervisorMiddlewareServer::new(RemoteResponseService))
-            .add_service(HttpResponsePreReturnServer::new(RemoteResponseService))
+            .add_service(SupervisorMiddlewareServer::new(service.clone()))
+            .add_service(HttpResponsePreReturnServer::new(service))
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                 let _ = shutdown_rx.await;
             });
@@ -3065,6 +2393,13 @@ mod tests {
             Some("remote")
         );
         assert!(outcome.session.is_none());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), session_end_rx.recv())
+                .await
+                .expect("bounded session end delivery"),
+            Some(MiddlewareSessionEndReason::Normal)
+        );
+        assert!(session_end_rx.try_recv().is_err());
 
         let _ = shutdown_tx.send(());
         tokio::time::timeout(Duration::from_secs(2), server_task)

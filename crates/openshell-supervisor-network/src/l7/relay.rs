@@ -351,7 +351,7 @@ pub(crate) fn http_response_middleware_relay<'a>(
     }
 }
 
-fn policy_safe_response_query(
+pub(super) fn policy_safe_response_query(
     query_params: &std::collections::HashMap<String, Vec<String>>,
 ) -> String {
     let mut parameters: Vec<_> = query_params.iter().collect();
@@ -2881,21 +2881,24 @@ where
                 return Ok(());
             }
             let runner = engine.middleware_runner()?;
-            response_selection = Some((chain.clone(), runner.clone()));
+            let exchange = crate::l7::middleware::HttpMiddlewareExchange::new(
+                request_id.clone(),
+                chain,
+                runner,
+                generation_guard.clone(),
+            );
             // The passthrough path enforces no L7 policy, so there is no
             // body-aware decision to re-check after a transformation.
-            match apply_middleware_chain_with_request_id(
-                req,
-                client,
-                ctx,
-                chain,
-                &runner,
-                generation_guard,
-                openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
-                &request_id,
-            )
-            .await?
-            {
+            let result = exchange
+                .apply_request(
+                    req,
+                    client,
+                    ctx,
+                    "http",
+                    openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+                )
+                .await?;
+            let request = match result {
                 MiddlewareApplyResult::Allowed(request) => request,
                 MiddlewareApplyResult::Denied { denial, .. } => {
                     let denied_request = crate::l7::provider::L7Request {
@@ -2932,7 +2935,9 @@ where
                     .await?;
                     return Ok(());
                 }
-            }
+            };
+            response_selection = Some(exchange);
+            request
         } else {
             req
         };
@@ -2954,17 +2959,9 @@ where
         let scoped_ctx = scoped_context_for_request(ctx, &req_with_auth);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
         let resolver = ctx.secret_resolver.as_deref();
-        let response_middleware = response_selection.as_ref().map(|(chain, runner)| {
-            http_response_middleware_relay(
-                &req_with_auth,
-                ctx,
-                "http",
-                &request_id,
-                chain,
-                runner,
-                Some(generation_guard),
-            )
-        });
+        let response_middleware = response_selection
+            .as_ref()
+            .map(|exchange| exchange.response_relay(&req_with_auth, ctx, "http"));
 
         // Forward request with credential rewriting and relay the response.
         // relay_http_request_with_resolver handles both directions: it sends

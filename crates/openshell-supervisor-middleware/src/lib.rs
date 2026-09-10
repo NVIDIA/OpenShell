@@ -12,7 +12,7 @@ pub use response::{
     HttpResponseDiagnostics, HttpResponseFinish, HttpResponseInvocation,
     HttpResponseInvocationOutcome, HttpResponseMiddlewareFailure, HttpResponsePreflightInput,
     HttpResponsePreflightOutcome, HttpResponseSession, MAX_HTTP_RESPONSE_RETAINED_BODY_BYTES,
-    MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES,
+    MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES, is_stale_http_response_integrity_header,
 };
 
 pub use websocket::{

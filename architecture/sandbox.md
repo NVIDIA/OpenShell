@@ -190,8 +190,19 @@ implementations live in `openshell-supervisor-middleware-builtins`.
 The selected middleware chain can also inspect the final HTTP response before
 it returns to the workload. Stages select header-only, whole-body, or streaming
 inspection independently. The relay owns response framing when body bytes can
-change. Stage failures follow policy-local `on_error`; explicit denials always
-block delivery. Once delivery has started, blocking aborts the response.
+change. Preflight exposes upstream `Content-Length`, `Content-Encoding`, and
+`Content-Range` as read-only metadata, while the relay emits final framing
+separately from middleware-visible headers. Stage failures follow policy-local
+`on_error`; explicit denials always block delivery. Once delivery has started,
+blocking aborts the response.
+
+The network supervisor represents the destination-selected request and response
+pair as one `HttpMiddlewareExchange`. It retains the full chain, runner, request
+identity, and policy generation while request and response bindings are selected
+independently. The HTTP response adapter owns wire parsing, downstream commit
+state, generation fences, framing, and transport error classification. The
+generic middleware crate owns stage selection, remote stream lifecycle, ordered
+body processing, limits, and result validation.
 
 The supervisor installs policy and middleware registry changes as one runtime
 generation and preserves the last-known-good generation if preparation fails.

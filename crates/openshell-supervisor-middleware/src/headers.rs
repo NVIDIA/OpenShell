@@ -643,6 +643,25 @@ mod tests {
     }
 
     #[test]
+    fn response_authority_keeps_visible_body_metadata_read_only() {
+        let existing = [
+            header("content-length", "5"),
+            header("content-encoding", "gzip"),
+            header("content-range", "bytes 0-4/10"),
+        ];
+        for name in ["Content-Length", "Content-Encoding", "Content-Range"] {
+            for mutation in [
+                write(name, "replacement", ExistingHeaderAction::Overwrite),
+                remove(name),
+            ] {
+                let error = apply(HeaderAuthority::Response, &existing, &[], &[mutation])
+                    .expect_err("read-only response body metadata");
+                assert!(matches!(error, HeaderMutationError::Protected { .. }));
+            }
+        }
+    }
+
+    #[test]
     fn response_authority_protects_credential_headers_from_writes_and_removals() {
         let existing = [header("set-cookie", "session=upstream")];
         for name in [

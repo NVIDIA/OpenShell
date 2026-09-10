@@ -26,6 +26,89 @@ pub enum MiddlewareApplyResult {
     AdmissionExhausted,
 }
 
+/// One destination-selected middleware chain shared by an HTTP request and
+/// its matching response. The request and response phases filter bindings
+/// independently, so the full chain must remain available until relay ends.
+#[derive(Clone)]
+pub struct HttpMiddlewareExchange {
+    request_id: String,
+    chain: Vec<openshell_supervisor_middleware::ChainEntry>,
+    runner: openshell_supervisor_middleware::ChainRunner,
+    generation_guard: PolicyGenerationGuard,
+}
+
+impl HttpMiddlewareExchange {
+    pub fn new(
+        request_id: String,
+        chain: Vec<openshell_supervisor_middleware::ChainEntry>,
+        runner: openshell_supervisor_middleware::ChainRunner,
+        generation_guard: PolicyGenerationGuard,
+    ) -> Self {
+        Self {
+            request_id,
+            chain,
+            runner,
+            generation_guard,
+        }
+    }
+
+    pub async fn apply_request<C>(
+        &self,
+        request: crate::l7::provider::L7Request,
+        client: &mut C,
+        ctx: &L7EvalContext,
+        scheme: &str,
+        transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+    ) -> Result<MiddlewareApplyResult>
+    where
+        C: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        apply_middleware_chain_for_scheme_with_request_id(
+            request,
+            client,
+            ctx,
+            scheme,
+            self.chain.clone(),
+            &self.runner,
+            &self.generation_guard,
+            transformed_body_policy,
+            &self.request_id,
+        )
+        .await
+    }
+
+    pub fn response_relay<'a>(
+        &'a self,
+        request: &crate::l7::provider::L7Request,
+        ctx: &'a L7EvalContext,
+        scheme: &str,
+    ) -> crate::l7::rest::HttpResponseMiddlewareRelay<'a> {
+        let sandbox = openshell_ocsf::ctx::ctx();
+        crate::l7::rest::HttpResponseMiddlewareRelay {
+            chain: &self.chain,
+            runner: &self.runner,
+            request_context: openshell_core::proto::RequestContext {
+                request_id: self.request_id.clone(),
+                sandbox_id: sandbox.sandbox_id.clone(),
+                sandbox_name: sandbox.sandbox_name.clone(),
+                workspace: ctx.workspace.clone(),
+                originating_process: None,
+            },
+            target: openshell_core::proto::HttpRequestTarget {
+                scheme: scheme.to_string(),
+                host: ctx.host.clone(),
+                port: u32::from(ctx.port),
+                method: request.action.clone(),
+                path: request.target.clone(),
+                query: super::relay::policy_safe_response_query(&request.query_params),
+            },
+            policy_name: &ctx.policy_name,
+            generation_guard: Some(&self.generation_guard),
+            whole_body_timeout: super::rest::DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
+        }
+    }
+}
+
 /// How traffic a middleware chain can never inspect (h2c, non-HTTP TCP,
 /// protocols without an L7 relay) must be handled for a matching chain.
 ///
