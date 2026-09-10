@@ -80,7 +80,7 @@ Public skills live in `skills/` and work without an OpenShell source checkout. I
 | --- | --- |
 | `openshell-cli` | CLI usage, sandbox lifecycle, provider management, and BYOC workflows |
 | `debug-openshell-cluster` | Diagnose gateway deployment and health issues |
-| `debug-inference` | Diagnose managed, system, local, and direct external inference issues |
+| `debug-inference` | Diagnose attached-provider inference, native endpoints, and migration from `inference.local` |
 | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API documentation |
 
 Public skills use `openshell --help` for installed command syntax and published OpenShell documentation for product concepts and configuration. They must not depend on repository-relative source or documentation files.
@@ -306,7 +306,7 @@ echo 'eval "$(~/.local/bin/mise activate zsh)"' >> ~/.zshrc
 
 Project requirements:
 
-- Rust 1.90+
+- Rust 1.94+
 - Python 3.11+
 - Docker (running)
 - CMake 3.16+ (only required when building with the `bundled-z3` feature)
@@ -488,9 +488,9 @@ mise run docs
 
 PRs that touch `docs/**` or `fern/**` are validated by `.github/workflows/branch-docs.yml`, and they get a preview when `FERN_TOKEN` is available to the workflow.
 
-Fern docs publishing is handled by the `publish-fern-docs` job in `.github/workflows/release-tag.yml` when a stable release tag is created.
+Release Dev publishes the `dev` docs version from `main`. Release Tag publishes an immutable stable version and updates `latest`. See [fern/README.md](fern/README.md) for the source layout, version model, and publishing workflows.
 
-`docs/` is the source-of-truth docs tree. `fern/` contains the site config, components, and theme assets that publish those pages.
+`docs/` is the source-of-truth docs tree. `fern/` contains the site configuration, components, theme assets, and its README.
 
 See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authoring guide.
 

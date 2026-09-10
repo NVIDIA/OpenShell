@@ -3,7 +3,11 @@
 
 package types
 
-import "time"
+import (
+	"time"
+
+	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/options"
+)
 
 // PolicyLoadStatus represents the load state of a policy revision.
 type PolicyLoadStatus int
@@ -266,9 +270,7 @@ func WithStatusFilter(status string) GetDraftOption {
 // ApplyGetDraftOptions applies options and returns the config.
 func ApplyGetDraftOptions(opts []GetDraftOption) getDraftConfig { //nolint:revive // unexported return is intentional; consumed only by v1 package
 	var cfg getDraftConfig
-	for _, opt := range opts {
-		opt(&cfg)
-	}
+	options.Apply(&cfg, opts)
 	return cfg
 }
 
@@ -303,9 +305,7 @@ func WithIncludeSecurityFlagged() ApproveAllOption {
 // ApplyApproveAllOptions applies options and returns the config.
 func ApplyApproveAllOptions(opts []ApproveAllOption) approveAllConfig { //nolint:revive // unexported return is intentional; consumed only by v1 package
 	var cfg approveAllConfig
-	for _, opt := range opts {
-		opt(&cfg)
-	}
+	options.Apply(&cfg, opts)
 	return cfg
 }
 
@@ -347,9 +347,7 @@ func WithStatusGlobal(global bool) GetStatusOption {
 // ApplyGetStatusOptions applies options and returns the config.
 func ApplyGetStatusOptions(opts []GetStatusOption) getStatusConfig { //nolint:revive // unexported return is intentional; consumed only by v1 package
 	var cfg getStatusConfig
-	for _, opt := range opts {
-		opt(&cfg)
-	}
+	options.Apply(&cfg, opts)
 	return cfg
 }
 
@@ -399,9 +397,7 @@ func WithListGlobal(global bool) ListPolicyOption {
 // ApplyListPolicyOptions applies options and returns the config.
 func ApplyListPolicyOptions(opts []ListPolicyOption) listPolicyConfig { //nolint:revive // unexported return is intentional; consumed only by v1 package
 	var cfg listPolicyConfig
-	for _, opt := range opts {
-		opt(&cfg)
-	}
+	options.Apply(&cfg, opts)
 	return cfg
 }
 

@@ -14,22 +14,22 @@ pub mod workspace;
 use openshell_core::proto::{
     AddWorkspaceMemberRequest, AddWorkspaceMemberResponse, ApproveAllDraftChunksRequest,
     ApproveAllDraftChunksResponse, ApproveDraftChunkRequest, ApproveDraftChunkResponse,
-    AttachSandboxProviderRequest, AttachSandboxProviderResponse, ClearDraftChunksRequest,
-    ClearDraftChunksResponse, ComputeDriverCapabilities, ComputeDriverInfo,
-    ConfigureProviderRefreshRequest, ConfigureProviderRefreshResponse, CpuResourceCapabilities,
-    CreateProviderRequest, CreateSandboxRequest, CreateSandboxTemplateRequest,
-    CreateSshSessionRequest, CreateSshSessionResponse, CreateWorkspaceRequest,
-    CreateWorkspaceResponse, DeleteProviderProfileRequest, DeleteProviderProfileResponse,
-    DeleteProviderRefreshRequest, DeleteProviderRefreshResponse, DeleteProviderRequest,
-    DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DeleteSandboxTemplateRequest, DeleteSandboxTemplateResponse, DeleteServiceRequest,
-    DeleteServiceResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse, EditDraftChunkRequest,
-    EditDraftChunkResponse, ExchangeProviderSubjectTokenRequest,
-    ExchangeProviderSubjectTokenResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
-    ExposeServiceRequest, FinalizeMainProcessExitRequest, FinalizeMainProcessExitResponse,
-    GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse, GetDraftHistoryRequest,
-    GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
+    AttachSandboxProviderRequest, AttachSandboxProviderResponse, BeginRootfsTarStagingRequest,
+    BeginRootfsTarStagingResponse, ClearDraftChunksRequest, ClearDraftChunksResponse,
+    ComputeDriverCapabilities, ComputeDriverInfo, ConfigureProviderRefreshRequest,
+    ConfigureProviderRefreshResponse, CpuResourceCapabilities, CreateProviderRequest,
+    CreateSandboxRequest, CreateSandboxTemplateRequest, CreateSshSessionRequest,
+    CreateSshSessionResponse, CreateWorkspaceRequest, CreateWorkspaceResponse,
+    DeleteProviderProfileRequest, DeleteProviderProfileResponse, DeleteProviderRefreshRequest,
+    DeleteProviderRefreshResponse, DeleteProviderRequest, DeleteProviderResponse,
+    DeleteSandboxRequest, DeleteSandboxResponse, DeleteSandboxTemplateRequest,
+    DeleteSandboxTemplateResponse, DeleteServiceRequest, DeleteServiceResponse,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DetachSandboxProviderRequest,
+    DetachSandboxProviderResponse, EditDraftChunkRequest, EditDraftChunkResponse,
+    ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
+    ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest, FinalizeMainProcessExitRequest,
+    FinalizeMainProcessExitResponse, GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse,
+    GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetGatewayInfoRequest,
     GetGatewayInfoResponse, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
     GetProviderRefreshStatusResponse, GetProviderRequest, GetSandboxConfigRequest,
@@ -191,19 +191,6 @@ enum StoredSettingValue {
 // Utility
 // ---------------------------------------------------------------------------
 
-/// Validate that object metadata is present and contains required fields.
-///
-/// This is a crate-level helper that wraps the validation module's implementation.
-/// Use this from modules outside of `grpc` that need to validate metadata.
-// `tonic::Status` is large but is the API surface of gRPC handlers.
-#[allow(clippy::result_large_err)]
-pub fn validate_object_metadata(
-    metadata: Option<&openshell_core::proto::datamodel::v1::ObjectMeta>,
-    resource_type: &str,
-) -> Result<(), Status> {
-    validation::validate_object_metadata(metadata, resource_type)
-}
-
 // ---------------------------------------------------------------------------
 // Service struct
 // ---------------------------------------------------------------------------
@@ -282,6 +269,13 @@ impl OpenShell for OpenShellService {
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         sandbox::handle_create_sandbox(&self.state, request).await
+    }
+
+    async fn begin_rootfs_tar_staging(
+        &self,
+        request: Request<BeginRootfsTarStagingRequest>,
+    ) -> Result<Response<BeginRootfsTarStagingResponse>, Status> {
+        sandbox::handle_begin_rootfs_tar_staging(&self.state, request).await
     }
 
     type WatchSandboxStream = sandbox::WatchSandboxStream;

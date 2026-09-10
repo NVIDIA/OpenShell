@@ -25,6 +25,16 @@ Sandbox community images are built outside this repository.
 
 ## Build Features
 
+Rust builds require Rust 1.94 or newer. TLS and certificate generation use
+AWS-LC, including the CLI and standalone examples. Native and cross-build
+environments must provide the C toolchain required by aws-lc-sys; the Nix
+development shells provide static AWS-LC libraries.
+
+SQLx uses AWS-LC with native certificate roots. The server enables
+`sqlx-core/rustls-native-certs` directly because SQLx's facade does not expose
+that root selection independently of the crypto provider. Credential storage
+continues to use the same AES-256-GCM envelope format across backend changes.
+
 Anonymous telemetry emission is gated behind a default-on `telemetry` Cargo
 feature. It is defined in `openshell-core` (where the emission code, HTTP
 client, and endpoint live) and forwarded by the binary crates that emit or
@@ -446,17 +456,38 @@ tags and gating stable promotion on qualification results are part of
 [RFC 0014](../rfc/0014-release-stability/release-qualification.md) and are not
 implemented yet.
 
-See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
+## Artifact Scanning
+
+Two entry points share `tasks/scripts/trivy-scan.sh`: a standalone analysis
+workflow and a pull-request change gate. Nix supplies Trivy, Helm and `yq`.
+
+The standalone workflow scans deployment configuration and supplied OCI
+references independently of release publication. Detailed JSON reports feed the
+differential gate; the summary and published SARIF consolidate configuration
+findings across profiles while preserving resource identity and affected profiles.
+Images and packaged charts retain separate identities based on their full
+references. Publication batches respect GitHub's limit of 20 SARIF runs.
+
+The PR/merge-group gate scans base and candidate with the same scanner and rejects
+new `HIGH` or `CRITICAL` configuration findings. Its stable
+`OpenShell / Trivy Changes` status succeeds when nothing relevant changed.
+Image CVEs need the standalone scan. The reporting and gate invariants are:
+
+- A structurally invalid Trivy report is an error, not an empty finding set.
+- Scanner failures prevent publication of incomplete analyses; findings alone
+  do not prevent publishing complete reports.
+- Findings compare per profile against the same baseline profile, by semantic
+  identity and count rather than line number; a profile absent from the baseline
+  falls back to that identity's maximum across all profiles.
+- The candidate's ignore file is validated, but the baseline's policy applies to
+  both scans, so an exemption takes effect only after merge.
+
+See [CI.md](../CI.md#artifact-scanning) for profiles, report paths, severity
+settings, exceptions, and the contributor and maintainer workflows.
 
 ## Docs Site
 
-Published docs live in `docs/`. Navigation lives in `docs/index.yml`. Fern site
-configuration, components, theme assets, and publish settings live in `fern/`.
-
-Use `mise run docs` for strict validation and `mise run docs:serve` for local
-preview. PR previews are produced by `.github/workflows/branch-docs.yml` when
-Fern credentials are available. Production docs publish from the release tag
-workflow.
+Published docs live in `docs/`, and Fern site configuration lives in `fern/`. See [fern/README.md](../fern/README.md) for the source layout, local development commands, version model, and publishing workflows.
 
 ## Validation Expectations
 

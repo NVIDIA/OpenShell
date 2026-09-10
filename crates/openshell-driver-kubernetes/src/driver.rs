@@ -54,7 +54,7 @@ use openshell_core::proto::compute::v1::{
 };
 use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -589,6 +589,8 @@ impl KubernetesComputeDriver {
                     count_selection_supported: true,
                 }),
             }),
+            rootfs_tar_staging_dir: String::new(),
+            rootfs_tar_max_bytes: 0,
         })
     }
 
@@ -1963,7 +1965,7 @@ impl KubernetesComputeDriver {
             loop {
                 tokio::select! {
                     event = sandbox_stream.next() => match event {
-                        Some(Event::Applied(obj)) => {
+                        Some(Event::Apply(obj) | Event::InitApply(obj)) => {
                             if let Ok((kube_name, sandbox)) = sandbox_from_object(&namespace, obj) {
                                 update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
                                 let event = WatchSandboxesEvent {
@@ -1976,7 +1978,7 @@ impl KubernetesComputeDriver {
                                 }
                             }
                         }
-                        Some(Event::Deleted(obj)) => {
+                        Some(Event::Delete(obj)) => {
                             if is_openshell_managed(&obj)
                                 && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
                             {
@@ -1991,21 +1993,7 @@ impl KubernetesComputeDriver {
                                 }
                             }
                         }
-                        Some(Event::Restarted(objs)) => {
-                            for obj in objs {
-                                if let Ok((kube_name, sandbox)) = sandbox_from_object(&namespace, obj) {
-                                    update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &kube_name, &sandbox);
-                                    let event = WatchSandboxesEvent {
-                                        payload: Some(watch_sandboxes_event::Payload::Sandbox(
-                                            WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
-                                        )),
-                                    };
-                                    if tx.send(Ok(event)).await.is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                        }
+                        Some(Event::Init | Event::InitDone) => {}
                         None => {
                             let _ = tx.send(Err(KubernetesDriverError::Message(
                                 "sandbox watcher stream ended unexpectedly".to_string()
@@ -2014,7 +2002,7 @@ impl KubernetesComputeDriver {
                         }
                     },
                     event = event_stream.next() => match event {
-                        Some(Event::Applied(obj)) => {
+                        Some(Event::Apply(obj)) => {
                             if let Some((sandbox_id, event)) = map_kube_event_to_platform(
                                 &sandbox_name_to_id,
                                 &agent_pod_to_id,
@@ -2030,8 +2018,8 @@ impl KubernetesComputeDriver {
                                 }
                             }
                         }
-                        Some(Event::Deleted(_)) => {}
-                        Some(Event::Restarted(_)) => {
+                        Some(Event::Delete(_) | Event::InitApply(_) | Event::InitDone) => {}
+                        Some(Event::Init) => {
                             debug!(namespace = %namespace, "Kubernetes event watcher restarted");
                         }
                         None => {
@@ -2080,7 +2068,7 @@ where
         loop {
             tokio::select! {
                 event = sandbox_stream.next() => match event {
-                    Some(Event::Applied(obj)) => {
+                    Some(Event::Apply(obj) | Event::InitApply(obj)) => {
                         let ns = obj.metadata.namespace.clone()
                             .unwrap_or_else(|| default_namespace.clone());
                         if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj) {
@@ -2094,7 +2082,7 @@ where
                             }
                         }
                     }
-                    Some(Event::Deleted(obj)) => {
+                    Some(Event::Delete(obj)) => {
                         if is_openshell_managed(&obj)
                             && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
                         {
@@ -2108,22 +2096,7 @@ where
                             }
                         }
                     }
-                    Some(Event::Restarted(objs)) => {
-                        for obj in objs {
-                            let ns = obj.metadata.namespace.clone()
-                                .unwrap_or_else(|| default_namespace.clone());
-                            if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj) {
-                                let event = WatchSandboxesEvent {
-                                    payload: Some(watch_sandboxes_event::Payload::Sandbox(
-                                        WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
-                                    )),
-                                };
-                                if tx.send(Ok(event)).await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                    }
+                    Some(Event::Init | Event::InitDone) => {}
                     None => {
                         let _ = tx.send(Err(KubernetesDriverError::Message(
                             "sandbox watcher stream ended unexpectedly".to_string()
@@ -2316,7 +2289,6 @@ fn managed_ssh_network_policy(namespace: &str, config: &KubernetesComputeConfig)
             }]),
             ..Default::default()
         }),
-        status: None,
     }
 }
 
@@ -4731,6 +4703,7 @@ fn spawn_namespace_label_watcher(
         let mut retry_attempt = 0;
         loop {
             let mut stream = watcher::watcher(ns_api.clone(), watcher_config.clone()).boxed();
+            let mut relisted_names = BTreeSet::new();
 
             loop {
                 let event = tokio::select! {
@@ -4743,37 +4716,9 @@ fn spawn_namespace_label_watcher(
                     }
                 };
                 match event {
-                    Ok(Some(Event::Applied(ns))) => {
+                    Ok(Some(event)) => {
                         retry_attempt = 0;
-                        if let Some(name) = ns.metadata.name.as_deref()
-                            && allowlist.insert(name.to_string())
-                        {
-                            info!(namespace = name, "operator namespace added to allowlist");
-                        }
-                    }
-                    Ok(Some(Event::Deleted(ns))) => {
-                        retry_attempt = 0;
-                        if let Some(name) = ns.metadata.name.as_deref()
-                            && allowlist.remove(name)
-                        {
-                            info!(
-                                namespace = name,
-                                "operator namespace removed from allowlist"
-                            );
-                        }
-                    }
-                    Ok(Some(Event::Restarted(namespaces))) => {
-                        retry_attempt = 0;
-                        let names: std::collections::BTreeSet<String> = namespaces
-                            .into_iter()
-                            .filter_map(|ns| ns.metadata.name)
-                            .collect();
-                        let count = names.len();
-                        allowlist.replace(names);
-                        info!(
-                            total = count,
-                            "operator namespace allowlist replaced from full relist"
-                        );
+                        apply_namespace_watch_event(&allowlist, &mut relisted_names, event);
                     }
                     Ok(None) => {
                         warn!("operator namespace watcher stream ended unexpectedly");
@@ -4815,12 +4760,53 @@ fn namespace_watcher_retry_delay(attempt: u32, jitter_seed: u64) -> Duration {
     Duration::from_secs(base_secs + jitter_secs)
 }
 
-fn load_namespace_file(path: &Path) -> Result<std::collections::BTreeSet<String>, String> {
+fn load_namespace_file(path: &Path) -> Result<BTreeSet<String>, String> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     let names: Vec<String> = serde_json::from_str(&contents)
         .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
     Ok(names.into_iter().collect())
+}
+
+fn apply_namespace_watch_event(
+    allowlist: &OperatorNamespaceAllowlist,
+    relisted_names: &mut BTreeSet<String>,
+    event: Event<Namespace>,
+) {
+    match event {
+        Event::Apply(ns) => {
+            if let Some(name) = ns.metadata.name
+                && allowlist.insert(name.clone())
+            {
+                info!(namespace = name, "operator namespace added to allowlist");
+            }
+        }
+        Event::Delete(ns) => {
+            if let Some(name) = ns.metadata.name
+                && allowlist.remove(&name)
+            {
+                info!(
+                    namespace = name,
+                    "operator namespace removed from allowlist"
+                );
+            }
+        }
+        Event::Init => relisted_names.clear(),
+        Event::InitApply(ns) => {
+            if let Some(name) = ns.metadata.name {
+                relisted_names.insert(name);
+            }
+        }
+        Event::InitDone => {
+            // Readers must see a complete snapshot, including during interrupted relists.
+            let count = relisted_names.len();
+            allowlist.replace(std::mem::take(relisted_names));
+            info!(
+                total = count,
+                "operator namespace allowlist replaced from full relist"
+            );
+        }
+    }
 }
 
 fn spawn_namespace_file_watcher(
@@ -5070,7 +5056,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_watcher_error_does_not_hide_restarted_recovery_event() {
+    async fn sandbox_watcher_error_does_not_hide_relist() {
         let recovered = DynamicObject {
             types: None,
             metadata: ObjectMeta {
@@ -5081,22 +5067,22 @@ mod tests {
         };
         let source = futures::stream::iter([
             Err(expired_watch_error()),
-            Ok(Event::Restarted(vec![recovered])),
+            Ok(Event::Init),
+            Ok(Event::InitApply(recovered)),
+            Ok(Event::InitDone),
         ]);
         let mut stream = continue_on_watcher_errors(source, "sandbox-resource");
 
+        assert!(matches!(stream.next().await, Some(Event::Init)));
         let event = stream
             .next()
             .await
             .expect("410 Expired must not terminate the watcher stream");
-        let Event::Restarted(objects) = event else {
-            panic!("expected kube-runtime recovery to emit Restarted");
+        let Event::InitApply(object) = event else {
+            panic!("expected kube-runtime recovery to emit InitApply");
         };
-        assert_eq!(objects.len(), 1);
-        assert_eq!(
-            objects[0].metadata.name.as_deref(),
-            Some("recovered-sandbox")
-        );
+        assert_eq!(object.metadata.name.as_deref(), Some("recovered-sandbox"));
+        assert!(matches!(stream.next().await, Some(Event::InitDone)));
         assert!(
             stream.next().await.is_none(),
             "source closure must be preserved"
@@ -5125,7 +5111,9 @@ mod tests {
         };
         let source = futures::stream::iter([
             Err(expired_watch_error()),
-            Ok(Event::Restarted(vec![recovered])),
+            Ok(Event::Init),
+            Ok(Event::InitApply(recovered)),
+            Ok(Event::InitDone),
         ])
         .chain(futures::stream::pending());
         let sandbox_stream = recovering_watcher_stream(source, "sandbox-resource").boxed();
@@ -5152,10 +5140,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kubernetes_event_watcher_error_does_not_hide_restarted_recovery_event() {
+    async fn kubernetes_event_watcher_error_does_not_hide_relist() {
         let source = futures::stream::iter([
             Err(expired_watch_error()),
-            Ok(Event::Restarted(vec![KubeEventObj::default()])),
+            Ok(Event::Init),
+            Ok(Event::InitApply(KubeEventObj::default())),
+            Ok(Event::InitDone),
         ]);
         let mut stream = continue_on_watcher_errors(source, "kubernetes-event");
 
@@ -5163,14 +5153,63 @@ mod tests {
             .next()
             .await
             .expect("410 Expired must not terminate the watcher stream");
-        let Event::Restarted(events) = event else {
-            panic!("expected kube-runtime recovery to emit Restarted");
-        };
-        assert_eq!(events.len(), 1);
+        assert!(matches!(event, Event::Init));
+        assert!(matches!(stream.next().await, Some(Event::InitApply(_))));
+        assert!(matches!(stream.next().await, Some(Event::InitDone)));
         assert!(
             stream.next().await.is_none(),
             "source closure must be preserved"
         );
+    }
+
+    #[test]
+    fn namespace_relist_replaces_only_completed_snapshots() {
+        let allowlist = OperatorNamespaceAllowlist::from_set(BTreeSet::from(["old".to_string()]));
+        let mut pending = BTreeSet::new();
+        let namespace = |name: &str| Namespace {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Operator,
+            ..Default::default()
+        };
+
+        apply_namespace_watch_event(&allowlist, &mut pending, Event::Init);
+        apply_namespace_watch_event(
+            &allowlist,
+            &mut pending,
+            Event::InitApply(namespace("partial")),
+        );
+        assert!(accepts_auth_namespace(&config, Some(&allowlist), "old"));
+        assert!(!accepts_auth_namespace(
+            &config,
+            Some(&allowlist),
+            "partial"
+        ));
+
+        apply_namespace_watch_event(&allowlist, &mut pending, Event::Init);
+        apply_namespace_watch_event(&allowlist, &mut pending, Event::InitApply(namespace("new")));
+        apply_namespace_watch_event(&allowlist, &mut pending, Event::InitDone);
+        assert!(accepts_auth_namespace(&config, Some(&allowlist), "new"));
+        assert!(!accepts_auth_namespace(&config, Some(&allowlist), "old"));
+        assert!(!accepts_auth_namespace(
+            &config,
+            Some(&allowlist),
+            "partial"
+        ));
+
+        apply_namespace_watch_event(&allowlist, &mut pending, Event::Apply(namespace("live")));
+        assert!(accepts_auth_namespace(&config, Some(&allowlist), "live"));
+        apply_namespace_watch_event(&allowlist, &mut pending, Event::Delete(namespace("live")));
+        assert!(!accepts_auth_namespace(&config, Some(&allowlist), "live"));
+
+        apply_namespace_watch_event(&allowlist, &mut pending, Event::Init);
+        apply_namespace_watch_event(&allowlist, &mut pending, Event::InitDone);
+        assert!(!accepts_auth_namespace(&config, Some(&allowlist), "new"));
     }
 
     fn authenticated_token_review(username: &str) -> TokenReviewStatus {
@@ -5380,7 +5419,7 @@ mod tests {
 
         assert_eq!(
             kubernetes_sandbox_stop_timeout(&sandbox),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             "an omitted grace period uses the Kubernetes 30-second default"
         );
 

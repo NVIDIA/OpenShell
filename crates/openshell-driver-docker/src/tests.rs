@@ -4,8 +4,9 @@
 use super::*;
 use openshell_core::config::DEFAULT_SERVER_PORT;
 use openshell_core::driver_utils::{
-    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_NAMESPACE, supervisor_cache_path_with_base,
+    CONDITION_WORKSPACE_VALIDATION_FAILED, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE,
+    LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_NAMESPACE,
+    SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED, supervisor_cache_path_with_base,
 };
 use openshell_core::progress::{
     PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
@@ -3300,6 +3301,15 @@ fn ready_reason(sandbox: &DriverSandbox) -> &str {
         .expect("Ready condition present")
 }
 
+fn ready_message(sandbox: &DriverSandbox) -> &str {
+    sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.conditions.iter().find(|c| c.r#type == "Ready"))
+        .map(|c| c.message.as_str())
+        .expect("Ready condition present")
+}
+
 #[test]
 fn docker_signal_kill_reclassified_as_runtime_restart() {
     // 137 (128+SIGKILL) and 143 (128+SIGTERM) mark an external termination —
@@ -3335,6 +3345,24 @@ fn docker_ordinary_exit_stays_terminal() {
     };
     apply_docker_exit_classification(&mut sandbox, &state);
     assert_eq!(ready_reason(&sandbox), CONDITION_EXITED);
+}
+
+#[test]
+fn docker_workspace_validation_exit_is_reported_explicitly() {
+    let mut sandbox = exited_sandbox_with_ready_reason(CONDITION_EXITED);
+    let state = ContainerState {
+        status: Some(ContainerStateStatusEnum::EXITED),
+        exit_code: Some(i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)),
+        ..Default::default()
+    };
+
+    apply_docker_exit_classification(&mut sandbox, &state);
+
+    assert_eq!(
+        ready_reason(&sandbox),
+        CONDITION_WORKSPACE_VALIDATION_FAILED
+    );
+    assert!(ready_message(&sandbox).contains("WorkingDir"));
 }
 
 #[test]

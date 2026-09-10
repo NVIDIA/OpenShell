@@ -31,7 +31,6 @@ type ClientInterface interface {
 	Config() ConfigInterface
 	Policy() PolicyInterface
 	Workspaces() WorkspaceInterface
-	Inference() InferenceInterface
 	Close() error
 }
 
@@ -65,7 +64,6 @@ type Client struct {
 	cfg            ConfigInterface
 	policy         PolicyInterface
 	workspaces     WorkspaceInterface
-	inference      InferenceInterface
 }
 
 // NewClient creates a new SDK client connected to the given gateway.
@@ -112,7 +110,6 @@ func NewClient(cfg Config) (*Client, error) {
 	c.cfg = newConfigClient(conn, c.sandboxes)
 	c.policy = newPolicyClient(conn)
 	c.workspaces = newWorkspaceClient(conn)
-	c.inference = newInferenceClient(conn)
 
 	return c, nil
 }
@@ -158,9 +155,6 @@ func (c *Client) Policy() PolicyInterface { return c.policy }
 
 // Workspaces returns the workspace management sub-client.
 func (c *Client) Workspaces() WorkspaceInterface { return c.workspaces }
-
-// Inference returns the inference route management sub-client.
-func (c *Client) Inference() InferenceInterface { return c.inference }
 
 // Close closes the underlying gRPC connection. Safe to call multiple times.
 func (c *Client) Close() error {

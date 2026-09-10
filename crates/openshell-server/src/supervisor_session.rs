@@ -1767,7 +1767,7 @@ mod tests {
                 "sbx-test",
                 relay_tx,
                 Instant::now()
-                    .checked_sub(Duration::from_secs(60))
+                    .checked_sub(Duration::from_mins(1))
                     .expect("test duration should be before now"),
             ),
         );
@@ -1845,7 +1845,7 @@ mod tests {
                 "sbx-test",
                 relay_tx,
                 Instant::now()
-                    .checked_sub(Duration::from_secs(60))
+                    .checked_sub(Duration::from_mins(1))
                     .expect("test duration should be before now"),
             ),
         );

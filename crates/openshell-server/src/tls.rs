@@ -18,7 +18,7 @@ use openshell_ocsf::{
     ConfigStateChangeBuilder, OCSF_TARGET, SandboxContext, SeverityId, StateId, StatusId,
 };
 use rustls::ServerConfig;
-use rustls::crypto::ring::sign;
+use rustls::crypto::aws_lc_rs::sign;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
@@ -488,9 +488,7 @@ fn tls_ocsf_ctx() -> SandboxContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tls_test_utils::{
-        generate_test_certs_with_ca, install_rustls_provider, write_test_file,
-    };
+    use crate::tls_test_utils::{generate_test_certs_with_ca, write_test_file};
     use rcgen::{CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -532,7 +530,6 @@ mod tests {
 
     #[test]
     fn test_build_server_config() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let _ = generate_test_certs_with_ca(dir.path());
 
@@ -553,7 +550,6 @@ mod tests {
 
     #[test]
     fn test_reload_success() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
 
@@ -574,7 +570,6 @@ mod tests {
 
     #[test]
     fn test_reload_invalid_preserves_old() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         generate_test_certs_with_ca(dir.path());
 
@@ -607,8 +602,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_concurrent_handshake_and_reload() {
-        install_rustls_provider();
-
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
         let acceptor = TlsAcceptor::from_files(
@@ -702,8 +695,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_reload_serves_new_cert() {
-        install_rustls_provider();
-
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
         let acceptor = TlsAcceptor::from_files(
@@ -778,8 +769,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_reload_worker_shutdown() {
-        install_rustls_provider();
-
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         generate_test_certs_with_ca(dir.path());
         let acceptor = TlsAcceptor::from_files(
@@ -812,8 +801,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_reload_worker_detects_file_change() {
-        install_rustls_provider();
-
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
         let acceptor = TlsAcceptor::from_files(
@@ -902,8 +889,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_reload_mtls_ca_rotation() {
-        install_rustls_provider();
-
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (initial_ca_cert, initial_ca_key) = generate_test_certs_with_ca(dir.path());
 
@@ -1110,7 +1095,6 @@ mod tests {
 
     #[test]
     fn test_build_cert_resolver_returns_none_when_no_external() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         generate_test_certs_with_ca(dir.path());
 
@@ -1127,7 +1111,6 @@ mod tests {
 
     #[test]
     fn test_build_cert_resolver_errors_on_cert_without_key() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         generate_test_certs_with_ca(dir.path());
 
@@ -1147,7 +1130,6 @@ mod tests {
 
     #[test]
     fn test_build_cert_resolver_errors_on_key_without_cert() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         generate_test_certs_with_ca(dir.path());
 
@@ -1167,7 +1149,6 @@ mod tests {
 
     #[test]
     fn test_build_cert_resolver_errors_on_empty_server_names() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
         generate_named_cert(
@@ -1195,7 +1176,6 @@ mod tests {
 
     #[test]
     fn test_dual_cert_resolver_returns_external_on_sni_match() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
         generate_named_cert(
@@ -1233,8 +1213,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_dual_cert_resolver_sni_selects_correct_cert() {
-        install_rustls_provider();
-
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
         generate_named_cert(

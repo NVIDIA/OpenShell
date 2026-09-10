@@ -26,7 +26,7 @@ For gator's PR/issue validation policy, load `gator-gate` inside the launched sa
 |---|---|
 | `scripts/agents/run.sh` | Manifest-driven OpenShell agent launcher. |
 | `scripts/agents/gator/agent.yaml` | Gator manifest: immutable payload version, default gateway, harness, providers, runtime, skills, and subagents. |
-| `scripts/agents/gator/Dockerfile` | Gator sandbox image source. Local launches build this image through OpenShell. |
+| `scripts/agents/gator/Dockerfile` | Gator sandbox image source. Local launches build it in gateway's Docker or Podman image store. |
 | `scripts/agents/gator/policy.yaml` | Sandbox policy for the gator agent. |
 | `scripts/agents/gator/bin/gh` | Gator-specific `gh` wrapper and same-SHA duplicate-post guard. |
 | `scripts/agents/gator/bin/review-feedback-ledger` | Builds tree-aware review scope, durable findings, convergence telemetry, and review-budget state. |
@@ -160,7 +160,7 @@ sandbox_name="gator-pr-${pr_number}-supervised"
   "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}."
 ```
 
-The launcher builds the gator sandbox image when needed, stages the immutable payload, imports provider profiles, configures provider credentials and refresh, creates and uploads the sandbox payload, then starts the agent supervisor with `sandbox exec`. It writes a background log under `scripts/agents/gator/logs/`.
+The launcher queries gateway's selected compute driver, builds gator image in matching Docker or Podman image store, stages immutable payload, imports provider profiles, configures provider credentials and refresh, creates and uploads sandbox payload, then starts agent supervisor with `sandbox exec`. It writes a background log under `scripts/agents/gator/logs/`. `CONTAINER_ENGINE`, when set, must match gateway driver.
 
 ### Launch An Issue Or Issue/PR Pair
 

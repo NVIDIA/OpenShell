@@ -12,6 +12,7 @@ import (
 	"golang.org/x/oauth2"
 	"golang.org/x/sync/singleflight"
 
+	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/options"
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 )
 
@@ -160,9 +161,7 @@ func RefreshableToken(src oauth2.TokenSource, opts ...RefreshOption) (AuthProvid
 	}
 
 	cfg := defaultRefreshConfig()
-	for _, o := range opts {
-		o(&cfg)
-	}
+	options.Apply(&cfg, opts)
 
 	return &refreshableAuth{
 		source: src,

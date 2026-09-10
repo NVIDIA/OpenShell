@@ -12,7 +12,7 @@ gateway-name resolution.
   CRUD, reusable sandbox template CRUD, readiness/deletion waits, and
   non-streaming exec.
 - `raw` — direct access to the generated tonic clients for RPCs the curated
-  surface doesn't yet cover (inference, providers, policy, logs, settings, SSH,
+  surface doesn't yet cover (providers, policy, logs, settings, SSH,
   forwarding).
 
 ## Auth and refresh
@@ -21,9 +21,8 @@ The curated surface drives OIDC refresh automatically: proactively before a
 request and reactively on `Unauthenticated`. Refreshes are single-flight, so
 only one is in flight at a time.
 
-The plain `raw_grpc`/`raw_inference` accessors do not refresh; they return a
-client bound to the current token. When a refresher is wired, use
-`raw_grpc_fresh`/`raw_inference_fresh` to refresh before the call, and
+The plain `raw_grpc` accessor does not refresh; it returns a client bound to
+the current token. When a refresher is wired, use `raw_grpc_fresh` to refresh before the call, and
 `force_refresh` to recover after a raw RPC returns `Unauthenticated`.
 
 The SDK consumes a `Refresh` trait that the caller implements; it does not run

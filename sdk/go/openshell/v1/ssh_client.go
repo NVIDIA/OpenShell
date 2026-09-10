@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/converter"
+	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/options"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
 	"google.golang.org/grpc"
 )
@@ -64,9 +65,7 @@ func (s *sshClient) Tunnel(ctx context.Context, workspace, sandboxName string, p
 	}
 
 	var cfg tunnelConfig
-	for _, o := range opts {
-		o(&cfg)
-	}
+	options.Apply(&cfg, opts)
 
 	sandbox, err := s.sandboxes.Get(ctx, workspace, sandboxName)
 	if err != nil {

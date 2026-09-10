@@ -13,7 +13,7 @@ and what to use instead.
 
 ### Commands that work normally
 
-All sandbox, provider, policy, inference, and settings commands
+All sandbox, provider, policy, and settings commands
 communicate with the gateway over gRPC and work identically regardless
 of deployment mode:
 
@@ -23,7 +23,8 @@ openshell sandbox create|list|get|delete|connect|exec
 openshell logs <sandbox>
 openshell provider create|list|get|update|delete
 openshell policy get|set|update|list|prove
-openshell inference set|get|update
+openshell provider list
+openshell sandbox provider list <sandbox>
 openshell settings get|set
 openshell forward start|stop|list
 openshell term
@@ -47,13 +48,11 @@ systemd commands directly:
 
 ### Building from local Dockerfiles
 
-`openshell sandbox create --from ./Dockerfile` builds via the local
-Docker daemon. With the RPM Podman driver, build the image with Podman
-and reference it directly:
+Build the image with Podman, then reference it directly:
 
 ```shell
-podman build -t my-sandbox ./my-dir
-openshell sandbox create --from localhost/my-sandbox
+podman build -t localhost/my-sandbox:latest ./my-dir
+openshell sandbox create --from localhost/my-sandbox:latest
 ```
 
 ## Remote CLI access
