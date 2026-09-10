@@ -105,10 +105,8 @@ jobs:
         include:
           - triple: x86_64-unknown-linux-musl
             runner: linux-amd64-cpu8
-            dev_shell: .#devShells.x86_64-linux.musl
           - triple: aarch64-unknown-linux-musl
             runner: linux-arm64-cpu8
-            dev_shell: .#devShells.aarch64-linux.musl
     uses: ./.github/workflows/build-binaries.yml
     with:
       package: openshell-conformance-cli
@@ -116,7 +114,6 @@ jobs:
       artifact-name: openshell-conformance-${{ matrix.triple }}
       triple: ${{ matrix.triple }}
       runner: ${{ matrix.runner }}
-      dev-shell: ${{ matrix.dev_shell }}
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       checkout-ref: ${{ inputs.tag || github.ref }}
     secrets: inherit

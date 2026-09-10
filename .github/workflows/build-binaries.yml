@@ -18,9 +18,6 @@ on:
       runner:
         required: true
         type: string
-      dev-shell:
-        required: true
-        type: string
       cargo-version:
         required: true
         type: string
@@ -70,7 +67,6 @@ jobs:
           package: ${{ inputs.package }}
           binary: ${{ inputs.binary }}
           triple: ${{ inputs.triple }}
-          dev-shell: ${{ inputs['dev-shell'] }}
           cargo-version: ${{ inputs['cargo-version'] }}
           image-tag: ${{ inputs['image-tag'] }}
           artifact-name: ${{ inputs['artifact-name'] }}
