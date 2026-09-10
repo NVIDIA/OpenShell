@@ -176,7 +176,7 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
             "CreateSandbox",
             lambda s, m: s.CreateSandbox(
                 openshell_pb2.CreateSandboxRequest(
-                    workspace=WS,
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                     spec=openshell_pb2.SandboxSpec(
                         template=openshell_pb2.SandboxTemplate(image="ubuntu:24.04")
                     ),
@@ -187,20 +187,29 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
         (
             "GetSandbox",
             lambda s, m: s.GetSandbox(
-                openshell_pb2.GetSandboxRequest(name="nonexistent", workspace=WS),
+                openshell_pb2.GetSandboxRequest(
+                    name="nonexistent",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
+                ),
                 metadata=m,
             ),
         ),
         (
             "ListSandboxes",
             lambda s, m: s.ListSandboxes(
-                openshell_pb2.ListSandboxesRequest(workspace=WS), metadata=m
+                openshell_pb2.ListSandboxesRequest(
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS)
+                ),
+                metadata=m,
             ),
         ),
         (
             "DeleteSandbox",
             lambda s, m: s.DeleteSandbox(
-                openshell_pb2.DeleteSandboxRequest(name="nonexistent", workspace=WS),
+                openshell_pb2.DeleteSandboxRequest(
+                    name="nonexistent",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
+                ),
                 metadata=m,
             ),
         ),
@@ -208,7 +217,8 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
             "ListSandboxProviders",
             lambda s, m: s.ListSandboxProviders(
                 openshell_pb2.ListSandboxProvidersRequest(
-                    sandbox_name="nonexistent", workspace=WS
+                    sandbox_name="nonexistent",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                 ),
                 metadata=m,
             ),
@@ -219,7 +229,7 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
                 openshell_pb2.AttachSandboxProviderRequest(
                     sandbox_name="nonexistent",
                     provider_name="nonexistent",
-                    workspace=WS,
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                 ),
                 metadata=m,
             ),
@@ -230,7 +240,7 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
                 openshell_pb2.DetachSandboxProviderRequest(
                     sandbox_name="nonexistent",
                     provider_name="nonexistent",
-                    workspace=WS,
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                 ),
                 metadata=m,
             ),
@@ -240,7 +250,7 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
             "CreateProvider",
             lambda s, m: s.CreateProvider(
                 openshell_pb2.CreateProviderRequest(
-                    workspace=WS,
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                     provider=datamodel_pb2.Provider(
                         metadata=datamodel_pb2.ObjectMeta(
                             name="authz-test", workspace=WS
@@ -255,21 +265,27 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
         (
             "GetProvider",
             lambda s, m: s.GetProvider(
-                openshell_pb2.GetProviderRequest(name="nonexistent", workspace=WS),
+                openshell_pb2.GetProviderRequest(
+                    name="nonexistent",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
+                ),
                 metadata=m,
             ),
         ),
         (
             "ListProviders",
             lambda s, m: s.ListProviders(
-                openshell_pb2.ListProvidersRequest(workspace=WS), metadata=m
+                openshell_pb2.ListProvidersRequest(
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS)
+                ),
+                metadata=m,
             ),
         ),
         (
             "UpdateProvider",
             lambda s, m: s.UpdateProvider(
                 openshell_pb2.UpdateProviderRequest(
-                    workspace=WS,
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                     provider=datamodel_pb2.Provider(
                         metadata=datamodel_pb2.ObjectMeta(
                             name="nonexistent", workspace=WS
@@ -284,7 +300,10 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
         (
             "DeleteProvider",
             lambda s, m: s.DeleteProvider(
-                openshell_pb2.DeleteProviderRequest(name="nonexistent", workspace=WS),
+                openshell_pb2.DeleteProviderRequest(
+                    name="nonexistent",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
+                ),
                 metadata=m,
             ),
         ),
@@ -337,7 +356,8 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
             "GetProviderRefreshStatus",
             lambda s, m: s.GetProviderRefreshStatus(
                 openshell_pb2.GetProviderRefreshStatusRequest(
-                    provider="nonexistent", workspace=WS
+                    provider="nonexistent",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                 ),
                 metadata=m,
             ),
@@ -349,7 +369,7 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
                     provider="nonexistent",
                     credential_key="k",
                     strategy=openshell_pb2.PROVIDER_CREDENTIAL_REFRESH_STRATEGY_STATIC,
-                    workspace=WS,
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                 ),
                 metadata=m,
             ),
@@ -360,7 +380,7 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
                 openshell_pb2.RotateProviderCredentialRequest(
                     provider="nonexistent",
                     credential_key="k",
-                    workspace=WS,
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                 ),
                 metadata=m,
             ),
@@ -371,7 +391,7 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
                 openshell_pb2.DeleteProviderRefreshRequest(
                     provider="nonexistent",
                     credential_key="k",
-                    workspace=WS,
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                 ),
                 metadata=m,
             ),
@@ -384,7 +404,7 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
                     sandbox="nonexistent",
                     service="svc",
                     target_port=8080,
-                    workspace=WS,
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                 ),
                 metadata=m,
             ),
@@ -393,7 +413,9 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
             "GetService",
             lambda s, m: s.GetService(
                 openshell_pb2.GetServiceRequest(
-                    sandbox="nonexistent", service="svc", workspace=WS
+                    sandbox="nonexistent",
+                    service="svc",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                 ),
                 metadata=m,
             ),
@@ -401,14 +423,19 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
         (
             "ListServices",
             lambda s, m: s.ListServices(
-                openshell_pb2.ListServicesRequest(workspace=WS), metadata=m
+                openshell_pb2.ListServicesRequest(
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS)
+                ),
+                metadata=m,
             ),
         ),
         (
             "DeleteService",
             lambda s, m: s.DeleteService(
                 openshell_pb2.DeleteServiceRequest(
-                    sandbox="nonexistent", service="svc", workspace=WS
+                    sandbox="nonexistent",
+                    service="svc",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                 ),
                 metadata=m,
             ),
@@ -418,7 +445,8 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
             "GetSandboxPolicyStatus",
             lambda s, m: s.GetSandboxPolicyStatus(
                 openshell_pb2.GetSandboxPolicyStatusRequest(
-                    name="nonexistent", workspace=WS
+                    name="nonexistent",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                 ),
                 metadata=m,
             ),
@@ -427,7 +455,8 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
             "ListSandboxPolicies",
             lambda s, m: s.ListSandboxPolicies(
                 openshell_pb2.ListSandboxPoliciesRequest(
-                    name="nonexistent", workspace=WS
+                    name="nonexistent",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                 ),
                 metadata=m,
             ),
@@ -435,7 +464,10 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
         (
             "GetDraftPolicy",
             lambda s, m: s.GetDraftPolicy(
-                openshell_pb2.GetDraftPolicyRequest(name="nonexistent", workspace=WS),
+                openshell_pb2.GetDraftPolicyRequest(
+                    name="nonexistent",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
+                ),
                 metadata=m,
             ),
         ),
@@ -443,7 +475,9 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
             "ApproveDraftChunk",
             lambda s, m: s.ApproveDraftChunk(
                 openshell_pb2.ApproveDraftChunkRequest(
-                    name="nonexistent", chunk_id="x", workspace=WS
+                    name="nonexistent",
+                    chunk_id="x",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                 ),
                 metadata=m,
             ),
@@ -452,7 +486,9 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
             "RejectDraftChunk",
             lambda s, m: s.RejectDraftChunk(
                 openshell_pb2.RejectDraftChunkRequest(
-                    name="nonexistent", chunk_id="x", workspace=WS
+                    name="nonexistent",
+                    chunk_id="x",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                 ),
                 metadata=m,
             ),
@@ -461,7 +497,8 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
             "ApproveAllDraftChunks",
             lambda s, m: s.ApproveAllDraftChunks(
                 openshell_pb2.ApproveAllDraftChunksRequest(
-                    name="nonexistent", workspace=WS
+                    name="nonexistent",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                 ),
                 metadata=m,
             ),
@@ -470,7 +507,9 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
             "EditDraftChunk",
             lambda s, m: s.EditDraftChunk(
                 openshell_pb2.EditDraftChunkRequest(
-                    name="nonexistent", chunk_id="x", workspace=WS
+                    name="nonexistent",
+                    chunk_id="x",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                 ),
                 metadata=m,
             ),
@@ -479,7 +518,9 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
             "UndoDraftChunk",
             lambda s, m: s.UndoDraftChunk(
                 openshell_pb2.UndoDraftChunkRequest(
-                    name="nonexistent", chunk_id="x", workspace=WS
+                    name="nonexistent",
+                    chunk_id="x",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                 ),
                 metadata=m,
             ),
@@ -487,14 +528,20 @@ def _workspace_rpcs() -> list[tuple[str, Callable]]:
         (
             "ClearDraftChunks",
             lambda s, m: s.ClearDraftChunks(
-                openshell_pb2.ClearDraftChunksRequest(name="nonexistent", workspace=WS),
+                openshell_pb2.ClearDraftChunksRequest(
+                    name="nonexistent",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
+                ),
                 metadata=m,
             ),
         ),
         (
             "GetDraftHistory",
             lambda s, m: s.GetDraftHistory(
-                openshell_pb2.GetDraftHistoryRequest(name="nonexistent", workspace=WS),
+                openshell_pb2.GetDraftHistoryRequest(
+                    name="nonexistent",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
+                ),
                 metadata=m,
             ),
         ),
@@ -558,18 +605,14 @@ def _global_policy_read_rpcs() -> list[tuple[str, Callable]]:
         (
             "GetSandboxPolicyStatus",
             lambda s, m: s.GetSandboxPolicyStatus(
-                openshell_pb2.GetSandboxPolicyStatusRequest(
-                    workspace="", **{"global": True}
-                ),
+                openshell_pb2.GetSandboxPolicyStatusRequest(**{"global": True}),
                 metadata=m,
             ),
         ),
         (
             "ListSandboxPolicies",
             lambda s, m: s.ListSandboxPolicies(
-                openshell_pb2.ListSandboxPoliciesRequest(
-                    workspace="", **{"global": True}
-                ),
+                openshell_pb2.ListSandboxPoliciesRequest(**{"global": True}),
                 metadata=m,
             ),
         ),
@@ -626,7 +669,9 @@ class TestWorkspaceAuthorization:
         with contextlib.suppress(grpc.RpcError):
             stub.CreateProvider(
                 openshell_pb2.CreateProviderRequest(
-                    workspace=workspace,
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(
+                        workspace=workspace
+                    ),
                     provider=datamodel_pb2.Provider(
                         metadata=datamodel_pb2.ObjectMeta(
                             name=prov_name, workspace=workspace
@@ -641,7 +686,10 @@ class TestWorkspaceAuthorization:
         with contextlib.suppress(grpc.RpcError):
             stub.DeleteProvider(
                 openshell_pb2.DeleteProviderRequest(
-                    name=prov_name, workspace=workspace
+                    name=prov_name,
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(
+                        workspace=workspace
+                    ),
                 ),
                 metadata=metadata,
             )
@@ -673,7 +721,10 @@ class TestWorkspaceAuthorization:
         stub, metadata, user_sub = user_ctx
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.UpdateConfig(
-                openshell_pb2.UpdateConfigRequest(name="nonexistent", workspace=WS),
+                openshell_pb2.UpdateConfigRequest(
+                    name="nonexistent",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
+                ),
                 metadata=metadata,
             )
         _assert_non_member_denial(
@@ -713,7 +764,9 @@ class TestWorkspaceAuthorization:
             response = admin_stub.CreateSandbox(
                 openshell_pb2.CreateSandboxRequest(
                     name=sandbox_name,
-                    workspace=other_workspace,
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(
+                        workspace=other_workspace
+                    ),
                     spec=openshell_pb2.SandboxSpec(),
                 ),
                 metadata=admin_md,
@@ -724,7 +777,7 @@ class TestWorkspaceAuthorization:
                 user_stub.GetSandboxLogs(
                     openshell_pb2.GetSandboxLogsRequest(
                         sandbox_id=sandbox_id,
-                        workspace=WS,
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                     ),
                     metadata=user_md,
                 )
@@ -740,7 +793,9 @@ class TestWorkspaceAuthorization:
                     admin_stub.DeleteSandbox(
                         openshell_pb2.DeleteSandboxRequest(
                             name=sandbox_name,
-                            workspace=other_workspace,
+                            workspace_scope=datamodel_pb2.WorkspaceSelector(
+                                workspace=other_workspace
+                            ),
                         ),
                         metadata=admin_md,
                     )
@@ -773,7 +828,6 @@ class TestWorkspaceAuthorization:
             with pytest.raises(grpc.RpcError) as exc_info:
                 user_stub.UpdateConfig(
                     openshell_pb2.UpdateConfigRequest(
-                        workspace="",
                         setting_key="log_level",
                         delete_setting=True,
                         **{"global": True},
@@ -824,7 +878,9 @@ class TestWorkspaceAuthorization:
     ) -> None:
         stub, metadata = admin_ctx
         stub.ListSandboxes(
-            openshell_pb2.ListSandboxesRequest(workspace=WS),
+            openshell_pb2.ListSandboxesRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS)
+            ),
             metadata=metadata,
         )
 
@@ -835,7 +891,10 @@ class TestWorkspaceAuthorization:
     ) -> None:
         stub, metadata = admin_ctx
         resp = stub.GetProvider(
-            openshell_pb2.GetProviderRequest(name=seed_provider, workspace=WS),
+            openshell_pb2.GetProviderRequest(
+                name=seed_provider,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
+            ),
             metadata=metadata,
         )
         assert resp.provider.metadata.name == seed_provider
@@ -846,7 +905,9 @@ class TestWorkspaceAuthorization:
     ) -> None:
         stub, metadata = admin_ctx
         stub.ListServices(
-            openshell_pb2.ListServicesRequest(workspace=WS),
+            openshell_pb2.ListServicesRequest(
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS)
+            ),
             metadata=metadata,
         )
 
@@ -858,7 +919,10 @@ class TestWorkspaceAuthorization:
         # May fail with NOT_FOUND for the sandbox name, but should not fail with PERMISSION_DENIED
         try:
             stub.GetDraftHistory(
-                openshell_pb2.GetDraftHistoryRequest(name="nonexistent", workspace=WS),
+                openshell_pb2.GetDraftHistoryRequest(
+                    name="nonexistent",
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
+                ),
                 metadata=metadata,
             )
         except grpc.RpcError as e:
@@ -888,26 +952,35 @@ class TestWorkspaceAuthorization:
 
             # ListSandboxes
             user_stub.ListSandboxes(
-                openshell_pb2.ListSandboxesRequest(workspace=WS),
+                openshell_pb2.ListSandboxesRequest(
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS)
+                ),
                 metadata=user_md,
             )
 
             # GetProvider
             resp = user_stub.GetProvider(
-                openshell_pb2.GetProviderRequest(name=seed_provider, workspace=WS),
+                openshell_pb2.GetProviderRequest(
+                    name=seed_provider,
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
+                ),
                 metadata=user_md,
             )
             assert resp.provider.metadata.name == seed_provider
 
             # ListProviders
             user_stub.ListProviders(
-                openshell_pb2.ListProvidersRequest(workspace=WS),
+                openshell_pb2.ListProvidersRequest(
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS)
+                ),
                 metadata=user_md,
             )
 
             # ListServices
             user_stub.ListServices(
-                openshell_pb2.ListServicesRequest(workspace=WS),
+                openshell_pb2.ListServicesRequest(
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS)
+                ),
                 metadata=user_md,
             )
 
@@ -937,7 +1010,7 @@ class TestWorkspaceAuthorization:
             with pytest.raises(grpc.RpcError) as exc_info:
                 user_stub.CreateProvider(
                     openshell_pb2.CreateProviderRequest(
-                        workspace=WS,
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                         provider=datamodel_pb2.Provider(
                             metadata=datamodel_pb2.ObjectMeta(
                                 name="user-blocked", workspace=WS
@@ -978,7 +1051,7 @@ class TestWorkspaceAuthorization:
                     openshell_pb2.ApproveDraftChunkRequest(
                         name="nonexistent",
                         chunk_id="x",
-                        workspace=WS,
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                     ),
                     metadata=user_md,
                 )
@@ -1008,7 +1081,7 @@ class TestWorkspaceAuthorization:
         try:
             user_stub.CreateProvider(
                 openshell_pb2.CreateProviderRequest(
-                    workspace=WS,
+                    workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
                     provider=datamodel_pb2.Provider(
                         metadata=datamodel_pb2.ObjectMeta(name=prov_name, workspace=WS),
                         type="claude",
@@ -1031,7 +1104,10 @@ class TestWorkspaceAuthorization:
         finally:
             with contextlib.suppress(grpc.RpcError):
                 admin_stub.DeleteProvider(
-                    openshell_pb2.DeleteProviderRequest(name=prov_name, workspace=WS),
+                    openshell_pb2.DeleteProviderRequest(
+                        name=prov_name,
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=WS),
+                    ),
                     metadata=admin_md,
                 )
             _remove_member(admin_stub, admin_md, WS, user_sub)
@@ -1052,21 +1128,33 @@ class TestWorkspaceAuthorization:
         try:
             with pytest.raises(grpc.RpcError) as exc_info:
                 user_stub.ListSandboxes(
-                    openshell_pb2.ListSandboxesRequest(all_workspaces=True),
+                    openshell_pb2.ListSandboxesRequest(
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            all_workspaces=datamodel_pb2.AllWorkspaces()
+                        )
+                    ),
                     metadata=user_md,
                 )
             assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
 
             with pytest.raises(grpc.RpcError) as exc_info:
                 user_stub.ListProviders(
-                    openshell_pb2.ListProvidersRequest(all_workspaces=True),
+                    openshell_pb2.ListProvidersRequest(
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            all_workspaces=datamodel_pb2.AllWorkspaces()
+                        )
+                    ),
                     metadata=user_md,
                 )
             assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
 
             with pytest.raises(grpc.RpcError) as exc_info:
                 user_stub.ListServices(
-                    openshell_pb2.ListServicesRequest(all_workspaces=True),
+                    openshell_pb2.ListServicesRequest(
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(
+                            all_workspaces=datamodel_pb2.AllWorkspaces()
+                        )
+                    ),
                     metadata=user_md,
                 )
             assert exc_info.value.code() == grpc.StatusCode.PERMISSION_DENIED
