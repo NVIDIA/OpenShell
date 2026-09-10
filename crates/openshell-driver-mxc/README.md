@@ -109,6 +109,8 @@ activity, and correlation-vector links remain available for five seconds so
 already in-flight ETW records can arrive, but retired PID evidence cannot resolve
 them. Records without matching generation evidence remain unattributed.
 
+Each sandbox receives a distinct listener port through its MXC redirect, but the listener does not authenticate its TCP peer. Processes that can connect directly to gateway-owned loopback ports are part of the trusted Windows host boundary. MXC feedback item M3 tracks stable source attribution for deployments that need a mutually untrusted shared-host boundary.
+
 The MXC credential handoff is also fixed at sandbox creation. The gateway rejects expiring static provider credentials because the in-process MXC driver has no live credential-refresh channel. Dynamic token grants remain request-time operations in the host proxy. Recreate the sandbox after rotating or revoking a non-expiring static credential.
 
 ## Prerequisites (live runs)
