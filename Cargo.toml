@@ -56,7 +56,7 @@ miette = { version = "7", features = ["fancy"] }
 thiserror = "2"
 
 # Windows platform APIs (ETW/TDH audit consumer in openshell-driver-mxc; Windows-only)
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Diagnostics_Etw", "Win32_System_Time"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Diagnostics_Etw", "Win32_System_Performance", "Win32_System_Time"] }
 anyhow = "1"
 
 # Logging/Tracing

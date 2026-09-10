@@ -386,10 +386,8 @@ arguments from structured fields and messages. Raw ETW debug summaries replace
 the `commandLine` value with `[REDACTED]`, including pending-buffer eviction
 diagnostics.
 MXC ETW attribution never treats command text as ownership evidence. It uses the
-driver-owned `wxc-exec` PID only while that child is alive, then retains only
-established identity, activity, and correlation-vector links for a five-second
-late-event window. The ETW callback timestamps each record before queueing it.
-PID resolution accepts a record only when its capture time belongs to the
-current registration generation, apart from the bounded initial-registration
-race, so consumer backlog cannot carry an old record across a PID-reuse
-boundary.
+driver-owned `wxc-exec` PID as the initial anchor and retains bounded PID
+lifetime records plus established identity, activity, and correlation-vector
+links for a five-second late-event window. PID resolution compares the event's
+ETW producer timestamp with those lifetimes. Events delayed inside ETW can
+therefore resolve after process exit without crossing a PID-reuse boundary.

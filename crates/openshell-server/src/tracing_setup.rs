@@ -62,21 +62,29 @@ pub fn install(
     );
     let (jsonl_layer, jsonl_dir) = build_ocsf_jsonl_layer(gateway.compute_driver());
 
+    // Keep the audit sink independent from the operator's diagnostic log
+    // level. An explicit JSONL opt-in must keep every OCSF event even when the
+    // console and routed diagnostic logs are restricted to `warn` or `error`.
     tracing_subscriber::registry()
-        .with(env_filter)
-        .with(tracing_subscriber::fmt::layer())
-        .with(tracing_log_bus.layer())
+        .with(tracing_subscriber::fmt::layer().with_filter(env_filter.clone()))
+        .with(tracing_log_bus.layer().with_filter(env_filter.clone()))
         .with(jsonl_layer)
         .with(
             tracer_provider
                 .as_ref()
-                .map(|provider| crate::otel_tracing::layer(provider, driver)),
+                .map(|provider| crate::otel_tracing::layer(provider, driver))
+                .with_filter(env_filter.clone()),
         )
-        .with(driver_tracer_provider.as_ref().map(|provider| {
-            driver
-                .expect("a driver provider requires a selected driver")
-                .in_process_layer(provider)
-        }))
+        .with(
+            driver_tracer_provider
+                .as_ref()
+                .map(|provider| {
+                    driver
+                        .expect("a driver provider requires a selected driver")
+                        .in_process_layer(provider)
+                })
+                .with_filter(env_filter),
+        )
         .init();
 
     if let Some(dir) = jsonl_dir {
@@ -197,7 +205,63 @@ fn ocsf_log_dir() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use openshell_ocsf::{
+        AppLifecycleBuilder, OcsfJsonlLayer, SandboxContext, emit_ocsf_event_routed,
+    };
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::prelude::*;
+
     use super::mxc_ocsf_jsonl_requested;
+
+    #[derive(Clone)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn diagnostic_filter_does_not_suppress_ocsf_jsonl() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::sink)
+                    .with_filter(EnvFilter::new("warn")),
+            )
+            .with(OcsfJsonlLayer::new(SharedWriter(output.clone())));
+        let ctx = SandboxContext {
+            sandbox_id: "sandbox-filter-test".into(),
+            sandbox_name: "filter-test".into(),
+            container_image: String::new(),
+            hostname: "gateway-host".into(),
+            product_version: openshell_core::VERSION.into(),
+            proxy_ip: "127.0.0.1".parse().unwrap(),
+            proxy_port: 0,
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            emit_ocsf_event_routed(
+                "sandbox-filter-test",
+                AppLifecycleBuilder::new(&ctx).build(),
+            );
+        });
+
+        assert!(
+            !output.lock().unwrap().is_empty(),
+            "warn-level diagnostic filtering must not suppress informational audit records"
+        );
+    }
 
     #[test]
     fn gateway_ocsf_jsonl_requires_explicit_opt_in() {

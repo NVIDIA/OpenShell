@@ -79,12 +79,11 @@ to once every 30 seconds while overload continues.
 
 Audit attribution bootstraps only from the driver-owned `wxc-exec` PID while
 that child is alive; command text is never an ownership key. The process monitor
-retires the PID at exit. Identity, activity, and correlation-vector links learned
-from the live PID remain available for five seconds so already in-flight ETW
-records can arrive, then the consumer removes them. The callback timestamps each
-record before queueing it, and PID resolution requires the capture time to match
-the current registration generation so delayed decoding cannot cross a PID-reuse
-boundary.
+retires the live PID at exit. Its bounded process lifetime and any identity,
+activity, and correlation-vector links learned from it remain available for five
+seconds so already in-flight ETW records can arrive. PID resolution uses the
+event's ETW producer timestamp, so delayed delivery can resolve after process
+exit without crossing a PID-reuse boundary.
 
 ## Prerequisites (live runs)
 

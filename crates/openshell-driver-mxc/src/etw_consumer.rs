@@ -67,6 +67,7 @@ use windows::Win32::System::Diagnostics::Etw::{
     ProcessTrace, StartTraceW, TRACE_EVENT_INFO, TRACE_LEVEL_VERBOSE, TdhGetEventInformation,
     WNODE_FLAG_TRACED_GUID,
 };
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::core::{GUID, PCWSTR, PWSTR};
 
 use openshell_ocsf::{
@@ -152,9 +153,6 @@ const OPCODE_STOP: u8 = 2;
 /// buffers and decodes at leisure. TraceLogging events carry their schema in the
 /// extended-data items, so those are deep-copied too (not just `UserData`).
 struct RawEtwEvent {
-    /// Monotonic instant when the ETW callback observed this record. Attribution
-    /// uses capture time, not delayed decode time, across PID generations.
-    captured_at: Instant,
     header: EVENT_HEADER,
     user_data: Vec<u8>,
     /// Extended-data item headers (their `DataPtr` is re-pointed at `ext_bufs`
@@ -168,7 +166,7 @@ struct RawEtwEvent {
     queued_bytes: usize,
 }
 
-// SAFETY: every field is `Send`: `Instant`, `Vec`, or a POD Windows struct whose
+// SAFETY: every field is `Send`: `Vec` or a POD Windows struct whose
 // only address-like field (`EVENT_HEADER_EXTENDED_DATA_ITEM::DataPtr`, a `u64`)
 // is re-pointed at our owned buffers on the consumer thread before use. No
 // borrowed kernel pointers survive the callback, so this is sound to move
@@ -181,9 +179,11 @@ unsafe impl Send for RawEtwEvent {}
 /// [`DecodedEtwEvent::summary`] for sanitized diagnostic output.
 #[derive(Clone)]
 pub(crate) struct DecodedEtwEvent {
-    /// Monotonic instant copied from the ETW callback. This prevents consumer
-    /// backlog from making an old record appear to belong to a reused PID.
-    pub captured_at: Instant,
+    /// QPC timestamp recorded by ETW when the producer emitted the event. The
+    /// session uses `ClientContext = 1`, so this is on the same clock as process
+    /// registration and retirement. Callback delivery time is deliberately not
+    /// used: ETW may retain a record in a per-CPU buffer across PID reuse.
+    pub timestamp_qpc: i64,
     /// Provider that emitted the event.
     pub provider: GUID,
     /// TraceLogging event id.
@@ -743,8 +743,6 @@ unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD)
     if event.EventHeader.ProviderId != SANDBOXING_PROVIDER_GUID {
         return;
     }
-    let captured_at = Instant::now();
-
     // Hot path: reserve bounded queue memory, copy raw bytes, then use a
     // non-blocking send. No TDH decode or logging runs here. Overload is counted
     // atomically and reported by the consumer thread so ETW's pump never waits
@@ -758,7 +756,7 @@ unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD)
         record_queue_drop(&context.health);
         return;
     }
-    let raw = unsafe { copy_raw(event_record, queued_bytes, captured_at) };
+    let raw = unsafe { copy_raw(event_record, queued_bytes) };
     try_enqueue_raw(context, raw);
 }
 
@@ -841,11 +839,7 @@ fn try_enqueue_raw(context: &CallbackContext, raw: RawEtwEvent) -> bool {
 
 /// Deep-copy a kernel `EVENT_RECORD` into an owned, `Send` [`RawEtwEvent`].
 /// Runs in the ETW callback, so it does the minimum: byte copies, no decode.
-unsafe fn copy_raw(
-    event_record: *const EVENT_RECORD,
-    queued_bytes: usize,
-    captured_at: Instant,
-) -> RawEtwEvent {
+unsafe fn copy_raw(event_record: *const EVENT_RECORD, queued_bytes: usize) -> RawEtwEvent {
     let ev = unsafe { &*event_record };
     let header = ev.EventHeader;
 
@@ -874,7 +868,6 @@ unsafe fn copy_raw(
     }
 
     RawEtwEvent {
-        captured_at,
         header,
         user_data,
         ext_items,
@@ -912,7 +905,7 @@ fn decode_raw(raw: &mut RawEtwEvent) -> Option<DecodedEtwEvent> {
         raw.ext_items.as_mut_ptr()
     };
 
-    decode_event(std::ptr::addr_of_mut!(rec), raw.captured_at)
+    decode_event(std::ptr::addr_of_mut!(rec))
 }
 
 // ---------------------------------------------------------------------------
@@ -921,7 +914,7 @@ fn decode_raw(raw: &mut RawEtwEvent) -> Option<DecodedEtwEvent> {
 
 /// Decode a raw event record into a neutral [`DecodedEtwEvent`] via TDH.
 /// Returns `None` only when TDH decoding fails entirely.
-fn decode_event(event_record: *mut EVENT_RECORD, captured_at: Instant) -> Option<DecodedEtwEvent> {
+fn decode_event(event_record: *mut EVENT_RECORD) -> Option<DecodedEtwEvent> {
     let mut buf_size: u32 = 0;
     let status = unsafe { TdhGetEventInformation(event_record, None, None, &mut buf_size) };
     if status != ERROR_INSUFFICIENT_BUFFER {
@@ -947,7 +940,7 @@ fn decode_event(event_record: *mut EVENT_RECORD, captured_at: Instant) -> Option
     let props = decode_properties(&buffer, info, event_record);
 
     Some(DecodedEtwEvent {
-        captured_at,
+        timestamp_qpc: header.TimeStamp,
         provider: header.ProviderId,
         event_id: header.EventDescriptor.Id,
         level: header.EventDescriptor.Level,
@@ -1193,17 +1186,41 @@ const PRE_REGISTRATION_PID_GRACE: Duration = Duration::from_secs(2);
 /// replay.
 const RETIRED_CORRELATION_TTL: Duration = PENDING_TTL;
 
+fn qpc_now() -> i64 {
+    let mut value = 0;
+    // QPC is available on every supported Windows version. If the call ever
+    // fails, zero fails closed for generation matching instead of borrowing a
+    // wall clock that is incompatible with ETW's configured timestamp source.
+    let _ = unsafe { QueryPerformanceCounter(&mut value) };
+    value
+}
+
+fn duration_qpc_ticks(duration: Duration) -> i64 {
+    let mut frequency = 0;
+    if unsafe { QueryPerformanceFrequency(&mut frequency) }.is_err() || frequency <= 0 {
+        return 0;
+    }
+    let ticks = duration.as_nanos().saturating_mul(frequency as u128) / 1_000_000_000;
+    i64::try_from(ticks).unwrap_or(i64::MAX)
+}
+
 /// A `wxc-exec` PID registration: which sandbox owns the PID and *when* it was
 /// registered. The timestamp lets every resolution path reject a record that
 /// was captured under an older generation of a recycled PID.
 struct PidReg {
     sid: String,
-    at: Instant,
+    started_qpc: i64,
     /// Whether an event captured just before this registration may use the PID.
     /// A recently retired or reassigned PID makes that race ambiguous, so only
     /// its strong identity/activity/CV correlators remain eligible for
     /// resolution.
     allow_pre_registration_capture: bool,
+}
+
+struct RetiredPidReg {
+    registration: PidReg,
+    ended_qpc: i64,
+    retired_at: Instant,
 }
 
 #[derive(Default)]
@@ -1216,10 +1233,10 @@ pub(crate) struct AttributionIndex {
     /// correlations remain authoritative only until the recorded instant plus
     /// [`RETIRED_CORRELATION_TTL`].
     retired_sandboxes: HashMap<String, Instant>,
-    /// Recently retired PID generations. Tombstones prevent a buffered event
-    /// from binding to a quickly recycled PID's new owner and expire once every
-    /// event from the prior generation must have aged out.
-    retired_pids: HashMap<u32, Instant>,
+    /// Recently retired PID generations. Their producer-time lifetime lets
+    /// records delivered after process exit resolve to the correct sandbox and
+    /// prevents those records from binding to a recycled PID's new owner.
+    retired_pids: HashMap<u32, VecDeque<RetiredPidReg>>,
     names: HashMap<String, String>,
     /// Sandboxes for which a lifecycle [6002] row has already been emitted, so
     /// the two redundant create events don't double-count.
@@ -1243,11 +1260,9 @@ impl AttributionIndex {
     /// identity/activity/CV correlations used for the rest of the create burst.
     pub fn register_launch(&mut self, sandbox_id: &str, sandbox_name: &str, wxc_pid: u32) {
         let now = Instant::now();
+        let now_qpc = qpc_now();
         self.purge_expired_retirements(now);
-        let previous = self
-            .by_pid
-            .get(&wxc_pid)
-            .map(|registration| registration.sid.clone());
+        let previous = self.by_pid.remove(&wxc_pid);
         let allow_pre_registration_capture =
             previous.is_none() && !self.retired_pids.contains_key(&wxc_pid);
 
@@ -1257,26 +1272,33 @@ impl AttributionIndex {
         // the prior owner's strong correlations on the normal late-event horizon,
         // and refuse pre-registration PID matches across the ambiguous
         // generation boundary.
-        if let Some(prev_sid) = previous.as_deref() {
-            if prev_sid != sandbox_id {
+        if let Some(previous) = previous {
+            if previous.sid != sandbox_id {
                 tracing::warn!(
                     target: "mxc_etw",
                     pid = wxc_pid,
-                    prev = %prev_sid,
+                    prev = %previous.sid,
                     new = %sandbox_id,
                     "wxc-exec PID reused before prior sandbox was forgotten; rebinding attribution"
                 );
                 self.retired_sandboxes
-                    .entry(prev_sid.to_string())
+                    .entry(previous.sid.clone())
                     .or_insert(now);
-                self.retired_pids.insert(wxc_pid, now);
             }
+            self.retired_pids
+                .entry(wxc_pid)
+                .or_default()
+                .push_back(RetiredPidReg {
+                    registration: previous,
+                    ended_qpc: now_qpc,
+                    retired_at: now,
+                });
         }
         self.by_pid.insert(
             wxc_pid,
             PidReg {
                 sid: sandbox_id.to_string(),
-                at: now,
+                started_qpc: now_qpc,
                 allow_pre_registration_capture,
             },
         );
@@ -1288,8 +1310,9 @@ impl AttributionIndex {
 
     /// Retire a driver-owned PID after its monitored child exits. The exact
     /// sandbox match prevents a delayed monitor from removing a recycled PID's
-    /// newer registration. Strong correlations remain for a short late-event
-    /// window, but PID-only events stop resolving immediately.
+    /// newer registration. Strong correlations and the bounded historical PID
+    /// lifetime remain for a short late-event window so records still buffered
+    /// inside ETW can be attributed after the process exits.
     pub fn retire_launch(&mut self, sandbox_id: &str, wxc_pid: u32) {
         let matches_owner = self
             .by_pid
@@ -1299,9 +1322,19 @@ impl AttributionIndex {
             return;
         }
 
-        self.by_pid.remove(&wxc_pid);
         let now = Instant::now();
-        self.retired_pids.insert(wxc_pid, now);
+        let registration = self
+            .by_pid
+            .remove(&wxc_pid)
+            .expect("owner match requires a live registration");
+        self.retired_pids
+            .entry(wxc_pid)
+            .or_default()
+            .push_back(RetiredPidReg {
+                registration,
+                ended_qpc: qpc_now(),
+                retired_at: now,
+            });
         if !self
             .by_pid
             .values()
@@ -1327,8 +1360,16 @@ impl AttributionIndex {
             .filter_map(|(pid, registration)| (registration.sid == sandbox_id).then_some(*pid))
             .collect::<Vec<_>>();
         for pid in retired_pids {
-            self.by_pid.remove(&pid);
-            self.retired_pids.insert(pid, now);
+            if let Some(registration) = self.by_pid.remove(&pid) {
+                self.retired_pids
+                    .entry(pid)
+                    .or_default()
+                    .push_back(RetiredPidReg {
+                        registration,
+                        ended_qpc: qpc_now(),
+                        retired_at: now,
+                    });
+            }
         }
         self.by_identity.retain(|_, v| v != sandbox_id);
         self.by_activity.retain(|_, v| v != sandbox_id);
@@ -1339,9 +1380,12 @@ impl AttributionIndex {
     }
 
     fn purge_expired_retirements(&mut self, now: Instant) {
-        self.retired_pids.retain(|_, retired_at| {
-            now.checked_duration_since(*retired_at)
-                .map_or(true, |age| age < PENDING_TTL)
+        self.retired_pids.retain(|_, generations| {
+            generations.retain(|generation| {
+                now.checked_duration_since(generation.retired_at)
+                    .is_none_or(|age| age < PENDING_TTL)
+            });
+            !generations.is_empty()
         });
 
         let expired_sandboxes = self
@@ -1384,10 +1428,9 @@ impl AttributionIndex {
     /// Resolve an event to a `sandbox_id` via any known key, then cross-link the
     /// other keys it carries so later keyless events attribute correctly.
     ///
-    /// Strong per-sandbox correlators take precedence over PID. A PID match is
-    /// trusted only when the event was captured during the current registration,
-    /// or during the bounded seed race immediately before the first unambiguous
-    /// registration. This rule applies before and after pending-buffer replay.
+    /// Strong per-sandbox correlators take precedence over PID. A PID match uses
+    /// ETW's producer timestamp against current and recently-retired process
+    /// lifetimes. This rule applies before and after pending-buffer replay.
     fn resolve(&mut self, ev: &DecodedEtwEvent) -> Option<String> {
         self.purge_expired_retirements(Instant::now());
         let identity = ev.identity();
@@ -1404,11 +1447,29 @@ impl AttributionIndex {
             })
             .or_else(|| cv.as_ref().and_then(|c| self.by_cv.get(c).cloned()))
             .or_else(|| {
+                self.retired_pids
+                    .get(&ev.process_id)
+                    .and_then(|generations| {
+                        generations.iter().rev().find_map(|generation| {
+                            let start = if generation.registration.allow_pre_registration_capture {
+                                generation
+                                    .registration
+                                    .started_qpc
+                                    .saturating_sub(duration_qpc_ticks(PRE_REGISTRATION_PID_GRACE))
+                            } else {
+                                generation.registration.started_qpc
+                            };
+                            (ev.timestamp_qpc >= start && ev.timestamp_qpc <= generation.ended_qpc)
+                                .then(|| generation.registration.sid.clone())
+                        })
+                    })
+            })
+            .or_else(|| {
                 self.by_pid.get(&ev.process_id).and_then(|r| {
-                    let captured_during_registration = ev.captured_at >= r.at;
+                    let captured_during_registration = ev.timestamp_qpc >= r.started_qpc;
                     let captured_during_seed_race = r.allow_pre_registration_capture
-                        && r.at.saturating_duration_since(ev.captured_at)
-                            <= PRE_REGISTRATION_PID_GRACE;
+                        && r.started_qpc.saturating_sub(ev.timestamp_qpc)
+                            <= duration_qpc_ticks(PRE_REGISTRATION_PID_GRACE);
                     if captured_during_registration || captured_during_seed_race {
                         Some(r.sid.clone())
                     } else {
@@ -1918,7 +1979,6 @@ mod tests {
 
     fn empty_raw_event(queued_bytes: usize) -> RawEtwEvent {
         RawEtwEvent {
-            captured_at: Instant::now(),
             header: EVENT_HEADER::default(),
             user_data: Vec::new(),
             ext_items: Vec::new(),
@@ -1998,7 +2058,7 @@ mod tests {
 
     fn mk_event(pid: u32, name: &str) -> DecodedEtwEvent {
         DecodedEtwEvent {
-            captured_at: Instant::now(),
+            timestamp_qpc: qpc_now(),
             provider: GUID::from_u128(0),
             event_id: 1,
             level: 4,
@@ -2208,7 +2268,7 @@ mod tests {
     fn pid_match_refused_when_capture_predates_registration_beyond_grace() {
         let mut idx = AttributionIndex::new();
         let mut ev = mk_event(1000, "CreateProcessInSandbox");
-        ev.captured_at = Instant::now() - Duration::from_secs(3);
+        ev.timestamp_qpc = qpc_now() - duration_qpc_ticks(Duration::from_secs(3));
 
         idx.register_launch("sbx-new", "new", 1000);
 
@@ -2219,18 +2279,19 @@ mod tests {
     }
 
     #[test]
-    fn queued_record_captured_before_pid_reuse_is_not_misattributed() {
+    fn producer_timestamp_routes_delayed_record_to_original_pid_generation() {
         let mut idx = AttributionIndex::new();
         idx.register_launch("sbx-old", "old", 1000);
-        // The callback copies this record while the old PID generation is live,
-        // but consumer backlog delays decode/resolution until after reuse.
+        // The producer emits this record while the old PID generation is live,
+        // but ETW delays callback delivery until after process exit and reuse.
         let queued_old = mk_event(1000, "CreateProcessInSandbox");
         idx.retire_launch("sbx-old", 1000);
         idx.register_launch("sbx-new", "new", 1000);
 
-        assert!(
-            idx.resolve(&queued_old).is_none(),
-            "a record captured under the old PID generation must not bind to the new owner"
+        assert_eq!(
+            idx.resolve(&queued_old).as_deref(),
+            Some("sbx-old"),
+            "a delayed record must resolve through its producer-time PID generation"
         );
 
         let fresh = mk_event(1000, "CreateProcessInSandbox");
@@ -2238,6 +2299,23 @@ mod tests {
             idx.resolve(&fresh).as_deref(),
             Some("sbx-new"),
             "a record captured during the new registration remains authoritative"
+        );
+    }
+
+    #[test]
+    fn short_lived_process_keeps_attribution_until_etw_flushes() {
+        let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-short", "short", 2000);
+        let emitted_before_exit = mk_event(2000, "SandboxConfig");
+
+        // The process exits before ETW's one-second flush timer delivers the
+        // record to our callback.
+        idx.retire_launch("sbx-short", 2000);
+
+        assert_eq!(
+            idx.resolve(&emitted_before_exit).as_deref(),
+            Some("sbx-short"),
+            "process exit must not discard attribution for ETW-buffered records"
         );
     }
 

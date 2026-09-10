@@ -206,7 +206,7 @@ try {
   $gwLog    = Join-Path $resultDir "gateway.log"
   $gwErrLog = Join-Path $resultDir "gateway.err.log"
   $gw = Start-Process -FilePath $gateway `
-    -ArgumentList @("--disable-tls", "--config", $toml, "--log-level", "info") `
+    -ArgumentList @("--disable-tls", "--config", $toml, "--port", $Port, "--log-level", "info") `
     -WorkingDirectory $here -PassThru -NoNewWindow `
     -RedirectStandardOutput $gwLog -RedirectStandardError $gwErrLog
   Info "gateway pid $($gw.Id); logs -> $(Split-Path $gwLog -Leaf) (+ .err)"
